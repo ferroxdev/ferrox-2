@@ -2632,7 +2632,7 @@ fn serve_stream(
     );
 }
 
-/// Opens one H2 request stream and hands its body to the session, choosing the frame window when the request carries no sequence.
+/// Opens one H2 request stream and hands its body to the session, choosing the frame window when the request carries no sequence. The handshake rides the setup pool, so eight streams peak at its lanes instead of one thread each.
 fn open_stream(
     conn: &Arc<H2Conn>,
     settings: &XhttpSettings,
@@ -2715,7 +2715,7 @@ fn open_stream(
     };
     let settings = settings.clone();
     let decryption = conn.decryption.clone();
-    crate::budgets::spawn(move || {
+    crate::proxy::lane_pool::submit_stream_setup(move || {
         match crate::xhttp::accept_core(
             &head,
             Vec::new(),
@@ -4279,6 +4279,53 @@ mod tests {
         );
         drop(client);
         server.join().expect("joins");
+    }
+
+    /// Eight stream handshakes peak at the setup pool's lanes, not one thread per stream: every served
+    /// body parks until released, so a thread spawned per stream would sit in the task table.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn eight_stream_setups_ride_the_setup_pool() {
+        if !crate::conn::in_a_quiet_process(
+            "xhttp_h2::tests::eight_stream_setups_ride_the_setup_pool",
+        ) {
+            return;
+        }
+        let (conn, _state, _written) = reading_conn(Box::new(std::io::Cursor::new(Vec::new())));
+        let settings = test_settings("stream-up");
+        let parked = Arc::new((AtomicUsize::new(0), Mutex::new(false), Condvar::new()));
+        let seen = Arc::clone(&parked);
+        let serve: Arc<SessionServe> = Arc::new(move |_reader, _writer, _decryption| {
+            seen.0.fetch_add(1, Ordering::SeqCst);
+            let (_, open, cv) = &*seen;
+            let mut open = open.lock().expect("lock");
+            while !*open {
+                open = cv.wait(open).expect("waits");
+            }
+        });
+        let before = crate::conn::live_threads();
+        for sid in 2..=9u32 {
+            let path = format!("/up/pool-{sid:04}");
+            let block = block_encode(&[
+                (":method", "GET"),
+                (":path", path.as_str()),
+                (":scheme", "http"),
+                (":authority", "127.0.0.1"),
+            ]);
+            assert!(
+                open_stream(&conn, &settings, Arc::clone(&serve), sid, &block, true),
+                "stream {sid} was not opened"
+            );
+        }
+        let grown = crate::conn::live_threads().saturating_sub(before);
+        assert!(
+            grown <= crate::proxy::lane_pool::setup_lanes() + 1,
+            "eight stream setups grew the process by {grown} threads past the setup pool's {} lanes",
+            crate::proxy::lane_pool::setup_lanes()
+        );
+        let (_, open, cv) = &*parked;
+        *open.lock().expect("lock") = true;
+        cv.notify_all();
     }
 
     /// The h2 body is selected by the request's shape, not its method: a hub configured for a PUT uplink still hands a POST stream-up body over as a window instead of chunk-framing it.

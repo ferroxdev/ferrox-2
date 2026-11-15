@@ -32665,6 +32665,12 @@ pub(crate) mod lane_pool {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// The setup pool's lanes: a stream handshake rides one of these instead of a thread of its own.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn setup_lanes() -> usize {
+        SETUP_LANES
+    }
+
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn demux_workers() -> usize {
         demux_pool()
