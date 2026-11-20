@@ -3142,8 +3142,16 @@ pub(crate) struct RouteShared {
 
 impl RouteShared {
     /// Rebuild the rule table from the config after a geodata download, keeping the balancer state
-    /// a reparse cannot recreate. The script's matchers are rebuilt from the same files.
+    /// a reparse cannot recreate. A script owns its own matchers and reads the files per call.
     pub(crate) fn reload_routing(&self, root: &Json) -> Result<(), String> {
+        if self
+            .routing
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .carries_script()
+        {
+            return Ok(());
+        }
         let Some(mut next) = crate::router::Routing::parse_in(root, crate::router::asset_dirs())?
         else {
             return Ok(());
