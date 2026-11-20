@@ -1,0 +1,95 @@
+# ECH
+
+`tlsSettings.echConfigList` carries an ECH config list as raw base64 or as `name+udp://…` / `name+https://…/dns-query`, and one list feeds both client lanes: the stock rustls dial in `crates/ferrox-core/src/tls/rustls_backend.rs` and the shaped dial in `crates/ferrox-core/src/tls/shaped/client.rs`. `tlsSettings.echServerKeys` is the base64 `u16 key || u16 config` TLV a TLS listener answers through BoringSSL. A QUIC listener hands the same keys to quiche's BoringSSL context, and a QUIC dial offers the same list before its first packet, so this method carries both roles on both transports. `echSockopt` (also read as `echSocketSettings`) marks the socket that carries the ECH DNS query.
+
+The HPKE lane accepts X25519 with HKDF-SHA256 and AES-128-GCM, AES-256-GCM, or ChaCha20-Poly1305, so every suite an xray or sing-box key names is one this tree can answer. A bad config list fails the dial closed; a bad server key set refuses the inbound. A BoringSSL server that rejects an offer names its retry list, and the TLS stock dial repeats the TCP and TLS handshake once with that list. The shaped lane reports the same list to the same one-retry caller. That retry is a deliberate superset: Go's `SendAsRetry=false` leaves xray's rejected answer without a list, while every xray and sing-box client here can use one. A QUIC dial has no rejection retry: its list is set before the first packet, and a rejected handshake fails that dial. This is a setup path, not a per-record one.
+
+## Data path
+
+```mermaid
+graph TD
+    C["config: echConfigList<br/>or echServerKeys"] --> R["resolve: raw base64,<br/>or DNS SVCB over UDP/DoH"]
+    R --> L["ECHConfigList: config id,<br/>X25519 key, HPKE suites"]
+    L --> T["TLS: rustls or shaped ClientHello<br/>with an inner name"]
+    L --> Q["QUIC: quiche connects,<br/>then set_ech_config_list"]
+    T --> S["Server: BoringSSL answers<br/>or rejects with a retry list"]
+    Q --> S
+    S -->|accepted| W(("inner handshake<br/>on the wire"))
+    S -->|TLS rejected| D["one redial with<br/>the retry list (superset)"]
+    D --> W
+    S -->|QUIC rejected| X["that dial fails:<br/>no QUIC retry"]
+```
+
+## Measured
+
+<!-- counts:begin -->
+| key | value | checked by |
+| --- | --- | --- |
+| aes256-gcm-seal-retired-instructions | 14957 | scripts/count-ops.sh |
+| aes256-gcm-open-retired-instructions | 15329 | scripts/count-ops.sh |
+| syscalls-per-ech-handshake | UNBLESSED | scripts/count-ops.sh |
+| user-space-copies-per-ech-handshake | UNBLESSED | no copy checker yet |
+| seconds-per-ech-handshake | UNBLESSED | CI bench.yml (no cell yet) |
+| ech-offers-accepted-by-the-stock-lane | 1 | ferrox-app-proxy::tests::vless_over_ech_tls_carries_an_echo |
+| rejected-ech-offers-retried-once | 1 | ferrox-app-proxy::tests::a_rejected_ech_offer_retries_once_with_the_servers_list |
+| ech-retries-that-ask-at-most-twice | 1 | ferrox-app-proxy::tests::a_retry_is_the_dials_last_ask |
+| ech-offers-built-by-the-shaped-lane | 1 | ferrox-core-tls::shaped::hello::tests::a_real_ech_offer_hides_the_inner_name_under_the_public_one |
+| quic-ech-offers-accepted | 1 | ferrox-app-quic::tests::an_ech_serving_lane_accepts_an_offer |
+| quic-dials-that-offer-the-configured-list | 1 | ferrox-app-quic::tests::a_client_dial_offers_the_configured_ech_list |
+| quic-lanes-that-fall-back-without-an-offer | 1 | ferrox-app-quic::tests::an_ech_serving_lane_answers_a_client_without_an_offer |
+| heap-buffers-for-an-ech-cover | 1 | ferrox-core-tls::shaped::hello::tests::an_ech_cover_is_written_into_one_buffer |
+| heap-buffers-for-an-hpke-context | 0 | ferrox-core-tls::hpke::tests::a_context_costs_no_allocations |
+| heap-buffers-for-a-shaped-sealer | 0 | ferrox-core-tls::hpke::tests::a_shaped_sealer_costs_no_allocations |
+| heap-buffers-for-an-ech-config | 1 | ferrox-core-tls::ech::tests::an_encoded_config_is_one_buffer |
+| heap-buffers-for-a-real-ech-offer | 8 | ferrox-core-tls::shaped::hello::tests::an_enable_ech_offer_parses_in_place |
+| seal-plaintext-buffer-moves | 0 | ferrox-core-tls::hpke::tests::an_owned_seal_appends_where_the_plaintext_lay |
+<!-- counts:end -->
+
+The relay test (`vless_over_ech_tls_carries_an_echo`) is the stock lane: a VLESS flow over a TLS listener whose ECH key is the fixture's. The two retry tests drive that lane too, through the same `dial_tls_session` caller the shaped lane uses: the first offers a valid config the listener does not hold, takes the retry list it returns, then keeps the second session, records both ClientHellos and reads the outer name from each, so the first carries the stale list's own public name and the retry carries the public name the server's list names rather than the configured host. A second answer after the retry is the dial's last ask: `a_retry_is_the_dials_last_ask` counts the listener's accepts and proves the socket is never connected a third time, and the retry's own answer stands (a rejecting ECH server finishes under the outer name, so the count, not a client error, is the gate). The shaped lane's own cover is gated by `a_real_ech_offer_hides_the_inner_name_under_the_public_one`; a retry hands it a new list through the same `connect` call, whose `enable_ech` sets the outer name from that list, though no byte-level retry test drives the shaped hello yet. A QUIC rejection has no retry to test. The QUIC tests read `ech_accepted()` on both ends, and the fallback test proves a client without a list still reaches the lane. The shaped hello test gates the real offer's outer and inner names, not a GREASE cover.
+
+## Ops
+
+```bash
+./scripts/count-ops.sh report \
+  tls::shaped::hello::tests::an_aes_256_only_config_seals_the_inner_hello \
+  'ferrox_core::tls::hpke::Context::seal_owned' \
+  'ferrox_core::tls::hpke::Context::open'
+```
+
+The probe is the existing AES-256-only ECH hello test: one `enable_ech` seals the cover and one inner open decrypts it, under a fixed hello and fixed inner length. The rows price `Context::seal_owned` and `Context::open`, including call costs attributed to those frames, but exclude the HPKE context setup `Context::new` performs; the AEAD body is attributed to a separate frame in this binary's thin-LTO layout. `ops.yml` on this head reports `seal_owned` 14957, down from 15414 when the cover was sealed through a fresh ciphertext buffer, and `open` 15329, whose AES-GCM code is unchanged and whose frame moved 28 Ir with this offer's allocation shape: the cipher-list reserve takes two reallocations out of `enable_ech`, and the open's fallback allocation lands on a different allocator path. This host is macOS/aarch64, where valgrind has no build, so the exact-count gate in `./scripts/check.sh` is CI-only for the rows.
+
+## Time
+
+No matrix cell isolates ECH: the bench cells time a relay after the handshake, and a TLS ECH dial does one extra TCP/TLS handshake only when the server rejects the offer. No duration is quoted here. The byte order is the gate: accepted offers keep xray's inner handshake, while a rejected TLS offer follows this tree's one-retry path with the list BoringSSL returns where xray's `SendAsRetry=false` sends none.
+
+## What we removed
+
+- **A boxed sealer and its encapsulation buffer.** The shaped offer keeps the 32-byte encapsulation and the sealer's context on the stack, and the cover's zero payload is written in place rather than staged.
+- **The real offer's staged cover.** The cover header and its zero payload are written straight into the outer hello, so the offer no longer allocates a cover buffer or copies it in.
+- **The inner hello's ciphertext buffer and the plaintext copy into it.** The inner body is reserved with room for its padding and tag, then sealed where it lies; the tag is appended and the caller copies one ciphertext into the cover instead of allocating a second buffer and copying the plaintext through it.
+- **The parse copies and staged hello frames.** The config list is walked where it lies, the HPKE info is hashed from the config's own fields, and the inner transcript and outer hello are framed where they are written.
+- **The cipher list's reallocations.** The outer hello reserves its cipher list to the table's exact length before the first suite, so a 16-entry profile no longer grows it through two reallocations.
+- **The hidden name's clone and the public name's DNS temporary.** The offer moves the hello's hidden name instead of cloning it, and validates the public name as the borrowed config slice, so neither the old copy nor a validation `String` is allocated.
+- **A config rebuild for the retry.** The rejected offer clones the parsed `TlsConfig`, replaces its `ech_config_list` `Arc`, and reuses every other field; no text is parsed again and no server name is resolved again.
+- **A second accept loop for QUIC.** The listener's BoringSSL context is built once per identity and shared with quiche; the dial sets the list on the connection it already made.
+
+What was **not** removed: the TLS retry costs one extra connection when a server rejects, and BoringSSL requires at least one retry config where Go/xray's `SendAsRetry=false` sends none. That list is kept on purpose: it lets a TLS xray or sing-box client recover without a second DNS query, so the rejected answer is a superset of xray's rather than a byte-for-byte copy, while an accepted offer is unchanged. QUIC pays no such extra connection because it has no rejection retry.
+
+## Pins
+
+| what | where |
+| --- | --- |
+| ECH config list, DNS query, cache and `echServerKeys` TLV | `upstream/xray-core/transport/internet/tls/ech.go` |
+| retry-on-rejection client | `upstream/sing-box/common/tls/client.go` |
+| quiche's ECH setter | `upstream/quiche/quiche/src/lib.rs` |
+| BoringSSL retry-config rule | `~/.cargo/registry/src/*/boring-sys-5.4.0/deps/boringssl/ssl/encrypted_client_hello.cc` |
+| rustls rejection payload | `~/.cargo/registry/src/*/rustls-0.23.46/src/error.rs` |
+
+## CI scope
+
+What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
+
+<!-- scope:begin -->
+- paths: crates/ferrox-app/src/ech_dns.rs, crates/ferrox-core/src/tls/ech.rs, crates/ferrox-core/src/tls/hpke.rs
+- go: ./transport/internet/tls/...
+<!-- scope:end -->

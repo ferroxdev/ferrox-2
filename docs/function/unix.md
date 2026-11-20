@@ -1,0 +1,100 @@
+# Unix domain sockets
+
+A `unix` field on an inbound names an `AF_UNIX` path and stands in for `listen`+`port`; a flow that arrives on it is served by the same engine that serves TCP. There is no second read/write path for the socket family: one `Connection` seam (`Tcp(TcpStream)` / `Unix(UnixStream)`, `crates/ferrox-app/src/conn.rs`) is the transport every carrier and the relay already read and wrote through, so switching a leg to a unix socket changes which `Read`/`Write` impl answers, not the bytes handed to it. The row is transparency, not a new framing: what leaves one end of a unix stream is what would leave the same round trip over TCP, octet for octet.
+
+Both roles the method has are served, on both host families. The server role binds a path and accepts on it (`Listener::bind`, `accept_loop`); the client role dials a path (`connect`). The `unix:` spelling is parsed before anything is dialed (`parse_target`), so an empty path is refused rather than bound at the root. The text after the prefix is read the way the reference's listener reads it: on Linux and Android a leading `@` names the abstract namespace, a second `@` pads the name across the kernel's whole `sun_path` (the spelling haproxy's sockets use), and a filesystem path may carry one comma-separated octal mode the listener applies to the socket file; a comma followed by anything but an octal mode is part of the name, so `app,v2.sock` binds and dials the literal text. One reader, `abstract_name` plus `split_permission`, serves the inbound that binds the row and the fallback dial that reaches it, so both sides of a config agree on which address the text names. A path that already names a socket is replaced on either host — the recovery sing-box's `os.Remove` reaches for — but the regular-file check is Unix-only: on Unix a path naming anything else is refused before it is touched, so a typo cannot delete a file on its way to a failed bind. The stale entry is unlinked only while it is still the inode the check saw, but `take_stale` re-stats and then calls `remove_file` as a separate step, so a writer that replaces the path between them can still be unlinked; the race is narrowed, not closed. On Windows the arm unlinks whatever entry is at the path before binding, so a path naming a regular file is deleted; treat a Windows unix listen path as owned by the listener.
+
+On a Unix host the arm is `std`'s `UnixStream`. On Windows `std` has the type — `std::os::windows::net::UnixStream` — but keeps it behind the unstable `windows_unix_domain_sockets` feature (tracking issue `150487`), which a stable build cannot name, so the `winunix` module of `crates/ferrox-app/src/conn.rs` drives the same family itself: one `WSAStartup` for the process, then `socket`/`bind`/`listen`/`accept`/`connect` and `recv`/`send`, with `WSARecv`/`WSASend` over a `WSABUF` array where the Unix arm has `readv`/`writev`. The `SOCK_STREAM` shape and the Windows 10 build 17063 floor are the ones `std`'s own Windows unix module names. Either host keeps one socket behind an `Arc`: `try_clone` bumps the count instead of calling `dup`, so a relay's second leg costs no descriptor and the last drop closes the socket.
+
+What refuses, and where: a datagram carrier (kcp, quic, hysteria) cannot bind a stream socket, so an inbound naming one keeps the IP address it is given and the `unix` field does not reach it. A unix peer reports no socket address — there is no port to name — so `peer_addr`/`local_addr` answer `Unsupported` rather than a fabricated one; `reality_edges` reads the two ends through those and a unix leg yields the same `None` pair a never-bound TCP stream yields, which is what a cover origin expecting no PROXY header already handles.
+
+What the Windows arm refuses, and where each refusal lives: it opens `SOCK_STREAM` only, the shape `std` opens for the family, so the datagram-carrier rule above reads the same on either host; an address is always a named path, so `parse_target` refuses the empty one before anything is dialed; `peer_addr`/`local_addr` answer `Unsupported` because a socket path has no port to name — the seam never asks the provider for an address it would throw away, and `accept` passes null address out-params for the same reason; and `try_clone` shares the one handle behind an `Arc` rather than calling `WSADuplicateSocket`, which is what `std`'s unstable Windows unix stream reaches for in its own `try_clone`. Nothing in this arm depends on whether the provider serves that call, and the shared handle gives the relay the lifetime a `dup`ed unix descriptor has: the last leg to drop closes the socket. The Unix arm takes the same shared handle, so its `try_clone` does not `dup` either.
+
+## Data path
+
+```mermaid
+graph TD
+    A["inbound config: unix:path<br/>parse_target selects the family"] --> B["Listener::bind(path)<br/>@name -> namespace, padded or not<br/>path,mode -> unix: socket? unlink (same inode) : refuse<br/>windows: unlink any entry before bind<br/>mode -> mkdir 0700 + bind + chmod + link<br/>field-full path -> bind + chmod"]
+    B --> W{"host family"}
+    W -->|"unix"| B1["std UnixListener"]
+    W -->|"windows"| B2["winunix: socket(AF_UNIX, SOCK_STREAM)<br/>+ bind + listen, WSAStartup once"]
+    B1 --> I["incoming() accept loop<br/>Connection::Unix(UnixStream)"]
+    B2 --> I
+    I --> C["carrier + relay read/write<br/>the same Read/Write seam as TCP"]
+    C --> D["freedom dials the origin<br/>Target::Ip -> dial_tcp, unchanged"]
+    D --> Z["0 bytes added by the unix leg<br/>0 copies beyond the relay's own"]
+```
+
+## Measured
+
+<!-- counts:begin -->
+| key | value | checked by |
+| --- | --- | --- |
+| ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
+| syscalls-per-round-trip | UNBLESSED | no syscall checker yet |
+| user-space-copies-per-round-trip | UNBLESSED | no copy checker yet |
+| seconds-per-round-trip | UNBLESSED | CI bench.yml (no cell yet) |
+| unix-stream-bytes-preserved | 65536 | ferrox-app-conn::tests::a_unix_connection_carries_the_same_bytes_the_tcp_round_trip_does |
+| unix-head-not-vector-multiple | 1501 | ferrox-app-conn::tests::a_unix_round_trip_survives_lengths_a_vector_would_split |
+| unix-timeout-bound-read-back | 50 | ferrox-app-conn::tests::a_unix_read_timeout_arms_the_way_the_tcp_one_does |
+| unix-path-past-the-field-refused | 200 | ferrox-app-conn::tests::a_unix_path_past_the_socket_field_is_refused |
+| unix-abstract-name-served | 27 | ferrox-app-conn::tests::a_unix_abstract_name_is_bound_and_dialed |
+| unix-abstract-padded-field | 108 | ferrox-app-conn::tests::a_doubled_unix_at_names_the_padded_abstract_name |
+| unix-permission-mode | 504 | ferrox-app-conn::tests::a_unix_listener_takes_the_permission_it_names |
+| unix-non-octal-comma-literal | 7 | ferrox-app-conn::tests::a_unix_comma_path_that_is_not_a_mode_stays_literal |
+| unix-regular-file-refused | 16 | ferrox-app-conn::tests::a_unix_listener_never_removes_a_regular_file |
+| unix-mode-path-at-field-limit | 107 | ferrox-app-conn::tests::a_unix_mode_on_a_path_at_the_address_field_limit |
+| unix-mode-staging-litter | 0 | ferrox-app-conn::tests::a_unix_mode_staging_leaves_only_the_socket |
+<!-- counts:end -->
+
+The first row is the byte-identity claim itself: a 64 KiB stream round-tripped both ways over a real `AF_UNIX` socket equals the same round trip over TCP and equals the payload. The second is the arithmetic on the inputs a round number hides — lengths `1`, `3`, `1501`, `65535`, none a multiple of the vector width the vectored write path splits on — each arriving whole. Both rows run on either host, so they are the checkers of the Windows arm's open, dial, accept, read, write, half-close and EOF, not only of the Unix one. `a_unix_clone_shares_the_descriptor_instead_of_duplicating_it` is the checker for the shared handle: both legs must report one raw descriptor, the clone's write must reach the peer, a half-close through the original must end the peer's read, and dropping the original then the clone without a shutdown must end the peer's read, with the peer's clock turning a missing close into a failure instead of a hang. On Unix that is the removed `dup`; on Windows it is what the arm already did.
+
+The third is the wait bound: `50` ms handed to a unix leg comes back out of `read_timeout` on either host, which is the whole claim a test can make where hanging the suite is the failure mode. On a Unix host the same test adds the witness that the bound stops the block — an empty armed read returns `WouldBlock`/`TimedOut` rather than parking; on Windows a provider that ignored the option would hang that read, so only the read-back runs there.
+
+The fourth is the input every round trip avoids: the path field of a socket address is a fixed array — `sun_path` is 108 bytes on Linux and in the Windows `SOCKADDR_UN`, 104 on macOS — and the test binds a short path in the same directory first, so the 200-character one is refused for its length rather than by where it sits.
+
+The fifth is the abstract namespace, and it is a behavior no path-shaped test can witness: a config naming `unix:@<27-byte name>` must bind the kernel's namespace, not a file called `@…` next to the working directory, and both the seam's dial and a raw `from_abstract_name` client reach it. The sixth is the padded spelling: a `unix:@@name` listener declares the field's whole 108 bytes, so a client that fills the field the haproxy way — the name, then zeros — lands on it, where the short spelling would name a different address. The seventh is the mode: a listener bound from `unix:<path>,0770` creates the file under 504 decimal, and both a client that names only the path and one that repeats the suffixed text reach it, so the suffix changes the file and not the name. The mode is applied inside a private `0700` staging directory created beside the socket — `mkdir` is the atomic step, so another writer cannot own the name — and the socket is then hard-linked into place: `link` refuses an existing destination, so the publish never replaces a file another writer put there, and the staging directory is removed. A path whose directory leaves no room for a staged name takes the reference's by-name `chmod` on the path itself, so the mode spelling never refuses a path that binds without it. The eighth is the suffix that is not a mode: `app,v2.sock` keeps its 7-byte `v2.sock` comma tail, binds as that literal file, and the same text dials it, where a hard error would refuse a name a peer outside this tree can serve. The ninth is the input every listener avoids: 16 bytes of a regular file at the configured path survive a refused bind, so the `os.Remove` recovery is taken for a stale socket and for nothing else. The tenth is that same field full and a mode on it: a path of exactly the field's 107 text bytes on Linux (103 on macOS, both read from `sockaddr_un` in the test) binds under `,0750` and comes out at that mode, so the spelling cannot narrow a path that binds without it. The eleventh is the staging's cleanup: after `unix:<path>,0750` binds, the socket's directory holds the socket and no `.ferrox-*` entry — `0` left behind — so the private directory is removed on every happy path. Only a name collision retries the staging name; every other `mkdir` error is returned as itself, so a missing directory is `NotFound` and not a staging message (`a_unix_mode_reports_a_missing_directory`). The Windows arm refuses a path that is not UTF-8 with `InvalidInput` — no test can name a non-UTF-8 temp directory on a runner — so that branch has no checker and no count; the socket-type check above is the Unix arm's, and Windows keeps its unconditional unlink.
+
+A full listener backlog is the one connect the fourth row cannot witness here: Linux parks a blocking `AF_UNIX` connect until the queue has room, macOS refuses it at once, so the witness `a_full_unix_backlog_ends_the_dial_at_its_budget` runs on Linux only and fills the queue with a thread that blocks before the bounded dial is made.
+
+Syscalls: a unix bind is `socket`+`bind`+`listen` where TCP is `socket`+`setsockopt`+`bind`+`listen`, so the unix leg issues no `SO_REUSEADDR` that has no meaning for a path, and the arm of `Connection` that decides this is chosen at `Listener::bind`, not per byte; a read/write over the unix stream is the same `read(2)`/`write(2)`/`writev(2)` the TCP path issues, one per call the relay makes. A unix dial is now the bounded TCP dial's shape — `socket`, the two `fcntl` read-modify-writes that put it into and back out of nonblocking mode, `connect`, and a `poll` when the connect did not answer at once — where it used to be `socket`+`connect`; the bound is what a full Linux backlog costs, and the Windows arm keeps WinSock's own blocking `connect`. On the Windows arm the same three opens are `WinSock`'s `socket`/`bind`/`listen` behind one `WSAStartup` per process (a `Once`, and no `WSACleanup`, since a leg outlives the call that opened it), a read/write is `recv`/`send`, and a vectored write is one `WSASend` over at most 16 `WSABUF` entries — `writev(2)`'s analogue, with the same clamp `IOV_MAX` puts on the Unix one, so parts past it go on the next turn of `write_all_parts` and coalescing is clamped, not lost. `syscalls-per-round-trip` and `user-space-copies-per-round-trip` stay `UNBLESSED`: no checker counts either, and a loopback `AF_UNIX` pair cannot gate a syscall total. `seconds-per-round-trip` has no `bench.yml` cell. Copies: the seam forwards `read`/`write` to whichever socket it holds without staging; the `WSABUF` array is filled with the caller's own slice pointers, so the vectored Windows write stages an array of descriptors, never the bytes. The only copy on the data path is the relay's own, shared with TCP. There is no copy here that the unix row removes relative to a prior implementation — the row went from refused to served. `unix-stream-bytes-preserved` witnesses only that 64 KiB arrives byte-identical without a re-frame; no checker observes the copy count, which is why `user-space-copies-per-round-trip` is `UNBLESSED`. The timeout arm is one `setsockopt(SO_RCVTIMEO)` on either family (the Unix path supplies it directly, `std` offering no setter); the Windows arm names the same option `std` names for a Windows stream, spelled as a `DWORD` of milliseconds with zero meaning no bound, so a bound handed to a unix leg is a bound the same getter reads back.
+
+## Ops
+
+```bash
+./scripts/count-ops.sh report \
+  conn::tests::a_unix_connection_carries_the_same_bytes_the_tcp_round_trip_does 'conn::Listener::bind'
+```
+
+`UNBLESSED`, as above — macOS/aarch64 ships no `valgrind`, so this count is CI-only there and has not been read; it is not a number and is not quoted as one.
+
+## Time
+
+**Not measured yet.** Durations in this repository come from CI runners (`bench.yml`, `parity.yml`); no CI artefact has been read, and a laptop behind a VPN measures a tunnel either way.
+
+## What we removed
+
+The address lie, the file-lock, and the duplicate descriptor. Xray's `UnixConnWrapper` ( `transport/internet/system_listener.go`) rewrites `RemoteAddr()` to a fabricated `&net.TCPAddr{IP: {0,0,0,0}}` so the app-layer address machinery does not choke on a unix peer, and wraps the listener in a `FileLocker` it releases on `Close`. Neither has anything to feed here: this tree has no `net.Addr`-keyed dispatcher downstream of the seam, so the honest `Unsupported` — which the one consumer, `reality_edges`, already maps to `None` — replaces the fake address, and the stale-socket case is met by replacing the socket the path already names rather than a lock file. That replacement is the recovery the references reach for (sing-box `server_unix.go` / `cmd_worker_unix.go` run `os.Remove(path)` before `net.Listen("unix", path)`); the lock was its heavier stand-in for the same `EADDRINUSE`, and one path that is replaced needs no second file to say it is held. On Unix we take the recovery but narrow it: only a socket file is replaced, and a path naming a regular file or a symlink is refused, so the blind `os.Remove` cannot delete data a typo pointed at; on Windows the arm keeps the unconditional unlink, so a regular file at the path is deleted. Two parts of the same listener are taken whole instead of removed: the comma-separated octal mode is one `set_permissions` inside a private staging directory, published with one `link` that refuses an existing destination, and the `@@` spelling fills the kernel's field, because a config naming either must be served at the file mode and the address it names. The abstract branch creates no lock file at all, which is the reference's own rule for a name that leaves with its last descriptor. A cloned relay leg no longer spends `dup`: both hosts share the socket behind an `Arc`, and the last leg to drop closes it, which is the lifetime the duplicated descriptor had.
+
+## What was not removed
+
+The `writev` coalescing on the vectored write path is kept on the unix arm, not relocated to a plain `write`: `write_vectored` is `writev(2)` for either family (a `Connection` is a socket on both), so the frame-part packing the TCP path already had is the same call on a unix stream — `impl Write for Connection` forwards `write_vectored` unchanged, and no frame is split to reach it. The Windows arm keeps it too: its `write_vectored` is one `WSASend` over the caller's `IoSlice` array rather than a `send` per part. `MSG_PEEK` is kept for the head readers (`Connection::peek`), the flag `recv` takes on either host. The `TCP_NODELAY` request is accepted-and-ignored on a unix stream rather than dropped from the caller: `set_nodelay` is called uniformly on either family in `no_delay`, and a unix socket has no internetwork to delay on, so the request does nothing instead of failing — the caller keeps one path, not a family test. What the staging does not remove: a writer of the *parent* directory can still rename the staging directory and race the `chmod`, and could equally replace the socket path itself — the boundary every pathname-based bind lives behind, where the reference applies the mode to the bare configured path with no staging at all. xray-core-rust carries unix only on the commander/API socket, not the transport listener, so there is no transport dial/serve shape to take from it; and zeronet ships no unix transport at all — `grep` finds none — so this row borrows nothing from it and says so rather than naming a source it did not read.
+
+## Pins
+
+| what | where |
+| --- | --- |
+| `UnixListenerWrapper`, `FileLocker` release on close, `RemoteAddr` rewritten to a zero `TCPAddr` | `upstream/xray-core/transport/internet/system_listener.go` |
+| unlink-then-bind a stale socket path before listening | `upstream/sing-box/experimental/boxdd/server_unix.go`, `upstream/sing-box/experimental/boxdd/cmd_worker_unix.go` |
+| unix on the commander/API socket only, no transport listener | `upstream/xray-core-rust/crates/xray-app-commander/src/` |
+| no unix transport to take from | `upstream/zero-net/` |
+| the Windows call shapes: `WSAStartup(0x0202)` once with no `WSACleanup`, timeouts as a `DWORD` of milliseconds with zero for no bound and a zero `Duration` refused, `ioctlsocket(FIONBIO)`, `SD_SEND`/`SD_RECEIVE`/`SD_BOTH`, `WSASend`/`WSARecv` for vectored I/O, `from_raw_os_error(WSAGetLastError())` | the toolchain's own `std` sources — `library/std/src/os/windows/net/stream.rs`, `library/std/src/os/windows/net/addr.rs` (the unstable `SOCK_STREAM`/17063 shape) and `library/std/src/sys/net/connection/socket/windows.rs` (the stream spellings the arm copies). No pinned reference ships a Windows unix transport, so this row reads `std`, not `upstream/` |
+
+## CI scope
+
+What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
+
+<!-- scope:begin -->
+- paths: crates/ferrox-app/src/conn.rs
+- symbols: unix_peer
+<!-- scope:end -->
