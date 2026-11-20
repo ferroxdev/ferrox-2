@@ -2546,8 +2546,7 @@ fn lane_send(
 /// Resolve a name through the tunnel against the configured DNS servers: the
 /// query rides the same datagram path as the caller's flows, so a name resolves
 /// where the tunnel can reach, not where the host can. A literal is returned
-/// unchanged, and an answer this lane cannot use is `None` so the caller keeps
-/// its own resolver as the fallback.
+/// unchanged, and an answer this lane cannot use is `None`.
 pub(crate) fn resolve_over_tunnel(
     config: &DeviceConfig,
     to_tunnel: &ToTunnel,

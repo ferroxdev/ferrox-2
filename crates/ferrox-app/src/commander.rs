@@ -3936,6 +3936,41 @@ mod tests {
     }
 
     #[test]
+    fn test_route_falls_through_a_script_that_names_no_tag() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-commander-script-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let script = dir.join("route.lua");
+        std::fs::write(
+            &script,
+            r#"
+function HandleRoute(ctx, inbound, sourcePort, targetPort, localPort, targetDomain)
+  if targetDomain == "script.test" then return "block" end
+  return nil
+end
+"#,
+        )
+        .expect("write");
+        let root = crate::json::parse(&format!(
+            r#"{{"routing":{{"script":{:?},"rules":[{{"domain":["rule.test"],"outboundTag":"rule"}}]}},"outbounds":[{{"tag":"default","protocol":"freedom"}},{{"tag":"rule","protocol":"freedom"}},{{"tag":"block","protocol":"blackhole"}}]}}"#,
+            script.display().to_string()
+        ))
+        .expect("parses");
+        let api = routing_api(&root);
+        assert_eq!(
+            routed_tag(&api, "rule.test").as_deref(),
+            Some("rule"),
+            "a script that names no tag falls through to the rule table"
+        );
+        assert_eq!(routed_tag(&api, "script.test").as_deref(), Some("block"));
+        assert_eq!(routed_tag(&api, "other.test"), None);
+    }
+
+    #[test]
     fn test_route_reads_a_multi_address_context_as_any_of() {
         let root = crate::json::parse(
             r#"{

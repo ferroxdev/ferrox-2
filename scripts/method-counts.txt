@@ -919,6 +919,7 @@ engine-router dns-lookups-per-unmatched-name 1 ferrox-app-router::tests::ip_if_n
 engine-router dns-lookups-ip-if-non-match-no-ip-rule 0 ferrox-app-router::tests::ip_if_non_match_does_not_resolve_without_an_ip_rule
 engine-router dns-lookups-ip-on-demand-source-failed 0 ferrox-app-router::tests::ip_on_demand_does_not_resolve_when_a_later_selector_fails
 engine-router gunzip-write-chunk-bytes 65536 ferrox-app-geodata::tests::a_gzipped_asset_is_written_while_it_is_decompressed
+engine-router seconds-per-decision UNBLESSED CI benchmark-matrix.yml (no routing cell)
 
 # --- SOCKS5, both roles ------------------------------------------------------
 socks ops-retired-instructions 895 scripts/count-ops.sh

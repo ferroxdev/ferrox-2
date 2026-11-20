@@ -5,13 +5,16 @@ use crate::conn::HttpUrl;
 use crate::json::Json;
 use crate::proxy::{Destination, Outbound, RouteShared};
 use ferrox_core::tls::TlsProvider as _;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const IDLE: Duration = Duration::from_secs(30);
-const MAX_DOWNLOAD: u64 = 256 * 1024 * 1024;
+/// One budget covers a remote rule set from lookup to the last body byte, so a server that drips
+/// below the idle timeout cannot hold startup open.
+const FETCH_BUDGET: Duration = Duration::from_secs(60);
+pub(crate) const MAX_DOWNLOAD: u64 = 256 * 1024 * 1024;
 /// One decompressed asset is written in chunks of this size, never as one buffer.
 const COPY_BUFFER: usize = 64 * 1024;
 const MAX_HEAD_LINE: usize = 8192;
@@ -862,9 +865,14 @@ impl Transaction {
 
 fn fetch(url: &str, outbound: &Outbound, writer: &mut impl Write) -> Result<(), String> {
     let mut current = url.to_owned();
-    for _ in 0..20 {
+    let mut redirects = 0;
+    loop {
         let response = request(&current, outbound)?;
         if (300..400).contains(&response.status) {
+            if redirects >= 20 {
+                return Err("stopped after 20 redirects".to_owned());
+            }
+            redirects += 1;
             let location = response
                 .header("location")
                 .ok_or_else(|| "redirected without a Location header".to_owned())?;
@@ -877,7 +885,98 @@ fn fetch(url: &str, outbound: &Outbound, writer: &mut impl Write) -> Result<(), 
         write_body(&response, writer)?;
         return Ok(());
     }
-    Err("stopped after 20 redirects".to_owned())
+}
+
+/// A remote rule set's bytes, dialled directly rather than through an outbound: the routing block
+/// is parsed before the outbound registry exists, so the fetch cannot name a lane yet.
+pub(crate) fn fetch_remote(url: &str) -> Result<Vec<u8>, String> {
+    let deadline = Instant::now()
+        .checked_add(FETCH_BUDGET)
+        .ok_or_else(|| "remote fetch budget overflows".to_owned())?;
+    let mut current = url.to_owned();
+    let mut redirects = 0;
+    loop {
+        let response = request_any(&current, None, Some(deadline))?;
+        if (300..400).contains(&response.status) {
+            if redirects >= 20 {
+                return Err("stopped after 20 redirects".to_owned());
+            }
+            redirects += 1;
+            let location = response
+                .header("location")
+                .ok_or_else(|| "redirected without a Location header".to_owned())?;
+            current = resolve_remote_location(&current, location)?;
+            continue;
+        }
+        if !(200..300).contains(&response.status) {
+            return Err(format!("unexpected status code: {}", response.status));
+        }
+        let mut body = Vec::new();
+        write_body(&response, &mut body)?;
+        return Ok(body);
+    }
+}
+
+/// Publish a cache only after its bytes have been validated, and never leave a half-written file:
+/// the temp lives beside the target and the previous file is moved aside only after the write ends.
+pub(crate) fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), String> {
+    if target.is_dir() {
+        return Err(format!("{} is a directory", target.display()));
+    }
+    let temp = unique_path(target, ".tmp")?;
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .map_err(|error| format!("cannot create {}: {error}", temp.display()))?;
+        file.write_all(bytes).map_err(|error| error.to_string())?;
+        file.flush().map_err(|error| error.to_string())
+    })();
+    if let Err(reason) = result {
+        let _ = std::fs::remove_file(&temp);
+        return Err(reason);
+    }
+    if let Err(error) = replace_file(&temp, target) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(format!("cannot replace {}: {error}", target.display()));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_file(temp: &Path, target: &Path) -> io::Result<()> {
+    std::fs::rename(temp, target)
+}
+
+#[cfg(windows)]
+fn replace_file(temp: &Path, target: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    let from: Vec<u16> = temp
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let to: Vec<u16> = target
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let replaced = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if replaced == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -897,13 +996,30 @@ impl Response {
 }
 
 fn request(url: &str, outbound: &Outbound) -> Result<Response, String> {
+    request_any(url, Some(outbound), None)
+}
+
+fn request_any(
+    url: &str,
+    outbound: Option<&Outbound>,
+    deadline: Option<Instant>,
+) -> Result<Response, String> {
     let url = HttpUrl::parse(url)?;
-    if !url.tls {
+    if outbound.is_some() && !url.tls {
         return Err("geodata asset url must be https".to_owned());
     }
-    let destination = Destination::Name(url.host.clone(), url.port);
-    let stream = crate::proxy::probe_stream(outbound, &destination, IDLE)
-        .ok_or_else(|| format!("cannot dial {}", url.authority))?;
+    let stream = match outbound {
+        Some(outbound) => {
+            let destination = Destination::Name(url.host.clone(), url.port);
+            crate::proxy::probe_stream(outbound, &destination, fetch_budget(deadline)?)
+                .ok_or_else(|| format!("cannot dial {}", url.authority))?
+        }
+        None => direct_stream(&url, deadline)?,
+    };
+    let stream = DeadlineIo::new(stream, deadline);
+    if !url.tls {
+        return exchange(&url, stream);
+    }
     let config = ferrox_core::tls::TlsConfig {
         server_name: url.host.clone(),
         alpn: vec![b"http/1.1".to_vec()].into(),
@@ -914,15 +1030,136 @@ fn request(url: &str, outbound: &Outbound) -> Result<Response, String> {
     let mut session = ferrox_core::tls::RustlsProvider::connect(&config, stream)
         .map_err(|error| error.to_string())?;
     session.handshake().map_err(|error| error.to_string())?;
+    exchange(&url, session)
+}
+
+fn fetch_budget(deadline: Option<Instant>) -> Result<Duration, String> {
+    let Some(deadline) = deadline else {
+        return Ok(IDLE);
+    };
+    let now = Instant::now();
+    if now >= deadline {
+        return Err("remote fetch outlasted its budget".to_owned());
+    }
+    Ok(deadline - now)
+}
+
+fn fetch_timeout() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "remote fetch outlasted its budget")
+}
+
+/// The dial's socket with one absolute deadline over every read and write, so a peer that keeps
+/// trickling below the idle timeout still runs out of the fetch's budget.
+struct DeadlineIo {
+    inner: crate::conn::Connection,
+    deadline: Option<Instant>,
+}
+
+impl DeadlineIo {
+    fn new(inner: crate::conn::Connection, deadline: Option<Instant>) -> Self {
+        Self { inner, deadline }
+    }
+
+    fn remaining(&self) -> io::Result<Duration> {
+        let Some(deadline) = self.deadline else {
+            return Ok(IDLE);
+        };
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(fetch_timeout());
+        }
+        Ok(deadline - now)
+    }
+
+    fn expired(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+}
+
+impl Read for DeadlineIo {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.deadline.is_some() {
+            let left = self.remaining()?;
+            self.inner
+                .set_read_timeout(Some(left.max(Duration::from_millis(1))))?;
+            self.inner.set_read_until(self.deadline);
+        }
+        let read = self.inner.read(buf)?;
+        if self.expired() {
+            return Err(fetch_timeout());
+        }
+        Ok(read)
+    }
+}
+
+impl Write for DeadlineIo {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.deadline.is_some() {
+            let left = self.remaining()?;
+            self.inner
+                .set_write_timeout(Some(left.max(Duration::from_millis(1))))?;
+        }
+        let written = self.inner.write(buf)?;
+        if self.expired() {
+            return Err(fetch_timeout());
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()?;
+        if self.expired() {
+            return Err(fetch_timeout());
+        }
+        Ok(())
+    }
+}
+
+fn direct_stream(
+    url: &HttpUrl,
+    deadline: Option<Instant>,
+) -> Result<crate::conn::Connection, String> {
+    use std::net::ToSocketAddrs as _;
+    let budget = fetch_budget(deadline)?;
+    let addresses = crate::proxy::resolve_bounded(&url.host, url.port, budget, |host, port| {
+        (host, port)
+            .to_socket_addrs()
+            .map(std::iter::Iterator::collect)
+    })
+    .ok_or_else(|| format!("cannot resolve {} within its budget", url.authority))?;
+    let mut last = None;
+    for address in addresses {
+        let left = fetch_budget(deadline)?.min(IDLE);
+        match std::net::TcpStream::connect_timeout(&address, left) {
+            Ok(stream) => {
+                stream
+                    .set_read_timeout(Some(left))
+                    .map_err(|error| error.to_string())?;
+                stream
+                    .set_write_timeout(Some(left))
+                    .map_err(|error| error.to_string())?;
+                return Ok(crate::conn::Connection::Tcp(stream));
+            }
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(match last {
+        Some(error) => format!("cannot dial {}: {error}", url.authority),
+        None => format!("cannot resolve {}", url.authority),
+    })
+}
+
+fn exchange<S: Read + Write>(url: &HttpUrl, mut stream: S) -> Result<Response, String> {
     let head = format!(
         "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {USER_AGENT}\r\nAccept: */*\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n",
         url.path, url.authority
     );
-    session
+    stream
         .write_all(head.as_bytes())
         .map_err(|error| error.to_string())?;
-    session.flush().map_err(|error| error.to_string())?;
-    read_response(&mut session)
+    stream.flush().map_err(|error| error.to_string())?;
+    read_response(&mut stream)
 }
 
 /// One head line, bounded: `read_line` grows a `String` without limit, so a malicious
@@ -1114,40 +1351,51 @@ fn read_chunked(reader: &mut impl BufRead, body: &mut Vec<u8>) -> Result<(), Str
 }
 
 fn resolve_location(base: &str, location: &str) -> Result<String, String> {
+    resolve_location_any(base, location, false)
+}
+
+fn resolve_remote_location(base: &str, location: &str) -> Result<String, String> {
+    resolve_location_any(base, location, true)
+}
+
+fn resolve_location_any(base: &str, location: &str, allow_http: bool) -> Result<String, String> {
     let prefix = location.get(..8).unwrap_or(location).to_ascii_lowercase();
     if prefix.starts_with("https://") {
         return Ok(location.to_owned());
     }
     if prefix.starts_with("http://") {
+        if allow_http && !HttpUrl::parse(base)?.tls {
+            return Ok(location.to_owned());
+        }
         return Err("redirected to non-https URL".to_owned());
     }
-    if let Some(rest) = location.strip_prefix("//") {
-        return Ok(format!("https://{rest}"));
-    }
     let url = HttpUrl::parse(base)?;
+    let scheme = if url.tls { "https" } else { "http" };
+    if let Some(rest) = location.strip_prefix("//") {
+        return Ok(format!("{scheme}://{rest}"));
+    }
     let (path, query) = match url.path.split_once('?') {
         Some((path, query)) => (path, format!("?{query}")),
         None => (url.path.as_str(), String::new()),
     };
     if location.starts_with('?') {
-        return Ok(format!("https://{}{}{}", url.authority, path, location));
+        return Ok(format!("{scheme}://{}{}{}", url.authority, path, location));
     }
     if location.starts_with('#') {
         return Ok(format!(
-            "https://{}{}{}{}",
+            "{scheme}://{}{}{}{}",
             url.authority, path, query, location
         ));
     }
     let path = if location.starts_with('/') {
         location.to_owned()
     } else {
-        let directory = url
-            .path
+        let directory = path
             .rsplit_once('/')
             .map_or("/", |(directory, _)| directory);
         format!("{directory}/{location}")
     };
-    Ok(format!("https://{}{}", url.authority, path))
+    Ok(format!("{scheme}://{}{}", url.authority, path))
 }
 
 #[cfg(test)]
@@ -1542,6 +1790,80 @@ mod tests {
             resolve_location("https://example.test/a", "#part").expect("joined"),
             "https://example.test/a#part"
         );
+        assert_eq!(
+            resolve_location(
+                "https://example.test/releases/old.srs?next=/archive",
+                "new.srs"
+            )
+            .expect("joined"),
+            "https://example.test/releases/new.srs"
+        );
+    }
+
+    #[test]
+    fn a_remote_redirect_keeps_the_scheme_it_started_with() {
+        assert_eq!(
+            resolve_remote_location("http://example.test/a/b", "c").expect("joined"),
+            "http://example.test/a/c"
+        );
+        assert_eq!(
+            resolve_remote_location("https://example.test/a/b", "//cdn.test/c").expect("joined"),
+            "https://cdn.test/c"
+        );
+        assert_eq!(
+            resolve_remote_location("http://example.test/a", "http://cdn.test/b").expect("joined"),
+            "http://cdn.test/b"
+        );
+        let error = resolve_remote_location("https://example.test/a", "http://cdn.test/b")
+            .expect_err("an https source cannot downgrade");
+        assert!(error.contains("non-https"), "{error}");
+    }
+
+    #[test]
+    fn a_cache_target_that_is_a_directory_is_refused() {
+        let dir = asset_dir();
+        let target = dir.join("cache");
+        std::fs::create_dir(&target).expect("directory");
+        let error = write_atomic(&target, b"rules").expect_err("refused");
+        assert!(error.contains("directory"), "{error}");
+        assert!(target.is_dir());
+    }
+
+    #[test]
+    fn a_remote_fetch_follows_twenty_redirects_and_refuses_the_next() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            use std::io::{ErrorKind, Read as _, Write as _};
+            use std::time::{Duration, Instant};
+            listener.set_nonblocking(true).expect("nonblocking");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut at = 0;
+            while at < 21 && Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(accepted) => accepted,
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) => panic!("accepts: {error}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .expect("read timeout");
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request);
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: /{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    at + 1
+                );
+                stream.write_all(response.as_bytes()).expect("redirect");
+                at += 1;
+            }
+        });
+        let error = fetch_remote(&format!("http://127.0.0.1:{port}/0")).expect_err("refused");
+        server.join().expect("server");
+        assert!(error.contains("20 redirects"), "{error}");
     }
 
     #[test]

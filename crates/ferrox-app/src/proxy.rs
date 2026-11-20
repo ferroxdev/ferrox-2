@@ -3158,6 +3158,7 @@ impl RouteShared {
             .routing
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        next.adopt_added_rules(&mut current)?;
         next.adopt_balancer_state(&mut current);
         *current = next;
         *script = next_script;
@@ -3399,7 +3400,9 @@ impl RouteShared {
                 return Ok(None);
             };
             let first = probe.flow(probe.targets[0], probe.sources[0], probe.locals[0]);
-            return script.route(&first, callbacks);
+            if let Some(tag) = script.route(&first, callbacks)? {
+                return Ok(Some(tag));
+            }
         }
         let (target, webhook) = {
             let routing = self
@@ -4014,17 +4017,17 @@ impl RoutePlan {
             let Some(callbacks) = self.shared.script.as_ref() else {
                 return self.default_lane();
             };
-            return match script.route(&flow, callbacks) {
+            match script.route(&flow, callbacks) {
                 Ok(Some(tag)) => {
                     let out = self.target(&tag);
-                    (out, Some(std::borrow::Cow::Owned(tag)))
+                    return (out, Some(std::borrow::Cow::Owned(tag)));
                 }
-                Ok(None) => self.default_lane(),
+                Ok(None) => {}
                 Err(error) => {
                     eprintln!("routing script: {error}");
-                    (Picked::Static(&self.shared.closed), None)
+                    return (Picked::Static(&self.shared.closed), None);
                 }
-            };
+            }
         }
         let (lane, tag, webhook) = {
             let routing = self
@@ -81049,6 +81052,58 @@ end
         let (picked, tag) = plan.lane(&broken, crate::router::Network::Tcp, None, None);
         assert_eq!(tag, None);
         assert!(matches!(&*picked, Outbound::Block(_)));
+    }
+
+    /// A script's pick wins over the rule table; a script that names no tag falls through to it.
+    #[test]
+    fn a_routing_script_falls_through_to_rules() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-proxy-mix-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let script = dir.join("route.lua");
+        std::fs::write(
+            &script,
+            r#"
+function HandleRoute(ctx, inbound, sourcePort, targetPort, localPort, targetDomain)
+  if targetDomain == "blocked.test" then return "block" end
+  return nil
+end
+"#,
+        )
+        .expect("write");
+        let config = format!(
+            r#"{{"routing":{{"script":{:?},"rules":[{{"domain":["rule.test"],"outboundTag":"rule"}},{{"domain":["blocked.test"],"outboundTag":"rule"}}]}},"outbounds":[{{"tag":"default","protocol":"freedom"}},{{"tag":"rule","protocol":"freedom"}},{{"tag":"block","protocol":"blackhole"}}]}}"#,
+            script.display().to_string()
+        );
+        let plan = route_outbound(&config, Some("in"), false);
+        let Outbound::Route(plan) = plan else {
+            panic!("the config is routed");
+        };
+        let (_, tag) = plan.lane(
+            &Destination::Name("rule.test".to_owned(), 80),
+            crate::router::Network::Tcp,
+            None,
+            None,
+        );
+        assert_eq!(tag.as_deref(), Some("rule"));
+        let (_, tag) = plan.lane(
+            &Destination::Name("blocked.test".to_owned(), 80),
+            crate::router::Network::Tcp,
+            None,
+            None,
+        );
+        assert_eq!(tag.as_deref(), Some("block"));
+        let (_, tag) = plan.lane(
+            &Destination::Name("other.test".to_owned(), 80),
+            crate::router::Network::Tcp,
+            None,
+            None,
+        );
+        assert_eq!(tag.as_deref(), Some("default"));
     }
 
     /// One SOCKS CONNECT by name, granted; the caller writes the payload or reads the close.

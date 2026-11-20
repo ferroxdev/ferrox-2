@@ -586,15 +586,7 @@ impl MasqueOut {
         let Ok(inner) = self.ensure() else {
             return false;
         };
-        wg_stack::resolve_over_tunnel(
-            &inner.config,
-            &inner.to_tunnel,
-            &inner.routes,
-            &self.spec.remote_dns,
-            host,
-            port,
-        )
-        .is_some()
+        self.resolve_name(&inner, host, port).is_some()
     }
 
     pub(crate) fn serve_udp(
@@ -605,7 +597,6 @@ impl MasqueOut {
     ) {
         match self.ensure_leased() {
             Ok((inner, _lease)) => {
-                let remote = self.spec.remote_dns.as_slice();
                 if !wg_stack::client_udp(
                     relay,
                     &inner.config,
@@ -613,21 +604,7 @@ impl MasqueOut {
                     &inner.routes,
                     associate,
                     peer,
-                    &|host, port| {
-                        if let Some(answer) = wg_stack::resolve_over_tunnel(
-                            &inner.config,
-                            &inner.to_tunnel,
-                            &inner.routes,
-                            remote,
-                            host,
-                            port,
-                        ) {
-                            return vec![answer];
-                        }
-                        crate::proxy::resolve_endpoint(host, port)
-                            .into_iter()
-                            .collect()
-                    },
+                    &|host, port| self.resolve_name(&inner, host, port).into_iter().collect(),
                     0,
                 ) {
                     eprintln!("masque: the UDP relay port is already in use");
@@ -720,21 +697,23 @@ impl MasqueOut {
         }
     }
 
-    /// A name resolves inside the tunnel the reference names, then falls back to
-    /// the host so an unreachable DNS server never makes a name undialable.
     fn resolve(&self, inner: &Inner, asked: &Destination) -> Option<SocketAddr> {
-        let Destination::Name(host, port) = asked else {
-            return asked.socket();
-        };
+        match asked {
+            Destination::Name(host, port) => self.resolve_name(inner, host, *port),
+            Destination::Address(address) => Some(*address),
+        }
+    }
+
+    /// A name resolves only through the tunnel's remote DNS, as the reference's tunnel does.
+    fn resolve_name(&self, inner: &Inner, host: &str, port: u16) -> Option<SocketAddr> {
         wg_stack::resolve_over_tunnel(
             &inner.config,
             &inner.to_tunnel,
             &inner.routes,
             &self.spec.remote_dns,
             host,
-            *port,
+            port,
         )
-        .or_else(|| crate::proxy::resolve_endpoint(host, *port))
     }
 }
 
@@ -5181,6 +5160,17 @@ mod tests {
             retire: Arc::new(AtomicBool::new(false)),
             stable: Arc::new(AtomicBool::new(stable)),
         }
+    }
+
+    #[test]
+    fn a_name_without_a_tunnel_answer_does_not_fall_back_to_the_host() {
+        let masque = MasqueOut::new(&outbound(443)).expect("outbound");
+        let inner = dead_lane(true);
+        assert_eq!(
+            masque.resolve(&inner, &Destination::Name("localhost".to_owned(), 443)),
+            None,
+            "a name the tunnel cannot answer must not be dialed from the host"
+        );
     }
 
     /// A lane that is still live carries its reuse window; `end` marks retirement first so a lease
