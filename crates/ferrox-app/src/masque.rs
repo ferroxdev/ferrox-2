@@ -2621,7 +2621,9 @@ fn io(
             }
         }
         quic::flush_egress(&mut conn, sock);
-        if !quic::pump_once(&mut conn, sock, local, TICK) || conn.is_closed() {
+        // A packet the stack queues after the drain above cannot wake this read, so the wait is the relay grain, not the retransmission tick.
+        if !quic::pump_once(&mut conn, sock, local, crate::budgets::RELAY_POLL) || conn.is_closed()
+        {
             break;
         }
         if moved && quic::path_failed(&mut conn, local) {

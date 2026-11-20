@@ -2820,7 +2820,8 @@ pub(crate) fn client_udp<T: Clone + Into<ToTunnel>>(
     let Ok((reply_tx, reply_rx)) = claim_udp_route(routes, port) else {
         return false;
     };
-    let _ = relay.set_read_timeout(Some(LANE_TICK));
+    // A reply the stack already queued for this lane cannot wake the read below, so the wait is the relay grain, not the lane's idle cadence.
+    let _ = relay.set_read_timeout(Some(crate::budgets::RELAY_POLL));
     if let Some(associate) = associate {
         let _ = associate.set_read_timeout(Some(crate::budgets::SESSION_POLL));
     }
@@ -2962,7 +2963,8 @@ pub(crate) fn client_udp_forward<T: Clone + Into<ToTunnel>>(
     if let Some(ready) = ready {
         let _ = ready.send(Ok(()));
     }
-    let _ = relay.set_read_timeout(Some(LANE_TICK));
+    // A reply the stack already queued for this lane cannot wake the read below, so the wait is the relay grain, not the lane's idle cadence.
+    let _ = relay.set_read_timeout(Some(crate::budgets::RELAY_POLL));
     let mut buf = crate::proxy::udp_buffer();
     let mut app: Option<SocketAddr> = None;
     while !stop.load(Ordering::Relaxed) {
