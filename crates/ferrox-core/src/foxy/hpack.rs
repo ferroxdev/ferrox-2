@@ -469,6 +469,9 @@ const QPACK_STATIC: [(&[u8], &[u8]); 99] = [
     (b"x-frame-options", b"sameorigin"),
 ];
 
+/// HPACK's static table is index `1..=61`; anything past it is a dynamic entry this lane does not have.
+const H2_STATIC: usize = 61;
+
 /// The `:status` entries of a static table, HPACK's from index 8 and QPACK's from the table above: an indexed entry is one integer with nothing following, so a field this lane never reads costs nothing to walk past.
 fn static_status(index: usize, h2: bool) -> Option<u16> {
     if h2 {
@@ -494,7 +497,7 @@ fn status_of(bytes: &[u8]) -> Option<u16> {
     )
 }
 
-/// Reads an HPACK block's `:status`: an indexed entry is one integer, so any index outside the `:status` range is skipped; a literal is read only under a `:status` name; a dynamic size update carries no entry and is skipped, the lane keeping no dynamic table.
+/// Reads an HPACK block's `:status`: an indexed entry is one integer, so any index inside the static table but outside the `:status` range is skipped; a literal is read only under a `:status` name; a dynamic size update carries no entry and is skipped, the lane keeping no dynamic table. A reference past the static table names a dynamic entry this lane cannot resolve, so the whole block is refused.
 pub fn hpack_status(block: &[u8]) -> Option<u16> {
     let mut at = 0usize;
     let mut status = None;
@@ -502,6 +505,9 @@ pub fn hpack_status(block: &[u8]) -> Option<u16> {
         let first = block[at];
         if first & 0x80 != 0 {
             let index = read_integer(block, &mut at, 7)?;
+            if index == 0 || index > H2_STATIC {
+                return None;
+            }
             if let Some(code) = static_status(index, true) {
                 status = Some(code);
             }
@@ -512,6 +518,9 @@ pub fn hpack_status(block: &[u8]) -> Option<u16> {
             let name_is_status = if index == 0 {
                 string_literal(block, &mut at)?.is_status()
             } else {
+                if index > H2_STATIC {
+                    return None;
+                }
                 static_status(index, true).is_some()
             };
             let value = string_literal(block, &mut at)?;
@@ -528,6 +537,9 @@ pub fn hpack_status(block: &[u8]) -> Option<u16> {
         let name_is_status = if index == 0 {
             string_literal(block, &mut at)?.is_status()
         } else {
+            if index > H2_STATIC {
+                return None;
+            }
             static_status(index, true).is_some()
         };
         let value = string_literal(block, &mut at)?;
@@ -538,16 +550,32 @@ pub fn hpack_status(block: &[u8]) -> Option<u16> {
     status
 }
 
-/// Reads a QPACK block's `:status`: QPACK prefixes it with a required insert count and a delta base, and a block not prefixed by two zero bytes names a dynamic table this lane does not have.
-pub fn qpack_status(block: &[u8]) -> Option<u16> {
-    if *block.first()? != 0 || *block.get(1)? != 0 {
+/// The field section prefix QPACK puts in front of every block: a required insert count that must be zero, since this lane keeps no dynamic table, and a delta base that must not encode a negative Base. Returns the offset of the first field line.
+fn qpack_prefix(block: &[u8]) -> Option<usize> {
+    let mut at = 0usize;
+    let required = read_integer(block, &mut at, 8)?;
+    if required != 0 {
         return None;
     }
-    let mut at = 2usize;
+    let negative = *block.get(at)? & 0x80 != 0;
+    let delta = read_integer(block, &mut at, 7)?;
+    if negative && delta >= required {
+        return None;
+    }
+    Some(at)
+}
+
+/// Reads a QPACK block's `:status`: a static-only section may still carry a non-zero delta base, whose Base is the required insert count plus that delta; a negative Base and any reference naming dynamic state are refused.
+pub fn qpack_status(block: &[u8]) -> Option<u16> {
+    let mut at = qpack_prefix(block)?;
     let mut status = None;
     while at < block.len() {
         let first = block[at];
         let name_is_status = if first & 0x80 != 0 {
+            if first & 0x40 == 0 {
+                // The T bit clear names the dynamic table, which this lane never fills.
+                return None;
+            }
             let index = read_integer(block, &mut at, 6)?;
             // A field the lane does not read is walked past, the way the `h2` reader does: the status is what the block has, not the first line it met.
             if let Some(code) = static_status(index, false) {
@@ -575,45 +603,53 @@ pub fn qpack_status(block: &[u8]) -> Option<u16> {
     status
 }
 
-/// Reads a QPACK block's `content-length` without building its field list, so a response reader can check a short body and still keep its zero-allocation walk.
-pub fn qpack_content_length(block: &[u8]) -> Option<usize> {
-    if *block.first()? != 0 || *block.get(1)? != 0 {
-        return None;
-    }
-    let mut at = 2usize;
+/// Reads a QPACK block's `content-length` without building its field list, so a response reader can check a short body and still keep its zero-allocation walk. A conflicting repeat or a malformed field is an error, distinct from a block that carries no length.
+pub fn qpack_content_length(block: &[u8]) -> Result<Option<usize>, Malformed> {
+    let mut at = qpack_prefix(block).ok_or(Malformed)?;
     let mut length = None;
     while at < block.len() {
         let first = block[at];
         let name_is_length = if first & 0x80 != 0 {
-            let index = read_integer(block, &mut at, 6)?;
-            if static_name(index) == Some(b"content-length".as_slice()) {
-                length = Some(0);
+            if first & 0x40 == 0 {
+                return Err(Malformed);
+            }
+            let index = read_integer(block, &mut at, 6).ok_or(Malformed)?;
+            if static_name(index).ok_or(Malformed)? == b"content-length" {
+                length = Some(match length {
+                    Some(known) if known != 0 => return Err(Malformed),
+                    _ => 0,
+                });
             }
             continue;
         } else if first & 0xC0 == 0x40 {
             if first & 0x10 == 0 {
-                return None;
+                return Err(Malformed);
             }
-            let index = read_integer(block, &mut at, 4)?;
-            static_name(index) == Some(b"content-length".as_slice())
+            let index = read_integer(block, &mut at, 4).ok_or(Malformed)?;
+            static_name(index).ok_or(Malformed)? == b"content-length"
         } else if first & 0xE0 == 0x20 {
-            qpack_name(block, &mut at)?.as_bytes() == b"content-length"
+            qpack_name(block, &mut at).ok_or(Malformed)?.as_bytes() == b"content-length"
         } else {
-            return None;
+            return Err(Malformed);
         };
-        let value = string_literal(block, &mut at)?;
+        let value = string_literal(block, &mut at).ok_or(Malformed)?;
         if name_is_length {
-            length = Some(
-                std::str::from_utf8(value.as_bytes())
-                    .ok()?
-                    .trim()
-                    .parse()
-                    .ok()?,
-            );
+            let parsed = std::str::from_utf8(value.as_bytes())
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+                .ok_or(Malformed)?;
+            length = Some(match length {
+                Some(known) if known != parsed => return Err(Malformed),
+                _ => parsed,
+            });
         }
     }
-    length
+    Ok(length)
 }
+
+/// A QPACK section that cannot be read as one `content-length`: a field is malformed, the static index names no entry, or the length repeats with a different value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Malformed;
 
 /// A static table entry's name, which the `01` pattern names instead of spelling out: the entry's value is not read, only its name.
 fn static_name(index: usize) -> Option<&'static [u8]> {
@@ -687,14 +723,14 @@ pub fn qpack_literal_many(fields: &[(&str, &str)], out: &mut Vec<u8>) {
 /// Reads every field of a QPACK block whose references stay inside the static table — indexed lines, static name references, literal names Huffman-coded or not — and refuses anything naming dynamic state.
 #[must_use]
 pub fn qpack_fields(block: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
-    if *block.first()? != 0 || *block.get(1)? != 0 {
-        return None;
-    }
-    let mut at = 2usize;
+    let mut at = qpack_prefix(block)?;
     let mut fields = Vec::new();
     while at < block.len() {
         let first = block[at];
         if first & 0x80 != 0 {
+            if first & 0x40 == 0 {
+                return None;
+            }
             let index = read_integer(block, &mut at, 6)?;
             let (name, value) = QPACK_STATIC.get(index)?;
             fields.push((name.to_vec(), value.to_vec()));
@@ -1196,6 +1232,65 @@ mod tests {
         }
     }
 
+    /// The stateless decoder keeps no dynamic table, so a reference past the 61 static entries cannot be resolved and the block is malformed rather than status-less; a static field it does not read is still walked past.
+    #[test]
+    fn an_hpack_reference_past_the_static_table_is_refused() {
+        let mut past = vec![0x88];
+        integer(&mut past, 7, 0x80, 62);
+        assert_eq!(hpack_status(&past), None, "an indexed dynamic reference");
+        let mut named = vec![0x40];
+        integer_into(&mut named, 6, 62);
+        integer(&mut named, 7, 0x00, 3);
+        named.extend_from_slice(b"200");
+        assert_eq!(hpack_status(&named), None, "a literal dynamic name");
+        assert_eq!(hpack_status(&[0x80]), None, "index zero");
+        let mut static_field = vec![0x88];
+        integer(&mut static_field, 7, 0x80, 61);
+        assert_eq!(hpack_status(&static_field), Some(200));
+    }
+
+    /// A static-only section may still carry a non-zero delta base: S clear with a required insert count of zero makes Base the delta, which is legal. A negative Base and a non-zero insert count are refused.
+    #[test]
+    fn a_static_only_qpack_section_may_carry_a_nonzero_delta_base() {
+        let block = [0x00, 0x01, 0xD9];
+        assert_eq!(qpack_status(&block), Some(200));
+        assert_eq!(qpack_fields(&block).map(|fields| fields.len()), Some(1));
+        assert_eq!(qpack_status(&[0x00, 0x80, 0xC1]), None, "a negative base");
+        assert_eq!(
+            qpack_status(&[0x01, 0x00, 0xC1]),
+            None,
+            "a nonzero insert count"
+        );
+    }
+
+    /// An indexed line's T bit decides which table its index addresses: T clear names the dynamic table, so a slot number that happens to sit in the static table is not that static field.
+    #[test]
+    fn an_indexed_qpack_field_requires_the_static_table_bit() {
+        let mut dynamic = vec![0x00, 0x00];
+        integer(&mut dynamic, 6, 0x80, 25);
+        assert_eq!(qpack_status(&dynamic), None);
+        assert_eq!(qpack_fields(&dynamic), None);
+        let mut length = vec![0x00, 0x00];
+        integer(&mut length, 6, 0x80, 4);
+        assert_eq!(qpack_content_length(&length), Err(Malformed));
+    }
+
+    /// Two content-length fields that disagree make the block malformed, not length-less: a caller that treated the conflict as absent could smuggle a body past the check. A repeat of the same number is the one length.
+    #[test]
+    fn conflicting_content_lengths_are_malformed() {
+        let mut conflicting = Vec::new();
+        qpack_literal(&mut conflicting, "content-length", b"10");
+        qpack_literal(&mut conflicting, "content-length", b"3");
+        assert_eq!(qpack_content_length(&conflicting), Err(Malformed));
+        let mut same = Vec::new();
+        qpack_literal(&mut same, "content-length", b"10");
+        qpack_literal(&mut same, "content-length", b"10");
+        assert_eq!(qpack_content_length(&same), Ok(Some(10)));
+        let mut indexed = vec![0x00, 0x00, 0xC4];
+        qpack_literal(&mut indexed, "content-length", b"3");
+        assert_eq!(qpack_content_length(&indexed), Err(Malformed));
+    }
+
     #[test]
     fn a_huffman_coded_status_is_read() {
         let mut value = Vec::new();
@@ -1328,7 +1423,7 @@ mod tests {
             &[(":method", "POST"), ("hysteria-auth", "s3cret")],
             &mut block,
         );
-        block.push(0x80 | 0x17);
+        block.push(0x80 | 0x40 | 0x17);
         // A static name reference to `:status` (index 24), which the four-bit prefix does not hold, so the index continues in the byte after it.
         block.extend_from_slice(&[0x5F, 0x09, 0x03, b'2', b'3', b'3']);
         assert_eq!(
@@ -1366,9 +1461,9 @@ mod tests {
     /// An indexed line the lane does not read is walked past, not refused: a response that names its status and then `date` (`static` index 6) has a readable status, and the reader keeps whichever status the block carried.
     #[test]
     fn a_field_the_h3_lane_does_not_read_is_skipped_not_refused() {
-        assert_eq!(qpack_status(&[0x00, 0x00, 0x99]), Some(200));
+        assert_eq!(qpack_status(&[0x00, 0x00, 0xD9]), Some(200));
         assert_eq!(
-            qpack_status(&[0x00, 0x00, 0x99, 0x86]),
+            qpack_status(&[0x00, 0x00, 0xD9, 0xC6]),
             Some(200),
             "the status survives an indexed `date` behind it"
         );
@@ -1415,7 +1510,7 @@ mod tests {
     fn the_status_reader_understands_every_pattern_the_edge_may_send() {
         // The `1T` pattern, an indexed line: the status is the table entry's own value.
         let mut indexed = vec![0x00, 0x00];
-        integer(&mut indexed, 6, 0x80, 25);
+        integer(&mut indexed, 6, 0xC0, 25);
         // The `01NT` pattern, a literal line naming the field in the static table.
         let mut named = vec![0x00, 0x00];
         integer(&mut named, 4, 0x40 | 0x10, 24);

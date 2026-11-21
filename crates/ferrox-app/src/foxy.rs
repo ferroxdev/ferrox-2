@@ -1752,6 +1752,15 @@ impl Tls2 {
                 );
                 let _ = inner.tls.write_all(&reset);
             }
+            // RFC 9113 §6.1: a frame whose padding or priority prefix does not fit its length is a connection error, not an event to drop.
+            frames::H2Routed::Malformed { .. } => {
+                inner.gone = true;
+                inner.out = payload;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "malformed h2 frame",
+                ));
+            }
             _ => {}
         }
         let out = body(&mut *inner, frame, &payload, delivered);
@@ -1903,7 +1912,7 @@ impl Tls2 {
                                 take_status(inner, own)
                             }
                         }
-                        frames::H2Routed::GoAway { .. } => {
+                        frames::H2Routed::GoAway { .. } | frames::H2Routed::Malformed { .. } => {
                             inner.gone = true;
                             Err(Failure::Stream)
                         }
@@ -2098,6 +2107,10 @@ fn stage_datagram(
             inner.gone = true;
             Ok(0)
         }
+        frames::H2Routed::Malformed { .. } => {
+            inner.gone = true;
+            Err(io(Failure::Stream))
+        }
         _ => Ok(0),
     }
 }
@@ -2133,6 +2146,10 @@ fn stage_address(
         frames::H2Routed::GoAway { .. } => {
             inner.gone = true;
             Ok(())
+        }
+        frames::H2Routed::Malformed { .. } => {
+            inner.gone = true;
+            Err(io(Failure::Stream))
         }
         _ => Ok(()),
     }
@@ -2201,6 +2218,10 @@ fn route_packet(
         frames::H2Routed::GoAway { .. } => {
             inner.gone = true;
             Ok(false)
+        }
+        frames::H2Routed::Malformed { .. } => {
+            inner.gone = true;
+            Err(io(Failure::Stream))
         }
         _ => Ok(false),
     }
@@ -2352,6 +2373,10 @@ impl Read for Tls2 {
                             inner.gone = true;
                             end_stream(inner, own, 8);
                             Ok(0)
+                        }
+                        frames::H2Routed::Malformed { .. } => {
+                            inner.gone = true;
+                            Err(io(Failure::Stream))
                         }
                         _ => Ok(0),
                     }
@@ -2655,7 +2680,13 @@ impl H3 {
         };
         let edge = edge_authority(&dial.host, dial.port);
         let mut block = Vec::with_capacity(160 + dial.pass.token.len());
-        connectip::connect_ip_qpack(&edge, "*", 0, &dial.pass.token, &mut block);
+        connectip::connect_ip_qpack(
+            &edge,
+            "*",
+            connectip::IpProto::Any,
+            &dial.pass.token,
+            &mut block,
+        );
         let mut frame = Vec::with_capacity(16 + block.len());
         frames::quic_varint(&mut frame, frames::H3_HEADERS);
         frames::quic_varint(&mut frame, block.len() as u64);
@@ -3876,7 +3907,7 @@ pub(crate) fn open_ip_h2(
 ) -> Result<(Tls2, Option<ferrox_core::foxy::connectip::Assigned>), Failure> {
     let edge = edge_authority(&dial.host, dial.port);
     let mut lane = open_stream(dial, PoolClass::Ip, |block| {
-        connectip::connect_ip(&edge, "*", 0, &dial.pass.token, block);
+        connectip::connect_ip(&edge, "*", connectip::IpProto::Any, &dial.pass.token, block);
     })?;
     let assigned = match lane.address_assign() {
         Ok(assigned) => assigned,
@@ -8486,7 +8517,7 @@ pub(crate) mod loopback {
         for field in [
             "CONNECT",
             "connect-ip",
-            "/.well-known/masque/ip/*/0/",
+            "/.well-known/masque/ip/*/*/",
             "Bearer the-pass",
             "capsule-protocol",
             "?1",
@@ -8878,7 +8909,7 @@ pub(crate) mod loopback {
                     named = Some(error.to_string());
                     break;
                 }
-                _ => {}
+                Ok(false) => {}
             }
         }
         let held = match &lane {
@@ -10030,7 +10061,13 @@ pub(crate) mod loopback {
             .recv_timeout(Duration::from_secs(60))
             .expect("block");
         let mut want = Vec::new();
-        connectip::connect_ip_qpack(&format!("localhost:{port}"), "*", 0, "the-pass", &mut want);
+        connectip::connect_ip_qpack(
+            &format!("localhost:{port}"),
+            "*",
+            connectip::IpProto::Any,
+            "the-pass",
+            &mut want,
+        );
         assert_eq!(block, want, "the edge reads the block the lane wrote");
         let written = lane
             .write(

@@ -367,19 +367,28 @@ mod tests {
             ("2001:db8::42", 80),
             ("a-rather-longer-hostname.example", 8080),
         ] {
-            for build in [connect_udp, connect_udp_qpack] {
-                let mut block = Vec::new();
-                build("edge.example:2499", host, port, "the-pass", &mut block);
-                let mut path = Vec::new();
-                udp_path(host, port, &mut path);
-                let path = String::from_utf8(path).expect("ascii");
-                let text = String::from_utf8_lossy(&block).into_owned();
-                assert_eq!(
-                    text.matches(&path).count(),
-                    1,
-                    "{host} writes its path once"
-                );
-            }
+            let mut path = Vec::new();
+            udp_path(host, port, &mut path);
+            let mut h2 = Vec::new();
+            connect_udp("edge.example:2499", host, port, "the-pass", &mut h2);
+            assert_eq!(
+                fields_of_h2(&h2)
+                    .into_iter()
+                    .find(|(name, _)| name == b":path")
+                    .map(|(_, value)| value),
+                Some(path.clone()),
+                "{host} writes its path with the length it names"
+            );
+            let mut q3 = Vec::new();
+            connect_udp_qpack("edge.example:2499", host, port, "the-pass", &mut q3);
+            assert_eq!(
+                fields_of(&q3)
+                    .into_iter()
+                    .find(|(name, _)| name == b":path")
+                    .map(|(_, value)| value),
+                Some(path),
+                "{host} writes its path once over QPACK too"
+            );
         }
         let mut path = Vec::new();
         udp_path("2001:db8::42", 65535, &mut path);

@@ -3417,7 +3417,25 @@ mod tests {
 
     #[test]
     fn a_v6_echo_request_flips_to_a_v6_reply() {
-        let request = [128u8, 0, 0, 0, 0, 1, 0, 1, b'p', b'i', b'n', b'g'];
+        let mut request = [128u8, 0, 0, 0, 0, 1, 0, 1, b'p', b'i', b'n', b'g'];
+        let mut covered = Vec::new();
+        covered.extend_from_slice(
+            &"2001:db8::2"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets(),
+        );
+        covered.extend_from_slice(
+            &"2001:db8::1"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets(),
+        );
+        covered.extend_from_slice(&(request.len() as u32).to_be_bytes());
+        covered.extend_from_slice(&[0, 0, 0, ICMPV6_PROTO]);
+        covered.extend_from_slice(&request);
+        let sum = ferrox_core::foxy::connectip::checksum(&covered);
+        request[2..4].copy_from_slice(&sum.to_be_bytes());
         let mut out = Vec::new();
         render_icmp_reply_ip(
             "2001:db8::1".parse().unwrap(),
@@ -3508,7 +3526,9 @@ mod tests {
                 "a reused render is byte-identical to a fresh one"
             );
         }
-        let request = [8u8, 0, 0, 0, 0, 1, 0, 1, b'p', b'i', b'n', b'g'];
+        let mut request = [8u8, 0, 0, 0, 0, 1, 0, 1, b'p', b'i', b'n', b'g'];
+        let sum = ferrox_core::foxy::connectip::checksum(&request);
+        request[2..4].copy_from_slice(&sum.to_be_bytes());
         render_icmp_reply([10, 0, 0, 1], [10, 0, 0, 2], &request, &mut out);
         assert_eq!(
             out.as_ptr() as usize,

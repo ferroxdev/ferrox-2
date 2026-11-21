@@ -18,6 +18,9 @@ pub const WINDOW_UPDATE: u8 = 0x8;
 /// The flag a DATA or HEADERS frame carries when it is the stream's last.
 pub const END_STREAM: u8 = 0x1;
 pub const PADDED: u8 = 0x8;
+/// A HEADERS frame's five bytes of stream dependency and weight, which precede the block.
+const PRIORITY: u8 = 0x20;
+const PRIORITY_BYTES: usize = 5;
 const FLAG_ACK: u8 = 0x1;
 
 /// The client preface, sent before the first settings and answered by any HTTP/2 server.
@@ -93,6 +96,10 @@ pub enum H2Event<'a> {
     Push {
         promised: u32,
     },
+    /// A frame whose padding or priority prefix does not fit its wire length: RFC 9113 §6.1 makes it a connection error, so it is never a clean end of stream.
+    Malformed {
+        kind: u8,
+    },
     Other {
         kind: u8,
     },
@@ -147,6 +154,10 @@ pub enum H2Routed<'a> {
     Push {
         promised: u32,
     },
+    /// A frame whose padding or priority prefix does not fit its wire length: RFC 9113 §6.1 makes it a connection error.
+    Malformed {
+        kind: u8,
+    },
     Other {
         kind: u8,
     },
@@ -173,41 +184,46 @@ pub fn be64(payload: &[u8]) -> u64 {
     value
 }
 
-/// A padded frame's payload: the padding-length byte and trailing pad come off, and a frame whose own bytes do not add up has no payload.
+/// A `PADDED` frame's body: the pad length and trailing pad come off. Only DATA, HEADERS and `PUSH_PROMISE` define the flag, so another type's bit is a different flag and never padding.
 #[must_use]
-fn unpadded(payload: &[u8]) -> Option<&[u8]> {
-    let pad = usize::from(*payload.first()?);
-    payload.get(1..payload.len().checked_sub(pad)?)
+fn framed_body(kind: u8, flags: u8, payload: &[u8]) -> Option<&[u8]> {
+    if flags & PADDED != 0 && matches!(kind, DATA | HEADERS | PUSH_PROMISE) {
+        let pad = usize::from(*payload.first()?);
+        payload.get(1..payload.len().checked_sub(pad)?)
+    } else {
+        Some(payload)
+    }
+}
+
+/// One HEADERS frame's block: the padding comes off first, then the five bytes a `PRIORITY` flag puts ahead of the block, and a prefix that does not fit is malformed (RFC 9113 §6.2).
+#[must_use]
+fn header_block(flags: u8, payload: &[u8]) -> Option<&[u8]> {
+    let body = framed_body(HEADERS, flags, payload)?;
+    if flags & PRIORITY != 0 {
+        body.get(PRIORITY_BYTES..)
+    } else {
+        Some(body)
+    }
 }
 
 /// Classifies one complete frame against `ours`, this lane's stream id, because DATA and HEADERS are per-stream and every other type it acts on is not.
 #[must_use]
 pub fn h2_event(frame: H2Frame, payload: &[u8], ours: u32) -> H2Event<'_> {
-    let trimmed = if frame.flags & PADDED == 0 {
-        Some(payload)
-    } else {
-        unpadded(payload)
-    };
     match frame.kind {
-        DATA if frame.stream == ours => match trimmed {
+        DATA if frame.stream == ours => match framed_body(DATA, frame.flags, payload) {
             Some(body) => H2Event::Data {
                 payload: body,
                 end: frame.flags & END_STREAM != 0,
                 wire: payload.len(),
             },
-            // A pad length that does not fit the frame has no payload to hand over, but its octets still spent the window.
-            None => H2Event::Data {
-                payload: &[],
-                end: frame.flags & END_STREAM != 0,
-                wire: payload.len(),
-            },
+            None => H2Event::Malformed { kind: DATA },
         },
-        HEADERS if frame.stream == ours => match trimmed {
-            Some(body) => H2Event::Headers {
-                block: body,
+        HEADERS if frame.stream == ours => match header_block(frame.flags, payload) {
+            Some(block) => H2Event::Headers {
+                block,
                 end: frame.flags & END_STREAM != 0,
             },
-            None => H2Event::Other { kind: frame.kind },
+            None => H2Event::Malformed { kind: HEADERS },
         },
         RST_STREAM if frame.stream == ours => H2Event::Reset {
             code: be32(payload),
@@ -218,21 +234,22 @@ pub fn h2_event(frame: H2Frame, payload: &[u8], ours: u32) -> H2Event<'_> {
         },
         SETTINGS => H2Event::Settings {
             ack: frame.flags & FLAG_ACK != 0,
-            payload: trimmed.unwrap_or_default(),
+            payload,
         },
         PING => H2Event::Ping {
             ack: frame.flags & FLAG_ACK != 0,
-            payload: trimmed.unwrap_or_default(),
+            payload,
         },
         GOAWAY => H2Event::GoAway {
-            code: be32(payload),
+            code: be32(payload.get(4..).unwrap_or_default()),
         },
         // A promise short enough to name no stream cannot be refused on the stream it promised.
-        PUSH_PROMISE => match trimmed.filter(|body| body.len() >= 4) {
-            Some(body) => H2Event::Push {
+        PUSH_PROMISE => match framed_body(PUSH_PROMISE, frame.flags, payload) {
+            Some(body) if body.len() >= 4 => H2Event::Push {
                 promised: be32(body) & 0x7fff_ffff,
             },
-            None => H2Event::Other { kind: frame.kind },
+            Some(_) => H2Event::Other { kind: PUSH_PROMISE },
+            None => H2Event::Malformed { kind: PUSH_PROMISE },
         },
         _ => H2Event::Other { kind: frame.kind },
     }
@@ -241,43 +258,29 @@ pub fn h2_event(frame: H2Frame, payload: &[u8], ours: u32) -> H2Event<'_> {
 /// Classifies one complete frame, keeping the stream it belongs to: a session that carries many streams routes by this id, and the payload and the wire length are the ones `h2_event` hands over.
 #[must_use]
 pub fn h2_routed(frame: H2Frame, payload: &[u8]) -> H2Routed<'_> {
-    let trimmed = if frame.flags & PADDED == 0 {
-        Some(payload)
-    } else {
-        unpadded(payload)
-    };
     match frame.kind {
-        DATA => match trimmed {
+        DATA => match framed_body(DATA, frame.flags, payload) {
             Some(body) => H2Routed::Data {
                 stream: frame.stream,
                 payload: body,
                 end: frame.flags & END_STREAM != 0,
                 wire: payload.len(),
             },
-            // A pad length that does not fit the frame has no payload to hand over, but its octets still spent the window.
-            None => H2Routed::Data {
-                stream: frame.stream,
-                payload: &[],
-                end: frame.flags & END_STREAM != 0,
-                wire: payload.len(),
-            },
+            None => H2Routed::Malformed { kind: DATA },
         },
-        HEADERS => match trimmed {
-            Some(body) => H2Routed::Headers {
+        HEADERS => match header_block(frame.flags, payload) {
+            Some(block) => H2Routed::Headers {
                 stream: frame.stream,
-                block: body,
+                block,
                 end: frame.flags & END_STREAM != 0,
                 end_headers: frame.flags & END_HEADERS != 0,
             },
-            None => H2Routed::Other { kind: frame.kind },
+            None => H2Routed::Malformed { kind: HEADERS },
         },
-        CONTINUATION => match trimmed {
-            Some(body) => H2Routed::Continuation {
-                stream: frame.stream,
-                block: body,
-                end: frame.flags & END_HEADERS != 0,
-            },
-            None => H2Routed::Other { kind: frame.kind },
+        CONTINUATION => H2Routed::Continuation {
+            stream: frame.stream,
+            block: payload,
+            end: frame.flags & END_HEADERS != 0,
         },
         RST_STREAM => H2Routed::Reset {
             stream: frame.stream,
@@ -289,21 +292,22 @@ pub fn h2_routed(frame: H2Frame, payload: &[u8]) -> H2Routed<'_> {
         },
         SETTINGS => H2Routed::Settings {
             ack: frame.flags & FLAG_ACK != 0,
-            payload: trimmed.unwrap_or_default(),
+            payload,
         },
         PING => H2Routed::Ping {
             ack: frame.flags & FLAG_ACK != 0,
-            payload: trimmed.unwrap_or_default(),
+            payload,
         },
         GOAWAY => H2Routed::GoAway {
-            code: be32(payload),
+            code: be32(payload.get(4..).unwrap_or_default()),
         },
         // A promise short enough to name no stream cannot be refused on the stream it promised.
-        PUSH_PROMISE => match trimmed.filter(|body| body.len() >= 4) {
-            Some(body) => H2Routed::Push {
+        PUSH_PROMISE => match framed_body(PUSH_PROMISE, frame.flags, payload) {
+            Some(body) if body.len() >= 4 => H2Routed::Push {
                 promised: be32(body) & 0x7fff_ffff,
             },
-            None => H2Routed::Other { kind: frame.kind },
+            Some(_) => H2Routed::Other { kind: PUSH_PROMISE },
+            None => H2Routed::Malformed { kind: PUSH_PROMISE },
         },
         _ => H2Routed::Other { kind: frame.kind },
     }
@@ -382,7 +386,7 @@ pub fn quic_varint_len(value: u64) -> usize {
     }
 }
 
-/// The same varint written into a fixed buffer, so a frame header travels beside a payload that already has a home instead of staging it: the first byte carries the length tag and the value's top six bits, every later byte a whole eight, as `quic_varint` writes. The buffer may be any length; the value's width decides how many bytes it fills.
+/// The same varint written into a fixed buffer, so a frame header travels beside a payload that already has a home instead of staging it: the first byte carries the length tag and the value's top six bits, every later byte a whole eight, as `quic_varint` writes. The buffer must hold at least [`quic_varint_len`] of the value's bytes, exactly as many as are written.
 pub fn quic_varint_into(out: &mut [u8], value: u64) -> usize {
     // The four forms mirror `quic_varint` op for op — same width, same tag `or` — so the bytes are identical by construction, each one `to_be_bytes` plus a fixed copy instead of a value-sized byte loop; `the_fixed_buffer_varint_is_the_vec_one` reads them against each other at every width.
     match value {
@@ -451,19 +455,37 @@ pub struct H3Frame {
 
 #[must_use]
 pub fn h3_frame(bytes: &[u8], at: &mut usize) -> Option<H3Frame> {
-    Some(H3Frame {
-        kind: quic_read(bytes, at)?,
-        length: quic_read(bytes, at)?,
-    })
+    // Both fields are read through a local cursor: a header that fits only half of itself commits nothing, so a caller that retries with more bytes reads the frame from its start.
+    let mut next = *at;
+    let frame = H3Frame {
+        kind: quic_read(bytes, &mut next)?,
+        length: quic_read(bytes, &mut next)?,
+    };
+    *at = next;
+    Some(frame)
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum H3Event<'a> {
-    Headers { block: &'a [u8], end: bool },
-    Data { payload: &'a [u8], end: bool },
-    Reset { code: u64 },
-    GoAway { code: u64 },
-    Other { kind: u64 },
+    Headers {
+        block: &'a [u8],
+        end: bool,
+    },
+    Data {
+        payload: &'a [u8],
+        end: bool,
+    },
+    /// A GOAWAY's stream id: HTTP/3 carries an id, not an error code, and it is one QUIC varint.
+    GoAway {
+        id: u64,
+    },
+    /// A frame whose body does not carry the varint it names: a connection error, never a clean event.
+    Malformed {
+        kind: u64,
+    },
+    Other {
+        kind: u64,
+    },
 }
 
 #[must_use]
@@ -477,12 +499,14 @@ pub fn h3_event(frame: H3Frame, payload: &[u8]) -> H3Event<'_> {
             payload,
             end: false,
         },
-        H3_RESET => H3Event::Reset {
-            code: be64(payload),
-        },
-        H3_GOAWAY => H3Event::GoAway {
-            code: be64(payload),
-        },
+        // 0x03 is CANCEL_PUSH on the control stream; a request reset is QUIC stream state, not a frame.
+        H3_GOAWAY => {
+            let mut at = 0;
+            match quic_read(payload, &mut at) {
+                Some(id) => H3Event::GoAway { id },
+                None => H3Event::Malformed { kind: frame.kind },
+            }
+        }
         _ => H3Event::Other { kind: frame.kind },
     }
 }
@@ -649,31 +673,110 @@ mod tests {
         );
     }
 
-    /// The witness that an impossible pad hands over no payload yet still costs the window its whole body.
+    /// Padding comes off both ends, and a pad that cannot fit the frame is a connection error rather than an empty end of stream.
     #[test]
-    fn padding_comes_off_both_ends_and_an_impossible_pad_has_no_payload() {
+    fn padding_comes_off_both_ends_and_an_impossible_pad_is_malformed() {
         let (frame, raw) = frame_of(DATA, PADDED, 1, &[3, b'a', b'b', b'c', 9, 9, 9]);
         let H2Event::Data { payload, .. } = h2_event(frame, &raw[H2_HEADER..], 1) else {
             panic!("not data");
         };
         assert_eq!(payload, b"abc");
-        let (frame, raw) = frame_of(DATA, PADDED, 1, &[200]);
-        let H2Event::Data { payload, wire, .. } = h2_event(frame, &raw[H2_HEADER..], 1) else {
-            panic!("not data");
-        };
-        assert!(
-            payload.is_empty(),
-            "the pad byte names more than the frame holds"
+        let (frame, raw) = frame_of(DATA, PADDED | END_STREAM, 1, &[200]);
+        assert_eq!(
+            h2_event(frame, &raw[H2_HEADER..], 1),
+            H2Event::Malformed { kind: DATA },
+            "a pad that names more than the frame holds is not a clean end of stream"
         );
-        assert_eq!(wire, 1, "the octet still spent the window");
         let (frame, raw) = frame_of(DATA, PADDED, 1, &[]);
         assert_eq!(
             h2_event(frame, &raw[H2_HEADER..], 1),
-            H2Event::Data {
-                payload: &[],
-                end: false,
-                wire: 0
+            H2Event::Malformed { kind: DATA },
+            "a padded DATA frame with no pad byte is malformed"
+        );
+        assert_eq!(
+            h2_routed(frame, &raw[H2_HEADER..]),
+            H2Routed::Malformed { kind: DATA }
+        );
+    }
+
+    /// RFC 9113 §6.2: a PRIORITY HEADERS frame carries five bytes ahead of its block, and a prefix that does not fit is malformed rather than a block.
+    #[test]
+    fn a_headers_priority_prefix_is_not_a_header_block() {
+        let (frame, raw) = frame_of(HEADERS, PRIORITY | END_HEADERS, 1, &[0, 0, 0, 0, 16, 0x88]);
+        assert_eq!(
+            h2_event(frame, &raw[H2_HEADER..], 1),
+            H2Event::Headers {
+                block: &[0x88],
+                end: false
             }
+        );
+        assert_eq!(
+            h2_routed(frame, &raw[H2_HEADER..]),
+            H2Routed::Headers {
+                stream: 1,
+                block: &[0x88],
+                end: false,
+                end_headers: true
+            }
+        );
+        let (frame, raw) = frame_of(HEADERS, PRIORITY, 1, &[0, 0, 0, 0]);
+        assert_eq!(
+            h2_event(frame, &raw[H2_HEADER..], 1),
+            H2Event::Malformed { kind: HEADERS }
+        );
+        // Padding is stripped before the prefix is read.
+        let (frame, raw) = frame_of(
+            HEADERS,
+            PADDED | PRIORITY | END_HEADERS,
+            1,
+            &[2, 0, 0, 0, 0, 16, 0x88, 0, 0],
+        );
+        assert_eq!(
+            h2_event(frame, &raw[H2_HEADER..], 1),
+            H2Event::Headers {
+                block: &[0x88],
+                end: false
+            }
+        );
+    }
+
+    /// A flag bit that means padding on DATA is a different flag, or no flag, on every other type.
+    #[test]
+    fn padded_is_read_only_where_the_type_defines_it() {
+        let (frame, raw) = frame_of(PING, PADDED, 0, &[0, 1, 2, 3, 4, 5, 6, 7]);
+        let H2Event::Ping { payload, .. } = h2_event(frame, &raw[H2_HEADER..], 1) else {
+            panic!("not a ping");
+        };
+        assert_eq!(payload.len(), 8, "a PING keeps all eight bytes");
+        assert_eq!(payload, &[0, 1, 2, 3, 4, 5, 6, 7]);
+        let (frame, raw) = frame_of(SETTINGS, PADDED, 0, &[0, 1, 0, 2]);
+        let H2Event::Settings { payload, .. } = h2_event(frame, &raw[H2_HEADER..], 1) else {
+            panic!("not settings");
+        };
+        assert_eq!(payload, &[0, 1, 0, 2], "SETTINGS keeps its first byte");
+        let (frame, raw) = frame_of(CONTINUATION, PADDED, 1, &[3, b'a', b'b', b'c', 9, 9, 9]);
+        assert_eq!(
+            h2_routed(frame, &raw[H2_HEADER..]),
+            H2Routed::Continuation {
+                stream: 1,
+                block: &[3, b'a', b'b', b'c', 9, 9, 9],
+                end: false
+            },
+            "a CONTINUATION defines no padding"
+        );
+    }
+
+    /// RFC 9113 §6.8: GOAWAY is the last stream id, then the error code; the code is the second field.
+    #[test]
+    fn a_goaway_code_is_the_field_after_the_last_stream_id() {
+        let (frame, raw) = frame_of(GOAWAY, 0, 0, &[0, 0, 0, 3, 0, 0, 0, 0]);
+        assert_eq!(
+            h2_event(frame, &raw[H2_HEADER..], 1),
+            H2Event::GoAway { code: 0 }
+        );
+        assert_eq!(
+            h2_routed(frame, &raw[H2_HEADER..]),
+            H2Routed::GoAway { code: 0 }
         );
     }
 
@@ -710,7 +813,7 @@ mod tests {
             h2_event(frame, &raw[H2_HEADER..], 1),
             H2Event::Ping { ack: false, payload } if payload.len() == 8
         ));
-        let (frame, raw) = frame_of(GOAWAY, 0, 0, &[0, 0, 0, 2]);
+        let (frame, raw) = frame_of(GOAWAY, 0, 0, &[0, 0, 0, 0, 0, 0, 0, 2]);
         assert!(matches!(
             h2_event(frame, &raw[H2_HEADER..], 1),
             H2Event::GoAway { code: 2 }
@@ -903,18 +1006,37 @@ mod tests {
     }
 
     #[test]
-    fn an_http3_reset_goaway_and_data_are_read_and_a_push_is_not() {
+    fn an_http3_goaway_is_a_varint_id_and_a_push_is_not_a_reset() {
         let mut at = 0;
-        let frame = h3_frame(&[0x03, 0x04, 0, 0, 0, 0, 0, 0, 0, 9], &mut at).expect("reads");
-        assert_eq!(
-            h3_event(frame, &[0, 0, 0, 0, 0, 0, 0, 9]),
-            H3Event::Reset { code: 9 }
-        );
+        let frame = h3_frame(&[0x07, 0x01, 0x07], &mut at).expect("reads");
+        assert_eq!(h3_event(frame, &[0x07]), H3Event::GoAway { id: 7 });
         at = 0;
-        let frame = h3_frame(&[0x07, 0x08, 0, 0, 0, 0, 0, 0, 0, 7], &mut at).expect("reads");
+        let frame = h3_frame(&[0x07, 0x02, 0x40, 0x40], &mut at).expect("reads");
         assert_eq!(
-            h3_event(frame, &[0, 0, 0, 0, 0, 0, 0, 7]),
-            H3Event::GoAway { code: 7 }
+            h3_event(frame, &[0x40, 0x40]),
+            H3Event::GoAway { id: 64 },
+            "the length tag is not part of the id"
+        );
+        assert_eq!(
+            h3_event(
+                H3Frame {
+                    kind: H3_GOAWAY,
+                    length: 0
+                },
+                &[]
+            ),
+            H3Event::Malformed { kind: H3_GOAWAY }
+        );
+        // 0x03 is CANCEL_PUSH on the control stream; a request reset is QUIC stream state.
+        assert_eq!(
+            h3_event(
+                H3Frame {
+                    kind: H3_RESET,
+                    length: 0
+                },
+                &[]
+            ),
+            H3Event::Other { kind: H3_RESET }
         );
         assert_eq!(
             h3_event(
@@ -936,5 +1058,17 @@ mod tests {
             ),
             H3Event::Data { end: false, .. }
         ));
+    }
+
+    #[test]
+    fn a_truncated_http3_header_commits_no_cursor() {
+        let mut at = 0;
+        assert!(
+            h3_frame(&[0x01], &mut at).is_none(),
+            "the length is missing"
+        );
+        assert_eq!(at, 0, "a half-read header leaves the cursor at its start");
+        assert!(h3_frame(&[0x01, 0x04], &mut at).is_some());
+        assert_eq!(at, 2);
     }
 }

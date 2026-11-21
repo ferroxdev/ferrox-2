@@ -382,7 +382,13 @@ impl H3Reader {
                             ));
                         };
                         if !self.expect_request {
-                            self.content_length = hpack::qpack_content_length(payload);
+                            self.content_length =
+                                hpack::qpack_content_length(payload).map_err(|_| {
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        "h3 content-length is malformed",
+                                    )
+                                })?;
                         }
                         self.head = head;
                         self.status = status;
@@ -2131,11 +2137,11 @@ mod tests {
             counts.allocs, 0,
             "a response reader walks the fields without building them: {counts:?}"
         );
-        assert_eq!(hpack::qpack_content_length(&block), None);
+        assert_eq!(hpack::qpack_content_length(&block), Ok(None));
 
         let mut sized = Vec::new();
         hpack::qpack_literal_many(&[(":status", "200"), ("content-length", "10")], &mut sized);
-        assert_eq!(hpack::qpack_content_length(&sized), Some(10));
+        assert_eq!(hpack::qpack_content_length(&sized), Ok(Some(10)));
         assert_eq!(
             decode_head(&block, true),
             None,

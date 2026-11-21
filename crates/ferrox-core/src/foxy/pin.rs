@@ -132,7 +132,7 @@ impl Pins {
         if self.entries.is_empty() {
             return true;
         }
-        self.entries.contains(&digest(leaf_der).unwrap_or([0; 32]))
+        digest(leaf_der).is_some_and(|digest| self.entries.contains(&digest))
     }
 }
 
@@ -235,6 +235,20 @@ mod tests {
         assert!(Pins::parse_checked([good]).is_some());
         assert!(
             Pins::parse_checked(std::iter::empty::<String>()).is_some_and(|pins| pins.is_empty())
+        );
+    }
+
+    #[test]
+    fn an_unparseable_leaf_matches_no_pin() {
+        let zero = Pins::parse([format!("sha256/{}", crate::b64::encode(&[0u8; 32]))]);
+        assert_eq!(zero.len(), 1);
+        assert!(
+            !zero.holds(&[]),
+            "a leaf that yields no key is no match, not the all-zero digest"
+        );
+        assert!(
+            Pins::parse(std::iter::empty::<String>()).holds(&[]),
+            "an empty set still pins and refuses nothing"
         );
     }
 

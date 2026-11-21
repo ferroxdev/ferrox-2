@@ -289,14 +289,21 @@ pub fn line_end(bytes: &[u8]) -> Option<usize> {
 }
 
 pub fn connect_status(head: &[u8]) -> Result<u16, Failure> {
-    let line_end = head_end(head).ok_or(Failure::Frame)?;
-    let line = &head[..line_end];
+    let end = head_end(head).ok_or(Failure::Frame)?;
+    let first = line_end(head).ok_or(Failure::Frame)?;
+    if first > end {
+        return Err(Failure::Frame);
+    }
+    let line = &head[..first];
     let mut parts = line.split(|byte| *byte == b' ');
     let version = parts.next().ok_or(Failure::Frame)?;
-    if !version.starts_with(b"HTTP/1.") {
+    if version.len() != 8 || !version.starts_with(b"HTTP/1.") || !version[7].is_ascii_digit() {
         return Err(Failure::Frame);
     }
     let status = parts.next().ok_or(Failure::Frame)?;
+    if status.len() != 3 || !status.iter().all(u8::is_ascii_digit) {
+        return Err(Failure::Frame);
+    }
     let status = std::str::from_utf8(status).map_err(|_| Failure::Frame)?;
     status.parse::<u16>().map_err(|_| Failure::Frame)
 }
@@ -331,11 +338,14 @@ pub fn renewal_delay(expires_at: Option<u64>, now: u64) -> std::time::Duration {
     let Some(remaining) = expires_at.map(|at| at.saturating_sub(now)) else {
         return std::time::Duration::from_secs(UNKNOWN);
     };
-    let delay = (remaining / 2).min(remaining.saturating_sub(SAFETY));
-    std::time::Duration::from_secs(delay.clamp(FLOOR, CEILING))
+    let delay = (remaining / 2)
+        .min(remaining.saturating_sub(SAFETY))
+        .clamp(FLOOR, CEILING)
+        .min(remaining);
+    std::time::Duration::from_secs(delay)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Pass {
     /// The bearer the plane minted, shared rather than copied: a flow's dial clones the pass into every
     /// carrier it tries, and the token is the same bytes each time.
@@ -347,6 +357,18 @@ pub struct Pass {
     /// against, and the only way to tell a metered account from an unmetered one. `None` is not zero —
     /// a plane that names no ceiling has named no ceiling, not an empty one.
     pub quota_limit: Option<u64>,
+}
+
+impl std::fmt::Debug for Pass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pass")
+            .field("token", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .field("quota_remaining", &self.quota_remaining)
+            .field("quota_reset", &self.quota_reset)
+            .field("quota_limit", &self.quota_limit)
+            .finish()
+    }
 }
 
 impl Pass {
@@ -574,7 +596,7 @@ impl EdgeStrikes {
             .entries
             .iter()
             .any(|(known, _)| known.host.as_ref() == host && known.port == port);
-        if entry && !known && self.entries.len() >= self.cap {
+        if !known && self.entries.len() >= self.cap {
             // The entry that expires first is the one to drop: the window is the whole of what an entry says, so the earliest expiry is the oldest news.
             if let Some(at) = self
                 .entries
@@ -711,7 +733,7 @@ impl<'a> DialOrder<'a> {
         self.edges[..self.len]
             .iter()
             .flatten()
-            .any(|held| *held == edge)
+            .any(|held| held.host == edge.host && held.port == edge.port)
     }
 
     /// The edge at this place in the order, if the order reaches that far.
@@ -998,6 +1020,26 @@ mod tests {
         assert_eq!(connect_status(b"nonsense"), Err(Failure::Frame));
         assert_eq!(connect_status(b"HTTP/2 200\r\n\r\n"), Err(Failure::Frame));
         assert_eq!(connect_status(b"HTTP/1.1 abc\r\n\r\n"), Err(Failure::Frame));
+        assert_eq!(
+            connect_status(b"HTTP/1.1\r\nX-Note: 200 OK\r\n\r\n"),
+            Err(Failure::Frame),
+            "a code on the second line is not the status"
+        );
+        assert_eq!(
+            connect_status(b"HTTP/1.1 20\r\n\r\n"),
+            Err(Failure::Frame),
+            "a two-digit code"
+        );
+        assert_eq!(
+            connect_status(b"HTTP/1.1 2000\r\n\r\n"),
+            Err(Failure::Frame),
+            "a four-digit code"
+        );
+        assert_eq!(
+            connect_status(b"HTTP/1.1 200 OK\r\nX-Note: 500\r\n\r\n"),
+            Ok(200),
+            "the first line decides"
+        );
     }
 
     /// The lookup a refusal is read with: a name matched whichever way the edge spelled it, the value as it arrived with or without its space, and a marker that only appears inside another field's value is not the field.
@@ -1080,14 +1122,34 @@ mod tests {
         for (expires, now, want) in [
             (Some(1_000_u64), 0_u64, 500_u64),
             (Some(1_000), 400, 300),
-            (Some(100), 90, 15),
+            (Some(100), 90, 10),
             (None, 0, 240),
             (Some(1_000_000), 0, 1_800),
-            (Some(10), 10, 15),
+            (Some(10), 10, 0),
             (Some(20), 0, 15),
+            (Some(29), 0, 15),
         ] {
             assert_eq!(renewal_delay(expires, now).as_secs(), want, "at {now}");
+            let remaining = expires.map_or(u64::MAX, |at| at.saturating_sub(now));
+            assert!(
+                renewal_delay(expires, now).as_secs() <= remaining,
+                "a renewal is never scheduled after the pass it replaces expires"
+            );
         }
+    }
+
+    #[test]
+    fn a_pass_never_writes_its_bearer() {
+        let pass = Pass {
+            token: std::sync::Arc::from("live-secret"),
+            expires_at: None,
+            quota_remaining: None,
+            quota_reset: None,
+            quota_limit: None,
+        };
+        let text = format!("{pass:?}");
+        assert!(!text.contains("live-secret"), "{text}");
+        assert!(text.contains("<redacted>"), "{text}");
     }
 
     #[test]
@@ -1175,18 +1237,36 @@ mod tests {
     /// The strike lookup takes the edge's own name, so a caller that already holds it asks without copying it: the joined key this replaced cost one allocation and a hash of the joined bytes per lookup, and the lookup is on the dial path, once per edge per flow.
     #[test]
     fn an_edge_strike_lookup_allocates_nothing() {
+        use std::time::Duration;
         let mut strikes = EdgeStrikes::new(8);
-        strikes.note_end("edge.example", 2499, TUNNEL_STAYED_UP, 100);
+        let short = TUNNEL_STAYED_UP.saturating_sub(Duration::from_secs(1));
+        strikes.note_end("edge.example", 2499, short, 100);
+        strikes.note_end("edge.example", 2499, short, 100);
         let host = String::from("edge.example");
         let ((), counts) = crate::alloc_count::measure(|| {
             for _ in 0..4096 {
-                assert!(!strikes.resting(&host, 2499, 100));
+                assert!(strikes.resting(&host, 2499, 100));
             }
         });
         assert_eq!(
             counts.allocs, 0,
             "the lookup copies nothing: the name is the caller's own"
         );
+    }
+
+    #[test]
+    fn a_new_edge_never_grows_the_strike_cache_past_its_cap() {
+        use std::time::Duration;
+        let short = TUNNEL_STAYED_UP.saturating_sub(Duration::from_secs(1));
+        let mut strikes = EdgeStrikes::new(1);
+        strikes.note_end("a", 443, short, 100);
+        strikes.note_end("b", 443, short, 100);
+        assert_eq!(
+            strikes.entries.len(),
+            1,
+            "a second new key evicts, not joins"
+        );
+        assert!(!strikes.resting("a", 443, 100));
     }
 
     /// Two quick ends rest the edge for the window; a third carrier that carried traffic for its length frees the entry instead of adding a strike.
@@ -1230,6 +1310,21 @@ mod tests {
             country: country.to_owned(),
             city: city.to_owned(),
         }
+    }
+
+    #[test]
+    fn a_dial_order_holds_one_edge_per_host_and_port() {
+        let edges = vec![
+            edge("de1", "DE", "berlin"),
+            edge("de1", "DE", "frankfurt"),
+            edge("de1", "DE", "berlin"),
+        ];
+        let order = dial_order(&edges, "DE", None, 3);
+        assert_eq!(
+            order.iter().map(Candidate::authority).collect::<Vec<_>>(),
+            ["de1:443"],
+            "a city label is not a second endpoint"
+        );
     }
 
     #[test]

@@ -77,8 +77,15 @@ impl Route {
     }
 }
 
+/// The protocol a CONNECT-IP target is scoped to (RFC 9484 §3.2): a number in `0..=255`, or [`IpProto::Any`] for `*`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpProto {
+    Number(u8),
+    Any,
+}
+
 /// The default URI template's path for one target (RFC 9484 §3.2): only a colon is encoded, since of a DNS name, an IPv4 literal and an IPv6 literal only the last uses one.
-pub fn ip_path(host: &str, port: u16, out: &mut Vec<u8>) {
+pub fn ip_path(host: &str, proto: IpProto, out: &mut Vec<u8>) {
     out.extend_from_slice(PREFIX);
     for byte in host.bytes() {
         if byte == b':' {
@@ -88,30 +95,36 @@ pub fn ip_path(host: &str, port: u16, out: &mut Vec<u8>) {
         }
     }
     out.push(b'/');
-    push_port(out, port);
+    match proto {
+        IpProto::Any => out.push(b'*'),
+        IpProto::Number(number) => push_number(out, u16::from(number)),
+    }
     out.push(b'/');
 }
 
 /// The path's length, which a field line names before writing it: HTTP/2 and QPACK write a field's length ahead of its bytes, so staging the path first would spend a buffer per connection.
-fn ip_path_len(host: &str, port: u16) -> usize {
+fn ip_path_len(host: &str, proto: IpProto) -> usize {
     PREFIX.len()
         + host.len()
         + 2 * host.bytes().filter(|byte| *byte == b':').count()
         + 1
-        + decimal_len(port)
+        + match proto {
+            IpProto::Any => 1,
+            IpProto::Number(number) => decimal_len(u16::from(number)),
+        }
         + 1
 }
 
-/// The port's digits, written lowest first into the end of the buffer: a division per digit is the whole cost, where a `format!` here is an allocation per path.
-fn push_port(out: &mut Vec<u8>, port: u16) {
-    let mut port = port;
+/// A decimal number's digits, written lowest first into the end of the buffer: a division per digit is the whole cost, where a `format!` here is an allocation per path.
+fn push_number(out: &mut Vec<u8>, number: u16) {
+    let mut number = number;
     let mut digits = [0u8; 5];
     let mut at = digits.len();
     loop {
         at -= 1;
-        digits[at] = b'0' + (port % 10) as u8;
-        port /= 10;
-        if port == 0 {
+        digits[at] = b'0' + (number % 10) as u8;
+        number /= 10;
+        if number == 0 {
             break;
         }
     }
@@ -139,31 +152,40 @@ fn field(out: &mut Vec<u8>, name: &[u8], value: &[u8]) {
 
 /// The same field line under QPACK's `001` pattern: the never-indexed bit set and a three-bit name prefix continuing into the following bytes.
 fn qpack_field(out: &mut Vec<u8>, name: &[u8], value: &[u8]) {
-    out.push(0x20);
+    out.push(0x30);
     integer_into(out, 3, name.len());
     out.extend_from_slice(name);
     integer(out, 7, 0x00, value.len());
     out.extend_from_slice(value);
 }
 
+/// The same line for a caller-supplied name, lowercased in place as RFC 9114 requires: a name above `a` is malformed on the wire, so the encoder never spells one.
+fn qpack_field_lower(out: &mut Vec<u8>, name: &[u8], value: &[u8]) {
+    out.push(0x30);
+    integer_into(out, 3, name.len());
+    out.extend(name.iter().map(u8::to_ascii_lowercase));
+    integer(out, 7, 0x00, value.len());
+    out.extend_from_slice(value);
+}
+
 /// The `:path` field line for one target, in either codec's own spelling: its length is known before the path is written, so the path never sits in a buffer of its own.
-fn path_field(out: &mut Vec<u8>, host: &str, port: u16, qpack: bool) {
+fn path_field(out: &mut Vec<u8>, host: &str, proto: IpProto, qpack: bool) {
     if qpack {
-        out.push(0x20);
+        out.push(0x30);
         integer_into(out, 3, 5);
     } else {
         out.push(0x00);
         integer(out, 7, 0x00, 5);
     }
     out.extend_from_slice(b":path");
-    integer(out, 7, 0x00, ip_path_len(host, port));
-    ip_path(host, port, out);
+    integer(out, 7, 0x00, ip_path_len(host, proto));
+    ip_path(host, proto, out);
 }
 
 /// The authorization field line, whose value is the pass behind the scheme: one length covers both halves and the bytes follow in place, because a `Bearer ` and a token are never more than a concatenation.
 fn bearer_field(out: &mut Vec<u8>, bearer: &str, qpack: bool) {
     if qpack {
-        out.push(0x20);
+        out.push(0x30);
         integer_into(out, 3, b"proxy-authorization".len());
     } else {
         out.push(0x00);
@@ -176,12 +198,18 @@ fn bearer_field(out: &mut Vec<u8>, bearer: &str, qpack: bool) {
 }
 
 /// One CONNECT-IP request over HTTP/2 (RFC 9484 §3.2): the `:protocol` naming the IP proxy rather than the UDP one, the template, the pass, and the capsule protocol the rest of the stream is written in.
-pub fn connect_ip(edge_authority: &str, host: &str, port: u16, bearer: &str, out: &mut Vec<u8>) {
+pub fn connect_ip(
+    edge_authority: &str,
+    host: &str,
+    proto: IpProto,
+    bearer: &str,
+    out: &mut Vec<u8>,
+) {
     field(out, b":method", b"CONNECT");
     field(out, b":protocol", b"connect-ip");
     field(out, b":scheme", b"https");
     field(out, b":authority", edge_authority.as_bytes());
-    path_field(out, host, port, false);
+    path_field(out, host, proto, false);
     bearer_field(out, bearer, false);
     field(out, b"capsule-protocol", b"?1");
 }
@@ -190,7 +218,7 @@ pub fn connect_ip(edge_authority: &str, host: &str, port: u16, bearer: &str, out
 pub fn connect_ip_qpack(
     edge_authority: &str,
     host: &str,
-    port: u16,
+    proto: IpProto,
     bearer: &str,
     out: &mut Vec<u8>,
 ) {
@@ -199,7 +227,7 @@ pub fn connect_ip_qpack(
     qpack_field(out, b":protocol", b"connect-ip");
     qpack_field(out, b":scheme", b"https");
     qpack_field(out, b":authority", edge_authority.as_bytes());
-    path_field(out, host, port, true);
+    path_field(out, host, proto, true);
     bearer_field(out, bearer, true);
     qpack_field(out, b"capsule-protocol", b"?1");
 }
@@ -231,7 +259,7 @@ pub fn connect_ip_qpack_named_protocol(
     qpack_field(out, b":authority", authority.as_bytes());
     qpack_field(out, b":path", path.as_bytes());
     for (name, value) in headers {
-        qpack_field(out, name.as_bytes(), value.as_bytes());
+        qpack_field_lower(out, name.as_bytes(), value.as_bytes());
     }
     qpack_field(out, b"capsule-protocol", b"?1");
 }
@@ -259,8 +287,18 @@ pub fn address_request(id: u64, version: u8, address: &[u8], out: &mut Vec<u8>) 
     address_requests(&[(id, version, address)], out);
 }
 
-/// One `ADDRESS_REQUEST` capsule naming every address a client wants, which is how the reference asks for both families at once: a proxy replaces the peer's allowed sources with each answer, so a second request would leave the first family unroutable.
+/// One `ADDRESS_REQUEST` capsule naming every address a client wants, which is how the reference asks for both families at once: a proxy replaces the peer's allowed sources with each answer, so a second request would leave the first family unroutable. An empty batch, a zero request id or an address whose width disagrees with its version is refused before any bytes are written.
 pub fn address_requests(entries: &[(u64, u8, &[u8])], out: &mut Vec<u8>) {
+    let valid = !entries.is_empty()
+        && entries
+            .iter()
+            .all(|(id, version, address)| match (version, address.len()) {
+                (4, 4) | (6, 16) => *id != 0,
+                _ => false,
+            });
+    if !valid {
+        return;
+    }
     let length: usize = entries
         .iter()
         .map(|(id, _, address)| quic_varint_len(*id) + 1 + address.len() + 1)
@@ -390,7 +428,7 @@ pub fn capsule_split_bare(buf: &[u8]) -> Option<(usize, Capsule<'_>)> {
     ))
 }
 
-/// The addresses one `ADDRESS_ASSIGN` capsule grants (RFC 9484 §4.2): host bits above the prefix are *not* required to be zero — a proxy hands out a `/64` and `2001:db8::1` inside it is the tunnel's address — while a request must zero them, which this lane's all-zeros-at-full-length request does by construction.
+/// The addresses one `ADDRESS_ASSIGN` capsule grants (RFC 9484 §4.2): an address whose prefix is shorter than its width must leave the low bits zero, which this decoder enforces because a conforming peer would treat the entry as malformed. An all-zero address at full length is a refusal.
 pub fn address_assign(body: &[u8], into: &mut Vec<Assigned>) -> Option<()> {
     into.clear();
     let mut at = 0usize;
@@ -408,7 +446,7 @@ pub fn address_assign(body: &[u8], into: &mut Vec<Assigned>) -> Option<()> {
         at += width;
         let prefix = *body.get(at)?;
         at += 1;
-        if usize::from(prefix) > width * 8 {
+        if usize::from(prefix) > width * 8 || !host_bits_clear(&address[..width], prefix) {
             return None;
         }
         into.push(Assigned {
@@ -421,7 +459,63 @@ pub fn address_assign(body: &[u8], into: &mut Vec<Assigned>) -> Option<()> {
     Some(())
 }
 
-/// The routes one `ROUTE_ADVERTISEMENT` capsule names, RFC 9484 §4.3.
+/// Whether every bit past the prefix is zero, as RFC 9484 §4.2 requires of an assignment narrower than its address.
+fn host_bits_clear(address: &[u8], prefix: u8) -> bool {
+    let prefix = usize::from(prefix);
+    let full = prefix / 8;
+    let rem = prefix % 8;
+    if rem != 0 && address[full] & (0xffu8 >> rem) != 0 {
+        return false;
+    }
+    let rest = full + usize::from(rem != 0);
+    address[rest..].iter().all(|byte| *byte == 0)
+}
+
+/// Zeroes the bits an assignment's prefix does not cover, so the writer never emits a noncanonical address.
+fn mask_host_bits(address: &mut [u8], prefix: u8) {
+    let prefix = usize::from(prefix);
+    let full = prefix / 8;
+    let rem = prefix % 8;
+    if rem != 0 && full < address.len() {
+        address[full] &= 0xffu8 << (8 - rem);
+        for byte in &mut address[full + 1..] {
+            *byte = 0;
+        }
+        return;
+    }
+    let start = full.min(address.len());
+    for byte in &mut address[start..] {
+        *byte = 0;
+    }
+}
+
+/// Whether a snapshot is in the order RFC 9484 §4.3 requires: versions then protocols ascending, and no overlap within one version and protocol, where an empty snapshot is valid.
+fn route_order_ok(routes: &[Route]) -> bool {
+    let mut previous: Option<&Route> = None;
+    for route in routes {
+        let width = route.width();
+        if route.first[..width] > route.last[..width] {
+            return false;
+        }
+        if let Some(prev) = previous {
+            if route.version < prev.version {
+                return false;
+            }
+            if route.version == prev.version {
+                if route.protocol < prev.protocol {
+                    return false;
+                }
+                if route.protocol == prev.protocol && prev.last[..width] >= route.first[..width] {
+                    return false;
+                }
+            }
+        }
+        previous = Some(route);
+    }
+    true
+}
+
+/// The routes one `ROUTE_ADVERTISEMENT` capsule names, RFC 9484 §4.3: an out-of-order snapshot, a range whose start is past its end, or two same-version same-protocol ranges that touch make the stream malformed.
 pub fn route_advert(body: &[u8], into: &mut Vec<Route>) -> Option<()> {
     into.clear();
     let mut at = 0usize;
@@ -448,6 +542,10 @@ pub fn route_advert(body: &[u8], into: &mut Vec<Route>) -> Option<()> {
             protocol,
         });
     }
+    if !route_order_ok(into) {
+        into.clear();
+        return None;
+    }
     Some(())
 }
 
@@ -461,13 +559,18 @@ pub fn address_assign_encode(assignments: &[Assigned], out: &mut Vec<u8>) {
     for a in assignments {
         quic_varint(out, a.request_id);
         out.push(a.version);
-        out.extend_from_slice(&a.address[..a.width()]);
+        let mut address = a.address;
+        mask_host_bits(&mut address[..a.width()], a.prefix);
+        out.extend_from_slice(&address[..a.width()]);
         out.push(a.prefix);
     }
 }
 
-/// The `ROUTE_ADVERTISEMENT` capsule a proxy names its carried ranges with (RFC 9484 §4.3): the exact inverse of [`route_advert`], one whole capsule of first, last and protocol per route.
+/// The `ROUTE_ADVERTISEMENT` capsule a proxy names its carried ranges with (RFC 9484 §4.3): the exact inverse of [`route_advert`], one whole capsule of first, last and protocol per route. A snapshot out of order, reversed or overlapping is refused rather than written as bytes a peer must abort on.
 pub fn route_advert_encode(routes: &[Route], out: &mut Vec<u8>) {
+    if !route_order_ok(routes) {
+        return;
+    }
     let body_len = routes.iter().fold(0usize, |acc, r| acc + 2 + 2 * r.width());
     quic_varint(out, ROUTE_ADVERTISEMENT);
     quic_varint(out, body_len as u64);
@@ -489,6 +592,8 @@ pub struct Ipv4Head {
     pub protocol: u8,
     /// Time to live, which a hop decrements and a zero refuses.
     pub hop: u8,
+    /// The flags and fragment offset, where a non-zero bit below the reserved flag means the body is not a whole transport segment.
+    pub fragment: u16,
     pub source: [u8; 4],
     pub destination: [u8; 4],
 }
@@ -543,6 +648,7 @@ pub fn ipv4_head(packet: &[u8]) -> Option<(Ipv4Head, &[u8])> {
             length,
             protocol: *packet.get(9)?,
             hop: *packet.get(8)?,
+            fragment: u16::from_be_bytes([*packet.get(6)?, *packet.get(7)?]),
             source,
             destination,
         },
@@ -849,7 +955,10 @@ pub fn icmp_too_large(packet: &[u8], mtu: usize) -> Option<Vec<u8>> {
                 return None;
             }
             let header = usize::from(packet[0] & 0x0f) * 4;
-            let data = &packet[..packet.len().min(header.max(IPV4_HEADER) + 8)];
+            if header < IPV4_HEADER || header > packet.len() {
+                return None;
+            }
+            let data = &packet[..packet.len().min(header + 8)];
             let mtu = u16::try_from(mtu).ok()?;
             let mut message = vec![
                 ICMP_DESTINATION_UNREACHABLE,
@@ -933,6 +1042,9 @@ pub fn icmp_echo_reply(
     }
     match (source, destination) {
         (IpAddr::V4(source), IpAddr::V4(destination)) => {
+            if checksum(message) != 0 {
+                return false;
+            }
             let Ok(total) = u16::try_from(IPV4_HEADER + message.len()) else {
                 return false;
             };
@@ -957,6 +1069,15 @@ pub fn icmp_echo_reply(
             true
         }
         (IpAddr::V6(source), IpAddr::V6(destination)) => {
+            if pseudo_checksum(
+                &source.octets(),
+                &destination.octets(),
+                ICMPV6_PROTOCOL,
+                message,
+            ) != 0
+            {
+                return false;
+            }
             let Ok(payload) = u16::try_from(message.len()) else {
                 return false;
             };
@@ -999,8 +1120,8 @@ fn checksum_holds(
     optional: bool,
 ) -> Option<bool> {
     let field = u16::from_be_bytes([*datagram.get(6)?, *datagram.get(7)?]);
-    if field == 0 && optional {
-        return Some(true);
+    if field == 0 {
+        return Some(optional);
     }
     let mut sum = pseudo_sum(source, destination, datagram.len() - UDP_HEADER);
     sum = (sum & 0xffff) + (sum >> 16);
@@ -1091,7 +1212,7 @@ pub fn udp_from_packet(packet: &[u8]) -> Option<Datagram<'_>> {
     let (source, destination, body, optional) = match packet.first()? >> 4 {
         4 => {
             let (head, body) = ipv4_head(packet)?;
-            if head.protocol != PROTOCOL_UDP {
+            if head.protocol != PROTOCOL_UDP || head.fragment & 0x3fff != 0 {
                 return None;
             }
             (&packet[12..16], &packet[16..20], body, true)
@@ -1170,6 +1291,22 @@ mod tests {
         assert_eq!(request(1, 4, &V4).len(), 9, "one family keeps its bytes");
     }
 
+    #[test]
+    fn an_invalid_request_batch_is_refused_before_any_bytes() {
+        type Case<'a> = (&'a str, Vec<(u64, u8, &'a [u8])>);
+        let cases: [Case<'_>; 4] = [
+            ("an empty batch", Vec::new()),
+            ("a zero request id", vec![(0, 4, &V4[..])]),
+            ("a v4 request of v6 width", vec![(1, 4, &V6[..])]),
+            ("a v6 request of v4 width", vec![(1, 6, &V4[..])]),
+        ];
+        for (label, entries) in cases {
+            let mut out = b"kept".to_vec();
+            address_requests(&entries, &mut out);
+            assert_eq!(out, b"kept", "{label} writes nothing");
+        }
+    }
+
     /// The all-zeros prefix at full length is how a proxy refuses, and the reader has to say so rather than hand the lane a tunnel address of zero.
     #[test]
     fn a_refused_assignment_is_named_and_a_granted_one_is_not() {
@@ -1184,29 +1321,33 @@ mod tests {
         );
     }
 
-    /// Host bits above an assignment's prefix are the tunnel's own address, so they read as granted: a proxy hands out a `/64` with an address inside it, and refusing that would leave the lane with no address; a prefix past the address is still refused at either version.
+    /// RFC 9484 §4.2 requires the bits below an assignment's prefix to be zero, so a `/64` whose host bits name an address is malformed rather than a grant of that host; the canonical form still grants, and a prefix past the address is refused at either version.
     #[test]
-    fn the_host_bits_of_an_assignment_are_the_tunnels_own_address() {
+    fn the_host_bits_of_an_assignment_are_not_the_tunnels_own_address() {
         let granted = assign(
             1,
             6,
-            &[0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            &[0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             64,
         )
         .expect("a /64 grant parses");
         assert_eq!(granted.len(), 1);
-        assert!(
-            !granted[0].refused(),
-            "an address inside its prefix is a grant"
-        );
+        assert!(!granted[0].refused(), "a real address is a grant");
         assert_eq!(granted[0].prefix, 64);
-        assert_eq!(granted[0].bytes().last(), Some(&1));
+        assert_eq!(granted[0].bytes()[..8], [0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0]);
+        let mut host_bits = [0u8; 16];
+        host_bits[..8].copy_from_slice(&[0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0]);
+        host_bits[15] = 1;
+        assert!(
+            assign(1, 6, &host_bits, 64).is_none(),
+            "host bits below the prefix are refused, not adopted"
+        );
         assert!(assign(1, 4, &[10, 0, 0, 1], 33).is_none(), "33 bits of v4");
         assert!(
             assign(
                 1,
                 6,
-                &[0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                &[0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
                 129
             )
             .is_none(),
@@ -1302,10 +1443,31 @@ mod tests {
         let wide64 = [assigned(
             2,
             6,
+            &[0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            64,
+        )];
+        assert_eq!(read_back(&wide64), wide64.to_vec(), "a canonical /64");
+        let host_bits = [assigned(
+            2,
+            6,
             &[0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
             64,
         )];
-        assert_eq!(read_back(&wide64), wide64.to_vec(), "host bits above a /64");
+        assert_eq!(
+            read_back(&host_bits),
+            wide64.to_vec(),
+            "host bits below a /64 are zeroed before they reach the wire"
+        );
+        let mut raws = Vec::new();
+        quic_varint(&mut raws, 2);
+        raws.push(6);
+        raws.extend_from_slice(&[0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        raws.push(64);
+        assert_eq!(
+            address_assign(&raws, &mut Vec::new()),
+            None,
+            "a peer sending host bits below the prefix is refused"
+        );
         let refused = [assigned(3, 4, &[0, 0, 0, 0], 32)];
         assert!(
             read_back(&refused)[0].refused(),
@@ -1319,11 +1481,11 @@ mod tests {
         )];
         assert_eq!(read_back(&big_id), big_id.to_vec(), "a two-byte request id");
         let both = [
-            assigned(1, 4, &[10, 0, 0, 1], 24),
+            assigned(1, 4, &[10, 0, 0, 0], 24),
             assigned(
                 2,
                 6,
-                &[0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3],
+                &[0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
                 64,
             ),
         ];
@@ -1383,6 +1545,77 @@ mod tests {
         route_advert_encode(&[], &mut empty);
         assert_eq!(empty, [0x03, 0x00], "an empty advert names a zero body");
         assert_eq!(read_back(&[]), [] as [Route; 0]);
+    }
+
+    /// A body the reader walks, built without the writer's order check so a malformed snapshot can be aimed at it.
+    fn route_body(routes: &[Route]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for route in routes {
+            let width = route.width();
+            body.push(route.version);
+            body.extend_from_slice(&route.first[..width]);
+            body.extend_from_slice(&route.last[..width]);
+            body.push(route.protocol);
+        }
+        body
+    }
+
+    /// The snapshot's order is part of the wire format, so both sides enforce it: the writer emits nothing for a snapshot a peer would abort on, and the reader refuses the same body.
+    #[test]
+    fn an_out_of_order_or_overlapping_route_snapshot_is_refused() {
+        let v6_then_v4 = [
+            route(
+                6,
+                &[0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                &[0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255],
+                0,
+            ),
+            route(4, &[10, 0, 0, 0], &[10, 0, 0, 255], 0),
+        ];
+        let mut wire = Vec::new();
+        route_advert_encode(&v6_then_v4, &mut wire);
+        assert!(
+            wire.is_empty(),
+            "the writer refuses an out-of-order snapshot"
+        );
+        assert_eq!(
+            route_advert(&route_body(&v6_then_v4), &mut Vec::new()),
+            None
+        );
+
+        let reversed = [route(4, &[10, 0, 0, 5], &[10, 0, 0, 4], 0)];
+        assert_eq!(route_advert(&route_body(&reversed), &mut Vec::new()), None);
+        let mut wire = Vec::new();
+        route_advert_encode(&reversed, &mut wire);
+        assert!(wire.is_empty(), "a range past its end is refused");
+
+        let touching = [
+            route(4, &[10, 0, 0, 0], &[10, 0, 0, 9], 0),
+            route(4, &[10, 0, 0, 9], &[10, 0, 0, 20], 0),
+        ];
+        assert_eq!(
+            route_advert(&route_body(&touching), &mut Vec::new()),
+            None,
+            "ranges sharing an endpoint overlap"
+        );
+        let disjoint = [
+            route(4, &[10, 0, 0, 0], &[10, 0, 0, 9], 0),
+            route(4, &[10, 0, 0, 10], &[10, 0, 0, 20], 0),
+        ];
+        assert_eq!(
+            route_advert(&route_body(&disjoint), &mut Vec::new()),
+            Some(())
+        );
+
+        let protocol_down = [
+            route(4, &[10, 0, 0, 0], &[10, 0, 0, 9], 17),
+            route(4, &[10, 0, 1, 0], &[10, 0, 1, 9], 0),
+        ];
+        assert_eq!(
+            route_advert(&route_body(&protocol_down), &mut Vec::new()),
+            None,
+            "protocols within one version ascend"
+        );
     }
 
     /// A capsule this lane does not read is answered whole and stepping over it is the caller's, so a proxy advertising an extension must not cost the tunnel its packets.
@@ -2085,6 +2318,24 @@ mod tests {
             udp_from_packet(&packet).is_none(),
             "a TCP packet is not a datagram"
         );
+        packet[9] = PROTOCOL_UDP;
+        packet[6] = 0x20;
+        assert!(
+            udp_from_packet(&packet).is_none(),
+            "a more-fragments packet is not a whole datagram"
+        );
+        packet[6] = 0x00;
+        packet[7] = 0x08;
+        assert!(
+            udp_from_packet(&packet).is_none(),
+            "a nonzero fragment offset is not the start of a datagram"
+        );
+        packet[7] = 0x00;
+        packet[6] = 0x40;
+        assert!(
+            udp_from_packet(&packet).is_some(),
+            "don't-fragment alone still names a whole datagram"
+        );
         assert!(udp_from_packet(b"").is_none());
         assert!(
             udp_from_packet(b"\x45").is_none(),
@@ -2096,16 +2347,28 @@ mod tests {
     #[test]
     fn both_carriers_carry_the_same_connect_ip_request() {
         let mut h2 = Vec::new();
-        connect_ip("edge.example:2499", "example.com", 443, "the-pass", &mut h2);
+        connect_ip(
+            "edge.example:2499",
+            "example.com",
+            IpProto::Number(17),
+            "the-pass",
+            &mut h2,
+        );
         let mut q3 = Vec::new();
-        connect_ip_qpack("edge.example:2499", "example.com", 443, "the-pass", &mut q3);
+        connect_ip_qpack(
+            "edge.example:2499",
+            "example.com",
+            IpProto::Number(17),
+            "the-pass",
+            &mut q3,
+        );
         let text = String::from_utf8_lossy(&h2);
         for field in [
             "CONNECT",
             "connect-ip",
             "https",
             "edge.example:2499",
-            "/.well-known/masque/ip/example.com/443/",
+            "/.well-known/masque/ip/example.com/17/",
             "Bearer the-pass",
             "capsule-protocol",
             "?1",
@@ -2116,16 +2379,53 @@ mod tests {
         for field in [
             "CONNECT",
             "connect-ip",
-            "/.well-known/masque/ip/example.com/443/",
+            "/.well-known/masque/ip/example.com/17/",
             "Bearer the-pass",
         ] {
             assert!(text.contains(field), "qp3 is missing {field}");
         }
+        let mut any = Vec::new();
+        ip_path("example.com", IpProto::Any, &mut any);
+        assert_eq!(
+            any, b"/.well-known/masque/ip/example.com/*/",
+            "an unscoped target names every protocol"
+        );
+        assert_eq!(any.len(), ip_path_len("example.com", IpProto::Any));
+        assert_eq!(
+            h2.windows(b"/17/".len())
+                .filter(|run| *run == b"/17/")
+                .count(),
+            1,
+            "the protocol rides the path once, not as a port twice"
+        );
         assert_eq!(super::super::hpack::hpack_status(&h2), None);
         assert_eq!(
             super::super::hpack::qpack_status(&q3),
             None,
             "a request carries no status"
+        );
+    }
+
+    #[test]
+    fn a_caller_header_name_reaches_the_wire_lowercased_and_never_indexed() {
+        let mut line = Vec::new();
+        qpack_field_lower(&mut line, b"X", b"v");
+        assert_eq!(line[0], 0x31, "the 001 pattern, N set, a one-byte name");
+        assert_eq!(&line[1..2], b"x");
+        let mut block = Vec::new();
+        connect_ip_qpack_named_protocol(
+            "edge.example:2499",
+            "/.well-known/masque/ip/*/*/",
+            b"connect-ip",
+            &[("User-Agent".to_string(), "ferrox".to_string())],
+            &mut block,
+        );
+        let fields = super::super::hpack::qpack_fields(&block).expect("reads");
+        assert!(
+            fields
+                .iter()
+                .any(|(name, value)| name == b"user-agent" && value == b"ferrox"),
+            "the name is lowercase on the wire"
         );
     }
 
@@ -2234,11 +2534,23 @@ mod tests {
             icmp_too_large(&[0x55; 40], 1280).is_none(),
             "not an IP version"
         );
+        let mut truncated = [0u8; IPV4_HEADER];
+        truncated[0] = 0x46;
+        assert!(
+            icmp_too_large(&truncated, 1170).is_none(),
+            "a 24-byte header in a 20-byte packet is not all there"
+        );
+        let mut headerless = [0u8; IPV4_HEADER];
+        headerless[0] = 0x40;
+        assert!(
+            icmp_too_large(&headerless, 1170).is_none(),
+            "an IHL below five"
+        );
     }
 
     #[test]
     fn an_echo_request_is_answered_at_both_families() {
-        let request = [
+        let mut request = [
             ICMP_ECHO_REQUEST,
             0,
             0,
@@ -2252,6 +2564,8 @@ mod tests {
             b'n',
             b'g',
         ];
+        let sum = checksum(&request);
+        request[2..4].copy_from_slice(&sum.to_be_bytes());
         let mut answer = Vec::new();
         assert!(icmp_echo_reply(
             "10.13.0.2".parse().expect("a v4 source"),
@@ -2274,6 +2588,8 @@ mod tests {
         let destination6 = [0xfd, 0x13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         let mut request = vec![ICMPV6_ECHO_REQUEST, 0, 0, 0, 0x12, 0x34, 0, 7];
         request.extend_from_slice(b"ping");
+        let sum = pseudo_checksum(&source6, &destination6, ICMPV6_PROTOCOL, &request);
+        request[2..4].copy_from_slice(&sum.to_be_bytes());
         let mut answer = Vec::new();
         assert!(icmp_echo_reply(
             source6.into(),
@@ -2308,10 +2624,15 @@ mod tests {
     fn a_message_that_is_not_an_echo_request_leaves_the_buffer_alone() {
         let mut answer = b"kept".to_vec();
         let base = answer.as_ptr();
-        let refused: [(&[u8], &str); 3] = [
+        let mut corrupt = [ICMP_ECHO_REQUEST, 0, 0x12, 0x34, 0x12, 0x34, 0, 7];
+        let sum = checksum(&corrupt);
+        corrupt[2..4].copy_from_slice(&sum.to_be_bytes());
+        corrupt[3] ^= 0x01;
+        let refused: [(&[u8], &str); 4] = [
             (&[ICMP_ECHO_REPLY, 0, 0, 0, 0, 0, 0, 0], "10.13.0.1"),
             (&[ICMP_ECHO_REQUEST, 3, 0, 0, 0, 0, 0, 0], "10.13.0.1"),
             (&[ICMP_ECHO_REQUEST, 0, 0, 0], "10.13.0.1"),
+            (&corrupt, "10.13.0.1"),
         ];
         for (message, destination) in refused {
             assert!(!icmp_echo_reply(

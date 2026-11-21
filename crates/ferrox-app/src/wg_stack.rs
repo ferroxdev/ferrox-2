@@ -4117,6 +4117,8 @@ mod tests {
         packet[16..20].copy_from_slice(&destination);
         packet[IPV4_HEADER] = 8;
         packet[IPV4_HEADER + 8..].copy_from_slice(payload);
+        let sum = checksum(&packet[IPV4_HEADER..]);
+        packet[IPV4_HEADER + 2..IPV4_HEADER + 4].copy_from_slice(&sum.to_be_bytes());
         packet
     }
 
@@ -4131,6 +4133,14 @@ mod tests {
         packet[24..40].copy_from_slice(&destination);
         packet[IPV6_HEADER] = 128;
         packet[IPV6_HEADER + 8..].copy_from_slice(payload);
+        let mut covered = Vec::with_capacity(40 + 8 + payload.len());
+        covered.extend_from_slice(&source);
+        covered.extend_from_slice(&destination);
+        covered.extend_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
+        covered.extend_from_slice(&[0, 0, 0, PROTOCOL_ICMPV6]);
+        covered.extend_from_slice(&packet[IPV6_HEADER..]);
+        let sum = checksum(&covered);
+        packet[IPV6_HEADER + 2..IPV6_HEADER + 4].copy_from_slice(&sum.to_be_bytes());
         packet
     }
 
