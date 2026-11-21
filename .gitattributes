@@ -1,0 +1,40 @@
+# The oracle fixtures are compared byte for byte against a recorder's output, so
+# no runner may rewrite their line endings. `core.autocrlf` defaults to true on
+# the `windows x86_64` image and converted `expected.txt` to CRLF on checkout,
+# which failed `kcp::oracle::the_scripted_core_matches_the_pinned_go` on that
+# runner and nowhere else. `-text` is a path-scoped opt-out of EOL conversion: a
+# golden file whose bytes a runner can rewrite is not a golden file.
+scripts/kcp-oracle/expected.txt -text
+scripts/kcp-oracle/script.txt -text
+
+# The same reason, for the socks client's golden and its script: the client
+# replays the script line by line and compares the golden byte for byte.
+scripts/socks5-oracle/expected.txt -text
+scripts/socks5-oracle/script.txt -text
+
+# Same reason, for the blackhole sink's golden and its script: the answer the
+# sink writes is compared against the recorder's output byte for byte.
+scripts/blackhole-oracle/expected.txt -text
+scripts/blackhole-oracle/script.txt -text
+
+# Same reason, for the DNS and TLS-hello oracles: each golden is compared
+# byte for byte against the recorder's output.
+scripts/dns-oracle/expected.txt -text
+scripts/dns-oracle/script.txt -text
+scripts/hello-oracle/expected.txt -text
+scripts/hello-oracle/script.txt -text
+
+# The engine-cache key hashes this file on every runner; a converted checkout
+# would key a cache the build never wrote.
+upstream/pins.toml -text
+
+# Shell entrypoints run under Git Bash and WSL on Windows; a CRLF checkout
+# breaks both with a syntax error at the first function body.
+*.sh text eol=lf
+*.cmd text eol=crlf
+
+# Same reason, for every other checked-in expectation in this tree. This
+# follows the shell rules so a fixture keeps its bytes even when its name ends
+# in `.sh` or `.cmd`.
+**/fixtures/** -text
+**/*.golden -text
