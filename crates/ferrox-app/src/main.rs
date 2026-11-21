@@ -34,6 +34,7 @@ mod foxy_latency;
 #[cfg(test)]
 mod foxy_live;
 mod geodata;
+mod group;
 mod grpc;
 mod h2;
 mod headers;

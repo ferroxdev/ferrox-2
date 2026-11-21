@@ -328,7 +328,8 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, tes
         let _ = DIRECT_FREEDOM.set(Arc::clone(freedom));
     }
     // Named only when no outbound was built, so the reason behind an exit that names nothing is on its own line first.
-    let refused = outbound.is_none().then(|| diagnose_outbounds(root));
+    let refused =
+        (outbound.is_none() && !crate::group::is_present(root)).then(|| diagnose_outbounds(root));
     let portals =
         reverse_portals(root).unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
     let routing = routing_for(root)
@@ -365,6 +366,11 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, tes
         )
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")))
     });
+    if !test {
+        if let Some(route) = &route {
+            crate::group::spawn(&route.groups, route);
+        }
+    }
     if let Some(observatory) = &observatory {
         crate::observatory::spawn(root, observatory, route.as_ref())
             .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
@@ -2104,7 +2110,9 @@ fn parse_outbound_sockopt(
 fn routing_for(root: &Json) -> Result<Option<crate::router::Routing>, String> {
     match crate::router::Routing::parse(root)? {
         Some(routing) => Ok(Some(routing)),
-        None if dial_settings_present(root)? => Ok(Some(crate::router::Routing::empty())),
+        None if dial_settings_present(root)? || crate::group::is_present(root) => {
+            Ok(Some(crate::router::Routing::empty()))
+        }
         None => Ok(None),
     }
 }
@@ -2207,6 +2215,7 @@ fn udp_lane_supported(out: &Outbound) -> bool {
         Outbound::Loopback(loopback) => loopback.dial.as_ref().is_some_and(udp_lane_supported),
         Outbound::Vless(vless) => match &vless.carrier {
             Carrier::Quic => true,
+            Carrier::Raw(_) if vless.mux.udp_manager().is_some() => true,
             Carrier::Raw(_) => vless.tls.is_none(),
             Carrier::Kcp(_) => vless.mux.udp_manager().is_some(),
             Carrier::Hysteria(_) => {
@@ -2232,6 +2241,9 @@ fn udp_lane_supported(out: &Outbound) -> bool {
         | Outbound::ReversePortal(_) => true,
         Outbound::Shadowsocks(ss) => matches!(ss.carrier, Carrier::Raw(_)),
         Outbound::Socks(socks) => socks.version != crate::socks::Version::V4,
+        Outbound::Group(group) => group
+            .resolve_bound(crate::router::Network::Udp)
+            .is_some_and(|(_, out)| udp_lane_supported(&out)),
         Outbound::Http(_)
         | Outbound::AnyTls(_)
         | Outbound::Veepn(_)
@@ -2239,6 +2251,18 @@ fn udp_lane_supported(out: &Outbound) -> bool {
         | Outbound::Block(_)
         | Outbound::Metrics { .. }
         | Outbound::Api(_) => false,
+    }
+}
+
+/// Whether a lane declares the network a route asks it for; groups resolve to the member first.
+pub(crate) fn outbound_supports_network(out: &Outbound, network: crate::router::Network) -> bool {
+    match network {
+        crate::router::Network::Udp => udp_lane_supported(out),
+        crate::router::Network::Tcp => !matches!(
+            out,
+            Outbound::Block(_) | Outbound::Route(_) | Outbound::Metrics { .. } | Outbound::Api(_)
+        ),
+        crate::router::Network::Other(_) => false,
     }
 }
 
@@ -2351,6 +2375,7 @@ pub(crate) fn dial_udp_through_proxy(
                 None,
                 source,
                 sockopts.as_ref(),
+                strategy,
                 None,
                 Some(&relay_stop),
             );
@@ -3134,6 +3159,8 @@ pub(crate) enum Outbound {
     Psiphon(crate::psiphon::PsiphonOut),
     Freedom(Arc<FreedomOut>),
     Http(HttpOut),
+    /// A sing-box group: the lane one selected member dials, or the fastest one with a reading.
+    Group(Arc<crate::group::Group>),
     /// The rules choose the outbound per flow; the plan holds the registry and the fallback.
     Route(Arc<RoutePlan>),
     /// A re-inject through a named inbound, with its own sniffer applied before the dial.
@@ -3180,6 +3207,9 @@ impl Outbound {
             Self::Warp(warp) => warp.edge(),
             Self::Psiphon(lane) => Some(lane.endpoint()),
             Self::Metrics { address } => Some(*address),
+            Self::Group(group) => group
+                .resolve_bound(crate::router::Network::Tcp)
+                .and_then(|(_, out)| out.edge()),
             Self::Foxy(_)
             | Self::Veepn(_)
             | Self::Freedom(_)
@@ -3333,6 +3363,8 @@ pub(crate) struct RouteShared {
     tagged: HashMap<String, Outbound>,
     /// Each balancer's candidate tags, ordered by tag. Built once so a flow picks from a slice.
     balancers: Arc<HashMap<String, Vec<String>>>,
+    /// Every configured group, so its probe loop and a nested member can find it.
+    groups: HashMap<String, Arc<crate::group::Group>>,
     /// Each balancer's fallback, so the server-route proof resolves every tag it can pick without the table's lock.
     balancer_fallbacks: HashMap<String, String>,
     /// Every server inbound's tag and target networks, including one the management API added,
@@ -3358,6 +3390,7 @@ pub(crate) struct RouteShared {
     has_dial_settings: bool,
     dynamic: Arc<RwLock<Dynamic>>,
     changed: AtomicBool,
+    revision: AtomicU64,
     closed: Outbound,
     /// The table's own weak handle, so an outbound the management API adds later can bind a
     /// loopback's second routing pass without the table keeping itself alive.
@@ -3410,6 +3443,12 @@ impl RouteShared {
         }
     }
 
+    /// A counter that moves whenever a tag is added or removed, so a probe can discard a reading
+    /// whose outbound changed while it was in flight.
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Relaxed)
+    }
+
     /// The outbound a `geodata.outbound` tag names, borrowed from the registry rather than copied.
     fn outbound_ref(&self, tag: &str) -> Option<&Outbound> {
         if tag.is_empty() {
@@ -3418,15 +3457,61 @@ impl RouteShared {
         self.tagged.get(tag)
     }
 
+    /// One group member by tag, live so a removed member blocks and a replacement is reached.
+    pub(crate) fn member(&self, tag: &str) -> Option<Outbound> {
+        if self.changed.load(Ordering::Relaxed) {
+            let dynamic = self
+                .dynamic
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if dynamic.removed.contains(tag) {
+                return Some(self.closed.clone());
+            }
+            if let Some(out) = dynamic.added.get(tag) {
+                return Some((*out.out).clone());
+            }
+        }
+        self.tagged
+            .get(tag)
+            .cloned()
+            .or_else(|| (self.default_tag.as_deref() == Some(tag)).then(|| self.default.clone()))
+    }
+
+    /// The source, socket options and target strategy one tag names, with the default's own when
+    /// the tag is the default entry.
+    fn tag_dial_settings(
+        &self,
+        tag: &str,
+    ) -> (
+        Option<SendThrough>,
+        Option<Arc<crate::sockopt::SocketOptions>>,
+        Option<FreedomDomain>,
+    ) {
+        if self.default_tag.as_deref() == Some(tag) {
+            return (
+                self.default_source,
+                self.default_sockopts.clone(),
+                self.default_strategy,
+            );
+        }
+        (
+            self.sources.get(tag).copied(),
+            self.sockopts.get(tag).cloned(),
+            self.strategies.get(tag).copied(),
+        )
+    }
+
+    fn carry_tag_settings(&self, tag: &str) {
+        let (source, sockopts, strategy) = self.tag_dial_settings(tag);
+        SEND_THROUGH.with(|cell| cell.set(source));
+        DIAL_SOCKOPTS.with(|cell| *cell.borrow_mut() = sockopts);
+        TARGET_STRATEGY.with(|cell| cell.set(strategy));
+    }
+
     /// The probe target a health check reaches by tag, with the same source, options and target
     /// strategy the route gives a flow; the chain tag resolves to its exit lane.
     pub(crate) fn probe_target(self: &Arc<Self>, tag: &str) -> Option<ProbeTarget> {
-        let out = if self.default_tag.as_deref() == Some(tag) {
-            self.default.clone()
-        } else {
-            self.tagged.get(tag)?.clone()
-        };
-        Some(self.probe_target_with(tag, out))
+        Some(self.probe_target_with(tag, self.member(tag)?))
     }
 
     /// A target for a configured tag no rule selected: the route never built it, but its dial
@@ -3602,6 +3687,7 @@ impl RouteShared {
             },
         );
         self.changed.store(true, Ordering::Relaxed);
+        self.revision.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -3619,6 +3705,7 @@ impl RouteShared {
         }
         if was_added || was_static {
             self.changed.store(true, Ordering::Relaxed);
+            self.revision.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -3749,6 +3836,9 @@ impl Runtime {
     /// handler is built and dropped, which is the reference's unused manager entry.
     pub(crate) fn add_outbound(&self, tag: &str, raw: &[u8]) -> Result<(), String> {
         let config = crate::xray_pb::outbound(raw)?;
+        if crate::group::is_config(&config) {
+            return Err("group outbounds must be in the startup config".to_owned());
+        }
         let out = build_outbound(&config, tag)?;
         if let Some(route) = &self.route {
             route.add_outbound(tag, out)?;
@@ -3791,7 +3881,7 @@ impl Runtime {
                 || Some(tag) == route.default_tag.as_deref()
                 || crate::reverse::portal_for_tag(tag).is_some()
         };
-        let direct = |named: &str| direct_tag(route, named);
+        let direct = |named: &str| handler_direct(route, named);
         let server_inbounds = route
             .server_inbounds
             .lock()
@@ -3837,7 +3927,7 @@ impl Runtime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let direct = |named: &str| direct_tag(route, named);
+        let direct = |named: &str| handler_direct(route, named);
         let proofs: Vec<crate::router::ServerProof<'_>> = server_inbounds
             .iter()
             .map(|inbound| {
@@ -3916,7 +4006,7 @@ impl Runtime {
         };
         let previous = balancer.forced();
         balancer.force(target);
-        let direct = |named: &str| direct_tag(route, named);
+        let direct = |named: &str| handler_direct(route, named);
         let server_inbounds = route
             .server_inbounds
             .lock()
@@ -4410,6 +4500,9 @@ pub(crate) fn build_outbound(config: &Json, tag: &str) -> Result<Outbound, Strin
             "outbound `{tag}` is a chain; add chains in the startup config"
         ));
     }
+    if crate::group::is_config(config) {
+        return crate::group::Group::unbound(tag, config).map(Outbound::Group);
+    }
     let protocol = canonical_protocol(config.get("protocol").and_then(Json::as_str).unwrap_or(""));
     if protocol == "loopback" {
         // A management-API handler has no config root; its named tag is all the second pass needs.
@@ -4535,6 +4628,54 @@ fn detour_tag(config: &Json) -> Option<&str> {
         .get("detour")
         .and_then(Json::as_str)
         .filter(|tag| !tag.is_empty())
+}
+
+/// A group's member edge and an outbound's detour edge meet at the same tag. Walking each edge
+/// type alone misses a cycle that passes through both, so start from every group and reject a
+/// back edge on the combined graph.
+fn check_group_detour_cycles<'a>(
+    configs: &HashMap<&'a str, &'a Json>,
+    groups: &HashMap<String, Arc<crate::group::Group>>,
+) -> Result<(), String> {
+    fn visit<'a>(
+        tag: &str,
+        configs: &HashMap<&'a str, &'a Json>,
+        groups: &HashMap<String, Arc<crate::group::Group>>,
+        path: &mut Vec<String>,
+        state: &mut HashMap<String, u8>,
+    ) -> Result<(), String> {
+        match state.get(tag) {
+            Some(1) => {
+                let at = path.iter().position(|entry| entry == tag).unwrap_or(0);
+                let mut cycle = path[at..].to_vec();
+                cycle.push(tag.to_owned());
+                return Err(format!(
+                    "group/detour loop through `{}`",
+                    cycle.join(" -> ")
+                ));
+            }
+            Some(2) => return Ok(()),
+            _ => {}
+        }
+        state.insert(tag.to_owned(), 1);
+        path.push(tag.to_owned());
+        if let Some(group) = groups.get(tag) {
+            for member in group.members() {
+                visit(member, configs, groups, path, state)?;
+            }
+        } else if let Some(config) = configs.get(tag) {
+            if let Some(hop) = next_hop_tag(config)? {
+                visit(hop, configs, groups, path, state)?;
+            }
+        }
+        path.pop();
+        state.insert(tag.to_owned(), 2);
+        Ok(())
+    }
+    for tag in groups.keys() {
+        visit(tag, configs, groups, &mut Vec::new(), &mut HashMap::new())?;
+    }
+    Ok(())
 }
 
 /// The one hop an outbound dials through. `dialerProxy` and `detour` are the same edge; naming
@@ -4728,6 +4869,7 @@ fn chain_hop_can_dial_through(out: &Outbound) -> bool {
         | Outbound::Foxy(_)
         | Outbound::Veepn(_)
         | Outbound::Loopback(_)
+        | Outbound::Group(_)
         | Outbound::Route(_)
         | Outbound::Block(_)
         | Outbound::Dns(_)
@@ -4767,6 +4909,11 @@ fn build_chain_lanes(
                 "chain `{tag}` names `{hop}`, which no outbound names"
             ));
         };
+        if crate::group::is_config(config) {
+            return Err(format!(
+                "chain `{tag}` names group `{hop}`; a chain hop must be one concrete outbound"
+            ));
+        }
         if next_hop_tag(config)?.is_some() {
             eprintln!(
                 "chain `{tag}` hop `{hop}` names its own detour; the chain position is used instead"
@@ -4871,6 +5018,15 @@ fn route_shared_with_api(
         .and_then(Json::as_str)
         .filter(|tag| !tag.is_empty())
         .map(str::to_owned);
+    if list.iter().any(|outbound| {
+        crate::group::is_config(outbound)
+            && outbound
+                .get("tag")
+                .and_then(Json::as_str)
+                .is_none_or(str::is_empty)
+    }) {
+        return Err("a group outbound needs a tag its members can be reached by".to_owned());
+    }
     let mut configs: HashMap<&str, &Json> = HashMap::new();
     for outbound in list {
         let tag = outbound.get("tag").and_then(Json::as_str).unwrap_or("");
@@ -4882,6 +5038,31 @@ fn route_shared_with_api(
         }
     }
     check_dialer_proxies(&configs, default_tag.as_deref(), first)?;
+    let history = Arc::new(crate::group::History::default());
+    let mut groups: HashMap<String, Arc<crate::group::Group>> = HashMap::new();
+    for (&tag, &config) in &configs {
+        if crate::group::is_config(config) {
+            groups.insert(
+                tag.to_owned(),
+                Arc::new(crate::group::Group::parse(
+                    tag,
+                    config,
+                    Arc::clone(&history),
+                )?),
+            );
+        }
+    }
+    crate::group::check_cycles(&groups)?;
+    for (tag, group) in &groups {
+        for member in group.members() {
+            if !configs.contains_key(member.as_str()) {
+                return Err(format!(
+                    "group `{tag}` names `{member}`, which no outbound names"
+                ));
+            }
+        }
+    }
+    check_group_detour_cycles(&configs, &groups)?;
     let mut chain_specs: HashMap<String, Vec<String>> = HashMap::new();
     for (&tag, &config) in &configs {
         if is_chain_config(config) {
@@ -4894,6 +5075,9 @@ fn route_shared_with_api(
         chain_lanes.insert(tag.clone(), build_chain_lanes(root, &configs, tag, hops)?);
     }
     let build = |config: &Json, tag: &str| -> Result<Outbound, String> {
+        if let Some(group) = groups.get(tag) {
+            return Ok(Outbound::Group(Arc::clone(group)));
+        }
         if is_chain_config(config) {
             return chain_lanes
                 .get(tag)
@@ -5009,6 +5193,14 @@ fn route_shared_with_api(
         }
     }
     add_dialer_proxy_targets(&configs, default_tag.as_deref(), first, &mut targets)?;
+    for tag in groups.keys() {
+        targets.push(tag.as_str());
+    }
+    for group in groups.values() {
+        for member in group.members() {
+            targets.push(member.as_str());
+        }
+    }
     for target in targets {
         if tagged.contains_key(target) {
             continue;
@@ -5116,6 +5308,7 @@ fn route_shared_with_api(
         routing,
         tagged,
         balancers,
+        groups,
         balancer_fallbacks,
         server_inbounds: Mutex::new(server_inbounds),
         vmess_users: Mutex::new(HashMap::new()),
@@ -5133,11 +5326,15 @@ fn route_shared_with_api(
         has_dial_settings,
         dynamic,
         changed: AtomicBool::new(false),
+        revision: AtomicU64::new(0),
         closed: Outbound::Block(ferrox_core::blackhole::Response::None),
         self_weak: OnceLock::new(),
     });
     for options in shared.sockopts.values() {
         options.install_route(&shared);
+    }
+    for group in shared.groups.values() {
+        group.bind(&shared);
     }
     if let Some(options) = &shared.default_sockopts {
         options.install_route(&shared);
@@ -5236,7 +5433,7 @@ fn prove_server_route(shared: &RouteShared, inbound: &Json, label: &str) {
     };
     let tag = inbound_tag(inbound);
     let portal = portal_inbound(inbound.get("protocol").and_then(Json::as_str).unwrap_or(""));
-    let direct = |named: &str| direct_tag(shared, named);
+    let direct = |named: &str| handler_direct(shared, named);
     let routing = shared
         .routing
         .read()
@@ -5252,6 +5449,24 @@ fn prove_server_route(shared: &RouteShared, inbound: &Json, label: &str) {
     };
 }
 
+/// A direct-only handler cannot observe a group member removed after its proof, so a group is
+/// never a direct target for one; ordinary Freedom classification still uses `direct_tag`.
+fn handler_direct(shared: &RouteShared, tag: &str) -> bool {
+    !matches!(shared.member(tag), Some(Outbound::Group(_))) && direct_tag(shared, tag)
+}
+
+fn handler_direct_with(
+    shared: &RouteShared,
+    tag: &str,
+    candidate: Option<(&str, &Outbound)>,
+) -> bool {
+    let group = match candidate {
+        Some((name, out)) if name == tag => matches!(out, Outbound::Group(_)),
+        _ => matches!(shared.member(tag), Some(Outbound::Group(_))),
+    };
+    !group && direct_tag_with(shared, tag, candidate)
+}
+
 /// A server inbound's fixed direct dial, as the rules that reach it must see it.
 fn server_proof<'a>(
     shared: &'a RouteShared,
@@ -5262,7 +5477,7 @@ fn server_proof<'a>(
 ) -> crate::router::ServerProof<'a> {
     let default_direct = match shared.default_tag.as_deref() {
         Some(tag) => {
-            direct_tag(shared, tag)
+            handler_direct(shared, tag)
                 || (portal
                     && matches!(&shared.default, Outbound::Block(_))
                     && !shared.has_freedom())
@@ -5295,12 +5510,6 @@ fn server_proof<'a>(
     }
 }
 
-/// Whether a candidate outbound dials direct, by the same rule the dynamic table applies: a
-/// freedom lane with no final block rules.
-fn candidate_direct(out: &Outbound) -> bool {
-    matches!(out, Outbound::Freedom(freedom) if !freedom.has_final_rules())
-}
-
 /// One server inbound's proof against a candidate outbound that is not published yet, so an
 /// `AddOutbound` cannot replace a proven direct lane with a blocked one.
 fn server_proof_for_candidate<'a>(
@@ -5311,22 +5520,15 @@ fn server_proof_for_candidate<'a>(
     candidate: &'a Outbound,
     portal: bool,
 ) -> crate::router::ServerProof<'a> {
-    let direct = move |named: &str| {
-        if named == tag {
-            candidate_direct(candidate)
-        } else {
-            direct_tag(shared, named)
-        }
-    };
+    let direct = |named: &str| handler_direct_with(shared, named, Some((tag, candidate)));
     let candidate_is_default = shared.default_tag.as_deref() == Some(tag);
     let has_freedom = shared.has_freedom() || matches!(candidate, Outbound::Freedom(_));
     let default_direct = if candidate_is_default {
-        candidate_direct(candidate)
-            || (portal && matches!(&shared.default, Outbound::Block(_)) && !has_freedom)
+        direct(tag) || (portal && matches!(&shared.default, Outbound::Block(_)) && !has_freedom)
     } else {
         match shared.default_tag.as_deref() {
             Some(default) => {
-                direct_tag(shared, default)
+                direct(default)
                     || (portal && matches!(&shared.default, Outbound::Block(_)) && !has_freedom)
             }
             None => {
@@ -5375,37 +5577,95 @@ impl RouteShared {
     }
 }
 
+/// One direct-route walk: completed group answers are cached by tag for this call, while `active`
+/// keeps cycle detection on the current path.
+#[derive(Default)]
+struct DirectCheck {
+    done: HashMap<String, bool>,
+    active: HashSet<String>,
+}
+
+fn direct_member(
+    shared: &RouteShared,
+    tag: &str,
+    candidate: Option<(&str, &Outbound)>,
+    check: &mut DirectCheck,
+) -> bool {
+    if let Some(done) = check.done.get(tag) {
+        return *done;
+    }
+    if !check.active.insert(tag.to_owned()) {
+        return false;
+    }
+    let direct = match candidate {
+        Some((name, out)) if name == tag => direct_out(shared, tag, out, candidate, check),
+        _ => shared
+            .member(tag)
+            .is_some_and(|out| direct_out(shared, tag, &out, candidate, check)),
+    };
+    check.active.remove(tag);
+    check.done.insert(tag.to_owned(), direct);
+    direct
+}
+
+fn direct_out(
+    shared: &RouteShared,
+    tag: &str,
+    out: &Outbound,
+    candidate: Option<(&str, &Outbound)>,
+    check: &mut DirectCheck,
+) -> bool {
+    match out {
+        Outbound::Freedom(lane) => {
+            !lane.has_final_rules()
+                && shared
+                    .tag_dial_settings(tag)
+                    .1
+                    .is_none_or(|options| options.dialer_proxy().is_none())
+        }
+        Outbound::Group(group) => group
+            .members()
+            .iter()
+            .all(|member| direct_member(shared, member, candidate, check)),
+        _ => false,
+    }
+}
+
 /// Whether an outbound tag dials direct: a freedom outbound, or the default tag when the default
 /// outbound is freedom. The dynamic table wins, so a removed or replaced tag reads its live lane.
 fn direct_tag(shared: &RouteShared, tag: &str) -> bool {
-    if shared.changed.load(Ordering::Relaxed) {
-        let dynamic = shared
-            .dynamic
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if dynamic.removed.contains(tag) {
+    direct_tag_with(shared, tag, None)
+}
+
+fn direct_tag_with(shared: &RouteShared, tag: &str, candidate: Option<(&str, &Outbound)>) -> bool {
+    let is_candidate = candidate.is_some_and(|(name, _)| name == tag);
+    let default_freedom = if is_candidate {
+        false
+    } else {
+        let (removed, replaced) = if shared.changed.load(Ordering::Relaxed) {
+            let dynamic = shared
+                .dynamic
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                dynamic.removed.contains(tag),
+                dynamic.added.contains_key(tag),
+            )
+        } else {
+            (false, false)
+        };
+        if removed {
             return false;
         }
-        if let Some(entry) = dynamic.added.get(tag) {
-            return match entry.out.as_ref() {
-                Outbound::Freedom(freedom) => !freedom.has_final_rules(),
-                _ => false,
-            };
-        }
-    }
-    // A direct-only inbound dials its own target, so a lane naming a hop is not a direct route.
-    let options = if Some(tag) == shared.default_tag.as_deref() {
-        shared.default_sockopts.as_deref()
-    } else {
-        shared.sockopts.get(tag).map(Arc::as_ref)
+        !replaced
+            && Some(tag) == shared.default_tag.as_deref()
+            && matches!(&shared.default, Outbound::Freedom(_))
+            && shared
+                .tag_dial_settings(tag)
+                .1
+                .is_none_or(|options| options.dialer_proxy().is_none())
     };
-    if options.is_some_and(|options| options.dialer_proxy().is_some()) {
-        return false;
-    }
-    let default_tag = Some(tag) == shared.default_tag.as_deref();
-    (default_tag && matches!(&shared.default, Outbound::Freedom(_)))
-        || matches!(shared.tagged.get(tag), Some(Outbound::Freedom(lane))
-            if default_tag || !lane.has_final_rules())
+    default_freedom || direct_member(shared, tag, candidate, &mut DirectCheck::default())
 }
 
 /// Whether an inbound protocol attaches reverse portals, so a rule naming one is served rather than dialed.
@@ -28997,6 +29257,24 @@ fn serve_connect_at(
     facts: FlowFacts<'_>,
     depth: u8,
 ) {
+    if let Outbound::Group(group) = out {
+        let Some((leaf, member)) = group.resolve_bound(crate::router::Network::Tcp) else {
+            return;
+        };
+        if let Some(route) = group.route_handle() {
+            route.carry_tag_settings(&leaf);
+        }
+        return serve_connect_at(
+            client,
+            &member,
+            asked,
+            front,
+            prefix,
+            Some(&leaf),
+            facts,
+            depth + 1,
+        );
+    }
     let tag = tag.map(str::to_owned).or_else(default_outbound_tag);
     let _outbound = OutboundTag::enter(tag.as_deref());
     let _source = SendThroughGuard::enter(SEND_THROUGH.with(std::cell::Cell::take));
@@ -29299,6 +29577,7 @@ fn dial_socks_outbound(
         Outbound::Foxy(_)
         | Outbound::Veepn(_)
         | Outbound::Freedom(_)
+        | Outbound::Group(_)
         | Outbound::Route(_)
         | Outbound::Loopback(_)
         | Outbound::Block(_)
@@ -31050,6 +31329,7 @@ pub(crate) fn serve_udp_lane(
 ) {
     let source = SEND_THROUGH.with(std::cell::Cell::take);
     let sockopts = DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take());
+    let strategy = TARGET_STRATEGY.with(std::cell::Cell::take);
     serve_udp_lane_with(
         relay,
         out,
@@ -31057,6 +31337,7 @@ pub(crate) fn serve_udp_lane(
         peer,
         source,
         sockopts.as_ref(),
+        strategy,
         None,
         stop,
     );
@@ -31070,17 +31351,42 @@ fn serve_udp_lane_with(
     peer: Option<IpAddr>,
     source: Option<SendThrough>,
     sockopts: Option<&Arc<crate::sockopt::SocketOptions>>,
+    strategy: Option<FreedomDomain>,
     relay_peer: Option<IpAddr>,
     stop: Option<&AtomicBool>,
 ) {
+    if let Outbound::Group(group) = out {
+        let Some((leaf, member)) = group.resolve_bound(crate::router::Network::Udp) else {
+            return;
+        };
+        let (source, sockopts, strategy) = group
+            .route_handle()
+            .map_or((None, None, None), |route| route.tag_dial_settings(&leaf));
+        let _tag = OutboundTag::enter(Some(&leaf));
+        serve_udp_lane_with(
+            relay,
+            &member,
+            associate,
+            peer,
+            source,
+            sockopts.as_ref(),
+            strategy,
+            relay_peer,
+            stop,
+        );
+        return;
+    }
     let _source = SendThroughGuard::enter(source);
     let _sockopts = DialSockoptsGuard::enter(sockopts.cloned());
+    let _target = TargetStrategyGuard::enter(strategy);
     let sockopts = sockopts.map(Arc::as_ref);
     match out {
         // Loopback is TCP-only in the reference; a routed front tag has no datagram lane.
         Outbound::Loopback(loopback) => {
             if let Some(dial) = &loopback.dial {
-                serve_udp_lane_with(relay, dial, associate, peer, None, None, relay_peer, stop);
+                serve_udp_lane_with(
+                    relay, dial, associate, peer, None, None, strategy, relay_peer, stop,
+                );
             }
         }
         // Every carrier whose mux pool is open takes the same datagram lane: one XUDP flow per destination, framed by the carrier the opener dialled.
@@ -31503,6 +31809,7 @@ fn spawn_udp_lane_with_cancel(
     arm_control(associate.as_ref());
     let source = SEND_THROUGH.with(std::cell::Cell::take);
     let sockopts = DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take());
+    let strategy = TARGET_STRATEGY.with(std::cell::Cell::take);
     let out = out.clone();
     let handle = thread::spawn(move || {
         // The lane's own thread starts with the settings the pick left on this one.
@@ -31517,6 +31824,7 @@ fn spawn_udp_lane_with_cancel(
             peer,
             source,
             sockopts.as_ref(),
+            strategy,
             Some(local),
             cancel.as_deref(),
         );
@@ -42303,8 +42611,8 @@ fn outbound_refusal(outbound: &Json, protocol: &str) -> Option<String> {
             }
             None
         }
-        // The chain's own refusals carry their one line already.
-        "foxy" | "veepn" | "psiphon" | "masque" => None,
+        // The chain's refusals carry their one line already; groups resolve before this.
+        "foxy" | "veepn" | "psiphon" | "masque" | "selector" | "urltest" => None,
         // A lane without an outbound this binary builds: the name is xray's, not a typo to diagnose.
         "hysteria" => hysteria_outbound_refusal(outbound),
         "dokodemo-door" => Some("the `dokodemo-door` outbound is not carried".to_owned()),
@@ -42370,6 +42678,9 @@ fn diagnose_outbounds(root: &Json) -> Vec<String> {
         if is_chain_config(outbound) {
             continue;
         }
+        if crate::group::is_config(outbound) {
+            continue;
+        }
         let named = outbound
             .get("protocol")
             .and_then(Json::as_str)
@@ -42401,6 +42712,10 @@ fn find_outbound_with(root: &Json, test: bool) -> Result<Option<Outbound>, Strin
     else {
         return Ok(None);
     };
+    // A group chooses a member at flow time, so the routing table owns it rather than this probe.
+    if crate::group::is_config(first) {
+        return Ok(None);
+    }
     // The default is the first configured outbound, so the finders below are shown only that entry.
     let only = Json::Obj(vec![(
         "outbounds".to_owned(),
@@ -64798,6 +65113,23 @@ mod tests {
         join_thread_within(answering, Duration::from_secs(5), "the answering server");
     }
 
+    /// A mux-enabled raw-TCP VLESS lane carries datagrams, so it declares UDP even under TLS;
+    /// the raw-TLS exclusion only applies when there is no UDP manager.
+    #[test]
+    fn a_mux_vless_raw_tls_lane_declares_udp() {
+        let mut vless = header_test_outbound();
+        vless.tls = Some(Arc::new(ferrox_core::tls::TlsConfig::default()));
+        vless.mux = Mux {
+            enabled: true,
+            tcp: Some(128),
+            xudp: Xudp::Shared,
+            ..Mux::default()
+        };
+        assert!(udp_lane_supported(&Outbound::Vless(vless.clone())));
+        vless.mux.xudp = Xudp::Off;
+        assert!(!udp_lane_supported(&Outbound::Vless(vless)));
+    }
+
     /// The VLESS mux skip policy leaves the mux for a direct UDP lane; a peer that waits for the
     /// header and the datagram sees both, and the answer returns through the association.
     #[test]
@@ -83658,6 +83990,311 @@ end
             Some("direct"),
             "an observatory-less pick falls back"
         );
+    }
+
+    fn group_route(json: &str) -> Arc<RouteShared> {
+        let root = crate::json::parse(json).expect("parses");
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        route_shared(&root, routing, &crate::reverse::Portals::default(), None).expect("builds")
+    }
+
+    fn group_of(shared: &Arc<RouteShared>, tag: &str) -> Arc<crate::group::Group> {
+        match shared.member(tag) {
+            Some(Outbound::Group(group)) => group,
+            _ => panic!("`{tag}` is a group"),
+        }
+    }
+
+    /// The selector dials its default, then its first member when no default is named.
+    #[test]
+    fn a_selector_dials_its_default_then_its_first_member() {
+        let shared = group_route(
+            r#"{"outbounds":[
+                {"tag":"a","protocol":"freedom"},
+                {"tag":"b","protocol":"blackhole"},
+                {"tag":"pick","type":"selector","outbounds":["a","b"],"default":"b"}
+            ],"routing":{}}"#,
+        );
+        let group = group_of(&shared, "pick");
+        let (tag, out) = group
+            .resolve(&shared, crate::router::Network::Tcp)
+            .expect("picks");
+        assert_eq!(tag, "b");
+        assert!(matches!(out, Outbound::Block(_)));
+
+        let shared = group_route(
+            r#"{"outbounds":[
+                {"tag":"a","protocol":"freedom"},
+                {"tag":"b","protocol":"blackhole"},
+                {"tag":"pick","protocol":"selector","outbounds":["a","b"]}
+            ],"routing":{}}"#,
+        );
+        let group = group_of(&shared, "pick");
+        let (tag, out) = group
+            .resolve(&shared, crate::router::Network::Tcp)
+            .expect("picks");
+        assert_eq!(tag, "a");
+        assert!(matches!(out, Outbound::Freedom(_)));
+    }
+
+    /// A urltest keeps the selected member until another is faster by more than the tolerance.
+    #[test]
+    fn a_urltest_picks_the_fastest_history_and_keeps_it_inside_the_tolerance() {
+        let config = |a: u16, b: u16| {
+            let shared = group_route(
+                r#"{"outbounds":[
+                    {"tag":"a","protocol":"freedom"},
+                    {"tag":"b","protocol":"blackhole"},
+                    {"tag":"pick","type":"urltest","outbounds":["a","b"],"url":"http://127.0.0.1/204"}
+                ],"routing":{}}"#,
+            );
+            let group = group_of(&shared, "pick");
+            group.record("a", a);
+            group.record("b", b);
+            let (tag, _) = group
+                .resolve(&shared, crate::router::Network::Tcp)
+                .expect("picks");
+            tag
+        };
+        assert_eq!(config(100, 40), "b", "a clear winner takes over");
+        assert_eq!(
+            config(100, 90),
+            "a",
+            "a winner inside the 50ms tolerance does not"
+        );
+        assert_eq!(config(100, 49), "b", "a winner outside it does");
+        assert_eq!(
+            config(0, 100),
+            "a",
+            "a sub-millisecond reading is a reading, not a reason to replace it"
+        );
+    }
+
+    /// The fastest supported member is compared with the original current member, not with an
+    /// intermediate candidate that happened to be faster than the previous one.
+    #[test]
+    fn a_urltest_compares_the_fastest_member_with_the_current_one() {
+        let shared = group_route(
+            r#"{"outbounds":[
+                {"tag":"a","protocol":"freedom"},
+                {"tag":"b","protocol":"freedom"},
+                {"tag":"c","protocol":"freedom"},
+                {"tag":"pick","type":"urltest","outbounds":["a","b","c"],"url":"http://127.0.0.1/204"}
+            ],"routing":{}}"#,
+        );
+        let group = group_of(&shared, "pick");
+        group.record("a", 10);
+        let (tag, _) = group
+            .resolve(&shared, crate::router::Network::Tcp)
+            .expect("picks");
+        assert_eq!(tag, "a");
+        group.record("a", 200);
+        group.record("b", 100);
+        group.record("c", 60);
+        let (tag, _) = group
+            .resolve(&shared, crate::router::Network::Tcp)
+            .expect("picks");
+        assert_eq!(tag, "c");
+    }
+
+    /// A UDP lookup does not retain a current member that cannot carry datagrams, even when its
+    /// reading is the fastest.
+    #[test]
+    fn a_urltest_skips_a_tcp_only_member_for_udp() {
+        let shared = group_route(
+            r#"{"outbounds":[
+                {"tag":"tcp","protocol":"http","settings":{"servers":[{"address":"127.0.0.1","port":1}]}},
+                {"tag":"datagrams","protocol":"freedom"},
+                {"tag":"pick","type":"urltest","outbounds":["tcp","datagrams"],"url":"http://127.0.0.1/204"}
+            ],"routing":{}}"#,
+        );
+        let group = group_of(&shared, "pick");
+        group.record("tcp", 20);
+        group.record("datagrams", 100);
+        let (tag, _) = group
+            .resolve(&shared, crate::router::Network::Udp)
+            .expect("picks");
+        assert_eq!(tag, "datagrams");
+    }
+
+    /// A nested group's member identity is what the outer group keeps, so a change inside the
+    /// nested group is re-resolved instead of pinning the leaf it first selected.
+    #[test]
+    fn a_nested_urltest_keeps_the_member_identity() {
+        let shared = group_route(
+            r#"{"outbounds":[
+                {"tag":"a","protocol":"freedom"},
+                {"tag":"b","protocol":"freedom"},
+                {"tag":"inner","type":"urltest","outbounds":["a","b"],"tolerance":10,"url":"http://127.0.0.1/204"},
+                {"tag":"outer","type":"urltest","outbounds":["inner"],"tolerance":500,"url":"http://127.0.0.1/204"}
+            ],"routing":{}}"#,
+        );
+        let group = group_of(&shared, "outer");
+        group.record("a", 100);
+        group.record("b", 100);
+        let (tag, _) = group
+            .resolve(&shared, crate::router::Network::Tcp)
+            .expect("picks");
+        assert_eq!(tag, "a");
+        group.record("b", 10);
+        let (tag, _) = group
+            .resolve(&shared, crate::router::Network::Tcp)
+            .expect("picks");
+        assert_eq!(tag, "b", "the outer group follows the inner selection");
+    }
+
+    /// A group is a direct route only when every member it can dial is a plain Freedom lane; a
+    /// final rule, a hop, or a URL test that can switch to a proxy is not direct.
+    #[test]
+    fn a_group_is_direct_only_when_every_path_is_plain_freedom() {
+        let plain = group_route(
+            r#"{"outbounds":[
+                {"tag":"a","protocol":"freedom"},
+                {"tag":"b","protocol":"freedom"},
+                {"tag":"pick","type":"urltest","outbounds":["a","b"]}
+            ],"routing":{}}"#,
+        );
+        assert!(direct_tag(&plain, "pick"));
+        assert!(
+            !handler_direct(&plain, "pick"),
+            "a direct-only handler cannot observe a later member removal"
+        );
+
+        let rules = group_route(
+            r#"{"outbounds":[
+                {"tag":"a","protocol":"freedom","settings":{"finalRules":[{"action":"block","port":"1"}]}},
+                {"tag":"pick","type":"selector","outbounds":["a"]}
+            ],"routing":{}}"#,
+        );
+        assert!(!direct_tag(&rules, "pick"));
+
+        let detour = group_route(
+            r#"{"outbounds":[
+                {"tag":"a","protocol":"freedom","streamSettings":{"sockopt":{"dialerProxy":"hop"}}},
+                {"tag":"hop","protocol":"freedom"},
+                {"tag":"pick","type":"selector","outbounds":["a"]}
+            ],"routing":{}}"#,
+        );
+        assert!(!direct_tag(&detour, "pick"));
+
+        let mixed = group_route(
+            r#"{"outbounds":[
+                {"tag":"a","protocol":"freedom"},
+                {"tag":"b","protocol":"http","settings":{"servers":[{"address":"127.0.0.1","port":1}]}},
+                {"tag":"pick","type":"urltest","outbounds":["a","b"]}
+            ],"routing":{}}"#,
+        );
+        assert!(!direct_tag(&mixed, "pick"));
+
+        let selector = group_route(
+            r#"{"outbounds":[
+                {"tag":"a","protocol":"freedom"},
+                {"tag":"b","protocol":"http","settings":{"servers":[{"address":"127.0.0.1","port":1}]}},
+                {"tag":"pick","type":"selector","outbounds":["a","b"]}
+            ],"routing":{}}"#,
+        );
+        assert!(
+            !direct_tag(&selector, "pick"),
+            "a selector's later member is still a possible route"
+        );
+    }
+
+    /// A restored member is checked as the candidate the management API is about to publish, not
+    /// as the closed entry the live table still holds.
+    #[test]
+    fn a_restored_member_is_checked_as_its_candidate() {
+        let shared = group_route(
+            r#"{"outbounds":[
+                {"tag":"a","protocol":"freedom"},
+                {"tag":"pick","type":"selector","outbounds":["a"]}
+            ],"routing":{}}"#,
+        );
+        shared.remove_outbound("a");
+        let freedom = Outbound::Freedom(Arc::new(FreedomOut::default()));
+        assert!(direct_tag_with(&shared, "pick", Some(("a", &freedom))));
+        let blocked = Outbound::Block(ferrox_core::blackhole::Response::None);
+        assert!(!direct_tag_with(&shared, "pick", Some(("a", &blocked))));
+    }
+
+    /// A member the management API removes is blocked for group flows, not served from the
+    /// startup table's stale handler.
+    #[test]
+    fn a_removed_group_member_blocks_new_flows() {
+        let shared = group_route(
+            r#"{"outbounds":[
+                {"tag":"a","protocol":"freedom"},
+                {"tag":"pick","type":"selector","outbounds":["a"]}
+            ],"routing":{}}"#,
+        );
+        let group = group_of(&shared, "pick");
+        shared.remove_outbound("a");
+        let (_, out) = group
+            .resolve(&shared, crate::router::Network::Tcp)
+            .expect("picks");
+        assert!(matches!(out, Outbound::Block(_)));
+    }
+
+    /// A group naming an unknown member, a selector default outside its list, or a cycle is a
+    /// startup refusal, not a lane that blocks at dial time.
+    #[test]
+    fn a_broken_group_is_refused_by_name() {
+        let build = |json: &str| {
+            let root = crate::json::parse(json).expect("parses");
+            let routing = crate::router::Routing::parse_in(&root, Vec::new())
+                .expect("parses")
+                .expect("routing");
+            route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+        };
+        let missing = build(
+            r#"{"outbounds":[{"tag":"a","protocol":"freedom"},
+                {"tag":"pick","type":"selector","outbounds":["a","nope"]}],"routing":{}}"#,
+        )
+        .expect_err("a missing member is refused");
+        assert!(missing.contains("nope"), "{missing}");
+
+        let default = build(
+            r#"{"outbounds":[{"tag":"a","protocol":"freedom"},
+                {"tag":"pick","type":"selector","outbounds":["a"],"default":"b"}],"routing":{}}"#,
+        )
+        .expect_err("a default outside the list is refused");
+        assert!(default.contains("default"), "{default}");
+
+        let cycle = build(
+            r#"{"outbounds":[
+                {"tag":"a","protocol":"freedom"},
+                {"tag":"one","type":"selector","outbounds":["two"]},
+                {"tag":"two","type":"selector","outbounds":["one"]}
+            ],"routing":{}}"#,
+        )
+        .expect_err("a cycle is refused");
+        assert!(cycle.contains("loops"), "{cycle}");
+
+        let combined = build(
+            r#"{"outbounds":[
+                {"tag":"g","type":"selector","outbounds":["a"]},
+                {"tag":"a","protocol":"freedom","detour":"g"}
+            ],"routing":{}}"#,
+        )
+        .expect_err("a cycle through a group and a detour is refused");
+        assert!(combined.contains("group/detour loop"), "{combined}");
+
+        build(
+            r#"{"outbounds":[
+                {"tag":"g","type":"selector","outbounds":["a"]},
+                {"tag":"a","protocol":"freedom","detour":"b"},
+                {"tag":"b","protocol":"freedom"}
+            ],"routing":{}}"#,
+        )
+        .expect("an acyclic group-to-detour path is kept");
+
+        let untagged = build(
+            r#"{"outbounds":[{"tag":"a","protocol":"freedom"},
+                {"type":"selector","outbounds":["a"]}],"routing":{}}"#,
+        )
+        .expect_err("an untagged group cannot be reached");
+        assert!(untagged.contains("needs a tag"), "{untagged}");
     }
 
     /// A balancer tag and an outbound tag may be the same name; an `outboundTag` rule still takes

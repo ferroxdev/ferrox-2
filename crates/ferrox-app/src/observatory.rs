@@ -1,7 +1,7 @@
 //! The health observatory the balancers read: xray's legacy probe loop, its burst sampler,
 //! and the two URL shapes they speak through a configured outbound.
 
-use crate::conn::HttpUrl;
+use crate::conn::{Connection, HttpUrl};
 use crate::json::Json;
 use crate::proxy::{Destination, Outbound, ProbeTarget, RouteShared};
 use crate::router::{HealthPing, Observed};
@@ -666,19 +666,32 @@ impl Ring {
     }
 }
 
-fn probe(
+pub(crate) fn probe(
     outbound: &ProbeTarget,
     target: &str,
     method: &str,
     timeout: Duration,
     read_body: bool,
 ) -> Result<Duration, String> {
-    let url = HttpUrl::parse(target)?;
     let started = Instant::now();
+    let deadline = started + timeout;
+    let url = HttpUrl::parse(target)?;
     let destination = Destination::Name(url.host.clone(), url.port);
-    let stream = outbound
-        .probe_stream(&destination, timeout)
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(format!("cannot dial {target}: the probe deadline expired"));
+    }
+    let mut stream = outbound
+        .probe_stream(&destination, left)
         .ok_or_else(|| format!("cannot dial {target}"))?;
+    let mut io = DeadlineIo {
+        io: &mut stream,
+        deadline,
+        arm: &|stream: &Connection, left| {
+            let _ = stream.set_read_timeout(Some(left));
+            let _ = stream.set_write_timeout(Some(left));
+        },
+    };
     if url.tls {
         let config = ferrox_core::tls::TlsConfig {
             server_name: url.host.clone(),
@@ -700,15 +713,75 @@ fn probe(
             padding: None,
             ..Default::default()
         };
-        let mut session = ferrox_core::tls::RustlsProvider::connect(&config, stream)
+        let mut session = ferrox_core::tls::RustlsProvider::connect(&config, io)
             .map_err(|error| error.to_string())?;
         session.handshake().map_err(|error| error.to_string())?;
         round_trip(&mut session, &url, method, read_body)?;
     } else {
-        let mut stream = stream;
-        round_trip(&mut stream, &url, method, read_body)?;
+        round_trip(&mut io, &url, method, read_body)?;
+    }
+    finish(started, deadline)
+}
+
+/// A probe that finishes at or after its deadline is late even when the final read returned a
+/// complete response; no later read would have checked the clock.
+fn finish(started: Instant, deadline: Instant) -> Result<Duration, String> {
+    finish_at(Instant::now(), started, deadline)
+}
+
+fn finish_at(now: Instant, started: Instant, deadline: Instant) -> Result<Duration, String> {
+    if now >= deadline {
+        return Err("the probe deadline expired".to_owned());
     }
     Ok(started.elapsed())
+}
+
+/// A probe's reads and writes share one absolute deadline: every call gets only the time left, so
+/// a head that drips one byte just under the socket timeout cannot extend the probe past it.
+struct DeadlineIo<'a, S> {
+    io: &'a mut S,
+    deadline: Instant,
+    arm: &'a dyn Fn(&S, Duration),
+}
+
+impl<S: Read> Read for DeadlineIo<'_, S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the probe deadline expired",
+            ));
+        }
+        (self.arm)(self.io, left);
+        self.io.read(buf)
+    }
+}
+
+impl<S: Write> Write for DeadlineIo<'_, S> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the probe deadline expired",
+            ));
+        }
+        (self.arm)(self.io, left);
+        self.io.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the probe deadline expired",
+            ));
+        }
+        (self.arm)(self.io, left);
+        self.io.flush()
+    }
 }
 
 fn round_trip(
@@ -847,6 +920,46 @@ mod tests {
         )]))
         .expect("parses");
         assert_eq!(spaced.url, " ");
+    }
+
+    #[test]
+    fn a_late_result_is_not_a_healthy_reading() {
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(1);
+        assert!(
+            finish_at(started + Duration::from_secs(1), started, deadline).is_err(),
+            "a result after the deadline is rejected"
+        );
+    }
+
+    #[test]
+    fn a_probe_read_cannot_outlive_its_deadline() {
+        struct Drip;
+        impl Read for Drip {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(2));
+                if buf.is_empty() {
+                    return Ok(0);
+                }
+                buf[0] = b'x';
+                Ok(1)
+            }
+        }
+        let mut drip = Drip;
+        let mut io = DeadlineIo {
+            io: &mut drip,
+            deadline: Instant::now() + Duration::from_millis(5),
+            arm: &|_: &Drip, _: Duration| {},
+        };
+        let mut byte = [0u8; 1];
+        let mut timed_out = false;
+        for _ in 0..10 {
+            if let Err(error) = io.read(&mut byte) {
+                timed_out = error.kind() == std::io::ErrorKind::TimedOut;
+                break;
+            }
+        }
+        assert!(timed_out, "a drip read stops at the probe deadline");
     }
 
     #[test]
