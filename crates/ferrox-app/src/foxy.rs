@@ -8517,7 +8517,7 @@ pub(crate) mod loopback {
         for field in [
             "CONNECT",
             "connect-ip",
-            "/.well-known/masque/ip/*/0/",
+            "/.well-known/masque/ip/*/*/",
             "Bearer the-pass",
             "capsule-protocol",
             "?1",
