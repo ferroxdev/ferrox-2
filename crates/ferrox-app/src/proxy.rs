@@ -31252,7 +31252,15 @@ fn serve_socks_udp_freedom(
     let mut uplinks: HashMap<SocketAddr, FreedomUplink> = HashMap::new();
     let mut buf = udp_buffer();
     let mut seen = 0u64;
-    let idle = budgets::udp_idle();
+    // The relay's read timeout is its idle deadline; a cancellable lane polls it instead and keeps that deadline here.
+    let idle = relay
+        .read_timeout()
+        .ok()
+        .flatten()
+        .unwrap_or_else(budgets::udp_idle);
+    if cancel.is_some() {
+        let _ = relay.set_read_timeout(Some(UDP_POLL));
+    }
     let mut last = Instant::now();
     loop {
         if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {

@@ -3012,8 +3012,7 @@ pub(crate) fn server_udp<T: Clone + Into<ToTunnel>>(
             .into_owned(),
         other => other.clone(),
     };
-    // The relay checks its stop flag each tick; the device's idle deadline still decides when the lane is removed.
-    let _ = relay.set_read_timeout(Some(LANE_TICK));
+    let _ = relay.set_read_timeout(Some(crate::budgets::udp_idle()));
 
     let stop = Arc::new(AtomicBool::new(false));
     let relay_stop = Arc::clone(&stop);
