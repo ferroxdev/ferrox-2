@@ -8,15 +8,437 @@ use crate::json::Json;
 use crate::router_script::ScriptRouter;
 use crate::xray_pb::Reader;
 use std::borrow::Cow;
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::io::Read as _;
+use std::io::{Read as _, Seek as _, Write as _};
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
-use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+pub(crate) enum CacheBody {
+    Bytes(Vec<u8>),
+    Staged(RemoteBody),
+}
+
+impl CacheBody {
+    fn read(&self) -> Result<Vec<u8>, String> {
+        match self {
+            Self::Bytes(bytes) => Ok(bytes.clone()),
+            Self::Staged(body) => body.read(),
+        }
+    }
+
+    pub(crate) fn into_bytes(self) -> Result<Vec<u8>, String> {
+        match self {
+            Self::Bytes(bytes) => Ok(bytes),
+            Self::Staged(body) => body.read(),
+        }
+    }
+}
+
+impl From<Vec<u8>> for CacheBody {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::Bytes(bytes)
+    }
+}
+
+pub(crate) struct CacheWrite {
+    pub(crate) id: u64,
+    pub(crate) target: PathBuf,
+    pub(crate) body: CacheBody,
+}
+
+pub(crate) type CacheWrites = Vec<CacheWrite>;
+pub(crate) type CacheInputs = HashSet<u64>;
+
+static NEXT_CACHE_WRITE: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    static CANDIDATE_ASSETS: RefCell<Option<HashMap<PathBuf, PathBuf>>> =
+        const { RefCell::new(None) };
+    static CANDIDATE_CACHE_WRITES: RefCell<Option<CacheWrites>> = const { RefCell::new(None) };
+    static CANDIDATE_CACHE_INPUTS: RefCell<Option<CacheInputs>> = const { RefCell::new(None) };
+}
+
+/// Point asset reads on this thread at staged files, so a refresh validates the candidate without
+/// swapping the live files, and hold remote cache writes until the caller commits the swap.
+pub(crate) fn with_candidate_assets<T>(
+    files: HashMap<PathBuf, PathBuf>,
+    build: impl FnOnce() -> T,
+) -> (T, CacheWrites, CacheInputs) {
+    CANDIDATE_ASSETS.with(|slot| *slot.borrow_mut() = Some(files));
+    CANDIDATE_CACHE_WRITES.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+    CANDIDATE_CACHE_INPUTS.with(|slot| *slot.borrow_mut() = Some(CacheInputs::new()));
+    let _reset = CandidateReset;
+    let output = build();
+    let writes = CANDIDATE_CACHE_WRITES
+        .with(|slot| slot.borrow_mut().take())
+        .unwrap_or_default();
+    let inputs = CANDIDATE_CACHE_INPUTS
+        .with(|slot| slot.borrow_mut().take())
+        .unwrap_or_default();
+    (output, writes, inputs)
+}
+
+struct CandidateReset;
+
+impl Drop for CandidateReset {
+    fn drop(&mut self) {
+        CANDIDATE_ASSETS.with(|slot| *slot.borrow_mut() = None);
+        CANDIDATE_CACHE_WRITES.with(|slot| *slot.borrow_mut() = None);
+        CANDIDATE_CACHE_INPUTS.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+struct CandidateRestore {
+    assets: Option<HashMap<PathBuf, PathBuf>>,
+    writes: Option<CacheWrites>,
+    inputs: Option<CacheInputs>,
+}
+
+impl Drop for CandidateRestore {
+    fn drop(&mut self) {
+        if let Some(assets) = self.assets.take() {
+            CANDIDATE_ASSETS.with(|slot| *slot.borrow_mut() = Some(assets));
+        }
+        if let Some(writes) = self.writes.take() {
+            CANDIDATE_CACHE_WRITES.with(|slot| *slot.borrow_mut() = Some(writes));
+        }
+        if let Some(inputs) = self.inputs.take() {
+            CANDIDATE_CACHE_INPUTS.with(|slot| *slot.borrow_mut() = Some(inputs));
+        }
+    }
+}
+
+/// Run a live-routing call with any candidate overlay removed, so a nested query reads committed assets rather than bytes a refresh has not published.
+pub(crate) fn with_committed_assets<T>(build: impl FnOnce() -> T) -> T {
+    let _restore = CandidateRestore {
+        assets: CANDIDATE_ASSETS.with(|slot| slot.borrow_mut().take()),
+        writes: CANDIDATE_CACHE_WRITES.with(|slot| slot.borrow_mut().take()),
+        inputs: CANDIDATE_CACHE_INPUTS.with(|slot| slot.borrow_mut().take()),
+    };
+    build()
+}
+
+fn candidate_asset(path: &Path) -> Option<PathBuf> {
+    candidate_asset_entry(path).or_else(|| candidate_asset_referent(path))
+}
+
+fn candidate_asset_entry(path: &Path) -> Option<PathBuf> {
+    CANDIDATE_ASSETS.with(|slot| {
+        let slot = slot.borrow();
+        let files = slot.as_ref()?;
+        files
+            .get(path)
+            .or_else(|| entry_key(path).and_then(|key| files.get(&key)))
+            .cloned()
+    })
+}
+
+fn candidate_asset_referent(path: &Path) -> Option<PathBuf> {
+    CANDIDATE_ASSETS.with(|slot| {
+        let slot = slot.borrow();
+        let files = slot.as_ref()?;
+        let mut current = path.to_path_buf();
+        let staged = |path: &Path| {
+            files
+                .get(path)
+                .or_else(|| entry_key(path).and_then(|key| files.get(&key)))
+                .cloned()
+        };
+        for _ in 0..32 {
+            if let Some(staged) = staged(&current) {
+                return Some(staged);
+            }
+            let Ok(meta) = std::fs::symlink_metadata(&current) else {
+                break;
+            };
+            if !meta.file_type().is_symlink() {
+                break;
+            }
+            let Ok(target) = std::fs::read_link(&current) else {
+                break;
+            };
+            current = if target.is_absolute() {
+                target
+            } else {
+                current
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(target)
+            };
+        }
+        staged(&current)
+    })
+}
+
+/// The entry a swap replaces: the real path with a final-component symlink resolved, so an alias spelling and the refreshed spelling name the same staged file; an entry not yet on disk keeps its real parent.
+pub(crate) fn asset_key(path: &Path) -> Option<PathBuf> {
+    if let Ok(real) = std::fs::canonicalize(path) {
+        return Some(real);
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let parent = std::fs::canonicalize(parent.unwrap_or_else(|| Path::new("."))).ok()?;
+    Some(parent.join(path.file_name()?))
+}
+
+/// The directory entry a path names, with the parent canonicalized but the final name kept: a directory symlink is the same entry, a final-component symlink is not.
+pub(crate) fn entry_key(path: &Path) -> Option<PathBuf> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let parent = std::fs::canonicalize(parent.unwrap_or_else(|| Path::new("."))).ok()?;
+    let name = path.file_name()?;
+    // NTFS and default APFS directories compare names without case unless the volume opted into case sensitivity.
+    let fold = if cfg!(windows) {
+        !windows_case_sensitive(&parent)
+    } else if cfg!(target_os = "macos") {
+        macos_case_insensitive(&parent)
+    } else {
+        false
+    };
+    let name = if fold {
+        std::ffi::OsString::from(name.to_string_lossy().to_lowercase())
+    } else {
+        name.to_os_string()
+    };
+    Some(parent.join(name))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_case_insensitive(dir: &Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+    let Ok(dir) = CString::new(dir.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `dir` is a live NUL-terminated path and `pathconf` only reads it.
+    unsafe { libc::pathconf(dir.as_ptr(), libc::_PC_CASE_SENSITIVE) == 0 }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_case_insensitive(_dir: &Path) -> bool {
+    false
+}
+
+/// Whether the directory opts into per-directory case sensitivity; a failed query keeps NTFS's default.
+#[cfg(windows)]
+fn windows_case_sensitive(dir: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    const FILE_SHARE_ALL: u32 = 0x7;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_CASE_SENSITIVE_INFO: i32 = 23;
+    const FILE_CS_FLAG_CASE_SENSITIVE_DIR: u32 = 1;
+    #[repr(C)]
+    struct CaseSensitive {
+        flags: u32,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandleEx(
+            handle: *mut core::ffi::c_void,
+            class: i32,
+            info: *mut core::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+    let Ok(file) = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_ALL)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)
+    else {
+        return false;
+    };
+    let mut info = CaseSensitive { flags: 0 };
+    // SAFETY: the handle is live, `info` is writable and its size is the class's structure.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FILE_CASE_SENSITIVE_INFO,
+            (&raw mut info).cast(),
+            std::mem::size_of::<CaseSensitive>() as u32,
+        )
+    };
+    ok != 0 && info.flags & FILE_CS_FLAG_CASE_SENSITIVE_DIR != 0
+}
+
+#[cfg(not(windows))]
+fn windows_case_sensitive(_dir: &Path) -> bool {
+    false
+}
+
+/// Resolve a rule-set path in normal search order, taking a queued write for the same directory entry before a live file so the candidate sees what publication will install.
+fn resolve_asset_with_queued(path: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    let mut candidates = Vec::with_capacity(dirs.len() + 1);
+    candidates.push(PathBuf::from(path));
+    candidates.extend(dirs.iter().map(|dir| dir.join(path)));
+    candidates.into_iter().find_map(|candidate| {
+        // The entry the path names wins over its symlink referent: publication installs its write before the referent's.
+        if candidate_cache_present(&candidate) {
+            return Some(candidate);
+        }
+        if let Some(staged) = candidate_asset_entry(&candidate) {
+            return Some(staged);
+        }
+        let symlink =
+            std::fs::symlink_metadata(&candidate).is_ok_and(|meta| meta.file_type().is_symlink());
+        if symlink {
+            if candidate_cache_present_referent(&candidate) {
+                return Some(candidate);
+            }
+            if let Some(staged) = candidate_asset_referent(&candidate) {
+                return Some(staged);
+            }
+        }
+        candidate.is_file().then_some(candidate)
+    })
+}
+
+/// The directory entry a rule-set path resolves to, independent of the staged file its candidate read uses.
+fn resolve_entry_with_queued(path: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    if path.contains("://") {
+        return None;
+    }
+    let mut candidates = Vec::with_capacity(dirs.len() + 1);
+    candidates.push(PathBuf::from(path));
+    candidates.extend(dirs.iter().map(|dir| dir.join(path)));
+    candidates.into_iter().find(|candidate| {
+        if candidate_cache_present(candidate) || candidate_asset_entry(candidate).is_some() {
+            return true;
+        }
+        let symlink =
+            std::fs::symlink_metadata(candidate).is_ok_and(|meta| meta.file_type().is_symlink());
+        if symlink && candidate_cache_present_referent(candidate) {
+            return true;
+        }
+        if symlink && candidate_asset_referent(candidate).is_some() {
+            return true;
+        }
+        candidate.is_file()
+    })
+}
+
+/// Bytes an earlier rule set in this candidate already queued for `path`, so a later local set reads the response the refresh validated instead of the file it is about to replace.
+fn entry_matches(path: &Path, queued: &Path) -> bool {
+    if queued == path {
+        return true;
+    }
+    let entry = entry_key(path);
+    entry.is_some() && entry_key(queued) == entry
+}
+
+fn referent_matches(path: &Path, queued: &Path) -> bool {
+    // A write through the entry a read's final symlink points at still reaches that read; a write through the symlink does not reach the target's own readers.
+    if !std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+        || std::fs::symlink_metadata(queued).is_ok_and(|meta| meta.file_type().is_symlink())
+    {
+        return false;
+    }
+    let Some(target) = resolve_link_target(path) else {
+        return false;
+    };
+    entry_key(&target).is_some_and(|target| entry_key(queued).as_ref() == Some(&target))
+}
+
+/// Walk a final-component symlink chain by its link text, so a referent a queued write has not created yet still resolves.
+fn resolve_link_target(path: &Path) -> Option<PathBuf> {
+    let mut current = path.to_path_buf();
+    for _ in 0..32 {
+        let Ok(meta) = std::fs::symlink_metadata(&current) else {
+            return Some(current);
+        };
+        if !meta.file_type().is_symlink() {
+            return Some(current);
+        }
+        let target = std::fs::read_link(&current).ok()?;
+        current = if target.is_absolute() {
+            target
+        } else {
+            current
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(target)
+        };
+    }
+    None
+}
+
+fn candidate_cache_bytes(path: &Path) -> Option<Result<Vec<u8>, String>> {
+    candidate_cache_bytes_tracked(path, true)
+}
+
+fn candidate_cache_bytes_tracked(path: &Path, record: bool) -> Option<Result<Vec<u8>, String>> {
+    candidate_cache_bytes_where(path, entry_matches, record)
+        .or_else(|| candidate_cache_bytes_where(path, referent_matches, record))
+}
+
+fn candidate_cache_bytes_where(
+    path: &Path,
+    matches: fn(&Path, &Path) -> bool,
+    record: bool,
+) -> Option<Result<Vec<u8>, String>> {
+    CANDIDATE_CACHE_WRITES.with(|slot| {
+        let slot = slot.borrow();
+        let writes = slot.as_ref()?;
+        writes
+            .iter()
+            .rev()
+            .find(|(queued, _)| matches(path, queued))
+            .map(|(queued, body)| {
+                let loaded = body.read();
+                if record && loaded.is_ok() {
+                    CANDIDATE_CACHE_INPUTS.with(|slot| {
+                        if let Some(inputs) = slot.borrow_mut().as_mut() {
+                            inputs.insert(queued.id);
+                        }
+                    });
+                }
+                loaded
+            })
+    })
+}
+
+fn candidate_cache_present(path: &Path) -> bool {
+    candidate_cache_present_where(path, entry_matches)
+}
+
+fn candidate_cache_present_referent(path: &Path) -> bool {
+    candidate_cache_present_where(path, referent_matches)
+}
+
+fn candidate_cache_present_where(path: &Path, matches: fn(&Path, &Path) -> bool) -> bool {
+    CANDIDATE_CACHE_WRITES.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|writes| writes.iter().any(|(queued, _)| matches(path, queued)))
+    })
+}
+
+fn publish_cache(target: PathBuf, body: CacheBody) -> Result<(), String> {
+    let mut queued = Some(CacheWrite {
+        id: NEXT_CACHE_WRITE.fetch_add(1, Ordering::Relaxed),
+        target,
+        body,
+    });
+    CANDIDATE_CACHE_WRITES.with(|slot| {
+        if let Some(writes) = slot.borrow_mut().as_mut() {
+            if let Some(item) = queued.take() {
+                writes.push(item);
+            }
+        }
+    });
+    match queued {
+        Some(write) => crate::geodata::write_atomic(&write.target, &write.body.into_bytes()?),
+        None => Ok(()),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Network {
@@ -337,6 +759,11 @@ fn rule_hit(rule: &Rule) -> RuleHit<'_> {
         target,
         webhook: rule.webhook.as_ref(),
     }
+}
+
+enum ScriptSource {
+    Resolve,
+    Reuse(Option<Arc<ScriptRouter>>),
 }
 
 /// One rule as `RoutingService.ListRule` lists it: the tag the rule names (empty when it names a
@@ -1098,8 +1525,116 @@ impl Routing {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    /// Fetch every remote rule set before a geodata refresh takes the live asset lock, so a slow
+    /// server delays the refresh rather than a route that needs the old snapshot.
+    pub(crate) fn prefetch_remote_sets(root: &Json) -> RemoteSetCache {
+        let mut found = HashMap::new();
+        let Some(block) = root.get("routing") else {
+            return found;
+        };
+        let Ok(pairs) = object(block, "routing") else {
+            return found;
+        };
+        let Some(raw_sets) = pairs.iter().rev().find_map(|(key, value)| {
+            matches!(
+                key.as_str(),
+                "ruleSet" | "ruleSets" | "rule_set" | "rule_sets"
+            )
+            .then_some(value)
+        }) else {
+            return found;
+        };
+        let Some(items) = raw_sets.as_arr() else {
+            return found;
+        };
+        for item in items {
+            let Ok(pairs) = object(item, "routing rule set") else {
+                continue;
+            };
+            let mut kind = None;
+            let mut url = None;
+            let mut path = None;
+            let mut has_rules = false;
+            for (key, value) in pairs {
+                match key.as_str() {
+                    "type" => kind = value.as_str().map(str::to_owned),
+                    "url" => url = value.as_str().map(str::to_owned),
+                    "path" => path = value.as_str().map(str::to_owned),
+                    "rules" => has_rules = true,
+                    _ => {}
+                }
+            }
+            let kind = kind.unwrap_or_else(|| {
+                if has_rules {
+                    "inline".to_owned()
+                } else if url.is_some() {
+                    "remote".to_owned()
+                } else {
+                    "local".to_owned()
+                }
+            });
+            if kind != "remote" {
+                continue;
+            }
+            let Some(url) = url.or_else(|| path.filter(|path| path.contains("://"))) else {
+                continue;
+            };
+            found.entry(url.clone()).or_insert_with(|| {
+                let bytes = crate::geodata::fetch_remote(&url)?;
+                match RemoteBody::stage(&bytes) {
+                    Ok(body) => Ok(body),
+                    Err(error) => {
+                        // A valid response that cannot be staged is not a fetch failure: keep it in memory rather than serve the stale fallback.
+                        eprintln!("routing rule set `{url}`: cannot stage the response: {error}; holding it in memory");
+                        Ok(RemoteBody::memory(bytes))
+                    }
+                }
+            });
+        }
+        found
+    }
+
     pub(crate) fn parse_in(root: &Json, dirs: Vec<PathBuf>) -> Result<Option<Self>, String> {
+        Self::parse_with(root, dirs, ScriptSource::Resolve, None)
+    }
+
+    /// A geodata refresh keeps the active script's saved source instead of reopening its file.
+    pub(crate) fn parse_in_reusing_script(
+        root: &Json,
+        dirs: Vec<PathBuf>,
+        script: Option<Arc<ScriptRouter>>,
+        remote: &RemoteSetCache,
+    ) -> Result<Option<Self>, String> {
+        Self::parse_with(root, dirs, ScriptSource::Reuse(script), Some(remote))
+    }
+
+    /// Whether a rule set is fetched from a URL, either named or inferred as `RuleSet::parse` does.
+    fn rule_set_is_remote(value: &Json) -> bool {
+        let Ok(pairs) = object(value, "routing rule set") else {
+            return false;
+        };
+        let kind = pairs
+            .iter()
+            .find_map(|(key, value)| (key.as_str() == "type").then_some(value.as_str()).flatten());
+        match kind {
+            Some("remote") => true,
+            Some(_) => false,
+            None => {
+                !pairs.iter().any(|(key, _)| key.as_str() == "rules")
+                    && pairs
+                        .iter()
+                        .any(|(key, value)| key.as_str() == "url" && value.as_str().is_some())
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn parse_with(
+        root: &Json,
+        dirs: Vec<PathBuf>,
+        source: ScriptSource,
+        remote: Option<&RemoteSetCache>,
+    ) -> Result<Option<Self>, String> {
         let Some(block) = root.get("routing") else {
             return Ok(None);
         };
@@ -1150,9 +1685,20 @@ impl Routing {
                 let items = value
                     .as_arr()
                     .ok_or_else(|| "routing rule set is not an array".to_owned())?;
-                let mut tags = HashSet::new();
+                let mut prepared: Vec<Option<RuleSet>> = Vec::with_capacity(items.len());
                 for item in items {
-                    let set = RuleSet::parse(item, &mut assets, &dirs)?;
+                    prepared.push(
+                        Self::rule_set_is_remote(item)
+                            .then(|| RuleSet::parse(item, &mut assets, &dirs, remote))
+                            .transpose()?,
+                    );
+                }
+                let mut tags = HashSet::new();
+                for (at, item) in items.iter().enumerate() {
+                    let set = match prepared[at].take() {
+                        Some(set) => set,
+                        None => RuleSet::parse(item, &mut assets, &dirs, remote)?,
+                    };
                     if !tags.insert(set.tag.clone()) {
                         return Err(format!("duplicate rule set tag `{}`", set.tag));
                     }
@@ -1168,7 +1714,23 @@ impl Routing {
                 if path.is_empty() {
                     return Err("routing script is empty".into());
                 }
-                Some(Arc::new(ScriptRouter::parse_in(path, dirs.clone())?))
+                match source {
+                    ScriptSource::Reuse(script) => script,
+                    ScriptSource::Resolve => {
+                        #[cfg(not(target_os = "ios"))]
+                        let script = Some(Arc::new(ScriptRouter::parse_in(path, dirs.clone())?));
+                        #[cfg(target_os = "ios")]
+                        let script = {
+                            // iOS cannot run Lua, so a config that names a script is refused before the inbound opens rather than forwarding what the script would block.
+                            let name = crate::router_script::resolve(path, &dirs).map_err(|reason| {
+                                format!("routing script `{path}` cannot be enforced on iOS: {reason}")
+                            })?;
+                            ScriptRouter::parse_resolved(&name)?;
+                            None
+                        };
+                        script
+                    }
+                }
             }
             _ => None,
         };
@@ -1241,13 +1803,6 @@ impl Routing {
             added_replaced: false,
             removed_tags: HashSet::new(),
         }))
-    }
-
-    /// Whether a script alone owns the decisions, so a geodata reload must leave the parsed table
-    /// alone: the script's own `xray.geodata` matchers read the files on every call. With rules
-    /// beside the script the table still needs rebuilding, because a script `null` falls through.
-    pub(crate) fn carries_script(&self) -> bool {
-        self.script.is_some() && self.rules.is_empty()
     }
 
     /// Move the runtime state a reparse cannot rebuild — a balancer's forced tag, weights and
@@ -2859,7 +3414,7 @@ fn read_ip_set(reader: &mut SrsReader<'_>, tag: &str) -> Result<RangeSet, String
                         "routing rule set `{tag}` IP set range is not a range"
                     ));
                 }
-                set.v6.push((from, to));
+                set.add_v6_range(from, to)?;
             }
             _ => {
                 return Err(format!(
@@ -2898,7 +3453,12 @@ impl RuleSet {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn parse(value: &Json, assets: &mut Assets, dirs: &[PathBuf]) -> Result<Self, String> {
+    fn parse(
+        value: &Json,
+        assets: &mut Assets,
+        dirs: &[PathBuf],
+        remote: Option<&RemoteSetCache>,
+    ) -> Result<Self, String> {
         let pairs = object(value, "routing rule set")?;
         let mut tag = None;
         let mut kind = None;
@@ -2945,6 +3505,7 @@ impl RuleSet {
         let mut body = None;
         let mut bytes = None;
         let mut cache = None;
+        let mut staged = None;
         match kind.as_str() {
             "inline" => {
                 if format
@@ -2963,11 +3524,17 @@ impl RuleSet {
             }
             "local" | "file" => {
                 let path = path.ok_or_else(|| format!("routing rule set `{tag}` has no path"))?;
-                let file = resolve_asset_path(&path, dirs)
+                let file = resolve_asset_with_queued(&path, dirs)
                     .ok_or_else(|| format!("routing rule set `{tag}` path `{path}` not found"))?;
-                bytes = Some(std::fs::read(&file).map_err(|error| {
-                    format!("routing rule set `{tag}` cannot be read: {error}")
-                })?);
+                bytes = Some(match candidate_cache_bytes(&file) {
+                    Some(Ok(bytes)) => bytes,
+                    Some(Err(error)) => {
+                        return Err(format!("routing rule set `{tag}` cannot be read: {error}"));
+                    }
+                    None => std::fs::read(&file).map_err(|error| {
+                        format!("routing rule set `{tag}` cannot be read: {error}")
+                    })?,
+                });
             }
             "remote" => {
                 let url = url
@@ -2979,11 +3546,24 @@ impl RuleSet {
                     .ok_or_else(|| format!("routing rule set `{tag}` has no url"))?;
                 let fallback = path
                     .as_deref()
-                    .and_then(|path| resolve_asset_path(path, dirs));
-                cache = fallback
-                    .clone()
-                    .or_else(|| cache_path(path.as_deref(), dirs));
-                match crate::geodata::fetch_remote(&url) {
+                    .and_then(|path| resolve_asset_with_queued(path, dirs));
+                // The configured destination stays logical: the staged path only reads candidate fallback bytes.
+                cache = path
+                    .as_deref()
+                    .and_then(|path| resolve_entry_with_queued(path, dirs))
+                    .or_else(|| cache_path(path.as_deref(), dirs))
+                    .or_else(|| fallback.clone());
+                let fetched = match remote.and_then(|sets| sets.get(&url)) {
+                    Some(result) => match result.as_ref() {
+                        Ok(fetched) => {
+                            staged = Some(fetched.clone());
+                            fetched.read()
+                        }
+                        Err(error) => Err(error.clone()),
+                    },
+                    None => crate::geodata::fetch_remote(&url),
+                };
+                match fetched {
                     Ok(fetched) => {
                         bytes = Some(fetched);
                     }
@@ -2998,9 +3578,17 @@ impl RuleSet {
                             file.display()
                         );
                         cache = None;
-                        bytes = Some(std::fs::read(&file).map_err(|error| {
-                            format!("routing rule set `{tag}` cannot be read: {error}")
-                        })?);
+                        bytes = Some(match candidate_cache_bytes(&file) {
+                            Some(Ok(bytes)) => bytes,
+                            Some(Err(error)) => {
+                                return Err(format!(
+                                    "routing rule set `{tag}` cannot be read: {error}"
+                                ));
+                            }
+                            None => std::fs::read(&file).map_err(|error| {
+                                format!("routing rule set `{tag}` cannot be read: {error}")
+                            })?,
+                        });
                     }
                 }
             }
@@ -3034,8 +3622,9 @@ impl RuleSet {
                 parse_source_rules(&body, &tag, assets)?
             }
         };
-        if let (Some(cache), Some(bytes)) = (cache, bytes.as_deref()) {
-            if let Err(error) = crate::geodata::write_atomic(&cache, bytes) {
+        if let (Some(cache), Some(bytes)) = (cache, bytes) {
+            let source = staged.map_or_else(|| CacheBody::Bytes(bytes), CacheBody::Staged);
+            if let Err(error) = publish_cache(cache, source) {
                 eprintln!("routing rule set `{tag}` cache: {error}");
             }
         }
@@ -4009,12 +4598,28 @@ impl IpMatcher {
             set.matches(ip, reverse)
         })
     }
+
+    /// A list matches only when one set, with its own reverse applied, accepts every address.
+    pub(crate) fn matches_all_override(
+        &self,
+        ips: &[IpAddr],
+        reverse: Option<bool>,
+        flip: bool,
+    ) -> bool {
+        !ips.is_empty()
+            && self.sets.iter().any(|(set, own)| {
+                let reverse = reverse.unwrap_or(if flip { !*own } else { *own });
+                ips.iter().all(|ip| set.matches(*ip, reverse))
+            })
+    }
 }
 
 #[derive(Debug, Default, Clone)]
 struct RangeSet {
     v4: Vec<(u32, u32)>,
     v6: Vec<(u128, u128)>,
+    mapped: Vec<(u128, u128)>,
+    mapped_wide: Vec<(u128, u128)>,
 }
 
 impl RangeSet {
@@ -4044,8 +4649,29 @@ impl RangeSet {
                     u128::MAX << (128 - prefix)
                 };
                 let start = host & mask;
-                self.v6.push((start, start | !mask));
+                let end = start | !mask;
+                self.v6.push((start, end));
+                if start >= MAPPED_BASE && end <= MAPPED_BASE + u128::from(u32::MAX) {
+                    self.mapped.push((start, end));
+                } else if end >= MAPPED_BASE && start <= MAPPED_BASE + u128::from(u32::MAX) {
+                    self.mapped_wide.push((start, end));
+                }
             }
+        }
+        Ok(())
+    }
+
+    /// Add an arbitrary IPv6 range, classing the part inside the mapped block so a mapped input matches it.
+    fn add_v6_range(&mut self, start: u128, end: u128) -> Result<(), String> {
+        if end < start {
+            return Err("IPv6 range is not a range".to_owned());
+        }
+        self.v6.push((start, end));
+        let mapped_end = MAPPED_BASE + u128::from(u32::MAX);
+        if start >= MAPPED_BASE && end <= mapped_end {
+            self.mapped.push((start, end));
+        } else if start <= mapped_end && end >= MAPPED_BASE {
+            self.mapped_wide.push((start, end));
         }
         Ok(())
     }
@@ -4055,6 +4681,10 @@ impl RangeSet {
         self.v4 = merge(&self.v4);
         self.v6.sort_unstable();
         self.v6 = merge(&self.v6);
+        self.mapped.sort_unstable();
+        self.mapped = merge(&self.mapped);
+        self.mapped_wide.sort_unstable();
+        self.mapped_wide = merge(&self.mapped_wide);
     }
 
     fn ranges(&self) -> Vec<(IpAddr, IpAddr)> {
@@ -4076,20 +4706,45 @@ impl RangeSet {
     }
 
     fn matches(&self, ip: IpAddr, reverse: bool) -> bool {
+        let mut named = false;
+        let mut hit = false;
         match ip {
             IpAddr::V4(ip) => {
-                if self.v4.is_empty() {
-                    return false;
+                if !self.v4.is_empty() {
+                    named = true;
+                    hit = contains(&self.v4, u32::from(ip));
                 }
-                contains(&self.v4, u32::from(ip)) != reverse
-            }
-            IpAddr::V6(ip) => {
-                if self.v6.is_empty() {
-                    return false;
+                let mapped = u128::from(ip.to_ipv6_mapped());
+                if !self.mapped.is_empty() {
+                    named = true;
+                    hit |= contains(&self.mapped, mapped);
                 }
-                contains(&self.v6, u128::from(ip)) != reverse
             }
+            IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+                Some(ip) => {
+                    if !self.v4.is_empty() {
+                        named = true;
+                        hit = contains(&self.v4, u32::from(ip));
+                    }
+                    let mapped = u128::from(ip.to_ipv6_mapped());
+                    if !self.mapped.is_empty() {
+                        named = true;
+                        hit |= contains(&self.mapped, mapped);
+                    }
+                    if !self.mapped_wide.is_empty() {
+                        named = true;
+                        hit |= contains(&self.mapped_wide, mapped);
+                    }
+                }
+                None => {
+                    if !self.v6.is_empty() {
+                        named = true;
+                        hit |= contains(&self.v6, u128::from(ip));
+                    }
+                }
+            },
         }
+        named && hit != reverse
     }
 }
 
@@ -4114,6 +4769,9 @@ fn contains<T: Copy + Ord>(ranges: &[(T, T)], value: T) -> bool {
     let at = ranges.partition_point(|&(_, end)| end < value);
     ranges.get(at).is_some_and(|&(start, _)| start <= value)
 }
+
+/// `::ffff:0:0/96`, the block whose ranges also name IPv4 addresses.
+const MAPPED_BASE: u128 = 0xffff_0000_0000;
 
 #[derive(Debug, Default)]
 struct PortSet {
@@ -4337,16 +4995,6 @@ fn has_domain_prefix(value: &str) -> bool {
     .any(|prefix| value.starts_with(prefix))
 }
 
-pub(crate) fn resolve_asset_path(path: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
-    let direct = PathBuf::from(path);
-    if direct.is_file() {
-        return Some(direct);
-    }
-    dirs.iter()
-        .map(|dir| dir.join(path))
-        .find(|path| path.is_file())
-}
-
 pub(crate) fn add_domain(
     matcher: &mut DomainMatcher,
     value: &str,
@@ -4509,10 +5157,22 @@ fn add_ip_rule(
     }
     let (ip, prefix) = parse_cidr(value)?;
     let mut set = RangeSet::default();
-    set.add(ip, prefix)?;
+    match ip {
+        IpAddr::V4(ip) => set.add(IpAddr::V4(ip), prefix)?,
+        IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+            // A mapped prefix at 96+ keeps its IPv6 range too, so a reverse rule names native IPv6 the same way a GeoIP mapped range does.
+            Some(_) if prefix >= 96 => set.add(IpAddr::V6(ip), prefix)?,
+            // Shorter mapped prefixes are the IPv4 prefix in a mapped spelling, as they were before.
+            Some(v4) if prefix <= 32 => set.add(IpAddr::V4(v4), prefix)?,
+            // Prefixes 33 through 95 cannot name an IPv4 width; they stay the IPv6 range they spell.
+            _ => set.add(IpAddr::V6(ip), prefix)?,
+        },
+    }
     let target = if reverse { negative } else { positive };
     target.v4.extend(set.v4);
     target.v6.extend(set.v6);
+    target.mapped.extend(set.mapped);
+    target.mapped_wide.extend(set.mapped_wide);
     Ok(())
 }
 
@@ -4647,11 +5307,10 @@ struct DomainEntry {
 type SiteCache = HashMap<(String, String, String), Arc<Vec<DomainEntry>>>;
 type IpCache = HashMap<(String, String), Arc<Vec<(IpAddr, u32)>>>;
 
-/// A container read into an anonymous mapping rather than the allocator's large zone. `geoip.dat`
-/// is many megabytes on a real install, and a freed `Vec` that size can stay resident in the
-/// process; unmapping returns the pages to the kernel as soon as startup is done.
+/// A container read as an immutable snapshot in a private mapping: a freed large `Vec` can stay
+/// resident, while dropping the mapping returns the pages to the kernel.
 #[cfg(unix)]
-struct AssetBytes {
+pub(crate) struct AssetBytes {
     ptr: *mut u8,
     len: usize,
 }
@@ -4664,8 +5323,6 @@ const MAP_ANON: libc::c_int = libc::MAP_ANON;
 #[cfg(unix)]
 impl AssetBytes {
     fn read(path: &Path) -> Result<Self, String> {
-        use std::io::Read as _;
-
         let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
         let len = usize::try_from(file.metadata().map_err(|error| error.to_string())?.len())
             .map_err(|_| "asset is larger than this address space".to_owned())?;
@@ -4725,8 +5382,14 @@ impl Drop for AssetBytes {
     }
 }
 
+// SAFETY: the mapping is immutable after `read`, and `Drop` needs exclusive ownership.
+#[cfg(unix)]
+unsafe impl Send for AssetBytes {}
+#[cfg(unix)]
+unsafe impl Sync for AssetBytes {}
+
 #[cfg(not(unix))]
-struct AssetBytes {
+pub(crate) struct AssetBytes {
     bytes: Vec<u8>,
 }
 
@@ -4748,9 +5411,139 @@ impl std::ops::Deref for AssetBytes {
     }
 }
 
+/// A prefetched remote body, normally on disk so a refresh holds one response at a time rather than
+/// every URL's bytes in RAM. A response that cannot be staged stays in memory rather than being
+/// mistaken for a failed fetch. The temporary directory is removed when the last clone is dropped.
+#[derive(Clone)]
+pub(crate) struct RemoteBody {
+    temp: Option<Arc<RemoteTemp>>,
+    memory: Option<Arc<Vec<u8>>>,
+}
+
+struct RemoteTemp {
+    dir: PathBuf,
+    file: std::sync::Mutex<Option<std::fs::File>>,
+}
+
+impl RemoteTemp {
+    fn create() -> Result<Self, String> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |stamp| stamp.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-rule-set-{}-{stamp}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        #[cfg(unix)]
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(not(unix))]
+        let builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            builder.mode(0o700);
+        }
+        builder
+            .create(&dir)
+            .map_err(|error| format!("stage remote rule set: {error}"))?;
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(dir.join("body"))
+        {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(format!("stage remote rule set: {error}"));
+            }
+        };
+        Ok(Self {
+            dir,
+            file: std::sync::Mutex::new(Some(file)),
+        })
+    }
+
+    fn write(&self, bytes: &[u8]) -> Result<(), String> {
+        let mut file = self
+            .file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        file.as_mut()
+            .ok_or_else(|| "staged rule set is closed".to_owned())?
+            .write_all(bytes)
+            .map_err(|error| format!("stage remote rule set: {error}"))
+    }
+
+    fn read(&self) -> Result<Vec<u8>, String> {
+        let file = self
+            .file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut file = file
+            .as_ref()
+            .ok_or_else(|| "staged rule set is closed".to_owned())?
+            .try_clone()
+            .map_err(|error| format!("read staged rule set: {error}"))?;
+        file.seek(std::io::SeekFrom::Start(0))
+            .map_err(|error| format!("read staged rule set: {error}"))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|error| format!("read staged rule set: {error}"))?;
+        Ok(bytes)
+    }
+}
+
+impl Drop for RemoteTemp {
+    fn drop(&mut self) {
+        let file = self
+            .file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(file);
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+impl RemoteBody {
+    fn stage(bytes: &[u8]) -> Result<Self, String> {
+        let temp = RemoteTemp::create()?;
+        temp.write(bytes)?;
+        Ok(Self {
+            temp: Some(Arc::new(temp)),
+            memory: None,
+        })
+    }
+
+    fn memory(bytes: Vec<u8>) -> Self {
+        Self {
+            temp: None,
+            memory: Some(Arc::new(bytes)),
+        }
+    }
+
+    fn read(&self) -> Result<Vec<u8>, String> {
+        if let Some(temp) = &self.temp {
+            return temp.read();
+        }
+        self.memory
+            .as_ref()
+            .map(|bytes| (**bytes).clone())
+            .ok_or_else(|| "staged rule set is closed".to_owned())
+    }
+}
+
+pub(crate) type RemoteSetCache = HashMap<String, Result<RemoteBody, String>>;
+
+pub(crate) type AssetCache = Arc<std::sync::Mutex<HashMap<PathBuf, Arc<AssetBytes>>>>;
+
 pub(crate) struct Assets {
     dirs: Vec<PathBuf>,
-    files: HashMap<PathBuf, Rc<AssetBytes>>,
+    files: HashMap<PathBuf, Arc<AssetBytes>>,
+    shared: Option<AssetCache>,
     sites: SiteCache,
     ips: IpCache,
 }
@@ -4760,27 +5553,84 @@ impl Assets {
         Self {
             dirs,
             files: HashMap::new(),
+            shared: None,
             sites: HashMap::new(),
             ips: HashMap::new(),
         }
     }
 
-    fn file(&mut self, file: &str) -> Result<Rc<AssetBytes>, String> {
+    pub(crate) fn cached(dirs: Vec<PathBuf>, shared: AssetCache) -> Self {
+        Self {
+            dirs,
+            files: HashMap::new(),
+            shared: Some(shared),
+            sites: HashMap::new(),
+            ips: HashMap::new(),
+        }
+    }
+
+    fn file(&mut self, file: &str) -> Result<Arc<AssetBytes>, String> {
         if !is_local_asset(file) {
             return Err(format!("asset `{file}` is not a local path"));
         }
+        let shared_has = |path: &PathBuf| {
+            self.shared.as_ref().is_some_and(|shared| {
+                shared
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_key(path)
+            })
+        };
         let path = self
             .dirs
             .iter()
             .map(|dir| dir.join(file))
-            .find(|path| path.is_file())
+            .find(|path| candidate_asset(path).is_some() || path.is_file() || shared_has(path))
             .ok_or_else(|| format!("asset `{file}` was not found under the asset directories"))?;
-        if let Some(bytes) = self.files.get(&path) {
-            return Ok(Rc::clone(bytes));
+        if let Some(staged) = candidate_asset(&path) {
+            // The candidate reads the staged bytes but keys them by the public entry publication will install, so a later pool miss reuses this snapshot.
+            if let Some(bytes) = self.files.get(&path) {
+                return Ok(Arc::clone(bytes));
+            }
+            let bytes = Arc::new(
+                AssetBytes::read(&staged).map_err(|error| format!("asset `{file}`: {error}"))?,
+            );
+            if let Some(shared) = &self.shared {
+                shared
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(path.clone(), Arc::clone(&bytes));
+            }
+            self.files.insert(path, Arc::clone(&bytes));
+            return Ok(bytes);
         }
-        let bytes = AssetBytes::read(&path).map_err(|error| format!("asset `{file}`: {error}"))?;
-        let bytes = Rc::new(bytes);
-        self.files.insert(path, Rc::clone(&bytes));
+        if let Some(bytes) = self.files.get(&path) {
+            return Ok(Arc::clone(bytes));
+        }
+        if let Some(shared) = &self.shared {
+            let shared = shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(bytes) = shared.get(&path) {
+                let bytes = Arc::clone(bytes);
+                self.files.insert(path.clone(), Arc::clone(&bytes));
+                return Ok(bytes);
+            }
+        }
+        let bytes =
+            Arc::new(AssetBytes::read(&path).map_err(|error| format!("asset `{file}`: {error}"))?);
+        if let Some(shared) = &self.shared {
+            let mut shared = shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let stored = shared
+                .entry(path.clone())
+                .or_insert_with(|| Arc::clone(&bytes));
+            let stored = Arc::clone(stored);
+            self.files.insert(path, Arc::clone(&stored));
+            return Ok(stored);
+        }
+        self.files.insert(path, Arc::clone(&bytes));
         Ok(bytes)
     }
 
@@ -5091,26 +5941,40 @@ pub(crate) fn resolve_ips_script(
     fake: bool,
     v4: bool,
     v6: bool,
-) -> (Vec<IpAddr>, u32) {
+) -> (Vec<IpAddr>, u32, Option<String>) {
     if let Some(resolver) = crate::dnsapp::installed() {
-        if let Some(answer) = resolver.lookup_families(host, v4, v6, fake) {
-            return answer;
-        }
+        return match resolver.lookup_outcome(host, v4, v6, fake) {
+            crate::dnsapp::Lookup::Records(addrs, ttl) => (addrs, ttl, None),
+            crate::dnsapp::Lookup::Rcode(code) => {
+                (Vec::new(), 0, Some(format!("response code {code}")))
+            }
+            crate::dnsapp::Lookup::Empty => (Vec::new(), 0, Some("empty response".to_owned())),
+            crate::dnsapp::Lookup::Skipped | crate::dnsapp::Lookup::Failed => {
+                let (addrs, ttl) = resolve_ips_system(host, port, v4, v6);
+                (addrs, ttl, None)
+            }
+        };
     }
-    resolve_ips_system(host, port, v4, v6)
+    let (addrs, ttl) = resolve_ips_system(host, port, v4, v6);
+    (addrs, ttl, None)
 }
 
-fn resolve_ips_system(host: &str, port: u16, v4: bool, v6: bool) -> (Vec<IpAddr>, u32) {
+pub(crate) fn resolve_ips_system(host: &str, port: u16, v4: bool, v6: bool) -> (Vec<IpAddr>, u32) {
     use std::net::ToSocketAddrs;
-    let ips = (host, port)
-        .to_socket_addrs()
-        .map(|addrs| {
-            addrs
-                .map(|addr| addr.ip())
-                .filter(|ip| (v4 && ip.is_ipv4()) || (v6 && ip.is_ipv6()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let budget = crate::dnsapp::system_budget(crate::budgets::dial());
+    if budget.is_zero() {
+        return (Vec::new(), 0);
+    }
+    let ips = crate::proxy::resolve_bounded(host, port, budget, |host, port| {
+        (host, port)
+            .to_socket_addrs()
+            .map(std::iter::Iterator::collect)
+    })
+    .unwrap_or_default()
+    .into_iter()
+    .map(|addr| addr.ip())
+    .filter(|ip| (v4 && ip.is_ipv4()) || (v6 && ip.is_ipv6()))
+    .collect();
     (ips, 0)
 }
 
@@ -5351,6 +6215,24 @@ mod tests {
     }
 
     #[test]
+    fn a_staged_remote_body_reads_through_its_handle_and_cleans_up() {
+        let body = RemoteBody::stage(&[1, 2, 3]).expect("stages");
+        let dir = body.temp.as_ref().expect("staged on disk").dir.clone();
+        assert_eq!(body.read().expect("reads"), vec![1, 2, 3]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&dir)
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+        drop(body);
+        assert!(!dir.exists(), "the private staging directory is removed");
+    }
+
+    #[test]
     fn an_asset_container_reads_whole_including_its_last_byte() {
         let dir = dir();
         let path = dir.join("container.dat");
@@ -5362,6 +6244,65 @@ mod tests {
         std::fs::write(&empty, []).expect("writes");
         let bytes = AssetBytes::read(&empty).expect("reads");
         assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn a_remote_cache_write_waits_for_the_candidate_to_commit() {
+        let cache = dir().join("cache");
+        let (queued, writes, _) = with_candidate_assets(HashMap::new(), || {
+            publish_cache(cache.clone(), vec![1, 2, 3].into()).expect("queues");
+            cache.clone()
+        });
+        assert_eq!(queued, cache);
+        assert!(
+            !cache.exists(),
+            "the candidate did not touch the live cache"
+        );
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].target, cache);
+        let mut writes = writes;
+        let CacheWrite {
+            target: path, body, ..
+        } = writes.pop().expect("one queued write");
+        let bytes = body.into_bytes().expect("reads");
+        assert_eq!(bytes, vec![1, 2, 3]);
+        crate::geodata::write_atomic(&path, &bytes).expect("publishes");
+        assert_eq!(std::fs::read(&cache).expect("reads"), vec![1, 2, 3]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_staged_symlink_chain_reads_the_intermediate_target() {
+        let root = dir();
+        let data = root.join("data.dat");
+        std::fs::write(&data, b"live").expect("data");
+        let middle = root.join("middle");
+        let first = root.join("first");
+        std::os::unix::fs::symlink(&data, &middle).expect("middle");
+        std::os::unix::fs::symlink(&middle, &first).expect("first");
+        let staged = root.join("staged.dat");
+        std::fs::write(&staged, b"staged").expect("staged");
+        let candidate = HashMap::from([(middle, staged.clone())]);
+        let (found, _, _) = with_candidate_assets(candidate, || candidate_asset_referent(&first));
+        assert_eq!(found, Some(staged));
+    }
+
+    #[test]
+    fn a_staged_asset_does_not_override_an_earlier_asset_directory() {
+        let root = dir();
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(&first).expect("first");
+        std::fs::create_dir_all(&second).expect("second");
+        std::fs::write(first.join("geosite.dat"), b"first").expect("first asset");
+        std::fs::write(second.join("geosite.dat"), b"second").expect("second asset");
+        let staged = root.join("staged");
+        std::fs::write(&staged, b"staged").expect("staged asset");
+        let candidate = HashMap::from([(second.join("geosite.dat"), staged)]);
+        let mut assets = Assets::new(vec![first, second]);
+        let (bytes, writes, _) = with_candidate_assets(candidate, || assets.file("geosite.dat"));
+        assert_eq!(&**bytes.expect("reads"), b"first");
+        assert!(writes.is_empty());
     }
 
     #[test]
@@ -5727,6 +6668,92 @@ mod tests {
             routing.route(&flow("10.0.0.1".parse().expect("ip"))),
             Some("direct")
         );
+    }
+
+    #[test]
+    fn a_mapped_geoip_range_matches_beside_a_native_default() {
+        let mut set = RangeSet::default();
+        set.add("::ffff:192.0.2.0".parse().expect("ip"), 120)
+            .expect("adds");
+        set.finish();
+        assert!(set.matches("192.0.2.1".parse().expect("ip"), false));
+        assert!(!set.matches("198.51.100.1".parse().expect("ip"), false));
+        set.add("::".parse().expect("ip"), 0).expect("adds");
+        set.finish();
+        assert!(set.matches("192.0.2.1".parse().expect("ip"), false));
+        assert!(
+            !set.matches("198.51.100.1".parse().expect("ip"), false),
+            "a native IPv6 default capture does not match IPv4"
+        );
+        assert!(set.matches("2001:db8::1".parse().expect("ip"), false));
+    }
+
+    #[test]
+    fn a_native_default_matches_mapped_input_in_both_forms() {
+        let mapped: IpAddr = "::ffff:198.51.100.1".parse().expect("ip");
+        let mut source = RangeSet::default();
+        source.add("::".parse().expect("ip"), 0).expect("adds");
+        source.finish();
+        assert!(source.matches(mapped, false));
+        let mut srs = RangeSet::default();
+        srs.add_v6_range(0, u128::MAX).expect("adds");
+        srs.finish();
+        assert!(srs.matches(mapped, false));
+    }
+
+    #[test]
+    fn an_arbitrary_mapped_v6_range_matches_an_ipv4_input() {
+        let mut set = RangeSet::default();
+        let start = MAPPED_BASE + u128::from(u32::from(std::net::Ipv4Addr::new(192, 0, 2, 0)));
+        set.add_v6_range(start, start + 255).expect("adds");
+        set.finish();
+        assert!(set.matches("192.0.2.1".parse().expect("ip"), false));
+        assert!(!set.matches("198.51.100.1".parse().expect("ip"), false));
+        assert!(set.matches("::ffff:192.0.2.1".parse().expect("ip"), false));
+    }
+
+    #[test]
+    fn a_mapped_input_matches_the_wide_mapped_rule_it_spells() {
+        let mut set = RangeSet::default();
+        set.add("::ffff:0:0".parse().expect("ip"), 95)
+            .expect("adds");
+        set.finish();
+        assert!(set.matches("::ffff:192.0.2.1".parse().expect("ip"), false));
+        assert!(!set.matches("192.0.2.1".parse().expect("ip"), false));
+        assert!(!set.matches("198.51.100.1".parse().expect("ip"), false));
+        assert!(!set.matches("2001:db8::1".parse().expect("ip"), false));
+    }
+
+    #[test]
+    fn a_wide_mapped_rule_routes_mapped_input_through_parse() {
+        let root = object(vec![(
+            "routing",
+            routing(vec![rule(
+                "direct",
+                vec![("ip", array(vec![text("::ffff:0:0/95")]))],
+            )]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        let flow = |ip: &str| Flow {
+            network: Network::Tcp,
+            domain: None,
+            ip: Some(ip.parse().expect("ip")),
+            port: Some(443),
+            source: None,
+            source_port: 0,
+            local: None,
+            local_port: 0,
+            vless_route: 0,
+            inbound_tag: None,
+            protocol: None,
+            user: None,
+            attrs: None,
+            process: None,
+        };
+        assert_eq!(routing.route(&flow("::ffff:192.0.2.1")), Some("direct"));
+        assert_eq!(routing.route(&flow("192.0.2.1")), None);
     }
 
     #[test]
@@ -7654,7 +8681,6 @@ mod tests {
         let routing = Routing::parse_in(&root, vec![dir])
             .expect("parses")
             .expect("routing");
-        assert!(!routing.carries_script());
         let flow = Flow {
             network: Network::Tcp,
             domain: Some("x.test"),
@@ -8726,25 +9752,34 @@ mod tests {
             "routing",
             object(vec![("script", text("route.lua"))]),
         )]);
-        let routing = Routing::parse_in(&root, vec![dir])
-            .expect("parses")
-            .expect("routing");
-        assert_eq!(routing.source_refusal(Some("tun")), None);
-        let both = [Network::Tcp, Network::Udp];
-        let proof = ServerProof {
-            inbound: Some("server"),
-            default_direct: true,
-            networks: &both,
-            direct: Box::new(|_| true),
-            direct_policy: Box::new(|_| true),
-            portal_rule: Box::new(|_| false),
-            candidates: &HashMap::new(),
-            fallbacks: &HashMap::new(),
-        };
-        let error = routing
-            .server_routes(&proof)
-            .expect_err("a server inbound cannot evaluate a script");
-        assert!(error.contains("script"), "{error}");
+        #[cfg(not(target_os = "ios"))]
+        {
+            let routing = Routing::parse_in(&root, vec![dir])
+                .expect("parses")
+                .expect("routing");
+            assert_eq!(routing.source_refusal(Some("tun")), None);
+            let both = [Network::Tcp, Network::Udp];
+            let proof = ServerProof {
+                inbound: Some("server"),
+                default_direct: true,
+                networks: &both,
+                direct: Box::new(|_| true),
+                direct_policy: Box::new(|_| true),
+                portal_rule: Box::new(|_| false),
+                candidates: &HashMap::new(),
+                fallbacks: &HashMap::new(),
+            };
+            let error = routing
+                .server_routes(&proof)
+                .expect_err("a server inbound cannot evaluate a script");
+            assert!(error.contains("script"), "{error}");
+        }
+        #[cfg(target_os = "ios")]
+        {
+            let error = Routing::parse_in(&root, vec![dir])
+                .expect_err("iOS refuses a config that names a script");
+            assert!(error.contains("cannot be enforced"), "{error}");
+        }
     }
 
     #[test]

@@ -5,13 +5,16 @@
 
 use crate::conn::Connection;
 use crate::h2::{
-    block_encode, frame_head, read_head, Decoder, F_ACK, F_END, F_END_HEADERS, F_PADDED,
+    block_encode, frame_head, read_head_bounded, Decoder, F_ACK, F_END, F_END_HEADERS, F_PADDED,
     F_PRIORITY, T_CONT, T_DATA, T_GOAWAY, T_HEADERS, T_PING, T_RST, T_SETTINGS,
 };
 use crate::sockopt::SocketOptions;
 use ferrox_core::tls::TlsProvider as _;
 use std::io::{Read, Write};
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
+
+const H2_FRAME_MAX: usize = 16_384;
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn udp(
@@ -30,10 +33,37 @@ pub(crate) fn udp(
             Err(error) => return Err(error),
         }
     }
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    let routes = crate::tun_route::route_read();
+    crate::tun_route::force_underlay();
     let socket = crate::sockopt::datagram(options, host, port, timeout)?;
     socket
         .send(query)
         .map_err(|error| format!("dns udp send: {error}"))?;
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    drop(routes);
+    let mut response = vec![0u8; ferrox_core::dns::MESSAGE_MAX];
+    let read = socket
+        .recv(&mut response)
+        .map_err(|error| format!("dns udp receive: {error}"))?;
+    response.truncate(read);
+    Ok(response)
+}
+
+pub(crate) fn udp_target(
+    target: SocketAddr,
+    query: &[u8],
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    let routes = crate::tun_route::route_read();
+    crate::tun_route::force_underlay();
+    let socket = crate::sockopt::datagram_target(target, timeout)?;
+    socket
+        .send(query)
+        .map_err(|error| format!("dns udp send: {error}"))?;
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    drop(routes);
     let mut response = vec![0u8; ferrox_core::dns::MESSAGE_MAX];
     let read = socket
         .recv(&mut response)
@@ -51,9 +81,17 @@ pub(crate) fn tcp(
     timeout: Duration,
     local: bool,
 ) -> Result<Vec<u8>, String> {
-    let mut stream = connect(host, port, tag, options, timeout, local)?;
+    let deadline = Instant::now() + timeout;
+    let mut stream = Timed {
+        inner: connect(host, port, tag, options, deadline, local)?,
+        deadline,
+    };
     write_frame(&mut stream, query)?;
-    read_frame(&mut stream)
+    let reply = read_frame(&mut stream)?;
+    if Instant::now() >= deadline {
+        return Err("dns deadline".to_owned());
+    }
+    Ok(reply)
 }
 
 pub(crate) fn tls(
@@ -65,7 +103,11 @@ pub(crate) fn tls(
     timeout: Duration,
     local: bool,
 ) -> Result<Vec<u8>, String> {
-    let stream = connect(host, port, tag, options, timeout, local)?;
+    let deadline = Instant::now() + timeout;
+    let stream = Timed {
+        inner: connect(host, port, tag, options, deadline, local)?,
+        deadline,
+    };
     let config = std::sync::Arc::new(ferrox_core::tls::TlsConfig {
         server_name: host.to_owned(),
         alpn: Vec::new().into(),
@@ -92,7 +134,11 @@ pub(crate) fn tls(
         .handshake()
         .map_err(|error| format!("dns tls handshake: {error}"))?;
     write_frame(&mut stream, query)?;
-    read_frame(&mut stream)
+    let reply = read_frame(&mut stream)?;
+    if Instant::now() >= deadline {
+        return Err("dns deadline".to_owned());
+    }
+    Ok(reply)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -114,9 +160,20 @@ pub(crate) fn doh(
         format!("{host}:{port}")
     };
     let scheme = if cleartext { "http" } else { "https" };
-    let stream = connect(host, port, tag, options, timeout, local)?;
+    let deadline = Instant::now() + timeout;
+    let stream = connect(host, port, tag, options, deadline, local)?;
     if cleartext {
-        return exchange(stream, &authority, scheme, path, query);
+        return exchange(
+            Timed {
+                inner: stream,
+                deadline,
+            },
+            &authority,
+            scheme,
+            path,
+            query,
+            deadline,
+        );
     }
     let config = std::sync::Arc::new(ferrox_core::tls::TlsConfig {
         server_name: host.to_owned(),
@@ -138,11 +195,17 @@ pub(crate) fn doh(
         padding: None,
         ..Default::default()
     });
-    let mut tls = ferrox_core::tls::RustlsProvider::connect(&config, stream)
-        .map_err(|error| format!("dns doh tls: {error}"))?;
+    let mut tls = ferrox_core::tls::RustlsProvider::connect(
+        &config,
+        Timed {
+            inner: stream,
+            deadline,
+        },
+    )
+    .map_err(|error| format!("dns doh tls: {error}"))?;
     tls.handshake()
         .map_err(|error| format!("dns doh handshake: {error}"))?;
-    exchange(tls, &authority, scheme, path, query)
+    exchange(Unbounded(tls), &authority, scheme, path, query, deadline)
 }
 
 pub(crate) fn doq(
@@ -192,9 +255,15 @@ fn connect(
     port: u16,
     tag: Option<&str>,
     options: Option<&SocketOptions>,
-    timeout: Duration,
+    deadline: Instant,
     local: bool,
 ) -> Result<Connection, String> {
+    let left = |deadline: Instant| {
+        deadline
+            .saturating_duration_since(Instant::now())
+            .max(std::time::Duration::from_millis(1))
+    };
+    let timeout = left(deadline);
     if !local {
         match crate::proxy::dns_stream(host, port, tag, timeout) {
             Ok(Some(stream)) => return Ok(stream),
@@ -202,9 +271,21 @@ fn connect(
             Err(error) => return Err(error),
         }
     }
-    Ok(Connection::Tcp(crate::sockopt::connect(
-        options, host, port, timeout,
-    )?))
+    let timeout = crate::dnsapp::system_deadline().map_or_else(
+        || left(deadline),
+        |absolute| left(deadline).min(left(absolute)),
+    );
+    crate::tun_route::force_underlay();
+    let stream = crate::dnsapp::with_system_deadline(deadline, || {
+        crate::sockopt::connect(options, host, port, timeout)
+    })?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|error| format!("dns stream timeout: {error}"))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|error| format!("dns stream write timeout: {error}"))?;
+    Ok(Connection::Tcp(stream))
 }
 
 fn write_frame(stream: &mut impl Write, query: &[u8]) -> Result<(), String> {
@@ -230,18 +311,93 @@ fn read_frame(stream: &mut impl Read) -> Result<Vec<u8>, String> {
     Ok(body)
 }
 
-fn exchange(
-    mut stream: impl Read + Write,
+/// Arm a stream's next read with the time left before the exchange deadline.
+trait ReadDeadline {
+    fn arm(&mut self, remaining: Duration) -> std::io::Result<()>;
+}
+
+impl ReadDeadline for Connection {
+    fn arm(&mut self, remaining: Duration) -> std::io::Result<()> {
+        self.set_read_timeout(Some(remaining))
+    }
+}
+
+/// A stream whose transport has no settable read timeout; the exchange still checks the deadline between reads.
+struct Unbounded<S>(S);
+
+impl<S> ReadDeadline for Unbounded<S> {
+    fn arm(&mut self, _remaining: Duration) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<S: Read> Read for Unbounded<S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl<S: Write> Write for Unbounded<S> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+struct Bounded<S> {
+    inner: S,
+    deadline: Instant,
+    expired: bool,
+}
+
+impl<S: Read + ReadDeadline> Read for Bounded<S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            self.expired = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "dns doh deadline",
+            ));
+        }
+        self.inner.arm(left)?;
+        match self.inner.read(buf) {
+            Ok(read) => Ok(read),
+            Err(error) => {
+                if error.kind() == std::io::ErrorKind::TimedOut {
+                    self.expired = true;
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
+impl<S: Write> Write for Bounded<S> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn send_doh(
+    stream: &mut impl Write,
     authority: &str,
     scheme: &str,
     path: &str,
     query: &[u8],
-) -> Result<Vec<u8>, String> {
+) -> Result<(), String> {
     let path = if path.is_empty() { "/" } else { path };
     stream
         .write_all(crate::h2::MAGIC)
         .map_err(|error| format!("dns doh preface: {error}"))?;
-    frame(&mut stream, T_SETTINGS, 0, 0, &[])?;
+    frame(stream, T_SETTINGS, 0, 0, &[])?;
     let length = query.len().to_string();
     let headers = [
         (":method", "POST"),
@@ -252,27 +408,104 @@ fn exchange(
         ("accept", "application/dns-message"),
         ("content-length", length.as_str()),
     ];
-    frame(
-        &mut stream,
-        T_HEADERS,
-        F_END_HEADERS,
-        1,
-        &block_encode(&headers),
-    )?;
-    frame(&mut stream, T_DATA, F_END, 1, query)?;
+    frame(stream, T_HEADERS, F_END_HEADERS, 1, &block_encode(&headers))?;
+    frame(stream, T_DATA, F_END, 1, query)?;
     stream
         .flush()
-        .map_err(|error| format!("dns doh flush: {error}"))?;
+        .map_err(|error| format!("dns doh flush: {error}"))
+}
+
+fn read_doh_frame<S: Read + ReadDeadline>(
+    stream: &mut Bounded<S>,
+) -> Result<(u8, u8, Vec<u8>, u32), String> {
+    let Some((len, kind, flags, id)) = read_head_bounded(stream) else {
+        return Err(if stream.expired {
+            "dns doh deadline".to_owned()
+        } else {
+            "dns doh closed".to_owned()
+        });
+    };
+    if len > H2_FRAME_MAX {
+        return Err("dns doh frame over the frame bound".to_owned());
+    }
+    let mut payload = vec![0u8; len];
+    if let Err(error) = stream.read_exact(&mut payload) {
+        return Err(if stream.expired {
+            "dns doh deadline".to_owned()
+        } else {
+            format!("dns doh read: {error}")
+        });
+    }
+    Ok((kind, flags, payload, id))
+}
+
+/// A connection that re-arms its socket timeout from one absolute deadline before every read and write, so a TLS handshake and the exchange behind it cannot each spend the whole budget.
+struct Timed {
+    inner: Connection,
+    deadline: Instant,
+}
+
+impl Timed {
+    fn left(&self) -> std::io::Result<Duration> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "dns deadline",
+            ));
+        }
+        Ok(left)
+    }
+}
+
+impl Read for Timed {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.set_read_timeout(Some(self.left()?))?;
+        self.inner.read(buf)
+    }
+}
+
+impl Write for Timed {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.set_write_timeout(Some(self.left()?))?;
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.set_write_timeout(Some(self.left()?))?;
+        self.inner.flush()
+    }
+}
+
+impl ReadDeadline for Timed {
+    fn arm(&mut self, _remaining: Duration) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn exchange(
+    stream: impl Read + Write + ReadDeadline,
+    authority: &str,
+    scheme: &str,
+    path: &str,
+    query: &[u8],
+    deadline: Instant,
+) -> Result<Vec<u8>, String> {
+    let mut stream = Bounded {
+        inner: stream,
+        deadline,
+        expired: false,
+    };
+    send_doh(&mut stream, authority, scheme, path, query)?;
     let mut decoder = Decoder::default();
     let mut block = Vec::new();
     let mut body = Vec::new();
     let mut status = None;
     loop {
-        let (len, kind, flags, id) = read_head(&mut stream).ok_or("dns doh closed")?;
-        let mut payload = vec![0u8; len];
-        stream
-            .read_exact(&mut payload)
-            .map_err(|error| format!("dns doh read: {error}"))?;
+        if Instant::now() >= deadline {
+            return Err("dns doh deadline".to_owned());
+        }
+        let (kind, flags, payload, id) = read_doh_frame(&mut stream)?;
         match kind {
             T_SETTINGS => {
                 if flags & F_ACK == 0 {
@@ -325,6 +558,9 @@ fn exchange(
             _ => {}
         }
     }
+    if Instant::now() >= deadline {
+        return Err("dns doh deadline".to_owned());
+    }
     match status.as_deref() {
         Some("200") => {}
         Some(other) => return Err(format!("dns doh answered {other}")),
@@ -367,7 +603,7 @@ fn frame(stream: &mut impl Write, kind: u8, flags: u8, id: u32, body: &[u8]) -> 
 mod tests {
     use super::{exchange, read_frame};
     use crate::h2::{
-        block_encode, frame_head, F_END, F_END_HEADERS, T_DATA, T_HEADERS, T_SETTINGS,
+        block_encode, frame_head, F_END, F_END_HEADERS, F_PADDED, T_DATA, T_HEADERS, T_SETTINGS,
     };
     use std::io::{Cursor, Read, Write};
 
@@ -393,6 +629,34 @@ mod tests {
     }
 
     #[test]
+    fn a_padded_data_frame_uses_the_h2_limit_before_the_dns_bound() {
+        let body = vec![0x5a; 8000];
+        let padding = 200usize;
+        let mut payload = vec![padding as u8];
+        payload.extend_from_slice(&body);
+        payload.resize(1 + body.len() + padding, 0);
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&frame_head(payload.len(), T_DATA, F_PADDED | F_END, 1));
+        wire.extend_from_slice(&payload);
+        let mut stream = super::Bounded {
+            inner: Wire {
+                read: Cursor::new(wire),
+            },
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+            expired: false,
+        };
+        let (kind, flags, payload, _) =
+            super::read_doh_frame(&mut stream).expect("a frame inside the H2 limit");
+        assert_eq!(kind, T_DATA);
+        assert_eq!(
+            super::unframe(flags, &payload, false)
+                .expect("unframes")
+                .len(),
+            body.len()
+        );
+    }
+
+    #[test]
     fn a_priority_flag_does_not_apply_to_data() {
         let data = [0, 0, 0, 0, 1, b'd', b'n', b's'];
         assert_eq!(
@@ -410,9 +674,101 @@ mod tests {
         read: Cursor<Vec<u8>>,
     }
 
+    struct Endless;
+
+    impl Read for Endless {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            buf.fill(0);
+            Ok(buf.len())
+        }
+    }
+
+    impl super::ReadDeadline for Endless {
+        fn arm(&mut self, _remaining: std::time::Duration) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Write for Endless {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct Trickle;
+
+    impl Read for Trickle {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            buf[0] = 0;
+            Ok(1)
+        }
+    }
+
+    impl Write for Trickle {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl super::ReadDeadline for Trickle {
+        fn arm(&mut self, _remaining: std::time::Duration) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A one-byte-per-call reader still stops at the absolute deadline, even inside a frame.
+    #[test]
+    fn a_trickling_doh_stream_ends_at_the_query_deadline() {
+        let started = std::time::Instant::now();
+        let answer = exchange(
+            Trickle,
+            "dns.example",
+            "https",
+            "/dns-query",
+            b"query",
+            std::time::Instant::now() + std::time::Duration::from_millis(40),
+        );
+        assert_eq!(answer, Err("dns doh deadline".to_owned()));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    /// A peer that only sends empty data frames cannot stretch the query past its absolute deadline.
+    #[test]
+    fn an_endless_doh_stream_ends_at_the_query_deadline() {
+        let started = std::time::Instant::now();
+        let answer = exchange(
+            Endless,
+            "dns.example",
+            "https",
+            "/dns-query",
+            b"query",
+            std::time::Instant::now() + std::time::Duration::from_millis(50),
+        );
+        assert_eq!(answer, Err("dns doh deadline".to_owned()));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
     impl Read for Wire {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             self.read.read(buf)
+        }
+    }
+
+    impl super::ReadDeadline for Wire {
+        fn arm(&mut self, _remaining: std::time::Duration) -> std::io::Result<()> {
+            Ok(())
         }
     }
 
@@ -449,6 +805,7 @@ mod tests {
                 "https",
                 "/dns-query",
                 b"query",
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
             )
         });
         assert_eq!(

@@ -6,14 +6,15 @@
 //! packet to the lane that asked. Writers only enqueue inner packets, so no
 //! flow ever locks a session or races a counter.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 #[cfg(target_os = "linux")]
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ferrox_core::dns::{build_query, parse_answer, Answer};
@@ -142,6 +143,16 @@ impl CookieGuard {
             encryption_key,
             &nonce,
         )
+    }
+}
+
+/// A mapped IPv6 endpoint reaches the same host over IPv4, so pins choose the family the route table can capture.
+fn canonical_endpoint(endpoint: SocketAddr) -> SocketAddr {
+    match endpoint {
+        SocketAddr::V6(address) => address.ip().to_ipv4_mapped().map_or(endpoint, |ip| {
+            SocketAddr::new(IpAddr::V4(ip), address.port())
+        }),
+        SocketAddr::V4(_) => endpoint,
     }
 }
 
@@ -339,7 +350,25 @@ impl WireGuardOut {
     }
 
     pub(crate) fn edge(&self) -> Option<SocketAddr> {
-        self.config.peers.first().and_then(|peer| peer.endpoint)
+        self.config
+            .peers
+            .first()
+            .and_then(|peer| peer.endpoint)
+            .map(canonical_endpoint)
+    }
+
+    /// Every configured endpoint of every peer, deduplicated, so auto capture pins each handshake target.
+    pub(crate) fn edges(&self) -> Vec<SocketAddr> {
+        let mut edges = Vec::new();
+        for peer in &self.config.peers {
+            for edge in peer.endpoints.iter().chain(peer.endpoint.iter()) {
+                let edge = canonical_endpoint(*edge);
+                if !edges.contains(&edge) {
+                    edges.push(edge);
+                }
+            }
+        }
+        edges
     }
 
     pub(crate) fn serve_tcp(&self, client: Connection, asked: &Destination, prefix: &[u8]) {
@@ -1312,6 +1341,7 @@ impl Allowed for PeerConfig {
 
 #[allow(clippy::struct_field_names)]
 struct Peers {
+    owner: usize,
     peers: Vec<Peer>,
     routes: Routes,
     receivers: Receivers,
@@ -1356,6 +1386,7 @@ impl Peers {
     fn new(peers: Vec<Peer>) -> Self {
         let routes = Routes::new(&peers);
         Self {
+            owner: OWNER_IDS.fetch_add(1, Ordering::Relaxed),
             peers,
             routes,
             receivers: Receivers([None; 64]),
@@ -2055,6 +2086,97 @@ fn handle_initiation(
     );
 }
 
+thread_local! {
+    static LEARNED: RefCell<HashMap<IpAddr, (u64, u64, bool)>> = RefCell::new(HashMap::new());
+    static PEER_ENDPOINTS: RefCell<HashMap<usize, IpAddr>> = RefCell::new(HashMap::new());
+}
+
+static OWNER_IDS: AtomicUsize = AtomicUsize::new(0);
+
+fn endpoint_owners() -> &'static Mutex<HashMap<IpAddr, HashSet<usize>>> {
+    static OWNERS: OnceLock<Mutex<HashMap<IpAddr, HashSet<usize>>>> = OnceLock::new();
+    OWNERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn release_endpoint_owner(ip: IpAddr, owner: usize) {
+    let last = endpoint_owners()
+        .lock()
+        .map(|mut owners| {
+            let Some(set) = owners.get_mut(&ip) else {
+                return false;
+            };
+            set.remove(&owner);
+            let last = set.is_empty();
+            if last {
+                owners.remove(&ip);
+            }
+            last
+        })
+        .unwrap_or(false);
+    if last {
+        crate::tun_route::unpin_dialled(ip);
+    }
+}
+
+// Pin an endpoint to its underlay before the first send over the new address, once per route generation, so a moved configured endpoint or a roamed one cannot be pulled back into the TUN.
+fn pin_learned(to: SocketAddr, owner: usize) -> bool {
+    let ip = to.ip();
+    let generation = (
+        crate::quic::network_generation(),
+        crate::tun_route::capture_generation(),
+    );
+    if !LEARNED.with(|seen| {
+        seen.borrow()
+            .get(&ip)
+            .is_some_and(|cached| (cached.0, cached.1) == generation)
+    }) {
+        let uncaptured = match crate::tun_route::pin_dialled_outcome(ip) {
+            crate::tun_route::PinOutcome::Pinned => false,
+            crate::tun_route::PinOutcome::Uncaptured => true,
+            crate::tun_route::PinOutcome::Refused => return false,
+        };
+        LEARNED.with(|seen| {
+            seen.borrow_mut()
+                .insert(ip, (generation.0, generation.1, uncaptured));
+        });
+    }
+    if let Ok(mut owners) = endpoint_owners().lock() {
+        owners.entry(ip).or_default().insert(owner);
+    }
+    true
+}
+
+fn retire_learned(peers: &[Peer], index: usize, current: IpAddr, owner: usize) {
+    let previous = PEER_ENDPOINTS.with(|seen| seen.borrow_mut().insert(index, current));
+    if previous.is_none_or(|previous| previous == current) {
+        return;
+    }
+    let configured: Vec<IpAddr> = peers
+        .iter()
+        .flat_map(|peer| peer.config.endpoints.iter())
+        .map(|endpoint| canonical_endpoint(*endpoint).ip())
+        .collect();
+    let roamed: Vec<IpAddr> = PEER_ENDPOINTS.with(|seen| seen.borrow().values().copied().collect());
+    if let Some(previous) = previous {
+        if !configured.contains(&previous) && !roamed.contains(&previous) {
+            release_endpoint_owner(previous, owner);
+        }
+    }
+    let stale: Vec<IpAddr> = LEARNED.with(|seen| {
+        seen.borrow()
+            .keys()
+            .filter(|ip| !configured.contains(ip) && !roamed.contains(ip))
+            .copied()
+            .collect()
+    });
+    for ip in stale {
+        release_endpoint_owner(ip, owner);
+        LEARNED.with(|seen| {
+            seen.borrow_mut().remove(&ip);
+        });
+    }
+}
+
 /// Send every event, and for each decrypted payload require the authenticating
 /// peer to own the source by longest allowed prefix before the upper layer sees
 /// it.
@@ -2071,6 +2193,7 @@ fn flush(
     recycle: Option<&Sender<Vec<u8>>>,
 ) {
     let candidates = peer.map(|index| peers[index].config.endpoints.as_slice());
+    let owner = peers.owner;
     let mut endpoint = None;
     for event in events.drain(..) {
         match event {
@@ -2078,19 +2201,30 @@ fn flush(
                 endpoint: to,
                 packet,
             } => {
+                if let Some(index) = peer {
+                    retire_learned(peers, index, to.ip(), owner);
+                }
+                let primary = pin_learned(to, owner);
+                if !primary && !is_initiation(&packet) {
+                    continue;
+                }
                 if is_initiation(&packet) {
                     flush_sends(socket, ipv6_socket, endpoint, sends);
                     endpoint = None;
-                    if let Some(index) = peer {
-                        peers[index].noise.before_handshake(|noise| {
-                            send_noise(socket, ipv6_socket, to, noise);
-                        });
+                    if primary {
+                        if let Some(index) = peer {
+                            peers[index].noise.before_handshake(|noise| {
+                                send_noise(socket, ipv6_socket, to, noise);
+                            });
+                        }
                     }
-                    send_packet(socket, ipv6_socket, to, &packet, candidates);
-                    if let Some(index) = peer {
-                        peers[index].noise.after_handshake(|noise| {
-                            send_noise(socket, ipv6_socket, to, noise);
-                        });
+                    send_packet(socket, ipv6_socket, to, primary, &packet, candidates);
+                    if primary {
+                        if let Some(index) = peer {
+                            peers[index].noise.after_handshake(|noise| {
+                                send_noise(socket, ipv6_socket, to, noise);
+                            });
+                        }
                     }
                 } else if ipv6_socket || to.is_ipv4() {
                     if endpoint != Some(to) {
@@ -2419,7 +2553,7 @@ fn peers(config: &DeviceConfig, epoch: [u8; 12], noise: crate::noize::WireGuardN
                     config.secret,
                     peer.public,
                     peer.preshared,
-                    peer.endpoint.unwrap_or_else(|| {
+                    canonical_endpoint(peer.endpoint.unwrap_or_else(|| {
                         let address = config
                             .addresses
                             .iter()
@@ -2428,7 +2562,7 @@ fn peers(config: &DeviceConfig, epoch: [u8; 12], noise: crate::noize::WireGuardN
                             .copied()
                             .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
                         SocketAddr::new(address, 0)
-                    }),
+                    })),
                     peer.keepalive,
                     config.reserved,
                     epoch,
@@ -2591,10 +2725,16 @@ fn bind_socket(config: &DeviceConfig) -> Result<UdpSocket, String> {
     let mut any = false;
     for peer in &config.peers {
         for endpoint in peer.endpoints.iter().copied().chain(peer.endpoint) {
+            let configured = endpoint;
+            let endpoint = canonical_endpoint(endpoint);
             any = true;
             if endpoint.is_ipv4() {
                 v4 = true;
             } else {
+                v6 = true;
+            }
+            // A mapped endpoint sends over IPv4 but the peer may roam to its native IPv6 address, so ask for the dual-stack socket the configured family allowed.
+            if configured.is_ipv6() && endpoint.is_ipv4() {
                 v6 = true;
             }
         }
@@ -2696,18 +2836,23 @@ fn send_packet(
     socket: &UdpSocket,
     ipv6: bool,
     endpoint: SocketAddr,
+    primary: bool,
     packet: &[u8],
     candidates: Option<&[SocketAddr]>,
 ) {
     if is_initiation(packet) {
-        if ipv6 || endpoint.is_ipv4() {
+        if primary && (ipv6 || endpoint.is_ipv4()) {
             let _ = socket.send_to(packet, send_endpoint(endpoint, ipv6));
         }
         for target in candidates.unwrap_or_default() {
-            if *target == endpoint || (!ipv6 && target.is_ipv6()) {
+            let target = canonical_endpoint(*target);
+            if target == endpoint || (!ipv6 && target.is_ipv6()) {
                 continue;
             }
-            let _ = socket.send_to(packet, send_endpoint(*target, ipv6));
+            if !pin_learned(target) {
+                continue;
+            }
+            let _ = socket.send_to(packet, send_endpoint(target, ipv6));
         }
         return;
     }
@@ -3876,7 +4021,14 @@ mod tests {
         let sender_port = sender.local_addr().expect("sender address").port();
         let mut initiation = vec![0u8; INITIATION_SIZE];
         initiation[..4].copy_from_slice(&TYPE_INITIATION.to_le_bytes());
-        send_packet(&sender, true, candidates[0], &initiation, Some(&candidates));
+        send_packet(
+            &sender,
+            true,
+            candidates[0],
+            true,
+            &initiation,
+            Some(&candidates),
+        );
         let mut buf = [0u8; 256];
         assert_eq!(
             recv_from_port(&v4, sender_port, &mut buf),
@@ -3891,7 +4043,14 @@ mod tests {
         let mut transport = vec![0u8; 32];
         transport[..4]
             .copy_from_slice(&ferrox_core::wireguard::transport::TYPE_TRANSPORT.to_le_bytes());
-        send_packet(&sender, true, candidates[0], &transport, Some(&candidates));
+        send_packet(
+            &sender,
+            true,
+            candidates[0],
+            true,
+            &transport,
+            Some(&candidates),
+        );
         assert_eq!(
             recv_from_port(&v4, sender_port, &mut buf),
             transport.len(),
@@ -3911,6 +4070,7 @@ mod tests {
             &v4_only,
             false,
             candidates[0],
+            true,
             &initiation,
             Some(&candidates),
         );
@@ -3955,6 +4115,7 @@ mod tests {
             &sender,
             true,
             roamed_address,
+            true,
             &initiation,
             Some(&candidates),
         );
@@ -3974,7 +4135,14 @@ mod tests {
         let mut transport = vec![0u8; 32];
         transport[..4]
             .copy_from_slice(&ferrox_core::wireguard::transport::TYPE_TRANSPORT.to_le_bytes());
-        send_packet(&sender, true, roamed_address, &transport, Some(&candidates));
+        send_packet(
+            &sender,
+            true,
+            roamed_address,
+            true,
+            &transport,
+            Some(&candidates),
+        );
         assert_eq!(
             roamed.recv_from(&mut buf).expect("roamed data").0,
             transport.len()

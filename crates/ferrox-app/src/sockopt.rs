@@ -133,6 +133,44 @@ struct CustomSockopt {
     value: CustomValue,
 }
 
+impl CustomSockopt {
+    fn applies(&self, network: &str) -> bool {
+        (self.system.is_empty() || self.system == platform::GOOS)
+            && network.starts_with(&self.network)
+    }
+
+    fn is_binding_option(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.level == libc::SOL_SOCKET
+                && matches!(self.opt, libc::SO_BINDTODEVICE | libc::SO_BINDTOIFINDEX)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            (self.level == libc::IPPROTO_IP && self.opt == libc::IP_BOUND_IF)
+                || (self.level == libc::IPPROTO_IPV6 && self.opt == libc::IPV6_BOUND_IF)
+        }
+        #[cfg(windows)]
+        {
+            (self.level == windows_sys::Win32::Networking::WinSock::IPPROTO_IP
+                && self.opt == windows_sys::Win32::Networking::WinSock::IP_UNICAST_IF)
+                || (self.level == windows_sys::Win32::Networking::WinSock::IPPROTO_IPV6
+                    && self.opt == windows_sys::Win32::Networking::WinSock::IPV6_UNICAST_IF)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        {
+            false
+        }
+    }
+
+    fn clears_interface(&self) -> bool {
+        match &self.value {
+            CustomValue::Int(value) => *value == 0,
+            CustomValue::Str(value) => value.is_empty(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum CustomValue {
     Int(i32),
@@ -465,10 +503,25 @@ impl SocketOptions {
         let mut all = Vec::new();
         let mut v4 = Vec::new();
         let mut v6 = Vec::new();
-        for addr in (host, port)
-            .to_socket_addrs()
-            .map_err(|e| format!("ech: resolve {host}: {e}"))?
-        {
+        let addrs = match crate::dnsapp::system_deadline() {
+            Some(deadline) => {
+                let budget = deadline.saturating_duration_since(std::time::Instant::now());
+                if budget.is_zero() {
+                    return Err(format!("ech: resolve {host}: deadline exceeded"));
+                }
+                crate::proxy::resolve_bounded(host, port, budget, |host, port| {
+                    (host, port)
+                        .to_socket_addrs()
+                        .map(std::iter::Iterator::collect)
+                })
+                .ok_or_else(|| format!("ech: resolve {host}: deadline exceeded"))?
+            }
+            None => (host, port)
+                .to_socket_addrs()
+                .map_err(|e| format!("ech: resolve {host}: {e}"))?
+                .collect(),
+        };
+        for addr in addrs {
             all.push(addr);
             if addr.is_ipv4() {
                 v4.push(addr);
@@ -580,28 +633,48 @@ impl SocketOptions {
             }
         }
         platform::apply(self, socket, addr, tcp, listen)?;
-        self.apply_custom(
-            socket,
-            if tcp {
-                if addr.is_ipv4() {
-                    "tcp4"
-                } else {
-                    "tcp6"
+        self.apply_custom(socket, network(tcp, addr))
+    }
+
+    /// Whether a socket for this address ends up bound to a named interface, after the top-level
+    /// interface and every custom option that changes or clears it have been applied in order.
+    fn binds_interface(&self, tcp: bool, addr: SocketAddr) -> bool {
+        let network = network(tcp, addr);
+        let mut bound = platform::APPLIES_INTERFACE && self.interface.is_some();
+        for custom in &self.custom {
+            if custom.applies(network) && custom.is_binding_option() {
+                bound = !custom.clears_interface();
+            }
+        }
+        bound
+    }
+
+    fn effective_mark(&self, network: &str) -> Option<i32> {
+        let _ = network;
+        #[cfg(target_os = "linux")]
+        {
+            let mut mark = self.mark;
+            for custom in &self.custom {
+                if custom.applies(network)
+                    && custom.level == libc::SOL_SOCKET
+                    && custom.opt == libc::SO_MARK
+                {
+                    if let CustomValue::Int(value) = &custom.value {
+                        mark = Some(*value);
+                    }
                 }
-            } else if addr.is_ipv4() {
-                "udp4"
-            } else {
-                "udp6"
-            },
-        )
+            }
+            mark
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.mark
+        }
     }
 
     fn apply_custom(&self, socket: &Socket, network: &str) -> io::Result<()> {
         for custom in &self.custom {
-            if !custom.system.is_empty() && custom.system != platform::GOOS {
-                continue;
-            }
-            if !network.starts_with(&custom.network) {
+            if !custom.applies(network) {
                 continue;
             }
             match &custom.value {
@@ -617,6 +690,19 @@ impl SocketOptions {
     }
 }
 
+fn network(tcp: bool, addr: SocketAddr) -> &'static str {
+    let v4 = match addr.ip() {
+        std::net::IpAddr::V4(_) => true,
+        std::net::IpAddr::V6(ip) => ip.to_ipv4_mapped().is_some(),
+    };
+    match (tcp, v4) {
+        (true, true) => "tcp4",
+        (true, false) => "tcp6",
+        (false, true) => "udp4",
+        (false, false) => "udp6",
+    }
+}
+
 /// Connect a DNS transport with the ECH socket settings applied before the first packet.
 pub(crate) fn connect(
     options: Option<&SocketOptions>,
@@ -624,13 +710,29 @@ pub(crate) fn connect(
     port: u16,
     timeout: Duration,
 ) -> Result<TcpStream, String> {
+    let started = std::time::Instant::now();
     let addr = match options {
         Some(options) => options.resolve(host, port)?,
-        None => (host, port)
-            .to_socket_addrs()
-            .map_err(|e| format!("ech: resolve {host}: {e}"))?
-            .next()
-            .ok_or_else(|| format!("ech: {host} resolved to nothing"))?,
+        None => match crate::dnsapp::system_deadline() {
+            Some(deadline) => {
+                let budget = deadline.saturating_duration_since(std::time::Instant::now());
+                if budget.is_zero() {
+                    return Err(format!("ech: resolve {host}: deadline exceeded"));
+                }
+                crate::proxy::resolve_bounded(host, port, budget, |host, port| {
+                    (host, port)
+                        .to_socket_addrs()
+                        .map(std::iter::Iterator::collect)
+                })
+                .and_then(|addrs| addrs.first().copied())
+                .ok_or_else(|| format!("ech: {host} resolved to nothing"))?
+            }
+            None => (host, port)
+                .to_socket_addrs()
+                .map_err(|e| format!("ech: resolve {host}: {e}"))?
+                .next()
+                .ok_or_else(|| format!("ech: {host} resolved to nothing"))?,
+        },
     };
     let socket = Socket::new(domain_of(addr), Type::STREAM, Some(Protocol::TCP))
         .map_err(|e| format!("ech: tcp socket: {e}"))?;
@@ -639,8 +741,15 @@ pub(crate) fn connect(
             .apply(&socket, addr, true, false)
             .map_err(|e| format!("ech: tcp options: {e}"))?;
     }
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    let _routes = crate::tun_route::route_read();
+    apply_underlay(options, &socket, addr, true).map_err(|e| format!("ech: tcp underlay: {e}"))?;
+    let remaining = timeout
+        .checked_sub(started.elapsed())
+        .filter(|left| !left.is_zero())
+        .ok_or_else(|| format!("ech: connect {addr}: deadline exceeded during resolution"))?;
     socket
-        .connect_timeout(&SockAddr::from(addr), timeout)
+        .connect_timeout(&SockAddr::from(addr), remaining)
         .map_err(|e| format!("ech: connect {addr}: {e}"))?;
     Ok(TcpStream::from(socket))
 }
@@ -660,6 +769,19 @@ pub(crate) fn datagram(
             .next()
             .ok_or_else(|| format!("ech: {host} resolved to nothing"))?,
     };
+    datagram_at(options, addr, timeout)
+}
+
+/// The same socket when the caller already resolved the endpoint.
+pub(crate) fn datagram_target(addr: SocketAddr, timeout: Duration) -> Result<UdpSocket, String> {
+    datagram_at(None, addr, timeout)
+}
+
+fn datagram_at(
+    options: Option<&SocketOptions>,
+    addr: SocketAddr,
+    timeout: Duration,
+) -> Result<UdpSocket, String> {
     let socket = Socket::new(domain_of(addr), Type::DGRAM, Some(Protocol::UDP))
         .map_err(|e| format!("ech: udp socket: {e}"))?;
     if let Some(options) = options {
@@ -667,6 +789,7 @@ pub(crate) fn datagram(
             .apply(&socket, addr, false, false)
             .map_err(|e| format!("ech: udp options: {e}"))?;
     }
+    apply_underlay(options, &socket, addr, false).map_err(|e| format!("ech: udp underlay: {e}"))?;
     let bind = if addr.is_ipv4() {
         "0.0.0.0:0"
     } else {
@@ -721,6 +844,54 @@ pub(crate) fn bind_datagram_at(
     Ok(UdpSocket::from(socket))
 }
 
+/// Bind a dial socket to the underlay the TUN capture selected, without a host route. A socket
+/// whose own options name an interface keeps that one, so the device is bound exactly once.
+#[cfg(any(unix, windows))]
+pub(crate) fn apply_underlay(
+    options: Option<&SocketOptions>,
+    socket: &socket2::Socket,
+    addr: SocketAddr,
+    tcp: bool,
+) -> io::Result<()> {
+    let _ = crate::tun_route::take_underlay_force();
+    let explicit = options.is_some_and(|options| {
+        options.binds_interface(tcp, addr)
+            || (cfg!(target_os = "linux")
+                && options
+                    .effective_mark(network(tcp, addr))
+                    .is_some_and(|mark| mark != 0))
+    });
+    if explicit {
+        let _ = crate::tun_route::dial_underlay();
+        return Ok(());
+    }
+    // Re-resolve the underlay here so a moved route or an earlier address stage cannot bind the wrong interface.
+    let captured = crate::tun_route::stage_dial(addr.ip())?;
+    let Some((bound, interface, index)) = crate::tun_route::dial_underlay() else {
+        if captured {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "a captured destination has no underlay route to bind",
+            ));
+        }
+        return Ok(());
+    };
+    if bound != crate::tun_route::route_address(addr.ip()) {
+        return Ok(());
+    }
+    platform::bind_interface(socket, &interface, index, addr)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn apply_underlay(
+    _options: Option<&SocketOptions>,
+    _socket: &socket2::Socket,
+    _addr: SocketAddr,
+    _tcp: bool,
+) -> io::Result<()> {
+    Ok(())
+}
+
 fn domain_of(addr: SocketAddr) -> Domain {
     if addr.is_ipv4() {
         Domain::IPV4
@@ -743,6 +914,44 @@ mod platform {
     } else {
         std::env::consts::OS
     };
+
+    pub(super) const APPLIES_INTERFACE: bool = cfg!(any(target_os = "linux", target_os = "macos"));
+
+    pub(super) fn bind_interface(
+        socket: &Socket,
+        interface: &str,
+        _index: Option<u32>,
+        addr: SocketAddr,
+    ) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            set_str(socket, libc::SOL_SOCKET, libc::SO_BINDTODEVICE, interface)
+                .map_err(|e| named("SO_BINDTODEVICE", &e))?;
+            let _ = addr;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let name = CString::new(interface)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "interface name"))?;
+            // SAFETY: the name is a live NUL-terminated string.
+            let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+            if index == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let index = i32::try_from(index)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "interface index"))?;
+            if addr.is_ipv6() {
+                set_int(socket, libc::IPPROTO_IPV6, libc::IPV6_BOUND_IF, index)?;
+            } else {
+                set_int(socket, libc::IPPROTO_IP, libc::IP_BOUND_IF, index)?;
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (socket, interface, addr);
+        }
+        Ok(())
+    }
 
     pub(super) fn apply(
         options: &SocketOptions,
@@ -903,9 +1112,36 @@ mod platform {
     use std::io;
     use std::net::SocketAddr;
     use std::os::windows::io::AsRawSocket as _;
-    use windows_sys::Win32::Networking::WinSock::{setsockopt, SOCKET};
+    use windows_sys::Win32::Networking::WinSock::{
+        setsockopt, IPPROTO_IP, IPPROTO_IPV6, IPV6_UNICAST_IF, IP_UNICAST_IF, SOCKET,
+    };
 
     pub(super) const GOOS: &str = "windows";
+    pub(super) const APPLIES_INTERFACE: bool = false;
+
+    pub(super) fn bind_interface(
+        socket: &Socket,
+        _interface: &str,
+        index: Option<u32>,
+        addr: SocketAddr,
+    ) -> io::Result<()> {
+        let index = index.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the route has no interface index",
+            )
+        })?;
+        let ipv4 = addr.is_ipv4()
+            || matches!(addr.ip(), std::net::IpAddr::V6(ip) if ip.to_ipv4_mapped().is_some());
+        if ipv4 {
+            let value = i32::from_ne_bytes(index.to_be_bytes());
+            set_int(socket, IPPROTO_IP, IP_UNICAST_IF, value)
+        } else {
+            let value = i32::try_from(index)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "interface index"))?;
+            set_int(socket, IPPROTO_IPV6, IPV6_UNICAST_IF, value)
+        }
+    }
 
     pub(super) fn apply(
         _options: &SocketOptions,
@@ -960,6 +1196,13 @@ mod tests {
     fn refused(text: &str) -> String {
         let json = crate::json::parse(text).expect("parses");
         parse(Some(&json)).expect_err("refuses")
+    }
+
+    #[test]
+    fn a_mapped_destination_uses_the_ipv4_network_family() {
+        let mapped: SocketAddr = "[::ffff:192.0.2.1]:443".parse().expect("address");
+        assert_eq!(network(true, mapped), "tcp4");
+        assert_eq!(network(false, mapped), "udp4");
     }
 
     #[test]

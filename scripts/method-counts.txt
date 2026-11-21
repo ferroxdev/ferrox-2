@@ -876,6 +876,10 @@ front-tun time-tcp-down-10 ferrox=48.259Gbit/s,hev=43.298Gbit/s,ratio=1.11 tun-b
 front-tun time-rr ferrox=25801tps,hev=17785tps,ratio=1.45 tun-bench.yml
 front-tun time-rr-8x1k ferrox=95637tps,hev=93763tps,ratio=1.02 tun-bench.yml
 front-tun time-udp-100k ferrox=99296pps,hev=99301pps,ratio=1.00 tun-bench.yml
+front-tun route-default-halves-per-family 2 ferrox-app-tun_route::tests::a_route_default_captures_two_halves_per_family
+front-tun kept-prefixes-excluded-from-the-capture 1 ferrox-app-tun_route::tests::a_named_route_inside_a_kept_prefix_is_dropped
+front-tun hijacked-queries-riding-the-resolver 1 ferrox-app-tun::tests::a_hijacked_query_rides_the_dns_server_and_the_answer_keeps_its_address
+front-tun hijacked-tcp-flows-dialing-the-resolver 1 ferrox-app-tun::tests::a_hijacked_tcp_flow_dials_the_resolver_and_answers_from_the_asked_address
 front-tun cpu-cores-at-tcp-down-10 ferrox=1.79cores,hev=2.06cores tun-bench.yml
 front-tun rss-mb-at-tcp-down-10 ferrox=15.2MB,hev=2.5MB tun-bench.yml
 front-tun rss-above-start-mb-at-tcp-down-10 ferrox=1.0MB,hev=0.7MB tun-bench.yml

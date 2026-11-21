@@ -1188,10 +1188,16 @@ fn serve_stream(stream: AnyTlsStream, context: &ServerContext) {
         return;
     }
     let resolved = match destination {
-        Address::Name(host, port) => proxy::resolve_outbound(&host, port),
+        Address::Name(host, port) => proxy::resolve_outbound_with(None, &host, port),
         Address::Address(address) => Some(address),
     };
-    let Some(upstream) = resolved.and_then(|address| proxy::dial_or_report(&address)) else {
+    let Some(address) = resolved else {
+        stream.synack(b"anytls: dial failed");
+        stream.close();
+        return;
+    };
+    crate::tun_route::bind_dial(address.ip());
+    let Some(upstream) = proxy::dial_or_report(&address) else {
         stream.synack(b"anytls: dial failed");
         stream.close();
         return;

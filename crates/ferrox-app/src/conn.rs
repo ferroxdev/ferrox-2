@@ -2872,12 +2872,31 @@ impl Iterator for Incoming<'_> {
 /// did before the transport seam — the transport type changed, the syscall did not.
 pub(crate) fn dial_tcp(addr: &SocketAddr, timeout: Duration) -> io::Result<Connection> {
     use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+    static WARNED: std::sync::Once = std::sync::Once::new();
     let domain = if addr.is_ipv4() {
         Domain::IPV4
     } else {
         Domain::IPV6
     };
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    // Hold the route table read side across the underlay check and the connect, so an install cannot land a capture between them.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    let _routes = crate::tun_route::route_read();
+    if let Err(error) = crate::sockopt::apply_underlay(None, &socket, *addr, true) {
+        // Before Linux 5.7 an unprivileged `SO_BINDTODEVICE` needs `CAP_NET_RAW`, which `auto_route` (that installed the underlay) does not require; a direct dial stays usable unbound rather than failing every flow.
+        if error.kind() != io::ErrorKind::PermissionDenied {
+            return Err(error);
+        }
+        // A capture still sends this address into the device, so an unbound dial would loop back instead of reaching the underlay.
+        if crate::tun_route::captured(addr.ip())? {
+            return Err(error);
+        }
+        WARNED.call_once(|| {
+            eprintln!(
+                "dial: cannot bind the recorded underlay (needs CAP_NET_RAW before Linux 5.7); continuing unbound: {error}"
+            );
+        });
+    }
     connect_bounded(&socket, &SockAddr::from(*addr), timeout)?;
     Ok(Connection::Tcp(TcpStream::from(socket)))
 }
@@ -3779,8 +3798,14 @@ pub(crate) fn connect_bounded(
     address: &socket2::SockAddr,
     timeout: Duration,
 ) -> io::Result<()> {
-    let bounded = socket.connect_timeout(address, timeout);
+    let bounded = connect_cancellable(socket, address, timeout);
     if bounded.is_err() && socket.peer_addr().is_ok() {
+        if crate::proxy::dial_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "the dial's caller stopped",
+            ));
+        }
         return Ok(());
     }
     bounded.map_err(|error| {
@@ -3793,6 +3818,199 @@ pub(crate) fn connect_bounded(
             error
         }
     })
+}
+
+/// A connect that wakes often enough to observe a TUN removal; a socket with no cancellation
+/// armed keeps the kernel's own bounded connect.
+#[cfg(unix)]
+fn connect_cancellable(
+    socket: &socket2::Socket,
+    address: &socket2::SockAddr,
+    timeout: Duration,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    if !crate::proxy::dial_cancellable() {
+        return socket.connect_timeout(address, timeout);
+    }
+    if crate::proxy::dial_cancelled() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "the dial's caller stopped",
+        ));
+    }
+    socket.set_nonblocking(true)?;
+    let result = (|| {
+        let connected = match socket.connect(address) {
+            Ok(()) => true,
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.raw_os_error() == Some(libc::EINPROGRESS) =>
+            {
+                false
+            }
+            Err(error) => return Err(error),
+        };
+        if !connected {
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                if crate::proxy::dial_cancelled() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "the dial's caller stopped",
+                    ));
+                }
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "the dial timed out",
+                    ));
+                }
+                let mut row = libc::pollfd {
+                    fd: socket.as_raw_fd(),
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                let millis = left.min(Duration::from_millis(50)).as_millis();
+                // SAFETY: one live `pollfd` row names this socket for the duration of the call.
+                let ready =
+                    unsafe { libc::poll(&raw mut row, 1, i32::try_from(millis).unwrap_or(50)) };
+                if ready < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                if ready > 0 {
+                    if row.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                        return Err(socket.take_error()?.unwrap_or_else(|| {
+                            io::Error::other("the connect poll reported a hangup")
+                        }));
+                    }
+                    break;
+                }
+            }
+        }
+        if crate::proxy::dial_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "the dial's caller stopped",
+            ));
+        }
+        if let Some(error) = socket.take_error()? {
+            return Err(error);
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => socket.set_nonblocking(false),
+        Err(error) => {
+            let _ = socket.set_nonblocking(false);
+            Err(error)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn connect_cancellable(
+    socket: &socket2::Socket,
+    address: &socket2::SockAddr,
+    timeout: Duration,
+) -> io::Result<()> {
+    use std::os::windows::io::AsRawSocket as _;
+    use windows_sys::Win32::Networking::WinSock::{
+        WSAGetLastError, WSAPoll, POLLERR, POLLHUP, POLLNVAL, POLLWRNORM, SOCKET, WSAPOLLFD,
+    };
+    if !crate::proxy::dial_cancellable() {
+        return socket.connect_timeout(address, timeout);
+    }
+    if crate::proxy::dial_cancelled() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "the dial's caller stopped",
+        ));
+    }
+    socket.set_nonblocking(true)?;
+    let result = (|| {
+        let connected = match socket.connect(address) {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => false,
+            Err(error) => return Err(error),
+        };
+        if !connected {
+            let deadline = Instant::now() + timeout;
+            loop {
+                if crate::proxy::dial_cancelled() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "the dial's caller stopped",
+                    ));
+                }
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "the dial timed out",
+                    ));
+                }
+                let mut row = WSAPOLLFD {
+                    fd: socket.as_raw_socket() as SOCKET,
+                    events: POLLWRNORM,
+                    revents: 0,
+                };
+                let millis = left.min(Duration::from_millis(50)).as_millis();
+                // SAFETY: one live `WSAPOLLFD` row names this socket for the duration of the call.
+                let ready =
+                    unsafe { WSAPoll(&raw mut row, 1, i32::try_from(millis).unwrap_or(50)) };
+                if ready < 0 {
+                    let error = io::Error::from_raw_os_error(unsafe { WSAGetLastError() });
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                if ready > 0 {
+                    if row.revents & (POLLHUP | POLLERR | POLLNVAL) != 0 {
+                        return Err(socket.take_error()?.unwrap_or_else(|| {
+                            io::Error::other("the connect poll reported a hangup")
+                        }));
+                    }
+                    break;
+                }
+                // `WSAPoll` before Windows 10 2004 reports no hangup for a refused connect, so the pending error is the only prompt answer.
+                if let Some(error) = socket.take_error()? {
+                    return Err(error);
+                }
+            }
+        }
+        if crate::proxy::dial_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "the dial's caller stopped",
+            ));
+        }
+        if let Some(error) = socket.take_error()? {
+            return Err(error);
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => socket.set_nonblocking(false),
+        Err(error) => {
+            let _ = socket.set_nonblocking(false);
+            Err(error)
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn connect_cancellable(
+    socket: &socket2::Socket,
+    address: &socket2::SockAddr,
+    timeout: Duration,
+) -> io::Result<()> {
+    socket.connect_timeout(address, timeout)
 }
 
 #[cfg(unix)]

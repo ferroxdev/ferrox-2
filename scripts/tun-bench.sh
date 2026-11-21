@@ -31,6 +31,8 @@ BENCH=${BENCH:-}
 HEV=${HEV:-}
 HEV_SERVER=${HEV_SERVER:-}
 SINGBOX=${SINGBOX:-}
+SINGBOX_HEAD=${SINGBOX_HEAD:-}
+XRAY=${XRAY:-}
 TUN2SOCKS=${TUN2SOCKS:-}
 
 DURATION=${DURATION:-5}
@@ -191,13 +193,15 @@ start_hev() {
 }
 
 start_singbox() {
-    stack=$1
-    [ -n "$SINGBOX" ] || return 1
+    tag=$1
+    stack=$2
+    binary=$3
+    [ -n "$binary" ] || return 1
     printf '{"log":{"level":"error"},"inbounds":[{"type":"tun","tag":"tun-in","interface_name":"sb0","address":["%s/%s"],"mtu":%s,"auto_route":false,"stack":"%s"}],"outbounds":[{"type":"socks","tag":"proxy","server":"%s","server_port":%s}],"route":{"final":"proxy"}}' \
-        "$TUN_ADDR" "$TUN_PREFIX" "$MTU" "$stack" "$VETH_SERVER" "$SOCKS_PORT" > "$OUT_DIR/singbox-$stack.json"
-    "$SINGBOX" run -c "$OUT_DIR/singbox-$stack.json" > "$OUT_DIR/singbox-$stack.log" 2>&1 &
+        "$TUN_ADDR" "$TUN_PREFIX" "$MTU" "$stack" "$VETH_SERVER" "$SOCKS_PORT" > "$OUT_DIR/singbox-$tag.json"
+    "$binary" run -c "$OUT_DIR/singbox-$tag.json" > "$OUT_DIR/singbox-$tag.log" 2>&1 &
     ENGINE_PIDS=$!
-    wait_dev sb0 || { note "singbox-$stack did not create sb0"; cat "$OUT_DIR/singbox-$stack.log" >&2; return 1; }
+    wait_dev sb0 || { note "singbox-$tag did not create sb0"; cat "$OUT_DIR/singbox-$tag.log" >&2; return 1; }
     wait_up sb0 || return 1
     install_routes sb0
     TUN_NAME=sb0
@@ -216,6 +220,18 @@ start_tun2socks() {
     TUN_NAME=t2s0
 }
 
+start_xray() {
+    [ -n "$XRAY" ] || return 1
+    printf '{"log":{"loglevel":"error"},"inbounds":[{"tag":"tun","protocol":"tun","settings":{"name":"xr0","mtu":%s,"gateway":["%s/%s"]}}],"outbounds":[{"tag":"proxy","protocol":"socks","settings":{"servers":[{"address":"%s","port":%s}]}}]}' \
+        "$MTU" "$TUN_ADDR" "$TUN_PREFIX" "$VETH_SERVER" "$SOCKS_PORT" > "$OUT_DIR/xray.json"
+    "$XRAY" run -c "$OUT_DIR/xray.json" > "$OUT_DIR/xray.log" 2>&1 &
+    ENGINE_PIDS=$!
+    wait_dev xr0 || { note "xray did not create xr0"; cat "$OUT_DIR/xray.log" >&2; return 1; }
+    wait_up xr0 || return 1
+    install_routes xr0
+    TUN_NAME=xr0
+}
+
 start_engine() {
     engine=$1
     ENGINE_PIDS=""
@@ -227,8 +243,12 @@ start_engine() {
         ferrox-system) start_ferrox system ;;
         ferrox-hybrid) start_ferrox hybrid ;;
         hev|hev-socks5-tunnel) start_hev ;;
-        singbox-system|sing-tun-system) start_singbox system ;;
-        singbox-gvisor|sing-tun-gvisor) start_singbox gvisor ;;
+        xray) start_xray ;;
+        singbox-system|sing-tun-system) start_singbox system system "$SINGBOX" ;;
+        singbox-gvisor|sing-tun-gvisor) start_singbox gvisor gvisor "$SINGBOX" ;;
+        singbox-head|sing-tun-head) start_singbox head system "$SINGBOX_HEAD" ;;
+        singbox-head-system|sing-tun-head-system) start_singbox head-system system "$SINGBOX_HEAD" ;;
+        singbox-head-gvisor|sing-tun-head-gvisor) start_singbox head-gvisor gvisor "$SINGBOX_HEAD" ;;
         tun2socks) start_tun2socks ;;
         *) note "unknown engine $engine"; return 1 ;;
     esac
@@ -455,7 +475,9 @@ while [ "$rep" -le "$REPEAT" ]; do
         case "$engine" in
             ferrox|ferrox-*) [ -n "$FERROX" ] || continue ;;
             hev|hev-socks5-tunnel) [ -n "$HEV" ] || continue ;;
+            singbox-head|sing-tun-head|singbox-head-*|sing-tun-head-*) [ -n "$SINGBOX_HEAD" ] || continue ;;
             singbox-*|sing-tun-*) [ -n "$SINGBOX" ] || continue ;;
+            xray) [ -n "$XRAY" ] || continue ;;
             tun2socks) [ -n "$TUN2SOCKS" ] || continue ;;
         esac
         printf 'round %s engine %s\n' "$rep" "$engine"
