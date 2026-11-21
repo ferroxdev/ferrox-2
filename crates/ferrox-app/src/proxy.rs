@@ -16269,8 +16269,7 @@ fn serve_vless_xdrive(mut session: crate::xdrive::Conn, users: &[VlessUser], fre
     let ask = reverse_ask(users, &got, flow, cmd);
     if let ReverseAsk::Allowed(portal) = ask {
         let reader = session.clone();
-        let closer = session.clone();
-        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+        let close = xdrive_close(&session);
         attach_reverse(portal, reader, session, close);
         return;
     }
