@@ -402,13 +402,13 @@ impl<R: Read> WsReader<R> {
         }
     }
 
-    /// One syscall; the buffer grows only past the window and frames unmask in place. `False` means
-    /// done, and a relay's poll timeout is handed back to the lane with the frame where it broke.
-    fn pull(&mut self, len: usize) -> std::io::Result<bool> {
+    /// One syscall; a frame's declared length reserves nothing, so the buffer grows one window at a time
+    /// as bytes land. `False` means done, and a relay's poll timeout goes back to the lane where it broke.
+    fn pull(&mut self) -> std::io::Result<bool> {
         if !self.coalesce {
             self.compact();
         }
-        let room = READ_AHEAD.max(len);
+        let room = READ_AHEAD;
         let base = self.have.len();
         // SAFETY: `have_init` describes `have`, whose tail this reader owns.
         unsafe { ferrox_core::read::init_room(&mut self.have, &mut self.have_init, base + room) };
@@ -454,7 +454,7 @@ impl<R: Read> WsReader<R> {
             let at = self.at;
             let avail = self.have.len() - at;
             if avail < 2 {
-                if !fill || self.eof || !self.pull(2)? {
+                if !fill || self.eof || !self.pull()? {
                     return Ok(None);
                 }
                 continue;
@@ -484,7 +484,7 @@ impl<R: Read> WsReader<R> {
             };
             let head_len = 2 + ext_len + usize::from(masked) * 4;
             if avail < head_len {
-                if !fill || self.eof || !self.pull(head_len)? {
+                if !fill || self.eof || !self.pull()? {
                     return Ok(None);
                 }
                 continue;
@@ -516,7 +516,7 @@ impl<R: Read> WsReader<R> {
                 ));
             }
             if avail < head_len + len {
-                if !fill || self.eof || !self.pull(head_len + len)? {
+                if !fill || self.eof || !self.pull()? {
                     return Ok(None);
                 }
                 continue;
@@ -721,7 +721,7 @@ impl<R: Read> WsReader<R> {
                     if self.at < self.have.len() {
                         break;
                     }
-                    match self.pull(2) {
+                    match self.pull() {
                         Ok(true) => {}
                         Ok(false) => break,
                         Err(error) if crate::proxy::is_timeout(&error) => break,
@@ -1787,6 +1787,45 @@ mod tests {
                 writer.join().expect("joins");
             }
         }
+    }
+
+    /// A header that claims 16 MiB must not reserve it before the payload lands: ten bytes cost ten bytes.
+    #[test]
+    fn a_large_frame_header_does_not_reserve_its_payload() {
+        let mut wire = vec![0x80 | OP_DATA, 0x7F];
+        wire.extend_from_slice(&((FRAME_LIMIT - 1) as u64).to_be_bytes());
+        assert_eq!(wire.len(), 10);
+        let shared = Arc::new(Shared {
+            stream: Mutex::new(Box::new(Sink::default())),
+            closed: AtomicBool::new(false),
+            masked: false,
+            open: AtomicUsize::new(0),
+            cut: AtomicUsize::new(0),
+            pending: Mutex::new(Vec::new()),
+        });
+        let mut reader = WsReader {
+            read: std::io::Cursor::new(wire),
+            shared,
+            have: Vec::new(),
+            have_init: 0,
+            at: 0,
+            msg_end: 0,
+            early: Vec::new(),
+            eat: 0,
+            eof: false,
+            coalesce: false,
+            assembling: false,
+            handshake: None,
+            deferred: None,
+            reads: 0,
+        };
+        let mut byte = [0u8; 1];
+        assert_eq!(reader.read(&mut byte).expect("reads"), 0);
+        assert!(
+            reader.have.capacity() <= READ_AHEAD * 2,
+            "a header reserved {} bytes before its payload",
+            reader.have.capacity()
+        );
     }
 
     /// A socket that takes a bounded slice per call must not cut a frame short: the head announced the
