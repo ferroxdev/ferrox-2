@@ -148,7 +148,7 @@ pub fn hawk_normalised(
     out.push('\n');
     out.push_str(path);
     out.push('\n');
-    out.push_str(host);
+    out.extend(host.chars().map(|c| c.to_ascii_lowercase()));
     out.push('\n');
     push_u64(&mut out, u64::from(port));
     out.push('\n');
@@ -310,14 +310,103 @@ fn escape_into(value: &str, out: &mut String) {
 pub fn jwt_expiry(token: &str) -> Option<u64> {
     let payload = token.split('.').nth(1)?;
     let raw = b64::decode(payload.as_bytes())?;
-    let json = String::from_utf8(raw).ok()?;
-    let key = "\"exp\":";
-    let at = json.find(key)? + key.len();
-    let digits: String = json[at..]
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect();
-    digits.parse().ok()
+    let json = std::str::from_utf8(&raw).ok()?;
+    top_level_exp(json.as_bytes())
+}
+
+/// The `exp` member of the payload's top-level object, read by walking its depth rather than materialising the document: a nested `exp` is a different claim, and the token's own sits beside keys of either shape.
+fn top_level_exp(bytes: &[u8]) -> Option<u64> {
+    let mut at = json_space(bytes, 0);
+    if *bytes.get(at)? != b'{' {
+        return None;
+    }
+    at = json_space(bytes, at + 1);
+    if *bytes.get(at)? == b'}' {
+        return None;
+    }
+    loop {
+        if *bytes.get(at)? != b'"' {
+            return None;
+        }
+        let name_end = json_string_end(bytes, at)?;
+        let is_exp = &bytes[at + 1..name_end - 1] == b"exp";
+        at = json_space(bytes, name_end);
+        if *bytes.get(at)? != b':' {
+            return None;
+        }
+        at = json_space(bytes, at + 1);
+        let end = json_skip(bytes, at)?;
+        if is_exp {
+            return std::str::from_utf8(&bytes[at..end]).ok()?.parse().ok();
+        }
+        at = json_space(bytes, end);
+        match *bytes.get(at)? {
+            b',' => at = json_space(bytes, at + 1),
+            _ => return None,
+        }
+    }
+}
+
+fn json_space(bytes: &[u8], mut at: usize) -> usize {
+    while matches!(bytes.get(at), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+        at += 1;
+    }
+    at
+}
+
+/// The offset just past the string that opens at `at`, so a brace or comma inside a value is never mistaken for structure.
+fn json_string_end(bytes: &[u8], at: usize) -> Option<usize> {
+    let mut at = at + 1;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' => at += 2,
+            b'"' => return Some(at + 1),
+            _ => at += 1,
+        }
+    }
+    None
+}
+
+/// The offset just past any JSON value, nested structures included.
+fn json_skip(bytes: &[u8], at: usize) -> Option<usize> {
+    let at = json_space(bytes, at);
+    match *bytes.get(at)? {
+        b'"' => json_string_end(bytes, at),
+        b'{' | b'[' => {
+            let mut depth = 0usize;
+            let mut off = at;
+            while off < bytes.len() {
+                match bytes[off] {
+                    b'"' => {
+                        off = json_string_end(bytes, off)?;
+                        continue;
+                    }
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(off + 1);
+                        }
+                    }
+                    _ => {}
+                }
+                off += 1;
+            }
+            None
+        }
+        _ => {
+            let mut off = at;
+            while off < bytes.len()
+                && !matches!(
+                    bytes[off],
+                    b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r'
+                )
+            {
+                off += 1;
+            }
+            Some(off)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -483,6 +572,56 @@ mod tests {
         assert_eq!(
             String::from_utf8(body(&[("email", "ï@example.com")])).expect("utf-8"),
             "{\"email\":\"ï@example.com\"}"
+        );
+    }
+
+    #[test]
+    fn the_host_is_signed_lowercased_the_way_mozilla_signs_it() {
+        let lower = hawk_normalised(
+            "GET",
+            "/v1/oauth/token",
+            "api.accounts.firefox.com",
+            443,
+            b"",
+            9,
+            "abc",
+        );
+        let mixed = hawk_normalised(
+            "GET",
+            "/v1/oauth/token",
+            "API.Accounts.Firefox.COM",
+            443,
+            b"",
+            9,
+            "abc",
+        );
+        assert_eq!(mixed, lower, "the host is lowercased before it is signed");
+    }
+
+    #[test]
+    fn a_jwt_expiry_is_the_top_level_member() {
+        let token = |claims: &[u8]| {
+            format!(
+                "aaa.{}.bbb",
+                b64::encode(claims).replace('+', "-").replace('/', "_")
+            )
+        };
+        assert_eq!(
+            jwt_expiry(&token(br#"{"exp": 1735689600}"#)),
+            Some(1_735_689_600),
+            "whitespace before the value is legal"
+        );
+        assert_eq!(
+            jwt_expiry(&token(
+                br#"{"metadata":{"exp":4102444800},"exp":1735689600}"#
+            )),
+            Some(1_735_689_600),
+            "a nested exp is a different claim"
+        );
+        assert_eq!(
+            jwt_expiry(&token(br#"{"metadata":{"exp":4102444800}}"#)),
+            None,
+            "a token with no top-level exp has no expiry"
         );
     }
 

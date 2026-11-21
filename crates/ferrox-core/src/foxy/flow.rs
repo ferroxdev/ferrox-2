@@ -42,7 +42,7 @@ impl Window {
     /// The credit left in the window.
     #[must_use]
     pub fn left(&self) -> u32 {
-        self.bytes.max(0) as u32
+        u32::try_from(self.bytes.max(0)).unwrap_or(u32::MAX)
     }
 }
 
@@ -101,6 +101,17 @@ mod tests {
         let mut window = Window::new(i64::MAX - 1);
         window.add(u32::MAX);
         assert_eq!(window.left(), u32::MAX);
+    }
+
+    #[test]
+    fn a_window_past_the_largest_credit_reports_the_ceiling() {
+        let window = Window::new(i64::from(u32::MAX) + 1);
+        assert_eq!(
+            window.left(),
+            u32::MAX,
+            "a balance past the largest credit reports the ceiling, not zero"
+        );
+        assert!(window.allows(1));
     }
 
     #[test]

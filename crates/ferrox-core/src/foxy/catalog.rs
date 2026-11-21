@@ -1,6 +1,6 @@
 //! The catalogue a lane picks an edge from: Remote Settings publishes it unauthenticated, so a link can carry only a country code and reach an edge, with envelope parsing left to the app and the choice — the part worth proving — here.
 
-use crate::foxy::Candidate;
+use crate::foxy::{candidates_for_country, Candidate};
 
 /// "Wherever is best" is a real country in the list rather than a mode: `REC` is a row like any other.
 pub const RECOMMENDED: &str = "REC";
@@ -8,11 +8,7 @@ pub const RECOMMENDED: &str = "REC";
 /// One country pinned at dial, in the shape `dial_order` consumes.
 #[must_use]
 pub fn pinned(edges: &[Candidate], country: &str) -> Vec<Candidate> {
-    edges
-        .iter()
-        .filter(|edge| edge.country.eq_ignore_ascii_case(country))
-        .cloned()
-        .collect()
+    candidates_for_country(edges, country)
 }
 
 /// One country's edges: the named city's first plus one alternate more than asked, because a city is a failover tier and leaving it means a worse exit; `REC` is one code among many, so recommended and pinned travel the same road.
@@ -76,6 +72,18 @@ mod tests {
 
     fn hosts(edges: &[Candidate]) -> Vec<&str> {
         edges.iter().map(|edge| edge.host.as_ref()).collect()
+    }
+
+    #[test]
+    fn a_pin_is_the_country_filter_itself() {
+        let world = world();
+        for country in ["de", "DE", "us", "US", "fr"] {
+            assert_eq!(
+                pinned(&world, country),
+                candidates_for_country(&world, country),
+                "{country}"
+            );
+        }
     }
 
     #[test]
