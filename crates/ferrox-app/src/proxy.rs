@@ -793,6 +793,20 @@ fn serve_inbounds_counted(
                             inbounds += 1;
                         }
                     }
+                    "naive" => {
+                        if crate::naive::serve_inbound(
+                            address,
+                            inbound,
+                            label,
+                            freedom,
+                            handler_stop.as_ref(),
+                        ) {
+                            if let Some(stop) = &handler_stop {
+                                handler_stops.push((Arc::clone(stop), address.clone()));
+                            }
+                            inbounds += 1;
+                        }
+                    }
                     "socks" | "http" | "mixed" => {
                         let Some(out) = routed(inbound, true) else {
                             eprintln!(
@@ -1127,6 +1141,7 @@ fn serve_addresses(inbound: &Json, protocol: &str) -> Option<Vec<String>> {
 fn inbound_sockets(inbound: &Json, protocol: &str) -> (bool, bool) {
     match protocol {
         "socks" | "http" | "mixed" | "anytls" | "hc" | "blackhole" => (true, false),
+        "naive" => crate::naive::inbound_sockets(inbound),
         "hysteria" | "tuic" | "wireguard" => (false, true),
         "masque" => {
             let security = inbound
@@ -1287,7 +1302,7 @@ fn refuse_inbound(protocol: &str, label: &str, inbound: &Json) {
 }
 
 /// Served inbounds; the `tun` device inbound opens a native interface and relays TCP flows.
-const SERVED_INBOUNDS: [&str; 16] = [
+const SERVED_INBOUNDS: [&str; 17] = [
     "vless",
     "trojan",
     "vmess",
@@ -1295,6 +1310,7 @@ const SERVED_INBOUNDS: [&str; 16] = [
     "hysteria",
     "tuic",
     "anytls",
+    "naive",
     "socks",
     "http",
     "mixed",
@@ -2227,6 +2243,7 @@ fn udp_lane_supported(out: &Outbound) -> bool {
         | Outbound::ReversePortal(_) => true,
         Outbound::Shadowsocks(ss) => matches!(ss.carrier, Carrier::Raw(_)),
         Outbound::Socks(socks) => socks.version != crate::socks::Version::V4,
+        Outbound::Naive(naive) => naive.udp_over_tcp(),
         Outbound::Http(_)
         | Outbound::AnyTls(_)
         | Outbound::Veepn(_)
@@ -3123,6 +3140,7 @@ pub(crate) enum Outbound {
     Hysteria(Box<HysteriaOut>),
     Tuic(Arc<crate::tuic::TuicOut>),
     AnyTls(Arc<crate::anytls::AnyTlsOut>),
+    Naive(Arc<crate::naive::NaiveOut>),
     Socks(SocksOut),
     Foxy(Box<FoxyOut>),
     Veepn(crate::veepn::VeepnOut),
@@ -3168,6 +3186,7 @@ impl Outbound {
             Self::Hysteria(hy) => resolve_outbound(&hy.address, hy.port),
             Self::Tuic(tuic) => tuic.edge(),
             Self::AnyTls(anytls) => anytls.edge(),
+            Self::Naive(naive) => naive.edge(),
             Self::Socks(socks) => resolve_outbound(&socks.address, socks.port),
             Self::Http(http) => resolve_outbound(&http.address, http.port),
             Self::WireGuard(wireguard) => wireguard.edge(),
@@ -4724,6 +4743,7 @@ fn chain_hop_can_dial_through(out: &Outbound) -> bool {
         | Outbound::Warp(_)
         | Outbound::Hysteria(_)
         | Outbound::Tuic(_)
+        | Outbound::Naive(_)
         | Outbound::Foxy(_)
         | Outbound::Veepn(_)
         | Outbound::Loopback(_)
@@ -5193,7 +5213,8 @@ fn pick_script_outbound(
 }
 
 /// The target networks a direct-dial server inbound serves; `None` when this tree routes it
-/// through an outbound instead. `AnyTLS` carries streams only, so a datagram rule never reaches it.
+/// through an outbound instead. `AnyTLS` carries streams only; `Naive` also carries `UoT` datagrams,
+/// so a UDP rule that could bypass it must name a freedom outbound.
 fn server_networks(inbound: &Json) -> Option<Vec<crate::router::Network>> {
     let protocol = inbound.get("protocol").and_then(Json::as_str).unwrap_or("");
     match canonical_protocol(protocol) {
@@ -5218,7 +5239,7 @@ fn server_networks(inbound: &Json) -> Option<Vec<crate::router::Network>> {
             }
             (!networks.is_empty()).then_some(networks)
         }
-        "vless" | "trojan" | "vmess" | "hysteria" | "tuic" => Some(vec![
+        "vless" | "trojan" | "vmess" | "hysteria" | "tuic" | "naive" => Some(vec![
             crate::router::Network::Tcp,
             crate::router::Network::Udp,
         ]),
@@ -14013,6 +14034,7 @@ where
         }
         Err(error) if is_timeout(&error) => {
             if ended.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
+                ended.mark_failed();
                 Next::Done
             } else {
                 note_wait_finish(ended);
@@ -14020,7 +14042,10 @@ where
                 Next::Idle
             }
         }
-        Ok(_) | Err(_) => Next::Done,
+        Ok(_) | Err(_) => {
+            ended.mark_failed();
+            Next::Done
+        }
     }
 }
 
@@ -22977,7 +23002,7 @@ fn inject_sni_decoy(
     Ok(false)
 }
 
-fn dial_tls_session(
+pub(crate) fn dial_tls_session(
     server: &SocketAddr,
     cfg: &ferrox_core::tls::TlsConfig,
     mask: Option<&ferrox_core::finalmask::Chain>,
@@ -23136,7 +23161,7 @@ pub(crate) fn anytls_dial_session(
     dial_tls_session(server, cfg, None)
 }
 
-pub(crate) fn anytls_client_halves(
+pub(crate) fn tls_client_halves(
     session: ferrox_core::tls::ClientSession<Connection>,
 ) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
     let raw = session.get_ref().try_clone().ok()?;
@@ -23144,7 +23169,7 @@ pub(crate) fn anytls_client_halves(
     Some((Box::new(reader), Box::new(writer)))
 }
 
-pub(crate) fn anytls_server_halves(
+pub(crate) fn tls_server_halves(
     session: AnyTlsServerSession,
 ) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
     let raw = session.get_ref().get_ref().try_clone().ok()?;
@@ -23172,6 +23197,25 @@ pub(crate) fn relay_anytls_stream(
     flow.then(move || {
         if let Some(finish) = finish {
             finish();
+        }
+    });
+}
+
+pub(crate) fn relay_naive_stream(client: &Connection, stream: crate::naive::NaiveStream) {
+    let Some(upstream) = client.try_clone().ok() else {
+        stream.abort();
+        return;
+    };
+    let stall = Some(crate::budgets::relay_stall());
+    let _ = client.set_write_timeout(stall);
+    let _ = upstream.set_write_timeout(stall);
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+    let tunnel = stream.clone();
+    let flow = relay_lanes_handoff(Half::socket(upstream), Half::socket(stream), &close);
+    let ended = Arc::clone(&flow);
+    flow.then(move || {
+        if ended.failed() {
+            tunnel.abort();
         }
     });
 }
@@ -29268,6 +29312,7 @@ fn dial_socks_outbound(
         }
         Outbound::Tuic(tuic) => tuic.dial(client, target),
         Outbound::AnyTls(anytls) => anytls.dial(client, target),
+        Outbound::Naive(naive) => naive.dial(client, target),
         Outbound::Http(http) => {
             dial_http_outbound(client, server, http, target, ladder);
         }
@@ -30117,7 +30162,7 @@ fn origin_head(head: &mut Vec<u8>, line_end: Option<usize>, line: &RequestLine) 
 }
 
 /// An authority as a target: a literal address stays one, a name rides the tunnel untouched, no port means 80.
-fn authority_target(authority: &[u8]) -> Option<Destination> {
+pub(crate) fn authority_target(authority: &[u8]) -> Option<Destination> {
     let authority = std::str::from_utf8(authority).ok()?;
     if let Ok(address) = authority.parse::<SocketAddr>() {
         return Some(Destination::Address(address));
@@ -31133,6 +31178,9 @@ fn serve_udp_lane_with(
         Outbound::Freedom(out) => {
             serve_socks_udp_freedom(relay, out, source, sockopts, associate, peer, stop);
         }
+        Outbound::Naive(naive) if naive.udp_over_tcp() => {
+            naive.serve_udp(relay, associate, peer, stop);
+        }
         Outbound::Socks(socks) => {
             if socks.version == crate::socks::Version::V4 {
                 // SOCKS4 has no datagram half: the association is a SOCKS5 request.
@@ -31260,6 +31308,7 @@ struct UdpLane {
     address: SocketAddr,
     handle: thread::JoinHandle<()>,
     waker: UdpSocket,
+    stop: Arc<AtomicBool>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -31498,6 +31547,10 @@ fn spawn_udp_lane_with_cancel(
     let source = SEND_THROUGH.with(std::cell::Cell::take);
     let sockopts = DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take());
     let out = out.clone();
+    let stop = cancel
+        .clone()
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let lane_stop = Arc::clone(&stop);
     let handle = thread::spawn(move || {
         // The lane's own thread starts with the settings the pick left on this one.
         SEND_THROUGH.with(|cell| cell.set(source));
@@ -31512,13 +31565,14 @@ fn spawn_udp_lane_with_cancel(
             source,
             sockopts.as_ref(),
             Some(local),
-            cancel.as_deref(),
+            Some(cancel.as_deref().unwrap_or(lane_stop.as_ref())),
         );
     });
     Some(UdpLane {
         address,
         handle,
         waker,
+        stop,
     })
 }
 
@@ -31536,6 +31590,7 @@ fn retire_udp_lanes(
     }
     thread::spawn(move || {
         for lane in lanes.iter().chain(default_lane.iter()) {
+            lane.stop.store(true, Ordering::Relaxed);
             let _ = lane.waker.set_read_timeout(Some(UDP_POLL));
             let _ = relay.send_to(&[0u8], lane.address);
         }
@@ -38066,6 +38121,7 @@ pub(crate) fn track_relay(finish: &Arc<RelayFinish>) {
 pub(crate) struct RelayFinish {
     left: AtomicU32,
     ended: AtomicBool,
+    failed: AtomicBool,
     ended_at: Mutex<Option<std::time::Instant>>,
     /// The latest write either direction finished, so a lane that still moves bytes keeps its grace.
     progress_at: Mutex<Option<std::time::Instant>>,
@@ -38088,6 +38144,7 @@ impl RelayFinish {
         Arc::new(Self {
             left: AtomicU32::new(2),
             ended: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
             ended_at: Mutex::new(None),
             progress_at: Mutex::new(None),
             parked: Mutex::new(Vec::new()),
@@ -38102,6 +38159,15 @@ impl RelayFinish {
 
     pub(crate) fn ended(&self) -> bool {
         self.ended.load(Ordering::Relaxed)
+    }
+
+    /// A lane that ended on an error rather than a half-close: the tunnel is abandoned, not finished.
+    pub(crate) fn mark_failed(&self) {
+        self.failed.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn failed(&self) -> bool {
+        self.failed.load(Ordering::Relaxed)
     }
 
     pub(crate) fn mark_ended(&self) {
@@ -41152,7 +41218,7 @@ fn socks_authenticate<'a>(
     accepted
 }
 
-fn read_socks_named(stream: &mut dyn Read, atyp: u8) -> Option<Destination> {
+pub(crate) fn read_socks_named(stream: &mut dyn Read, atyp: u8) -> Option<Destination> {
     match atyp {
         3 => {
             let mut len = [0u8; 1];
@@ -42415,6 +42481,9 @@ fn find_outbound_with(root: &Json, test: bool) -> Result<Option<Outbound>, Strin
     }
     if let Some(anytls) = crate::anytls::outbound(root)? {
         return Ok(Some(Outbound::AnyTls(Arc::new(anytls))));
+    }
+    if let Some(naive) = crate::naive::outbound(root)? {
+        return Ok(Some(Outbound::Naive(Arc::new(naive))));
     }
     if let Some(wireguard) = find_wireguard_outbound(root)? {
         return Ok(Some(Outbound::WireGuard(Arc::new(wireguard))));
@@ -83497,6 +83566,7 @@ end
                 address,
                 handle,
                 waker,
+                stop: Arc::new(AtomicBool::new(false)),
             },
         )]);
         let mut replies = HashSet::from([address]);
@@ -88330,6 +88400,7 @@ mod reverse_tests {
                 let _ = hold.recv();
             }),
             waker: live_socket.try_clone().expect("live waker"),
+            stop: Arc::new(AtomicBool::new(false)),
         };
         let finished_socket = UdpSocket::bind("127.0.0.1:0").expect("finished socket");
         let finished_address = finished_socket.local_addr().expect("finished address");
@@ -88341,6 +88412,7 @@ mod reverse_tests {
             address: finished_address,
             handle: finished_handle,
             waker: finished_socket,
+            stop: Arc::new(AtomicBool::new(false)),
         };
         let default_socket = UdpSocket::bind("127.0.0.1:0").expect("default socket");
         let default_address = default_socket.local_addr().expect("default address");
@@ -88354,6 +88426,7 @@ mod reverse_tests {
                 address: default_address,
                 handle: default_handle,
                 waker: default_socket,
+                stop: Arc::new(AtomicBool::new(false)),
             },
         ));
         let mut lanes = HashMap::from([

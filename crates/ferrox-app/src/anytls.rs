@@ -812,7 +812,7 @@ impl AnyTlsOut {
     fn connect(self: &Arc<Self>) -> Option<Arc<Session>> {
         let server = proxy::resolve_outbound(&self.address, self.port)?;
         let session = proxy::anytls_dial_session(&server, &self.tls)?;
-        let (mut reader, mut writer) = proxy::anytls_client_halves(session)?;
+        let (mut reader, mut writer) = proxy::tls_client_halves(session)?;
         let padding_len = self.padding.handshake_padding().min(u16::MAX as usize);
         let mut prologue = Vec::with_capacity(PASSWORD_LEN + 2 + padding_len);
         prologue.extend_from_slice(&self.password);
@@ -1025,7 +1025,7 @@ fn serve_connection(
         if session.handshake().is_err() {
             return;
         }
-        let Some(halves) = proxy::anytls_server_halves(session) else {
+        let Some(halves) = proxy::tls_server_halves(session) else {
             return;
         };
         halves

@@ -1,5 +1,6 @@
 // xHTTP over HTTP/3: one QUIC connection carries the same request streams the H2 lane does, so stream-one, stream-up and packet-up keep their shapes and only the framing under them changes.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -53,6 +54,13 @@ impl Wire {
         match self {
             Self::Server(stream) => stream.activity(),
             Self::Client(stream) => Arc::clone(&stream.activity),
+        }
+    }
+
+    fn write_opening(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Server(stream) => stream.write(buf),
+            Self::Client(stream) => stream.write_opening(buf),
         }
     }
 
@@ -118,12 +126,15 @@ pub(crate) struct H3Reader {
     buf_at: usize,
     head: Option<Vec<u8>>,
     status: Option<u16>,
+    padding: bool,
     content_length: Option<usize>,
     frame_left: usize,
     ended: bool,
     reset: bool,
     head_seen: bool,
     expect_request: bool,
+    /// Only a CONNECT reads `Padding`; an ordinary answer leaves the field list unbuilt.
+    padding_head: bool,
     idle_since: Option<Instant>,
     activity: Arc<Activity>,
     deadline: Option<Instant>,
@@ -143,12 +154,14 @@ impl H3Reader {
             buf_at: 0,
             head: None,
             status: None,
+            padding: false,
             content_length: None,
             frame_left: 0,
             ended: false,
             reset: false,
             head_seen: false,
             expect_request,
+            padding_head: false,
             idle_since: None,
             activity,
             deadline: None,
@@ -207,6 +220,25 @@ impl H3Reader {
             }
         }
         Ok(self.head.take())
+    }
+
+    /// Wait for the final response HEADERS on a client stream and report its status and whether it
+    /// carried a nonempty `Padding` field, leaving any DATA that followed buffered for the tunnel.
+    pub(crate) fn read_response_head(&mut self) -> std::io::Result<Option<(u16, bool)>> {
+        self.deadline
+            .get_or_insert_with(|| Instant::now() + crate::budgets::relay_stall());
+        loop {
+            self.parse()?;
+            if let Some(status) = self.status {
+                self.deadline = None;
+                return Ok(Some((status, self.padding)));
+            }
+            if self.ended {
+                self.deadline = None;
+                return Ok(None);
+            }
+            self.fill_room()?;
+        }
     }
 
     /// The buffered bytes an open DATA frame can hand out without a copy.
@@ -389,6 +421,13 @@ impl H3Reader {
                                         "h3 content-length is malformed",
                                     )
                                 })?;
+                            if self.padding_head {
+                                self.padding = hpack::qpack_fields(payload).is_some_and(|fields| {
+                                    fields.iter().any(|(name, value)| {
+                                        name.eq_ignore_ascii_case(b"padding") && !value.is_empty()
+                                    })
+                                });
+                            }
                         }
                         self.head = head;
                         self.status = status;
@@ -644,6 +683,10 @@ impl std::fmt::Debug for H3StreamOut {
 }
 
 impl H3StreamOut {
+    pub(crate) fn new(wire: Wire, owner: Option<Arc<quic::ConnectionToken>>) -> Self {
+        Self { wire, owner }
+    }
+
     pub(crate) fn data(&self, payload: &[u8]) -> bool {
         payload.is_empty() || send_data(&self.wire, payload)
     }
@@ -751,7 +794,11 @@ fn synth_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Option<Vec<u8>> {
             .map(|(_, value)| value.as_slice())
     };
     let method = field(b":method")?;
-    let target = field(b":path")?;
+    let target = match field(b":path") {
+        Some(path) => path,
+        None if method == b"CONNECT" => field(b":authority")?,
+        None => return None,
+    };
     if !h1_token(method) || !h1_token(target) {
         return None;
     }
@@ -907,7 +954,7 @@ fn serve_one(stream: &quic::QuicStream, settings: &XhttpSettings, service: &Arc<
 /// One client request stream on the connection the session dialled.
 #[derive(Clone)]
 pub(crate) struct ClientStream {
-    _owner: Arc<H3Client>,
+    owner: Arc<H3Client>,
     conn: Arc<Mutex<quiche::Connection>>,
     sock: Arc<Datagram>,
     id: u64,
@@ -1004,6 +1051,42 @@ impl Write for ClientStream {
 }
 
 impl ClientStream {
+    /// Send the opening HEADERS under the connection lock, after the drain flag the GOAWAY pump
+    /// publishes, so a pause between the pool's check and this write cannot open a new stream.
+    fn write_opening(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let deadline = Instant::now() + crate::budgets::relay_stall();
+        let mut rest = buf;
+        while !rest.is_empty() {
+            let Ok(mut conn) = self.conn.lock() else {
+                return Err(std::io::Error::other("h3 connection lock poisoned"));
+            };
+            if self.owner.draining.load(Ordering::Relaxed) {
+                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+            }
+            match conn.stream_send(self.id, rest, false) {
+                Ok(0) | Err(quiche::Error::Done) => {
+                    drop(conn);
+                    if Instant::now() >= deadline {
+                        return Err(std::io::Error::other("h3 stream send timed out"));
+                    }
+                    std::thread::sleep(POLL);
+                }
+                Ok(n) => {
+                    self.activity.touch();
+                    quic::flush_egress(&mut conn, &self.sock);
+                    rest = &rest[n..];
+                }
+                Err(error) => {
+                    return Err(std::io::Error::other(format!("h3 stream send: {error:?}")));
+                }
+            }
+        }
+        Ok(buf.len())
+    }
+
     fn fin(&self) {
         let Ok(mut conn) = self.conn.lock() else {
             return;
@@ -1029,6 +1112,7 @@ pub(crate) struct H3Client {
     sock: Arc<Datagram>,
     next: AtomicU64,
     dead: Arc<AtomicBool>,
+    draining: Arc<AtomicBool>,
 }
 
 impl Drop for H3Client {
@@ -1042,6 +1126,12 @@ impl Drop for H3Client {
 }
 
 impl H3Client {
+    /// Whether the shared connection can still open a stream: the pump clears this once the
+    /// connection closes, and a pooled client that fails this is dropped rather than reused.
+    pub(crate) fn reusable(&self) -> bool {
+        !self.dead.load(Ordering::Relaxed) && !self.draining.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn connect(
         peer: SocketAddr,
         server_name: &str,
@@ -1056,6 +1146,31 @@ impl H3Client {
         tls: &ferrox_core::tls::TlsConfig,
         quic_params: Option<&ferrox_core::hysteria::QuicParams>,
         default_bbr: bool,
+    ) -> Option<Arc<Self>> {
+        Self::connect_windowed(
+            peer,
+            server_name,
+            tls,
+            quic_params,
+            default_bbr,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// The reference's `stream_receive_window` and `quic_session_receive_window` on one dial: the
+    /// stream window bounds a CONNECT's downlink, the session window bounds the whole connection.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn connect_windowed(
+        peer: SocketAddr,
+        server_name: &str,
+        tls: &ferrox_core::tls::TlsConfig,
+        quic_params: Option<&ferrox_core::hysteria::QuicParams>,
+        default_bbr: bool,
+        cc: Option<ferrox_core::hysteria::Congestion>,
+        stream_window: Option<u64>,
+        session_window: Option<u64>,
     ) -> Option<Arc<Self>> {
         let mut config = if tls.insecure || !tls.cert_pins.is_empty() {
             let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).ok()?;
@@ -1074,7 +1189,20 @@ impl H3Client {
             }
             quic::apply_hysteria_quic(&mut config, params, false);
         }
-        let cc = quic::lane_controller(quic_params.and_then(|params| params.cc), default_bbr);
+        if let Some(window) = stream_window {
+            let window = window.max(9);
+            config.set_initial_max_stream_data_bidi_local(window);
+            config.set_initial_max_stream_data_bidi_remote(window);
+            config.set_max_stream_window(window);
+        }
+        if let Some(window) = session_window {
+            let window = window.max(1);
+            config.set_initial_max_data(window);
+            config.set_max_connection_window(window);
+        }
+        let cc = cc.or_else(|| {
+            quic::lane_controller(quic_params.and_then(|params| params.cc), default_bbr)
+        });
         quic::apply_lane_congestion(&mut config, cc, quic_params)?;
         let sock = if peer.is_ipv6() {
             quic::bind_datagram("[::]:0").ok()?
@@ -1108,23 +1236,47 @@ impl H3Client {
         quic::send_h3_opening(&mut conn, &sock);
         let conn = Arc::new(Mutex::new(conn));
         let dead = Arc::new(AtomicBool::new(false));
+        let draining = Arc::new(AtomicBool::new(false));
         let pump = Arc::clone(&conn);
         let pump_sock = Arc::clone(&sock);
         let pump_dead = Arc::clone(&dead);
+        let pump_draining = Arc::clone(&draining);
         std::thread::Builder::new()
             .name("xhttp-h3-pump".to_owned())
-            .spawn(move || pump_connection(&pump, &pump_sock, local, peer, net, &pump_dead))
+            .spawn(move || {
+                pump_connection(
+                    &pump,
+                    &pump_sock,
+                    local,
+                    peer,
+                    net,
+                    &pump_dead,
+                    &pump_draining,
+                );
+            })
             .ok()?;
         Some(Arc::new(Self {
             conn,
             sock,
             next: AtomicU64::new(0),
             dead,
+            draining,
         }))
     }
 
     fn open(self: &Arc<Self>, block: &[u8], end_request: bool) -> Option<(H3Reader, H3StreamOut)> {
         self.open_with(block, end_request, Arc::new(Activity::new()))
+    }
+
+    /// A `NaiveProxy` CONNECT block: the caller frames its own tunnel, so no xHTTP writer is built.
+    pub(crate) fn open_block(
+        self: &Arc<Self>,
+        block: &[u8],
+        end_request: bool,
+    ) -> Option<(H3Reader, H3StreamOut)> {
+        let (mut reader, out) = self.open(block, end_request)?;
+        reader.padding_head = true;
+        Some((reader, out))
     }
 
     fn open_with(
@@ -1133,12 +1285,12 @@ impl H3Client {
         end_request: bool,
         activity: Arc<Activity>,
     ) -> Option<(H3Reader, H3StreamOut)> {
-        if self.dead.load(Ordering::Relaxed) {
+        if self.dead.load(Ordering::Relaxed) || self.draining.load(Ordering::Relaxed) {
             return None;
         }
         let id = self.next.fetch_add(4, Ordering::SeqCst);
         let wire = Wire::Client(ClientStream {
-            _owner: Arc::clone(self),
+            owner: Arc::clone(self),
             conn: Arc::clone(&self.conn),
             sock: Arc::clone(&self.sock),
             id,
@@ -1150,7 +1302,8 @@ impl H3Client {
         frames::quic_varint(&mut frame, block.len() as u64);
         frame.extend_from_slice(block);
         let mut writer = wire.clone();
-        if writer.write_all(&frame).is_err() {
+        if writer.write_opening(&frame).is_err() {
+            wire.close();
             return None;
         }
         if end_request {
@@ -1299,12 +1452,28 @@ fn drain_batch(
     true
 }
 
+/// The server control stream's identity and buffered frames, shared by the drain and idle sweeps.
+#[derive(Default)]
+struct ControlState {
+    buf: Vec<u8>,
+    id: Option<u64>,
+    skipped: Vec<u64>,
+    /// Peer QPACK encoder and decoder streams: critical, so their payload is drained but never stopped.
+    critical: Vec<u64>,
+    skip: u64,
+    /// The stream-type bytes seen so far per unidirectional stream, so a varint split across reads
+    /// is not mistaken for an unknown stream and stopped.
+    types: HashMap<u64, Vec<u8>>,
+}
+
 /// Run the connection's timers and answer what they queued, once the sock has nothing left to read.
 fn sweep(
     conn: &Arc<Mutex<quiche::Connection>>,
     sock: &Datagram,
     local: SocketAddr,
     moved: bool,
+    control: &mut ControlState,
+    draining: &Arc<AtomicBool>,
 ) -> bool {
     let Ok(mut conn) = conn.lock() else {
         return false;
@@ -1318,9 +1487,138 @@ fn sweep(
         let _ = conn.close(false, 0, b"rebind");
         return false;
     }
+    if h3_control_goaway(&mut conn, control) {
+        draining.store(true, Ordering::Relaxed);
+    }
     true
 }
 
+fn drain_stream(conn: &mut quiche::Connection, id: u64) {
+    let mut chunk = [0u8; 1024];
+    while let Ok((n, _)) = conn.stream_recv(id, &mut chunk) {
+        if n == 0 {
+            break;
+        }
+    }
+}
+
+/// The server's HTTP/3 control stream: its type, SETTINGS, then a GOAWAY that ends new requests but
+/// not the tunnels already open. The stream is found by its type, and a partial frame stays
+/// buffered until the next read completes it.
+fn h3_control_goaway(conn: &mut quiche::Connection, control: &mut ControlState) -> bool {
+    let ids: Vec<u64> = conn
+        .readable()
+        .filter(|id| *id % 4 == 3 && !control.skipped.contains(id))
+        .collect();
+    for id in ids {
+        if Some(id) != control.id {
+            if !control.critical.contains(&id) {
+                let Some(kind) = read_stream_varint(conn, id, &mut control.types) else {
+                    continue;
+                };
+                match kind {
+                    0 if control.id.is_none() => control.id = Some(id),
+                    2 | 3 => {
+                        // RFC 9204: QPACK encoder and decoder streams are critical; never STOP_SENDING them.
+                        control.critical.push(id);
+                    }
+                    _ => {
+                        // An unknown stream has no reader here, so stop its payload holding credit.
+                        let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
+                        control.skipped.push(id);
+                        continue;
+                    }
+                }
+            }
+            if Some(id) != control.id {
+                drain_stream(conn, id);
+                continue;
+            }
+        }
+        let mut chunk = [0u8; 1024];
+        while let Ok((n, _)) = conn.stream_recv(id, &mut chunk) {
+            control.buf.extend_from_slice(&chunk[..n]);
+        }
+    }
+    h3_control_frames(&mut control.buf, &mut control.skip)
+}
+
+/// Consume buffered control frames, skipping an unknown payload as it arrives so the next frame
+/// still starts on its own boundary; a GOAWAY after a large frame is not lost with the payload.
+fn h3_control_frames(control: &mut Vec<u8>, skip: &mut u64) -> bool {
+    if *skip > 0 {
+        let drop = (*skip).min(control.len() as u64) as usize;
+        control.drain(..drop);
+        *skip -= drop as u64;
+        if *skip > 0 {
+            return false;
+        }
+    }
+    loop {
+        let mut at = 0;
+        let Some(kind) = frames::quic_read(&control[..], &mut at) else {
+            break;
+        };
+        let Some(len) = frames::quic_read(&control[..], &mut at) else {
+            break;
+        };
+        let Ok(len) = usize::try_from(len) else {
+            control.clear();
+            break;
+        };
+        let Some(end) = at.checked_add(len) else {
+            control.clear();
+            break;
+        };
+        if end > control.len() {
+            if kind != 0x7 {
+                let held = control.len().saturating_sub(at);
+                control.drain(..control.len());
+                *skip = (len - held) as u64;
+            }
+            break;
+        }
+        control.drain(..end);
+        if kind == 0x7 {
+            return true;
+        }
+    }
+    if *skip == 0 && control.len() > 64 * 1024 {
+        control.clear();
+    }
+    false
+}
+
+/// Read just the stream-type varint from a unidirectional stream, leaving its frames unread and
+/// keeping a partial varint until the next read completes it.
+fn read_stream_varint(
+    conn: &mut quiche::Connection,
+    id: u64,
+    types: &mut HashMap<u64, Vec<u8>>,
+) -> Option<u64> {
+    loop {
+        let (kind, len) = {
+            let bytes = types.entry(id).or_default();
+            let mut at = 0;
+            (frames::quic_read(bytes, &mut at), bytes.len())
+        };
+        if let Some(kind) = kind {
+            types.remove(&id);
+            return Some(kind);
+        }
+        if len >= 8 {
+            types.remove(&id);
+            return None;
+        }
+        let mut byte = [0u8; 1];
+        match conn.stream_recv(id, &mut byte) {
+            Ok((1, _)) => types.entry(id).or_default().push(byte[0]),
+            _ => return None,
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 fn pump_connection(
     conn: &Arc<Mutex<quiche::Connection>>,
     sock: &Arc<Datagram>,
@@ -1328,11 +1626,13 @@ fn pump_connection(
     peer: SocketAddr,
     generation: u64,
     dead: &Arc<AtomicBool>,
+    draining: &Arc<AtomicBool>,
 ) {
     let mut local = local;
     let mut generation = generation;
     let mut moved = false;
     let mut buf = vec![0u8; 65535];
+    let mut control = ControlState::default();
     #[cfg(target_os = "linux")]
     let mut batch = quic::Batch::new();
     loop {
@@ -1369,13 +1669,15 @@ fn pump_connection(
             }
             match quic::recv_batch(sock, &mut batch) {
                 quic::Drain::Read => {
-                    if drain_batch(conn, sock, local, &mut batch, moved) {
+                    if drain_batch(conn, sock, local, &mut batch, moved)
+                        && sweep(conn, sock, local, moved, &mut control, draining)
+                    {
                         continue;
                     }
                     break;
                 }
                 quic::Drain::Empty => {
-                    if sweep(conn, sock, local, moved) {
+                    if sweep(conn, sock, local, moved, &mut control, draining) {
                         continue;
                     }
                     break;
@@ -1398,7 +1700,7 @@ fn pump_connection(
                 ) => {}
             Err(_) => break,
         }
-        if !sweep(conn, sock, local, moved) {
+        if !sweep(conn, sock, local, moved, &mut control, draining) {
             break;
         }
     }
@@ -1703,7 +2005,7 @@ mod tests {
     fn raw_stream(client: &Arc<H3Client>) -> Wire {
         let id = client.next.fetch_add(4, Ordering::SeqCst);
         Wire::Client(ClientStream {
-            _owner: Arc::clone(client),
+            owner: Arc::clone(client),
             conn: Arc::clone(&client.conn),
             sock: Arc::clone(&client.sock),
             id,
@@ -2307,5 +2609,25 @@ mod tests {
             .is_none(),
             "brutal is a Hysteria sender, not an h3 service controller"
         );
+    }
+
+    #[test]
+    fn a_large_control_frame_keeps_the_goaway_after_it() {
+        let mut wire = Vec::new();
+        frames::quic_varint(&mut wire, 0x21);
+        frames::quic_varint(&mut wire, 65_536);
+        wire.extend(std::iter::repeat_n(0u8, 65_536));
+        frames::quic_varint(&mut wire, 0x7);
+        frames::quic_varint(&mut wire, 1);
+        wire.push(0);
+        let split = 50_000;
+        let mut control = wire[..split].to_vec();
+        let mut skip = 0;
+        assert!(!h3_control_frames(&mut control, &mut skip));
+        assert!(skip > 0, "the unknown payload is skipped incrementally");
+        control.extend_from_slice(&wire[split..]);
+        assert!(h3_control_frames(&mut control, &mut skip));
+        assert_eq!(skip, 0);
+        assert_eq!(control, [] as [u8; 0]);
     }
 }

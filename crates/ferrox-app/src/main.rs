@@ -49,6 +49,7 @@ mod masque_h1;
 mod masque_h2;
 mod metrics;
 mod muxpool;
+mod naive;
 mod noize;
 mod observatory;
 mod policy;

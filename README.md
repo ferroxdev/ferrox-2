@@ -298,7 +298,7 @@ Today exactly one method dials per hop. The chaining engine builds stacks as an 
 | --- | --- | --- | --- | --- |
 | 134 | mixed (HTTP + SOCKS) inbound | implemented | — | sing-box `protocol/mixed/`; one-byte sniff between SOCKS and HTTP |
 | 135 | redirect + tproxy inbounds | planned | — | sing-box `protocol/redirect/`; Leaf `proxy/redirect/` (the origin-destination spelling, inbound and outbound) |
-| 136 | NaïveProxy | planned | — | sing-box `protocol/naive/`; LxBox `naive+https://` |
+| 136 | NaïveProxy | implemented — both roles, HTTP/2 and HTTP/3, TCP and UDP-over-stream | Both roles over TLS, with a plaintext HTTP/2 inbound; `CONNECT`, Basic credential, `Padding` header, eight padded records, shared H2/H3 connections; outbound reads `settings.servers` or the flat settings. `udp_over_tcp` v1/v2, `stream_receive_window` (H2 connection, half-sized streams), `quic_session_receive_window`, and `quic_congestion_control` are carried. | sing-box `protocol/naive/`; [page](docs/function/naive.md). Row 23 is the link parse |
 | 137 | AnyTLS | implemented — both roles, TCP flows, session reuse; UDP-over-stream not carried | Both roles over TLS or plain TCP inbound; `sha256(password)` prologue, v2 settings, the default padding scheme, `SYN`/`PSH`/`FIN`/`SYNACK`, `UPDATE_PADDING_SCHEME`, `SERVER_SETTINGS`; outbound reads `settings.servers` or the flat settings and pools up to eight idle sessions. UoT is not carried, so UDP flows are not advertised. | sing-box `protocol/anytls/`; [page](docs/function/anytls.md). Row 23 is the link parse |
 | 138 | ShadowTLS | planned | — | sing-box `protocol/shadowtls/` |
 | 139 | Snell | planned | — | sing-box `protocol/snell/` |
