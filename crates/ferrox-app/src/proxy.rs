@@ -31252,6 +31252,8 @@ fn serve_socks_udp_freedom(
     let mut uplinks: HashMap<SocketAddr, FreedomUplink> = HashMap::new();
     let mut buf = udp_buffer();
     let mut seen = 0u64;
+    let idle = budgets::udp_idle();
+    let mut last = Instant::now();
     loop {
         if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
             break;
@@ -31268,15 +31270,23 @@ fn serve_socks_udp_freedom(
                     break;
                 }
                 let now = replies.load(Ordering::Relaxed);
-                if associate.is_some_and(peer_left) || now == seen {
+                if associate.is_some_and(peer_left) {
                     break;
                 }
-                seen = now;
+                if now != seen {
+                    seen = now;
+                    last = Instant::now();
+                    continue;
+                }
+                if last.elapsed() >= idle {
+                    break;
+                }
                 continue;
             }
             Err(_) => break,
         };
         seen = replies.load(Ordering::Relaxed);
+        last = Instant::now();
         // Only the control peer, then its first UDP source, may name a destination.
         if !source_admitted(peer, pinned, src) {
             continue;
