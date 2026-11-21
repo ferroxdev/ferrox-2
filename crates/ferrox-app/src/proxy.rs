@@ -13960,3 +13960,5254 @@ fn dial_vless_rung(
             let success = Box::new(move || note_success(ladder, rung, Stage::FirstByte, explicit));
             relay_handoff_answering(client, &uplink, success, refused);
             true
+        }
+    }
+}
+
+// KCP carries the same protocol bytes as TCP over a reliable UDP stream.
+#[derive(Clone)]
+struct KcpIo {
+    conn: Arc<ferrox_core::kcp::Connection>,
+    meter: crate::stats::Meter,
+}
+
+impl KcpIo {
+    fn new(conn: Arc<ferrox_core::kcp::Connection>) -> Self {
+        Self {
+            conn,
+            meter: crate::stats::Meter::default(),
+        }
+    }
+
+    fn with_meter(conn: Arc<ferrox_core::kcp::Connection>, meter: crate::stats::Meter) -> Self {
+        Self { conn, meter }
+    }
+
+    fn close(&self) {
+        self.conn.close();
+    }
+}
+
+// A shaped handshake cannot resume after a timeout, so handshake reads wait on the handshake clock rather than the relay quantum.
+thread_local! {
+    static KCP_HANDSHAKE_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct KcpHandshakeRead(bool);
+
+impl KcpHandshakeRead {
+    pub(crate) fn enter() -> Self {
+        Self(KCP_HANDSHAKE_READ.with(|read| read.replace(true)))
+    }
+}
+
+impl Drop for KcpHandshakeRead {
+    fn drop(&mut self) {
+        KCP_HANDSHAKE_READ.with(|read| read.set(self.0));
+    }
+}
+
+impl Read for KcpIo {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        // The directions share one half-lock, so a read that never returns wedges the other's write.
+        let quantum = if KCP_HANDSHAKE_READ.with(std::cell::Cell::get) {
+            crate::budgets::HANDSHAKE_POLL
+        } else {
+            RELAY_POLL
+        };
+        self.conn.set_read_deadline(Instant::now() + quantum);
+        match self.conn.read(buf) {
+            Ok(n) => {
+                self.meter.read(n);
+                Ok(n)
+            }
+            Err(ferrox_core::kcp::ConnError::IoTimeout) => {
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            }
+            Err(error) => Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, error)),
+        }
+    }
+}
+
+impl Write for KcpIo {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let n = match self.conn.write(buf) {
+            Ok(n) => n,
+            Err(ferrox_core::kcp::ConnError::IoTimeout) => {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            Err(error) => return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, error)),
+        };
+        self.meter.write(n);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.conn.flush();
+        Ok(())
+    }
+}
+
+fn kcp_relay(tcp: &Connection, conn: &Arc<ferrox_core::kcp::Connection>) {
+    kcp_relay_metered(tcp, conn, crate::stats::Meter::default());
+}
+
+fn kcp_relay_metered(
+    tcp: &Connection,
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    meter: crate::stats::Meter,
+) {
+    let Ok(mut tcp_read) = tcp.try_clone() else {
+        return;
+    };
+    let Ok(mut tcp_write) = tcp.try_clone() else {
+        return;
+    };
+    if tcp_read.read_timeout().ok().flatten().is_none() {
+        let _ = tcp_read.set_read_timeout(Some(RELAY_POLL));
+    }
+    let finish = RelayFinish::new(
+        false,
+        Arc::new({
+            let conn = Arc::clone(conn);
+            move || conn.close()
+        }),
+        Some(Box::new({
+            let conn = Arc::clone(conn);
+            move || conn.close()
+        })),
+    );
+    let up = Arc::clone(conn);
+    let forward = Arc::clone(&finish);
+    let downlink = meter.clone();
+    let mut buffer = RelayBuf::new();
+    lane_pool::submit(
+        Box::new(move || {
+            let next = match tcp_read.read(buffer.as_mut()) {
+                Ok(0) => Next::Done,
+                Ok(n) => match up.write(buffer.filled(n)) {
+                    Ok(written) => {
+                        downlink.write(written);
+                        Next::More
+                    }
+                    Err(_) => Next::Done,
+                },
+                Err(error) if is_timeout(&error) => {
+                    if forward.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
+                        Next::Done
+                    } else {
+                        buffer.release();
+                        Next::Idle
+                    }
+                }
+                Err(_) => Next::Done,
+            };
+            if next == Next::Idle {
+                note_wait_finish(&forward);
+            }
+            if next == Next::Done {
+                up.close();
+            }
+            next
+        }),
+        Box::new({
+            let finish = Arc::clone(&finish);
+            move || {
+                finish.mark_ended();
+                finish.lane_done();
+            }
+        }),
+    );
+    // The handshake's `KcpIo` leaves a 20 ms read deadline: a raw `conn.read` would answer an empty window with a terminal `IoTimeout` and half-close the client before the reply lands, so poll-retry the same quantum here.
+    let mut download = KcpIo::with_meter(Arc::clone(conn), meter);
+    let backward = Arc::clone(&finish);
+    let mut buffer = RelayBuf::new();
+    lane_pool::submit(
+        Box::new(move || {
+            let next = match download.read(buffer.as_mut()) {
+                Ok(0) => Next::Done,
+                Ok(n) => {
+                    if tcp_write.write_all(buffer.filled(n)).is_ok() {
+                        Next::More
+                    } else {
+                        Next::Done
+                    }
+                }
+                Err(error) if is_timeout(&error) => {
+                    if backward.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
+                        Next::Done
+                    } else {
+                        buffer.release();
+                        Next::Idle
+                    }
+                }
+                Err(_) => Next::Done,
+            };
+            if next == Next::Done {
+                let _ = tcp_write.shutdown(Shutdown::Write);
+            }
+            next
+        }),
+        Box::new({
+            let finish = Arc::clone(&finish);
+            move || {
+                finish.mark_ended();
+                finish.lane_done();
+            }
+        }),
+    );
+}
+
+fn serve_vless_kcp(
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    users: &[VlessUser],
+    freedom: bool,
+    meter: crate::stats::Meter,
+) {
+    let mut io = KcpIo::with_meter(Arc::clone(conn), meter.clone());
+    let allows = |id: &[u8; 16], flow: Flow, cmd: u8| {
+        vless_user_allows(users, id, flow, cmd, freedom, false)
+    };
+    let Some((got, flow, cmd, target)) = decode_request_bounded_gated(
+        &mut io,
+        |id, flow, cmd, _, _| allows(&id, flow, cmd),
+        resolve_endpoint,
+    ) else {
+        return;
+    };
+    // A mux or reverse header names no destination, so the gate above never saw it.
+    if !allows(&got, flow, cmd) {
+        return;
+    }
+    let Some(user) = users
+        .iter()
+        .find(|user| same_vless_user(&user.id, &got) && vless_flow_ok(user, flow, cmd, false))
+    else {
+        return;
+    };
+    let meter = meter.merged(crate::stats::user(&user.email, user.level));
+    if cmd == 3 || is_singmux_request(cmd, &target) {
+        let mut ack = KcpIo::with_meter(Arc::clone(conn), meter.clone());
+        if ack.write_all(&[0, 0]).is_err() {
+            return;
+        }
+        let (reader, writer, close) = kcp_parts_metered(conn, meter);
+        if cmd == 3 {
+            return spawn_vless_mux(reader, writer, close);
+        }
+        return spawn_singmux_halves(reader, writer, close, Vec::new());
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        return;
+    };
+    let mut ack = KcpIo::with_meter(Arc::clone(conn), meter.clone());
+    if ack.write_all(&[0, 0]).is_err() {
+        return;
+    }
+    kcp_relay_metered(&uplink, conn, meter);
+}
+
+/// Hysteria v2 flow: acknowledge before dialing, so a refused dial reads as EOF rather than as a refusal.
+fn serve_hysteria_flow(mut flow: crate::hysteria::Flow, freedom: bool) {
+    if !freedom {
+        return;
+    }
+    let deadline = std::time::Instant::now() + crate::quic::HANDSHAKE_TIMEOUT;
+    let Some(address) = crate::hysteria::read_request(&mut flow, deadline) else {
+        return;
+    };
+    let Some(target) = address.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
+        flow.close();
+        return;
+    };
+    let mut raw = [0u8; 2050];
+    let padding = crate::hysteria::hysteria_padding(128, 1024, &mut raw);
+    let mut ok = Vec::with_capacity(4 + padding.len());
+    ferrox_core::hysteria::encode_tcp_response(true, &[], padding.as_bytes(), &mut ok);
+    if flow.write_all(&ok).is_err() {
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        flow.close();
+        return;
+    };
+    crate::hysteria::relay(&uplink, &flow);
+}
+
+/// The `hysteria` inbound: v2 over the hysteria transport, users' passwords as auths; v1 over the binary control stream; other versions refused.
+fn serve_hysteria_inbound(address: &str, inbound: &Json, freedom: bool, path: &str) -> bool {
+    let settings = inbound.get("settings");
+    let version =
+        crate::config::hysteria_version(settings.and_then(|node| node.get("version"))).unwrap_or(2);
+    if version == 1 {
+        return serve_hysteria_v1_inbound(address, inbound, freedom, path);
+    }
+    if version != 2 {
+        eprintln!("hysteria inbound in {path} is not version 1 or 2: serves nothing");
+        return false;
+    }
+    let auths = crate::config::hysteria_inbound_auths(settings, inbound.get("streamSettings"));
+    if auths.is_empty() {
+        eprintln!("hysteria inbound in {path} names no user auth: serves nothing");
+        return false;
+    }
+    let Some(stream) = inbound.get("streamSettings") else {
+        eprintln!("hysteria inbound in {path} carries no transport: serves nothing");
+        return false;
+    };
+    if stream.get("network").and_then(Json::as_str) != Some("hysteria") {
+        eprintln!("hysteria inbound in {path} is not on the hysteria transport: serves nothing");
+        return false;
+    }
+    let Some(identity) = crate::config::tls_identity_from_settings(stream) else {
+        eprintln!("unreadable hysteria identity in {path}: serves nothing");
+        return false;
+    };
+    let owned = address.to_owned();
+    let mut obfs_password = String::new();
+    // A named obfuscation this build cannot honour is refused rather than served in the clear.
+    if let Some(password) = crate::config::salamander_obfs(inbound.get("streamSettings")) {
+        if ferrox_core::hysteria::Salamander::new(&password).is_none() {
+            eprintln!(
+                "hysteria inbound in {path} names an obfuscation it cannot honour: serves nothing"
+            );
+            return false;
+        }
+        obfs_password = password;
+    }
+    let hy = stream
+        .get("hysteriaSettings")
+        .or_else(|| inbound.get("settings"));
+    let udp_idle = match crate::config::hysteria_udp_idle(hy) {
+        Ok(idle) => std::time::Duration::from_secs(idle),
+        Err(why) => {
+            eprintln!("hysteria inbound in {path}: udpIdleTimeout: {why}; serves nothing");
+            return false;
+        }
+    };
+    let quic = match crate::config::hysteria_quic_params(Some(stream)) {
+        Ok(quic) => quic,
+        Err(why) => {
+            eprintln!("hysteria inbound in {path}: quicParams: {why}; serves nothing");
+            return false;
+        }
+    };
+    let cc = quic
+        .as_ref()
+        .and_then(|params| params.cc)
+        .unwrap_or(ferrox_core::hysteria::Congestion::Bbr);
+    let serve: crate::hysteria::Serve = Arc::new(move |flow| {
+        serve_hysteria_flow(flow, freedom);
+    });
+    let masq = crate::config::masquerade_from_stream(Some(stream));
+    let realm = match crate::config::hysteria_realm_for_stream(Some(stream), hy) {
+        Ok(realm) => realm,
+        Err(why) => {
+            eprintln!("hysteria realm: {why}; serves nothing");
+            return false;
+        }
+    };
+    thread::spawn(move || {
+        crate::hysteria::serve_loop(
+            &owned,
+            &auths,
+            &identity,
+            cc,
+            &obfs_password,
+            &masq,
+            &serve,
+            udp_idle,
+            quic.as_ref(),
+            realm.as_ref(),
+        );
+    });
+    true
+}
+
+/// The v1 inbound: the binary control stream, users' `auth` strings, and the same stream/datagram shapes under ALPN `hysteria`.
+fn serve_hysteria_v1_inbound(address: &str, inbound: &Json, freedom: bool, path: &str) -> bool {
+    let settings = inbound.get("settings");
+    let auths: Vec<String> = settings
+        .and_then(|node| node.get("users"))
+        .and_then(Json::as_arr)
+        .map(|users| {
+            users
+                .iter()
+                .filter_map(|user| user.get("auth").and_then(Json::as_str).map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    if auths.is_empty() {
+        eprintln!("hysteria inbound in {path} names no user auth: serves nothing");
+        return false;
+    }
+    let Some(stream) = inbound.get("streamSettings") else {
+        eprintln!("hysteria inbound in {path} carries no transport: serves nothing");
+        return false;
+    };
+    if stream.get("network").and_then(Json::as_str) != Some("hysteria") {
+        eprintln!("hysteria inbound in {path} is not on the hysteria transport: serves nothing");
+        return false;
+    }
+    let Some(identity) = crate::config::tls_identity_from_settings(stream) else {
+        eprintln!("unreadable hysteria identity in {path}: serves nothing");
+        return false;
+    };
+    let config = match crate::config::hysteria_v1_config(Some(stream)) {
+        Ok(config) => config,
+        Err(why) => {
+            eprintln!("hysteria inbound in {path}: {why}; serves nothing");
+            return false;
+        }
+    };
+    let owned = address.to_owned();
+    let serve: crate::hysteria_v1::Serve = Arc::new(move |flow, host, port| {
+        serve_hysteria_v1_flow(flow, &host, port, freedom);
+    });
+    thread::spawn(move || {
+        crate::hysteria_v1::serve_loop(&owned, &auths, &identity, &serve, &config);
+    });
+    true
+}
+
+fn serve_hysteria_v1_flow(mut flow: crate::hysteria::Flow, host: &str, port: u16, freedom: bool) {
+    if !freedom {
+        return;
+    }
+    let Some(target) = (host, port)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut it| it.next())
+    else {
+        let mut reply = Vec::with_capacity(8);
+        ferrox_core::hysteria_v1::encode_server_response(
+            &ferrox_core::hysteria_v1::ServerResponse {
+                ok: false,
+                udp_session_id: 0,
+                message: b"host resolution failure",
+            },
+            &mut reply,
+        );
+        let _ = flow.write_all(&reply);
+        flow.close();
+        return;
+    };
+    let Some(uplink) = dial_or_report(&target) else {
+        let mut reply = Vec::with_capacity(8);
+        ferrox_core::hysteria_v1::encode_server_response(
+            &ferrox_core::hysteria_v1::ServerResponse {
+                ok: false,
+                udp_session_id: 0,
+                message: b"connection failure",
+            },
+            &mut reply,
+        );
+        let _ = flow.write_all(&reply);
+        flow.close();
+        return;
+    };
+    let mut reply = Vec::with_capacity(8);
+    ferrox_core::hysteria_v1::encode_server_response(
+        &ferrox_core::hysteria_v1::ServerResponse {
+            ok: true,
+            udp_session_id: 0,
+            message: b"",
+        },
+        &mut reply,
+    );
+    if flow.write_all(&reply).is_err() {
+        return;
+    }
+    crate::hysteria::relay(&uplink, &flow);
+}
+
+fn serve_vless_hysteria(mut io: crate::hysteria::Flow, users: &[VlessUser], freedom: bool) {
+    let allows = |id: &[u8; 16], flow: Flow, cmd: u8| {
+        vless_user_allows(users, id, flow, cmd, freedom, false)
+    };
+    let Some((got, flow, cmd, target)) = decode_request_bounded_gated(
+        &mut io,
+        |id, flow, cmd, _, _| allows(&id, flow, cmd),
+        resolve_endpoint,
+    ) else {
+        io.close();
+        return;
+    };
+    let Some(user) = users
+        .iter()
+        .find(|user| same_vless_user(&user.id, &got) && vless_flow_ok(user, flow, cmd, false))
+    else {
+        io.close();
+        return;
+    };
+    // A mux or reverse header names no destination, so the gate above never saw it.
+    if !allows(&got, flow, cmd) {
+        io.close();
+        return;
+    }
+    io = io.with_meter(crate::stats::user(&user.email, user.level));
+    if cmd == 3 || is_singmux_request(cmd, &target) {
+        if io.write_all(&[0, 0]).is_err() {
+            return;
+        }
+        let read = io.clone();
+        let closer = io.clone();
+        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+        if cmd == 3 {
+            return serve_mux_tunnel(Box::new(read), Box::new(io), close, &[]);
+        }
+        return serve_singmux_tunnel(read, io, close, &[]);
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        io.close();
+        return;
+    };
+    if io.write_all(&[0, 0]).is_err() {
+        return;
+    }
+    crate::hysteria::relay(&uplink, &io);
+}
+
+/// A standalone v2 flow opens with `0x401`, the target authority and 64..512 bytes of padding, then reads the server's status before any payload; v1 keeps its binary control stream.
+fn dial_hysteria_v2(client: &Connection, dial: &crate::hysteria::Dial, target: &Destination) {
+    let mut raw = [0u8; 2050];
+    let padding = crate::hysteria::hysteria_padding(64, 512, &mut raw);
+    let mut request = Vec::with_capacity(3 + target.authority_len() + 2 + padding.len());
+    ferrox_core::hysteria::encode_tcp_request_body(
+        &target.authority(),
+        padding.as_bytes(),
+        &mut request,
+    );
+    let Some(mut flow) = crate::hysteria::open(dial, &request, 0) else {
+        return;
+    };
+    let deadline = Instant::now() + crate::quic::HANDSHAKE_TIMEOUT;
+    let Some((ok, _message)) = crate::hysteria::read_tcp_response(&mut flow, deadline) else {
+        flow.close();
+        return;
+    };
+    if !ok {
+        flow.close();
+        return;
+    }
+    crate::hysteria::relay(client, &flow);
+}
+
+fn hysteria_dial_session(vless: &VlessOut) -> Option<crate::hysteria::Dial> {
+    let Carrier::Hysteria(config) = &vless.carrier else {
+        return None;
+    };
+    Some(crate::hysteria::Dial {
+        host: vless.host.clone(),
+        address: vless.address.clone(),
+        port: vless.port,
+        config: config.clone(),
+        roots: vless.hysteria_roots.clone(),
+    })
+}
+
+/// The session a KCP dial opens when the row's security is tls, shaken before any header is written.
+fn kcp_tls_connect(
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    cfg: &ferrox_core::tls::TlsConfig,
+) -> Option<ferrox_core::tls::ClientSession<KcpIo>> {
+    let Ok(mut session) = ferrox_core::tls::connect(cfg, KcpIo::new(Arc::clone(conn))) else {
+        return None;
+    };
+    shake_tls(&mut session).then_some(session)
+}
+
+fn kcp_tls_session(
+    carrier: &Carrier,
+    address: &str,
+    port: u16,
+    cfg: &ferrox_core::tls::TlsConfig,
+) -> Option<(
+    Arc<ferrox_core::kcp::Connection>,
+    ferrox_core::tls::ClientSession<KcpIo>,
+)> {
+    let conn = kcp_dial_session(carrier, address, port)?;
+    let Some(session) = kcp_tls_connect(&conn, cfg) else {
+        conn.close();
+        return None;
+    };
+    Some((conn, session))
+}
+
+/// KCP is the transport and the security rides it, as it does upstream: the session carries the header and both relay legs, not the connection.
+fn relay_kcp_under<S>(
+    client: &Connection,
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    mut session: S,
+    header: &[u8],
+    ready: impl FnOnce(&mut S) -> bool,
+) where
+    S: std::io::Read
+        + std::io::Write
+        + ferrox_core::tls::TlsProvider
+        + ferrox_core::tls::RecordAlignment
+        + Drivable
+        + Send
+        + 'static,
+{
+    if session.write_all(header).is_err() || !ready(&mut session) {
+        conn.close();
+        return;
+    }
+    let Ok(downstream) = client.try_clone() else {
+        conn.close();
+        return;
+    };
+    if downstream.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        conn.close();
+        return;
+    }
+    let close: Arc<dyn Fn() + Send + Sync> = {
+        let conn = Arc::clone(conn);
+        let socket = downstream.try_clone().ok();
+        Arc::new(move || {
+            conn.close();
+            if let Some(socket) = &socket {
+                let _ = socket.shutdown(Shutdown::Both);
+            }
+        })
+    };
+    let (reader, writer) = session_halves(session, KcpIo::new(Arc::clone(conn)));
+    relay_shared_late(
+        Half::socket(downstream),
+        Half::split(reader, writer),
+        &close,
+    );
+}
+
+fn relay_kcp_under_tls(
+    client: &Connection,
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    cfg: &ferrox_core::tls::TlsConfig,
+    header: &[u8],
+    ready: impl FnOnce(&mut ferrox_core::tls::ClientSession<KcpIo>) -> bool,
+) {
+    let Some(session) = kcp_tls_connect(conn, cfg) else {
+        return;
+    };
+    relay_kcp_under(client, conn, session, header, ready);
+}
+
+fn kcp_reality_connect(
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    cfg: &ferrox_core::tls::RealityClientConfig,
+) -> Option<ferrox_core::tls::RealityClientSession<ferrox_core::tls::reality::RecordLimiter<KcpIo>>>
+{
+    let now = u32::try_from(unix_millis() / 1000).unwrap_or(u32::MAX);
+    let limiter = ferrox_core::tls::reality::RecordLimiter::new(KcpIo::new(Arc::clone(conn)));
+    ferrox_core::tls::RealityClientSession::connect(cfg, now, limiter).ok()
+}
+
+fn relay_kcp_under_reality(
+    client: &Connection,
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    cfg: &ferrox_core::tls::RealityClientConfig,
+    header: &[u8],
+) {
+    let Some(session) = kcp_reality_connect(conn, cfg) else {
+        return;
+    };
+    relay_kcp_under(client, conn, session, header, |_| true);
+}
+
+fn dial_vless_kcp(
+    client: &Connection,
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    vless: &VlessOut,
+    target: &Destination,
+) {
+    let header = vless_header(&vless.id, 1, target);
+    if let Some(cfg) = vless.tls.as_deref() {
+        relay_kcp_under_tls(client, conn, cfg, &header, |session| {
+            read_vless_response(session).is_some()
+        });
+        return;
+    }
+    if let Some(cfg) = vless.reality.as_deref() {
+        let Some(session) = kcp_reality_connect(conn, cfg) else {
+            return;
+        };
+        relay_kcp_under(client, conn, session, &header, |session| {
+            read_vless_response(session).is_some()
+        });
+        return;
+    }
+    if conn.write(&header).is_err() {
+        return;
+    }
+    let mut io = KcpIo::new(Arc::clone(conn));
+    let pump = Pump::over(client, {
+        let conn = Arc::clone(conn);
+        move |bytes| conn.write(bytes).is_ok()
+    });
+    let answered = read_vless_response_deferred(&mut io, pump.progress_flag()).is_some();
+    pump.end();
+    if !answered {
+        return;
+    }
+    kcp_relay(client, conn);
+}
+
+fn serve_vless_kcp_reality(
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    users: &[VlessUser],
+    freedom: bool,
+    server: &ferrox_core::tls::RealityServerConfig,
+    meter: crate::stats::Meter,
+) {
+    let accepted = ferrox_core::tls::RealityServer::accept(
+        server,
+        unix_millis(),
+        KcpIo::with_meter(Arc::clone(conn), meter),
+        Edges::default(),
+    );
+    let Ok(accepted) = accepted else {
+        if server.show {
+            eprintln!("REALITY: the cover origin refused the splice");
+        }
+        return;
+    };
+    match accepted {
+        ferrox_core::tls::RealityAccept::Session(session) => {
+            finish_reality(session, None, users, freedom, None, None);
+        }
+        ferrox_core::tls::RealityAccept::Proxied(proxied) => relay_fallback(proxied),
+    }
+}
+
+fn serve_trojan_mux<R, W>(reader: R, writer: W, close: Arc<dyn Fn() + Send + Sync>, carried: &[u8])
+where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    if take_handshake_lane() {
+        let carried = carried.to_vec();
+        let sniffing = crate::sniff::current();
+        let flow = crate::accesslog::snapshot();
+        thread::spawn(move || {
+            crate::sniff::install_current(sniffing);
+            let _flow = crate::accesslog::install_snapshot(flow);
+            serve_trojan_mux(reader, writer, close, &carried);
+        });
+        return;
+    }
+    serve_mux_tunnel(Box::new(reader), Box::new(writer), close, carried);
+}
+
+fn serve_trojan_kcp(
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    key: &[[u8; 56]],
+    accounts: &[InboundAccount],
+    freedom: bool,
+    meter: crate::stats::Meter,
+) {
+    let mut io = KcpIo::with_meter(Arc::clone(conn), meter.clone());
+    let Some((cmd, target, index)) = decode_trojan_request_index(&mut io, key) else {
+        return;
+    };
+    if !freedom {
+        return;
+    }
+    let account = accounts.get(index).cloned().unwrap_or_default();
+    crate::accesslog::reidentify(&account.email, account.level);
+    let meter = meter.merged(crate::stats::user(&account.email, account.level));
+    crate::accesslog::record_current(&target);
+    if cmd == 3 {
+        let (reader, writer, close) = kcp_parts_metered(conn, meter);
+        return serve_trojan_udp_halves(reader, writer, move || close());
+    }
+    if cmd != 1 {
+        return;
+    }
+    if target.is_rendezvous() {
+        let (reader, writer, close) = kcp_parts_metered(conn, meter);
+        return serve_singmux_tunnel(reader, writer, close, &[]);
+    }
+    if target.is_mux() {
+        let (reader, writer, close) = kcp_parts_metered(conn, meter);
+        return serve_trojan_mux(reader, writer, close, &[]);
+    }
+    let Some(target) = target.socket() else {
+        return;
+    };
+    let Some(uplink) = dial_or_report(&target) else {
+        return;
+    };
+    kcp_relay_metered(&uplink, conn, meter);
+}
+
+fn serve_trojan_kcp_tls(
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    key: &[[u8; 56]],
+    accounts: &[InboundAccount],
+    freedom: bool,
+    server: &ferrox_core::tls::TlsServerConfig,
+    meter: crate::stats::Meter,
+) {
+    let Ok(mut tls) =
+        ferrox_core::tls::accept(server, KcpIo::with_meter(Arc::clone(conn), meter.clone()))
+    else {
+        return;
+    };
+    if !shake_tls(&mut tls) {
+        return;
+    }
+    relay_trojan(
+        tls,
+        None,
+        Some(Arc::clone(conn)),
+        key,
+        accounts,
+        freedom,
+        meter,
+        &[],
+    );
+}
+
+fn serve_trojan_kcp_reality(
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    key: &[[u8; 56]],
+    accounts: &[InboundAccount],
+    freedom: bool,
+    server: &ferrox_core::tls::RealityServerConfig,
+    meter: crate::stats::Meter,
+) {
+    let accepted = ferrox_core::tls::RealityServer::accept(
+        server,
+        unix_millis(),
+        KcpIo::with_meter(Arc::clone(conn), meter.clone()),
+        Edges::default(),
+    );
+    let Ok(accepted) = accepted else {
+        if server.show {
+            eprintln!("REALITY: the cover origin refused the splice");
+        }
+        return;
+    };
+    match accepted {
+        ferrox_core::tls::RealityAccept::Session(session) => {
+            finish_trojan_reality(
+                session,
+                None,
+                Some(Arc::clone(conn)),
+                key,
+                accounts,
+                freedom,
+                None,
+                meter,
+            );
+        }
+        ferrox_core::tls::RealityAccept::Proxied(proxied) => relay_fallback(proxied),
+    }
+}
+
+fn kcp_dial_session(
+    carrier: &Carrier,
+    address: &str,
+    port: u16,
+) -> Option<Arc<ferrox_core::kcp::Connection>> {
+    let Carrier::Kcp(config) = carrier else {
+        return None;
+    };
+    let server = resolve_outbound(address, port)?;
+    let conv = ferrox_core::kcp::fresh_conversation();
+    let options = DIAL_SOCKOPTS.with(|cell| cell.borrow().clone());
+    let dialer = options
+        .as_deref()
+        .and_then(|options| options.dialer_proxy().map(|tag| (tag, options)));
+    if let Some((tag, options)) = dialer {
+        let (socket, stop) = dial_udp_through_proxy(server, tag, options)?;
+        return ferrox_core::kcp::dial_with(socket, server, config.clone(), conv, stop).ok();
+    }
+    let source = flow_source().ok()?;
+    if source.is_none() && options.is_none() {
+        return ferrox_core::kcp::dial(server, config.clone(), conv).ok();
+    }
+    let bind = match source {
+        Some(ip) if ip.is_ipv4() == server.is_ipv4() => SocketAddr::new(ip, 0),
+        Some(_) => return None,
+        None if server.is_ipv6() => "[::]:0".parse().ok()?,
+        None => "0.0.0.0:0".parse().ok()?,
+    };
+    let socket = crate::sockopt::bind_datagram_at(options.as_deref(), bind).ok()?;
+    socket.connect(server).ok()?;
+    let stop = Arc::new(AtomicBool::new(false));
+    ferrox_core::kcp::dial_with(socket, server, config.clone(), conv, stop).ok()
+}
+
+fn dial_trojan_kcp(
+    client: &Connection,
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    trojan: &TrojanOut,
+    target: &Destination,
+) {
+    let header = trojan_header(&trojan.key, 1, target);
+    if let Some(cfg) = trojan.reality.as_deref() {
+        relay_kcp_under_reality(client, conn, cfg, &header);
+        return;
+    }
+    if let Some(cfg) = trojan.tls.as_deref() {
+        relay_kcp_under_tls(client, conn, cfg, &header, |_| true);
+        return;
+    }
+    if conn.write(&header).is_err() {
+        return;
+    }
+    kcp_relay(client, conn);
+}
+
+fn dial_vmess_quic(client: &Connection, vmess: &VmessOut, target: &Destination) {
+    let Some((request, send, recv, response_key, response_iv, auth)) = crate::vmess::client_request(
+        &vmess.id,
+        vmess.cipher,
+        vmess.auth_len,
+        vmess.no_termination,
+        target,
+        1,
+    ) else {
+        return;
+    };
+    let Some(pooled) = crate::quic::pumped_stream_within(&vmess_quic_dial(vmess), budgets::dial())
+    else {
+        return;
+    };
+    let mut writer = pooled.stream_handle();
+    if writer.write_all(&request).is_err() {
+        pooled.cancel();
+        return;
+    }
+    let reader = pooled.stream_handle();
+    let close_stream = pooled.stream_handle();
+    let fin_stream = pooled.stream_handle();
+    let graceful = Arc::new(AtomicBool::new(false));
+    let finish: Arc<dyn Fn() + Send + Sync> = {
+        let graceful = Arc::clone(&graceful);
+        Arc::new(move || {
+            if fin_stream.fin() {
+                graceful.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        })
+    };
+    let pooled = Mutex::new(Some(pooled));
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        if !graceful.load(std::sync::atomic::Ordering::Relaxed) {
+            close_stream.close();
+        }
+        drop(pooled.lock().ok().and_then(|mut slot| slot.take()));
+    });
+    crate::vmess::pump_relay_carried_with_finish(
+        client,
+        reader,
+        writer,
+        &close,
+        send,
+        recv,
+        Some((response_key, response_iv, auth)),
+        None,
+        Some(finish),
+    );
+}
+
+fn vmess_quic_dial(vmess: &VmessOut) -> crate::quic::QuicDial {
+    crate::quic::QuicDial {
+        id: [0; 16],
+        host: std::sync::Arc::from(vmess.host.as_str()),
+        address: std::sync::Arc::from(vmess.address.as_str()),
+        port: vmess.port,
+        upstream: None,
+        roots: vmess.quic_roots.clone(),
+        ech_config_list: vmess.quic_ech.clone(),
+        default_cc: None,
+    }
+}
+
+fn vmess_hysteria_dial(vmess: &VmessOut) -> Option<crate::hysteria::Dial> {
+    let Carrier::Hysteria(config) = &vmess.carrier else {
+        return None;
+    };
+    Some(crate::hysteria::Dial {
+        host: vmess.host.clone(),
+        address: vmess.address.clone(),
+        port: vmess.port,
+        config: config.clone(),
+        roots: vmess.hysteria_roots.clone(),
+    })
+}
+
+fn dial_vmess_hysteria(
+    client: &Connection,
+    dial: &crate::hysteria::Dial,
+    vmess: &VmessOut,
+    target: &Destination,
+) {
+    let Some((request, send, recv, response_key, response_iv, auth)) = crate::vmess::client_request(
+        &vmess.id,
+        vmess.cipher,
+        vmess.auth_len,
+        vmess.no_termination,
+        target,
+        1,
+    ) else {
+        return;
+    };
+    let Some(flow) = crate::hysteria::open(dial, &request, 0) else {
+        return;
+    };
+    let reader = crate::hysteria::FlowRead::new(flow.clone());
+    let closer = flow.clone();
+    let finish_flow = flow.clone();
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+    let finish: Arc<dyn Fn() + Send + Sync> = Arc::new(move || finish_flow.close());
+    crate::vmess::pump_relay_carried_with_finish(
+        client,
+        reader,
+        flow,
+        &close,
+        send,
+        recv,
+        Some((response_key, response_iv, auth)),
+        None,
+        Some(finish),
+    );
+}
+
+fn dial_vmess_kcp(
+    client: &Connection,
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    vmess: &VmessOut,
+    target: &Destination,
+) {
+    let Some((request, send, recv, response_key, response_iv, auth)) = crate::vmess::client_request(
+        &vmess.id,
+        vmess.cipher,
+        vmess.auth_len,
+        vmess.no_termination,
+        target,
+        1,
+    ) else {
+        return;
+    };
+    if let Some(cfg) = vmess.tls.as_deref() {
+        let Some(mut session) = kcp_tls_connect(conn, cfg) else {
+            return;
+        };
+        if session.write_all(&request).is_err()
+            || !crate::vmess::read_response(&mut session, &response_key, &response_iv, auth)
+        {
+            return;
+        }
+        let (reader, writer) = session_halves(session, KcpIo::new(Arc::clone(conn)));
+        let close = kcp_close(conn);
+        crate::vmess::pump_relay_carried(client, reader, writer, &close, send, recv, None);
+        return;
+    }
+    if conn.write(&request).is_err() {
+        return;
+    }
+    let mut reader = KcpIo::new(Arc::clone(conn));
+    if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
+        return;
+    }
+    let (_, writer, close) = kcp_parts(conn);
+    crate::vmess::pump_relay_carried(client, reader, writer, &close, send, recv, None);
+}
+
+// KCP has no write-side half-close: its only end is the full `close`, which runs once both relay lanes finish.
+fn kcp_close(conn: &Arc<ferrox_core::kcp::Connection>) -> Arc<dyn Fn() + Send + Sync> {
+    let conn = Arc::clone(conn);
+    Arc::new(move || conn.close())
+}
+
+fn dial_ss_kcp(
+    client: &Connection,
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    ss: &ShadowsocksOut,
+    target: &Destination,
+) {
+    if let Some(cfg) = ss.reality.as_deref() {
+        let Some(mut session) = kcp_reality_connect(conn, cfg) else {
+            return;
+        };
+        if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
+            let Ok((send, recv)) = crate::shadowsocks2022::client_send_handshake(
+                &mut session,
+                &ss.password,
+                &ss.method,
+                target,
+            ) else {
+                return;
+            };
+            let (reader, writer) = session_halves(session, KcpIo::new(Arc::clone(conn)));
+            let close = kcp_close(conn);
+            crate::shadowsocks2022::pump_relay_carried(client, reader, writer, &close, send, recv);
+            return;
+        }
+        let Ok((send, recv)) = crate::shadowsocks::client_send_handshake(
+            &mut session,
+            &ss.password,
+            &ss.method,
+            target,
+        ) else {
+            return;
+        };
+        let (reader, writer) = session_halves(session, KcpIo::new(Arc::clone(conn)));
+        let close = kcp_close(conn);
+        crate::shadowsocks::pump_relay_carried(client, reader, writer, &close, send, recv);
+        return;
+    }
+    if let Some(cfg) = ss.tls.as_deref() {
+        let Some(mut session) = kcp_tls_connect(conn, cfg) else {
+            return;
+        };
+        if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
+            let Ok((send, recv)) = crate::shadowsocks2022::client_send_handshake(
+                &mut session,
+                &ss.password,
+                &ss.method,
+                target,
+            ) else {
+                return;
+            };
+            let (reader, writer) = session_halves(session, KcpIo::new(Arc::clone(conn)));
+            let close = kcp_close(conn);
+            crate::shadowsocks2022::pump_relay_carried(client, reader, writer, &close, send, recv);
+            return;
+        }
+        let Ok((send, recv)) = crate::shadowsocks::client_send_handshake(
+            &mut session,
+            &ss.password,
+            &ss.method,
+            target,
+        ) else {
+            return;
+        };
+        let (reader, writer) = session_halves(session, KcpIo::new(Arc::clone(conn)));
+        let close = kcp_close(conn);
+        crate::shadowsocks::pump_relay_carried(client, reader, writer, &close, send, recv);
+        return;
+    }
+    let mut writer = KcpIo::new(Arc::clone(conn));
+    if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
+        let Ok((send, recv)) = crate::shadowsocks2022::client_send_handshake(
+            &mut writer,
+            &ss.password,
+            &ss.method,
+            target,
+        ) else {
+            return;
+        };
+        let (reader, _, close) = kcp_parts(conn);
+        crate::shadowsocks2022::pump_relay_carried(client, reader, writer, &close, send, recv);
+        return;
+    }
+    let Ok((send, recv)) =
+        crate::shadowsocks::client_send_handshake(&mut writer, &ss.password, &ss.method, target)
+    else {
+        return;
+    };
+    let (reader, _, close) = kcp_parts(conn);
+    crate::shadowsocks::pump_relay_carried(client, reader, writer, &close, send, recv);
+}
+
+fn ss_hysteria_dial(ss: &ShadowsocksOut) -> Option<crate::hysteria::Dial> {
+    let Carrier::Hysteria(config) = &ss.carrier else {
+        return None;
+    };
+    Some(crate::hysteria::Dial {
+        host: ss.host.clone(),
+        address: ss.address.clone(),
+        port: ss.port,
+        config: config.clone(),
+        roots: ss.hysteria_roots.clone(),
+    })
+}
+
+fn dial_ss_hysteria(
+    client: &Connection,
+    dial: &crate::hysteria::Dial,
+    ss: &ShadowsocksOut,
+    target: &Destination,
+) {
+    let mut head = Vec::with_capacity(128);
+    if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
+        let Ok((send, recv)) = crate::shadowsocks2022::client_send_handshake(
+            &mut head,
+            &ss.password,
+            &ss.method,
+            target,
+        ) else {
+            return;
+        };
+        let Some(flow) = crate::hysteria::open(dial, &head, 0) else {
+            return;
+        };
+        let reader = crate::hysteria::FlowRead::new(flow.clone());
+        let closer = flow.clone();
+        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+        crate::shadowsocks2022::pump_relay_carried(client, reader, flow, &close, send, recv);
+        return;
+    }
+    let Ok((send, recv)) =
+        crate::shadowsocks::client_send_handshake(&mut head, &ss.password, &ss.method, target)
+    else {
+        return;
+    };
+    let Some(flow) = crate::hysteria::open(dial, &head, 0) else {
+        return;
+    };
+    let reader = crate::hysteria::FlowRead::new(flow.clone());
+    let closer = flow.clone();
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+    crate::shadowsocks::pump_relay_carried(client, reader, flow, &close, send, recv);
+}
+
+fn serve_ss_kcp_tls(
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    accounts: &crate::shadowsocks::SsAccounts,
+    freedom: bool,
+    server: &ferrox_core::tls::TlsServerConfig,
+    meter: crate::stats::Meter,
+) {
+    let Ok(mut tls) =
+        ferrox_core::tls::accept(server, KcpIo::with_meter(Arc::clone(conn), meter.clone()))
+    else {
+        return;
+    };
+    if !shake_tls(&mut tls) {
+        return;
+    }
+    let (reader, writer) = session_halves(tls, KcpIo::with_meter(Arc::clone(conn), meter));
+    let close = kcp_close(conn);
+    if accounts.is_2022 {
+        crate::shadowsocks2022::serve_kcp(
+            reader,
+            writer,
+            &accounts.password,
+            &accounts.method,
+            &accounts.identities,
+            freedom,
+            &close,
+        );
+    } else {
+        crate::shadowsocks::serve_kcp(reader, writer, &accounts.users, freedom, &close);
+    }
+}
+
+/// The store this outbound's config names, opened as one session: an xdrive lane starts by announcing itself where the listener polls.
+fn xdrive_dial_session(carrier: &Carrier, address: &str, port: u16) -> Option<crate::xdrive::Conn> {
+    let Carrier::Xdrive { settings } = carrier else {
+        return None;
+    };
+    match settings.dial(Some((address, port))) {
+        Ok(session) => Some(session),
+        Err(error) => {
+            eprintln!("xdrive: the store refused the session: {error}");
+            None
+        }
+    }
+}
+
+/// Both directions of a stream the store carries: the app's bytes land in the write log, the read log's bytes go back, and the store's own poll quantum bounds each wait, so neither leg holds a thread while the other's objects are in flight.
+fn xdrive_relay(app: &Connection, down: crate::xdrive::Conn) {
+    xdrive_relay_until(app, down, budgets::relay_stall());
+}
+
+fn xdrive_relay_until(app: &Connection, mut down: crate::xdrive::Conn, response_wait: Duration) {
+    let Ok(app_read) = app.try_clone() else {
+        return;
+    };
+    let Ok(mut app_write) = app.try_clone() else {
+        return;
+    };
+    let mut up = down.clone();
+    let done = RelayPool::global().run(move || {
+        let mut app_read = app_read;
+        let mut buf = RelayBuf::new().into_vec();
+        let mut wrote = true;
+        loop {
+            match app_read.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if up.write_all(&buf[..n]).is_err() {
+                        wrote = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if !wrote || up.end_write().is_err() {
+            up.abort();
+        }
+    });
+    let mut ended = false;
+    let mut response_deadline = None;
+    let mut buf = RelayBuf::new().into_vec();
+    loop {
+        match down.read(&mut buf) {
+            Ok(n) if n > 0 => {
+                if ended {
+                    response_deadline = Some(Instant::now() + response_wait);
+                }
+                if app_write.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+            }
+            Err(error) if is_timeout(&error) => {
+                if !ended && done.try_recv().is_ok() {
+                    ended = true;
+                    response_deadline = Some(Instant::now() + response_wait);
+                }
+                if ended && response_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    let _ = app_write.shutdown(Shutdown::Write);
+    join(&done);
+}
+
+/// The end-of-write closure the carried pumps call: the log's `.end` is what the peer reads as EOF, and the reader stays alive until the caller's own handle goes.
+fn xdrive_close(session: &crate::xdrive::Conn) -> Arc<dyn Fn() + Send + Sync> {
+    let closer = session.clone();
+    Arc::new(move || {
+        if closer.failed() || closer.end_write().is_err() {
+            closer.abort();
+        }
+    })
+}
+
+fn dial_vless_xdrive(client: &Connection, vless: &VlessOut, target: &Destination) {
+    dial_vless_xdrive_until(client, vless, target, budgets::relay_stall());
+}
+
+fn dial_vless_xdrive_until(
+    client: &Connection,
+    vless: &VlessOut,
+    target: &Destination,
+    response_wait: Duration,
+) {
+    let Some(mut session) = xdrive_dial_session(&vless.carrier, &vless.address, vless.port) else {
+        return;
+    };
+    if session
+        .write_all(&vless_header(&vless.id, 1, target))
+        .is_err()
+    {
+        return;
+    }
+    let mut up = session.clone();
+    let pump = Pump::over(client, move |bytes| up.write_all(bytes).is_ok());
+    let answered = read_vless_response_deferred(&mut session, pump.progress_flag()).is_some();
+    pump.end();
+    if !answered {
+        return;
+    }
+    xdrive_relay_until(client, session, response_wait);
+}
+
+fn dial_trojan_xdrive(client: &Connection, trojan: &TrojanOut, target: &Destination) {
+    dial_trojan_xdrive_until(client, trojan, target, budgets::relay_stall());
+}
+
+fn dial_trojan_xdrive_until(
+    client: &Connection,
+    trojan: &TrojanOut,
+    target: &Destination,
+    response_wait: Duration,
+) {
+    let Some(mut session) = xdrive_dial_session(&trojan.carrier, &trojan.address, trojan.port)
+    else {
+        return;
+    };
+    if session
+        .write_all(&trojan_header(&trojan.key, 1, target))
+        .is_err()
+    {
+        return;
+    }
+    xdrive_relay_until(client, session, response_wait);
+}
+
+fn dial_vmess_xdrive(client: &Connection, vmess: &VmessOut, target: &Destination) {
+    let Some(session) = xdrive_dial_session(&vmess.carrier, &vmess.address, vmess.port) else {
+        return;
+    };
+    let Some((request, send, recv, response_key, response_iv, auth)) = crate::vmess::client_request(
+        &vmess.id,
+        vmess.cipher,
+        vmess.auth_len,
+        vmess.no_termination,
+        target,
+        1,
+    ) else {
+        return;
+    };
+    let mut reader = session.clone();
+    if reader.write_all(&request).is_err() {
+        return;
+    }
+    if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
+        return;
+    }
+    let close = xdrive_close(&session);
+    crate::vmess::pump_relay_carried_with_finish(
+        client,
+        reader,
+        session,
+        &close,
+        send,
+        recv,
+        None,
+        None,
+        Some(Arc::clone(&close)),
+    );
+}
+
+fn dial_ss_xdrive(client: &Connection, ss: &ShadowsocksOut, target: &Destination) {
+    let Some(session) = xdrive_dial_session(&ss.carrier, &ss.address, ss.port) else {
+        return;
+    };
+    let mut writer = session.clone();
+    if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
+        let Ok((send, recv)) = crate::shadowsocks2022::client_send_handshake(
+            &mut writer,
+            &ss.password,
+            &ss.method,
+            target,
+        ) else {
+            return;
+        };
+        let close = xdrive_close(&session);
+        crate::shadowsocks2022::pump_relay_carried(client, session, writer, &close, send, recv);
+        return;
+    }
+    let Ok((send, recv)) =
+        crate::shadowsocks::client_send_handshake(&mut writer, &ss.password, &ss.method, target)
+    else {
+        return;
+    };
+    let close = xdrive_close(&session);
+    crate::shadowsocks::pump_relay_carried(client, session, writer, &close, send, recv);
+}
+
+/// Arms the xdrive front's inbound meter before the store serves a session.
+fn serve_vless_xdrive_inbound(
+    address: &str,
+    inbound: &Json,
+    users: &VlessUsers,
+    settings: &crate::xdrive::Settings,
+    freedom: bool,
+) {
+    let users = Arc::clone(users);
+    let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
+    let accept: crate::xdrive::Accept = Arc::new(move |session| {
+        serve_vless_xdrive(session.with_meter(meter.clone()), &users, freedom);
+    });
+    serve_xdrive_loop(settings, address, accept);
+}
+
+/// The listener an xdrive inbound is: the store itself polls for announcements, so there is no socket to bind.
+fn serve_xdrive_loop(
+    settings: &crate::xdrive::Settings,
+    address: &str,
+    accept: crate::xdrive::Accept,
+) {
+    let settings = settings.clone();
+    let address = address.to_owned();
+    thread::spawn(move || {
+        // The listen address only fronts the store's lanes, and a unix path names no host to front.
+        let front = match parse_target(&address) {
+            Ok(crate::conn::Target::Ip(addr)) => Some((addr.ip().to_string(), addr.port())),
+            _ => None,
+        };
+        let named = front.as_ref().map(|(host, port)| (host.as_str(), *port));
+        // Both poll loops hold a reference to their own server, so a listener that started outlives the handle this returns.
+        if let Err(error) = settings.listen(named, accept) {
+            eprintln!("xdrive: the store refused the listener: {error}");
+        }
+    });
+}
+
+fn serve_vless_xdrive(mut session: crate::xdrive::Conn, users: &[VlessUser], freedom: bool) {
+    let Some((got, flow, cmd, target)) = decode_request_bounded_gated(
+        &mut session,
+        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom, false),
+        resolve_endpoint,
+    ) else {
+        return;
+    };
+    // A mux or reverse header names no destination, so the gate above never saw it.
+    if !vless_user_allows(users, &got, flow, cmd, freedom, false) {
+        return;
+    }
+    let Some(user) = users.iter().find(|user| {
+        same_vless_user(&user.id, &got)
+            && user.reverse.is_none()
+            && vless_flow_ok(user, flow, cmd, false)
+    }) else {
+        return;
+    };
+    session = session.with_meter(crate::stats::user(&user.email, user.level));
+    if cmd == 3 || is_singmux_request(cmd, &target) {
+        if session.write_all(&[0, 0]).is_err() {
+            return;
+        }
+        let read = session.clone();
+        let close = xdrive_close(&session);
+        if cmd == 3 {
+            return serve_mux_tunnel(Box::new(read), Box::new(session), close, &[]);
+        }
+        return serve_singmux_tunnel(read, session, close, &[]);
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        return;
+    };
+    if session.write_all(&[0, 0]).is_err() {
+        return;
+    }
+    xdrive_relay(&uplink, session);
+}
+
+fn serve_trojan_xdrive(
+    mut session: crate::xdrive::Conn,
+    key: &[[u8; 56]],
+    accounts: &[InboundAccount],
+    freedom: bool,
+) {
+    let Some((cmd, target, index)) = decode_trojan_request_index(&mut session, key) else {
+        return;
+    };
+    if !freedom || cmd != 1 {
+        return;
+    }
+    let user = trojan_user(accounts, index);
+    session = session.with_meter(user);
+    crate::accesslog::record_current(&target);
+    if target.is_rendezvous() {
+        let read = session.clone();
+        let close = xdrive_close(&session);
+        return serve_singmux_tunnel(read, session, close, &[]);
+    }
+    if target.is_mux() {
+        let close = xdrive_close(&session);
+        return serve_trojan_mux(session.clone(), session, close, &[]);
+    }
+    let Some(target) = target.socket() else {
+        return;
+    };
+    let Some(uplink) = dial_or_report(&target) else {
+        return;
+    };
+    xdrive_relay(&uplink, session);
+}
+
+fn serve_vmess_xdrive(session: crate::xdrive::Conn, users: &crate::vmess::Users, freedom: bool) {
+    let close = xdrive_close(&session);
+    crate::vmess::serve_kcp(session.clone(), session, users, freedom, &close);
+}
+
+fn serve_ss_xdrive(
+    session: crate::xdrive::Conn,
+    accounts: &crate::shadowsocks::SsAccounts,
+    freedom: bool,
+) {
+    let close = xdrive_close(&session);
+    if accounts.is_2022 {
+        crate::shadowsocks2022::serve_kcp(
+            session.clone(),
+            session,
+            &accounts.password,
+            &accounts.method,
+            &accounts.identities,
+            freedom,
+            &close,
+        );
+        return;
+    }
+    crate::shadowsocks::serve_kcp(session.clone(), session, &accounts.users, freedom, &close);
+}
+
+/// Bind before answering, so a port already taken is the listener's refusal and not a thread's later accident.
+fn serve_kcp_bound(
+    address: &str,
+    config: ferrox_core::kcp::Config,
+    serve: &KcpServe,
+    inbound: &Json,
+) -> bool {
+    let Some(server) = address.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
+        return false;
+    };
+    let Ok(sockopt) = crate::sockopt::parse_inbound(
+        inbound
+            .get("streamSettings")
+            .and_then(|settings| settings.get("sockopt")),
+    ) else {
+        eprintln!("unreadable streamSettings.sockopt on {address}: refused, not served");
+        return false;
+    };
+    let Ok(sock) = crate::sockopt::bind_datagram_at(sockopt.as_ref(), server) else {
+        return false;
+    };
+    let Ok(listener) = ferrox_core::kcp::Listener::with_socket(sock, config) else {
+        return false;
+    };
+    let serve = Arc::clone(serve);
+    thread::spawn(move || serve_kcp_each(&listener, &serve));
+    true
+}
+
+fn serve_kcp_each(listener: &ferrox_core::kcp::Listener, serve: &KcpServe) {
+    loop {
+        let Ok(session) = listener.accept() else {
+            continue;
+        };
+        let serve = Arc::clone(serve);
+        std::thread::spawn(move || serve(&session));
+    }
+}
+
+type KcpServe = Arc<dyn Fn(&Arc<ferrox_core::kcp::Connection>) + Send + Sync>;
+
+type KcpClose = Arc<dyn Fn() + Send + Sync>;
+
+fn kcp_parts(conn: &Arc<ferrox_core::kcp::Connection>) -> (KcpIo, KcpIo, KcpClose) {
+    kcp_parts_metered(conn, crate::stats::Meter::default())
+}
+
+fn kcp_parts_metered(
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    meter: crate::stats::Meter,
+) -> (KcpIo, KcpIo, KcpClose) {
+    let reader = KcpIo::with_meter(Arc::clone(conn), meter.clone());
+    let writer = KcpIo::with_meter(Arc::clone(conn), meter);
+    let closer = KcpIo::new(Arc::clone(conn));
+    let close: KcpClose = Arc::new(move || closer.close());
+    (reader, writer, close)
+}
+
+/// The sink as a listener: each accepted flow gets the same answer the outbound writes and the
+/// same drain, so the wire is the one the oracle proved.
+fn serve_blackhole_inbound(
+    address: &str,
+    inbound: &Json,
+    label: &str,
+    stop: Option<Arc<Stop>>,
+) -> bool {
+    let answer = match crate::blackhole::answer(inbound.get("settings")) {
+        Ok(answer) => Arc::new(answer),
+        Err(reason) => exit(&format!(
+            "bad config {label}: inbound {} {reason}",
+            inbound_tag(inbound).as_deref().unwrap_or("<untagged>")
+        )),
+    };
+    let address = address.to_owned();
+    thread::spawn(move || {
+        if stop.as_ref().is_some_and(|stop| stop.stopped()) {
+            if let Some(stop) = stop {
+                stop.mark_closed();
+            }
+            return;
+        }
+        let target = parse_target(&address)
+            .unwrap_or_else(|error| exit(&format!("cannot resolve {address}: {error}")));
+        let listener = Listener::bind(&target)
+            .unwrap_or_else(|error| exit(&format!("cannot listen on {address}: {error}")));
+        if stop.as_ref().is_some_and(|stop| stop.stopped()) {
+            drop(listener);
+            if let Some(stop) = stop {
+                stop.mark_closed();
+            }
+            return;
+        }
+        for stream in listener.incoming() {
+            if stop.as_ref().is_some_and(|stop| stop.stopped()) {
+                break;
+            }
+            let Ok(stream) = stream else { continue };
+            no_delay(&stream);
+            let answer = Arc::clone(&answer);
+            thread::spawn(move || crate::blackhole::serve(stream, &answer));
+        }
+        drop(listener);
+        if let Some(stop) = stop {
+            stop.mark_closed();
+        }
+    });
+    true
+}
+
+/// Leaf's healthcheck door: one exact request line and, for `POST`, one exact body answer a
+/// fixed `200` body. A mismatch closes without an answer.
+fn serve_hc_inbound(address: &str, inbound: &Json) -> bool {
+    let Some(settings) = inbound.get("settings") else {
+        eprintln!("inbound `hc` names no settings");
+        return false;
+    };
+    let Some(path) = settings.get("path").and_then(Json::as_str) else {
+        eprintln!("inbound `hc` names no path");
+        return false;
+    };
+    let Some(response) = settings.get("response").and_then(Json::as_str) else {
+        eprintln!("inbound `hc` names no response");
+        return false;
+    };
+    let request = match settings.get("request") {
+        None | Some(Json::Null) => String::new(),
+        Some(Json::Str(request)) => request.clone(),
+        Some(_) => {
+            eprintln!("inbound `hc` request is not a string");
+            return false;
+        }
+    };
+    let handler = std::sync::Arc::new(HcHandler::new(path, request, response));
+    let address = address.to_owned();
+    thread::spawn(move || {
+        let target = parse_target(&address)
+            .unwrap_or_else(|error| exit(&format!("cannot resolve {address}: {error}")));
+        let listener = Listener::bind(&target)
+            .unwrap_or_else(|error| exit(&format!("cannot listen on {address}: {error}")));
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            no_delay(&stream);
+            let handler = std::sync::Arc::clone(&handler);
+            thread::spawn(move || handler.serve(stream));
+        }
+    });
+    true
+}
+
+/// The `hc` request's head and the octets behind it, one window at a time: the terminator scan resumes three octets before the bytes that just arrived, so a head that arrives in pieces is walked once rather than once per piece, and it reaches the tree's one `\r\n\r\n` scan rather than reopening the four-byte window.
+fn read_hc_head(stream: &mut dyn Read) -> Option<(Vec<u8>, usize)> {
+    let mut data = Vec::with_capacity(1024);
+    let mut buf = [0u8; 8192];
+    loop {
+        let read = match stream.read(&mut buf) {
+            Ok(0) | Err(_) => return None,
+            Ok(read) => read,
+        };
+        // A terminator straddles the seam at most three octets into what was already here.
+        let from = data.len().saturating_sub(3);
+        data.extend_from_slice(&buf[..read]);
+        if let Some(end) = ferrox_core::foxy::head_end(&data[from..]).map(|hit| hit + from) {
+            return Some((data, end + 4));
+        }
+        if data.len() > 65_536 {
+            return None;
+        }
+    }
+}
+
+struct HcHandler {
+    path: String,
+    request: String,
+    answer: Vec<u8>,
+}
+
+impl HcHandler {
+    fn new(path: &str, request: String, response: &str) -> Self {
+        let answer = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{}",
+            response.len(),
+            response
+        )
+        .into_bytes();
+        Self {
+            path: path.to_owned(),
+            request,
+            answer,
+        }
+    }
+
+    fn payload(&self) -> &[u8] {
+        &self.answer
+    }
+
+    fn serve(&self, mut stream: Connection) {
+        let Some((data, end)) = read_hc_head(&mut stream) else {
+            return;
+        };
+        let (head, body) = data.split_at(end);
+        if self.answer(&mut stream, head, body).is_ok() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
+
+    fn answer(
+        &self,
+        stream: &mut Connection,
+        head: &[u8],
+        remaining: &[u8],
+    ) -> std::io::Result<()> {
+        let head = std::str::from_utf8(head)
+            .map_err(|_| std::io::Error::other("request head is not UTF-8"))?;
+        let line = head.lines().next().unwrap_or("");
+        let mut parts = line.split_whitespace();
+        let method = parts.next().unwrap_or("");
+        let path = parts.next().unwrap_or("");
+        if path != self.path {
+            return Err(std::io::Error::other("not found"));
+        }
+        let get = self.request.is_empty();
+        if method != if get { "GET" } else { "POST" } {
+            return Err(std::io::Error::other("bad method"));
+        }
+        if !get {
+            let length = hc_content_length(head)
+                .filter(|length| *length > 0 && *length <= 8192)
+                .ok_or_else(|| std::io::Error::other("no usable content-length"))?;
+            let mut body = remaining.to_vec();
+            let mut left = length.saturating_sub(body.len());
+            while left > 0 {
+                let mut buf = [0u8; 8192];
+                let read = stream.read(&mut buf[..left.min(8192)])?;
+                if read == 0 {
+                    break;
+                }
+                body.extend_from_slice(&buf[..read]);
+                left = left.saturating_sub(read);
+            }
+            body.truncate(length);
+            if String::from_utf8_lossy(&body) != self.request {
+                return Err(std::io::Error::other("bad body"));
+            }
+        }
+        stream.write_all(self.payload())?;
+        stream.flush()
+    }
+}
+
+fn hc_content_length(head: &str) -> Option<usize> {
+    head.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse().ok())
+            .flatten()
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn serve_trojan_inbound(
+    address: &str,
+    inbound: &Json,
+    freedom: bool,
+    stop: Option<&Arc<Stop>>,
+) -> bool {
+    let key = inbound_trojan_keys(inbound);
+    let account = inbound_account(inbound);
+    let accounts = inbound_trojan_accounts(inbound);
+    let sec = stream_security(inbound);
+    let carrier = inbound_carrier(inbound);
+    if sec == "reality" && matches!(&carrier, Carrier::Quic | Carrier::Hysteria(_)) {
+        eprintln!("trojan reality on {address}: not carried on that transport");
+        return false;
+    }
+    if let Some(served) =
+        serve_trojan_transport_inbound(address, inbound, Arc::clone(&key), &carrier, freedom)
+    {
+        return served;
+    }
+    let fallbacks = if sec == "tls" || sec == "reality" {
+        match server_fallbacks(inbound) {
+            Ok(fallbacks) => fallbacks.map(Arc::from),
+            Err(error) => {
+                eprintln!("{error} on {address}: inbound refused");
+                return false;
+            }
+        }
+    } else {
+        None
+    };
+    match carrier {
+        Carrier::Kcp(config) => {
+            let email = account.email.clone();
+            let level = account.level;
+            let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
+            let accounts = Arc::clone(&accounts);
+            let serve: KcpServe = if sec == "reality" {
+                let Some(server) = inbound_reality_config(inbound) else {
+                    eprintln!("unreadable trojan reality settings on {address}: serves nothing");
+                    return false;
+                };
+                if let Err(error) = crate::config::reality_mldsa(inbound, true) {
+                    eprintln!("{error} on {address}: inbound refused");
+                    return false;
+                }
+                let server = Arc::new(server);
+                Arc::new(move |conn| {
+                    let _flow = crate::accesslog::flow(Some(conn.remote_addr()), &email, level);
+                    serve_trojan_kcp_reality(
+                        conn,
+                        &key,
+                        &accounts,
+                        freedom,
+                        &server,
+                        meter.clone(),
+                    );
+                })
+            } else if sec == "tls" {
+                let Some(server) = inbound_tls_identity(inbound) else {
+                    eprintln!("unreadable trojan tls identity on {address}: refused, not served");
+                    return false;
+                };
+                Arc::new(move |conn| {
+                    let _flow = crate::accesslog::flow(Some(conn.remote_addr()), &email, level);
+                    serve_trojan_kcp_tls(conn, &key, &accounts, freedom, &server, meter.clone());
+                })
+            } else {
+                Arc::new(move |conn| {
+                    let _flow = crate::accesslog::flow(Some(conn.remote_addr()), &email, level);
+                    serve_trojan_kcp(conn, &key, &accounts, freedom, meter.clone());
+                })
+            };
+            serve_kcp_bound(address, config, &serve, inbound)
+        }
+        Carrier::Xdrive { settings } => {
+            let email = account.email.clone();
+            let level = account.level;
+            let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
+            let accounts = Arc::clone(&accounts);
+            let accept: crate::xdrive::Accept = Arc::new(move |session| {
+                let _flow = crate::accesslog::flow(None, &email, level);
+                serve_trojan_xdrive(session.with_meter(meter.clone()), &key, &accounts, freedom);
+            });
+            serve_xdrive_loop(&settings, address, accept);
+            true
+        }
+        // A listener that declares reality answers the session its config names; unreadable settings are refused, never served as plaintext.
+        carrier if sec == "reality" => {
+            let Some(server) = inbound_reality_config(inbound) else {
+                eprintln!("unreadable trojan reality settings on {address}: serves nothing");
+                return false;
+            };
+            if let Err(error) = crate::config::reality_mldsa(inbound, true) {
+                eprintln!("{error} on {address}: inbound refused");
+                return false;
+            }
+            spawn_role(
+                address,
+                inbound_role(
+                    inbound,
+                    Role::TrojanReality {
+                        keys: key,
+                        carrier,
+                        freedom,
+                        server: Arc::new(server),
+                        fallbacks,
+                        account,
+                    },
+                ),
+                inbound_tag(inbound),
+            );
+            true
+        }
+        // A listener that declares tls answers the session its config names; an identity it cannot load is refused, never served as plaintext.
+        carrier if sec == "tls" => {
+            let Some(server) = inbound_tls_identity(inbound) else {
+                eprintln!("unreadable trojan tls identity on {address}: refused, not served");
+                return false;
+            };
+            if let Carrier::Xhttp { settings } = &carrier {
+                if crate::xhttp_h3::is_h3(&server.alpn) {
+                    let keys: Vec<[u8; 56]> = key.to_vec();
+                    let service: Arc<dyn crate::xhttp_h3::H3Service> =
+                        Arc::new(crate::xhttp_h2::XhttpSessionService::new(
+                            (**settings).clone(),
+                            Arc::new(move |reader, writer, _decryption| {
+                                serve_trojan_xhttp_accepted(reader, writer, &keys, freedom);
+                            }),
+                        ));
+                    return serve_xhttp_h3(
+                        address,
+                        &server,
+                        settings,
+                        service,
+                        stop,
+                        &format!("xhttp h3 trojan on {address}"),
+                    );
+                }
+            }
+            spawn_role(
+                address,
+                inbound_role(
+                    inbound,
+                    Role::TrojanTls {
+                        keys: key,
+                        carrier,
+                        freedom,
+                        server,
+                        fallbacks,
+                        account,
+                    },
+                ),
+                inbound_tag(inbound),
+            );
+            true
+        }
+        carrier => {
+            spawn_role(
+                address,
+                inbound_role(
+                    inbound,
+                    Role::Trojan {
+                        keys: key,
+                        carrier,
+                        freedom,
+                        account,
+                    },
+                ),
+                inbound_tag(inbound),
+            );
+            true
+        }
+    }
+}
+
+fn serve_trojan_transport_inbound(
+    address: &str,
+    inbound: &Json,
+    key: Arc<[[u8; 56]]>,
+    carrier: &Carrier,
+    freedom: bool,
+) -> Option<bool> {
+    if matches!(carrier, Carrier::Quic) {
+        return Some(serve_trojan_quic_inbound(address, inbound, key, freedom));
+    }
+    let Carrier::Hysteria(config) = carrier else {
+        return None;
+    };
+    if config.version != 2 {
+        eprintln!(
+            "hysteria v{} carrier in trojan is not the v2 serve `hysteria` names: serves nothing",
+            config.version
+        );
+        return Some(false);
+    }
+    let Some(settings) = inbound.get("streamSettings") else {
+        eprintln!("unreadable hysteria identity in trojan: serves nothing");
+        return Some(false);
+    };
+    let Some(identity) = crate::config::tls_identity_from_settings(settings) else {
+        eprintln!("unreadable hysteria identity in trojan: serves nothing");
+        return Some(false);
+    };
+    let masq = crate::config::masquerade_from_stream(Some(settings));
+    let config = config.clone();
+    let owned = address.to_owned();
+    let key = Arc::clone(&key);
+    let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
+    let serve: crate::hysteria::Serve = Arc::new(move |flow| {
+        serve_trojan_hysteria(flow.with_meter(meter.clone()), &key, freedom);
+    });
+    Some(serve_hysteria_thread(
+        &owned, &config, &identity, &masq, &serve,
+    ))
+}
+
+fn serve_trojan_quic_inbound(
+    address: &str,
+    inbound: &Json,
+    key: Arc<[[u8; 56]]>,
+    freedom: bool,
+) -> bool {
+    let Some(identity) = quic_inbound_identity(inbound) else {
+        eprintln!("trojan quic inbound needs security tls with a certificate: serves nothing");
+        return false;
+    };
+    let Some(config) = crate::quic::serve_config(&identity) else {
+        eprintln!("unreadable trojan quic tls identity: serves nothing");
+        return false;
+    };
+    let Ok(sock) = crate::quic::bind_datagram(address) else {
+        eprintln!("cannot listen on {address}: serves nothing");
+        return false;
+    };
+    let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
+    let serve: crate::quic::Serve = Arc::new(move |stream| {
+        serve_trojan_quic(stream.with_meter(meter.clone()), &key, freedom);
+    });
+    thread::spawn(move || {
+        crate::quic::serve_loop(
+            crate::quic::Datagram::plain(sock),
+            &Arc::new(Mutex::new(config)),
+            &serve,
+            &Arc::new(AtomicBool::new(false)),
+        );
+    });
+    true
+}
+
+fn serve_trojan_quic(mut stream: crate::quic::QuicStream, key: &[[u8; 56]], freedom: bool) {
+    if !freedom {
+        stream.close();
+        return;
+    }
+    let Some((cmd, target)) = decode_trojan_request(
+        &mut HandshakeDeadline {
+            inner: &mut stream,
+            until: Instant::now() + budgets::handshake(),
+        },
+        key,
+    ) else {
+        stream.close();
+        return;
+    };
+    crate::accesslog::record_current(&target);
+    match cmd {
+        1 => {
+            if target.is_rendezvous() {
+                let close = stream.clone();
+                return serve_singmux_tunnel(
+                    stream.clone(),
+                    stream,
+                    Arc::new(move || close.close()),
+                    &[],
+                );
+            }
+            if target.is_mux() {
+                let close = stream.clone();
+                return serve_trojan_mux(
+                    stream.clone(),
+                    stream,
+                    Arc::new(move || close.close()),
+                    &[],
+                );
+            }
+            let Some(target) = target.socket() else {
+                stream.close();
+                return;
+            };
+            serve_trojan_quic_tcp(stream, &target);
+        }
+        3 => {
+            let close = stream.clone();
+            serve_trojan_udp_halves(stream.clone(), stream, move || close.close());
+        }
+        _ => stream.close(),
+    }
+}
+
+fn serve_trojan_quic_tcp(stream: crate::quic::QuicStream, target: &SocketAddr) {
+    let fin = stream.clone();
+    let Some(uplink) = dial_or_report(target) else {
+        stream.close();
+        return;
+    };
+    if uplink.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        stream.close();
+        return;
+    }
+    let Ok(stop) = uplink.try_clone() else {
+        stream.close();
+        return;
+    };
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let _ = stop.shutdown(Shutdown::Both);
+    });
+    relay_shared_then(
+        Half::socket(stream),
+        Half::socket(uplink),
+        &close,
+        move || {
+            let _ = fin.fin();
+        },
+    );
+}
+
+fn serve_ss_hysteria(
+    io: crate::hysteria::Flow,
+    accounts: &crate::shadowsocks::SsAccounts,
+    freedom: bool,
+) {
+    if !freedom {
+        io.close();
+        return;
+    }
+    let reader = crate::hysteria::FlowRead::new(io.clone());
+    let closer = io.clone();
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+    if accounts.is_2022 {
+        crate::shadowsocks2022::serve_kcp(
+            reader,
+            io,
+            &accounts.password,
+            &accounts.method,
+            &accounts.identities,
+            freedom,
+            &close,
+        );
+    } else {
+        crate::shadowsocks::serve_kcp(reader, io, &accounts.users, freedom, &close);
+    }
+}
+
+fn serve_trojan_hysteria(mut io: crate::hysteria::Flow, key: &[[u8; 56]], freedom: bool) {
+    if !freedom {
+        io.close();
+        return;
+    }
+    let Some((cmd, target)) = decode_trojan_request(
+        &mut HandshakeDeadline {
+            inner: &mut io,
+            until: Instant::now() + budgets::handshake(),
+        },
+        key,
+    ) else {
+        io.close();
+        return;
+    };
+    crate::accesslog::record_current(&target);
+    match cmd {
+        1 => {
+            if target.is_rendezvous() {
+                let close = io.clone();
+                return serve_singmux_tunnel(io.clone(), io, Arc::new(move || close.close()), &[]);
+            }
+            if target.is_mux() {
+                let close = io.clone();
+                return serve_trojan_mux(io.clone(), io, Arc::new(move || close.close()), &[]);
+            }
+            let Some(target) = target.socket() else {
+                io.close();
+                return;
+            };
+            let Some(uplink) = dial_or_report(&target) else {
+                io.close();
+                return;
+            };
+            crate::hysteria::relay(&uplink, &io);
+        }
+        3 => {
+            let close = io.clone();
+            serve_trojan_udp_halves(io.clone(), io, move || close.close());
+        }
+        _ => io.close(),
+    }
+}
+
+#[cfg(test)]
+fn serve_vmess_inbound(
+    address: &str,
+    inbound: &Json,
+    freedom: bool,
+    stop: Option<Arc<Stop>>,
+) -> (crate::vmess::UsersRef, bool) {
+    let users = inbound_vmess_users(inbound);
+    let served = serve_vmess_inbound_users(address, inbound, freedom, stop, &users);
+    (users, served)
+}
+
+/// One address of a `VMess` handler, sharing the account table every port of that handler reads.
+#[allow(clippy::too_many_lines)]
+fn serve_vmess_inbound_users(
+    address: &str,
+    inbound: &Json,
+    freedom: bool,
+    stop: Option<Arc<Stop>>,
+    users: &crate::vmess::UsersRef,
+) -> bool {
+    let account = inbound_account(inbound);
+    let sec = stream_security(inbound);
+    match inbound_carrier(inbound) {
+        Carrier::Kcp(config) => {
+            if sec == "reality" {
+                eprintln!("vmess reality on {address}: not carried on kcp");
+                return false;
+            }
+            let email = account.email.clone();
+            let level = account.level;
+            let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
+            let serve: KcpServe = if sec == "tls" {
+                let Some(server) = inbound_tls_identity(inbound) else {
+                    eprintln!("unreadable vmess tls identity on {address}: refused, not served");
+                    return false;
+                };
+                let kcp_users = std::sync::Arc::clone(users);
+                Arc::new(move |conn| {
+                    let _flow = crate::accesslog::flow(Some(conn.remote_addr()), &email, level);
+                    serve_vmess_kcp_tls(conn, &kcp_users, freedom, &server, meter.clone());
+                })
+            } else {
+                let owned_users = std::sync::Arc::clone(users);
+                Arc::new(move |conn| {
+                    let _flow = crate::accesslog::flow(Some(conn.remote_addr()), &email, level);
+                    let (reader, writer, close) = kcp_parts_metered(conn, meter.clone());
+                    crate::vmess::serve_kcp(reader, writer, &owned_users, freedom, &close);
+                })
+            };
+            let owned = address.to_owned();
+            serve_kcp_bound(&owned, config, &serve, inbound)
+        }
+        Carrier::Xdrive { settings } => {
+            let email = account.email.clone();
+            let level = account.level;
+            let xdrive_users = std::sync::Arc::clone(users);
+            let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
+            let accept: crate::xdrive::Accept = Arc::new(move |session| {
+                let _flow = crate::accesslog::flow(None, &email, level);
+                serve_vmess_xdrive(session.with_meter(meter.clone()), &xdrive_users, freedom);
+            });
+            serve_xdrive_loop(&settings, address, accept);
+            true
+        }
+        Carrier::Quic => serve_vmess_quic_inbound(address, inbound, users, freedom, address),
+        Carrier::Hysteria(config) => {
+            serve_vmess_hysteria_inbound(address, inbound, &config, users, freedom)
+        }
+        carrier if sec == "reality" => {
+            if !carrier.tcp_stream() {
+                eprintln!("vmess reality on {address}: not carried on that transport");
+                return false;
+            }
+            let Some(server) = inbound_reality_config(inbound) else {
+                eprintln!("unreadable vmess reality settings on {address}: serves nothing");
+                return false;
+            };
+            if let Err(error) = crate::config::reality_mldsa(inbound, true) {
+                eprintln!("{error} on {address}: inbound refused");
+                return false;
+            }
+            spawn_role_stopped(
+                address,
+                inbound_role(
+                    inbound,
+                    Role::VmessReality {
+                        users: std::sync::Arc::clone(users),
+                        carrier,
+                        freedom,
+                        server: Arc::new(server),
+                        account,
+                    },
+                ),
+                inbound_tag(inbound),
+                stop,
+            );
+            true
+        }
+        carrier if sec == "tls" => {
+            let Some(server) = inbound_tls_identity(inbound) else {
+                eprintln!("unreadable vmess tls identity on {address}: refused, not served");
+                return false;
+            };
+            if let Carrier::Xhttp { settings } = &carrier {
+                if crate::xhttp_h3::is_h3(&server.alpn) {
+                    let users = std::sync::Arc::clone(users);
+                    let service: Arc<dyn crate::xhttp_h3::H3Service> =
+                        Arc::new(crate::xhttp_h2::XhttpSessionService::new(
+                            (**settings).clone(),
+                            Arc::new(move |reader, writer, _decryption| {
+                                let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+                                crate::vmess::serve_xhttp_accepted(
+                                    reader, writer, &users, freedom, &close,
+                                );
+                            }),
+                        ));
+                    return serve_xhttp_h3(
+                        address,
+                        &server,
+                        settings,
+                        service,
+                        stop.as_ref(),
+                        &format!("xhttp h3 vmess on {address}"),
+                    );
+                }
+            }
+            spawn_role_stopped(
+                address,
+                inbound_role(
+                    inbound,
+                    Role::VmessTls {
+                        users: std::sync::Arc::clone(users),
+                        carrier,
+                        freedom,
+                        server,
+                        account,
+                    },
+                ),
+                inbound_tag(inbound),
+                stop,
+            );
+            true
+        }
+        other => {
+            spawn_role_stopped(
+                address,
+                inbound_role(
+                    inbound,
+                    Role::Vmess {
+                        users: std::sync::Arc::clone(users),
+                        carrier: other,
+                        freedom,
+                        account,
+                    },
+                ),
+                inbound_tag(inbound),
+                stop,
+            );
+            true
+        }
+    }
+}
+
+fn serve_vmess_hysteria_inbound(
+    address: &str,
+    inbound: &Json,
+    config: &ferrox_core::hysteria::Config,
+    users: &crate::vmess::UsersRef,
+    freedom: bool,
+) -> bool {
+    if config.version != 2 {
+        eprintln!(
+            "hysteria v{} carrier on {address} is not the v2 serve `hysteria` names: serves nothing",
+            config.version
+        );
+        return false;
+    }
+    let Some(settings) = inbound.get("streamSettings") else {
+        eprintln!("unreadable hysteria identity on {address}: serves nothing");
+        return false;
+    };
+    let Some(identity) = crate::config::tls_identity_from_settings(settings) else {
+        eprintln!("unreadable hysteria identity on {address}: serves nothing");
+        return false;
+    };
+    let masq = crate::config::masquerade_from_stream(Some(settings));
+    let Some(prepared) = crate::hysteria::prepare(
+        address,
+        &identity,
+        config.cc,
+        &config.obfs_password,
+        config.quic.as_ref(),
+    ) else {
+        eprintln!("cannot listen on {address}: serves nothing");
+        return false;
+    };
+    let config = config.clone();
+    let hysteria_users = std::sync::Arc::clone(users);
+    let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
+    let serve: crate::hysteria::Serve = Arc::new(move |flow| {
+        serve_vmess_hysteria(flow.with_meter(meter.clone()), &hysteria_users, freedom);
+    });
+    thread::spawn(move || {
+        crate::hysteria::serve_prepared(
+            prepared,
+            std::slice::from_ref(&config.auth),
+            &masq,
+            &serve,
+            std::time::Duration::from_secs(config.udp_idle),
+            config.quic.as_ref(),
+            config.realm.as_deref(),
+        );
+    });
+    true
+}
+
+fn serve_vmess_quic_inbound(
+    address: &str,
+    inbound: &Json,
+    users: &crate::vmess::UsersRef,
+    freedom: bool,
+    path: &str,
+) -> bool {
+    let Some(identity) = quic_inbound_identity(inbound) else {
+        eprintln!("quic inbound in {path} needs security tls with a certificate: serves nothing");
+        return false;
+    };
+    let Some(config) = crate::quic::serve_config(&identity) else {
+        eprintln!("unreadable quic tls identity in {path}: serves nothing");
+        return false;
+    };
+    let Ok(sock) = crate::quic::bind_datagram(address) else {
+        eprintln!("cannot listen on {address}: serves nothing");
+        return false;
+    };
+    let users = std::sync::Arc::clone(users);
+    let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
+    let serve: crate::quic::Serve = Arc::new(move |stream| {
+        serve_vmess_quic(stream.with_meter(meter.clone()), &users, freedom);
+    });
+    thread::spawn(move || {
+        crate::quic::serve_loop(
+            crate::quic::Datagram::plain(sock),
+            &Arc::new(Mutex::new(config)),
+            &serve,
+            &Arc::new(AtomicBool::new(false)),
+        );
+    });
+    true
+}
+
+fn serve_vmess_quic(
+    mut stream: crate::quic::QuicStream,
+    users: &crate::vmess::Users,
+    freedom: bool,
+) {
+    let decoded = crate::vmess::accept_request_bounded(&mut stream, users);
+    let closer = stream.clone();
+    let finisher = stream.clone();
+    let graceful = Arc::new(AtomicBool::new(false));
+    let close: crate::vmess::Close = {
+        let graceful = Arc::clone(&graceful);
+        Arc::new(move || {
+            if !graceful.load(std::sync::atomic::Ordering::Relaxed) {
+                closer.close();
+            }
+        })
+    };
+    let finish: crate::vmess::Close = Arc::new(move || {
+        if finisher.fin() {
+            graceful.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    crate::vmess::serve_decoded_with_finish(
+        stream.clone(),
+        stream,
+        &close,
+        decoded,
+        freedom,
+        Some(finish),
+    );
+}
+
+fn serve_vmess_hysteria(flow: crate::hysteria::Flow, users: &crate::vmess::Users, freedom: bool) {
+    let mut reader = crate::hysteria::FlowRead::new(flow.clone());
+    let decoded = crate::vmess::accept_request_bounded(&mut reader, users);
+    let closer = flow.clone();
+    let finisher = flow.clone();
+    let close: crate::vmess::Close = Arc::new(move || closer.close());
+    let finish: crate::vmess::Close = Arc::new(move || finisher.close());
+    crate::vmess::serve_decoded_with_finish(reader, flow, &close, decoded, freedom, Some(finish));
+}
+
+/// A TLS xHTTP carrier for vmess: h2 shares the demux with the vless lane, H1 keeps the session
+/// the carrier has always served.
+fn serve_vmess_xhttp_carrier<
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
+    W: FrameWrite + Send + 'static,
+>(
+    read: R,
+    write: W,
+    settings: &crate::xhttp::XhttpSettings,
+    users: &crate::vmess::UsersRef,
+    freedom: bool,
+    close: &Arc<dyn Fn() + Send + Sync>,
+) {
+    let Some((chained, h2)) = sniff_xhttp(read, false, |_, _| true) else {
+        return;
+    };
+    if !h2 {
+        return crate::vmess::serve_xhttp_split(chained, write, settings, users, freedom, close);
+    }
+    #[cfg(test)]
+    if let Ok(mut paths) = H2_DIAL_WITNESS.lock() {
+        paths.push(settings.path.clone());
+    }
+    let users = Arc::clone(users);
+    let service = crate::xhttp_h2::XhttpSessionService::new(
+        settings.clone(),
+        Arc::new(move |reader, writer, _decryption| {
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+            crate::vmess::serve_xhttp_accepted(reader, writer, &users, freedom, &close);
+        }),
+    );
+    crate::xhttp_h2::serve_h2_service(chained, write, &service, None);
+}
+
+/// The session a `VMess` listener that declares `security: tls` answers, over raw and every carried carrier.
+fn serve_vmess_tls(
+    stream: Connection,
+    users: &crate::vmess::UsersRef,
+    carrier: &Carrier,
+    freedom: bool,
+    server: &ferrox_core::tls::TlsServerConfig,
+) {
+    if stream.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        return;
+    }
+    let Ok(raw) = stream.try_clone() else { return };
+    let Some(session) = accept_tls_session(stream, server) else {
+        return;
+    };
+    let Ok(out) = raw.try_clone() else {
+        return;
+    };
+    let (reader, writer) = session_halves(session, out);
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let _ = raw.shutdown(Shutdown::Both);
+    });
+    match carrier {
+        Carrier::Raw(_) => crate::vmess::serve_raw_split(reader, writer, users, freedom, &close),
+        Carrier::Ws { path, .. } => {
+            crate::vmess::serve_ws_split(reader, writer, path, users, freedom, &close);
+        }
+        Carrier::Xhttp { settings, .. } => {
+            serve_vmess_xhttp_carrier(reader, writer, settings, users, freedom, &close);
+        }
+        Carrier::HttpHeader {
+            paths, response, ..
+        } => {
+            crate::vmess::serve_httpheader_split_with(
+                reader,
+                writer,
+                paths,
+                users,
+                freedom,
+                &close,
+                response.as_deref(),
+            );
+        }
+        Carrier::HttpUpgrade { path, host, .. } => {
+            crate::vmess::serve_httpupgrade_split(
+                reader, writer, path, host, users, freedom, &close,
+            );
+        }
+        Carrier::Grpc(settings) => {
+            crate::vmess::serve_grpc_muxed_split(reader, writer, settings, users, freedom);
+        }
+        refused_carriers!() => {}
+    }
+}
+
+/// The session a `VMess` listener that declares `security: reality` answers, over raw and every carried carrier.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per carrier; splitting would scatter the dispatch"
+)]
+fn serve_vmess_reality(
+    stream: Connection,
+    users: &crate::vmess::UsersRef,
+    carrier: &Carrier,
+    freedom: bool,
+    server: &ferrox_core::tls::RealityServerConfig,
+) {
+    if stream.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        return;
+    }
+    match carrier {
+        Carrier::Raw(_) => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let edges = reality_edges(server, &stream);
+            let accepted =
+                ferrox_core::tls::RealityServer::accept(server, unix_millis(), stream, edges);
+            match accepted {
+                Ok(ferrox_core::tls::RealityAccept::Session(mut session)) => {
+                    if !shake_tls(&mut session) {
+                        return;
+                    }
+                    let Ok(out) = raw.try_clone() else { return };
+                    let (reader, writer) = session_halves(session, out);
+                    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                        let _ = raw.shutdown(Shutdown::Both);
+                    });
+                    crate::vmess::serve_raw_split(reader, writer, users, freedom, &close);
+                }
+                Ok(ferrox_core::tls::RealityAccept::Proxied(proxied)) => relay_fallback(proxied),
+                Err(why) => {
+                    if server.show {
+                        eprintln!("REALITY: {why}");
+                    }
+                }
+            }
+        }
+        Carrier::Ws { path, .. } => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Ok(out) = raw.try_clone() else { return };
+            serve_carrier_reality(stream, server, |mut session| {
+                if !shake_tls(&mut session) {
+                    return;
+                }
+                let (reader, writer) = session_halves(session, out);
+                let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                    let _ = raw.shutdown(Shutdown::Both);
+                });
+                crate::vmess::serve_ws_split(reader, writer, path, users, freedom, &close);
+            });
+        }
+        Carrier::Xhttp { settings, .. } => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Ok(out) = raw.try_clone() else { return };
+            serve_carrier_reality(stream, server, |mut session| {
+                if !shake_tls(&mut session) {
+                    return;
+                }
+                let (reader, writer) = session_halves(session, out);
+                let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                    let _ = raw.shutdown(Shutdown::Both);
+                });
+                serve_vmess_xhttp_carrier(reader, writer, settings, users, freedom, &close);
+            });
+        }
+        Carrier::HttpHeader {
+            paths, response, ..
+        } => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Ok(out) = raw.try_clone() else { return };
+            serve_carrier_reality(stream, server, |mut session| {
+                if !shake_tls(&mut session) {
+                    return;
+                }
+                let (reader, writer) = session_halves(session, out);
+                let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                    let _ = raw.shutdown(Shutdown::Both);
+                });
+                crate::vmess::serve_httpheader_split_with(
+                    reader,
+                    writer,
+                    paths,
+                    users,
+                    freedom,
+                    &close,
+                    response.as_deref(),
+                );
+            });
+        }
+        Carrier::HttpUpgrade { path, host, .. } => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Ok(out) = raw.try_clone() else { return };
+            serve_carrier_reality(stream, server, |mut session| {
+                if !shake_tls(&mut session) {
+                    return;
+                }
+                let (reader, writer) = session_halves(session, out);
+                let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                    let _ = raw.shutdown(Shutdown::Both);
+                });
+                crate::vmess::serve_httpupgrade_split(
+                    reader, writer, path, host, users, freedom, &close,
+                );
+            });
+        }
+        Carrier::Grpc(settings) => {
+            let Ok(out) = stream.try_clone() else { return };
+            serve_carrier_reality(stream, server, |mut session| {
+                if !shake_tls(&mut session) {
+                    return;
+                }
+                let (reader, writer) = session_halves(session, out);
+                crate::vmess::serve_grpc_muxed_split(reader, writer, settings, users, freedom);
+            });
+        }
+        refused_carriers!() => {}
+    }
+}
+
+/// Bind a dokodemo-door flow and rewrite it to the target its config names, and say how many
+/// inbounds it armed. The tcp flow and the udp flow are served when the config names them.
+#[allow(clippy::too_many_lines)]
+fn serve_dokodemo(
+    address: &str,
+    inbound: &Json,
+    out: &Outbound,
+    label: &str,
+    stop: Option<&Arc<Stop>>,
+    fallible: bool,
+) -> (usize, bool) {
+    let follow_redirect = inbound
+        .get("settings")
+        .and_then(|settings| settings.get("followRedirect"))
+        .and_then(Json::as_bool)
+        .unwrap_or(false);
+    let receive_original_destination = inbound
+        .get("receiveOriginalDestination")
+        .and_then(Json::as_bool)
+        .unwrap_or(follow_redirect);
+    let user_level = dokodemo_user_level(inbound);
+    let rewrite = DokodemoRewrite::from_config(inbound);
+    let networks = dokodemo_networks(inbound);
+    if !dokodemo_has(&networks, "tcp") && !dokodemo_has(&networks, "udp") {
+        eprintln!("dokodemo-door without tcp or udp in {label}: no flow to serve");
+        return (0, false);
+    }
+    let mode = match crate::sockopt::inbound_tproxy(inbound.get("streamSettings")) {
+        Ok(mode) => mode,
+        Err(reason) => {
+            eprintln!("dokodemo-door sockopt in {label}: {reason}");
+            return (0, false);
+        }
+    };
+    let requested = dokodemo_transparent(receive_original_destination, mode);
+    let transparent = match requested {
+        Some(crate::sockopt::Tproxy::Tproxy) if !crate::transparent::TPROXY => {
+            eprintln!("dokodemo-door in {label}: tproxy is unavailable here; its redirect lookup carries the flow");
+            crate::transparent::REDIRECT.then_some(crate::sockopt::Tproxy::Redirect)
+        }
+        Some(crate::sockopt::Tproxy::Redirect) if !crate::transparent::REDIRECT => {
+            eprintln!("dokodemo-door in {label}: redirect is unavailable here; the rewrite target carries the flow");
+            None
+        }
+        mode => mode,
+    };
+    let mask = match crate::config::tcp_mask(inbound.get("streamSettings")) {
+        Some(chain) if !chain.is_empty() || !chain.filters().is_empty() => Some(chain),
+        Some(_) => None,
+        None => {
+            eprintln!("dokodemo-door in {label} asks for a finalmask tcp chain it cannot arm");
+            return (0, false);
+        }
+    };
+    let port_map = match dokodemo_port_map(inbound) {
+        Ok(map) => map,
+        Err(reason) => {
+            eprintln!("dokodemo-door portMap in {label}: {reason}");
+            return (0, false);
+        }
+    };
+    let listen = match parse_target(address) {
+        Ok(crate::conn::Target::Ip(address)) => Some(address),
+        _ => None,
+    };
+    let mut armed = 0;
+    if dokodemo_has(&networks, "tcp")
+        && follow_redirect
+        && rewrite.configured().is_none()
+        && (!receive_original_destination || transparent.is_none())
+    {
+        eprintln!(
+            "dokodemo-door in {label}: followRedirect has no rewrite address and no original-destination lookup; each tcp flow closes without a destination"
+        );
+    }
+    let mut tcp_armed = false;
+    if dokodemo_has(&networks, "tcp") {
+        let role = inbound_role(
+            inbound,
+            Role::Dokodemo {
+                out: out.clone(),
+                dest: rewrite.clone(),
+                port_map: port_map.clone(),
+                follow_redirect,
+                receive_original_destination,
+                transparent,
+                mask,
+                listen,
+                account: Box::new(InboundAccount {
+                    email: String::new(),
+                    level: user_level,
+                }),
+            },
+        );
+        if fallible {
+            match try_spawn_role_stopped(address, role, inbound_tag(inbound), stop.cloned()) {
+                Ok(()) => tcp_armed = true,
+                Err(error) => {
+                    eprintln!("dokodemo-door tcp: cannot listen on {address} in {label}: {error}");
+                }
+            }
+        } else {
+            spawn_role_stopped(address, role, inbound_tag(inbound), stop.cloned());
+            tcp_armed = true;
+        }
+        if tcp_armed {
+            armed += 1;
+        }
+    }
+    if dokodemo_has(&networks, "udp") {
+        // The door's own socket is bound before the inbound is armed: a port nobody holds answers a datagram with a refusal.
+        let mut listen = None;
+        let socket = if transparent.is_some() {
+            let Ok(crate::conn::Target::Ip(bound)) = parse_target(address) else {
+                eprintln!("dokodemo-door udp: {address} names no IP in {label}");
+                return (armed, dokodemo_has(&networks, "tcp"));
+            };
+            listen = Some(bound);
+            crate::transparent::bind_udp(bound)
+        } else {
+            UdpSocket::bind(address)
+        };
+        let (socket, transparent_udp) = match socket {
+            Ok(socket) => (
+                socket,
+                transparent.is_some() && follow_redirect && receive_original_destination,
+            ),
+            Err(_)
+                if transparent.is_some()
+                    && (!follow_redirect || rewrite.configured().is_some()) =>
+            {
+                eprintln!("dokodemo-door udp: a transparent listener is unavailable in {label}; the rewrite target carries the flow");
+                let Ok(socket) = UdpSocket::bind(address) else {
+                    eprintln!("dokodemo-door udp: cannot bind {address} in {label}");
+                    return (armed, dokodemo_has(&networks, "tcp"));
+                };
+                (socket, false)
+            }
+            Err(_) => {
+                eprintln!("dokodemo-door udp: cannot bind {address} in {label}");
+                return (armed, dokodemo_has(&networks, "tcp"));
+            }
+        };
+        let door = out.clone();
+        if transparent_udp {
+            let Some(listen) = socket.local_addr().ok().or(listen) else {
+                eprintln!("dokodemo-door udp: cannot read the bound address in {label}");
+                return (armed, dokodemo_has(&networks, "tcp"));
+            };
+            thread::spawn(move || dokodemo_transparent_udp_door(&socket, &door, listen));
+        } else {
+            let dest = if follow_redirect {
+                rewrite.configured()
+            } else {
+                Some(rewrite.resolved(socket.local_addr().ok(), &port_map))
+            };
+            let Some(dest) = dest else {
+                eprintln!(
+                    "dokodemo-door udp: followRedirect needs a rewrite address in {label}; no UDP flow is served"
+                );
+                return (armed, dokodemo_has(&networks, "tcp"));
+            };
+            thread::spawn(move || dokodemo_udp_door(&socket, &dest, &door));
+        }
+        armed += 1;
+    }
+    (armed, tcp_armed)
+}
+
+fn dokodemo_original_destination(
+    stream: &Connection,
+    peer: SocketAddr,
+    local: Option<SocketAddr>,
+) -> Option<SocketAddr> {
+    #[cfg(unix)]
+    {
+        crate::transparent::original_destination(
+            std::os::fd::AsRawFd::as_raw_fd(stream),
+            peer,
+            local,
+        )
+        .ok()
+    }
+    #[cfg(windows)]
+    {
+        let _ = (stream, peer, local);
+        None
+    }
+}
+
+/// The loop the reference closes when a transparent destination is the inbound's own address.
+fn dokodemo_loopback(dest: &Destination, listen: SocketAddr) -> bool {
+    let Destination::Address(dest) = dest else {
+        return false;
+    };
+    if listen.ip().is_unspecified() {
+        dest.port() == listen.port() && local_address(dest.ip())
+    } else {
+        *dest == listen
+    }
+}
+
+/// The destination a followed flow asks for: the kernel's answer, or the configured
+/// rewrite when the lookup has none; a loopback answer closes rather than falls back.
+fn dokodemo_redirected(
+    found: Option<SocketAddr>,
+    rewrite: Option<&Destination>,
+    listen: Option<SocketAddr>,
+) -> Option<Destination> {
+    let Some(found) = found else {
+        return rewrite.cloned();
+    };
+    let found = Destination::Address(found);
+    if listen.is_some_and(|listen| dokodemo_loopback(&found, listen)) {
+        None
+    } else {
+        Some(found)
+    }
+}
+
+/// xray's `IsLocal`: an address this host owns, which a wildcard listener answers on every one.
+fn local_address(ip: std::net::IpAddr) -> bool {
+    ip.is_loopback() || ip.is_unspecified() || UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok()
+}
+
+/// xray's receiver marker turns a bare follow into the REDIRECT lookup; a named mode arms the listener on its own.
+fn dokodemo_transparent(
+    receive_original_destination: bool,
+    mode: crate::sockopt::Tproxy,
+) -> Option<crate::sockopt::Tproxy> {
+    match (receive_original_destination, mode) {
+        (true, crate::sockopt::Tproxy::Off) => Some(crate::sockopt::Tproxy::Redirect),
+        (false, crate::sockopt::Tproxy::Off) => None,
+        (_, mode) => Some(mode),
+    }
+}
+
+/// A `portMap` value split into the halves it may override; an empty half keeps the
+/// config's own half, exactly as the reference's `len > 0` checks do.
+#[derive(Clone, Debug, Default)]
+struct DokodemoPortMapEntry {
+    host: Option<String>,
+    port: Option<u16>,
+}
+
+/// The per-port rewrite table a dokodemo inbound names: the flow's own port is the string
+/// key and the value is where that flow is rewritten to. A table entry that is not a
+/// host:port shape is the refusal the reference's Build makes
+/// (`infra/conf/dokodemo.go`). A flow whose port has no entry keeps the config's target.
+fn dokodemo_port_map(inbound: &Json) -> Result<HashMap<String, DokodemoPortMapEntry>, String> {
+    let Some(map) = inbound
+        .get("settings")
+        .and_then(|settings| settings.get("portMap"))
+    else {
+        return Ok(HashMap::new());
+    };
+    let Json::Obj(pairs) = map else {
+        return Ok(HashMap::new());
+    };
+    let mut rewritten = HashMap::new();
+    for (key, value) in pairs {
+        let Some(text) = value.as_str() else {
+            return Err(format!("the entry for `{key}` is not host:port"));
+        };
+        let (host, port_text) = dokodemo_split_host_port(text)?;
+        let port = if port_text.is_empty() {
+            None
+        } else {
+            Some(port_text.parse::<i64>().unwrap_or(0) as u16)
+        };
+        rewritten.insert(
+            key.clone(),
+            DokodemoPortMapEntry {
+                host: (!host.is_empty()).then_some(host),
+                port,
+            },
+        );
+    }
+    Ok(rewritten)
+}
+
+/// Go's `net.SplitHostPort` for the shapes a `portMap` value takes: the last colon splits
+/// an ordinary host, and a bracketed IPv6 literal splits after its closing bracket.
+fn dokodemo_split_host_port(text: &str) -> Result<(String, String), String> {
+    if let Some(rest) = text.strip_prefix('[') {
+        let Some((host, rest)) = rest.split_once(']') else {
+            return Err(format!("`{text}` is not host:port"));
+        };
+        let Some(port) = rest.strip_prefix(':') else {
+            return Err(format!("`{text}` is not host:port"));
+        };
+        if port.contains(':') {
+            return Err(format!("`{text}` is not host:port"));
+        }
+        return Ok((host.to_owned(), port.to_owned()));
+    }
+    let Some((host, port)) = text.rsplit_once(':') else {
+        return Err(format!("`{text}` is not host:port"));
+    };
+    if host.contains(':') {
+        return Err(format!("`{text}` is not host:port"));
+    }
+    Ok((host.to_owned(), port.to_owned()))
+}
+
+fn inbound_ss_destinations(inbound: &Json, method: &str) -> Vec<(Vec<u8>, SocketAddr)> {
+    let Some(parsed) = ferrox_core::shadowsocks2022::Method::parse(method) else {
+        return Vec::new();
+    };
+    if parsed.is_chacha() {
+        return Vec::new();
+    }
+    let Some(settings) = inbound.get("settings") else {
+        return Vec::new();
+    };
+    let Some(list) = settings.get("destinations").and_then(Json::as_arr) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in list {
+        let Some(key) = item.get("key").and_then(Json::as_str) else {
+            continue;
+        };
+        let Some(addr) = item.get("address").and_then(Json::as_str) else {
+            continue;
+        };
+        let Some(port) = item.get("port").and_then(Json::as_port) else {
+            continue;
+        };
+        let Some(psk) = ferrox_core::shadowsocks2022::parse_psk_list(key, parsed.key_len())
+            .and_then(|mut list| list.pop())
+        else {
+            continue;
+        };
+        let Ok(mut addrs) = format!("{addr}:{port}").to_socket_addrs() else {
+            continue;
+        };
+        let Some(target) = addrs.next() else {
+            continue;
+        };
+        out.push((psk, target));
+    }
+    out
+}
+
+fn serve_ss_kcp_listener(
+    address: &str,
+    inbound: &Json,
+    config: ferrox_core::kcp::Config,
+    accounts: &Arc<crate::shadowsocks::SsAccounts>,
+    freedom: bool,
+    email: &str,
+    level: u32,
+) -> bool {
+    let accounts = Arc::clone(accounts);
+    let email = email.to_owned();
+    let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
+    let serve: KcpServe = if stream_security(inbound) == "tls" {
+        let Some(server) = inbound_tls_identity(inbound) else {
+            eprintln!("unreadable shadowsocks tls identity on {address}: refused, not served");
+            return false;
+        };
+        let email = email.clone();
+        let accounts = Arc::clone(&accounts);
+        Arc::new(move |conn| {
+            let _flow = crate::accesslog::flow(Some(conn.remote_addr()), &email, level);
+            serve_ss_kcp_tls(conn, &accounts, freedom, &server, meter.clone());
+        })
+    } else {
+        Arc::new(move |conn| {
+            let _flow = crate::accesslog::flow(Some(conn.remote_addr()), &email, level);
+            let (reader, writer, close) = kcp_parts_metered(conn, meter.clone());
+            if accounts.is_2022 {
+                crate::shadowsocks2022::serve_kcp(
+                    reader,
+                    writer,
+                    &accounts.password,
+                    &accounts.method,
+                    &accounts.identities,
+                    freedom,
+                    &close,
+                );
+            } else {
+                crate::shadowsocks::serve_kcp(reader, writer, &accounts.users, freedom, &close);
+            }
+        })
+    };
+    serve_kcp_bound(address, config, &serve, inbound)
+}
+
+/// The datagram half a shadowsocks listener owns before it reports served: bound here, refused here, or never asked for.
+enum UdpFront {
+    Unasked,
+    Bound(UdpSocket),
+    Refused,
+}
+
+fn bind_udp_front(address: &str, tcp: bool, wanted: bool, label: &str) -> UdpFront {
+    if !wanted {
+        return UdpFront::Unasked;
+    }
+    match UdpSocket::bind(address) {
+        Ok(socket) => UdpFront::Bound(socket),
+        Err(error) if !tcp => {
+            eprintln!("{label} on {address}: {error}; refused, not served");
+            UdpFront::Refused
+        }
+        Err(error) => {
+            eprintln!("{label} on {address}: {error}; serving tcp only");
+            UdpFront::Unasked
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RelayFront {
+    NotRelay,
+    Served,
+    Refused,
+}
+
+fn serve_ss_relay_inbound(
+    address: &str,
+    inbound: &Json,
+    password: &str,
+    method: &str,
+) -> RelayFront {
+    let relay_dests = inbound_ss_destinations(inbound, method);
+    if relay_dests.is_empty() {
+        return RelayFront::NotRelay;
+    }
+    let Some(parsed) = ferrox_core::shadowsocks2022::Method::parse(method) else {
+        return RelayFront::NotRelay;
+    };
+    let Some(psk) = ferrox_core::shadowsocks2022::parse_psk_list(password, parsed.key_len())
+        .and_then(|mut list| list.pop())
+    else {
+        return RelayFront::NotRelay;
+    };
+    let (tcp, udp) = inbound_ss_networks(inbound);
+    // Bind the relay's datagram front here, so a caller that reads this true cannot hold a relay whose only requested worker never bound.
+    let udp_front = match bind_udp_front(
+        address,
+        tcp,
+        udp && !parsed.is_chacha(),
+        "shadowsocks relay udp",
+    ) {
+        UdpFront::Refused => return RelayFront::Refused,
+        UdpFront::Unasked => None,
+        UdpFront::Bound(clients) => Some(clients),
+    };
+    let udp_served = udp_front.is_some();
+    let tcp_address = address.to_owned();
+    if tcp {
+        let method = method.to_owned();
+        let psk = psk.clone();
+        let relay_dests = relay_dests.clone();
+        thread::spawn(move || {
+            let Ok(target) = parse_target(&tcp_address) else {
+                return;
+            };
+            let Ok(listener) = Listener::bind(&target) else {
+                return;
+            };
+            for stream in listener.incoming().flatten() {
+                crate::shadowsocks2022::serve_relay(stream, &method, &psk, &relay_dests);
+            }
+        });
+    }
+    if let Some(clients) = udp_front {
+        let udp_dests = relay_dests.clone();
+        let udp_psk = psk.clone();
+        thread::spawn(move || {
+            crate::shadowsocks2022::serve_udp_relay(&clients, parsed, &udp_psk, &udp_dests);
+        });
+    }
+    if tcp || udp_served {
+        RelayFront::Served
+    } else {
+        RelayFront::Refused
+    }
+}
+
+fn serve_ss_relay_front(
+    address: &str,
+    inbound: &Json,
+    accounts: &Arc<crate::shadowsocks::SsAccounts>,
+    carrier: &Carrier,
+    freedom: bool,
+) -> Option<bool> {
+    if let Carrier::Hysteria(config) = carrier {
+        let tcp = inbound_ss_networks(inbound).0;
+        return Some(serve_ss_hysteria_front(
+            config, address, inbound, accounts, tcp, freedom,
+        ));
+    }
+    if !matches!(carrier, Carrier::Raw(_)) {
+        return None;
+    }
+    match serve_ss_relay_inbound(address, inbound, &accounts.password, &accounts.method) {
+        RelayFront::Served => Some(true),
+        RelayFront::Refused => Some(false),
+        RelayFront::NotRelay => None,
+    }
+}
+
+/// The networks a shadowsocks inbound opens, from a `tcp,udp` string or an array: a list that names neither opens none, and an absent list opens both, the superset of the reference's tcp default.
+fn inbound_ss_networks(inbound: &Json) -> (bool, bool) {
+    let Some(named) = inbound.get("settings").and_then(|s| s.get("network")) else {
+        return (true, true);
+    };
+    let mut tcp = false;
+    let mut udp = false;
+    let mut take = |name: &str| {
+        for part in name.split(',') {
+            match part.trim() {
+                "tcp" => tcp = true,
+                "udp" => udp = true,
+                _ => {}
+            }
+        }
+    };
+    match named.as_arr() {
+        Some(items) => {
+            for item in items {
+                if let Some(name) = item.as_str() {
+                    take(name);
+                }
+            }
+        }
+        None => take(named.as_str().unwrap_or("")),
+    }
+    (tcp, udp)
+}
+
+/// Hysteria carries its own QUIC TLS, so xray's `security: tls` names that handshake rather than a second layer above it.
+fn serve_ss_hysteria_front(
+    config: &ferrox_core::hysteria::Config,
+    address: &str,
+    inbound: &Json,
+    accounts: &Arc<crate::shadowsocks::SsAccounts>,
+    tcp: bool,
+    freedom: bool,
+) -> bool {
+    if !tcp {
+        return false;
+    }
+    if config.version != 2 {
+        eprintln!(
+            "hysteria v{} carrier in shadowsocks is not the v2 serve `hysteria` names: serves nothing",
+            config.version
+        );
+        return false;
+    }
+    let Some(settings) = inbound.get("streamSettings") else {
+        eprintln!("unreadable hysteria identity in shadowsocks: serves nothing");
+        return false;
+    };
+    let Some(identity) = crate::config::tls_identity_from_settings(settings) else {
+        eprintln!("unreadable hysteria identity in shadowsocks: serves nothing");
+        return false;
+    };
+    let masq = crate::config::masquerade_from_stream(Some(settings));
+    let config = config.clone();
+    let accounts = Arc::clone(accounts);
+    let owned = address.to_owned();
+    let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
+    let serve: crate::hysteria::Serve = Arc::new(move |flow| {
+        serve_ss_hysteria(flow.with_meter(meter.clone()), &accounts, freedom);
+    });
+    serve_hysteria_thread(&owned, &config, &identity, &masq, &serve)
+}
+
+fn serve_ss_xhttp_h3(
+    address: &str,
+    server: &ferrox_core::tls::TlsServerConfig,
+    settings: &crate::xhttp::XhttpSettings,
+    accounts: &crate::shadowsocks::SsAccounts,
+    freedom: bool,
+    stop: Option<&Arc<Stop>>,
+) -> bool {
+    let service = Arc::new(ss_xhttp_service(settings, accounts.clone(), freedom));
+    serve_xhttp_h3(
+        address,
+        server,
+        settings,
+        service,
+        stop,
+        &format!("xhttp h3 on {address}"),
+    )
+}
+
+/// The one h3 serve every protocol calls: an unreadable identity or a bound QUIC socket is
+/// reported with its own sentence, and the stop flag always comes from the handler that owns it.
+fn serve_xhttp_h3(
+    address: &str,
+    server: &ferrox_core::tls::TlsServerConfig,
+    settings: &crate::xhttp::XhttpSettings,
+    service: Arc<dyn crate::xhttp_h3::H3Service>,
+    stop: Option<&Arc<Stop>>,
+    context: &str,
+) -> bool {
+    let stop = stop.map(Arc::clone);
+    match crate::xhttp_h3::serve_inbound(address, server, settings, service, stop) {
+        Ok(_) => true,
+        Err(error) => {
+            eprintln!("{context}: {error}");
+            false
+        }
+    }
+}
+
+fn serve_ss_tls_front(
+    address: &str,
+    inbound: &Json,
+    carrier: Carrier,
+    accounts: Arc<crate::shadowsocks::SsAccounts>,
+    freedom: bool,
+    stop: Option<&Arc<Stop>>,
+) -> Option<bool> {
+    let Some(server) = inbound_tls_identity(inbound) else {
+        // A refused identity takes only the stream half: a udp relay this config asked for still opens.
+        eprintln!("unreadable shadowsocks tls identity on {address}: refused, not served");
+        return None;
+    };
+    if let Carrier::Xhttp { settings } = &carrier {
+        if crate::xhttp_h3::is_h3(&server.alpn) {
+            return Some(serve_ss_xhttp_h3(
+                address, &server, settings, &accounts, freedom, stop,
+            ));
+        }
+    }
+    spawn_role(
+        address,
+        inbound_role(
+            inbound,
+            Role::Shadowsocks {
+                accounts,
+                carrier,
+                freedom,
+                tls: Some(server),
+            },
+        ),
+        inbound_tag(inbound),
+    );
+    None
+}
+
+fn serve_shadowsocks_inbound(
+    address: &str,
+    inbound: &Json,
+    freedom: bool,
+    configured: &HashSet<String>,
+    stop: Option<&Arc<Stop>>,
+) -> bool {
+    let password = inbound_ss_password(inbound);
+    let account = inbound_account(inbound);
+    let method = inbound_method(inbound);
+    let carrier = inbound_carrier(inbound);
+    let (tcp, udp) = inbound_ss_networks(inbound);
+    let accounts = ss_accounts(inbound, address, password, method, configured);
+    let udp_accounts = (udp && matches!(carrier, Carrier::Raw(_))).then(|| Arc::clone(&accounts));
+    if udp && udp_accounts.is_none() {
+        // A carrier that frames streams cannot carry datagrams; say so in one line instead of binding nothing and reporting a live inbound.
+        eprintln!(
+            "shadowsocks udp on {address}: the configured carrier carries streams only, so udp is not served"
+        );
+    }
+    // The 2022 relay opens each listener the inbound's network list names, so a tcp-only relay binds no udp socket.
+    if let Some(served) = serve_ss_relay_front(address, inbound, &accounts, &carrier, freedom) {
+        return served;
+    }
+    // Bind the datagram front here: a worker that binds after this function answers true would turn a lost race for the port into a live inbound that never answers.
+    let udp_front = match bind_udp_front(address, tcp, udp_accounts.is_some(), "shadowsocks udp") {
+        UdpFront::Refused => return false,
+        UdpFront::Unasked => None,
+        UdpFront::Bound(socket) => Some(socket),
+    };
+    if !tcp && !udp {
+        return false;
+    }
+    let mut served = false;
+    if tcp {
+        match carrier {
+            Carrier::Kcp(config) => {
+                if !serve_ss_kcp_listener(
+                    address,
+                    inbound,
+                    config,
+                    &accounts,
+                    freedom,
+                    &account.email,
+                    account.level,
+                ) {
+                    return false;
+                }
+                served = true;
+            }
+            Carrier::Xdrive { settings } => {
+                let accounts = Arc::clone(&accounts);
+                let email = account.email.clone();
+                let level = account.level;
+                let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
+                let accept: crate::xdrive::Accept = Arc::new(move |session| {
+                    let _flow = crate::accesslog::flow(None, &email, level);
+                    serve_ss_xdrive(session.with_meter(meter.clone()), &accounts, freedom);
+                });
+                serve_xdrive_loop(&settings, address, accept);
+                served = true;
+            }
+            carrier if stream_security(inbound) == "tls" => {
+                if let Some(served) =
+                    serve_ss_tls_front(address, inbound, carrier, accounts, freedom, stop)
+                {
+                    return served;
+                }
+            }
+            _ if !matches!(stream_security(inbound), "" | "none") => {
+                let security = stream_security(inbound);
+                eprintln!("shadowsocks security `{security}` on {address}: refused, not served");
+            }
+            other => {
+                spawn_role(
+                    address,
+                    inbound_role(
+                        inbound,
+                        Role::Shadowsocks {
+                            accounts,
+                            carrier: other,
+                            freedom,
+                            tls: None,
+                        },
+                    ),
+                    inbound_tag(inbound),
+                );
+                served = true;
+            }
+        }
+    }
+    if let (Some(accounts), Some(clients)) = (udp_accounts, udp_front) {
+        served = true;
+        thread::spawn(move || {
+            if accounts.is_2022 {
+                crate::shadowsocks2022::serve_udp_on(
+                    &clients,
+                    &accounts.password,
+                    &accounts.method,
+                    freedom,
+                );
+            } else {
+                crate::shadowsocks::serve_udp_on(&clients, &accounts.users, freedom);
+            }
+        });
+    }
+    served
+}
+
+/// The inbound's own key, preferring `settings`.
+fn tun_field<'a>(inbound: &'a Json, key: &str) -> Option<&'a Json> {
+    inbound
+        .get("settings")
+        .and_then(|settings| settings.get(key))
+        .or_else(|| inbound.get(key))
+}
+
+/// The configured stack name, defaulting to `smoltcp`.
+fn tun_stack(inbound: &Json) -> &str {
+    tun_field(inbound, "stack")
+        .and_then(Json::as_str)
+        .unwrap_or("smoltcp")
+}
+
+/// Parse an optional unsigned integer, refusing a non-number.
+fn tun_u32(inbound: &Json, key: &str) -> Result<Option<u32>, String> {
+    tun_field(inbound, key)
+        .map(|value| {
+            value
+                .as_u32()
+                .ok_or_else(|| format!("`{key}` must be an unsigned integer"))
+        })
+        .transpose()
+}
+
+/// Parse an optional string, refusing a non-string.
+fn tun_string<'a>(inbound: &'a Json, key: &str) -> Result<Option<&'a str>, String> {
+    match tun_field(inbound, key) {
+        None => Ok(None),
+        Some(Json::Str(text)) => Ok(Some(text.as_str())),
+        Some(_) => Err(format!("`{key}` must be a string")),
+    }
+}
+
+/// The configured address strings, refusing a non-string entry.
+fn tun_addresses<'a>(inbound: &'a Json, key: &str) -> Result<Vec<&'a str>, String> {
+    match tun_field(inbound, key) {
+        None => Ok(Vec::new()),
+        Some(Json::Str(text)) => Ok(vec![text.as_str()]),
+        Some(Json::Arr(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .ok_or_else(|| format!("`{key}` entries must be strings"))
+            })
+            .collect(),
+        Some(_) => Err(format!("`{key}` must be a string or an array of strings")),
+    }
+}
+
+/// The configured addresses: the `address` list when it carries any, else both deprecated `inet4_address` and `inet6_address`, with `prefix` filling a missing CIDR.
+fn tun_device_addresses(inbound: &Json) -> Result<(Vec<&str>, Option<u32>), String> {
+    let prefix = tun_u32(inbound, "prefix")?;
+    let mut found = tun_addresses(inbound, "address")?;
+    if found.is_empty() {
+        found.extend(tun_addresses(inbound, "inet4_address")?);
+        found.extend(tun_addresses(inbound, "inet6_address")?);
+    }
+    Ok((found, prefix))
+}
+
+/// An optional boolean, refusing a non-boolean.
+fn tun_bool(inbound: &Json, key: &str) -> Result<Option<bool>, String> {
+    tun_field(inbound, key)
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| format!("`{key}` must be a boolean"))
+        })
+        .transpose()
+}
+
+/// One `<digits><unit>` tail of a Go-style duration.
+fn tun_unit(tail: &str) -> Option<(std::time::Duration, &str)> {
+    [
+        ("ms", std::time::Duration::from_millis(1)),
+        ("us", std::time::Duration::from_micros(1)),
+        ("\u{b5}s", std::time::Duration::from_micros(1)),
+        ("ns", std::time::Duration::from_nanos(1)),
+        ("s", std::time::Duration::from_secs(1)),
+        ("m", std::time::Duration::from_secs(60)),
+        ("h", std::time::Duration::from_secs(3600)),
+    ]
+    .into_iter()
+    .find_map(|(suffix, unit)| tail.strip_prefix(suffix).map(|rest| (unit, rest)))
+}
+
+/// A Go-style duration: a run of `<digits><unit>` with `ns`, `us`, `µs`, `ms`, `s`, `m` or `h`.
+fn tun_duration(text: &str) -> Option<std::time::Duration> {
+    let mut rest = text;
+    let mut total = std::time::Duration::ZERO;
+    let mut seen = false;
+    while !rest.is_empty() {
+        let digits = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        if digits == 0 {
+            return None;
+        }
+        let value = u32::try_from(rest[..digits].parse::<u64>().ok()?).ok()?;
+        let (unit, tail) = tun_unit(&rest[digits..])?;
+        total = total.checked_add(unit.checked_mul(value)?)?;
+        seen = true;
+        rest = tail;
+    }
+    seen.then_some(total)
+}
+
+/// The reference's `udp_timeout`: seconds as a number, or a duration string (`500ms`, `1m30s`).
+fn tun_udp_timeout(inbound: &Json) -> Result<Option<std::time::Duration>, String> {
+    let Some(value) = tun_field(inbound, "udp_timeout") else {
+        return Ok(None);
+    };
+    let idle = match value {
+        Json::Num(_) => std::time::Duration::from_secs(u64::from(
+            value
+                .as_u32()
+                .ok_or_else(|| "`udp_timeout` must be a positive number of seconds".to_owned())?,
+        )),
+        Json::Str(text) => {
+            if text.chars().all(|c| c.is_ascii_digit()) {
+                std::time::Duration::from_secs(
+                    text.parse::<u64>()
+                        .map_err(|_| format!("`udp_timeout` `{text}` is not a duration"))?,
+                )
+            } else {
+                tun_duration(text)
+                    .ok_or_else(|| format!("`udp_timeout` `{text}` is not a duration"))?
+            }
+        }
+        _ => return Err("`udp_timeout` must be seconds or a duration string".to_owned()),
+    };
+    if idle.is_zero() {
+        return Err("`udp_timeout` must be longer than zero".to_owned());
+    }
+    Ok(Some(idle))
+}
+
+/// `queues`, or the reference's `multi_queue`: one queue when it is explicitly false, the platform's own when true.
+fn tun_queues(inbound: &Json) -> Result<Option<usize>, String> {
+    if let Some(queues) = tun_u32(inbound, "queues")? {
+        return Ok(usize::try_from(queues).ok());
+    }
+    Ok(match tun_bool(inbound, "multi_queue")? {
+        Some(false) => Some(1),
+        Some(true) | None => None,
+    })
+}
+
+/// Reference options this build reads and accepts but does not apply: the routing table, firewall marks, namespace and the process/MAC filters.
+const TUN_NOT_APPLIED: &[&str] = &[
+    "netns",
+    "dns_mode",
+    "dns_address",
+    "auto_route",
+    "iproute2_table_index",
+    "iproute2_rule_index",
+    "auto_redirect",
+    "auto_redirect_input_mark",
+    "auto_redirect_output_mark",
+    "auto_redirect_reset_mark",
+    "auto_redirect_tproxy_mark",
+    "auto_redirect_nfqueue",
+    "auto_redirect_iproute2_fallback_rule_index",
+    "exclude_mptcp",
+    "loopback_address",
+    "strict_route",
+    "route_address",
+    "route_address_set",
+    "route_exclude_address",
+    "route_exclude_address_set",
+    "include_interface",
+    "exclude_interface",
+    "include_uid",
+    "include_uid_range",
+    "exclude_uid",
+    "exclude_uid_range",
+    "include_android_user",
+    "include_package",
+    "exclude_package",
+    "include_mac_address",
+    "exclude_mac_address",
+    "udp_mapping",
+    "udp_filtering",
+    "udp_nat_max",
+    "platform",
+    "inet4_route_address",
+    "inet6_route_address",
+    "inet4_route_exclude_address",
+    "inet6_route_exclude_address",
+];
+
+/// One line naming the options present in the config that this build does not apply, so a config from another TUN front runs here and says what it lost.
+fn warn_unapplied_tun_options(inbound: &Json, native: bool) {
+    let unapplied: Vec<&str> = TUN_NOT_APPLIED
+        .iter()
+        .copied()
+        .filter(|key| tun_field(inbound, key).is_some())
+        .collect();
+    if !unapplied.is_empty() {
+        eprintln!(
+            "tun inbound: accepted but not applied by this build: {}",
+            unapplied.join(", ")
+        );
+    }
+    // The two datagram switches configure this handler's leg table; the userspace and hybrid engines keep their own.
+    if !native
+        && (tun_field(inbound, "udp_timeout").is_some()
+            || tun_field(inbound, "endpoint_independent_nat").is_some())
+    {
+        eprintln!(
+            "tun inbound: `udp_timeout` and `endpoint_independent_nat` apply to the `loopback` stack; this stack keeps its own datagram idle"
+        );
+    }
+}
+
+/// Parse and validate the TUN spec without opening the device.
+fn tun_spec(inbound: &Json) -> Result<crate::tun::Spec, String> {
+    let name = tun_string(inbound, "name")?.or(tun_string(inbound, "interface_name")?);
+    let _ = tun_string(inbound, "stack")?;
+    let mtu = tun_u32(inbound, "mtu")?.map(|mtu| mtu as usize);
+    let (listed, prefix) = tun_device_addresses(inbound)?;
+    let mut addresses = Vec::with_capacity(listed.len());
+    for text in &listed {
+        if let (Some(address), found) = crate::tun::parse_address(Some(text), prefix)? {
+            addresses.push((
+                address,
+                found.unwrap_or_else(|| crate::tun::default_prefix(address)),
+            ));
+        }
+    }
+    let (address, prefix) = match addresses.first() {
+        Some((address, prefix)) => (Some(*address), Some(*prefix)),
+        None => crate::tun::parse_address(None, prefix)?,
+    };
+    let mut spec = crate::tun::Spec::with(name, mtu, address, prefix, tun_queues(inbound)?)
+        .with_addresses(addresses);
+    if let Some(idle) = tun_udp_timeout(inbound)? {
+        spec = spec.with_udp_idle(idle);
+    }
+    if let Some(on) = tun_bool(inbound, "endpoint_independent_nat")? {
+        spec = spec.with_endpoint_independent_nat(on);
+    }
+    if let Some(on) = tun_bool(inbound, "gso")? {
+        spec = spec.with_gso(on);
+    }
+    spec.validate().map_err(|error| error.to_string())?;
+    Ok(spec)
+}
+
+/// The stack a config names: the reference's `gvisor` and `mixed` spellings map onto the userspace and hybrid engines.
+fn tun_mode(stack: &str) -> crate::tun_stack::Mode {
+    match stack {
+        "system" => crate::tun_stack::Mode::System,
+        "hybrid" | "mixed" => crate::tun_stack::Mode::Hybrid,
+        "smoltcp" | "userspace" | "gvisor" => crate::tun_stack::Mode::Userspace,
+        _ => {
+            eprintln!("tun inbound: unknown stack `{stack}`, using the userspace stack");
+            crate::tun_stack::Mode::Userspace
+        }
+    }
+}
+
+/// Open the TUN device and spawn the packet handler. Returns true when the device opens.
+fn serve_tun_inbound(
+    spec: &crate::tun::Spec,
+    inbound: &Json,
+    out: &Outbound,
+    _address: &str,
+) -> bool {
+    let stack = tun_stack(inbound);
+    warn_unapplied_tun_options(inbound, stack == "loopback");
+    if stack != "loopback" {
+        return match crate::tun_stack::serve(spec, out, tun_mode(stack)) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("tun inbound: {error}");
+                false
+            }
+        };
+    }
+    let Ok(devices) = crate::tun::Device::open_all(spec) else {
+        eprintln!("tun inbound: {}", crate::tun::refusal_reason(spec));
+        return false;
+    };
+    let flows = crate::tun::Flows::default();
+    let legs = crate::tun::Legs::default();
+    let dial = Some(device_dial(out));
+    let datagram = device_datagram(out);
+    for device in devices {
+        let outbound = out.clone();
+        let relay: crate::tun::Relay = std::sync::Arc::new(move |conn, lane, dest| {
+            serve_device_flow(conn, lane, &outbound, &dest)
+        });
+        let datagram_out = out.clone();
+        // The device's association is the protocol's own: the front reads the greeting and the `UDP ASSOCIATE` request and answers with the relay's address.
+        let associate: crate::tun::Associate =
+            std::sync::Arc::new(move |conn| serve_socks(conn, &datagram_out, &no_accounts()));
+        let mut handler = crate::tun::Handler::on(
+            device,
+            relay,
+            associate,
+            dial.clone(),
+            datagram.clone(),
+            flows.clone(),
+            legs.clone(),
+            spec,
+        );
+        thread::spawn(move || {
+            if let Err(e) = handler.serve() {
+                eprintln!("tun handler ended: {e}");
+            }
+        });
+    }
+    true
+}
+
+struct UdpUplink {
+    write: Box<dyn Write + Send>,
+    close: Arc<dyn Fn() + Send + Sync>,
+    target: SocketAddr,
+    done: RelayEnd,
+}
+
+fn dial_udp_uplink(
+    vless: &VlessOut,
+    dest: &SocketAddr,
+    relay: &UdpSocket,
+    source: Arc<Mutex<Option<SocketAddr>>>,
+) -> Option<UdpUplink> {
+    if !vless_udp_target_allowed(vless, dest) {
+        return None;
+    }
+    if matches!(vless.carrier, Carrier::Quic) {
+        return dial_quic_udp_uplink(vless, dest, relay, source);
+    }
+    if !matches!(vless.carrier, Carrier::Raw(_) | Carrier::Xhttp { .. }) {
+        return None;
+    }
+    let server = resolve_outbound(&vless.address, vless.port)?;
+    let mask = vless.carrier.tcp_mask();
+    let header = vless_header(&vless.id, 2, &Destination::from(*dest));
+    let (read, write, close, deferred): (Box<dyn Read + Send>, Box<dyn Write + Send>, _, bool) =
+        if let Carrier::Raw(_) = &vless.carrier {
+            let uplink = dial_or_report(&server)?.with_mask(mask);
+            if let Some(reality) = vless.reality.as_deref() {
+                let raw = uplink.try_clone().ok()?;
+                let now = u32::try_from(unix_millis() / 1000).unwrap_or(u32::MAX);
+                let limiter = ferrox_core::tls::reality::RecordLimiter::new(uplink);
+                let mut session =
+                    ferrox_core::tls::RealityClientSession::connect(reality, now, limiter).ok()?;
+                session
+                    .get_ref()
+                    .get_ref()
+                    .set_read_timeout(Some(SESSION_POLL))
+                    .ok()?;
+                raw.set_read_timeout(Some(SESSION_POLL)).ok()?;
+                session.write_all(&header).ok()?;
+                let close = connection_closer(&raw);
+                let (read, write): (Box<dyn Read + Send>, Box<dyn Write + Send>) =
+                    match driven_halves_answering(session, RELAY_POLL, Arc::new(|| {})) {
+                        Ok(Half::Split { read, write }) => (
+                            Box::new(
+                                read.into_inner()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                            ),
+                            Box::new(
+                                write
+                                    .into_inner()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                            ),
+                        ),
+                        _ => return None,
+                    };
+                (read, write, close, false)
+            } else if let Some(encryption) = &vless.encryption {
+                let close = connection_closer(&uplink);
+                let mut sealed = match encryption.handshake(uplink) {
+                    Ok(sealed) => sealed,
+                    Err(error) => {
+                        eprintln!("vless: encryption handshake failed: {error}");
+                        return None;
+                    }
+                };
+                sealed.write_all(&header).ok()?;
+                let (reader, writer) = sealed.into_split()?;
+                (Box::new(reader), Box::new(writer), close, true)
+            } else {
+                let mut uplink = uplink;
+                uplink.write_all(&header).ok()?;
+                let read = uplink.try_clone().ok()?;
+                let close = connection_closer(&uplink);
+                (Box::new(read), Box::new(uplink), close, true)
+            }
+        } else {
+            // An association rides the same xHTTP session a flow would, and the handshake's ALPN picks the head.
+            if vless.reality.is_some() || vless.encryption.is_some() {
+                return None;
+            }
+            let (mut read, write, close) = match &vless.tls {
+                Some(cfg) => udp_carried_session(
+                    dial_tls_session(&server, cfg, mask)?,
+                    || dial_tls_session(&server, cfg, mask),
+                    &vless.host,
+                    &vless.carrier,
+                    &vless.headers,
+                    vless.heartbeat,
+                    &header,
+                )?,
+                None => udp_plain_carried(
+                    dial_or_report(&server)?.with_mask(mask),
+                    &vless.host,
+                    &vless.carrier,
+                    &vless.headers,
+                    vless.heartbeat,
+                    &header,
+                )?,
+            };
+            // The reply is the association's acceptance; a datagram read here would eat it.
+            read_vless_response(&mut *read)?;
+            (read, write, close, false)
+        };
+    let Ok(udp_send) = relay.try_clone() else {
+        return None;
+    };
+    let done = spawn_udp_uplink_reader(read, udp_send, source, *dest, deferred);
+    Some(UdpUplink {
+        write,
+        close,
+        target: *dest,
+        done,
+    })
+}
+
+fn vless_quic_dial(vless: &VlessOut) -> crate::quic::QuicDial {
+    crate::quic::QuicDial {
+        id: vless.id,
+        host: std::sync::Arc::from(vless.host.as_str()),
+        address: std::sync::Arc::from(vless.address.as_str()),
+        port: vless.port,
+        upstream: None,
+        roots: vless.quic_roots.clone(),
+        ech_config_list: vless.quic_ech.clone(),
+        default_cc: None,
+    }
+}
+
+/// A REALITY session held over one borrowed QUIC stream: the handshake rides the pooled connection's stream, and the relay that follows it is the pooled relay's own.
+fn dial_vless_quic_reality(
+    client: &Connection,
+    vless: &VlessOut,
+    target: Option<&Destination>,
+    cfg: &ferrox_core::tls::RealityClientConfig,
+) {
+    let Some(pooled) = crate::quic::pumped_stream_within(&vless_quic_dial(vless), budgets::dial())
+    else {
+        eprintln!("vless: reality quic stream failed");
+        return;
+    };
+    let now = u32::try_from(unix_millis() / 1000).unwrap_or(u32::MAX);
+    let handshake = SealHandshake::new(pooled.stream_handle(), budgets::handshake());
+    let limiter = ferrox_core::tls::reality::RecordLimiter::new(handshake);
+    let mut session = match ferrox_core::tls::RealityClientSession::connect(cfg, now, limiter) {
+        Ok(session) => session,
+        Err(error) => {
+            eprintln!("vless: reality quic handshake failed: {error}");
+            pooled.cancel();
+            return;
+        }
+    };
+    let Some(header) = vless_request_header(vless, target) else {
+        pooled.cancel();
+        return;
+    };
+    if session.write_all(header.as_ref()).is_err() {
+        pooled.cancel();
+        return;
+    }
+    if read_vless_response(&mut session).is_none() {
+        pooled.cancel();
+        return;
+    }
+    let stream_handle = session.get_ref().get_ref().stream.clone();
+    let reader = stream_handle.clone();
+    let pooled = Mutex::new(Some(pooled));
+    let close_handle = stream_handle.clone();
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        close_handle.close();
+        drop(pooled.lock().ok().and_then(|mut slot| slot.take()));
+    });
+    relay_split(reader, stream_handle, client, &close);
+}
+
+/// A REALITY session held over one Hysteria flow: the handshake rides the same flow vmess opens.
+fn dial_vless_hysteria_reality(
+    client: &Connection,
+    vless: &VlessOut,
+    target: Option<&Destination>,
+    cfg: &ferrox_core::tls::RealityClientConfig,
+) {
+    let Some(dial) = hysteria_dial_session(vless) else {
+        eprintln!("vless: reality hysteria dial failed");
+        return;
+    };
+    let Some(header) = vless_request_header(vless, target) else {
+        return;
+    };
+    let Some(flow) = crate::hysteria::open(&dial, &header, 0) else {
+        eprintln!("vless: reality hysteria open failed");
+        return;
+    };
+    let now = u32::try_from(unix_millis() / 1000).unwrap_or(u32::MAX);
+    let limiter = ferrox_core::tls::reality::RecordLimiter::new(flow);
+    let Ok(mut session) = ferrox_core::tls::RealityClientSession::connect(cfg, now, limiter) else {
+        eprintln!("vless: reality hysteria handshake failed");
+        return;
+    };
+    if read_vless_response(&mut session).is_none() {
+        return;
+    }
+    let closer = session.get_ref().get_ref().clone();
+    crate::hysteria::relay(client, &closer);
+}
+
+fn dial_vless_quic_sealed(client: &Connection, vless: &VlessOut, target: &Destination) {
+    let Some(encryption) = &vless.encryption else {
+        return;
+    };
+    let Some(pooled) = crate::quic::pumped_stream_within(&vless_quic_dial(vless), budgets::dial())
+    else {
+        return;
+    };
+    let mut sealed = match encryption.handshake(SealHandshake::new(
+        pooled.stream_handle(),
+        budgets::handshake(),
+    )) {
+        Ok(sealed) => sealed,
+        Err(error) => {
+            eprintln!("vless: encryption handshake failed: {error}");
+            pooled.cancel();
+            return;
+        }
+    };
+    sealed.get_mut().rearm(budgets::dial());
+    if sealed
+        .write_all(&vless_header(&vless.id, 1, target))
+        .is_err()
+        || read_vless_response(&mut HandshakeDeadline {
+            inner: &mut sealed,
+            until: Instant::now() + budgets::dial(),
+        })
+        .is_none()
+    {
+        pooled.cancel();
+        return;
+    }
+    let Some((reader, writer)) = sealed.into_split() else {
+        pooled.cancel();
+        return;
+    };
+    let close_stream = pooled.stream_handle();
+    let pooled = Mutex::new(Some(pooled));
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        close_stream.close();
+        drop(pooled.lock().ok().and_then(|mut slot| slot.take()));
+    });
+    relay_split(reader, writer, client, &close);
+}
+
+/// A datagram association on its own QUIC stream: the lease is the flow's, so the stream and the pool entry live until the association closes.
+fn dial_quic_udp_uplink(
+    vless: &VlessOut,
+    dest: &SocketAddr,
+    relay: &UdpSocket,
+    source: Arc<Mutex<Option<SocketAddr>>>,
+) -> Option<UdpUplink> {
+    let pooled = crate::quic::pumped_stream_within(&vless_quic_dial(vless), budgets::dial())?;
+    let header = vless_header(&vless.id, 2, &Destination::from(*dest));
+    let (read, write): (Box<dyn Read + Send>, Box<dyn Write + Send>) =
+        if let Some(encryption) = &vless.encryption {
+            let mut sealed = match encryption.handshake(SealHandshake::new(
+                pooled.stream_handle(),
+                budgets::handshake(),
+            )) {
+                Ok(sealed) => sealed,
+                Err(error) => {
+                    eprintln!("vless: encryption handshake failed: {error}");
+                    pooled.cancel();
+                    return None;
+                }
+            };
+            sealed.get_mut().rearm(budgets::dial());
+            if sealed.write_all(&header).is_err()
+                || read_vless_response(&mut HandshakeDeadline {
+                    inner: &mut sealed,
+                    until: Instant::now() + budgets::dial(),
+                })
+                .is_none()
+            {
+                pooled.cancel();
+                return None;
+            }
+            let Some((reader, writer)) = sealed.into_split() else {
+                pooled.cancel();
+                return None;
+            };
+            (Box::new(reader), Box::new(writer))
+        } else {
+            let mut stream = pooled.stream_handle();
+            if stream.write_all(&header).is_err()
+                || read_vless_response(&mut HandshakeDeadline {
+                    inner: &mut stream,
+                    until: Instant::now() + budgets::dial(),
+                })
+                .is_none()
+            {
+                pooled.cancel();
+                return None;
+            }
+            (Box::new(pooled.stream_handle()), Box::new(stream))
+        };
+    let Ok(udp_send) = relay.try_clone() else {
+        pooled.cancel();
+        return None;
+    };
+    let done = spawn_udp_uplink_reader(read, udp_send, source, *dest, false);
+    let close_stream = pooled.stream_handle();
+    let pooled = Mutex::new(Some(pooled));
+    let close = Arc::new(move || {
+        close_stream.close();
+        drop(pooled.lock().ok().and_then(|mut slot| slot.take()));
+    });
+    Some(UdpUplink {
+        write,
+        close,
+        target: *dest,
+        done,
+    })
+}
+
+/// `answer` is true when the response header is still unread by the dial, as on the raw carrier whose server may hold it until the first datagram; the xhttp and QUIC carriers read it before dialing returns and pass false.
+fn spawn_udp_uplink_reader(
+    read: Box<dyn Read + Send>,
+    udp: UdpSocket,
+    source: Arc<Mutex<Option<SocketAddr>>>,
+    target: SocketAddr,
+    answer: bool,
+) -> RelayEnd {
+    RelayPool::global().run(move || {
+        let mut read = read;
+        if answer && read_vless_response(&mut read).is_none() {
+            return;
+        }
+        let mut buf = udp_buffer();
+        let mut reply = Vec::with_capacity(UDP_BUF);
+        while let Some(n) = read_udp_datagram(&mut read, &mut buf) {
+            let dest = match source.lock() {
+                Ok(guard) => *guard,
+                Err(_) => None,
+            };
+            let Some(dest) = dest else {
+                continue;
+            };
+            let out = socks_udp_frame(&mut reply, &target, &buf[..n]);
+            let _ = udp.send_to(out, dest);
+        }
+    })
+}
+
+type VmessClose = Arc<dyn Fn() + Send + Sync>;
+
+struct CarriedVmess {
+    reader: Box<dyn Read + Send>,
+    writer: Box<dyn Write + Send>,
+    close: VmessClose,
+    send: crate::vmess::Flow,
+    recv: crate::vmess::Flow,
+    response: ([u8; 16], [u8; 16], u8),
+}
+
+struct VmessUdpUplink {
+    write: Box<dyn Write + Send>,
+    close: VmessClose,
+    send: crate::vmess::Flow,
+    pad: crate::vmess::PadSource,
+    target: SocketAddr,
+    done: RelayEnd,
+}
+
+fn vmess_udp_request(vmess: &VmessOut, dest: &SocketAddr) -> Option<crate::vmess::ClientRequest> {
+    crate::vmess::client_request(
+        &vmess.id,
+        vmess.cipher,
+        vmess.auth_len,
+        vmess.no_termination,
+        &Destination::from(*dest),
+        2,
+    )
+}
+
+fn shutdown_close(connection: Connection) -> VmessClose {
+    Arc::new(move || {
+        let _ = connection.shutdown(Shutdown::Both);
+    })
+}
+
+fn dial_vmess_udp_uplink(
+    vmess: &VmessOut,
+    dest: &SocketAddr,
+    relay: &UdpSocket,
+    source: Arc<Mutex<Option<SocketAddr>>>,
+) -> Option<VmessUdpUplink> {
+    let carried = open_vmess_udp_stream(vmess, dest)?;
+    let Ok(udp_send) = relay.try_clone() else {
+        (carried.close)();
+        return None;
+    };
+    let Some(pad) = crate::vmess::PadSource::fresh() else {
+        (carried.close)();
+        return None;
+    };
+    let done = spawn_vmess_udp_reader(
+        carried.reader,
+        udp_send,
+        source,
+        *dest,
+        carried.recv,
+        carried.response,
+        Arc::clone(&carried.close),
+    );
+    Some(VmessUdpUplink {
+        write: carried.writer,
+        close: carried.close,
+        send: carried.send,
+        pad,
+        target: *dest,
+        done,
+    })
+}
+
+fn open_vmess_udp_stream(vmess: &VmessOut, dest: &SocketAddr) -> Option<CarriedVmess> {
+    if matches!(&vmess.carrier, Carrier::Xdrive { .. }) {
+        return open_vmess_udp_xdrive(vmess, dest);
+    }
+    if matches!(&vmess.carrier, Carrier::Quic) {
+        return open_vmess_udp_quic(vmess, dest);
+    }
+    if matches!(&vmess.carrier, Carrier::Hysteria(_)) {
+        return open_vmess_udp_hysteria(vmess, dest);
+    }
+    if matches!(&vmess.carrier, Carrier::Kcp(_)) {
+        return open_vmess_udp_kcp(vmess, dest);
+    }
+    let server = resolve_outbound(&vmess.address, vmess.port)?;
+    let mask = vmess.carrier.tcp_mask();
+    if let Some(cfg) = vmess.reality.as_deref() {
+        let session = dial_reality_session(&server, cfg, mask)?;
+        return open_vmess_udp_session(
+            vmess,
+            &server,
+            session,
+            || dial_reality_session(&server, cfg, mask),
+            dest,
+        );
+    }
+    if let Some(cfg) = vmess.tls.as_deref() {
+        let session = dial_tls_session(&server, cfg, mask)?;
+        return open_vmess_udp_session(
+            vmess,
+            &server,
+            session,
+            || dial_tls_session(&server, cfg, mask),
+            dest,
+        );
+    }
+    let uplink = dial_or_report(&server)?.with_mask(vmess.carrier.tcp_mask());
+    let shutdown = uplink.try_clone().ok()?;
+    open_vmess_udp_plain(vmess, uplink, shutdown, dest)
+}
+
+fn open_vmess_udp_quic(vmess: &VmessOut, dest: &SocketAddr) -> Option<CarriedVmess> {
+    let (request, send, recv, response_key, response_iv, auth) = vmess_udp_request(vmess, dest)?;
+    let pooled = crate::quic::pumped_stream_within(&vmess_quic_dial(vmess), budgets::dial())?;
+    let mut writer = pooled.stream_handle();
+    let reader = pooled.stream_handle();
+    if writer.write_all(&request).is_err() {
+        pooled.cancel();
+        return None;
+    }
+    let close_stream = pooled.stream_handle();
+    let pooled = Mutex::new(Some(pooled));
+    let close: VmessClose = Arc::new(move || {
+        close_stream.close();
+        drop(pooled.lock().ok().and_then(|mut slot| slot.take()));
+    });
+    Some(CarriedVmess {
+        reader: Box::new(reader),
+        writer: Box::new(writer),
+        close,
+        send,
+        recv,
+        response: (response_key, response_iv, auth),
+    })
+}
+
+fn open_vmess_udp_hysteria(vmess: &VmessOut, dest: &SocketAddr) -> Option<CarriedVmess> {
+    let (request, send, recv, response_key, response_iv, auth) = vmess_udp_request(vmess, dest)?;
+    let dial = vmess_hysteria_dial(vmess)?;
+    let flow = crate::hysteria::open(&dial, &request, 0)?;
+    let reader = crate::hysteria::FlowRead::new(flow.clone());
+    let closer = flow.clone();
+    let close: VmessClose = Arc::new(move || closer.close());
+    Some(CarriedVmess {
+        reader: Box::new(reader),
+        writer: Box::new(flow),
+        close,
+        send,
+        recv,
+        response: (response_key, response_iv, auth),
+    })
+}
+
+fn open_vmess_udp_kcp(vmess: &VmessOut, dest: &SocketAddr) -> Option<CarriedVmess> {
+    let (request, send, recv, response_key, response_iv, auth) = vmess_udp_request(vmess, dest)?;
+    let conn = kcp_dial_session(&vmess.carrier, &vmess.address, vmess.port)?;
+    if let Some(cfg) = vmess.tls.as_deref() {
+        let mut session = kcp_tls_connect(&conn, cfg)?;
+        if session.write_all(&request).is_err() {
+            return None;
+        }
+        let (reader, writer) = session_halves(session, KcpIo::new(Arc::clone(&conn)));
+        return Some(CarriedVmess {
+            reader: Box::new(reader),
+            writer: Box::new(writer),
+            close: kcp_close(&conn),
+            send,
+            recv,
+            response: (response_key, response_iv, auth),
+        });
+    }
+    if conn.write(&request).is_err() {
+        return None;
+    }
+    let reader = KcpIo::new(Arc::clone(&conn));
+    let writer = KcpIo::new(Arc::clone(&conn));
+    Some(CarriedVmess {
+        reader: Box::new(reader),
+        writer: Box::new(writer),
+        close: kcp_close(&conn),
+        send,
+        recv,
+        response: (response_key, response_iv, auth),
+    })
+}
+
+fn open_vmess_udp_xdrive(vmess: &VmessOut, dest: &SocketAddr) -> Option<CarriedVmess> {
+    let (request, send, recv, response_key, response_iv, auth) = vmess_udp_request(vmess, dest)?;
+    let session = xdrive_dial_session(&vmess.carrier, &vmess.address, vmess.port)?;
+    let mut reader = session.clone();
+    if reader.write_all(&request).is_err() {
+        return None;
+    }
+    let close: VmessClose = {
+        let session = session.clone();
+        Arc::new(move || {
+            session.end_read();
+            let _ = session.end_write();
+        })
+    };
+    Some(CarriedVmess {
+        reader: Box::new(reader),
+        writer: Box::new(session),
+        close,
+        send,
+        recv,
+        response: (response_key, response_iv, auth),
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn open_vmess_udp_plain(
+    vmess: &VmessOut,
+    mut uplink: Connection,
+    shutdown: Connection,
+    dest: &SocketAddr,
+) -> Option<CarriedVmess> {
+    match &vmess.carrier {
+        Carrier::Raw(_) => {
+            let (request, send, recv, response_key, response_iv, auth) =
+                vmess_udp_request(vmess, dest)?;
+            uplink.write_all(&request).ok()?;
+            let reader = uplink.try_clone().ok()?;
+            reader.set_read_timeout(Some(RELAY_POLL)).ok()?;
+            Some(CarriedVmess {
+                reader: Box::new(reader),
+                writer: Box::new(uplink),
+                close: shutdown_close(shutdown),
+                send,
+                recv,
+                response: (response_key, response_iv, auth),
+            })
+        }
+        Carrier::Ws { path, ed } => {
+            let (request, send, recv, response_key, response_iv, auth) =
+                vmess_udp_request(vmess, dest)?;
+            let (mut reader, writer) = crate::ws::connect(
+                uplink,
+                &vmess.host,
+                path,
+                *ed,
+                &request,
+                &vmess.headers,
+                vmess.heartbeat,
+            )?;
+            reader.set_poll(Some(RELAY_POLL));
+            let closer = writer.clone();
+            let close = shutdown_close(shutdown);
+            let close: VmessClose = Arc::new(move || {
+                closer.close();
+                close();
+            });
+            Some(CarriedVmess {
+                reader: Box::new(reader),
+                writer: Box::new(writer),
+                close,
+                send,
+                recv,
+                response: (response_key, response_iv, auth),
+            })
+        }
+        Carrier::Grpc(settings) => {
+            let (mut reader, writer) = crate::grpc::connect_with(uplink, &vmess.host, settings)?;
+            reader.set_poll(Some(RELAY_POLL));
+            let (request, send, recv, response_key, response_iv, auth) =
+                vmess_udp_request(vmess, dest)?;
+            if !writer.send(&request) {
+                return None;
+            }
+            let closer = writer.clone();
+            let close = shutdown_close(shutdown);
+            let close: VmessClose = Arc::new(move || {
+                closer.close();
+                close();
+            });
+            Some(CarriedVmess {
+                reader: Box::new(reader),
+                writer: Box::new(writer),
+                close,
+                send,
+                recv,
+                response: (response_key, response_iv, auth),
+            })
+        }
+        Carrier::Xhttp { settings, .. } => {
+            let (mut reader, writer) =
+                xhttp_rung(uplink, &vmess.host, &vmess.carrier, settings.path.as_str())?;
+            reader.set_poll(Some(RELAY_POLL));
+            let (request, send, recv, response_key, response_iv, auth) =
+                vmess_udp_request(vmess, dest)?;
+            if !writer.send(&request) {
+                return None;
+            }
+            let closer = writer.clone();
+            let close = shutdown_close(shutdown);
+            let close: VmessClose = Arc::new(move || {
+                closer.finish();
+                close();
+            });
+            Some(CarriedVmess {
+                reader: Box::new(reader),
+                writer: Box::new(writer),
+                close,
+                send,
+                recv,
+                response: (response_key, response_iv, auth),
+            })
+        }
+        Carrier::HttpHeader { path, .. } => {
+            let (mut reader, mut writer) =
+                crate::httpheader::connect(uplink, &vmess.host, path, &vmess.headers)?;
+            reader.set_poll(Some(RELAY_POLL));
+            let (request, send, recv, response_key, response_iv, auth) =
+                vmess_udp_request(vmess, dest)?;
+            if writer.write_all(&request).is_err() {
+                return None;
+            }
+            Some(CarriedVmess {
+                reader: Box::new(reader),
+                writer: Box::new(writer),
+                close: shutdown_close(shutdown),
+                send,
+                recv,
+                response: (response_key, response_iv, auth),
+            })
+        }
+        Carrier::HttpUpgrade { path, .. } => {
+            let (request, send, recv, response_key, response_iv, auth) =
+                vmess_udp_request(vmess, dest)?;
+            let (mut reader, writer) =
+                crate::httpupgrade::connect(uplink, &vmess.host, path, &request, &vmess.headers)?;
+            reader.set_poll(Some(RELAY_POLL));
+            Some(CarriedVmess {
+                reader: Box::new(reader),
+                writer: Box::new(writer),
+                close: shutdown_close(shutdown),
+                send,
+                recv,
+                response: (response_key, response_iv, auth),
+            })
+        }
+        Carrier::Quic
+        | Carrier::Kcp(_)
+        | Carrier::Hysteria(_)
+        | Carrier::Masque
+        | Carrier::Xdrive { .. }
+        | Carrier::Http
+        | Carrier::Unknown { .. } => None,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn open_vmess_udp_session<S: Dialed>(
+    vmess: &VmessOut,
+    server: &SocketAddr,
+    session: S,
+    redial: impl FnOnce() -> Option<S>,
+    dest: &SocketAddr,
+) -> Option<CarriedVmess> {
+    let raw = session.raw_clone()?;
+    match &vmess.carrier {
+        Carrier::Raw(_) => {
+            let (request, send, recv, response_key, response_iv, auth) =
+                vmess_udp_request(vmess, dest)?;
+            let mut session = session;
+            session.write_all(&request).ok()?;
+            let (reader, writer, _) = session.into_halves()?;
+            Some(CarriedVmess {
+                reader: Box::new(reader),
+                writer: Box::new(writer),
+                close: shutdown_close(raw),
+                send,
+                recv,
+                response: (response_key, response_iv, auth),
+            })
+        }
+        Carrier::Ws { path, ed } => {
+            let (request, send, recv, response_key, response_iv, auth) =
+                vmess_udp_request(vmess, dest)?;
+            let (reader, writer) = tls_ws(
+                server,
+                session,
+                &vmess.host,
+                path,
+                *ed,
+                &request,
+                &vmess.headers,
+                vmess.heartbeat,
+            )?;
+            let closer = writer.clone();
+            let close = shutdown_close(raw);
+            let close: VmessClose = Arc::new(move || {
+                closer.close();
+                close();
+            });
+            Some(CarriedVmess {
+                reader: Box::new(reader),
+                writer: Box::new(writer),
+                close,
+                send,
+                recv,
+                response: (response_key, response_iv, auth),
+            })
+        }
+        Carrier::Grpc(settings) => {
+            let (reader, writer) = tls_grpc(server, session, &vmess.host, settings)?;
+            let (request, send, recv, response_key, response_iv, auth) =
+                vmess_udp_request(vmess, dest)?;
+            if !writer.send(&request) {
+                return None;
+            }
+            let closer = writer.clone();
+            let close = shutdown_close(raw);
+            let close: VmessClose = Arc::new(move || {
+                closer.close();
+                close();
+            });
+            Some(CarriedVmess {
+                reader: Box::new(reader),
+                writer: Box::new(writer),
+                close,
+                send,
+                recv,
+                response: (response_key, response_iv, auth),
+            })
+        }
+        Carrier::Xhttp { settings, .. } => {
+            let (reader, writer) =
+                tls_xhttp(server, session, redial, &vmess.host, settings, false)?;
+            let (request, send, recv, response_key, response_iv, auth) =
+                vmess_udp_request(vmess, dest)?;
+            if !writer.send(&request) {
+                return None;
+            }
+            let closer = writer.clone();
+            let close = shutdown_close(raw);
+            let close: VmessClose = Arc::new(move || {
+                closer.finish();
+                close();
+            });
+            Some(CarriedVmess {
+                reader,
+                writer: Box::new(writer),
+                close,
+                send,
+                recv,
+                response: (response_key, response_iv, auth),
+            })
+        }
+        Carrier::HttpHeader { path, .. } => {
+            let (reader, mut writer) =
+                tls_httpheader(server, session, &vmess.host, path, &vmess.headers)?;
+            let (request, send, recv, response_key, response_iv, auth) =
+                vmess_udp_request(vmess, dest)?;
+            if writer.write_all(&request).is_err() {
+                return None;
+            }
+            Some(CarriedVmess {
+                reader: Box::new(reader),
+                writer: Box::new(writer),
+                close: shutdown_close(raw),
+                send,
+                recv,
+                response: (response_key, response_iv, auth),
+            })
+        }
+        Carrier::HttpUpgrade { path, .. } => {
+            let (request, send, recv, response_key, response_iv, auth) =
+                vmess_udp_request(vmess, dest)?;
+            let (reader, writer) =
+                tls_httpupgrade(server, session, &vmess.host, path, &request, &vmess.headers)?;
+            Some(CarriedVmess {
+                reader: Box::new(reader),
+                writer: Box::new(writer),
+                close: shutdown_close(raw),
+                send,
+                recv,
+                response: (response_key, response_iv, auth),
+            })
+        }
+        Carrier::Quic
+        | Carrier::Kcp(_)
+        | Carrier::Hysteria(_)
+        | Carrier::Masque
+        | Carrier::Xdrive { .. }
+        | Carrier::Http
+        | Carrier::Unknown { .. } => None,
+    }
+}
+
+fn spawn_vmess_udp_reader<R>(
+    read: R,
+    udp: UdpSocket,
+    source: Arc<Mutex<Option<SocketAddr>>>,
+    target: SocketAddr,
+    recv: crate::vmess::Flow,
+    response: ([u8; 16], [u8; 16], u8),
+    close: VmessClose,
+) -> RelayEnd
+where
+    R: Read + Send + 'static,
+{
+    RelayPool::global().run(move || {
+        // The reference writes its first datagram before it decodes the header, so a server that buffers the head until the first body frame still answers.
+        let mut read = read;
+        {
+            let mut bounded = HandshakeDeadline {
+                inner: &mut read,
+                until: Instant::now() + crate::quic::HANDSHAKE_TIMEOUT,
+            };
+            if !crate::vmess::read_response(&mut bounded, &response.0, &response.1, response.2) {
+                close();
+                return;
+            }
+        }
+        let mut read = crate::vmess::Buffered::new(read);
+        let mut recv = recv;
+        let mut scratch = Vec::with_capacity(UDP_BUF);
+        let mut reply = Vec::with_capacity(UDP_BUF);
+        while let Some(chunk) = crate::vmess::read_frame(&mut read, &mut recv, &mut scratch) {
+            if chunk.is_empty() {
+                break;
+            }
+            let dest = match source.lock() {
+                Ok(guard) => *guard,
+                Err(_) => None,
+            };
+            let Some(dest) = dest else {
+                continue;
+            };
+            let out = socks_udp_frame(&mut reply, &target, chunk);
+            let _ = udp.send_to(out, dest);
+        }
+    })
+}
+
+struct TrojanUdpUplink {
+    write: Box<dyn Write + Send>,
+    close: Arc<dyn Fn() + Send + Sync>,
+    done: RelayEnd,
+}
+
+/// The outbound's direct UDP lane for a mux's skipped datagrams: one association, opened on the first.
+struct TrojanUdpLane {
+    trojan: TrojanOut,
+    relay: UdpSocket,
+    source: Arc<Mutex<Option<SocketAddr>>>,
+    uplink: Option<TrojanUdpUplink>,
+    head: Vec<u8>,
+}
+
+impl TrojanUdpLane {
+    fn new(trojan: &TrojanOut, relay: &UdpSocket) -> Option<Self> {
+        Some(Self {
+            trojan: trojan.clone(),
+            relay: relay.try_clone().ok()?,
+            source: Arc::new(Mutex::new(None)),
+            uplink: None,
+            head: Vec::with_capacity(32),
+        })
+    }
+
+    fn send(&mut self, src: SocketAddr, dest: SocketAddr, payload: &[u8]) -> bool {
+        if let Ok(mut slot) = self.source.lock() {
+            *slot = Some(src);
+        }
+        if self.uplink.is_none() {
+            self.uplink =
+                dial_trojan_udp_uplink(&self.trojan, &dest, &self.relay, Arc::clone(&self.source));
+        }
+        if let Some(up) = &mut self.uplink {
+            if !write_trojan_datagram(&mut *up.write, &dest, payload, &mut self.head) {
+                if let Some(old) = self.uplink.take() {
+                    (old.close)();
+                }
+                return false;
+            }
+        }
+        true
+    }
+
+    fn close(self) {
+        if let Some(old) = self.uplink {
+            (old.close)();
+            join(&old.done);
+        }
+    }
+}
+
+/// The direct lane a mux's `skip` policy uses for `VMess`: one plain UDP session per destination,
+/// framed through the same writer the non-mux path uses.
+struct VmessUdpLane {
+    vmess: VmessOut,
+    relay: UdpSocket,
+    source: Arc<Mutex<Option<SocketAddr>>>,
+    uplinks: HashMap<SocketAddr, VmessUdpUplink>,
+    staging: Vec<u8>,
+}
+
+impl VmessUdpLane {
+    fn new(vmess: &VmessOut, relay: &UdpSocket) -> Option<Self> {
+        Some(Self {
+            vmess: vmess.clone(),
+            relay: relay.try_clone().ok()?,
+            source: Arc::new(Mutex::new(None)),
+            uplinks: HashMap::new(),
+            staging: Vec::with_capacity(UDP_BUF),
+        })
+    }
+
+    fn send(&mut self, src: SocketAddr, dest: SocketAddr, payload: &[u8]) -> bool {
+        if let Ok(mut slot) = self.source.lock() {
+            *slot = Some(src);
+        }
+        if !self.uplinks.contains_key(&dest) {
+            let Some(up) =
+                dial_vmess_udp_uplink(&self.vmess, &dest, &self.relay, Arc::clone(&self.source))
+            else {
+                return true;
+            };
+            self.uplinks.insert(dest, up);
+        }
+        let Some(up) = self.uplinks.get_mut(&dest) else {
+            return true;
+        };
+        if crate::vmess::write_frame(
+            &mut up.write,
+            &mut up.send,
+            payload,
+            &mut self.staging,
+            &mut up.pad,
+        ) {
+            return true;
+        }
+        if let Some(old) = self.uplinks.remove(&dest) {
+            (old.close)();
+        }
+        false
+    }
+
+    fn close(self) {
+        for (_, old) in self.uplinks {
+            (old.close)();
+            join(&old.done);
+        }
+    }
+}
+
+/// The reader, writer and teardown of an association carried inside one carrier session.
+type UdpCarriedParts = (
+    Box<dyn Read + Send>,
+    Box<dyn Write + Send>,
+    Arc<dyn Fn() + Send + Sync>,
+);
+
+/// The carriers an association rides: the stream carriers frame the datagrams, and KCP carries them over its own session.
+fn trojan_udp_carried(carrier: &Carrier) -> bool {
+    matches!(
+        carrier,
+        Carrier::Raw(_)
+            | Carrier::Ws { .. }
+            | Carrier::HttpUpgrade { .. }
+            | Carrier::Grpc(_)
+            | Carrier::Xhttp { .. }
+            | Carrier::HttpHeader { .. }
+            | Carrier::Kcp(_)
+            | Carrier::Quic
+    )
+}
+
+fn trojan_quic_dial(trojan: &TrojanOut) -> crate::quic::QuicDial {
+    crate::quic::QuicDial {
+        id: [0; 16],
+        host: std::sync::Arc::from(trojan.host.as_str()),
+        address: std::sync::Arc::from(trojan.address.as_str()),
+        port: trojan.port,
+        upstream: None,
+        roots: trojan.quic_roots.clone(),
+        ech_config_list: trojan.quic_ech.clone(),
+        default_cc: None,
+    }
+}
+
+fn trojan_hysteria_dial(trojan: &TrojanOut) -> Option<crate::hysteria::Dial> {
+    let Carrier::Hysteria(config) = &trojan.carrier else {
+        return None;
+    };
+    Some(crate::hysteria::Dial {
+        host: trojan.host.clone(),
+        address: trojan.address.clone(),
+        port: trojan.port,
+        config: config.clone(),
+        roots: trojan.hysteria_roots.clone(),
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn dial_trojan_udp_uplink(
+    trojan: &TrojanOut,
+    dest: &SocketAddr,
+    relay: &UdpSocket,
+    source: Arc<Mutex<Option<SocketAddr>>>,
+) -> Option<TrojanUdpUplink> {
+    if matches!(trojan.carrier, Carrier::Quic) {
+        return dial_trojan_quic_udp_uplink(trojan, dest, relay, source);
+    }
+    let server = resolve_outbound(&trojan.address, trojan.port)?;
+    let header = trojan_header(&trojan.key, 3, &Destination::from(*dest));
+    let udp_send = relay.try_clone().ok()?;
+    let mask = trojan.carrier.tcp_mask();
+    // The association rides whatever the outbound names: a terminated session splits into the reader and writer the pump needs, and the header goes inside it.
+    let (read, write, close): UdpCarriedParts = match (
+        &trojan.carrier,
+        trojan.reality.as_deref(),
+        trojan.tls.as_deref(),
+    ) {
+        (Carrier::Raw(_), Some(cfg), _) => {
+            let mut session = dial_reality_session(&server, cfg, mask)?;
+            if session.write_all(&header).is_err() {
+                return None;
+            }
+            let out = session.get_ref().get_ref().try_clone().ok()?;
+            let socket = out.try_clone().ok()?;
+            let (_driven, half) = session_halves(session, out);
+            let close = move || {
+                let _ = socket.shutdown(Shutdown::Both);
+            };
+            (Box::new(half.clone()), Box::new(half), Arc::new(close))
+        }
+        (Carrier::Raw(_), None, Some(cfg)) => {
+            let mut session = dial_tls_session(&server, cfg, mask)?;
+            if session.write_all(&header).is_err() {
+                return None;
+            }
+            let out = session.get_ref().try_clone().ok()?;
+            let socket = out.try_clone().ok()?;
+            // A driven reader hands over one record's plaintext and withholds the rest until the next lands, and a datagram is read a field at a time: the pump reads through the shared session.
+            let (_driven, half) = session_halves(session, out);
+            let close = move || {
+                let _ = socket.shutdown(Shutdown::Both);
+            };
+            (Box::new(half.clone()), Box::new(half), Arc::new(close))
+        }
+        (Carrier::Kcp(_), Some(cfg), _) => {
+            let conn = kcp_dial_session(&trojan.carrier, &trojan.address, trojan.port)?;
+            let mut session = kcp_reality_connect(&conn, cfg)?;
+            if session.write_all(&header).is_err() {
+                return None;
+            }
+            let (read, write) = session_halves(session, KcpIo::new(Arc::clone(&conn)));
+            let close = move || conn.close();
+            (Box::new(read), Box::new(write), Arc::new(close))
+        }
+        (Carrier::Kcp(_), None, Some(cfg)) => {
+            let conn = kcp_dial_session(&trojan.carrier, &trojan.address, trojan.port)?;
+            let mut session = ferrox_core::tls::connect(cfg, KcpIo::new(Arc::clone(&conn))).ok()?;
+            if !shake_tls(&mut session) || session.write_all(&header).is_err() {
+                return None;
+            }
+            let (read, write) = session_halves(session, KcpIo::new(Arc::clone(&conn)));
+            let close = move || conn.close();
+            (Box::new(read), Box::new(write), Arc::new(close))
+        }
+        (Carrier::Raw(_), None, None) => {
+            let mut uplink = dial_or_report(&server)?.with_mask(mask);
+            uplink.write_all(&header).ok()?;
+            let read = uplink.try_clone().ok()?;
+            let write = uplink.try_clone().ok()?;
+            let close = move || {
+                let _ = uplink.shutdown(Shutdown::Both);
+            };
+            (Box::new(read), Box::new(write), Arc::new(close))
+        }
+        (Carrier::Kcp(_), None, None) => {
+            let conn = kcp_dial_session(&trojan.carrier, &trojan.address, trojan.port)?;
+            if conn.write(&header).is_err() {
+                return None;
+            }
+            let (read, write, closed) = kcp_parts(&conn);
+            let close = move || closed();
+            (Box::new(read), Box::new(write), Arc::new(close))
+        }
+        (carrier, Some(cfg), _) => {
+            let session = dial_reality_session(&server, cfg, mask)?;
+            trojan_udp_session(
+                session,
+                || dial_reality_session(&server, cfg, mask),
+                carrier,
+                trojan,
+                &header,
+            )?
+        }
+        (carrier, None, Some(cfg)) => {
+            let session = dial_tls_session(&server, cfg, mask)?;
+            trojan_udp_session(
+                session,
+                || dial_tls_session(&server, cfg, mask),
+                carrier,
+                trojan,
+                &header,
+            )?
+        }
+        (carrier, None, None) => {
+            let uplink = dial_or_report(&server)?.with_mask(mask);
+            trojan_udp_plain(uplink, carrier, trojan, &header)?
+        }
+    };
+    let done = spawn_trojan_uplink_reader(read, udp_send, source);
+    Some(TrojanUdpUplink { write, close, done })
+}
+
+fn dial_trojan_quic_udp_uplink(
+    trojan: &TrojanOut,
+    dest: &SocketAddr,
+    relay: &UdpSocket,
+    source: Arc<Mutex<Option<SocketAddr>>>,
+) -> Option<TrojanUdpUplink> {
+    let pooled = crate::quic::pumped_stream_within(&trojan_quic_dial(trojan), budgets::dial())?;
+    let header = trojan_header(&trojan.key, 3, &Destination::from(*dest));
+    let mut stream = pooled.stream_handle();
+    if stream.write_all(&header).is_err() {
+        pooled.cancel();
+        return None;
+    }
+    let Ok(udp_send) = relay.try_clone() else {
+        pooled.cancel();
+        return None;
+    };
+    let done = spawn_trojan_uplink_reader(pooled.stream_handle(), udp_send, source);
+    let close_stream = pooled.stream_handle();
+    let pooled = Mutex::new(Some(pooled));
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        close_stream.close();
+        drop(pooled.lock().ok().and_then(|mut slot| slot.take()));
+    });
+    Some(TrojanUdpUplink {
+        write: Box::new(stream),
+        close,
+        done,
+    })
+}
+
+fn trojan_udp_plain(
+    uplink: Connection,
+    carrier: &Carrier,
+    trojan: &TrojanOut,
+    header: &[u8],
+) -> Option<UdpCarriedParts> {
+    udp_plain_carried(
+        uplink,
+        &trojan.host,
+        carrier,
+        &trojan.headers,
+        trojan.heartbeat,
+        header,
+    )
+}
+
+fn udp_plain_carried(
+    uplink: Connection,
+    host: &str,
+    carrier: &Carrier,
+    headers: &[(String, String)],
+    heartbeat: u32,
+    header: &[u8],
+) -> Option<UdpCarriedParts> {
+    let raw = uplink.try_clone().ok()?;
+    match carrier {
+        Carrier::Ws { path, ed } => {
+            let (reader, writer) =
+                crate::ws::connect(uplink, host, path, *ed, header, headers, heartbeat)?;
+            let closer = writer.clone();
+            let close = move || {
+                closer.close();
+                let _ = raw.shutdown(Shutdown::Both);
+            };
+            Some((Box::new(reader), Box::new(writer), Arc::new(close)))
+        }
+        Carrier::HttpUpgrade { path, .. } => {
+            let (reader, writer) =
+                crate::httpupgrade::connect(uplink, host, path, header, headers)?;
+            let socket = writer.try_clone().ok()?;
+            let close = move || {
+                let _ = socket.shutdown(Shutdown::Both);
+            };
+            Some((Box::new(reader), Box::new(writer), Arc::new(close)))
+        }
+        Carrier::Grpc(settings) => {
+            let (reader, writer) = crate::grpc::connect_with(uplink, host, settings)?;
+            if !writer.send(header) {
+                return None;
+            }
+            let closer = writer.clone();
+            let close = move || {
+                closer.close();
+                let _ = raw.shutdown(Shutdown::Both);
+            };
+            Some((Box::new(reader), Box::new(writer), Arc::new(close)))
+        }
+        Carrier::Xhttp { .. } => {
+            let (reader, writer) = xhttp_rung(uplink, host, carrier, "")?;
+            if !writer.send(header) {
+                return None;
+            }
+            let closer = writer.clone();
+            let close = move || {
+                closer.finish();
+                let _ = raw.shutdown(Shutdown::Both);
+            };
+            Some((Box::new(reader), Box::new(writer), Arc::new(close)))
+        }
+        Carrier::HttpHeader { path, .. } => {
+            let (reader, mut writer) = crate::httpheader::connect(uplink, host, path, headers)?;
+            writer.write_all(header).ok()?;
+            let socket = writer.try_clone().ok()?;
+            let close = move || {
+                let _ = socket.shutdown(Shutdown::Both);
+            };
+            Some((Box::new(reader), Box::new(writer), Arc::new(close)))
+        }
+        _ => None,
+    }
+}
+
+fn trojan_udp_session<S: Dialed>(
+    session: S,
+    second: impl FnOnce() -> Option<S>,
+    carrier: &Carrier,
+    trojan: &TrojanOut,
+    header: &[u8],
+) -> Option<UdpCarriedParts> {
+    udp_carried_session(
+        session,
+        second,
+        &trojan.host,
+        carrier,
+        &trojan.headers,
+        trojan.heartbeat,
+        header,
+    )
+}
+
+/// One association inside one carrier session: a terminated session splits into the halves the pump reads and writes, and the header goes inside it.
+#[allow(clippy::too_many_arguments)]
+fn udp_carried_session<S: Dialed>(
+    session: S,
+    second: impl FnOnce() -> Option<S>,
+    host: &str,
+    carrier: &Carrier,
+    headers: &[(String, String)],
+    heartbeat: u32,
+    header: &[u8],
+) -> Option<UdpCarriedParts> {
+    let h2 = session
+        .alpn()
+        .is_some_and(|alpn| alpn.eq_ignore_ascii_case(b"h2"));
+    match carrier {
+        Carrier::Ws { path, ed } => {
+            let (reader, writer, raw) = session.into_halves()?;
+            let (reader, writer) = crate::ws::connect_split(
+                reader, writer, host, path, *ed, header, headers, heartbeat,
+            )?;
+            let closer = writer.clone();
+            let close = move || {
+                closer.close();
+                let _ = raw.shutdown(Shutdown::Both);
+            };
+            Some((Box::new(reader), Box::new(writer), Arc::new(close)))
+        }
+        Carrier::HttpUpgrade { path, .. } => {
+            let (reader, writer, raw) = session.into_halves()?;
+            let (reader, writer) =
+                crate::httpupgrade::connect_split(reader, writer, host, path, header, headers)?;
+            let close = move || {
+                let _ = raw.shutdown(Shutdown::Both);
+            };
+            Some((Box::new(reader), Box::new(writer), Arc::new(close)))
+        }
+        Carrier::Grpc(settings) => {
+            let (reader, writer, raw) = session.into_halves()?;
+            let (reader, writer) = crate::grpc::connect_split_with(reader, writer, host, settings)?;
+            if !writer.send(header) {
+                return None;
+            }
+            let closer = writer.clone();
+            let close = move || {
+                closer.close();
+                let _ = raw.shutdown(Shutdown::Both);
+            };
+            Some((Box::new(reader), Box::new(writer), Arc::new(close)))
+        }
+        Carrier::Xhttp { settings } => {
+            let (first, up, raw) = session.into_halves()?;
+            if settings.mode == crate::xhttp::XhttpMode::StreamOne {
+                // An ALPN-negotiated h2 session expects the preface; `decideHTTPVersion` (dialer.go:82) takes the negotiated protocol, not the offer.
+                let (reader, writer): (Box<dyn Read + Send>, crate::xhttp::XhttpWriter) = if h2 {
+                    let (reader, writer) = crate::xhttp_h2::connect_split(
+                        first,
+                        up,
+                        Arc::clone(&raw),
+                        host,
+                        settings,
+                        "https",
+                    )?;
+                    (Box::new(reader), writer)
+                } else {
+                    let (reader, writer) =
+                        crate::xhttp::connect_split_settings(first, up, host, settings)?;
+                    (Box::new(reader), writer)
+                };
+                if !writer.send(header) {
+                    return None;
+                }
+                let closer = writer.clone();
+                let close = move || {
+                    closer.finish();
+                    let _ = raw.shutdown(Shutdown::Both);
+                };
+                return Some((reader, Box::new(writer), Arc::new(close)));
+            }
+            // This tree's H2 client is stream-one; a packet-up session on a connection that negotiated h2 is not one this dialer can carry, and an H1 head is not a fallback the peer agreed to.
+            if h2 {
+                return None;
+            }
+            // The GET downlink dials its own session: one transport per direction, both under one session id (`dialer.go:411`).
+            let (down, down_write, down_raw) = second()?.into_halves()?;
+            let (reader, writer) =
+                crate::xhttp::connect_dual_split(down, down_write, up, host, settings)?;
+            if !writer.send(header) {
+                return None;
+            }
+            let closer = writer.clone();
+            let close = move || {
+                closer.finish();
+                let _ = raw.shutdown(Shutdown::Both);
+                let _ = down_raw.shutdown(Shutdown::Both);
+            };
+            Some((Box::new(reader), Box::new(writer), Arc::new(close)))
+        }
+        Carrier::HttpHeader { path, .. } => {
+            let (reader, writer, raw) = session.into_halves()?;
+            let (reader, writer) =
+                crate::httpheader::connect_split(reader, writer, host, path, headers)?;
+            let mut writer = writer;
+            writer.write_all(header).ok()?;
+            let close = move || {
+                let _ = raw.shutdown(Shutdown::Both);
+            };
+            Some((Box::new(reader), Box::new(writer), Arc::new(close)))
+        }
+        _ => None,
+    }
+}
+
+fn spawn_trojan_uplink_reader<R>(
+    read: R,
+    udp: UdpSocket,
+    source: Arc<Mutex<Option<SocketAddr>>>,
+) -> RelayEnd
+where
+    R: Read + Send + 'static,
+{
+    RelayPool::global().run(move || {
+        let mut read = read;
+        let mut buf = udp_buffer();
+        let mut reply = Vec::with_capacity(UDP_BUF);
+        while let Some((src_addr, n)) = read_trojan_datagram(&mut read, &mut buf) {
+            let dest = match source.lock() {
+                Ok(guard) => *guard,
+                Err(_) => None,
+            };
+            let Some(dest) = dest else {
+                continue;
+            };
+            let out = socks_udp_frame(&mut reply, &src_addr, &buf[..n]);
+            let _ = udp.send_to(out, dest);
+        }
+    })
+}
+
+/// The two halves of a mux carrier and the close that tears its socket down.
