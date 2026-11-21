@@ -23256,6 +23256,7 @@ fn relay_vless_xhttp_session<R: WindowRead + Send + RelayPoll + 'static>(
     if !writer.send(header) {
         return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
     }
+    eprintln!("DBG h2mux: client sent request");
     let mut reader = reader;
     if reader.awaits_head() {
         let pump = Pump::to_sink(client, &writer);
@@ -23286,6 +23287,10 @@ fn pooled_xhttp_reply(
     header: &[u8],
     lease: crate::xmux::Lease,
 ) -> bool {
+    eprintln!(
+        "DBG h2mux: client pool conn {:p}",
+        Arc::as_ptr(lease.conn())
+    );
     let Some((reader, writer)) = lease.conn().open(&vless.host, settings, "https", false) else {
         lease.retire();
         return false;

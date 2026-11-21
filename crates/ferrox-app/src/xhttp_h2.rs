@@ -1202,6 +1202,7 @@ impl H2StreamWriter {
         let text = std::str::from_utf8(head).unwrap_or_default();
         let headers = response_fields(text);
         let block = block_encode(&headers);
+        eprintln!("DBG h2mux: server head stream {}", self.stream);
         if !self.conn.header_block(self.stream, &block, false) {
             return false;
         }
@@ -3237,6 +3238,11 @@ fn open_stream(
     };
     let settings = settings.clone();
     let decryption = conn.decryption.clone();
+    eprintln!(
+        "DBG h2mux: server open stream {} conn {:p}",
+        sid,
+        Arc::as_ptr(conn)
+    );
     crate::proxy::lane_pool::submit_stream_setup(move || {
         match crate::xhttp::accept_core(
             &head,
@@ -3249,6 +3255,7 @@ fn open_stream(
         ) {
             crate::xhttp::Served::Session(ureader, xwriter) => {
                 // The handshake rode the setup lane; the served session is long-lived and takes its own thread, so a companion stream's handshake is not queued behind it.
+                eprintln!("DBG h2mux: server session stream {sid}");
                 let serve = Arc::clone(&serve);
                 crate::budgets::spawn(move || serve(ureader, xwriter, decryption));
             }
