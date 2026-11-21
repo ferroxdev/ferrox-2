@@ -24672,3 +24672,4980 @@ where
 }
 
 #[derive(Clone, Copy)]
+struct TlsDial<'a> {
+    server: &'a SocketAddr,
+    cfg: &'a ferrox_core::tls::TlsConfig,
+}
+
+#[derive(Clone, Copy)]
+struct RealityDial<'a> {
+    server: &'a SocketAddr,
+    cfg: &'a ferrox_core::tls::RealityClientConfig,
+}
+
+fn reality_session_on(
+    uplink: Connection,
+    cfg: &ferrox_core::tls::RealityClientConfig,
+) -> Result<
+    ferrox_core::tls::RealityClientSession<ferrox_core::tls::reality::RecordLimiter<Connection>>,
+    Kind,
+> {
+    let now = u32::try_from(unix_millis() / 1000).unwrap_or(u32::MAX);
+    let limiter = ferrox_core::tls::reality::RecordLimiter::new(uplink);
+    let session = ferrox_core::tls::RealityClientSession::connect(cfg, now, limiter)
+        .map_err(|_| Kind::Dropped)?;
+    session
+        .get_ref()
+        .get_ref()
+        .set_read_timeout(Some(SESSION_POLL))
+        .map_err(|_| Kind::Local)?;
+    Ok(session)
+}
+
+fn dial_ss_tls_rung(
+    client: &Connection,
+    uplink: Connection,
+    ss: &ShadowsocksOut,
+    target: &Destination,
+    attempt: &RungAttempt<'_>,
+    ladder: &Ladder,
+    tls: TlsDial<'_>,
+) -> bool {
+    let TlsDial { server, cfg } = tls;
+    let rung = attempt.rung;
+    if rung == Rung::Raw && !attempt.explicit {
+        return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+    }
+    let Some(session) = tls_session_on(uplink, cfg) else {
+        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Dropped);
+    };
+    match rung {
+        Rung::Raw => {
+            let Some((reader, writer, raw)) = session.into_halves() else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Dropped);
+            };
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                let _ = raw.shutdown(Shutdown::Both);
+            });
+            if !ss_client_relay(client, reader, writer, &close, ss, target) {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+            }
+            true
+        }
+        Rung::Ws => {
+            let Some((reader, writer)) = tls_ws(
+                server,
+                session,
+                &ss.host,
+                attempt.path,
+                attempt.ed,
+                &[],
+                &ss.headers,
+                ss.heartbeat,
+            ) else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+            };
+            let closer = writer.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+            if !ss_client_relay(client, reader, writer, &close, ss, target) {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+            }
+            true
+        }
+        Rung::HttpUpgrade => {
+            let Some((reader, sink)) =
+                tls_httpupgrade(server, session, &ss.host, attempt.path, &[], &ss.headers)
+            else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+            };
+            let writer = sink.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || sink.close());
+            if !ss_client_relay(client, reader, writer, &close, ss, target) {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+            }
+            true
+        }
+        Rung::Grpc => {
+            let settings = ss
+                .carrier
+                .grpc_settings()
+                .cloned()
+                .unwrap_or_else(|| crate::config::GrpcSettings::path(attempt.path));
+            let Some((reader, writer)) = tls_grpc(server, session, &ss.host, &settings) else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+            };
+            let closer = writer.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+            if !ss_client_relay(client, reader, writer, &close, ss, target) {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+            }
+            true
+        }
+        Rung::Xhttp => {
+            let Carrier::Xhttp { settings, .. } = &ss.carrier else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+            };
+            let Some((reader, writer)) = tls_xhttp(
+                server,
+                session,
+                || dial_tls_session(server, cfg, ss.carrier.tcp_mask()),
+                &ss.host,
+                settings,
+                false,
+            ) else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+            };
+            let closer = writer.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.finish());
+            if !ss_client_relay(client, reader, writer, &close, ss, target) {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+            }
+            true
+        }
+    }
+}
+
+fn dial_ss_reality_rung(
+    client: &Connection,
+    uplink: Connection,
+    ss: &ShadowsocksOut,
+    target: &Destination,
+    attempt: &RungAttempt<'_>,
+    ladder: &Ladder,
+    reality: RealityDial<'_>,
+) -> bool {
+    let RealityDial { server, cfg } = reality;
+    let rung = attempt.rung;
+    if rung == Rung::Raw && !attempt.explicit {
+        return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+    }
+    let session = match reality_session_on(uplink, cfg) {
+        Ok(session) => session,
+        Err(kind) => return climb_or_hold(ladder, rung, Stage::SocketConnected, kind),
+    };
+    match rung {
+        Rung::Raw => {
+            let Some((reader, writer, raw)) = session.into_halves() else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Dropped);
+            };
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                let _ = raw.shutdown(Shutdown::Both);
+            });
+            note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
+            if !ss_client_relay(client, reader, writer, &close, ss, target) {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+            }
+            true
+        }
+        Rung::Ws => {
+            let Some((reader, writer)) = tls_ws(
+                server,
+                session,
+                &ss.host,
+                attempt.path,
+                attempt.ed,
+                &[],
+                &ss.headers,
+                ss.heartbeat,
+            ) else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+            };
+            let closer = writer.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+            note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
+            if !ss_client_relay(client, reader, writer, &close, ss, target) {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+            }
+            true
+        }
+        Rung::HttpUpgrade => {
+            let Some((reader, sink)) =
+                tls_httpupgrade(server, session, &ss.host, attempt.path, &[], &ss.headers)
+            else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+            };
+            let writer = sink.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || sink.clone().close());
+            note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
+            if !ss_client_relay(client, reader, writer, &close, ss, target) {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+            }
+            true
+        }
+        Rung::Grpc => {
+            let settings = ss
+                .carrier
+                .grpc_settings()
+                .cloned()
+                .unwrap_or_else(|| crate::config::GrpcSettings::path(attempt.path));
+            let Some((reader, writer)) = tls_grpc(server, session, &ss.host, &settings) else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+            };
+            let closer = writer.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+            note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
+            if !ss_client_relay(client, reader, writer, &close, ss, target) {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+            }
+            true
+        }
+        Rung::Xhttp => {
+            let Carrier::Xhttp { settings, .. } = &ss.carrier else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+            };
+            let Some((reader, writer)) = tls_xhttp(
+                server,
+                session,
+                || dial_reality_session(server, cfg, ss.carrier.tcp_mask()),
+                &ss.host,
+                settings,
+                true,
+            ) else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+            };
+            let closer = writer.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.finish());
+            note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
+            if !ss_client_relay(client, reader, writer, &close, ss, target) {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+            }
+            true
+        }
+    }
+}
+
+fn dial_ss_rung(
+    client: &Connection,
+    server: &SocketAddr,
+    uplink: Connection,
+    ss: &ShadowsocksOut,
+    target: &Destination,
+    attempt: &RungAttempt<'_>,
+    ladder: &Ladder,
+) -> bool {
+    if let Some(cfg) = ss.reality.as_deref() {
+        return dial_ss_reality_rung(
+            client,
+            uplink,
+            ss,
+            target,
+            attempt,
+            ladder,
+            RealityDial { server, cfg },
+        );
+    }
+    if let Some(cfg) = ss.tls.as_deref() {
+        return dial_ss_tls_rung(
+            client,
+            uplink,
+            ss,
+            target,
+            attempt,
+            ladder,
+            TlsDial { server, cfg },
+        );
+    }
+    match attempt.rung {
+        Rung::Raw => {
+            if !attempt.explicit {
+                return climb_or_hold(ladder, attempt.rung, Stage::RequestSent, Kind::Dropped);
+            }
+            let mut uplink = uplink;
+            if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
+                let Ok((send, recv)) = crate::shadowsocks2022::client_send_handshake(
+                    &mut uplink,
+                    &ss.password,
+                    &ss.method,
+                    target,
+                ) else {
+                    return climb_or_hold(ladder, attempt.rung, Stage::RequestSent, Kind::Dropped);
+                };
+                note_success(ladder, attempt.rung, Stage::RequestSent, attempt.explicit);
+                crate::shadowsocks2022::pump_relay(client, &uplink, send, recv);
+                return true;
+            }
+            let Ok((send, recv)) = crate::shadowsocks::client_send_handshake(
+                &mut uplink,
+                &ss.password,
+                &ss.method,
+                target,
+            ) else {
+                return climb_or_hold(ladder, attempt.rung, Stage::RequestSent, Kind::Dropped);
+            };
+            note_success(ladder, attempt.rung, Stage::RequestSent, attempt.explicit);
+            crate::shadowsocks::pump_relay(client, &uplink, send, recv);
+            true
+        }
+        Rung::Ws => dial_ss_ws(client, uplink, ss, target, attempt, ladder),
+        Rung::HttpUpgrade => dial_ss_httpupgrade(client, uplink, ss, target, attempt, ladder),
+        Rung::Grpc => dial_ss_grpc(client, uplink, ss, target, attempt, ladder),
+        Rung::Xhttp => dial_ss_xhttp(client, uplink, ss, target, attempt, ladder),
+    }
+}
+
+fn dial_ss_ws(
+    client: &Connection,
+    uplink: Connection,
+    ss: &ShadowsocksOut,
+    target: &Destination,
+    attempt: &RungAttempt<'_>,
+    ladder: &Ladder,
+) -> bool {
+    let rung = attempt.rung;
+    let Some((reader, mut writer)) = crate::ws::connect(
+        uplink,
+        &ss.host,
+        attempt.path,
+        0,
+        &[],
+        &ss.headers,
+        ss.heartbeat,
+    ) else {
+        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+    };
+    if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
+        let Ok((send, recv)) = crate::shadowsocks2022::client_send_handshake(
+            &mut writer,
+            &ss.password,
+            &ss.method,
+            target,
+        ) else {
+            return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+        };
+        note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
+        let closer = writer.clone();
+        let close: std::sync::Arc<dyn Fn() + Send + Sync> =
+            std::sync::Arc::new(move || closer.close());
+        crate::shadowsocks2022::pump_relay_carried(client, reader, writer, &close, send, recv);
+        return true;
+    }
+    let Ok((send, recv)) =
+        crate::shadowsocks::client_send_handshake(&mut writer, &ss.password, &ss.method, target)
+    else {
+        return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+    };
+    note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
+    let closer = writer.clone();
+    let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || closer.close());
+    crate::shadowsocks::pump_relay_carried(client, reader, writer, &close, send, recv);
+    true
+}
+
+fn dial_ss_httpupgrade(
+    client: &Connection,
+    uplink: Connection,
+    ss: &ShadowsocksOut,
+    target: &Destination,
+    attempt: &RungAttempt<'_>,
+    ladder: &Ladder,
+) -> bool {
+    let rung = attempt.rung;
+    let Some((reader, mut writer)) =
+        crate::httpupgrade::connect(uplink, &ss.host, attempt.path, &[], &ss.headers)
+    else {
+        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+    };
+    if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
+        let (send, recv) = match crate::shadowsocks2022::client_send_handshake(
+            &mut writer,
+            &ss.password,
+            &ss.method,
+            target,
+        ) {
+            Ok(pair) => pair,
+            Err(kind) => return climb_or_hold(ladder, rung, Stage::RequestSent, kind),
+        };
+        note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
+        let Ok(closer) = writer.try_clone() else {
+            return true;
+        };
+        let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+            let _ = closer.shutdown(Shutdown::Both);
+        });
+        crate::shadowsocks2022::pump_relay_carried(client, reader, writer, &close, send, recv);
+        return true;
+    }
+    let (send, recv) = match crate::shadowsocks::client_send_handshake(
+        &mut writer,
+        &ss.password,
+        &ss.method,
+        target,
+    ) {
+        Ok(pair) => pair,
+        Err(kind) => return climb_or_hold(ladder, rung, Stage::RequestSent, kind),
+    };
+    note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
+    let Ok(closer) = writer.try_clone() else {
+        return true;
+    };
+    let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+        let _ = closer.shutdown(Shutdown::Both);
+    });
+    crate::shadowsocks::pump_relay_carried(client, reader, writer, &close, send, recv);
+    true
+}
+
+fn dial_ss_grpc(
+    client: &Connection,
+    uplink: Connection,
+    ss: &ShadowsocksOut,
+    target: &Destination,
+    attempt: &RungAttempt<'_>,
+    ladder: &Ladder,
+) -> bool {
+    let rung = attempt.rung;
+    let settings = ss
+        .carrier
+        .grpc_settings()
+        .cloned()
+        .unwrap_or_else(|| crate::config::GrpcSettings::path(attempt.path));
+    let Some((reader, mut writer)) = crate::grpc::connect_with(uplink, &ss.host, &settings) else {
+        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+    };
+    if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
+        let Ok((send, recv)) = crate::shadowsocks2022::client_send_handshake(
+            &mut writer,
+            &ss.password,
+            &ss.method,
+            target,
+        ) else {
+            return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+        };
+        note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
+        let closer = writer.clone();
+        let close: std::sync::Arc<dyn Fn() + Send + Sync> =
+            std::sync::Arc::new(move || closer.close());
+        crate::shadowsocks2022::pump_relay_carried(client, reader, writer, &close, send, recv);
+        return true;
+    }
+    let Ok((send, recv)) =
+        crate::shadowsocks::client_send_handshake(&mut writer, &ss.password, &ss.method, target)
+    else {
+        return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+    };
+    note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
+    let closer = writer.clone();
+    let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || closer.close());
+    crate::shadowsocks::pump_relay_carried(client, reader, writer, &close, send, recv);
+    true
+}
+
+fn dial_ss_xhttp(
+    client: &Connection,
+    uplink: Connection,
+    ss: &ShadowsocksOut,
+    target: &Destination,
+    attempt: &RungAttempt<'_>,
+    ladder: &Ladder,
+) -> bool {
+    let rung = attempt.rung;
+    let Some((reader, writer)) = xhttp_rung(uplink, &ss.host, &ss.carrier, attempt.path) else {
+        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+    };
+    ss_xhttp_relay(client, reader, writer, ss, target, attempt, ladder)
+}
+
+fn dial_ss_xhttp_h3(
+    client: &Connection,
+    server: &SocketAddr,
+    ss: &ShadowsocksOut,
+    target: &Destination,
+    ladder: &Ladder,
+    settings: &crate::xhttp::XhttpSettings,
+    cfg: &ferrox_core::tls::TlsConfig,
+) {
+    let rung = Rung::Xhttp;
+    let pair = if settings.mode == crate::xhttp::XhttpMode::StreamOne {
+        crate::xhttp_h3::connect_split(*server, &ss.host, settings, cfg)
+    } else {
+        crate::xhttp_h3::connect_dual_split(*server, &ss.host, settings, cfg)
+    };
+    let Some((reader, writer)) = pair else {
+        let failure = Failure::new(Stage::SocketConnected, Kind::Unreachable);
+        let _stop = ladder.record_failure(rung, &failure);
+        note_dial_failure(server, failure);
+        return;
+    };
+    let attempt = RungAttempt {
+        rung,
+        path: "",
+        ed: 0,
+        explicit: true,
+    };
+    let reader: Box<dyn WindowRead + Send> = Box::new(reader);
+    let _ = ss_xhttp_relay(client, reader, writer, ss, target, &attempt, ladder);
+}
+
+fn ss_xhttp_relay<R>(
+    client: &Connection,
+    reader: R,
+    mut writer: crate::xhttp::XhttpWriter,
+    ss: &ShadowsocksOut,
+    target: &Destination,
+    attempt: &RungAttempt<'_>,
+    ladder: &Ladder,
+) -> bool
+where
+    R: Read + Send + 'static + RelayPoll,
+{
+    let rung = attempt.rung;
+    if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
+        let Ok((send, recv)) = crate::shadowsocks2022::client_send_handshake(
+            &mut writer,
+            &ss.password,
+            &ss.method,
+            target,
+        ) else {
+            return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+        };
+        note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
+        let closer = writer.clone();
+        let close: std::sync::Arc<dyn Fn() + Send + Sync> =
+            std::sync::Arc::new(move || closer.finish());
+        crate::shadowsocks2022::pump_relay_carried(client, reader, writer, &close, send, recv);
+        return true;
+    }
+    let Ok((send, recv)) =
+        crate::shadowsocks::client_send_handshake(&mut writer, &ss.password, &ss.method, target)
+    else {
+        return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+    };
+    note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
+    let closer = writer.clone();
+    let close: std::sync::Arc<dyn Fn() + Send + Sync> =
+        std::sync::Arc::new(move || closer.finish());
+    crate::shadowsocks::pump_relay_carried(client, reader, writer, &close, send, recv);
+    true
+}
+
+fn serve_trojan(stream: Connection, key: &[[u8; 56]], carrier: &Carrier, freedom: bool) {
+    match carrier {
+        Carrier::Raw(_) => serve_trojan_raw(stream, key, freedom),
+        Carrier::Ws { path, .. } => serve_trojan_ws(stream, key, path.as_str(), freedom),
+        Carrier::HttpUpgrade { path, host, .. } => {
+            serve_trojan_httpupgrade(stream, key, path.as_str(), host, freedom);
+        }
+        Carrier::Grpc(settings) => serve_trojan_grpc(stream, key, settings, freedom),
+        Carrier::Xhttp { settings, .. } => {
+            let Ok(read) = stream.try_clone() else {
+                return;
+            };
+            // A bare H1 socket can bound its own first read: an idle peer must not hold a setup lane.
+            let arm = |read: &Connection, timeout| read.set_read_timeout(timeout).is_ok();
+            serve_trojan_xhttp_carrier(read, stream, settings, key, freedom, arm);
+        }
+        Carrier::HttpHeader {
+            paths, response, ..
+        } => {
+            serve_trojan_httpheader_with(stream, key, paths, freedom, response.as_deref());
+        }
+        refused_carriers!() => {}
+    }
+}
+
+fn serve_trojan_raw(mut stream: Connection, key: &[[u8; 56]], freedom: bool) {
+    // Bound only the opening request read to a wall-clock budget, then restore the blocking relay reads behind it.
+    let budget = budgets::handshake();
+    let _ = stream.set_read_timeout(Some(budget));
+    let decoded = {
+        let mut bounded = HandshakeDeadline {
+            inner: &mut stream,
+            until: Instant::now() + budget,
+        };
+        decode_trojan_request(&mut bounded, key)
+    };
+    let _ = stream.set_read_timeout(None);
+    let Some((cmd, target)) = decoded else {
+        return;
+    };
+    if !freedom {
+        return;
+    }
+    let online = crate::stats::online_flow();
+    crate::accesslog::record_current(&target);
+    if cmd == 3 {
+        return serve_trojan_udp(stream, online);
+    }
+    if cmd != 1 {
+        return;
+    }
+    if target.is_rendezvous() {
+        let Ok(read) = stream.try_clone() else {
+            return;
+        };
+        let Ok(close) = stream.try_clone() else {
+            return;
+        };
+        spawn_singmux_halves(
+            read,
+            stream,
+            Arc::new(move || {
+                let _ = &online;
+                let _ = close.shutdown(Shutdown::Both);
+            }),
+            Vec::new(),
+        );
+        return;
+    }
+    if target.is_mux() {
+        let Ok(read) = stream.try_clone() else {
+            return;
+        };
+        let Ok(close) = stream.try_clone() else {
+            return;
+        };
+        spawn_trojan_mux(
+            read,
+            stream,
+            Arc::new(move || {
+                let _ = &online;
+                let _ = close.shutdown(Shutdown::Both);
+            }),
+            Vec::new(),
+        );
+        return;
+    }
+    let Some(target) = target.socket() else {
+        return;
+    };
+    let Some(uplink) = dial_or_report(&target) else {
+        return;
+    };
+    let stream = stream.with_meter(online);
+    relay_handoff(&stream, &uplink);
+}
+
+fn serve_trojan_udp(stream: Connection, online: crate::stats::Meter) {
+    let Ok(read) = stream.try_clone() else {
+        return;
+    };
+    let Ok(close) = stream.try_clone() else {
+        return;
+    };
+    spawn_carried(move || {
+        serve_trojan_udp_halves(read, stream, move || {
+            let _ = &online;
+            let _ = close.shutdown(Shutdown::Both);
+        });
+    });
+}
+
+fn serve_trojan_udp_halves<R, W>(read: R, write: W, close: impl FnOnce() + Send + 'static)
+where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    if take_handshake_lane() {
+        let sniffing = crate::sniff::current();
+        let flow = crate::accesslog::snapshot();
+        thread::spawn(move || {
+            crate::sniff::install_current(sniffing);
+            let _flow = crate::accesslog::install_snapshot(flow);
+            serve_trojan_udp_halves(read, write, close);
+        });
+        return;
+    }
+    let mut write = write;
+    let Ok(udp4) = UdpSocket::bind("0.0.0.0:0") else {
+        return;
+    };
+    let udp6 = UdpSocket::bind("[::]:0").ok();
+    for sock in [&udp4].into_iter().chain(udp6.as_ref()) {
+        if sock.set_nonblocking(true).is_err() {
+            return;
+        }
+    }
+    let Ok(udp4_send) = udp4.try_clone() else {
+        return;
+    };
+    let udp6_send = match &udp6 {
+        Some(sock) => {
+            let Ok(sender) = sock.try_clone() else {
+                return;
+            };
+            Some(sender)
+        }
+        None => None,
+    };
+    let done = Arc::new(AtomicBool::new(false));
+    let done_in = Arc::clone(&done);
+    let forward = move || {
+        let mut read = read;
+        let mut buf = udp_buffer();
+        while let Some((dest, n)) = read_trojan_datagram(&mut read, &mut buf) {
+            let sent = if dest.is_ipv6() {
+                match &udp6_send {
+                    Some(sock) => send_udp(sock, &buf[..n], dest),
+                    None => true,
+                }
+            } else {
+                send_udp(&udp4_send, &buf[..n], dest)
+            };
+            if !sent {
+                break;
+            }
+        }
+        done_in.store(true, Ordering::Relaxed);
+    };
+    let replied = RelayPool::global().run(forward);
+    let mut buf = udp_buffer();
+    let mut trojan_head = Vec::with_capacity(32);
+    loop {
+        if done.load(Ordering::Relaxed) {
+            break;
+        }
+        let mut idle = true;
+        if let Some(live) = pump_trojan_replies(&udp4, &mut write, &mut buf, &mut trojan_head) {
+            idle = false;
+            if !live {
+                break;
+            }
+        }
+        if let Some(sock) = &udp6 {
+            if let Some(live) = pump_trojan_replies(sock, &mut write, &mut buf, &mut trojan_head) {
+                idle = false;
+                if !live {
+                    break;
+                }
+            }
+        }
+        if idle {
+            thread::sleep(RELAY_POLL);
+        }
+    }
+    done.store(true, Ordering::Relaxed);
+    close();
+    join(&replied);
+}
+
+fn send_udp(sock: &UdpSocket, buf: &[u8], dest: SocketAddr) -> bool {
+    for _ in 0..100 {
+        match sock.send_to(buf, dest) {
+            Ok(_) => return true,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(RELAY_POLL);
+            }
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+fn pump_trojan_replies(
+    udp: &UdpSocket,
+    stream: &mut dyn Write,
+    buf: &mut [u8],
+    head: &mut Vec<u8>,
+) -> Option<bool> {
+    match udp.recv_from(buf) {
+        Ok((n, src)) => {
+            if n == 0 {
+                return Some(true);
+            }
+            Some(write_trojan_datagram(stream, &src, &buf[..n], head))
+        }
+        Err(error)
+            if is_timeout(&error)
+                || error.kind() == std::io::ErrorKind::WouldBlock
+                || is_udp_gone(&error) =>
+        {
+            None
+        }
+        Err(_) => Some(false),
+    }
+}
+
+fn serve_trojan_ws(stream: Connection, key: &[[u8; 56]], path: &str, freedom: bool) {
+    let Some((mut reader, writer)) = crate::ws::accept(stream, path) else {
+        return;
+    };
+    let Some((cmd, target)) = decode_trojan_request(&mut reader, key) else {
+        return;
+    };
+    if !freedom {
+        return;
+    }
+    crate::accesslog::record_current(&target);
+    if cmd == 3 {
+        let closer = writer.clone();
+        spawn_trojan_udp(reader, writer, move || closer.close());
+        return;
+    }
+    if cmd != 1 {
+        return;
+    }
+    if target.is_rendezvous() {
+        let closer = writer.clone();
+        spawn_singmux_halves(reader, writer, Arc::new(move || closer.close()), Vec::new());
+        return;
+    }
+    if target.is_mux() {
+        let closer = writer.clone();
+        spawn_trojan_mux(reader, writer, Arc::new(move || closer.close()), Vec::new());
+        return;
+    }
+    let Some(target) = target.socket() else {
+        return;
+    };
+    let Some(uplink) = dial_or_report(&target) else {
+        return;
+    };
+    reader.set_poll(Some(RELAY_POLL));
+    crate::proxy::relay_sink_ws(reader, &writer, &uplink);
+}
+
+fn serve_trojan_httpupgrade(
+    stream: Connection,
+    key: &[[u8; 56]],
+    path: &str,
+    host: &str,
+    freedom: bool,
+) {
+    let Some((mut reader, write)) = crate::httpupgrade::accept(stream, path, host) else {
+        return;
+    };
+    let Some((cmd, target)) = decode_trojan_request(&mut reader, key) else {
+        return;
+    };
+    if !freedom {
+        return;
+    }
+    crate::accesslog::record_current(&target);
+    if cmd == 3 {
+        let close = write.try_clone().ok();
+        spawn_trojan_udp(reader, write, move || {
+            if let Some(stream) = close {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        });
+        return;
+    }
+    if cmd != 1 {
+        return;
+    }
+    if target.is_rendezvous() {
+        let close = write.try_clone().ok();
+        spawn_singmux_halves(
+            reader,
+            write,
+            Arc::new(move || {
+                if let Some(stream) = close.as_ref() {
+                    let _ = stream.shutdown(Shutdown::Both);
+                }
+            }),
+            Vec::new(),
+        );
+        return;
+    }
+    if target.is_mux() {
+        let close = write.try_clone().ok();
+        spawn_trojan_mux(
+            reader,
+            write,
+            Arc::new(move || {
+                if let Some(stream) = close.as_ref() {
+                    let _ = stream.shutdown(Shutdown::Both);
+                }
+            }),
+            Vec::new(),
+        );
+        return;
+    }
+    let Some(target) = target.socket() else {
+        return;
+    };
+    let Some(uplink) = dial_or_report(&target) else {
+        return;
+    };
+    reader.set_poll(Some(RELAY_POLL));
+    crate::proxy::relay_carried(reader, &write, &uplink);
+}
+
+fn serve_trojan_grpc(
+    stream: Connection,
+    key: &[[u8; 56]],
+    settings: &crate::config::GrpcSettings,
+    freedom: bool,
+) {
+    let Ok(write) = stream.try_clone() else {
+        return;
+    };
+    let _ = stream.set_read_timeout(Some(RELAY_POLL));
+    crate::grpc::serve_muxed_trojan_conn(
+        stream,
+        crate::grpc::Tail::new(Box::new(write)),
+        settings,
+        key,
+        freedom,
+    );
+}
+
+/// The trojan handler for one stream of a multiplexed gRPC connection: the demux has already
+/// answered the HTTP/2 head, so only the trojan header and the relay remain.
+pub(crate) fn serve_trojan_grpc_muxed(
+    mut reader: crate::grpc::GrpcReader<crate::grpc::BodyFrames>,
+    writer: crate::grpc::GrpcWriter,
+    key: &[[u8; 56]],
+    freedom: bool,
+    opened: &std::sync::atomic::AtomicBool,
+) {
+    reader.arm_mux_poll();
+    let Some((cmd, target)) = under_handshake(&mut reader, |read| decode_trojan_request(read, key))
+    else {
+        reader.abort();
+        return;
+    };
+    opened.store(true, std::sync::atomic::Ordering::Relaxed);
+    if !freedom {
+        reader.abort();
+        return;
+    }
+    crate::accesslog::record_current(&target);
+    if cmd == 3 {
+        let closer = writer.clone();
+        spawn_trojan_udp(reader, writer, move || closer.close());
+        return;
+    }
+    if cmd != 1 {
+        reader.abort();
+        return;
+    }
+    if target.is_rendezvous() {
+        let closer = writer.clone();
+        spawn_singmux_halves(reader, writer, Arc::new(move || closer.close()), Vec::new());
+        return;
+    }
+    if target.is_mux() {
+        let closer = writer.clone();
+        spawn_trojan_mux(reader, writer, Arc::new(move || closer.close()), Vec::new());
+        return;
+    }
+    let Some(target) = target.socket() else {
+        reader.abort();
+        return;
+    };
+    let Some(uplink) = dial_or_report(&target) else {
+        reader.abort();
+        return;
+    };
+    let reset = reader.reset_handle();
+    if relay_sink_drained_queued(
+        reader,
+        &writer,
+        &uplink,
+        crate::grpc::mark_reader_dead,
+        |reader| crate::grpc::request_ended(reader),
+    )
+    .is_none()
+    {
+        reset();
+    }
+}
+
+#[cfg(test)]
+fn serve_trojan_httpheader(stream: Connection, key: &[[u8; 56]], path: &str, freedom: bool) {
+    serve_trojan_httpheader_with(stream, key, &[path.to_owned()], freedom, None);
+}
+
+fn serve_trojan_httpheader_with(
+    stream: Connection,
+    key: &[[u8; 56]],
+    paths: &[String],
+    freedom: bool,
+    response: Option<&[u8]>,
+) {
+    let Some((mut reader, write)) = crate::httpheader::accept(stream, paths, response) else {
+        return;
+    };
+    let Some((cmd, target)) = decode_trojan_request(&mut reader, key) else {
+        return;
+    };
+    if !freedom {
+        return;
+    }
+    crate::accesslog::record_current(&target);
+    if cmd == 3 {
+        let close = write.try_clone().ok();
+        spawn_trojan_udp(reader, write, move || {
+            if let Some(stream) = close {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        });
+        return;
+    }
+    if cmd != 1 {
+        return;
+    }
+    if target.is_rendezvous() {
+        let close = write.try_clone().ok();
+        spawn_singmux_halves(
+            reader,
+            write,
+            Arc::new(move || {
+                if let Some(stream) = close.as_ref() {
+                    let _ = stream.shutdown(Shutdown::Both);
+                }
+            }),
+            Vec::new(),
+        );
+        return;
+    }
+    if target.is_mux() {
+        let close = write.try_clone().ok();
+        spawn_trojan_mux(
+            reader,
+            write,
+            Arc::new(move || {
+                if let Some(stream) = close.as_ref() {
+                    let _ = stream.shutdown(Shutdown::Both);
+                }
+            }),
+            Vec::new(),
+        );
+        return;
+    }
+    let Some(target) = target.socket() else {
+        return;
+    };
+    let Some(uplink) = dial_or_report(&target) else {
+        return;
+    };
+    reader.set_poll(Some(RELAY_POLL));
+    crate::proxy::relay_carried(reader, &write, &uplink);
+}
+
+/// The session a trojan listener that declares `security: tls` answers: the raw carrier reads its request off the records, and every other carrier parses the stream the session already is.
+fn serve_trojan_tls(
+    stream: Connection,
+    key: &[[u8; 56]],
+    carrier: &Carrier,
+    freedom: bool,
+    server: &ferrox_core::tls::TlsServerConfig,
+    fallbacks: Option<&[Fallback]>,
+) {
+    match carrier {
+        Carrier::Raw(_) => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Some(tls) = accept_tls_session(stream, server) else {
+                return;
+            };
+            let front = FrontNames::of(&tls);
+            relay_trojan_with_fallbacks(
+                tls,
+                Some(raw),
+                None,
+                key,
+                &[],
+                freedom,
+                fallbacks,
+                crate::stats::Meter::default(),
+                &front,
+                &[],
+            );
+        }
+        Carrier::Ws { path, .. } => {
+            let Ok(out) = stream.try_clone() else { return };
+            let Some(session) = accept_tls_session(stream, server) else {
+                return;
+            };
+            let (reader, writer) = session_halves(session, out);
+            serve_session_trojan_ws(reader, writer, path, key, freedom);
+        }
+        Carrier::Xhttp { settings, .. } => {
+            let Ok(out) = stream.try_clone() else { return };
+            let Some(session) = accept_tls_session(stream, server) else {
+                return;
+            };
+            let (reader, writer) = session_halves(session, out);
+            serve_trojan_xhttp_carrier(reader, writer, settings, key, freedom, |_, _| true);
+        }
+        Carrier::HttpUpgrade { path, host, .. } => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Ok(out) = stream.try_clone() else { return };
+            let Some(session) = accept_tls_session(stream, server) else {
+                return;
+            };
+            let (reader, writer) = session_halves(session, out);
+            serve_session_trojan_httpupgrade(reader, writer, raw, path, host, key, freedom);
+        }
+        Carrier::HttpHeader {
+            paths, response, ..
+        } => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Ok(out) = stream.try_clone() else { return };
+            let Some(session) = accept_tls_session(stream, server) else {
+                return;
+            };
+            let (reader, writer) = session_halves(session, out);
+            serve_session_trojan_httpheader(
+                reader,
+                writer,
+                raw,
+                paths,
+                key,
+                freedom,
+                response.as_deref(),
+            );
+        }
+        Carrier::Grpc(settings) => {
+            let Ok(out) = stream.try_clone() else { return };
+            let Some(session) = accept_tls_session(stream, server) else {
+                return;
+            };
+            let (reader, writer) = session_halves(session, out);
+            serve_session_trojan_grpc(reader, writer, settings, key, freedom);
+        }
+        refused_carriers!() => {}
+    }
+}
+
+fn serve_trojan_reality(
+    stream: Connection,
+    key: &[[u8; 56]],
+    carrier: &Carrier,
+    freedom: bool,
+    server: &ferrox_core::tls::RealityServerConfig,
+    fallbacks: Option<&[Fallback]>,
+) {
+    if stream.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        return;
+    }
+    match carrier {
+        Carrier::Raw(_) => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let edges = reality_edges(server, &stream);
+            let accepted =
+                ferrox_core::tls::RealityServer::accept(server, unix_millis(), stream, edges);
+            answer_trojan_reality(accepted, Some(raw), key, freedom, server, fallbacks);
+        }
+        Carrier::Ws { path, .. } => {
+            let Ok(out) = stream.try_clone() else { return };
+            serve_carrier_reality(stream, server, |mut session| {
+                if !shake_tls(&mut session) {
+                    return;
+                }
+                let (reader, writer) = session_halves(session, out);
+                serve_session_trojan_ws(reader, writer, path, key, freedom);
+            });
+        }
+        Carrier::Xhttp { settings, .. } => {
+            let Ok(out) = stream.try_clone() else { return };
+            serve_carrier_reality(stream, server, |mut session| {
+                if !shake_tls(&mut session) {
+                    return;
+                }
+                let (reader, writer) = session_halves(session, out);
+                serve_trojan_xhttp_carrier(reader, writer, settings, key, freedom, |_, _| true);
+            });
+        }
+        Carrier::HttpUpgrade { path, host, .. } => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Ok(out) = stream.try_clone() else { return };
+            serve_carrier_reality(stream, server, |mut session| {
+                if !shake_tls(&mut session) {
+                    return;
+                }
+                let (reader, writer) = session_halves(session, out);
+                serve_session_trojan_httpupgrade(reader, writer, raw, path, host, key, freedom);
+            });
+        }
+        Carrier::HttpHeader {
+            paths, response, ..
+        } => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Ok(out) = stream.try_clone() else { return };
+            serve_carrier_reality(stream, server, |mut session| {
+                if !shake_tls(&mut session) {
+                    return;
+                }
+                let (reader, writer) = session_halves(session, out);
+                serve_session_trojan_httpheader(
+                    reader,
+                    writer,
+                    raw,
+                    paths,
+                    key,
+                    freedom,
+                    response.as_deref(),
+                );
+            });
+        }
+        Carrier::Grpc(settings) => {
+            let Ok(out) = stream.try_clone() else { return };
+            serve_carrier_reality(stream, server, |mut session| {
+                if !shake_tls(&mut session) {
+                    return;
+                }
+                let (reader, writer) = session_halves(session, out);
+                serve_session_trojan_grpc(reader, writer, settings, key, freedom);
+            });
+        }
+        refused_carriers!() => {}
+    }
+}
+
+fn answer_trojan_reality(
+    accepted: Result<ferrox_core::tls::RealityAccept<Connection>, ferrox_core::tls::TlsError>,
+    raw: Option<Connection>,
+    key: &[[u8; 56]],
+    freedom: bool,
+    server: &ferrox_core::tls::RealityServerConfig,
+    fallbacks: Option<&[Fallback]>,
+) {
+    let accepted = match accepted {
+        Ok(accepted) => accepted,
+        Err(why) => {
+            if server.show {
+                eprintln!("REALITY: {why}");
+            }
+            return;
+        }
+    };
+    match accepted {
+        ferrox_core::tls::RealityAccept::Session(session) => {
+            finish_trojan_reality(
+                session,
+                raw,
+                None,
+                key,
+                &[],
+                freedom,
+                fallbacks,
+                crate::stats::Meter::default(),
+            );
+        }
+        ferrox_core::tls::RealityAccept::Proxied(proxied) => relay_fallback(proxied),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_trojan_reality<S>(
+    mut session: S,
+    raw: Option<Connection>,
+    kcp: Option<Arc<ferrox_core::kcp::Connection>>,
+    key: &[[u8; 56]],
+    accounts: &[InboundAccount],
+    freedom: bool,
+    fallbacks: Option<&[Fallback]>,
+    meter: crate::stats::Meter,
+) where
+    S: std::io::Read
+        + std::io::Write
+        + Send
+        + ferrox_core::tls::RecordAlignment
+        + ferrox_core::tls::TlsProvider
+        + Drivable
+        + CipherOpen
+        + 'static,
+{
+    if !shake_tls(&mut session) {
+        return;
+    }
+    let front = FrontNames::of(&session);
+    relay_trojan_with_fallbacks(
+        session,
+        raw,
+        kcp,
+        key,
+        accounts,
+        freedom,
+        fallbacks,
+        meter,
+        &front,
+        &[],
+    );
+}
+
+/// The served trojan session: the request is read under the handshake clock, then the relay drives the session's transport, so a read parked in the socket holds no lock its writer asks for.
+#[allow(clippy::too_many_arguments)]
+fn relay_trojan<S>(
+    mut session: S,
+    raw: Option<Connection>,
+    kcp: Option<Arc<ferrox_core::kcp::Connection>>,
+    key: &[[u8; 56]],
+    accounts: &[InboundAccount],
+    freedom: bool,
+    meter: crate::stats::Meter,
+    first: &[u8],
+) where
+    S: std::io::Read
+        + std::io::Write
+        + Send
+        + ferrox_core::tls::RecordAlignment
+        + ferrox_core::tls::TlsProvider
+        + Drivable
+        + CipherOpen
+        + 'static,
+{
+    if first.is_empty() {
+        let bounded = {
+            let mut deadline = HandshakeDeadline {
+                inner: &mut session,
+                until: Instant::now() + budgets::handshake(),
+            };
+            decode_trojan_request_index(&mut deadline, key)
+        };
+        let Some((cmd, target, index)) = bounded else {
+            return;
+        };
+        let user = trojan_user(accounts, index);
+        return relay_trojan_request(
+            session,
+            raw,
+            kcp,
+            (cmd, target),
+            freedom,
+            &[],
+            meter,
+            Some(user),
+        );
+    }
+    let mut read_ahead = Vec::new();
+    let (bounded, consumed) = {
+        let mut deadline = HandshakeDeadline {
+            inner: &mut session,
+            until: Instant::now() + budgets::handshake(),
+        };
+        let mut replay = Prefixed {
+            head: first,
+            at: 0,
+            tail: &mut deadline,
+            carried: &mut read_ahead,
+        };
+        let header = decode_trojan_request_index(&mut replay, key);
+        (header, replay.at)
+    };
+    let Some((cmd, target, index)) = bounded else {
+        return;
+    };
+    let user = trojan_user(accounts, index);
+    relay_trojan_request(
+        session,
+        raw,
+        kcp,
+        (cmd, target),
+        freedom,
+        &first[consumed..],
+        meter,
+        Some(user),
+    );
+}
+
+fn trojan_user(accounts: &[InboundAccount], index: usize) -> crate::stats::Meter {
+    let account = accounts.get(index).cloned().unwrap_or_default();
+    crate::accesslog::reidentify(&account.email, account.level);
+    crate::stats::user(&account.email, account.level)
+}
+
+/// A trojan front with fallbacks: the first read names the inbound or routes to the cover site.
+#[allow(clippy::too_many_arguments)]
+fn relay_trojan_with_fallbacks<S>(
+    mut session: S,
+    raw: Option<Connection>,
+    kcp: Option<Arc<ferrox_core::kcp::Connection>>,
+    key: &[[u8; 56]],
+    accounts: &[InboundAccount],
+    freedom: bool,
+    fallbacks: Option<&[Fallback]>,
+    meter: crate::stats::Meter,
+    front: &FrontNames,
+    first: &[u8],
+) where
+    S: std::io::Read
+        + std::io::Write
+        + Send
+        + ferrox_core::tls::RecordAlignment
+        + ferrox_core::tls::TlsProvider
+        + Drivable
+        + CipherOpen
+        + 'static,
+{
+    let Some(rows) = fallbacks else {
+        return relay_trojan(session, raw, kcp, key, accounts, freedom, meter, first);
+    };
+    let mut window = [0u8; PROBE_READ];
+    let mut n = first.len().min(PROBE_READ);
+    window[..n].copy_from_slice(&first[..n]);
+    {
+        let mut deadline = HandshakeDeadline {
+            inner: &mut session,
+            until: Instant::now() + budgets::handshake(),
+        };
+        while n < 58 {
+            if window[..n].iter().any(|byte| !byte.is_ascii_hexdigit()) {
+                break;
+            }
+            if n >= 56 && !key.iter().any(|key| key_agrees(&window[..56], key)) {
+                break;
+            }
+            if n >= 57 && window[56] != b'\r' {
+                break;
+            }
+            match deadline.read(&mut window[n..]) {
+                Ok(0) | Err(_) => break,
+                Ok(got) => n += got,
+            }
+        }
+    }
+    if n < 58 || window[56] != b'\r' || !key.iter().any(|key| key_agrees(&window[..56], key)) {
+        let Some(raw) = raw.as_ref() else {
+            return;
+        };
+        return seize_fallback_tls(session, raw, rows, &window[..n], &[], front);
+    }
+    let mut read_ahead = Vec::new();
+    let (header, consumed) = {
+        let mut deadline = HandshakeDeadline {
+            inner: &mut session,
+            until: Instant::now() + budgets::handshake(),
+        };
+        let mut replay = Prefixed {
+            head: &window[..n],
+            at: 0,
+            tail: &mut deadline,
+            carried: &mut read_ahead,
+        };
+        let header = decode_trojan_request_index(&mut replay, key);
+        (header, replay.at)
+    };
+    let Some((cmd, target, index)) = header else {
+        return;
+    };
+    let user = trojan_user(accounts, index);
+    relay_trojan_request(
+        session,
+        raw,
+        kcp,
+        (cmd, target),
+        freedom,
+        &window[consumed..n],
+        meter,
+        Some(user),
+    );
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn relay_trojan_request<S>(
+    session: S,
+    raw: Option<Connection>,
+    kcp: Option<Arc<ferrox_core::kcp::Connection>>,
+    (cmd, target): (u8, TrojanTarget),
+    freedom: bool,
+    carried: &[u8],
+    meter: crate::stats::Meter,
+    user: Option<crate::stats::Meter>,
+) where
+    S: std::io::Read
+        + std::io::Write
+        + Send
+        + ferrox_core::tls::RecordAlignment
+        + ferrox_core::tls::TlsProvider
+        + Drivable
+        + CipherOpen
+        + 'static,
+{
+    if !freedom {
+        return;
+    }
+    let user = user.unwrap_or_default();
+    let meter = meter.merged(user.clone());
+    let meter = if meter.has_online() {
+        meter
+    } else {
+        meter.merged(crate::stats::online_flow())
+    };
+    crate::accesslog::record_current(&target);
+    if target.is_rendezvous() {
+        let close: Arc<dyn Fn() + Send + Sync> = match &kcp {
+            Some(kcp) => {
+                let kcp = Arc::clone(kcp);
+                Arc::new(move || kcp.close())
+            }
+            None => raw
+                .as_ref()
+                .map_or_else(|| Arc::new(|| {}), connection_closer),
+        };
+        let carried = carried.to_vec();
+        if let Some(raw) = raw {
+            let (reader, writer) = session_halves(session, raw);
+            let close = hold_meter(close, meter);
+            spawn_carried(move || serve_singmux_tunnel(reader, writer, close, &carried));
+            return;
+        }
+        if let Some(kcp) = kcp {
+            let (reader, writer) =
+                session_halves(session, KcpIo::with_meter(Arc::clone(&kcp), meter));
+            spawn_carried(move || serve_singmux_tunnel(reader, writer, close, &carried));
+        }
+        return;
+    }
+    if target.is_mux() {
+        let close: Arc<dyn Fn() + Send + Sync> = match &kcp {
+            Some(kcp) => {
+                let kcp = Arc::clone(kcp);
+                Arc::new(move || kcp.close())
+            }
+            None => raw
+                .as_ref()
+                .map_or_else(|| Arc::new(|| {}), connection_closer),
+        };
+        if let Some(raw) = raw {
+            let (reader, writer) = session_halves(session, raw);
+            spawn_trojan_mux(reader, writer, hold_meter(close, meter), carried.to_vec());
+            return;
+        }
+        if let Some(kcp) = kcp {
+            let (reader, writer) =
+                session_halves(session, KcpIo::with_meter(Arc::clone(&kcp), meter));
+            spawn_trojan_mux(reader, writer, close, carried.to_vec());
+            return;
+        }
+        return;
+    }
+    let Some(target) = target.socket() else {
+        return;
+    };
+    if cmd == 3 {
+        if let Some(raw) = raw {
+            let Ok(close) = raw.try_clone() else {
+                return;
+            };
+            // A driven reader hands over one record's plaintext and withholds the rest until the next lands, and a datagram is read a field at a time: the pump reads through the shared session.
+            let (_driven, half) = session_halves(session, raw);
+            let close = Arc::new(move || {
+                let _ = close.shutdown(Shutdown::Both);
+            });
+            let close = hold_meter(close, meter);
+            spawn_trojan_udp(
+                CarriedReader::new(carried.to_vec(), half.clone()),
+                half,
+                move || close(),
+            );
+            return;
+        }
+        if let Some(kcp) = kcp {
+            let (reader, writer) =
+                session_halves(session, KcpIo::with_meter(Arc::clone(&kcp), meter));
+            spawn_trojan_udp(
+                CarriedReader::new(carried.to_vec(), reader),
+                writer,
+                move || kcp.close(),
+            );
+        }
+        return;
+    }
+    if cmd != 1 {
+        return;
+    }
+    let Some(mut uplink) = dial_or_report(&target) else {
+        return;
+    };
+    if !user.is_empty() {
+        uplink = uplink.with_meter(user.reversed());
+    }
+    if uplink.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        return;
+    }
+    if !carried.is_empty() && uplink.write_all(carried).is_err() {
+        return;
+    }
+    let close: Arc<dyn Fn() + Send + Sync> = match &kcp {
+        Some(kcp) => {
+            let kcp = Arc::clone(kcp);
+            let socket = uplink.try_clone().ok();
+            Arc::new(move || {
+                kcp.close();
+                if let Some(socket) = &socket {
+                    let _ = socket.shutdown(Shutdown::Both);
+                }
+            })
+        }
+        None => shutdown_pair(
+            uplink.try_clone().ok(),
+            raw.as_ref().and_then(|raw| raw.try_clone().ok()),
+        ),
+    };
+    let close = hold_meter(close, meter);
+    match driven_halves(session, RELAY_POLL) {
+        Ok(half) => relay_shared(half, Half::socket(uplink), &close),
+        Err(session) => relay_shared(
+            Half::shared_armed(session, move |_, grain| match &raw {
+                Some(raw) => raw.set_read_timeout(Some(grain)),
+                None => Ok(()),
+            }),
+            Half::socket(uplink),
+            &close,
+        ),
+    }
+}
+
+fn hold_meter(
+    close: Arc<dyn Fn() + Send + Sync>,
+    meter: crate::stats::Meter,
+) -> Arc<dyn Fn() + Send + Sync> {
+    Arc::new(move || {
+        let _ = &meter;
+        close();
+    })
+}
+
+fn serve_session_trojan_ws<R: Read + Send + 'static, W: FrameWrite + 'static>(
+    read: R,
+    write: W,
+    path: &str,
+    key: &[[u8; 56]],
+    freedom: bool,
+) {
+    let Some((mut creader, cwriter)) = crate::ws::accept_split(read, write, path) else {
+        echo_trace("session ws trojan accept refused");
+        return;
+    };
+    creader.set_handshake_budget(Some(Instant::now() + budgets::handshake()));
+    let decoded = decode_trojan_request(&mut creader, key);
+    creader.set_handshake_budget(None);
+    let Some((cmd, target)) = decoded else {
+        echo_trace("session ws trojan decode refused");
+        return;
+    };
+    crate::accesslog::record_current(&target);
+    if !freedom {
+        echo_trace("session ws trojan cmd refused");
+        return;
+    }
+    if cmd == 3 {
+        let closer = cwriter.clone();
+        spawn_trojan_udp(creader, cwriter, move || closer.close());
+        return;
+    }
+    if cmd != 1 {
+        echo_trace("session ws trojan cmd refused");
+        return;
+    }
+    if target.is_rendezvous() {
+        let closer = cwriter.clone();
+        spawn_singmux_halves(
+            creader,
+            cwriter,
+            Arc::new(move || closer.close()),
+            Vec::new(),
+        );
+        return;
+    }
+    if target.is_mux() {
+        let closer = cwriter.clone();
+        spawn_trojan_mux(
+            creader,
+            cwriter,
+            Arc::new(move || closer.close()),
+            Vec::new(),
+        );
+        return;
+    }
+    let Some(target) = target.socket() else {
+        return;
+    };
+    let Some(uplink) = dial_or_report(&target) else {
+        echo_trace("session ws uplink refused");
+        return;
+    };
+    echo_trace("session ws relaying");
+    relay_sink_ws(creader, &cwriter, &uplink);
+}
+
+fn serve_session_trojan_xhttp<
+    R: Read + Send + 'static + RelayPoll,
+    W: FrameWrite + Send + 'static,
+>(
+    read: R,
+    write: W,
+    settings: &crate::xhttp::XhttpSettings,
+    key: &[[u8; 56]],
+    freedom: bool,
+) {
+    let Some((creader, cwriter)) =
+        crate::xhttp::accept_split_with_settings(read, write, settings, None)
+    else {
+        echo_trace("session xhttp trojan accept refused");
+        return;
+    };
+    // A packet-up GET waits on its reader for a POST queued behind this lane; the wait belongs to the flow.
+    let key: Vec<[u8; 56]> = key.to_vec();
+    spawn_carried(move || serve_trojan_xhttp_accepted(creader, cwriter, &key, freedom));
+}
+
+/// A TLS xHTTP carrier for trojan: a peer that negotiated h2 gets the demux, an H1 peer the
+/// session every TLS xhttp client has always reached.
+fn serve_trojan_xhttp_carrier<
+    R: Read + Send + 'static + RelayPoll,
+    W: FrameWrite + Send + 'static,
+    A: FnMut(&R, Option<Duration>) -> bool + Send + 'static,
+>(
+    read: R,
+    write: W,
+    settings: &crate::xhttp::XhttpSettings,
+    key: &[[u8; 56]],
+    freedom: bool,
+    arm: A,
+) {
+    let settings = settings.clone();
+    let key = key.to_vec();
+    let sniffing = crate::sniff::current();
+    let mut access = Some(crate::accesslog::snapshot());
+    let mut arm = Some(arm);
+    let mut read = Some(read);
+    let mut write = Some(write);
+    lane_pool::submit_setup(
+        Box::new(move || {
+            crate::sniff::install_current(sniffing.clone());
+            let access = access.take().expect("one xhttp preface");
+            let _flow = crate::accesslog::install_snapshot(access);
+            let read = read.take().expect("one xhttp preface");
+            let write = write.take().expect("one xhttp preface");
+            let arm = arm.take().expect("one xhttp preface");
+            serve_trojan_xhttp_carrier_now(read, write, &settings, &key, freedom, arm);
+            Next::Done
+        }),
+        Box::new(|| {}),
+    );
+}
+
+fn serve_trojan_xhttp_carrier_now<
+    R: Read + Send + 'static + RelayPoll,
+    W: FrameWrite + Send + 'static,
+    A: FnMut(&R, Option<Duration>) -> bool,
+>(
+    read: R,
+    write: W,
+    settings: &crate::xhttp::XhttpSettings,
+    key: &[[u8; 56]],
+    freedom: bool,
+    arm: A,
+) {
+    let Some((chained, h2)) = sniff_xhttp(read, false, arm) else {
+        return;
+    };
+    if !h2 {
+        return serve_session_trojan_xhttp(chained, write, settings, key, freedom);
+    }
+    #[cfg(test)]
+    if let Ok(mut paths) = H2_DIAL_WITNESS.lock() {
+        paths.push(settings.path.clone());
+    }
+    // The demux parks on the socket between frames, so eight connections add lanes, not threads.
+    let keys: Vec<[u8; 56]> = key.to_vec();
+    let service = crate::xhttp_h2::XhttpSessionService::new(
+        settings.clone(),
+        Arc::new(move |reader, writer, _decryption| {
+            serve_trojan_xhttp_accepted(reader, writer, &keys, freedom);
+        }),
+    );
+    let until = Instant::now() + crate::budgets::handshake();
+    let opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut step = crate::xhttp_h2::h2_lane(chained, write, service, None, Some((until, opened)));
+    let sniffing = crate::sniff::current();
+    let access = crate::accesslog::snapshot();
+    lane_pool::submit_demux(
+        Box::new(move || {
+            crate::sniff::install_current(sniffing.clone());
+            let _flow = crate::accesslog::install_snapshot(access.clone());
+            step()
+        }),
+        Box::new(|| {}),
+    );
+}
+
+fn serve_trojan_xhttp_accepted(
+    creader: Box<dyn crate::proxy::WindowRead + Send>,
+    cwriter: crate::xhttp::XhttpWriter,
+    key: &[[u8; 56]],
+    freedom: bool,
+) {
+    // Every refusal ends the carrier's stream: a session that answers nothing leaves its reader parked on a reply that will never come.
+    let mut bounded = crate::proxy::HandshakeRead::new(creader, crate::budgets::handshake());
+    let decoded = decode_trojan_request(&mut bounded, key);
+    bounded.disarm();
+    let creader = bounded.into_inner();
+    let Some((cmd, target)) = decoded else {
+        echo_trace("session xhttp trojan decode refused");
+        cwriter.abort();
+        return;
+    };
+    crate::accesslog::record_current(&target);
+    if !freedom {
+        echo_trace("session xhttp trojan cmd refused");
+        cwriter.finish();
+        return;
+    }
+    if cmd == 3 {
+        let closer = cwriter.clone();
+        spawn_trojan_udp(creader, cwriter, move || closer.finish());
+        return;
+    }
+    if cmd != 1 {
+        echo_trace("session xhttp trojan cmd refused");
+        cwriter.finish();
+        return;
+    }
+    if target.is_rendezvous() {
+        let closer = cwriter.clone();
+        spawn_singmux_halves(
+            creader,
+            cwriter,
+            Arc::new(move || closer.finish()),
+            Vec::new(),
+        );
+        return;
+    }
+    if target.is_mux() {
+        let closer = cwriter.clone();
+        spawn_trojan_mux(
+            creader,
+            cwriter,
+            Arc::new(move || closer.finish()),
+            Vec::new(),
+        );
+        return;
+    }
+    let Some(target) = target.socket() else {
+        cwriter.finish();
+        return;
+    };
+    let Some(uplink) = dial_or_report(&target) else {
+        echo_trace("session xhttp uplink refused");
+        cwriter.finish();
+        return;
+    };
+    echo_trace("session xhttp relaying");
+    relay_sink_xhttp_drained(creader, &cwriter, &uplink);
+}
+
+fn serve_session_trojan_httpupgrade<R: Read + Send + 'static, W: Write + Clone + Send + 'static>(
+    read: R,
+    write: W,
+    raw: Connection,
+    path: &str,
+    host: &str,
+    key: &[[u8; 56]],
+    freedom: bool,
+) {
+    let raw = Arc::new(raw);
+    let Some((mut creader, cwriter)) = crate::httpupgrade::accept_split(read, write, path, host)
+    else {
+        echo_trace("session httpupgrade trojan accept refused");
+        crate::httpupgrade::quiet(&raw);
+        return;
+    };
+    let bounded = {
+        let mut deadline = HandshakeDeadline {
+            inner: &mut creader,
+            until: Instant::now() + budgets::handshake(),
+        };
+        decode_trojan_request(&mut deadline, key)
+    };
+    let Some((cmd, target)) = bounded else {
+        echo_trace("session httpupgrade trojan decode refused");
+        crate::httpupgrade::quiet(&raw);
+        return;
+    };
+    crate::accesslog::record_current(&target);
+    if !freedom {
+        echo_trace("session httpupgrade trojan cmd refused");
+        crate::httpupgrade::quiet(&raw);
+        return;
+    }
+    if cmd == 3 {
+        let raw = Arc::clone(&raw);
+        spawn_trojan_udp(creader, cwriter, move || {
+            let _ = raw.shutdown(Shutdown::Both);
+        });
+        return;
+    }
+    if cmd != 1 {
+        echo_trace("session httpupgrade trojan cmd refused");
+        crate::httpupgrade::quiet(&raw);
+        return;
+    }
+    if target.is_rendezvous() {
+        let raw = Arc::clone(&raw);
+        spawn_singmux_halves(
+            creader,
+            cwriter,
+            Arc::new(move || {
+                let _ = raw.shutdown(Shutdown::Both);
+            }),
+            Vec::new(),
+        );
+        return;
+    }
+    if target.is_mux() {
+        let raw = Arc::clone(&raw);
+        spawn_trojan_mux(
+            creader,
+            cwriter,
+            Arc::new(move || {
+                let _ = raw.shutdown(Shutdown::Both);
+            }),
+            Vec::new(),
+        );
+        return;
+    }
+    let Some(target) = target.socket() else {
+        crate::httpupgrade::quiet(&raw);
+        return;
+    };
+    let Some(uplink) = dial_or_report(&target) else {
+        echo_trace("session httpupgrade uplink refused");
+        crate::httpupgrade::quiet(&raw);
+        return;
+    };
+    let sink = SessionSink {
+        half: cwriter,
+        raw: Arc::clone(&raw),
+    };
+    echo_trace("session httpupgrade relaying");
+    match relay_sink(creader, &sink, &uplink, |_| {}) {
+        // The relay hands off: the drain-and-close belongs to the flow's end, not this call.
+        Some(flow) => flow.then(move || crate::httpupgrade::quiet(&raw)),
+        None => crate::httpupgrade::quiet(&raw),
+    }
+}
+
+fn serve_session_trojan_httpheader<R: Read + Send + 'static, W: Write + Clone + Send + 'static>(
+    read: R,
+    write: W,
+    raw: Connection,
+    paths: &[String],
+    key: &[[u8; 56]],
+    freedom: bool,
+    response: Option<&[u8]>,
+) {
+    let Some((mut creader, cwriter)) =
+        crate::httpheader::accept_split(read, write, paths, response)
+    else {
+        echo_trace("session httpheader trojan accept refused");
+        return;
+    };
+    let bounded = {
+        let mut deadline = HandshakeDeadline {
+            inner: &mut creader,
+            until: Instant::now() + budgets::handshake(),
+        };
+        decode_trojan_request(&mut deadline, key)
+    };
+    let Some((cmd, target)) = bounded else {
+        echo_trace("session httpheader trojan decode refused");
+        return;
+    };
+    crate::accesslog::record_current(&target);
+    if !freedom {
+        echo_trace("session httpheader trojan cmd refused");
+        return;
+    }
+    if cmd == 3 {
+        spawn_trojan_udp(creader, cwriter, move || {
+            let _ = raw.shutdown(Shutdown::Both);
+        });
+        return;
+    }
+    if cmd != 1 {
+        echo_trace("session httpheader trojan cmd refused");
+        return;
+    }
+    if target.is_rendezvous() {
+        let raw = Arc::new(raw);
+        spawn_singmux_halves(
+            creader,
+            cwriter,
+            Arc::new(move || {
+                let _ = raw.shutdown(Shutdown::Both);
+            }),
+            Vec::new(),
+        );
+        return;
+    }
+    if target.is_mux() {
+        let raw = Arc::new(raw);
+        spawn_trojan_mux(
+            creader,
+            cwriter,
+            Arc::new(move || {
+                let _ = raw.shutdown(Shutdown::Both);
+            }),
+            Vec::new(),
+        );
+        return;
+    }
+    let Some(target) = target.socket() else {
+        return;
+    };
+    let Some(uplink) = dial_or_report(&target) else {
+        echo_trace("session httpheader uplink refused");
+        return;
+    };
+    let sink = SessionSink {
+        half: cwriter,
+        raw: Arc::new(raw),
+    };
+    echo_trace("session httpheader relaying");
+    relay_sink(creader, &sink, &uplink, |_| {});
+}
+
+fn serve_session_trojan_grpc<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
+    read: R,
+    write: W,
+    settings: &crate::config::GrpcSettings,
+    key: &[[u8; 56]],
+    freedom: bool,
+) {
+    crate::grpc::serve_muxed_trojan(read, write, settings, key, freedom);
+}
+
+fn serve_vmess_kcp_tls(
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    users: &crate::vmess::Users,
+    freedom: bool,
+    server: &ferrox_core::tls::TlsServerConfig,
+    meter: crate::stats::Meter,
+) {
+    let Ok(mut tls) =
+        ferrox_core::tls::accept(server, KcpIo::with_meter(Arc::clone(conn), meter.clone()))
+    else {
+        return;
+    };
+    if !shake_tls(&mut tls) {
+        return;
+    }
+    let (reader, writer) = session_halves(tls, KcpIo::with_meter(Arc::clone(conn), meter));
+    let closer = Arc::clone(conn);
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+    crate::vmess::serve_kcp(reader, writer, users, freedom, &close);
+}
+
+/// The `socks` front is also an HTTP proxy: a first byte that is not SOCKS4/5 goes to the
+/// HTTP front, as the reference hands it to its own HTTP server.
+fn serve_socks(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) {
+    let budget = budgets::handshake();
+    let _ = client.set_read_timeout(Some(budget));
+    let until = Instant::now() + budget;
+    let mut first = [0u8; 1];
+    match client.peek(&mut first) {
+        Ok(0) | Err(_) => {
+            let _ = client.set_read_timeout(None);
+            reject_socks(&client);
+            return;
+        }
+        Ok(_) => {}
+    }
+    if first[0] != 5 && first[0] != ferrox_core::socks::VERSION4 {
+        let _ = client.set_read_timeout(None);
+        serve_http(client, out, accounts);
+        return;
+    }
+    let handshake = socks_request(&mut client, false, until, accounts);
+    let _ = client.set_read_timeout(None);
+    let Some(handshake) = handshake else {
+        reject_socks(&client);
+        return;
+    };
+    serve_socks_connected(client, out, &handshake);
+}
+
+fn reject_socks(client: &Connection) {
+    crate::accesslog::record(
+        client.peer_addr().ok(),
+        false,
+        &"unknown",
+        None,
+        "rejected",
+        "",
+    );
+}
+
+fn serve_socks_connected(mut client: Connection, out: &Outbound, handshake: &Handshake<'_>) {
+    let email = handshake
+        .account
+        .as_ref()
+        .map_or("", |account| account.email.as_str());
+    let user = (!email.is_empty()).then_some(email);
+    let level = handshake.account.as_ref().map(|account| account.level);
+    if let Some(account) = &handshake.account {
+        client = client
+            .with_meter(crate::stats::user(&account.email, account.level))
+            .with_policy(Some(crate::policy::flow(account.level)));
+    }
+    if handshake.cmd == 3 {
+        return serve_socks_udp(client, out, user, level);
+    }
+    // The rules decide the lane first; a blocked flow is granted before it closes, so the front's reply is read.
+    let destination = handshake.asked.authority();
+    crate::accesslog::record(client.peer_addr().ok(), true, &destination, None, "", email);
+    let first = match crate::sniff::current() {
+        Some(sniffing) if sniffing.enabled() => None,
+        _ => Some(out.resolved_lane_with_protocol(
+            &handshake.asked,
+            crate::router::Network::Tcp,
+            Some(&client),
+            FlowFacts {
+                source: None,
+                local: None,
+                user,
+                level,
+                ..FlowFacts::default()
+            },
+        )),
+    };
+    if !matches!(
+        first.as_ref().map_or(out, |(lane, _)| &**lane),
+        Outbound::Foxy(_) | Outbound::Veepn(_)
+    ) {
+        let grant = match handshake.version {
+            crate::socks::Version::V5 => Front::Socks.grant_line(),
+            crate::socks::Version::V4 => ferrox_core::socks::grant4(),
+        };
+        if client.write_all(grant).is_err() {
+            return;
+        }
+    }
+    let (dial, out, tag) = match first {
+        Some((lane, tag)) => (None, lane, tag),
+        None => sniff_lane(out, &handshake.asked, &client, user, level),
+    };
+    let asked = dial.as_ref().unwrap_or(&handshake.asked);
+    serve_connect(
+        client,
+        &out,
+        asked,
+        Front::Socks,
+        &[],
+        tag.as_deref(),
+        FlowFacts {
+            source: None,
+            local: None,
+            user,
+            level,
+            ..FlowFacts::default()
+        },
+    );
+}
+
+/// The device front's relay: the front layer's own dial, with the destination the
+/// device's packet named.
+///
+/// The device does not know what an outbound is, so it asks for the dial every other
+/// front reaches — the same `serve_connect` the socks and http fronts call, with the
+/// same rules and the same grant. A fallback flow carries the lane `device_dial`
+/// already resolved, so a balancer is drawn once per flow instead of twice.
+pub(crate) fn serve_device_flow(
+    client: Connection,
+    carried: Option<&Lane>,
+    out: &Outbound,
+    dest: &Destination,
+) -> std::io::Result<()> {
+    if let Some(lane) = carried {
+        let _settings = lane.enter();
+        return serve_lane(client, dest, &lane.out, lane.tag.as_deref());
+    }
+    let (dial, picked, tag) = sniff_lane(out, dest, &client, None, None);
+    let dest = dial.as_ref().unwrap_or(dest);
+    serve_lane(client, dest, &picked, tag.as_deref())
+}
+
+fn serve_lane(
+    client: Connection,
+    dest: &Destination,
+    lane: &Outbound,
+    tag: Option<&str>,
+) -> std::io::Result<()> {
+    let ((), dial_report) = observe_dial(|| {
+        serve_connect(
+            client,
+            lane,
+            dest,
+            Front::Socks,
+            &[],
+            tag,
+            FlowFacts::default(),
+        );
+    });
+    match dial_report {
+        Some(false) => Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "the proxy leg refused the device flow",
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The device front's direct dial: a lane whose destination is its whole request hands the handler
+/// the connected stream, so the flow owes no loopback pair and no relay thread. Every other lane
+/// reports `Fallback` with the outbound it resolved, and keeps the front's own `serve_connect`.
+pub(crate) fn device_dial(out: &Outbound) -> crate::tun::Dial {
+    let out = out.clone();
+    std::sync::Arc::new(move |dest: &Destination| {
+        let (lane, tag) = out.resolved_lane_with_protocol(
+            dest,
+            crate::router::Network::Tcp,
+            None,
+            FlowFacts::default(),
+        );
+        let lane = lane.into_owned();
+        let socks = match &lane {
+            Outbound::Socks(socks) if socks.tls.is_none() => Some(socks),
+            _ => None,
+        };
+        if let Some(socks) = socks {
+            let tag = tag
+                .map(std::borrow::Cow::into_owned)
+                .or_else(default_outbound_tag);
+            let _outbound = OutboundTag::enter(tag.as_deref());
+            let _source = SendThroughGuard::enter(SEND_THROUGH.with(std::cell::Cell::take));
+            let _sockopts =
+                DialSockoptsGuard::enter(DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take()));
+            let _target = TargetStrategyGuard::enter(TARGET_STRATEGY.with(std::cell::Cell::take));
+            let Some(server) = lane.edge() else {
+                return crate::tun::DialOutcome::Refused;
+            };
+            return match connect_socks(
+                &server,
+                &socks.credential,
+                socks.version,
+                &socks_destination(dest),
+            ) {
+                Some(tunnel) => crate::tun::DialOutcome::Direct(tunnel),
+                None => crate::tun::DialOutcome::Refused,
+            };
+        }
+        crate::tun::DialOutcome::Fallback(Lane {
+            out: std::sync::Arc::new(lane),
+            tag: tag.map(std::borrow::Cow::into_owned),
+            source: SEND_THROUGH.with(std::cell::Cell::take),
+            sockopts: DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take()),
+            strategy: TARGET_STRATEGY.with(std::cell::Cell::take),
+        })
+    })
+}
+
+/// What a direct datagram lane needs: the relay the server named, and the control connection that
+/// keeps the association alive for as long as the device holds the lane.
+pub(crate) struct DirectDatagram {
+    pub(crate) relay: SocketAddr,
+    pub(crate) control: Connection,
+}
+
+/// The device front's datagram dial: a static SOCKS5 outbound with no TLS opens its association
+/// once, and the handler frames every datagram straight at the relay, so no loopback association
+/// and no SOCKS server sit between the device and the outbound's own server. A route plan asks
+/// the live table whether it can supply that lane and resolves the lane again when the handler
+/// opens it, so a rule the management API changed before the first datagram is the one opened.
+#[derive(Clone)]
+pub(crate) struct Datagram {
+    open: Arc<dyn Fn() -> Option<DirectDatagram> + Send + Sync>,
+    ready: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl Datagram {
+    fn new(
+        open: Arc<dyn Fn() -> Option<DirectDatagram> + Send + Sync>,
+        ready: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Self {
+        Self { open, ready }
+    }
+
+    /// Open the direct lane for the association the live rules pick now.
+    pub(crate) fn open(&self) -> Option<DirectDatagram> {
+        (self.open)()
+    }
+
+    /// Whether the live rules currently pick a lane this handler can ride directly.
+    pub(crate) fn ready(&self) -> bool {
+        (self.ready)()
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn always(open: Arc<dyn Fn() -> Option<DirectDatagram> + Send + Sync>) -> Self {
+        Self::new(open, Arc::new(|| true))
+    }
+}
+
+fn datagram_socks(socks: &SocksOut) -> bool {
+    socks.tls.is_none() && socks.version != crate::socks::Version::V4
+}
+
+fn direct_datagram_ready(plan: &RoutePlan) -> bool {
+    plan.udp_lane(&plan.association())
+        .is_ok_and(|(lane, _)| matches!(&*lane, Outbound::Socks(socks) if datagram_socks(socks)))
+}
+
+fn open_direct_datagram(socks: &SocksOut) -> Option<DirectDatagram> {
+    let server = resolve_outbound(&socks.address, socks.port)?;
+    let stream = dial_or_report(&server)?;
+    let _ = stream.set_read_timeout(Some(budgets::handshake()));
+    let _ = stream.set_write_timeout(Some(budgets::handshake()));
+    let association = crate::socks::associate(stream, &socks.credential)?;
+    let _ = association.control.set_read_timeout(None);
+    let _ = association.control.set_write_timeout(None);
+    Some(DirectDatagram {
+        relay: association.relay,
+        control: association.control,
+    })
+}
+
+pub(crate) fn device_datagram(out: &Outbound) -> Option<Datagram> {
+    match out {
+        Outbound::Socks(socks) if datagram_socks(socks) => {
+            let socks = socks.clone();
+            Some(Datagram::new(
+                Arc::new(move || open_direct_datagram(&socks)),
+                Arc::new(|| true),
+            ))
+        }
+        Outbound::Route(plan) => {
+            let open_plan = Arc::clone(plan);
+            let ready_plan = Arc::clone(plan);
+            Some(Datagram::new(
+                Arc::new(move || {
+                    let association = open_plan.association();
+                    let lane = open_plan.udp_out(&association).ok()?.into_owned();
+                    let Outbound::Socks(socks) = lane else {
+                        return None;
+                    };
+                    if !datagram_socks(&socks) {
+                        return None;
+                    }
+                    open_direct_datagram(&socks)
+                }),
+                Arc::new(move || direct_datagram_ready(&ready_plan)),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// One mux `New` target for a flow the portal carries.
+fn mux_destination(
+    asked: &Destination,
+    network: ferrox_core::mux::Network,
+) -> ferrox_core::mux::Target<'_> {
+    let addr = match asked {
+        Destination::Name(host, _) => ferrox_core::addr::Addr::Name(host.as_bytes()),
+        Destination::Address(address) => match address.ip() {
+            std::net::IpAddr::V4(ip) => ferrox_core::addr::Addr::V4(ip.octets()),
+            std::net::IpAddr::V6(ip) => ferrox_core::addr::Addr::V6(ip.octets()),
+        },
+    };
+    ferrox_core::mux::Target {
+        network,
+        port: asked.port(),
+        addr,
+    }
+}
+
+/// A flow the rules routed to a portal: it rides one mux session the bridge opened, and the
+/// portal never sees a socket for it.
+fn serve_reverse_tcp(client: &Connection, portal: &crate::reverse::Portal, asked: &Destination) {
+    let target = mux_destination(asked, ferrox_core::mux::Network::Tcp);
+    let Some((session, id, flow)) = portal.open(target, ferrox_core::mux::DEFAULT_CAP as u32)
+    else {
+        eprintln!(
+            "reverse: portal `{}` has no live session, so the flow is closed",
+            portal.tag()
+        );
+        return;
+    };
+    let (Ok(mut down), Ok(mut up)) = (client.try_clone(), client.try_clone()) else {
+        session.end(id);
+        return;
+    };
+    let sender = Arc::clone(&session);
+    let reader = thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match up.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if !sender.send(id, &chunk[..n]) {
+                        break;
+                    }
+                }
+                Err(error) if is_timeout(&error) => {}
+                Err(_) => break,
+            }
+        }
+        sender.end(id);
+    });
+    while let Ok((data, _)) = flow.down.recv() {
+        if down.write_all(&data).is_err() {
+            break;
+        }
+    }
+    let _ = down.shutdown(Shutdown::Both);
+    session.end(id);
+    let _ = reader.join();
+}
+
+/// A copy bounded by one absolute deadline: each syscall gets the time left, never a fresh full window, and no progress past the deadline is accepted.
+fn write_all_within(conn: &Connection, mut bytes: &[u8], until: Instant) -> std::io::Result<()> {
+    let mut conn = conn;
+    while !bytes.is_empty() {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "interim response deadline expired",
+            ));
+        }
+        conn.set_write_timeout(Some(left.max(Duration::from_millis(1))))?;
+        let written = conn.write(bytes)?;
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "interim response made no progress",
+            ));
+        }
+        bytes = &bytes[written..];
+    }
+    Ok(())
+}
+
+/// Nothing carries the destination onward, so this lane is the one that has to redirect it,
+/// resolve it by the configured strategy, and add the header or fragment the config asks for.
+fn serve_connect_freedom(
+    client: &Connection,
+    freedom: &FreedomOut,
+    asked: &Destination,
+    prefix: &[u8],
+) {
+    let Some(target) = freedom_socket(freedom, asked) else {
+        return;
+    };
+    if let Some(rule) = freedom.final_rule(crate::router::Network::Tcp, target.ip(), target.port())
+    {
+        if rule.action == FreedomRuleAction::Block {
+            freedom_blackhole(client, rule);
+            return;
+        }
+    }
+    let Some(mut upstream) = dial_or_report(&target) else {
+        return;
+    };
+    if freedom.proxy_protocol > 0 {
+        let edges = Edges {
+            local: client.peer_addr().ok(),
+            peer: upstream.peer_addr().ok().or(Some(target)),
+        };
+        if ferrox_core::tls::write_proxy_protocol(&mut upstream, freedom.proxy_protocol, edges)
+            .is_err()
+        {
+            return;
+        }
+    }
+    let mut upstream = upstream.with_mask(freedom.fragment.as_deref());
+    if !prefix.is_empty() && upstream.write_all(prefix).is_err() {
+        return;
+    }
+    if !prefix.is_empty() && !http_head_has_body(prefix) {
+        let until = Instant::now() + budgets::head_arrival();
+        let saved = client.write_timeout().unwrap_or(None);
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                let _ = client.set_write_timeout(saved);
+                return;
+            }
+            let Some((mut head, at)) = read_http_head_kept(&mut upstream, HTTP_HEAD_LIMIT, left)
+            else {
+                let _ = client.set_write_timeout(saved);
+                return;
+            };
+            let tail = head.split_off(at);
+            let interim = http_head_is_interim(&head);
+            drop_invalid_header_names(&mut head);
+            if write_all_within(client, &head, until).is_err()
+                || write_all_within(client, &tail, until).is_err()
+            {
+                let _ = client.set_write_timeout(saved);
+                return;
+            }
+            if !interim {
+                break;
+            }
+        }
+        let _ = client.set_write_timeout(saved);
+    }
+    relay_handoff(client, &upstream);
+}
+
+/// A request head that carries a body: the origin answers only after it arrives, so the direct leg
+/// must relay before reading the response head or the two sides wait on each other.
+fn http_head_has_body(head: &[u8]) -> bool {
+    head.split(|byte| *byte == b'\n').skip(1).any(|line| {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+            return false;
+        };
+        let (name, value) = line.split_at(colon);
+        name.eq_ignore_ascii_case(b"transfer-encoding")
+            || (name.eq_ignore_ascii_case(b"content-length")
+                && value.iter().any(|byte| (b'1'..=b'9').contains(byte)))
+    })
+}
+
+/// The reference's blocked target: the client is drained until the rule's wait ends, then closed.
+fn freedom_blackhole(client: &Connection, rule: &FreedomFinalRule) {
+    let delay = rule.delay();
+    if delay.is_zero() {
+        let _ = client.shutdown(Shutdown::Both);
+        return;
+    }
+    let Some(until) = Instant::now().checked_add(delay) else {
+        let _ = client.shutdown(Shutdown::Both);
+        return;
+    };
+    let Ok(mut drain) = client.try_clone() else {
+        thread::sleep(delay);
+        return;
+    };
+    let mut buf = [0u8; 8192];
+    while let Some(left) = until.checked_duration_since(Instant::now()) {
+        let _ = drain.set_read_timeout(Some(left.min(Duration::from_secs(1))));
+        match drain.read(&mut buf) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) if is_timeout(&error) => {}
+            Err(_) => break,
+        }
+    }
+    let _ = drain.shutdown(Shutdown::Both);
+}
+
+/// The decoys a UDP destination receives before its first real datagram; a DNS redirect keeps its
+/// one packet clean, and a failed write ends the flow the way the reference's writer does.
+fn send_freedom_noises(
+    noises: &[FreedomNoise],
+    skip_dns: bool,
+    socket: &UdpSocket,
+    dest: SocketAddr,
+) -> bool {
+    if noises.is_empty() || skip_dns {
+        return true;
+    }
+    for noise in noises {
+        if !noise.applies_to(dest.ip()) {
+            continue;
+        }
+        for _ in 0..noise.noise.count {
+            let Some(packet) = noise.noise.generate() else {
+                return false;
+            };
+            if socket.send(&packet).is_err() {
+                return false;
+            }
+            let delay = noise.noise.delay();
+            if !delay.is_zero() {
+                thread::sleep(delay);
+            }
+        }
+    }
+    true
+}
+
+/// The first payload waits behind its destination's decoys without stalling the association's
+/// other lanes; the starter drains this queue once the last decoy has gone out.
+#[derive(Default)]
+struct FreedomNoiseGate {
+    ready: bool,
+    failed: bool,
+    pending: Vec<Vec<u8>>,
+}
+
+impl FreedomNoiseGate {
+    fn queue(&mut self, payload: &[u8]) {
+        if self.pending.len() < UDP_BURST {
+            self.pending.push(payload.to_vec());
+        }
+    }
+}
+
+/// The socket a freedom flow dials: its redirect first, then the family the strategy names.
+fn freedom_socket(freedom: &FreedomOut, asked: &Destination) -> Option<SocketAddr> {
+    let asked = freedom
+        .redirect
+        .as_ref()
+        .map_or_else(|| asked.clone(), |redirect| redirect.apply(asked));
+    match asked {
+        Destination::Address(address) => Some(address),
+        Destination::Name(host, port) => {
+            if freedom.domain == FreedomDomain::AsIs {
+                return resolve_endpoint(&host, port);
+            }
+            let ips = freedom_lookup(&host, port)?;
+            if let Some(ip) = freedom.domain.pick(&ips) {
+                return Some(SocketAddr::new(ip, port));
+            }
+            if freedom.domain.forces() {
+                eprintln!(
+                    "freedom: {host} did not resolve, and {} forces an address",
+                    strategy_name(freedom.domain)
+                );
+                return None;
+            }
+            resolve_endpoint(&host, port)
+        }
+    }
+}
+
+fn freedom_lookup(host: &str, port: u16) -> Option<Vec<std::net::IpAddr>> {
+    if let Some(resolver) = crate::dnsapp::installed() {
+        return resolver.lookup(host).map(|(ips, _)| ips);
+    }
+    let addrs = if let Some(addrs) = cached_lookup(host, port) {
+        addrs
+    } else {
+        let addrs = resolve_bounded(host, port, budgets::dial(), |host, port| {
+            (host, port)
+                .to_socket_addrs()
+                .map(std::iter::Iterator::collect)
+        })?;
+        remember_lookup(host, port, &addrs)
+    };
+    Some(addrs.iter().map(std::net::SocketAddr::ip).collect())
+}
+
+fn strategy_name(domain: FreedomDomain) -> &'static str {
+    match domain {
+        FreedomDomain::AsIs => "AsIs",
+        FreedomDomain::UseIp => "UseIP",
+        FreedomDomain::UseIp4 => "UseIP4",
+        FreedomDomain::UseIp6 => "UseIP6",
+        FreedomDomain::UseIp46 => "UseIP46",
+        FreedomDomain::UseIp64 => "UseIP64",
+        FreedomDomain::ForceIp => "ForceIP",
+        FreedomDomain::ForceIp4 => "ForceIP4",
+        FreedomDomain::ForceIp6 => "ForceIP6",
+        FreedomDomain::ForceIp46 => "ForceIP46",
+        FreedomDomain::ForceIp64 => "ForceIP64",
+    }
+}
+
+/// What `targetStrategy` takes a named target to before the protocol builds its request.
+enum TargetPick {
+    Keep,
+    Address(Destination),
+    Refuse,
+}
+
+/// The address the reference's outbound handler sends instead of a name, or the refusal a forced
+/// strategy owes a name that answered no address of its family.
+fn resolve_target(asked: &Destination, strategy: FreedomDomain) -> TargetPick {
+    let Destination::Name(host, port) = asked else {
+        return TargetPick::Keep;
+    };
+    let picked = freedom_lookup(host, *port).and_then(|ips| strategy.pick(&ips));
+    match picked {
+        Some(ip) => TargetPick::Address(Destination::Address(SocketAddr::new(ip, *port))),
+        None if strategy.forces() => {
+            eprintln!(
+                "targetStrategy: {host} did not resolve, and {} forces an address",
+                strategy_name(strategy)
+            );
+            TargetPick::Refuse
+        }
+        None => TargetPick::Keep,
+    }
+}
+
+/// Sniff the client's first bytes, then pick the lane the reference would: the sniffed name is the
+/// route target, and the original address stays the dial target under `routeOnly`. A sniffed HTTP
+/// head also carries the attributes an `attrs` rule reads, whether or not it named a host.
+fn sniff_lane<'a>(
+    out: &'a Outbound,
+    asked: &Destination,
+    client: &Connection,
+    user: Option<&str>,
+    level: Option<u32>,
+) -> (
+    Option<Destination>,
+    Picked<'a>,
+    Option<std::borrow::Cow<'a, str>>,
+) {
+    let Some(sniffing) = crate::sniff::current() else {
+        let facts = FlowFacts {
+            source: None,
+            local: None,
+            user,
+            level,
+            ..FlowFacts::default()
+        };
+        let (lane, tag) = out.resolved_lane_with_protocol(
+            asked,
+            crate::router::Network::Tcp,
+            Some(client),
+            facts,
+        );
+        return (None, lane, tag);
+    };
+    let (found, pairs) = sniffing.inspect(
+        asked,
+        crate::router::Network::Tcp,
+        client,
+        out.wants_attrs(),
+    );
+    let attrs = (!pairs.is_empty()).then(|| crate::router::Attributes::from_pairs(&pairs));
+    let facts = FlowFacts {
+        source: None,
+        local: None,
+        user,
+        level,
+        attrs: attrs.as_ref(),
+        original: Some(asked),
+        ..FlowFacts::default()
+    };
+    let Some(found) = found else {
+        let (lane, tag) = out.resolved_lane_with_protocol(
+            asked,
+            crate::router::Network::Tcp,
+            Some(client),
+            facts,
+        );
+        return (None, lane, tag);
+    };
+    let route = found
+        .override_destination
+        .then(|| Destination::Name(found.domain.clone(), asked.port()));
+    let dial = if sniffing.should_dial_override(&found) {
+        route.clone()
+    } else {
+        None
+    };
+    let facts = FlowFacts {
+        source: None,
+        local: None,
+        protocol: Some(found.protocol),
+        original: Some(asked),
+        route: if dial.is_none() { route.as_ref() } else { None },
+        ..facts
+    };
+    let (resolved, tag) = out.resolved_lane_with_protocol(
+        route.as_ref().unwrap_or(asked),
+        crate::router::Network::Tcp,
+        Some(client),
+        facts,
+    );
+    (dial, resolved, tag)
+}
+
+/// A loopback outbound's own sniffer runs before its named inbound sees the flow, as the
+/// reference's second dispatch does: the sniffed name routes, and only a dial override changes
+/// the target `routeOnly` keeps at the original address.
+#[allow(clippy::type_complexity)]
+fn loopback_sniffed(
+    loopback: &LoopbackOut,
+    asked: &Destination,
+    client: &Connection,
+    want_attrs: bool,
+) -> (
+    Option<Destination>,
+    Option<Destination>,
+    Option<&'static str>,
+    Vec<(String, String)>,
+) {
+    let Some(sniffing) = loopback.sniffing.as_ref() else {
+        return (None, None, None, Vec::new());
+    };
+    let (found, pairs) = sniffing.inspect(asked, crate::router::Network::Tcp, client, want_attrs);
+    let Some(found) = found else {
+        return (None, None, None, pairs);
+    };
+    let route = found
+        .override_destination
+        .then(|| Destination::Name(found.domain.clone(), asked.port()));
+    let dial = sniffing
+        .should_dial_override(&found)
+        .then(|| Destination::Name(found.domain, asked.port()));
+    (dial, route, Some(found.protocol), pairs)
+}
+
+/// One tunnel request from either front, already resolved to its lane: the Foxy lane grants after its tunnel opens.
+fn serve_connect(
+    client: Connection,
+    out: &Outbound,
+    asked: &Destination,
+    front: Front,
+    prefix: &[u8],
+    tag: Option<&str>,
+    facts: FlowFacts<'_>,
+) {
+    serve_connect_at(client, out, asked, front, prefix, tag, facts, 0);
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn serve_connect_at(
+    mut client: Connection,
+    out: &Outbound,
+    asked: &Destination,
+    front: Front,
+    prefix: &[u8],
+    tag: Option<&str>,
+    facts: FlowFacts<'_>,
+    depth: u8,
+) {
+    let tag = tag.map(str::to_owned).or_else(default_outbound_tag);
+    let _outbound = OutboundTag::enter(tag.as_deref());
+    let _source = SendThroughGuard::enter(SEND_THROUGH.with(std::cell::Cell::take));
+    let _sockopts = DialSockoptsGuard::enter(DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take()));
+    let _target = TargetStrategyGuard::enter(TARGET_STRATEGY.with(std::cell::Cell::take));
+    if let Outbound::Loopback(loopback) = out {
+        let plan = loopback
+            .shared()
+            .filter(|_| depth < MAX_LOOPBACK_DEPTH)
+            .map(|shared| {
+                RoutePlan::new(
+                    shared,
+                    Some(loopback.inbound_tag.clone()),
+                    loopback.inbound_name.clone(),
+                    loopback.source_known,
+                )
+                .without_dns()
+            });
+        let want_attrs = plan.as_ref().is_some_and(RoutePlan::wants_attrs);
+        let (dial, route, protocol, pairs) = loopback_sniffed(loopback, asked, &client, want_attrs);
+        let target = dial.as_ref().unwrap_or(asked);
+        if let Some(plan) = plan {
+            let attrs = (!pairs.is_empty()).then(|| crate::router::Attributes::from_pairs(&pairs));
+            let owner = plan.process_owner(crate::router::Network::Tcp, Some(&client));
+            let second = FlowFacts {
+                protocol,
+                user: facts.user,
+                level: facts.level,
+                attrs: attrs.as_ref(),
+                process: owner.as_ref(),
+                original: Some(asked),
+                route: route.as_ref().filter(|_| dial.is_none()),
+                ..FlowFacts::default()
+            };
+            let route = route.as_ref().unwrap_or(asked);
+            let (lane, lane_tag) =
+                plan.lane_with_protocol(route, crate::router::Network::Tcp, Some(&client), second);
+            if !same_loopback(&lane, loopback) {
+                return serve_connect_at(
+                    client,
+                    &lane,
+                    target,
+                    front,
+                    prefix,
+                    lane_tag.as_deref(),
+                    facts,
+                    depth + 1,
+                );
+            }
+        }
+        if let Some(dial) = &loopback.dial {
+            return serve_connect_at(
+                client,
+                dial,
+                target,
+                front,
+                prefix,
+                tag.as_deref(),
+                facts,
+                depth + 1,
+            );
+        }
+        return;
+    }
+    // The rules dropped this flow: the front has granted it, so the sink answers and ends it.
+    if let Outbound::Api(api) = out {
+        api.serve_routed(client);
+        return;
+    }
+    if let Outbound::Block(answer) = out {
+        crate::blackhole::serve(client, answer);
+        return;
+    }
+    if let Outbound::WireGuard(wireguard) = out {
+        wireguard.serve_tcp(client, asked, prefix);
+        return;
+    }
+    if let Outbound::Masque(masque) = out {
+        masque.serve_tcp(client, asked, prefix);
+        return;
+    }
+    if let Outbound::Warp(warp) = out {
+        warp.serve_tcp(client, asked, prefix);
+        return;
+    }
+    if let Outbound::Foxy(foxy) = out {
+        return serve_foxy_front(client, foxy, asked, front, prefix);
+    }
+    if let Outbound::Veepn(lane) = out {
+        return serve_veepn_front(client, lane, asked, front, prefix);
+    }
+    if let Outbound::Freedom(freedom) = out {
+        serve_connect_freedom(&client, freedom, asked, prefix);
+        return;
+    }
+    if !prefix.is_empty() {
+        // A protocol outbound handshakes over the client's own bytes, so a consumed head has nowhere to go.
+        let _ = client.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n");
+        return;
+    }
+    if let Outbound::Dns(dns) = out {
+        return serve_dns_tcp(client, dns, asked);
+    }
+    if let Outbound::ReversePortal(portal) = out {
+        return serve_reverse_tcp(&client, portal, asked);
+    }
+    if let Outbound::Metrics { address } = out {
+        let Some(mut upstream) = dial_or_report(address) else {
+            return;
+        };
+        if !prefix.is_empty() && upstream.write_all(prefix).is_err() {
+            return;
+        }
+        relay_handoff(&client, &upstream);
+        return;
+    }
+    // xray's outbound handler resolves a named target before the request, so `targetStrategy` decides which answer goes out.
+    let targeted = TARGET_STRATEGY.with(std::cell::Cell::get);
+    let resolved = targeted.map(|strategy| resolve_target(asked, strategy));
+    let asked = match &resolved {
+        Some(TargetPick::Address(address)) => address,
+        Some(TargetPick::Refuse) => return,
+        _ => asked,
+    };
+    if let Outbound::Vless(vless) = out {
+        if matches!(vless.carrier, Carrier::Quic) {
+            if vless.mux.tcp.is_some() && dial_vless_mux(&client, vless, asked) {
+                return;
+            }
+            if vless.encryption.is_some() {
+                dial_vless_quic_sealed(&client, vless, asked);
+            } else {
+                crate::quic::dial_pooled(&client, &vless_quic_dial(vless), asked);
+            }
+            return;
+        }
+        if matches!(vless.carrier, Carrier::Kcp(_)) && vless.mux.tcp.is_none() {
+            if let Some(session) = kcp_dial_session(&vless.carrier, &vless.address, vless.port) {
+                dial_vless_kcp(&client, &session, vless, asked);
+            }
+            return;
+        }
+        if matches!(vless.carrier, Carrier::Hysteria(_)) {
+            if vless.mux.tcp.is_some() && dial_vless_mux(&client, vless, asked) {
+                return;
+            }
+            if let Some(dial) = hysteria_dial_session(vless) {
+                crate::hysteria::dial_vless(&client, &dial, &vless.id, asked);
+            }
+            return;
+        }
+        if let Carrier::Xdrive { .. } = &vless.carrier {
+            if vless.mux.tcp.is_none() || !dial_vless_mux(&client, vless, asked) {
+                dial_vless_xdrive(&client, vless, asked);
+            }
+            return;
+        }
+    }
+    if let Outbound::Vmess(vmess) = out {
+        if matches!(vmess.carrier, Carrier::Kcp(_)) {
+            if vmess.mux.tcp.is_some() && dial_vmess_mux(&client, vmess, asked) {
+                return;
+            }
+            if let Some(session) = kcp_dial_session(&vmess.carrier, &vmess.address, vmess.port) {
+                dial_vmess_kcp(&client, &session, vmess, asked);
+            }
+            return;
+        }
+        if let Carrier::Xdrive { .. } = &vmess.carrier {
+            if vmess.mux.tcp.is_none() || !dial_vmess_mux(&client, vmess, asked) {
+                dial_vmess_xdrive(&client, vmess, asked);
+            }
+            return;
+        }
+    }
+    if let Outbound::Trojan(trojan) = out {
+        if matches!(trojan.carrier, Carrier::Quic) {
+            if trojan.mux.tcp.is_some() && dial_trojan_mux(&client, trojan, asked) {
+                return;
+            }
+            let header = trojan_header(&trojan.key, 1, asked);
+            crate::quic::dial_pooled_with(&client, &trojan_quic_dial(trojan), &header, false);
+            return;
+        }
+        if matches!(trojan.carrier, Carrier::Hysteria(_)) {
+            if trojan.mux.tcp.is_some() && dial_trojan_mux(&client, trojan, asked) {
+                return;
+            }
+            let header = trojan_header(&trojan.key, 1, asked);
+            if let Some(dial) = trojan_hysteria_dial(trojan) {
+                crate::hysteria::dial_header(&client, &dial, &header, 0);
+            }
+            return;
+        }
+        if matches!(trojan.carrier, Carrier::Kcp(_)) {
+            if trojan.mux.tcp.is_some() && dial_trojan_mux(&client, trojan, asked) {
+                return;
+            }
+            if let Some(session) = kcp_dial_session(&trojan.carrier, &trojan.address, trojan.port) {
+                dial_trojan_kcp(&client, &session, trojan, asked);
+            }
+            return;
+        }
+        if let Carrier::Xdrive { .. } = &trojan.carrier {
+            if trojan.mux.tcp.is_none() || !dial_trojan_mux(&client, trojan, asked) {
+                dial_trojan_xdrive(&client, trojan, asked);
+            }
+            return;
+        }
+    }
+    if let Outbound::Shadowsocks(ss) = out {
+        if matches!(ss.carrier, Carrier::Kcp(_)) {
+            if ss.mux.tcp.is_some() && dial_ss_mux(&client, ss, asked) {
+                return;
+            }
+            if let Some(session) = kcp_dial_session(&ss.carrier, &ss.address, ss.port) {
+                dial_ss_kcp(&client, &session, ss, asked);
+            }
+            return;
+        }
+        if matches!(ss.carrier, Carrier::Hysteria(_)) {
+            if ss.mux.tcp.is_none() || !dial_ss_mux(&client, ss, asked) {
+                if let Some(dial) = ss_hysteria_dial(ss) {
+                    dial_ss_hysteria(&client, &dial, ss, asked);
+                }
+            }
+            return;
+        }
+        if let Carrier::Xdrive { .. } = &ss.carrier {
+            if ss.mux.tcp.is_none() || !dial_ss_mux(&client, ss, asked) {
+                dial_ss_xdrive(&client, ss, asked);
+            }
+            return;
+        }
+    }
+    let Some(server) = out.edge() else { return };
+    dial_socks_outbound(&client, out, &server, asked);
+}
+
+fn dial_socks_outbound(
+    client: &Connection,
+    out: &Outbound,
+    server: &SocketAddr,
+    target: &Destination,
+) {
+    let ladder = Ladder::global();
+    match out {
+        Outbound::Vless(vless) => {
+            if vless.mux.tcp.is_none() || !dial_vless_mux(client, vless, target) {
+                dial_vless(client, server, vless, Some(target), ladder);
+            }
+        }
+        Outbound::Vmess(vmess) => {
+            if vmess.mux.tcp.is_none() || !dial_vmess_mux(client, vmess, target) {
+                dial_vmess(client, server, vmess, target, ladder);
+            }
+        }
+        Outbound::Trojan(trojan) => {
+            if trojan.mux.tcp.is_none() || !dial_trojan_mux(client, trojan, target) {
+                dial_trojan(client, server, trojan, target, ladder);
+            }
+        }
+        Outbound::Shadowsocks(shadowsocks) => {
+            if shadowsocks.mux.tcp.is_none() || !dial_ss_mux(client, shadowsocks, target) {
+                dial_shadowsocks(client, server, shadowsocks, target, ladder);
+            }
+        }
+        Outbound::Hysteria(hy) => {
+            let dial = hy.dial();
+            if dial.config.version == 1 {
+                crate::hysteria_v1::dial(client, &dial, target);
+            } else {
+                dial_hysteria_v2(client, &dial, target);
+            }
+        }
+        Outbound::Tuic(tuic) => tuic.dial(client, target),
+        Outbound::AnyTls(anytls) => anytls.dial(client, target),
+        Outbound::Http(http) => {
+            dial_http_outbound(client, server, http, target, ladder);
+        }
+        Outbound::Socks(socks) => {
+            let destination = socks_destination(target);
+            if socks.tls.is_none() {
+                dial_socks_client(
+                    client,
+                    server,
+                    &socks.credential,
+                    socks.version,
+                    &destination,
+                );
+            } else {
+                dial_socks_tls_client(client, server, socks, &destination);
+            }
+        }
+        Outbound::Psiphon(lane) => {
+            let destination = socks_destination(target);
+            let (version, credential) = lane.session(&destination);
+            dial_socks_client(client, server, credential, version, &destination);
+        }
+        Outbound::Foxy(_)
+        | Outbound::Veepn(_)
+        | Outbound::Freedom(_)
+        | Outbound::Route(_)
+        | Outbound::Loopback(_)
+        | Outbound::Block(_)
+        | Outbound::Dns(_)
+        | Outbound::ReversePortal(_)
+        | Outbound::WireGuard(_)
+        | Outbound::Masque(_)
+        | Outbound::Warp(_)
+        | Outbound::Metrics { .. }
+        | Outbound::Api(_) => {}
+    }
+}
+
+/// The SOCKS5 client: the greeting, the credential exchange, the `CONNECT` request, and
+/// then the tunnel.
+///
+/// The destination keeps its shape on the wire: a name the caller asked for is a name in
+/// the request, so the server resolves it and this tree's resolver never sees it.
+fn socks_destination(target: &Destination) -> crate::socks::Destination<'_> {
+    match target {
+        Destination::Address(address) => match address.ip() {
+            std::net::IpAddr::V4(octets) => {
+                crate::socks::Destination::V4(octets.octets(), address.port())
+            }
+            std::net::IpAddr::V6(octets) => {
+                crate::socks::Destination::V6(octets.octets(), address.port())
+            }
+        },
+        Destination::Name(host, port) => crate::socks::Destination::Name(host.as_bytes(), *port),
+    }
+}
+
+/// The SOCKS5 exchange over a fresh dial: the tunnel a lane carries, or `None` when the edge refuses the target.
+fn connect_socks(
+    server: &SocketAddr,
+    credential: &crate::socks::Credential,
+    version: crate::socks::Version,
+    destination: &crate::socks::Destination<'_>,
+) -> Option<Connection> {
+    let upstream = dial_or_report(server)?;
+    let read = upstream.read_timeout().ok().flatten();
+    let _ = upstream.set_read_timeout(Some(budgets::SESSION_POLL));
+    let _ = upstream.set_write_timeout(Some(budgets::handshake()));
+    let tunnel = crate::socks::connect(upstream, credential, destination, version)?;
+    let _ = tunnel.set_read_timeout(read);
+    let _ = tunnel.set_write_timeout(None);
+    Some(tunnel)
+}
+
+fn dial_socks_client(
+    client: &Connection,
+    server: &SocketAddr,
+    credential: &crate::socks::Credential,
+    version: crate::socks::Version,
+    destination: &crate::socks::Destination<'_>,
+) {
+    let Some(tunnel) = connect_socks(server, credential, version, destination) else {
+        return;
+    };
+    relay_handoff(client, &tunnel);
+}
+
+/// The SOCKS5 handshake inside a TLS session: the transport is dialled, the carrier is
+/// connected inside the session when the config names one, and the SOCKS exchange runs
+/// over that byte stream instead of the raw socket.
+fn dial_socks_tls_client(
+    client: &Connection,
+    server: &SocketAddr,
+    socks: &SocksOut,
+    destination: &crate::socks::Destination<'_>,
+) {
+    use ferrox_core::vless_encryption::SplitIo as _;
+    let Some(cfg) = socks.tls.as_ref() else {
+        return;
+    };
+    if matches!(socks.carrier, Carrier::Kcp(_)) {
+        let Some((conn, session)) =
+            kcp_tls_session(&socks.carrier, &socks.address, socks.port, cfg)
+        else {
+            return;
+        };
+        let Some(tunnel) =
+            crate::socks::connect(session, &socks.credential, destination, socks.version)
+        else {
+            conn.close();
+            return;
+        };
+        relay_kcp_under(client, &conn, tunnel, &[], |_| true);
+        return;
+    }
+    if matches!(socks.carrier, Carrier::Raw(_)) {
+        let Some(session) = dial_tls_session(server, cfg, socks.carrier.tcp_mask()) else {
+            return;
+        };
+        let Some((reader, writer, _)) = session.into_halves() else {
+            return;
+        };
+        let Some(tunnel) = crate::socks::connect(
+            CarrierStream { reader, writer },
+            &socks.credential,
+            destination,
+            socks.version,
+        ) else {
+            return;
+        };
+        let Some((reader, writer)) = tunnel.split_io() else {
+            return;
+        };
+        let sink = RelayWrite::new(Box::new(writer));
+        relay_sink(reader, &sink, client, |_| {});
+        return;
+    }
+    let Some(stream) = dial_tls_carried_stream(
+        server,
+        cfg,
+        &socks.carrier,
+        &socks.host,
+        &socks.carrier_headers,
+        socks.heartbeat,
+    ) else {
+        return;
+    };
+    let Some(tunnel) = crate::socks::connect(stream, &socks.credential, destination, socks.version)
+    else {
+        return;
+    };
+    let Some((reader, writer)) = tunnel.split_io() else {
+        return;
+    };
+    let sink = RelayWrite::new(writer);
+    relay_sink(reader, &sink, client, |_| {});
+}
+
+/// The split-tunnel list: targets this lane does not carry, which leave by the plain dial.
+fn foxy_splits(ports: &[u16], suffixes: &[String], asked: &Destination) -> bool {
+    if ports.contains(&asked.port()) {
+        return true;
+    }
+    // A domain list decides names only: an address leaves by a port or not at all.
+    let Destination::Name(host, _) = asked else {
+        return false;
+    };
+    suffixes.iter().any(|suffix| {
+        let suffix = suffix
+            .strip_prefix("*.")
+            .or_else(|| suffix.strip_prefix('.'))
+            .unwrap_or(suffix)
+            .trim_end_matches('.');
+        !suffix.is_empty()
+            && host.len() >= suffix.len()
+            && (host.len() == suffix.len()
+                || host.as_bytes()[host.len() - suffix.len() - 1] == b'.')
+            && host[host.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+    })
+}
+
+fn foxy_socks_reply(reply: u8) -> [u8; 10] {
+    [5, reply, 0, 1, 0, 0, 0, 0, 0, 0]
+}
+
+/// Edges past the first a refusal may try: the reference's count, and the most a flow is worth waiting for.
+const MAX_FOXY_ALTERNATES: usize = 3;
+
+/// The renewal thread: one per lane on the clock the pass names, stopping once the account itself is refused.
+fn start_renewal(account: std::sync::Arc<crate::foxy_account::Account>) {
+    thread::spawn(move || {
+        let mut attempt = 0u32;
+        loop {
+            thread::sleep(account.renews_in());
+            let Err(denied) = account.renew() else {
+                attempt = 0;
+                // The plane re-states the allowance on every mint, so the line a status reads is the one the latest pass carries.
+                if let Some(line) = account.current().allowance_line() {
+                    eprintln!("foxy: allowance {line}");
+                }
+                continue;
+            };
+            // A refused token is the only end: a rate limit, a challenge or an unreachable plane is asked again on the plane's own pause, since the pass it stands over keeps expiring meanwhile.
+            if denied.is_final() {
+                eprintln!(
+                    "foxy: the pass cannot be replaced ({denied}): restart the lane to sign in"
+                );
+                return;
+            }
+            let pause = crate::foxy_account::renewal_gap(&denied, attempt, account.pass_left());
+            attempt = attempt.saturating_add(1);
+            eprintln!(
+                "foxy: the pass could not be replaced ({denied}), asking again in {}s",
+                pause.as_secs()
+            );
+            thread::sleep(pause);
+        }
+    });
+}
+
+/// First bytes of each direction behind `FOXY_DEBUG`, so a tunnel that answers TLS with plaintext names itself, and with the moment they landed so a slow answer names the half it waited on.
+fn debug_bytes(direction: &str, buf: &[u8], after: Option<Instant>) {
+    if crate::foxy::debug_on() {
+        let end = buf.len().min(32);
+        eprintln!(
+            "foxy-debug: {direction} first {end} B in {}ms: {:02x?}",
+            trace_ms(after),
+            &buf[..end]
+        );
+    }
+}
+
+/// How long a phase took, for a trace line: an untraced open hands this `None`, so a shipped lane makes no clock call for a number nobody reads.
+fn trace_ms(at: Option<Instant>) -> u128 {
+    at.map_or(0, |started| started.elapsed().as_millis())
+}
+
+/// Lane trace behind `FOXY_DEBUG`: edge, carrier and outcome per dial, so a stall names where it stopped. The outcome is a closure because the lane's own trace is off by default, and the text it carries was built per flow: an authority joined per dial and a message formatted per attempt, both for a line nobody reads.
+fn debug_lane(
+    edge: &ferrox_core::foxy::Candidate,
+    carrier: crate::foxy::Carrier,
+    what: impl FnOnce() -> String,
+) {
+    if crate::foxy::debug_on() {
+        eprintln!("foxy-debug: {} {:?} {}", edge.authority(), carrier, what());
+    }
+}
+
+/// The stamps of one granted open behind `FOXY_DEBUG`: the lane's own dial and the CONNECT that rode it, in the milliseconds each took.
+fn debug_open(
+    edge: &ferrox_core::foxy::Candidate,
+    carrier: crate::foxy::Carrier,
+    target: &str,
+    lane: Option<Instant>,
+    open: Option<Instant>,
+) {
+    debug_lane(edge, carrier, || {
+        format!(
+            "opened for {target} lane={}ms open={}ms",
+            trace_ms(lane),
+            trace_ms(open)
+        )
+    });
+}
+
+/// Relay totals behind `FOXY_DEBUG`: which direction ended, after how many bytes, after how many turns the lane could not park through, and on what error kind.
+fn debug_relay(direction: &str, moved: u64, sleeps: u32, error: Option<std::io::ErrorKind>) {
+    if crate::foxy::debug_on() {
+        eprintln!(
+            "foxy-debug: relay {direction} ended after {moved} B with {sleeps} unparked sleeps on {error:?}"
+        );
+    }
+}
+
+/// Which byte front a tunnel answers: the grant and refusal render per front, the tunnel loop does not.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Front {
+    Socks,
+    Http,
+    Probe,
+}
+
+impl Front {
+    fn grant_line(self) -> &'static [u8] {
+        const SOCKS_GRANTED: [u8; 10] = [5, 0, 0, 1, 0, 0, 0, 0, 0, 0]; // `foxy_socks_reply`'s code 0
+        match self {
+            Self::Socks => &SOCKS_GRANTED,
+            Self::Http => b"HTTP/1.1 200 Connection established\r\n\r\n",
+            Self::Probe => &[],
+        }
+    }
+    fn direct_grant(self) -> Option<&'static [u8]> {
+        match self {
+            Self::Socks | Self::Probe => None,
+            Self::Http => Some(self.grant_line()),
+        }
+    }
+    fn refusal(self, code: u8) -> Vec<u8> {
+        match self {
+            Self::Socks => foxy_socks_reply(code).to_vec(),
+            Self::Http => b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n".to_vec(),
+            Self::Probe => Vec::new(),
+        }
+    }
+}
+
+/// An opened Foxy route: a tunnel that carries its own pooled stream, a direct dial, a refusal code, or nothing to say.
+enum FoxyOpen {
+    /// The lane carries the pool entry it owes, so the flow that ends it is the flow that pays the pool back.
+    Tunnel(Box<crate::foxy::Tunnel>, ferrox_core::foxy::Candidate),
+    Direct(SocketAddr),
+    Refused(u8),
+    Silent,
+}
+
+/// Whether a flow may dial yet: inside the curve it is refused locally, another attempt only extends the limit.
+fn edge_limited(until: &AtomicU64, now: u64) -> bool {
+    until.load(Ordering::Relaxed) > now
+}
+
+/// Records one limited attempt and returns the next allowed dial, climbing the curve instead of hammering.
+fn note_limited(strikes: &AtomicU32, until: &AtomicU64, now: u64) -> u64 {
+    let wait = ferrox_core::foxy::refusal_backoff(strikes.fetch_add(1, Ordering::Relaxed));
+    let at = now.saturating_add(wait.as_secs());
+    until.store(at, Ordering::Relaxed);
+    at
+}
+
+/// A working tunnel clears the limit: the curve restarts instead of punishing later flows for an old limit.
+fn clear_limited(strikes: &AtomicU32, until: &AtomicU64) {
+    strikes.store(0, Ordering::Relaxed);
+    until.store(0, Ordering::Relaxed);
+}
+
+/// Whether the exit probe names a real pin a disposable tunnel can answer: no probe, or `REC`, needs none.
+fn exit_needs_probe(foxy: &FoxyOut) -> bool {
+    foxy.exit_probe.is_some()
+        && !foxy
+            .country
+            .eq_ignore_ascii_case(ferrox_core::foxy::catalog::RECOMMENDED)
+}
+
+/// Given each edge's probe answer in dial order — `None` carried no probe, `Some(true)` exits the pinned country, `Some(false)` exits elsewhere — the index to prefer, or `None` to keep the label order.
+#[must_use]
+fn pick_verified_edge(probes: &[Option<bool>]) -> Option<usize> {
+    probes
+        .iter()
+        .position(|answer| matches!(answer, Some(true)))
+}
+
+/// Whether the answers read so far already fix the pick: once an edge honours the pin, a later probe cannot un-prefer it, so the walk is settled and every probe past here is dead work.
+#[must_use]
+fn probe_settled(probes: &[Option<bool>]) -> bool {
+    pick_verified_edge(probes).is_some()
+}
+
+/// Whether any edge answered a probe at all: none did means this runner cannot dial the probe tunnel, so stop trying.
+#[must_use]
+fn probes_reachable(probes: &[Option<bool>]) -> bool {
+    probes.iter().any(Option::is_some)
+}
+
+/// What a finished probe sweep concluded: the edge that honoured the pin, no probe reachable from here, or every reachable edge answering a different country than the pin.
+#[derive(Debug, PartialEq, Eq)]
+enum Sweep {
+    Agreed(usize),
+    Unreachable,
+    Refuted,
+}
+
+/// The verdict of a sweep, in the order the caller acts on it: a pick wins, an unreachable probe set stops the probes, and a set that answered and agreed with none is itself the answer.
+#[must_use]
+fn sweep_verdict(probes: &[Option<bool>]) -> Sweep {
+    if let Some(at) = pick_verified_edge(probes) {
+        return Sweep::Agreed(at);
+    }
+    if probes_reachable(probes) {
+        Sweep::Refuted
+    } else {
+        Sweep::Unreachable
+    }
+}
+
+/// The exit country one edge really hands back: a disposable H3 tunnel to the probe authority, asked for the trace, then dropped, which is what gives its pooled stream back. It never rides a flow's own tunnel, so a per-target carrier is left intact; `None` means this runner could not carry or read the trace here. The probe is a probe, so its dial gets the probe budget rather than a named carrier's full handshake: a lane whose UDP is blackholed has to say so before the first flow's client gives up.
+fn probe_edge_exit(
+    foxy: &FoxyOut,
+    edge: &ferrox_core::foxy::Candidate,
+    authority: &str,
+) -> Option<String> {
+    let pass = foxy
+        .account
+        .as_ref()
+        .map_or_else(|| foxy.pass.clone(), |account| account.current());
+    // A pinned edge is only trusted on a carrier that checks the pins; QUIC has no pin check, so a pinned probe takes H1, which does and owns its socket instead of sharing a pooled session's timeout.
+    if !foxy.pins.is_empty() {
+        let dial = crate::foxy::FoxyDial {
+            host: edge.host.clone(),
+            port: edge.port,
+            address: foxy.edge_address,
+            carrier: crate::foxy::Carrier::H1,
+            upstream: foxy.upstream.clone(),
+            roots: foxy.roots.clone(),
+            pins: foxy.pins.clone(),
+            pass,
+        };
+        let budget = budgets::carrier_probe();
+        let mut tunnel = crate::foxy::Tunnel::open(&dial, authority, None).ok()?;
+        let _ = tunnel.set_read_quantum(budget);
+        let seen = foxy_exit_country(&mut tunnel, foxy);
+        drop(tunnel);
+        return seen;
+    }
+    let dial = crate::foxy::FoxyDial {
+        host: edge.host.clone(),
+        port: edge.port,
+        address: foxy.edge_address,
+        carrier: crate::foxy::Carrier::H3,
+        upstream: foxy.upstream.clone(),
+        roots: foxy.roots.clone(),
+        pins: foxy.pins.clone(),
+        pass,
+    };
+    let quic_dial = foxy_quic_dial(foxy, edge);
+    let budget = budgets::carrier_probe();
+    let quic = crate::quic::pooled_stream_within(&quic_dial, budget)?;
+    // The lease goes into the open and comes back with the lane: whoever ends the flow hands the pool entry over, and a probe that ends early ends with it.
+    let opened = crate::foxy::Tunnel::open_within(&dial, authority, quic, budget);
+    match opened {
+        Ok(mut tunnel) => {
+            // The trace read carries the same budget as the dial: no head inside it is no answer, not a wait.
+            let _ = tunnel.set_read_quantum(budget);
+            let seen = foxy_exit_country(&mut tunnel, foxy);
+            drop(tunnel);
+            seen
+        }
+        Err(_) => None,
+    }
+}
+
+/// The pinned-country edge that really exits in the pin, chosen once per lane over disposable probes and cached so every carrier rides it. The walk stops at the first edge that honours the pin, since a later probe cannot change that pick. Falls back to the label order when no edge agrees, records the truth when one cannot, and stops probing when none can be reached here.
+fn verify_exit(foxy: &FoxyOut) {
+    if !exit_needs_probe(foxy)
+        || foxy.probe_unavailable.load(Ordering::Relaxed)
+        || edge_limited(&foxy.exit_refuted_until, now_secs())
+    {
+        return;
+    }
+    if foxy.verified.lock().is_ok_and(|kept| kept.is_some()) {
+        return;
+    }
+    let Some(probe) = foxy.exit_probe.as_deref() else {
+        return;
+    };
+    let Some(host) = probe.split('/').next() else {
+        return;
+    };
+    let authority = format!("{host}:80");
+    let edges = ferrox_core::foxy::dial_order(
+        &foxy.ladder,
+        &foxy.country,
+        foxy.stored.as_deref(),
+        MAX_FOXY_ALTERNATES,
+    );
+    let pin = foxy.country.to_ascii_uppercase();
+    let mut flags: Vec<Option<bool>> = Vec::with_capacity(edges.len());
+    for edge in edges.iter() {
+        let agreed = probe_edge_exit(foxy, edge, &authority).map(|seen| {
+            let agrees = exit_agrees(&foxy.country, &seen);
+            if !agrees {
+                debug_lane(edge, crate::foxy::Carrier::H3, || {
+                    format!("exit {seen} differs from pin {pin}")
+                });
+            }
+            agrees
+        });
+        flags.push(agreed);
+        if probe_settled(&flags) {
+            break;
+        }
+    }
+    match sweep_verdict(&flags) {
+        Sweep::Agreed(at) => {
+            if let Ok(mut kept) = foxy.verified.lock() {
+                if let Some(edge) = edges.get(at) {
+                    *kept = Some(std::sync::Arc::new(edge.clone()));
+                }
+            }
+        }
+        // The pin is not what this runner gets out; re-sweeping it per flow would only buy the same refusal again.
+        Sweep::Refuted => foxy
+            .exit_refuted_until
+            .store(now_secs() + CARRIER_DEAD_SECS, Ordering::Relaxed),
+        Sweep::Unreachable => foxy.probe_unavailable.store(true, Ordering::Relaxed),
+    }
+}
+
+/// The pre-flight belongs to no client's clock: the sweep runs once per lane on its own thread while the flow that scheduled it dials the label order, and the flows after it ride whatever edge the probe confirmed. Every verdict it writes goes through an `Arc`, so the clone the thread holds is only a dial snapshot.
+fn schedule_exit_probe(foxy: &FoxyOut) {
+    if !exit_needs_probe(foxy)
+        || foxy.probe_unavailable.load(Ordering::Relaxed)
+        || edge_limited(&foxy.exit_refuted_until, now_secs())
+        || foxy.verified.lock().is_ok_and(|kept| kept.is_some())
+    {
+        return;
+    }
+    if foxy.exit_probe_running.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let owned = std::sync::Arc::new(foxy.clone());
+    let running = std::sync::Arc::clone(&owned.exit_probe_running);
+    let spawned = std::thread::Builder::new()
+        .name("foxy-exit-probe".to_string())
+        .spawn(move || {
+            verify_exit(&owned);
+            running.store(false, Ordering::Relaxed);
+        });
+    if spawned.is_err() {
+        foxy.exit_probe_running.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Shared loop: first answer wins, a refused pass stops every carrier and edge; the grant belongs to the front.
+fn foxy_open(foxy: &FoxyOut, asked: &Destination) -> FoxyOpen {
+    if foxy
+        .unauthenticated
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return FoxyOpen::Refused(0x01);
+    }
+    if edge_limited(&foxy.limited_until, now_secs()) {
+        return FoxyOpen::Refused(0x01);
+    }
+    if foxy_splits(&foxy.direct_ports, &foxy.direct_suffixes, asked) {
+        let Some(target) = asked.socket() else {
+            return FoxyOpen::Silent;
+        };
+        return FoxyOpen::Direct(target);
+    }
+    // The target is spelled once, into a buffer the flow owns: a flow that joined the name and the port into a fresh string per carrier paid a heap buffer for every carrier it tried.
+    let mut target = String::new();
+    asked.authority_into(&mut target);
+    schedule_exit_probe(foxy);
+    let preferred = foxy.preferred_edge();
+    let mut last = None;
+    let order = ferrox_core::foxy::dial_order(
+        &foxy.ladder,
+        &foxy.country,
+        preferred.as_deref(),
+        MAX_FOXY_ALTERNATES,
+    );
+    for edge in foxy.live_dials(&order) {
+        let pass = foxy
+            .account
+            .as_ref()
+            .map_or_else(|| foxy.pass.clone(), |account| account.current());
+        for carrier in foxy.carrier.order() {
+            // As on UDP: a silent carrier is left alone for the window, not probed per flow.
+            if foxy.carrier_unanswered(edge, carrier)
+                || (carrier == crate::foxy::Carrier::H3 && !foxy.pins.is_empty())
+            {
+                continue;
+            }
+            let dial = crate::foxy::FoxyDial {
+                host: edge.host.clone(),
+                port: edge.port,
+                address: foxy.edge_address,
+                carrier,
+                upstream: foxy.upstream.clone(),
+                roots: foxy.roots.clone(),
+                pins: foxy.pins.clone(),
+                pass: pass.clone(),
+            };
+            // A named carrier gets the full budget; an `auto` walk is a probe and gets the probe's.
+            let lane_at = crate::foxy::debug_on().then(Instant::now);
+            let quic = match carrier {
+                crate::foxy::Carrier::H3 => crate::quic::pooled_stream_within(
+                    &foxy_quic_dial(foxy, edge),
+                    if foxy.carrier == crate::foxy::Carrier::H3 {
+                        crate::quic::HANDSHAKE_TIMEOUT
+                    } else {
+                        budgets::carrier_probe()
+                    },
+                ),
+                _ => None,
+            };
+            let open_at = lane_at.map(|_| Instant::now());
+            match crate::foxy::Tunnel::open(&dial, &target, quic) {
+                Ok(tunnel) => {
+                    debug_open(edge, carrier, &target, lane_at, open_at);
+                    foxy.unauthenticated
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    clear_limited(&foxy.limited_strikes, &foxy.limited_until);
+                    foxy.carrier_answered(edge, carrier);
+                    foxy.note_carrier("tcp", carrier);
+                    return FoxyOpen::Tunnel(Box::new(tunnel), (*edge).clone());
+                }
+                Err(failure) => {
+                    debug_lane(edge, carrier, || {
+                        format!("{} lane={}ms", failure, trace_ms(lane_at))
+                    });
+                    // A refused pass is the pass, not the edge: all carriers answer it the same.
+                    if let ferrox_core::foxy::Failure::Rejected(status) = failure {
+                        if ferrox_core::foxy::pass_is_rejected(status) {
+                            foxy.unauthenticated
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                            break;
+                        }
+                        // Account-wide limit: one attempt per flow, the rest wait out the curve.
+                        if status == 429 {
+                            note_limited(&foxy.limited_strikes, &foxy.limited_until, now_secs());
+                            break;
+                        }
+                    }
+                    // A status is the edge speaking, so only a silent carrier is remembered as dead.
+                    foxy.remember_unanswered(edge, carrier, failure);
+                    last = Some(failure);
+                    // A refused chain is the edge's own certificate, not the carrier's: HTTP/2 and HTTP/1.1 would answer a trust failure exactly as this one did.
+                    if matches!(failure, ferrox_core::foxy::Failure::Untrusted) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    FoxyOpen::Refused(last.map_or(0x01, crate::foxy::refusal_reply))
+}
+
+/// The Foxy half of either front: CONNECT grants, plain HTTP forwards its head, a split target dials direct.
+fn serve_foxy_front(
+    mut client: Connection,
+    foxy: &FoxyOut,
+    asked: &Destination,
+    front: Front,
+    prefix: &[u8],
+) {
+    match foxy_open(foxy, asked) {
+        FoxyOpen::Tunnel(tunnel, edge) => {
+            let mut tunnel = *tunnel;
+            if prefix.is_empty() && client.write_all(front.grant_line()).is_err() {
+                return;
+            }
+            if !prefix.is_empty() && tunnel.write_all(prefix).is_err() {
+                return;
+            }
+            // One lock serves both directions: the lane's read takes a grain so a writer never waits out the wait, and the idle leg parks on the edge socket outside the lock.
+            let _ = tunnel.set_relay_quantum(budgets::relay_quantum());
+            let tunnel = std::sync::Arc::new(std::sync::Mutex::new(tunnel));
+            let started = Instant::now();
+            relay_tunnel(&client, &tunnel);
+            // Both legs are joined, so the lane is no longer shared: a clean h2 session goes back to the pool instead of paying a handshake on the next flow.
+            if let Ok(lane) = std::sync::Arc::try_unwrap(tunnel) {
+                if let Ok(lane) = lane.into_inner() {
+                    lane.settle();
+                }
+            }
+            foxy.note_edge_end(&edge, started.elapsed());
+        }
+        FoxyOpen::Direct(target) => {
+            let Some(mut upstream) = dial_or_report(&target) else {
+                return;
+            };
+            if prefix.is_empty() {
+                if let Some(grant) = front.direct_grant() {
+                    if client.write_all(grant).is_err() {
+                        return;
+                    }
+                }
+            }
+            if !prefix.is_empty() && upstream.write_all(prefix).is_err() {
+                return;
+            }
+            relay_handoff(&client, &upstream);
+        }
+        FoxyOpen::Refused(code) => {
+            let _ = client.write_all(&front.refusal(code));
+        }
+        FoxyOpen::Silent => {}
+    }
+}
+
+/// The `VeePN` half of either front: the plane names the upstream, the `Foxy` record lane opens it, and the grant waits for that open as it does for Foxy's.
+fn serve_veepn_front(
+    mut client: Connection,
+    lane: &crate::veepn::VeepnOut,
+    asked: &Destination,
+    front: Front,
+    prefix: &[u8],
+) {
+    let mut tunnel = match lane.open(&asked.authority()) {
+        Ok(tunnel) => tunnel,
+        Err(why) => {
+            eprintln!("veepn: {}", why.why);
+            let _ = client.write_all(&front.refusal(why.code));
+            return;
+        }
+    };
+    if prefix.is_empty() && client.write_all(front.grant_line()).is_err() {
+        return;
+    }
+    if !prefix.is_empty() && tunnel.write_all(prefix).is_err() {
+        return;
+    }
+    // The same one lock serves both directions as a Foxy flow's, so it gets the same arm: a grain for the read, the wait outside the lock.
+    let _ = tunnel.set_relay_quantum(budgets::relay_quantum());
+    relay_tunnel(&client, &std::sync::Arc::new(std::sync::Mutex::new(tunnel)));
+}
+
+const HTTP_HEAD_LIMIT: usize = 8192;
+/// An HTTP proxy request: a tunnel to open, or a head to forward to a raw uplink.
+enum ProxyRequest {
+    Connect(Destination),
+    Forward(Destination, Vec<u8>),
+}
+
+/// CONNECT tunnels; absolute- and origin-form forward the head with its line rewritten to origin-form.
+fn http_proxy_request(mut head: Vec<u8>) -> Option<ProxyRequest> {
+    let line_end = ferrox_core::foxy::octet_in(&head, 0, b'\n');
+    let raw = &head[..line_end.unwrap_or(head.len())];
+    let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+    let mut parts = line.split(|byte| *byte == b' ');
+    let method = parts.next()?;
+    let target = parts.next()?;
+    let sent_version = parts.next();
+    if method.eq_ignore_ascii_case(b"CONNECT") {
+        return authority_target(connect_authority(target)).map(ProxyRequest::Connect);
+    }
+    if method.eq_ignore_ascii_case(b"OPTIONS")
+        || method.eq_ignore_ascii_case(b"TRACE")
+        || target.is_empty()
+    {
+        return None;
+    }
+    if let Some(rest) = target.strip_prefix(b"http://") {
+        let (authority, path) = match ferrox_core::foxy::octet_in(rest, 0, b'/') {
+            Some(at) => (&rest[..at], &rest[at..]),
+            None => (rest, b"/".as_slice()),
+        };
+        let asked = authority_target(authority)?;
+        // The pieces' places in the head, for a rewrite that moves the head's own bytes.
+        let base = head.as_ptr() as usize;
+        let place = |piece: &[u8]| {
+            let at = piece.as_ptr() as usize - base;
+            (at, at + piece.len())
+        };
+        let line = RequestLine {
+            method: place(method),
+            path: if path == b"/" {
+                None
+            } else {
+                Some(place(path))
+            },
+            version: sent_version.map(place),
+        };
+        origin_head(&mut head, line_end, &line);
+        return Some(ProxyRequest::Forward(asked, head));
+    }
+    if target.starts_with(b"/") {
+        let host = header_value(&head, "host")?;
+        let asked = authority_target(host.as_bytes())?;
+        // The line is already origin-form as it landed, so the head needs no rewrite to reach the uplink.
+        let untouched = line_end.is_some()
+            && raw.len() == line.len() + 1
+            && sent_version.is_some()
+            && parts.next().is_none();
+        if !untouched {
+            let base = head.as_ptr() as usize;
+            let place = |piece: &[u8]| {
+                let at = piece.as_ptr() as usize - base;
+                (at, at + piece.len())
+            };
+            let line = RequestLine {
+                method: place(method),
+                path: Some(place(target)),
+                version: sent_version.map(place),
+            };
+            origin_head(&mut head, line_end, &line);
+        }
+        return Some(ProxyRequest::Forward(asked, head));
+    }
+    None
+}
+
+/// A CONNECT target is the authority form; Go's transport also sends the
+/// absolute form (`Connect http://host:port/`) when the method is CONNECT and
+/// the destination is plain.
+fn connect_authority(target: &[u8]) -> &[u8] {
+    let rest = [b"http://".as_slice(), b"https://".as_slice()]
+        .into_iter()
+        .find_map(|scheme| target.strip_prefix(scheme))
+        .unwrap_or(target);
+    match ferrox_core::foxy::octet_in(rest, 0, b'/') {
+        Some(at) => &rest[..at],
+        None => rest,
+    }
+}
+
+/// The request line's three pieces, as ranges inside the head they were read from: the
+/// rewrite moves the head's own bytes, so the pieces are named by where they are rather
+/// than by what they point at.
+struct RequestLine {
+    method: (usize, usize),
+    /// The path inside the head, or the root path when the absolute form carried none.
+    path: Option<(usize, usize)>,
+    version: Option<(usize, usize)>,
+}
+
+/// Rewrites the request line to origin-form, keeping every header byte as sent. The
+/// rewrite happens inside the head's own buffer: the headers shift left to where the
+/// shorter line ends, so they are not copied at all.
+fn origin_head(head: &mut Vec<u8>, line_end: Option<usize>, line: &RequestLine) {
+    const VERSION: &[u8] = b"HTTP/1.1";
+    const ROOT: &[u8] = b"/";
+    let at = line_end.map_or(0, |at| at + 1);
+    let tail = head.len() - at;
+    let (m0, m1) = line.method;
+    let (p0, p1) = line.path.unwrap_or((0, ROOT.len()));
+    let version = line.version.unwrap_or((0, VERSION.len()));
+    let want = (m1 - m0) + 1 + (p1 - p0) + 1 + (version.1 - version.0) + 2;
+    if want > at {
+        head.resize(head.len() + (want - at), 0);
+    }
+    let mut at_new = 0;
+    head.copy_within(m0..m1, at_new);
+    at_new += m1 - m0;
+    head[at_new] = b' ';
+    at_new += 1;
+    if line.path.is_some() {
+        head.copy_within(p0..p1, at_new);
+        at_new += p1 - p0;
+    } else {
+        head[at_new..at_new + ROOT.len()].copy_from_slice(ROOT);
+        at_new += ROOT.len();
+    }
+    head[at_new] = b' ';
+    at_new += 1;
+    if line.version.is_some() {
+        head.copy_within(version.0..version.1, at_new);
+        at_new += version.1 - version.0;
+    } else {
+        head[at_new..at_new + VERSION.len()].copy_from_slice(VERSION);
+        at_new += VERSION.len();
+    }
+    head[at_new..at_new + 2].copy_from_slice(b"\r\n");
+    // The headers move to where the new line ends, over the old line's own bytes.
+    head.copy_within(at..at + tail, want);
+    head.truncate(want + tail);
+}
+
+/// An authority as a target: a literal address stays one, a name rides the tunnel untouched, no port means 80.
+fn authority_target(authority: &[u8]) -> Option<Destination> {
+    let authority = std::str::from_utf8(authority).ok()?;
+    if let Ok(address) = authority.parse::<SocketAddr>() {
+        return Some(Destination::Address(address));
+    }
+    if let Ok(ip) = authority.parse::<std::net::IpAddr>() {
+        return Some(Destination::Address(SocketAddr::new(ip, 80)));
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host, port.parse::<u16>().ok()?),
+        None => (authority, 80),
+    };
+    // A name has no longer than a length byte to be carried by, and a truncated destination is a wrong one.
+    if host.is_empty() || host.len() > ferrox_core::addr::MAX_DOMAIN {
+        return None;
+    }
+    Some(Destination::Name(host.to_owned(), port))
+}
+
+/// xray's answer to an HTTP front that asks for a credential and was not handed an accepted one.
+const HTTP_AUTH_REQUIRED: &[u8] =
+    b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n";
+
+/// Whether the head carries an account this front accepts, decoded as xray decodes it: `Basic `, standard base64, the first colon.
+fn http_credential_account<'a>(
+    head: &[u8],
+    accounts: &'a SocksAccounts,
+) -> Option<&'a SocksAccount> {
+    use base64::Engine as _;
+    let value = header_value(head, "proxy-authorization")?;
+    let encoded = value.strip_prefix("Basic ")?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    let colon = decoded.iter().position(|byte| *byte == b':')?;
+    accounts.account(&decoded[..colon], &decoded[colon + 1..])
+}
+
+/// The octets of the next `\r\n` line end, from a line's first octet: the first `\n` that a `\r` precedes, which is the two-octet window a walk would have matched, found one octet at a time.
+fn crlf_in(head: &[u8], mut at: usize) -> Option<usize> {
+    loop {
+        let hit = ferrox_core::foxy::octet_in(head, at, b'\n')?;
+        if hit > at && head[hit - 1] == b'\r' {
+            return Some(hit - 1 - at);
+        }
+        at = hit + 1;
+    }
+}
+
+/// Whether a header name is an HTTP token, which is what Go's header writer accepts and re-serializes.
+fn header_name_is_token(name: &[u8]) -> bool {
+    !name.is_empty()
+        && name.iter().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+/// Whether a response head is an interim `1xx`, which is answered and then followed by the final head.
+fn http_head_is_interim(head: &[u8]) -> bool {
+    let line = head.split(|byte| *byte == b'\n').next().unwrap_or(&[]);
+    let mut parts = line.split(|byte| *byte == b' ');
+    let _version = parts.next();
+    let code = parts.next().unwrap_or(&[]);
+    code.len() == 3 && code[0] == b'1' && code != b"101" && code.iter().all(u8::is_ascii_digit)
+}
+
+/// Whether every header line's name is an HTTP token, so a head that needs no rewrite can be forwarded as it landed.
+fn header_names_are_tokens(head: &[u8]) -> bool {
+    let mut at = ferrox_core::foxy::octet_in(head, 0, b'\n').map_or(head.len(), |at| at + 1);
+    while at < head.len() {
+        let Some(end) = ferrox_core::foxy::octet_in(head, at, b'\n') else {
+            return true;
+        };
+        let raw = &head[at..end];
+        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        if line.is_empty() {
+            return true;
+        }
+        if line
+            .first()
+            .is_some_and(|byte| *byte == b' ' || *byte == b'\t')
+        {
+            at = end + 1;
+            continue;
+        }
+        let valid = line
+            .iter()
+            .position(|byte| *byte == b':')
+            .is_some_and(|colon| header_name_is_token(&line[..colon]));
+        if !valid {
+            return false;
+        }
+        at = end + 1;
+    }
+    true
+}
+
+/// Removes every header line whose name is not an HTTP token, in place: a name the origin would
+/// frame differently from the bytes this side relays is a request-smuggling desync, not a header.
+fn drop_invalid_header_names(head: &mut Vec<u8>) {
+    let mut at = ferrox_core::foxy::octet_in(head, 0, b'\n').map_or(head.len(), |at| at + 1);
+    let mut dropped = false;
+    while at < head.len() {
+        let Some(end) = ferrox_core::foxy::octet_in(head, at, b'\n') else {
+            return;
+        };
+        let raw = &head[at..end];
+        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        if line.is_empty() {
+            return;
+        }
+        if line
+            .first()
+            .is_some_and(|byte| *byte == b' ' || *byte == b'\t')
+        {
+            if !dropped {
+                at = end + 1;
+                continue;
+            }
+            head.copy_within(end + 1.., at);
+            head.truncate(head.len() - (end + 1 - at));
+            continue;
+        }
+        let valid = line
+            .iter()
+            .position(|byte| *byte == b':')
+            .is_some_and(|colon| header_name_is_token(&line[..colon]));
+        if valid {
+            dropped = false;
+            at = end + 1;
+            continue;
+        }
+        dropped = true;
+        head.copy_within(end + 1.., at);
+        head.truncate(head.len() - (end + 1 - at));
+    }
+}
+
+/// Removes every line naming a header, in place; the credential is the proxy's, not the origin's.
+fn drop_header(head: &mut Vec<u8>, name: &str) {
+    let mut at = ferrox_core::foxy::octet_in(head, 0, b'\n').map_or(head.len(), |at| at + 1);
+    while at < head.len() {
+        let Some(end) = crlf_in(head, at) else {
+            return;
+        };
+        let named = {
+            let line = &head[at..at + end];
+            line.len() > name.len()
+                && line[name.len()] == b':'
+                && line[..name.len()].eq_ignore_ascii_case(name.as_bytes())
+        };
+        if named {
+            head.copy_within(at + end + 2.., at);
+            head.truncate(head.len() - end - 2);
+            continue;
+        }
+        at += end + 2;
+    }
+}
+
+/// The method and path the reference's HTTP inbound reads off the request line it was sent, before
+/// this front rewrites the line to origin-form: the method uppercased, the path percent-decoded and
+/// without its query, and an absolute target with no path naming the empty one the reference parses.
+fn request_line_attributes(head: &[u8]) -> Option<(String, String)> {
+    let end = ferrox_core::foxy::octet_in(head, 0, b'\n')?;
+    let line = head[..end].strip_suffix(b"\r").unwrap_or(&head[..end]);
+    let mut parts = line.split(|byte| *byte == b' ');
+    let method = std::str::from_utf8(parts.next()?).ok()?;
+    let target = std::str::from_utf8(parts.next()?).ok()?;
+    let path = if target.starts_with('/') {
+        target
+    } else {
+        let rest = target.split_once("://").map_or(target, |(_, rest)| rest);
+        rest.find('/').map_or("", |slash| &rest[slash..])
+    };
+    let path = path.split('?').next().unwrap_or("");
+    Some((method.to_ascii_uppercase(), decoded_path(path).into_owned()))
+}
+
+/// The path the reference's `URL.Path` holds: every `%XX` decoded. An escape that is not two hex
+/// digits stays as it was sent, where the reference's parse would have refused the request.
+fn decoded_path(path: &str) -> std::borrow::Cow<'_, str> {
+    let bytes = path.as_bytes();
+    if !bytes.contains(&b'%') {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    let hex = |byte: u8| (byte as char).to_digit(16).map(|digit| digit as u8);
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let escape = (bytes[at] == b'%' && at + 2 < bytes.len())
+            .then(|| (hex(bytes[at + 1]), hex(bytes[at + 2])));
+        if let Some((Some(high), Some(low))) = escape {
+            out.push(high << 4 | low);
+            at += 3;
+        } else {
+            out.push(bytes[at]);
+            at += 1;
+        }
+    }
+    std::borrow::Cow::Owned(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Every header the reference's hop-by-hop removal leaves, by the name it was sent with, plus the
+/// empty `User-Agent` it inserts when the client sent none; `host` is promoted off the header map.
+fn forward_headers<'a>(head: &'a [u8], attrs: &mut crate::router::Attributes<'a>) {
+    let Some(line_end) = ferrox_core::foxy::octet_in(head, 0, b'\n') else {
+        return;
+    };
+    let named = connection_named(head, line_end + 1);
+    let mut user_agent = false;
+    let mut at = line_end + 1;
+    while at < head.len() {
+        let Some(end) = ferrox_core::foxy::octet_in(head, at, b'\n') else {
+            break;
+        };
+        let raw = &head[at..end];
+        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        if line.is_empty() {
+            break;
+        }
+        if let Some(colon) = ferrox_core::foxy::octet_in(line, 0, b':') {
+            let name = &line[..colon];
+            if !hop_by_hop(name, named) && !name.eq_ignore_ascii_case(b"host") {
+                if let Ok(name) = std::str::from_utf8(name) {
+                    let user_agent_header = name.eq_ignore_ascii_case("user-agent");
+                    user_agent |= user_agent_header;
+                    let value = &line[colon + 1..];
+                    match std::str::from_utf8(value) {
+                        Ok(value) => attrs.push(name, std::borrow::Cow::Borrowed(value.trim())),
+                        Err(_) if user_agent_header => attrs.push(
+                            name,
+                            std::borrow::Cow::Owned(
+                                String::from_utf8_lossy(value).trim().to_owned(),
+                            ),
+                        ),
+                        Err(_) => {}
+                    }
+                }
+            }
+        }
+        at = end + 1;
+    }
+    if !user_agent {
+        attrs.push("user-agent", std::borrow::Cow::Borrowed(""));
+    }
+}
+
+/// The first `Connection` header's value, whose comma-separated names the reference also drops.
+fn connection_named(head: &[u8], from: usize) -> &[u8] {
+    let mut at = from;
+    while at < head.len() {
+        let Some(end) = ferrox_core::foxy::octet_in(head, at, b'\n') else {
+            break;
+        };
+        let raw = &head[at..end];
+        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        if line.is_empty() {
+            break;
+        }
+        if let Some(colon) = ferrox_core::foxy::octet_in(line, 0, b':') {
+            if line[..colon].eq_ignore_ascii_case(b"connection") {
+                return trim_bytes(&line[colon + 1..]);
+            }
+        }
+        at = end + 1;
+    }
+    b""
+}
+
+fn hop_by_hop(name: &[u8], named: &[u8]) -> bool {
+    const FIXED: [&[u8]; 8] = [
+        b"connection",
+        b"proxy-connection",
+        b"proxy-authenticate",
+        b"proxy-authorization",
+        b"te",
+        b"trailers",
+        b"transfer-encoding",
+        b"upgrade",
+    ];
+    FIXED.iter().any(|fixed| name.eq_ignore_ascii_case(fixed))
+        || named
+            .split(|byte| *byte == b',')
+            .any(|piece| trim_bytes(piece).eq_ignore_ascii_case(name))
+}
+
+fn trim_bytes(mut bytes: &[u8]) -> &[u8] {
+    while let [first, rest @ ..] = bytes {
+        if first.is_ascii_whitespace() {
+            bytes = rest;
+        } else {
+            break;
+        }
+    }
+    while let [rest @ .., last] = bytes {
+        if last.is_ascii_whitespace() {
+            bytes = rest;
+        } else {
+            break;
+        }
+    }
+    bytes
+}
+
+/// The `http` front: CONNECT tunnels like SOCKS, plain HTTP forwards its head, unparsable input closes quietly.
+#[allow(clippy::too_many_lines)]
+fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) {
+    let Some(mut head) = read_http_head(&mut client, HTTP_HEAD_LIMIT, budgets::head_arrival())
+    else {
+        return;
+    };
+    let account = if accounts.names_accounts() {
+        let Some(account) = http_credential_account(&head, accounts) else {
+            crate::accesslog::record(
+                client.peer_addr().ok(),
+                false,
+                &"unknown",
+                None,
+                "rejected",
+                "",
+            );
+            let _ = client.write_all(HTTP_AUTH_REQUIRED);
+            return;
+        };
+        Some(account.clone())
+    } else {
+        None
+    };
+    if let Some(account) = &account {
+        client = client
+            .with_meter(crate::stats::user(&account.email, account.level))
+            .with_policy(Some(crate::policy::flow(account.level)));
+    }
+    let email = account
+        .as_ref()
+        .map_or("", |account| account.email.as_str());
+    let user = (!email.is_empty()).then_some(email);
+    let level = account.as_ref().map(|account| account.level);
+    drop_header(&mut head, "proxy-authorization");
+    let request_line = out
+        .wants_attrs()
+        .then(|| request_line_attributes(&head))
+        .flatten();
+    let Some(request) = http_proxy_request(head) else {
+        return;
+    };
+    match request {
+        ProxyRequest::Connect(asked) => {
+            let destination = asked.authority();
+            crate::accesslog::record(client.peer_addr().ok(), true, &destination, None, "", email);
+            let first = match crate::sniff::current() {
+                Some(sniffing) if sniffing.enabled() => None,
+                _ => Some(out.resolved_lane_with_protocol(
+                    &asked,
+                    crate::router::Network::Tcp,
+                    Some(&client),
+                    FlowFacts {
+                        source: None,
+                        local: None,
+                        user,
+                        level,
+                        ..FlowFacts::default()
+                    },
+                )),
+            };
+            if !matches!(
+                first.as_ref().map_or(out, |(lane, _)| &**lane),
+                Outbound::Foxy(_) | Outbound::Veepn(_)
+            ) && client.write_all(Front::Http.grant_line()).is_err()
+            {
+                return;
+            }
+            let (dial, out, tag) = match first {
+                Some((lane, tag)) => (None, lane, tag),
+                None => sniff_lane(out, &asked, &client, user, level),
+            };
+            let asked = dial.as_ref().unwrap_or(&asked);
+            serve_connect(
+                client,
+                &out,
+                asked,
+                Front::Http,
+                &[],
+                tag.as_deref(),
+                FlowFacts {
+                    source: None,
+                    local: None,
+                    user,
+                    level,
+                    ..FlowFacts::default()
+                },
+            );
+        }
+        ProxyRequest::Forward(asked, origin) => {
+            let destination = asked.authority();
+            crate::accesslog::record(client.peer_addr().ok(), true, &destination, None, "", email);
+            let attrs = request_line.map(|(method, path)| {
+                let mut attrs = crate::router::Attributes::new();
+                attrs.push(":method", std::borrow::Cow::Owned(method));
+                attrs.push(":path", std::borrow::Cow::Owned(path));
+                forward_headers(&origin, &mut attrs);
+                attrs
+            });
+            let filtered = (!header_names_are_tokens(&origin)).then(|| {
+                let mut copy = origin.clone();
+                drop_invalid_header_names(&mut copy);
+                copy
+            });
+            let prefix = filtered.as_deref().unwrap_or(&origin);
+            let facts = FlowFacts {
+                source: None,
+                local: None,
+                protocol: Some("http/1.1"),
+                user,
+                level,
+                attrs: attrs.as_ref(),
+                ..FlowFacts::default()
+            };
+            let (out, tag) = out.resolved_lane_with_protocol(
+                &asked,
+                crate::router::Network::Tcp,
+                Some(&client),
+                facts,
+            );
+            serve_connect(
+                client,
+                &out,
+                &asked,
+                Front::Http,
+                prefix,
+                tag.as_deref(),
+                facts,
+            );
+        }
+    }
+}
+
+/// The `mixed` front answers the same two shapes as the `socks` front on one listener.
+fn serve_mixed(client: Connection, out: &Outbound, accounts: &SocksAccounts) {
+    serve_socks(client, out, accounts);
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+/// Whether an observed exit honours the pin: the recommended location accepts any, a pinned country accepts only its own code.
+#[must_use]
+fn exit_agrees(pin: &str, seen: &str) -> bool {
+    pin.eq_ignore_ascii_case(ferrox_core::foxy::catalog::RECOMMENDED)
+        || seen == pin.to_ascii_uppercase()
+}
+
+/// Whether the trace grew a blank line, walking the octets since the last ask rather than the whole buffer.
+fn grew_blank_line(head: &[u8], scanned: &mut usize) -> bool {
+    let from = head.len().min(*scanned).saturating_sub(1);
+    *scanned = head.len();
+    head[from..].windows(2).any(|pair| pair == b"\n\n")
+}
+
+/// Asks a tunnel where it really exits: one plaintext trace GET, then the `loc` off the reply. `None` when no probe is configured or the trace did not answer — the caller reads that as "no verdict," never as agreement.
+fn foxy_exit_country<T: Read + Write>(tunnel: &mut T, foxy: &FoxyOut) -> Option<String> {
+    let probe = foxy.exit_probe.as_deref()?;
+    let (host, path) = probe.split_once('/')?;
+    let request = format!("GET /{path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    if tunnel.write_all(request.as_bytes()).is_err() {
+        return None;
+    }
+    let mut head = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 512];
+    let mut scanned = 0usize;
+    loop {
+        match tunnel.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                head.extend_from_slice(&chunk[..read]);
+                if grew_blank_line(&head, &mut scanned) || head.len() >= 4096 {
+                    break;
+                }
+            }
+        }
+    }
+    crate::foxy::exit_country(&head)
+}
+
+/// The relay a datagram flow rides: a loopback SOCKS5 association whose server half
+/// runs `serve` and whose client half is the tree's own SOCKS5 UDP client.
+///
+/// The association is the protocol's own: the greeting, the method, the `UDP
+/// ASSOCIATE` request and the reply that names the relay. The control leg comes back
+/// with it and is held for the flow's life: dropping it ends the association, and the
+/// lane stops relaying.
+pub(crate) fn udp_association(
+    serve: impl FnOnce(Connection) + Send + 'static,
+) -> Option<crate::socks::Association<Connection>> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+    let pair = listener.local_addr().ok()?;
+    let client = std::net::TcpStream::connect(pair).ok()?;
+    let (server, _) = listener.accept().ok()?;
+    drop(listener);
+    thread::spawn(move || serve(Connection::from(server)));
+    crate::socks::associate(
+        Connection::from(client),
+        &crate::socks::Credential::default(),
+    )
+}
+
+/// A leg on a SOCKS5 UDP relay: the socket the frames go through.
+///
+/// The leg's own source address is what routes the reply — the relay answers the
+/// address the request came from — so one leg per client keeps the answers apart.
+pub(crate) fn relay_leg(relay: SocketAddr) -> std::io::Result<UdpSocket> {
+    relay_leg_armed(relay, budgets::udp_idle())
+}
+
+/// A leg whose reader parks at the caller's budget instead of the tree's default, which a TUN's `udp_timeout` moves.
+pub(crate) fn relay_leg_armed(
+    relay: SocketAddr,
+    idle: std::time::Duration,
+) -> std::io::Result<UdpSocket> {
+    // An upstream relay is not a local address, so the socket is bound wildcard-side, as the outbound's own client socket is.
+    let leg = UdpSocket::bind(udp_bind_for(relay))?;
+    leg.connect(relay)?;
+    leg.set_read_timeout(Some(idle))?;
+    #[cfg(unix)]
+    {
+        // A burst the reader has not drained yet is dropped by the kernel's few-kilobyte default; ask for room in both directions.
+        crate::quic::set_receive_buffer(&leg, 4 << 20);
+        crate::quic::set_send_buffer(&leg, 4 << 20);
+    }
+    Ok(leg)
+}
+
+/// One association per source; the bound keeps distinct sources from pinning threads and sockets for the door's life.
+const MAX_DOKODEMO_LEGS: usize = 1024;
+
+/// The dokodemo UDP door: a datagram a client sends goes to the target the config
+/// names, and the answer comes back to the client that sent it.
+///
+/// The door rides the outbound's own UDP lane over a loopback SOCKS5 association, the
+/// same relay the `tun` front rides: the lane sees a datagram with a destination and
+/// never learns that a door sent it.
+///
+/// The socket is the one the front bound, so the port is held from the moment the
+/// inbound is armed, and a datagram that arrives before the door reads it waits in the
+/// kernel rather than in a refusal.
+fn dokodemo_udp_door(socket: &UdpSocket, dest: &Destination, out: &Outbound) {
+    let Some(target) = dest.socket() else {
+        eprintln!("dokodemo-door udp: rewrite target unusable, refused");
+        return;
+    };
+    // One association per client: the upstream answers the source the request came from, so a shared association cannot route two clients' replies.
+    let mut legs: HashMap<SocketAddr, (UdpSocket, Connection, Arc<AtomicBool>)> = HashMap::new();
+    let mut buf = udp_buffer();
+    // The door's frame is the door's: the address it rewrites to is the same for every datagram.
+    let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
+    let _ = socket.set_read_timeout(Some(budgets::udp_idle()));
+    loop {
+        let (n, src) = match socket.recv_from(&mut buf) {
+            Ok(read) => read,
+            Err(error) if is_timeout(&error) => {
+                legs.retain(|_, (_, _, alive)| alive.load(Ordering::Relaxed));
+                continue;
+            }
+            Err(error) if is_udp_gone(&error) => {
+                thread::sleep(UDP_POLL);
+                legs.retain(|_, (_, _, alive)| alive.load(Ordering::Relaxed));
+                continue;
+            }
+            Err(_) => return,
+        };
+        if n == 0 {
+            continue;
+        }
+        if legs
+            .get(&src)
+            .is_some_and(|(_, _, alive)| !alive.load(Ordering::Relaxed))
+        {
+            legs.remove(&src);
+        }
+        if !legs.contains_key(&src) && legs.len() >= MAX_DOKODEMO_LEGS {
+            legs.retain(|_, (_, _, alive)| alive.load(Ordering::Relaxed));
+            if legs.len() >= MAX_DOKODEMO_LEGS {
+                continue;
+            }
+        }
+        let leg = match legs.entry(src) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                let outbound = out.clone();
+                let Some(association) =
+                    udp_association(move |conn| serve_socks(conn, &outbound, &no_accounts()))
+                else {
+                    eprintln!("dokodemo-door udp: the outbound refused the association");
+                    continue;
+                };
+                let Ok(leg) = relay_leg(association.relay) else {
+                    continue;
+                };
+                let Ok(writer) = socket.try_clone() else {
+                    continue;
+                };
+                let Ok(reader) = leg.try_clone() else {
+                    continue;
+                };
+                let alive = Arc::new(AtomicBool::new(true));
+                let reader_alive = alive.clone();
+                thread::spawn(move || {
+                    let mut back = udp_buffer();
+                    while let Ok(read) = reader.recv(&mut back) {
+                        let Some((_source, payload)) = parse_socks_udp(&back[..read]) else {
+                            continue;
+                        };
+                        if writer.send_to(payload, src).is_err() {
+                            break;
+                        }
+                    }
+                    reader_alive.store(false, Ordering::Relaxed);
+                });
+                vacant.insert((leg, association.control, alive))
+            }
+        };
+        let out = socks_udp_frame(&mut frame, &target, &buf[..n]);
+        let _ = leg.0.send(out);
+    }
+}
+
+/// The transparent dokodemo UDP door: every datagram carries its own original destination,
+/// and the answer must leave from that destination or the client drops it.
+fn dokodemo_transparent_udp_door(socket: &UdpSocket, out: &Outbound, listen: SocketAddr) {
+    type Flow = (SocketAddr, SocketAddr);
+    let mut legs: HashMap<Flow, (UdpSocket, Connection, Arc<AtomicBool>)> = HashMap::new();
+    let mut buf = udp_buffer();
+    let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
+    let _ = socket.set_read_timeout(Some(budgets::udp_idle()));
+    loop {
+        let (n, client, original) = match crate::transparent::receive_original(socket, &mut buf) {
+            Ok(read) => read,
+            Err(error) if is_timeout(&error) => {
+                legs.retain(|_, (_, _, alive)| alive.load(Ordering::Relaxed));
+                continue;
+            }
+            Err(error) if is_udp_gone(&error) => {
+                thread::sleep(UDP_POLL);
+                legs.retain(|_, (_, _, alive)| alive.load(Ordering::Relaxed));
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => continue,
+            Err(_) => return,
+        };
+        if n == 0 {
+            continue;
+        }
+        if dokodemo_loopback(&Destination::Address(original), listen) {
+            continue;
+        }
+        let key = (client, original);
+        if legs
+            .get(&key)
+            .is_some_and(|(_, _, alive)| !alive.load(Ordering::Relaxed))
+        {
+            legs.remove(&key);
+        }
+        if !legs.contains_key(&key) && legs.len() >= MAX_DOKODEMO_LEGS {
+            legs.retain(|_, (_, _, alive)| alive.load(Ordering::Relaxed));
+            if legs.len() >= MAX_DOKODEMO_LEGS {
+                continue;
+            }
+        }
+        let leg = match legs.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                let outbound = out.clone();
+                let Some(association) =
+                    udp_association(move |conn| serve_socks(conn, &outbound, &no_accounts()))
+                else {
+                    eprintln!("dokodemo-door udp: the outbound refused the association");
+                    continue;
+                };
+                let Ok(leg) = relay_leg(association.relay) else {
+                    continue;
+                };
+                let Ok(writer) = crate::transparent::reply_socket(original) else {
+                    continue;
+                };
+                let Ok(reader) = leg.try_clone() else {
+                    continue;
+                };
+                let alive = Arc::new(AtomicBool::new(true));
+                let reader_alive = alive.clone();
+                thread::spawn(move || {
+                    let mut back = udp_buffer();
+                    while let Ok(read) = reader.recv(&mut back) {
+                        let Some((_source, payload)) = parse_socks_udp(&back[..read]) else {
+                            continue;
+                        };
+                        if writer.send_to(payload, client).is_err() {
+                            break;
+                        }
+                    }
+                    reader_alive.store(false, Ordering::Relaxed);
+                });
+                vacant.insert((leg, association.control, alive))
+            }
+        };
+        let out = socks_udp_frame(&mut frame, &original, &buf[..n]);
+        let _ = leg.0.send(out);
+    }
+}
+
+fn socks_udp_relay(client: &mut Connection) -> Option<UdpSocket> {
+    let local_ip = client
+        .local_addr()
+        .map_or(std::net::IpAddr::V4([127, 0, 0, 1].into()), |addr| {
+            addr.ip()
+        });
+    let relay = UdpSocket::bind(SocketAddr::new(local_ip, 0)).ok()?;
+    let relay_addr = relay.local_addr().ok()?;
+    let mut reply = vec![5, 0, 0];
+    push_socks_addr(&mut reply, &relay_addr);
+    client.write_all(&reply).ok()?;
+    relay.set_read_timeout(Some(budgets::udp_idle())).ok()?;
+    Some(relay)
+}
+
+fn serve_socks_udp(client: Connection, out: &Outbound, user: Option<&str>, level: Option<u32>) {
+    if let Outbound::Route(plan) = out {
+        let association = plan.association();
+        if matches!(association, Association::Split)
+            || crate::sniff::current().is_some_and(|sniffing| sniffing.enabled())
+        {
+            return serve_socks_udp_split(client, plan, user, level);
+        }
+        if let Ok(target) = plan.udp_out(&association) {
+            return serve_socks_udp_lane(client, &target);
+        }
+    }
+    if !matches!(out, Outbound::Block(_))
+        && crate::sniff::current().is_some_and(|sniffing| sniffing.enabled())
+    {
+        return serve_socks_udp_sniffed(client, out);
+    }
+    serve_socks_udp_lane(client, out);
+}
+
+/// One outbound that is not the routing plan still needs the sniffer's override: the lane reads
+/// the datagram's own header, and this relay rewrites it before the outbound does.
+fn serve_socks_udp_sniffed(mut client: Connection, out: &Outbound) {
+    let Some(relay) = socks_udp_relay(&mut client) else {
+        return;
+    };
+    let _ = relay.set_read_timeout(Some(UDP_POLL));
+    let _ = client.set_read_timeout(Some(UDP_POLL));
+    let local = relay
+        .local_addr()
+        .map_or(std::net::IpAddr::V4([127, 0, 0, 1].into()), |addr| {
+            addr.ip()
+        });
+    let Some(lane) = spawn_udp_lane(out, local, None, Some(local)) else {
+        return;
+    };
+    let lane_address = lane.address;
+    let peer = control_peer(Some(&client));
+    let mut client_addr: Option<SocketAddr> = None;
+    let mut pinned = None;
+    let mut buf = udp_buffer();
+    let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
+    let mut quiet = Instant::now();
+    let mut checked = Instant::now();
+    loop {
+        if checked.elapsed() >= UDP_POLL {
+            checked = Instant::now();
+            if peer_left(&client) {
+                break;
+            }
+        }
+        let (n, src) = match relay.recv_from(&mut buf) {
+            Ok(read) => read,
+            Err(error) => {
+                if !is_timeout(&error) || quiet.elapsed() >= budgets::udp_idle() {
+                    break;
+                }
+                continue;
+            }
+        };
+        if src == lane_address {
+            quiet = Instant::now();
+            if let Some(client) = client_addr {
+                let _ = relay.send_to(&buf[..n], client);
+            }
+            continue;
+        }
+        if !source_admitted(peer, pinned, src) {
+            if quiet.elapsed() >= budgets::udp_idle() {
+                break;
+            }
+            continue;
+        }
+        let Some((dest, payload)) = parse_socks_udp_dest(&buf[..n]) else {
+            continue;
+        };
+        quiet = Instant::now();
+        pin_address(&mut pinned, src);
+        client_addr = Some(src);
+        let mut dial = None;
+        if let Some(sniffing) = crate::sniff::current().filter(|sniffing| sniffing.enabled()) {
+            if let Some(found) = sniffing.inspect_udp(&dest, payload) {
+                if sniffing.should_dial_override(&found) {
+                    dial = Destination::Name(found.domain, dest.port()).socket();
+                }
+            }
+        }
+        let frame = match dial {
+            Some(address) => socks_udp_frame(&mut frame, &address, payload),
+            None => &buf[..n],
+        };
+        let _ = relay.send_to(frame, lane_address);
+    }
+    retire_udp_lanes(relay, HashMap::new(), Some(lane));
+}
+
+/// One lane for the whole association: every datagram reaches the same outbound.
+fn serve_socks_udp_lane(mut client: Connection, out: &Outbound) {
+    // A blackhole association is a refusal: a relay that drops every datagram reads as working.
+    if matches!(out, Outbound::Block(_)) {
+        let _ = client.write_all(&foxy_socks_reply(0x07));
+        return;
+    }
+    let Some(relay) = socks_udp_relay(&mut client) else {
+        return;
+    };
+    let peer = control_peer(Some(&client));
+    serve_udp_lane(&relay, out, Some(&client), peer);
+}
+
+/// One outbound's datagram lane over a relay socket. `peer` is where the relay's datagrams must
+/// come from: the control peer directly, or the splitter's own address for an inner lane.
+pub(crate) fn serve_udp_lane(
+    relay: &UdpSocket,
+    out: &Outbound,
+    associate: Option<&Connection>,
+    peer: Option<IpAddr>,
+) {
+    let source = SEND_THROUGH.with(std::cell::Cell::take);
+    let sockopts = DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take());
+    serve_udp_lane_with(relay, out, associate, peer, source, sockopts.as_ref());
+}
+
+#[allow(clippy::too_many_lines)]
+fn serve_udp_lane_with(
+    relay: &UdpSocket,
+    out: &Outbound,
+    associate: Option<&Connection>,
+    peer: Option<IpAddr>,
+    source: Option<SendThrough>,
+    sockopts: Option<&Arc<crate::sockopt::SocketOptions>>,
+) {
+    let _source = SendThroughGuard::enter(source);
+    let _sockopts = DialSockoptsGuard::enter(sockopts.cloned());
+    let sockopts = sockopts.map(Arc::as_ref);
+    match out {
+        // Loopback is TCP-only in the reference; a routed front tag has no datagram lane.
+        Outbound::Loopback(loopback) => {
+            if let Some(dial) = &loopback.dial {
+                serve_udp_lane_with(relay, dial, associate, peer, None, None);
+            }
+        }
+        // Every carrier whose mux pool is open takes the same datagram lane: one XUDP flow per destination, framed by the carrier the opener dialled.
+        Outbound::Vless(vless) if vless.mux.udp_manager().is_some() => {
+            serve_socks_udp_vless(relay, vless, peer);
+        }
+        Outbound::Vless(vless) if matches!(vless.carrier, Carrier::Quic) => {
+            serve_socks_udp_vless(relay, vless, peer);
+        }
+        Outbound::Vless(vless)
+            if matches!(vless.carrier, Carrier::Raw(_)) && vless.tls.is_none() =>
+        {
+            serve_socks_udp_vless(relay, vless, peer);
+        }
+        Outbound::Vless(vless) if matches!(vless.carrier, Carrier::Hysteria(_)) => {
+            // The datagram lane carries UDP flows the same way it carries TCP ones: one association per destination, ids never reused on the connection.
+            if let Some(dial) = hysteria_dial_session(vless) {
+                crate::hysteria::serve_udp(relay, &dial, peer);
+            }
+        }
+        Outbound::Trojan(trojan) if trojan.mux.udp_manager().is_some() => {
+            serve_socks_udp_trojan(relay, trojan, peer);
+        }
+        Outbound::Trojan(trojan) if matches!(trojan.carrier, Carrier::Hysteria(_)) => {
+            if let Some(dial) = trojan_hysteria_dial(trojan) {
+                crate::hysteria::serve_udp(relay, &dial, peer);
+            }
+        }
+        Outbound::Trojan(trojan) if trojan_udp_carried(&trojan.carrier) => {
+            serve_socks_udp_trojan(relay, trojan, peer);
+        }
+        Outbound::Vmess(vmess) => serve_socks_udp_vmess(relay, vmess, peer),
+        Outbound::Shadowsocks(ss) if ss.mux.udp_manager().is_some() => {
+            serve_socks_udp_shadowsocks(relay, ss, peer);
+        }
+        Outbound::Shadowsocks(ss) if matches!(ss.carrier, Carrier::Raw(_)) => {
+            serve_socks_udp_shadowsocks(relay, ss, peer);
+        }
+        Outbound::Hysteria(hy) => {
+            let dial = hy.dial();
+            if dial.config.version == 1 {
+                crate::hysteria_v1::serve_udp(relay, &dial, peer);
+            } else {
+                crate::hysteria::serve_udp(relay, &dial, peer);
+            }
+        }
+        Outbound::Tuic(tuic) => tuic.serve_udp(relay, associate, peer),
+        Outbound::Foxy(foxy) => match foxy.carrier {
+            // One tunnel for all destinations: later ones ride the first one opened.
+            crate::foxy::Carrier::H3 => serve_socks_udp_foxy_ip(relay, foxy, associate, peer),
+            _ => serve_socks_udp_foxy(relay, foxy, associate, peer),
+        },
+        Outbound::WireGuard(wireguard) => wireguard.serve_udp(relay, associate, peer),
+        Outbound::Masque(masque) => masque.serve_udp(relay, associate, peer),
+        Outbound::Warp(warp) => warp.serve_udp(relay, associate, peer),
+        Outbound::Freedom(out) => {
+            serve_socks_udp_freedom(relay, out, source, sockopts, associate, peer);
+        }
+        Outbound::Socks(socks) => {
+            if socks.version == crate::socks::Version::V4 {
+                // SOCKS4 has no datagram half: the association is a SOCKS5 request.
+                return;
+            }
+            let Some(server) = resolve_outbound(&socks.address, socks.port) else {
+                return;
+            };
+            serve_socks_udp_client(
+                relay,
+                server,
+                &socks.credential,
+                socks.version,
+                associate,
+                peer,
+            );
+        }
+        Outbound::Psiphon(lane) => {
+            serve_socks_udp_client(
+                relay,
+                lane.endpoint(),
+                lane.credential(),
+                lane.version(),
+                associate,
+                peer,
+            );
+        }
+        Outbound::Dns(dns) => serve_dns_udp(relay, dns, peer),
+        Outbound::ReversePortal(portal) => serve_socks_udp_portal(relay, portal, peer),
+        _ => {}
+    }
+}
+
+/// A datagram flow the rules routed to a portal: one mux UDP flow per destination, its replies
+/// framed back to the client that sent the datagram.
+fn serve_socks_udp_portal(
+    relay: &UdpSocket,
+    portal: &crate::reverse::Portal,
+    peer: Option<IpAddr>,
+) {
+    struct Lane {
+        session: Arc<crate::reverse::Session>,
+        id: u16,
+        pump: thread::JoinHandle<()>,
+    }
+    // The map answers a datagram's key in one probe; `order` keeps insertion order for the teardown ends.
+    let mut lanes: HashMap<SocketAddr, Lane> = HashMap::new();
+    let mut order: Vec<SocketAddr> = Vec::new();
+    let mut buf = udp_buffer();
+    while let Ok((n, src)) = relay.recv_from(&mut buf) {
+        if !source_ip_ok(peer, src) {
+            continue;
+        }
+        let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
+            continue;
+        };
+        if payload.is_empty() || payload.len() > ferrox_core::mux::CHUNK_MAX {
+            continue;
+        }
+        let sent = {
+            let lane = match lanes.entry(dest) {
+                std::collections::hash_map::Entry::Occupied(lane) => lane.into_mut(),
+                std::collections::hash_map::Entry::Vacant(lane) => {
+                    let target = ferrox_core::mux::Target {
+                        network: ferrox_core::mux::Network::Udp,
+                        port: dest.port(),
+                        addr: match dest.ip() {
+                            std::net::IpAddr::V4(ip) => ferrox_core::addr::Addr::V4(ip.octets()),
+                            std::net::IpAddr::V6(ip) => ferrox_core::addr::Addr::V6(ip.octets()),
+                        },
+                    };
+                    let Some((session, id, flow)) =
+                        portal.open(target, ferrox_core::mux::DEFAULT_CAP as u32)
+                    else {
+                        eprintln!(
+                            "reverse: portal `{}` has no live session, so the datagram is dropped",
+                            portal.tag()
+                        );
+                        continue;
+                    };
+                    let Ok(output) = relay.try_clone() else {
+                        session.end(id);
+                        continue;
+                    };
+                    let replies = session.clone();
+                    let client_addr = src;
+                    let pump = thread::spawn(move || {
+                        let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
+                        while let Ok((data, from)) = flow.down.recv() {
+                            // The header names the sender the bridge saw, so the datagram reads as coming from the address that answered.
+                            let sender = from.unwrap_or(dest);
