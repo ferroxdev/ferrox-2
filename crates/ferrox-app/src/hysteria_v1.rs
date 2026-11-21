@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, ToSocketAddrs as _, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -588,94 +588,135 @@ fn server_config(
     Some(config)
 }
 
+/// One destination an association carries: the peer it resolved to, the reassembly in flight, the
+/// datagrams that arrived before the name resolved, and the stamp eviction reads.
+struct Assoc {
+    host: String,
+    port: u16,
+    dest: Option<SocketAddr>,
+    defrag: Defrag,
+    waiting: Vec<Vec<u8>>,
+    resolving: bool,
+    used: u64,
+}
+
+impl Assoc {
+    fn new(host: &str, port: u16, used: u64) -> Self {
+        Self {
+            host: host.to_owned(),
+            port,
+            dest: None,
+            defrag: Defrag::new(),
+            waiting: Vec::new(),
+            resolving: false,
+            used,
+        }
+    }
+
+    fn is(&self, host: &str, port: u16) -> bool {
+        self.port == port && self.host == host
+    }
+}
+
+/// Every destination one flow carries, scanned in place so a datagram on a known destination
+/// neither builds a key nor inserts one. `waiting` counts the queued payloads across all of them.
+#[derive(Default)]
+struct Assocs {
+    list: Vec<Assoc>,
+    waiting: usize,
+}
+
+impl Assocs {
+    fn find(&self, host: &str, port: u16) -> Option<usize> {
+        self.list.iter().position(|assoc| assoc.is(host, port))
+    }
+
+    fn insert(&mut self, host: &str, port: u16, used: u64) -> Option<usize> {
+        if self.list.len() >= MAX_UDP_ASSOCIATIONS {
+            return None;
+        }
+        self.list.push(Assoc::new(host, port, used));
+        Some(self.list.len() - 1)
+    }
+
+    fn enqueue(&mut self, at: usize, payload: Vec<u8>) {
+        self.list[at].waiting.push(payload);
+        self.waiting += 1;
+    }
+
+    fn drain(&mut self, at: usize) -> Vec<Vec<u8>> {
+        let drained = std::mem::take(&mut self.list[at].waiting);
+        self.waiting = self.waiting.saturating_sub(drained.len());
+        drained
+    }
+
+    fn evict(&mut self, at: usize) {
+        let assoc = self.list.swap_remove(at);
+        self.waiting = self.waiting.saturating_sub(assoc.waiting.len());
+    }
+
+    fn start_waiting(&mut self, room: usize) -> Vec<(String, u16)> {
+        let mut keys = Vec::new();
+        for assoc in &mut self.list {
+            if keys.len() >= room {
+                break;
+            }
+            if assoc.resolving || assoc.waiting.is_empty() {
+                continue;
+            }
+            assoc.resolving = true;
+            keys.push((assoc.host.clone(), assoc.port));
+        }
+        keys
+    }
+}
+
+/// One clock read per datagram is both the idle stamp and the eviction order.
+static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+fn now_nanos() -> u64 {
+    let epoch = EPOCH.get_or_init(Instant::now);
+    u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
 struct UdpFlow {
     target: Arc<UdpSocket>,
-    dests: HashMap<(String, u16), SocketAddr>,
-    waiting: HashMap<(String, u16), Vec<Vec<u8>>>,
-    resolving: HashSet<(String, u16)>,
-    defrags: HashMap<(String, u16), Defrag>,
-    used: HashMap<(String, u16), Instant>,
-    last: Arc<Mutex<Instant>>,
+    assocs: Assocs,
+    last: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
 }
 
 struct PendingUdp {
     token: u64,
-    host: String,
-    port: u16,
-    defrags: HashMap<(String, u16), Defrag>,
-    packets: HashMap<(String, u16), Vec<Vec<u8>>>,
-}
-
-fn touch(last: &Arc<Mutex<Instant>>) {
-    if let Ok(mut last) = last.lock() {
-        *last = Instant::now();
-    }
-}
-
-/// The destination an established association already resolved, or the literal it names
-/// registered once: a datagram on that path neither clones its key nor rewrites the table.
-fn dest_of(
-    dests: &mut HashMap<(String, u16), SocketAddr>,
-    literal: Option<SocketAddr>,
-    key: &(String, u16),
-) -> Option<SocketAddr> {
-    if let Some(peer) = dests.get(key) {
-        return Some(*peer);
-    }
-    let peer = literal?;
-    dests.insert(key.clone(), peer);
-    Some(peer)
+    assocs: Assocs,
 }
 
 impl UdpFlow {
-    fn track(&mut self, key: &(String, u16)) -> bool {
-        let now = Instant::now();
-        if let Some(at) = self.used.get_mut(key) {
-            *at = now;
-            return true;
+    /// The destination this datagram names, stamped and made room for when it is new: `None` when
+    /// every association is resolving or holding datagrams and the cap refuses one more.
+    fn slot(&mut self, host: &str, port: u16, now: u64) -> Option<usize> {
+        if let Some(at) = self.assocs.find(host, port) {
+            self.assocs.list[at].used = now;
+            return Some(at);
         }
-        while self.used.len() >= MAX_UDP_ASSOCIATIONS {
+        while self.assocs.list.len() >= MAX_UDP_ASSOCIATIONS {
             let mut victim = None;
             let mut oldest = now;
-            for (other, at) in &self.used {
-                if other == key
-                    || self.resolving.contains(other)
-                    || self.waiting.contains_key(other)
-                {
+            for (at, assoc) in self.assocs.list.iter().enumerate() {
+                if assoc.resolving || !assoc.waiting.is_empty() {
                     continue;
                 }
-                if *at <= oldest {
-                    oldest = *at;
-                    victim = Some(other.clone());
+                if assoc.used <= oldest {
+                    oldest = assoc.used;
+                    victim = Some(at);
                 }
             }
-            let Some(victim) = victim else {
+            let Some(at) = victim else {
                 break;
             };
-            self.used.remove(&victim);
-            self.dests.remove(&victim);
-            self.defrags.remove(&victim);
+            self.assocs.evict(at);
         }
-        if self.used.len() >= MAX_UDP_ASSOCIATIONS {
-            return false;
-        }
-        self.used.insert(key.clone(), now);
-        true
-    }
-
-    fn start_waiting(&mut self, room: usize) -> Vec<(String, u16)> {
-        let keys: Vec<_> = self
-            .waiting
-            .keys()
-            .filter(|key| !self.resolving.contains(*key))
-            .take(room)
-            .cloned()
-            .collect();
-        for key in &keys {
-            self.resolving.insert(key.clone());
-        }
-        keys
+        self.assocs.insert(host, port, now)
     }
 }
 
@@ -686,7 +727,7 @@ impl UdpLane {
             if spawn.len() >= room {
                 break;
             }
-            for (host, port) in flow.start_waiting(room - spawn.len()) {
+            for (host, port) in flow.assocs.start_waiting(room - spawn.len()) {
                 spawn.push((*session, host, port));
             }
         }
@@ -816,7 +857,7 @@ fn open_udp(
     target.set_read_timeout(Some(UDP_POLL)).ok()?;
     let target = Arc::new(target);
     let stop = Arc::new(AtomicBool::new(false));
-    let last = Arc::new(Mutex::new(Instant::now()));
+    let last = Arc::new(AtomicU64::new(now_nanos()));
     std::thread::spawn({
         let shared = Arc::clone(shared);
         let sock = Arc::clone(sock);
@@ -827,11 +868,7 @@ fn open_udp(
     });
     Some(UdpFlow {
         target,
-        dests: HashMap::new(),
-        waiting: HashMap::new(),
-        resolving: HashSet::new(),
-        defrags: HashMap::new(),
-        used: HashMap::new(),
+        assocs: Assocs::default(),
         last,
         stop,
     })
@@ -882,7 +919,7 @@ fn udp_reader(
     shared: &Arc<Mutex<quiche::Connection>>,
     sock: &Arc<crate::quic::Datagram>,
     target: &Arc<UdpSocket>,
-    last: &Arc<Mutex<Instant>>,
+    last: &Arc<AtomicU64>,
     stop: &AtomicBool,
     session: u32,
 ) {
@@ -914,7 +951,7 @@ fn udp_reader(
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        touch(last);
+        last.store(now_nanos(), Ordering::Relaxed);
         let Ok(mut conn) = shared.lock() else {
             break;
         };
@@ -1015,13 +1052,14 @@ fn relay_datagrams(
             let _ = conn.close(false, 0, b"");
             return;
         }
+        let host = message.host;
+        let port = message.port;
+        let now = now_nanos();
         if lane.flows.contains_key(&session) {
-            let key = (message.host.to_owned(), message.port);
-            let literal = key
-                .0
+            let literal = host
                 .parse::<IpAddr>()
                 .ok()
-                .map(|ip| SocketAddr::new(ip, message.port));
+                .map(|ip| SocketAddr::new(ip, port));
             let room = MAX_PENDING_RESOLVERS.saturating_sub(lane.resolving);
             let mut assembled = Vec::new();
             let forged;
@@ -1030,32 +1068,24 @@ fn relay_datagrams(
                 let Some(flow) = lane.flows.get_mut(&session) else {
                     continue;
                 };
-                if !flow.track(&key) {
+                flow.last.store(now, Ordering::Relaxed);
+                let Some(at) = flow.slot(host, port, now) else {
                     continue;
-                }
-                let whole = flow
-                    .defrags
-                    .entry(key.clone())
-                    .or_insert_with(Defrag::new)
-                    .feed(&message, &mut assembled);
-                touch(&flow.last);
+                };
+                let whole = flow.assocs.list[at].defrag.feed(&message, &mut assembled);
                 forged = whole.is_err();
                 match whole {
                     Ok(Some(message)) => {
-                        let peer = dest_of(&mut flow.dests, literal, &key);
+                        let assoc = &mut flow.assocs.list[at];
+                        let peer = assoc.dest.or(literal);
                         if let Some(peer) = peer {
-                            flow.waiting.remove(&key);
+                            assoc.dest = Some(peer);
+                            drop(flow.assocs.drain(at));
                             let _ = flow
                                 .target
                                 .send_to(message.payload, target_addr(&flow.target, peer));
-                        } else {
-                            let queued: usize = flow.waiting.values().map(Vec::len).sum::<usize>();
-                            if queued < MAX_PENDING_DATAGRAMS {
-                                flow.waiting
-                                    .entry(key.clone())
-                                    .or_default()
-                                    .push(message.payload.to_vec());
-                            }
+                        } else if flow.assocs.waiting < MAX_PENDING_DATAGRAMS {
+                            flow.assocs.enqueue(at, message.payload.to_vec());
                         }
                     }
                     Ok(None) => {}
@@ -1092,46 +1122,35 @@ fn relay_datagrams(
                 if at_cap || !can_spawn {
                     continue;
                 }
-                let host = message.host.to_owned();
-                let port = message.port;
-                let key = (host.clone(), port);
                 *next_token = next_token.wrapping_add(1);
                 *resolving += 1;
-                let inserted = vacant.insert(PendingUdp {
-                    token,
-                    host: host.clone(),
-                    port,
-                    defrags: HashMap::from([(key.clone(), Defrag::new())]),
-                    packets: HashMap::from([(key, Vec::new())]),
-                });
+                let mut assocs = Assocs::default();
+                let _ = assocs.insert(host, port, 0);
+                let inserted = vacant.insert(PendingUdp { token, assocs });
+                let owned = host.to_owned();
                 std::thread::spawn({
                     let lane = Arc::clone(&lane_handle);
                     let shared = Arc::clone(shared);
                     let sock = Arc::clone(sock);
-                    move || resolve_pending(lane, shared, sock, session, host, port, token)
+                    move || resolve_pending(lane, shared, sock, session, owned, port, token)
                 });
                 inserted
             }
         };
-        let key = (message.host.to_owned(), message.port);
-        if !pending.defrags.contains_key(&key) {
-            if pending.defrags.len() >= MAX_UDP_ASSOCIATIONS {
-                continue;
-            }
-            pending.defrags.insert(key.clone(), Defrag::new());
-            pending.packets.insert(key.clone(), Vec::new());
-        }
-        let queued: usize = pending.packets.values().map(Vec::len).sum();
-        let Some(defrag) = pending.defrags.get_mut(&key) else {
+        let Some(at) = pending
+            .assocs
+            .find(host, port)
+            .or_else(|| pending.assocs.insert(host, port, 0))
+        else {
             continue;
         };
         let mut assembled = Vec::new();
-        let whole = defrag.feed(&message, &mut assembled);
+        let whole = pending.assocs.list[at]
+            .defrag
+            .feed(&message, &mut assembled);
         match whole {
-            Ok(Some(message)) if queued < MAX_PENDING_DATAGRAMS => {
-                if let Some(packets) = pending.packets.get_mut(&key) {
-                    packets.push(message.payload.to_vec());
-                }
+            Ok(Some(message)) if pending.assocs.waiting < MAX_PENDING_DATAGRAMS => {
+                pending.assocs.enqueue(at, message.payload.to_vec());
             }
             Ok(_) => {}
             Err(_) => {
@@ -1198,23 +1217,17 @@ fn resolve_pending(
         resume_lane(&lane);
         return;
     };
-    let first = (pending.host.clone(), pending.port);
-    flow.dests.insert(first.clone(), peer);
-    flow.defrags = pending.defrags;
-    let now = Instant::now();
-    for key in flow.defrags.keys() {
-        flow.used.insert(key.clone(), now);
+    flow.assocs = pending.assocs;
+    let now = now_nanos();
+    for assoc in &mut flow.assocs.list {
+        assoc.used = now;
     }
-    flow.used.insert(first.clone(), now);
-    for (key, packets) in pending.packets {
-        if key == first {
-            for payload in packets {
-                let _ = flow
-                    .target
-                    .send_to(&payload, target_addr(&flow.target, peer));
-            }
-        } else {
-            flow.waiting.insert(key, packets);
+    if !flow.assocs.list.is_empty() {
+        flow.assocs.list[0].dest = Some(peer);
+        for payload in flow.assocs.drain(0) {
+            let _ = flow
+                .target
+                .send_to(&payload, target_addr(&flow.target, peer));
         }
     }
     guard.flows.insert(session, flow);
@@ -1251,7 +1264,6 @@ fn resume_lane(lane: &Arc<Mutex<UdpLane>>) {
 #[allow(clippy::needless_pass_by_value)]
 fn resolve_dest(handle: Arc<Mutex<UdpLane>>, session: u32, host: String, port: u16) {
     let mut resolving = Resolving::new(Arc::clone(&handle));
-    let key = (host.clone(), port);
     let peer = crate::proxy::resolve_bounded(&host, port, UDP_RESOLVE_BUDGET, |host, port| {
         (host, port)
             .to_socket_addrs()
@@ -1262,21 +1274,19 @@ fn resolve_dest(handle: Arc<Mutex<UdpLane>>, session: u32, host: String, port: u
         return;
     };
     if let Some(flow) = lane.flows.get_mut(&session) {
-        flow.resolving.remove(&key);
-        if let Some(peer) = peer {
-            flow.dests.insert(key.clone(), peer);
-            if let Some(packets) = flow.waiting.remove(&key) {
-                for payload in packets {
+        if let Some(at) = flow.assocs.find(&host, port) {
+            flow.assocs.list[at].resolving = false;
+            if let Some(peer) = peer {
+                flow.assocs.list[at].dest = Some(peer);
+                let queued = flow.assocs.drain(at);
+                for payload in queued {
                     let _ = flow
                         .target
                         .send_to(&payload, target_addr(&flow.target, peer));
                 }
+            } else {
+                flow.assocs.evict(at);
             }
-        } else {
-            flow.waiting.remove(&key);
-            flow.dests.remove(&key);
-            flow.defrags.remove(&key);
-            flow.used.remove(&key);
         }
     }
     resolving.release_in(&mut lane);
@@ -1484,6 +1494,10 @@ impl Router<'_> {
     }
 
     fn idle(&mut self) {
+        self.idle_at(now_nanos());
+    }
+
+    fn idle_at(&mut self, now: u64) {
         let Self {
             routes,
             sock,
@@ -1491,7 +1505,7 @@ impl Router<'_> {
             udp_idle,
             ..
         } = self;
-        let now = Instant::now();
+        let idle_nanos = u64::try_from(udp_idle.as_nanos()).unwrap_or(u64::MAX);
         routes.retain(|_, inbound| {
             let Ok(mut conn) = inbound.conn.lock() else {
                 return true;
@@ -1512,10 +1526,7 @@ impl Router<'_> {
             inbound.send.bump();
             if let Ok(mut lane) = inbound.udp.lock() {
                 lane.flows.retain(|_, flow| {
-                    let idle = flow
-                        .last
-                        .lock()
-                        .is_ok_and(|last| now.duration_since(*last) > *udp_idle);
+                    let idle = now.saturating_sub(flow.last.load(Ordering::Relaxed)) > idle_nanos;
                     if idle {
                         flow.stop.store(true, Ordering::Relaxed);
                         false
@@ -1792,7 +1803,8 @@ mod tests {
     #[test]
     fn a_v1_datagram_association_reaps_on_the_configured_idle() {
         // The v1 server's reaper takes the stream's `udpIdleTimeout` too: a six-second-old association dies at five and lives at sixty.
-        let reaps = |udp_idle: Duration| {
+        let stamp = now_nanos();
+        let reaps = |udp_idle: Duration, age: u64| {
             let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("configures");
             config
                 .set_application_protos(&[wire::ALPN])
@@ -1810,16 +1822,8 @@ mod tests {
                 1,
                 UdpFlow {
                     target: Arc::new(target),
-                    dests: HashMap::new(),
-                    waiting: HashMap::new(),
-                    resolving: HashSet::new(),
-                    defrags: HashMap::new(),
-                    used: HashMap::new(),
-                    last: Arc::new(Mutex::new(
-                        Instant::now()
-                            .checked_sub(Duration::from_secs(6))
-                            .expect("six seconds ago"),
-                    )),
+                    assocs: Assocs::default(),
+                    last: Arc::new(AtomicU64::new(stamp)),
                     stop: Arc::clone(&stop),
                 },
             );
@@ -1851,14 +1855,21 @@ mod tests {
                 udp_idle,
                 routes: by_scid,
             };
-            router.idle();
+            router.idle_at(stamp + age);
             stop.load(Ordering::Relaxed)
         };
         assert!(
-            reaps(Duration::from_secs(5)),
+            reaps(Duration::from_secs(5), 6_000_000_000),
             "five seconds reaps a six-second-old association"
         );
-        assert!(!reaps(Duration::from_secs(60)), "sixty seconds keeps it");
+        assert!(
+            !reaps(Duration::from_secs(5), 4_000_000_000),
+            "five seconds keeps a four-second-old association"
+        );
+        assert!(
+            !reaps(Duration::from_secs(60), 6_000_000_000),
+            "sixty seconds keeps it"
+        );
     }
 
     #[test]
@@ -1983,7 +1994,7 @@ mod tests {
             .expect("queues a datagram");
 
         let stop = AtomicBool::new(true);
-        let last = Arc::new(Mutex::new(Instant::now()));
+        let last = Arc::new(AtomicU64::new(now_nanos()));
         let reader = std::thread::spawn({
             let shared = Arc::clone(&shared);
             let sock = Arc::clone(&sock);
@@ -2022,7 +2033,7 @@ mod tests {
         let sender = UdpSocket::bind("127.0.0.1:0").expect("binds the sender");
 
         let stop = Arc::new(AtomicBool::new(false));
-        let last = Arc::new(Mutex::new(Instant::now()));
+        let last = Arc::new(AtomicU64::new(now_nanos()));
         let reader = std::thread::spawn({
             let shared = Arc::clone(&shared);
             let sock = Arc::clone(&sock);
@@ -2056,82 +2067,140 @@ mod tests {
         let target = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let mut flow = UdpFlow {
             target: Arc::new(target),
-            dests: HashMap::new(),
-            waiting: HashMap::new(),
-            resolving: HashSet::new(),
-            defrags: HashMap::new(),
-            used: HashMap::new(),
-            last: Arc::new(Mutex::new(Instant::now())),
+            assocs: Assocs::default(),
+            last: Arc::new(AtomicU64::new(now_nanos())),
             stop: Arc::new(AtomicBool::new(false)),
         };
-        let old = Instant::now()
-            .checked_sub(Duration::from_secs(1))
-            .expect("one second ago");
+        let old = now_nanos().saturating_sub(1_000_000_000);
         for index in 0..MAX_UDP_ASSOCIATIONS {
-            let key = (format!("old{index}.test"), 53);
-            flow.used.insert(key.clone(), old);
-            flow.dests
-                .insert(key, SocketAddr::from(([127, 0, 0, 1], 53)));
+            let host = format!("old{index}.test");
+            let at = flow.assocs.insert(&host, 53, old).expect("room");
+            flow.assocs.list[at].dest = Some(SocketAddr::from(([127, 0, 0, 1], 53)));
         }
-        let fresh = ("new.test".to_owned(), 53);
-        assert!(flow.track(&fresh));
-        assert!(flow.used.contains_key(&fresh));
-        assert_eq!(flow.used.len(), MAX_UDP_ASSOCIATIONS);
-        flow.waiting.insert(fresh.clone(), Vec::new());
-        assert_eq!(flow.start_waiting(1), vec![fresh.clone()]);
-        assert!(flow.resolving.contains(&fresh));
+        let at = flow
+            .slot("new.test", 53, now_nanos())
+            .expect("an idle slot is evicted");
+        assert!(flow.assocs.list[at].is("new.test", 53));
+        assert_eq!(flow.assocs.list.len(), MAX_UDP_ASSOCIATIONS);
+        let kept = (0..MAX_UDP_ASSOCIATIONS)
+            .filter(|index| flow.assocs.find(&format!("old{index}.test"), 53).is_some())
+            .count();
+        assert_eq!(
+            kept,
+            MAX_UDP_ASSOCIATIONS - 1,
+            "one idle association made room"
+        );
+        assert_eq!(flow.assocs.start_waiting(1), Vec::new());
     }
 
-    /// A datagram on a known association refreshes both tables in place: no key is cloned and
-    /// no table is rewritten.
+    /// A destination holding datagrams is never evicted to make room, so a flow at the cap
+    /// refuses the new destination instead of dropping reassembly state.
     #[test]
-    fn an_established_destination_costs_no_key_and_no_insert() {
-        let key = ("example.test".to_owned(), 53);
-        let peer: SocketAddr = "203.0.113.9:53".parse().expect("addr");
-        let mut dests = HashMap::new();
-        dests.insert(key.clone(), peer);
-        let (back, counts) = ferrox_core::alloc_count::measure(|| dest_of(&mut dests, None, &key));
-        assert_eq!(counts.allocs, 0, "the established destination costs no key");
-        assert_eq!(back, Some(peer));
-        assert_eq!(dests.len(), 1, "the table is not rewritten");
-        let ((), before) = ferrox_core::alloc_count::measure(|| {
-            let mut table = HashMap::new();
-            table.insert(key.clone(), peer);
-        });
-        assert!(
-            before.allocs > counts.allocs,
-            "the old shape cloned the key each time"
-        );
-
-        let literal = ("203.0.113.9".to_owned(), 53);
-        let (back, _) =
-            ferrox_core::alloc_count::measure(|| dest_of(&mut dests, Some(peer), &literal));
-        assert_eq!(back, Some(peer), "a literal resolves to itself");
-        assert_eq!(dests.len(), 2, "and it is registered once");
-
+    fn a_waiting_association_is_not_evicted_for_a_fresh_one() {
         let target = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let mut flow = UdpFlow {
             target: Arc::new(target),
-            dests: HashMap::new(),
-            waiting: HashMap::new(),
-            resolving: HashSet::new(),
-            defrags: HashMap::new(),
-            used: HashMap::new(),
-            last: Arc::new(Mutex::new(Instant::now())),
+            assocs: Assocs::default(),
+            last: Arc::new(AtomicU64::new(now_nanos())),
             stop: Arc::new(AtomicBool::new(false)),
         };
-        flow.used.insert(key.clone(), Instant::now());
-        let (kept, counts) = ferrox_core::alloc_count::measure(|| flow.track(&key));
-        assert!(kept);
-        assert_eq!(counts.allocs, 0, "tracking a known key costs no key");
-        assert_eq!(flow.used.len(), 1);
+        for index in 0..MAX_UDP_ASSOCIATIONS {
+            let host = format!("held{index}.test");
+            let at = flow.assocs.insert(&host, 53, 0).expect("room");
+            flow.assocs.enqueue(at, vec![1]);
+        }
+        assert_eq!(flow.assocs.waiting, MAX_UDP_ASSOCIATIONS);
+        assert!(
+            flow.slot("new.test", 53, now_nanos()).is_none(),
+            "a queue no eviction may drop refuses the new destination"
+        );
+        let waiting = flow.assocs.start_waiting(MAX_UDP_ASSOCIATIONS);
+        assert_eq!(waiting.len(), MAX_UDP_ASSOCIATIONS);
+        assert_eq!(
+            flow.assocs.drain(0).len(),
+            1,
+            "a resolution takes the queue it waited on"
+        );
+        assert_eq!(flow.assocs.waiting, MAX_UDP_ASSOCIATIONS - 1);
+    }
+
+    /// A datagram on a known association finds its destination in place: no key is cloned and no
+    /// table is rewritten.
+    #[test]
+    fn an_established_destination_costs_no_key_and_no_insert() {
+        let host = "example.test";
+        let port = 53u16;
+        let peer: SocketAddr = "203.0.113.9:53".parse().expect("addr");
+        let mut assocs = Assocs::default();
+        let at = assocs.insert(host, port, 0).expect("room");
+        assocs.list[at].dest = Some(peer);
+        let (found, counts) = ferrox_core::alloc_count::measure(|| assocs.find(host, port));
+        assert_eq!(found, Some(at));
+        assert_eq!(counts.allocs, 0, "the established destination costs no key");
+        assert_eq!(counts.bytes, 0);
+
+        let mut used = HashMap::new();
+        used.insert((host.to_owned(), port), at);
+        let mut defrags = HashMap::new();
+        defrags.insert((host.to_owned(), port), Defrag::new());
         let ((), before) = ferrox_core::alloc_count::measure(|| {
-            flow.used.insert(key.clone(), Instant::now());
+            let key = (host.to_owned(), port);
+            let _ = used.entry(key.clone()).or_insert(at);
+            let _ = defrags.entry(key.clone()).or_insert_with(Defrag::new);
         });
         assert!(
-            before.allocs > counts.allocs,
-            "the old shape cloned the key per datagram"
+            before.allocs >= 3,
+            "the old shape built a key and cloned it per table"
         );
+
+        let payload = [1u8, 2, 3];
+        let datagram = UdpMessage {
+            session: 1,
+            host,
+            port,
+            packet: 0,
+            frag: 0,
+            frags: 1,
+            payload: &payload,
+        };
+        let mut assembled = Vec::new();
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            for _ in 0..8 {
+                let whole = assocs.list[at]
+                    .defrag
+                    .feed(&datagram, &mut assembled)
+                    .expect("a whole datagram")
+                    .expect("nothing was missing");
+                assert_eq!(whole.payload, &payload[..]);
+            }
+        });
+        assert_eq!(
+            counts.allocs, 0,
+            "a whole datagram costs no key and no copy"
+        );
+
+        let mut waiting: HashMap<(String, u16), Vec<Vec<u8>>> = HashMap::new();
+        let ((), before) = ferrox_core::alloc_count::measure(|| {
+            for _ in 0..8 {
+                let key = (host.to_owned(), port);
+                waiting.entry(key.clone()).or_default().push(Vec::new());
+            }
+        });
+        assert!(
+            before.allocs >= 8,
+            "the old shape cloned the key to queue a datagram"
+        );
+        assocs.list[at].waiting.reserve(8);
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            for _ in 0..8 {
+                assocs.enqueue(at, Vec::new());
+            }
+        });
+        assert_eq!(
+            counts.allocs, 0,
+            "a queued datagram costs its payload, not a key"
+        );
+        assert_eq!(assocs.waiting, 8);
     }
 
     /// The host a datagram's message carries is the address's own text, written into a stack

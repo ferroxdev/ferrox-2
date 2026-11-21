@@ -217,6 +217,8 @@ mux-variants padding-protocols-round-trip 3 ferrox-app-singmux::tests::padding_r
 mux-variants packet-addr-protocols-round-trip 3 ferrox-app-singmux::tests::packet_addr_frames_each_datagram_with_its_destination
 mux-variants carrier-protocols-round-trip 3 ferrox-app-proxy::tests::a_vless_singmux_carries_a_tcp_stream_on_each_protocol
 mux-variants absent-protocol-keeps-mux-cool 1 ferrox-app-proxy::tests::an_absent_mux_protocol_keeps_mux_cool_and_an_explicit_one_selects_singmux
+mux-variants frame-buffer-allocations-per-frame 0 ferrox-app-singmux::tests::a_mux_frame_is_read_into_the_sessions_own_buffer
+mux-variants udp-packet-buffer-allocations-per-packet 0 ferrox-app-singmux::tests::a_mux_udp_packet_is_read_into_the_sessions_own_buffer
 
 # --- carriers ---------------------------------------------------------------
 carrier-websocket ops-retired-instructions UNBLESSED scripts/count-ops.sh
@@ -1281,5 +1283,6 @@ wireguard stack-reply-copies-per-datagram 0 ferrox-app-wg-stack::tests::a_reply_
 carrier-masque h3-lane-prefix-bytes-moved-per-datagram 0 ferrox-app-masque::tests::a_lane_datagram_keeps_its_prefix
 carrier-hysteria datagram-host-allocations-per-datagram 0 ferrox-app-hysteria-v1::tests::a_datagram_host_is_the_address_text_without_the_heap
 carrier-hysteria established-destination-allocations-per-datagram 0 ferrox-app-hysteria-v1::tests::an_established_destination_costs_no_key_and_no_insert
+carrier-hysteria queued-datagram-allocations-per-datagram 0 ferrox-app-hysteria_v1::tests::an_established_destination_costs_no_key_and_no_insert
 socks reply-head-allocations-per-reply-datagram 0 ferrox-app-proxy::tests::a_reply_head_is_written_without_a_buffer
 socks reply-ns-per-reply 2.3 .github/workflows/bench.yml
