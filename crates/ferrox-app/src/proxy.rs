@@ -11025,7 +11025,7 @@ fn serve_vless_quic(
     let mut stream = stream;
     let decoded = decode_request_bounded_gated(
         &mut stream,
-        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom, false),
+        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom, true),
         resolve_endpoint,
     );
     let Some((got, flow, cmd, target)) = decoded else {
@@ -11091,7 +11091,7 @@ fn serve_vless_quic_sealed(
 ) {
     let decoded = decode_request_bounded_gated(
         &mut sealed,
-        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom, false),
+        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom, true),
         resolve_endpoint,
     );
     let Some((got, flow, cmd, target)) = decoded else {
