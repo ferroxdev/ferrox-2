@@ -5054,6 +5054,16 @@ mod tests {
         let path = dir.join("sock");
         let target = parse_target(&format!("unix:{},0750", path.display())).expect("parses");
         let listener = Listener::bind(&target).expect("binds under the staged mode");
+        assert!(
+            matches!(
+                &listener,
+                Listener::Unix {
+                    staged: Some(_),
+                    ..
+                }
+            ),
+            "the test needs a staged bind"
+        );
         let client = std::os::unix::net::UnixStream::connect(&path).expect("connects a client");
         let accepted = match &listener {
             Listener::Unix { listener, .. } => listener.accept().expect("accepts the client").0,
@@ -5191,22 +5201,34 @@ mod tests {
             std::env::temp_dir().join(format!("ferrox-unix-moved-{}-{id}", std::process::id()));
         let old_dir = dir.join("old");
         std::fs::create_dir_all(&old_dir).expect("scratch dir");
-        let old_path = old_dir.join("sock");
+        let name = format!("sock-{id}");
+        let old_path = old_dir.join(&name);
         let listener =
             std::os::unix::net::UnixListener::bind(&old_path).expect("binds a live socket");
         let new_dir = dir.join("new");
         std::fs::rename(&old_dir, &new_dir).expect("moves the directory");
-        let new_path = new_dir.join("sock");
-        let alt_path = new_dir.join("SOCK");
+        let new_path = new_dir.join(&name);
+        let alt_path = new_dir.join(name.to_uppercase());
         let mut clients = Vec::new();
+        let mut refused = false;
         while clients.len() < 4096 {
             match std::os::unix::net::UnixStream::connect(&alt_path) {
                 Ok(client) => clients.push(client),
-                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => break,
+                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+                    refused = true;
+                    break;
+                }
                 Err(error) => panic!("fills the moved queue: {error}"),
             }
         }
         assert!(!clients.is_empty(), "the moved queue filled");
+        assert!(refused, "the full moved queue refused a connection");
+        let table = macos_socket_table().expect("reads the macOS socket table");
+        assert_eq!(
+            macos_table_names(&table, &alt_path),
+            None,
+            "the read table names the moved listener"
+        );
         assert_ne!(
             socket_table_names(&alt_path),
             Some(false),

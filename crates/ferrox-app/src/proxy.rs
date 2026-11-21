@@ -698,9 +698,15 @@ fn serve_inbounds_counted(
                         }
                     }
                     "trojan" => {
-                        if serve_trojan_inbound(address, inbound, freedom, handler_stop.as_ref()) {
+                        if serve_trojan_inbound_wake(
+                            address,
+                            inbound,
+                            freedom,
+                            handler_stop.as_ref(),
+                            &mut wake_address,
+                        ) {
                             if let Some(stop) = recorded_stop {
-                                handler_stops.push((Arc::clone(stop), address.clone()));
+                                handler_stops.push((Arc::clone(stop), wake_address.clone()));
                             }
                             inbounds += 1;
                         }
@@ -713,25 +719,27 @@ fn serve_inbounds_counted(
                             freedom,
                             handler_stop.as_ref().map(Arc::clone),
                             users,
+                            &mut wake_address,
                         ) {
                             if let Some(stop) = recorded_stop {
-                                handler_stops.push((Arc::clone(stop), address.clone()));
+                                handler_stops.push((Arc::clone(stop), wake_address.clone()));
                             }
                             inbounds += 1;
                         }
                     }
                     "shadowsocks" => {
-                        let listeners = serve_shadowsocks_inbound(
+                        let listeners = serve_shadowsocks_inbound_wake(
                             address,
                             inbound,
                             freedom,
                             &configured,
                             handler_stop.as_ref(),
+                            &mut wake_address,
                         );
                         if listeners > 0 {
                             if let Some(stop) = recorded_stop {
                                 for _ in 0..listeners {
-                                    handler_stops.push((Arc::clone(stop), address.clone()));
+                                    handler_stops.push((Arc::clone(stop), wake_address.clone()));
                                 }
                             }
                             inbounds += 1;
@@ -802,14 +810,15 @@ fn serve_inbounds_counted(
                             "socks" => Role::Socks { out, accounts },
                             _ => Role::Mixed { out, accounts },
                         };
-                        if spawn_role_stopped(
+                        if let Some(wake) = spawn_role_wake(
                             address,
                             inbound_role(inbound, role),
                             inbound_tag(inbound),
                             handler_stop.clone(),
                         ) {
+                            wake_address.clone_from(&wake);
                             if let Some(stop) = recorded_stop {
-                                handler_stops.push((Arc::clone(stop), address.clone()));
+                                handler_stops.push((Arc::clone(stop), wake));
                             }
                             inbounds += 1;
                         }
@@ -991,8 +1000,12 @@ fn serve_inbounds_counted(
                     for address in &armed_addresses {
                         wake_listener(stop, address);
                     }
-                    if !handler_stops.is_empty() {
-                        let _ = stop.wait_closed();
+                    if !handler_stops.is_empty() && !stop.wait_closed() {
+                        eprintln!("inbound rollback: a listener is still closing");
+                        CLOSING
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(Arc::clone(stop));
                     }
                 }
                 inbounds = before;
@@ -1390,15 +1403,6 @@ impl Drop for WorkerDone {
     }
 }
 
-fn spawn_role_stopped(
-    address: &str,
-    role: Role,
-    tag: Option<String>,
-    stop: Option<std::sync::Arc<Stop>>,
-) -> bool {
-    spawn_role_wake(address, role, tag, stop).is_some()
-}
-
 /// The same bind, returning the address a removal must dial: an ephemeral port is replaced by the one the socket took.
 fn spawn_role_wake(
     address: &str,
@@ -1424,16 +1428,20 @@ fn spawn_role_wake(
     Some(wake)
 }
 
-fn try_spawn_role_stopped(
+fn try_spawn_role_wake(
     address: &str,
     role: Role,
     tag: Option<String>,
     stop: Option<std::sync::Arc<Stop>>,
-) -> std::io::Result<()> {
+) -> std::io::Result<String> {
     let listener = bind_listener(address, &role)?;
+    let wake = listener.local_addr().map_or_else(
+        |_| address.to_owned(),
+        |bound| swapped_port(address, bound.port()),
+    );
     let address = address.to_owned();
     thread::spawn(move || accept_listener(listener, &address, &role, tag.as_deref(), stop));
-    Ok(())
+    Ok(wake)
 }
 
 /// The role a listener serves, wrapped when its config says the first bytes are a PROXY header.
@@ -16373,6 +16381,18 @@ fn serve_trojan_inbound(
     freedom: bool,
     stop: Option<&Arc<Stop>>,
 ) -> bool {
+    let mut wake = address.to_owned();
+    serve_trojan_inbound_wake(address, inbound, freedom, stop, &mut wake)
+}
+
+#[allow(clippy::too_many_lines)]
+fn serve_trojan_inbound_wake(
+    address: &str,
+    inbound: &Json,
+    freedom: bool,
+    stop: Option<&Arc<Stop>>,
+    wake: &mut String,
+) -> bool {
     let key = inbound_trojan_keys(inbound);
     let account = inbound_account(inbound);
     let accounts = inbound_trojan_accounts(inbound);
@@ -16464,7 +16484,7 @@ fn serve_trojan_inbound(
                 eprintln!("{error} on {address}: inbound refused");
                 return false;
             }
-            spawn_role_stopped(
+            if let Some(bound) = spawn_role_wake(
                 address,
                 inbound_role(
                     inbound,
@@ -16479,7 +16499,12 @@ fn serve_trojan_inbound(
                 ),
                 inbound_tag(inbound),
                 stop.cloned(),
-            )
+            ) {
+                *wake = bound;
+                true
+            } else {
+                false
+            }
         }
         // A listener that declares tls answers the session its config names; an identity it cannot load is refused, never served as plaintext.
         carrier if sec == "tls" => {
@@ -16507,7 +16532,7 @@ fn serve_trojan_inbound(
                     );
                 }
             }
-            spawn_role_stopped(
+            if let Some(bound) = spawn_role_wake(
                 address,
                 inbound_role(
                     inbound,
@@ -16522,22 +16547,34 @@ fn serve_trojan_inbound(
                 ),
                 inbound_tag(inbound),
                 stop.cloned(),
-            )
+            ) {
+                *wake = bound;
+                true
+            } else {
+                false
+            }
         }
-        carrier => spawn_role_stopped(
-            address,
-            inbound_role(
-                inbound,
-                Role::Trojan {
-                    keys: key,
-                    carrier,
-                    freedom,
-                    account,
-                },
-            ),
-            inbound_tag(inbound),
-            stop.cloned(),
-        ),
+        carrier => {
+            if let Some(bound) = spawn_role_wake(
+                address,
+                inbound_role(
+                    inbound,
+                    Role::Trojan {
+                        keys: key,
+                        carrier,
+                        freedom,
+                        account,
+                    },
+                ),
+                inbound_tag(inbound),
+                stop.cloned(),
+            ) {
+                *wake = bound;
+                true
+            } else {
+                false
+            }
+        }
     }
 }
 
@@ -16784,7 +16821,8 @@ fn serve_vmess_inbound(
     stop: Option<Arc<Stop>>,
 ) -> (crate::vmess::UsersRef, bool) {
     let users = inbound_vmess_users(inbound);
-    let served = serve_vmess_inbound_users(address, inbound, freedom, stop, &users);
+    let mut wake = address.to_owned();
+    let served = serve_vmess_inbound_users(address, inbound, freedom, stop, &users, &mut wake);
     (users, served)
 }
 
@@ -16796,6 +16834,7 @@ fn serve_vmess_inbound_users(
     freedom: bool,
     stop: Option<Arc<Stop>>,
     users: &crate::vmess::UsersRef,
+    wake: &mut String,
 ) -> bool {
     let account = inbound_account(inbound);
     let sec = stream_security(inbound);
@@ -16860,7 +16899,7 @@ fn serve_vmess_inbound_users(
                 eprintln!("{error} on {address}: inbound refused");
                 return false;
             }
-            spawn_role_stopped(
+            if let Some(bound) = spawn_role_wake(
                 address,
                 inbound_role(
                     inbound,
@@ -16874,7 +16913,12 @@ fn serve_vmess_inbound_users(
                 ),
                 inbound_tag(inbound),
                 stop,
-            )
+            ) {
+                *wake = bound;
+                true
+            } else {
+                false
+            }
         }
         carrier if sec == "tls" => {
             let Some(server) = inbound_tls_identity(inbound) else {
@@ -16904,7 +16948,7 @@ fn serve_vmess_inbound_users(
                     );
                 }
             }
-            spawn_role_stopped(
+            if let Some(bound) = spawn_role_wake(
                 address,
                 inbound_role(
                     inbound,
@@ -16918,22 +16962,34 @@ fn serve_vmess_inbound_users(
                 ),
                 inbound_tag(inbound),
                 stop,
-            )
+            ) {
+                *wake = bound;
+                true
+            } else {
+                false
+            }
         }
-        other => spawn_role_stopped(
-            address,
-            inbound_role(
-                inbound,
-                Role::Vmess {
-                    users: std::sync::Arc::clone(users),
-                    carrier: other,
-                    freedom,
-                    account,
-                },
-            ),
-            inbound_tag(inbound),
-            stop,
-        ),
+        other => {
+            if let Some(bound) = spawn_role_wake(
+                address,
+                inbound_role(
+                    inbound,
+                    Role::Vmess {
+                        users: std::sync::Arc::clone(users),
+                        carrier: other,
+                        freedom,
+                        account,
+                    },
+                ),
+                inbound_tag(inbound),
+                stop,
+            ) {
+                *wake = bound;
+                true
+            } else {
+                false
+            }
+        }
     }
 }
 
@@ -17372,6 +17428,7 @@ fn serve_dokodemo(
         );
     }
     let mut tcp_armed = false;
+    let mut bound = None;
     if dokodemo_has(&networks, "tcp") {
         let role = inbound_role(
             inbound,
@@ -17391,28 +17448,28 @@ fn serve_dokodemo(
             },
         );
         if fallible {
-            match try_spawn_role_stopped(address, role, inbound_tag(inbound), stop.cloned()) {
-                Ok(()) => tcp_armed = true,
+            match try_spawn_role_wake(address, role, inbound_tag(inbound), stop.cloned()) {
+                Ok(wake) => {
+                    tcp_armed = true;
+                    bound = Some(wake);
+                }
                 Err(error) => {
                     bind_failed();
                     eprintln!("dokodemo-door tcp: cannot listen on {address} in {label}: {error}");
                 }
             }
         } else {
-            tcp_armed = spawn_role_stopped(address, role, inbound_tag(inbound), stop.cloned());
+            bound = spawn_role_wake(address, role, inbound_tag(inbound), stop.cloned());
+            tcp_armed = bound.is_some();
         }
         if tcp_armed {
             armed += 1;
         }
     }
     let mut workers = tcp_armed as usize;
-    let wake = if tcp_armed {
-        address.to_owned()
-    } else {
-        String::new()
-    };
+    let wake = bound.unwrap_or_default();
     if fallible && dokodemo_has(&networks, "tcp") && !tcp_armed {
-        return (armed, workers, wake.clone());
+        return (armed, workers, wake);
     }
     if dokodemo_has(&networks, "udp") {
         // The door's own socket is bound before the inbound is armed: a port nobody holds answers a datagram with a refusal.
@@ -17995,6 +18052,7 @@ fn serve_ss_tls_front(
     accounts: Arc<crate::shadowsocks::SsAccounts>,
     freedom: bool,
     stop: Option<&Arc<Stop>>,
+    wake: &mut String,
 ) -> Option<usize> {
     let Some(server) = inbound_tls_identity(inbound) else {
         // A refused identity takes only the stream half unless this binary owns the add, where the requested front must not silently disappear.
@@ -18011,7 +18069,7 @@ fn serve_ss_tls_front(
             )));
         }
     }
-    Some(usize::from(spawn_role_stopped(
+    let Some(bound) = spawn_role_wake(
         address,
         inbound_role(
             inbound,
@@ -18024,16 +18082,32 @@ fn serve_ss_tls_front(
         ),
         inbound_tag(inbound),
         stop.cloned(),
-    )))
+    ) else {
+        return Some(0);
+    };
+    *wake = bound;
+    Some(1)
 }
 
-#[allow(clippy::too_many_lines)]
 fn serve_shadowsocks_inbound(
     address: &str,
     inbound: &Json,
     freedom: bool,
     configured: &HashSet<String>,
     stop: Option<&Arc<Stop>>,
+) -> usize {
+    let mut wake = address.to_owned();
+    serve_shadowsocks_inbound_wake(address, inbound, freedom, configured, stop, &mut wake)
+}
+
+#[allow(clippy::too_many_lines)]
+fn serve_shadowsocks_inbound_wake(
+    address: &str,
+    inbound: &Json,
+    freedom: bool,
+    configured: &HashSet<String>,
+    stop: Option<&Arc<Stop>>,
+    wake: &mut String,
 ) -> usize {
     let password = inbound_ss_password(inbound);
     let account = inbound_account(inbound);
@@ -18094,7 +18168,7 @@ fn serve_shadowsocks_inbound(
             }
             carrier if stream_security(inbound) == "tls" => {
                 if let Some(listeners) =
-                    serve_ss_tls_front(address, inbound, carrier, accounts, freedom, stop)
+                    serve_ss_tls_front(address, inbound, carrier, accounts, freedom, stop, wake)
                 {
                     if listeners == 0 && FALLIBLE_BIND.with(std::cell::Cell::get) {
                         return 0;
@@ -18113,7 +18187,7 @@ fn serve_shadowsocks_inbound(
                 }
             }
             other => {
-                if spawn_role_stopped(
+                if let Some(bound) = spawn_role_wake(
                     address,
                     inbound_role(
                         inbound,
@@ -18127,6 +18201,7 @@ fn serve_shadowsocks_inbound(
                     inbound_tag(inbound),
                     stop.cloned(),
                 ) {
+                    *wake = bound;
                     served += 1;
                 } else if FALLIBLE_BIND.with(std::cell::Cell::get) {
                     return 0;
