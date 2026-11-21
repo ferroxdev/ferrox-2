@@ -52316,3 +52316,8537 @@ mod tests {
             carrier: Carrier::HttpHeader {
                 paths: vec!["/p".to_owned()],
                 path: "/p".to_owned(),
+                response: None,
+            },
+            host: "127.0.0.1".to_owned(),
+            mux: Mux::default(),
+            pool: Pools::default(),
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            encryption: Some(Arc::clone(&client)),
+        };
+        let target: SocketAddr = "192.0.2.1:80".parse().expect("addr");
+        let relaying = thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            dial_vless(
+                &stream,
+                &server_addr,
+                &vless,
+                Some(&Destination::from(target)),
+                Ladder::global(),
+            );
+        });
+        let mut peer = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        peer.write_all(b"ping").expect("writes");
+        relaying.join().expect("joins");
+        stop.store(true, Ordering::SeqCst);
+        server.join().expect("joins");
+        let seen = seen.lock().expect("seen");
+        for payload in seen.iter() {
+            assert!(
+                !payload.windows(id.len()).any(|window| window == id),
+                "the user id reached the edge in clear"
+            );
+        }
+    }
+
+    const CARRIER_CERT: &[u8] = &[
+        48, 130, 1, 106, 48, 130, 1, 16, 160, 3, 2, 1, 2, 2, 20, 9, 118, 203, 85, 160, 31, 89, 126,
+        130, 240, 1, 124, 88, 139, 2, 183, 133, 180, 103, 195, 48, 10, 6, 8, 42, 134, 72, 206, 61,
+        4, 3, 2, 48, 23, 49, 21, 48, 19, 6, 3, 85, 4, 3, 12, 12, 99, 97, 114, 114, 105, 101, 114,
+        46, 116, 101, 115, 116, 48, 30, 23, 13, 50, 54, 49, 48, 48, 52, 49, 52, 52, 56, 50, 49, 90,
+        23, 13, 51, 54, 49, 48, 48, 49, 49, 52, 52, 56, 50, 49, 90, 48, 23, 49, 21, 48, 19, 6, 3,
+        85, 4, 3, 12, 12, 99, 97, 114, 114, 105, 101, 114, 46, 116, 101, 115, 116, 48, 89, 48, 19,
+        6, 7, 42, 134, 72, 206, 61, 2, 1, 6, 8, 42, 134, 72, 206, 61, 3, 1, 7, 3, 66, 0, 4, 41,
+        137, 145, 160, 42, 144, 149, 142, 54, 81, 211, 232, 207, 195, 182, 234, 177, 95, 42, 39,
+        92, 183, 224, 141, 46, 233, 255, 84, 155, 88, 113, 20, 230, 111, 41, 31, 113, 3, 159, 7,
+        37, 57, 17, 202, 128, 16, 91, 230, 56, 82, 214, 175, 165, 189, 32, 28, 94, 83, 15, 239,
+        210, 113, 16, 253, 163, 58, 48, 56, 48, 23, 6, 3, 85, 29, 17, 4, 16, 48, 14, 130, 12, 99,
+        97, 114, 114, 105, 101, 114, 46, 116, 101, 115, 116, 48, 29, 6, 3, 85, 29, 14, 4, 22, 4,
+        20, 126, 53, 130, 175, 120, 162, 169, 76, 233, 165, 63, 46, 152, 172, 200, 218, 190, 139,
+        205, 23, 48, 10, 6, 8, 42, 134, 72, 206, 61, 4, 3, 2, 3, 72, 0, 48, 69, 2, 33, 0, 130, 231,
+        244, 98, 234, 42, 158, 5, 44, 34, 56, 45, 180, 195, 201, 250, 215, 93, 204, 192, 169, 181,
+        83, 133, 90, 244, 246, 224, 213, 45, 28, 10, 2, 32, 92, 67, 120, 137, 239, 251, 234, 128,
+        183, 189, 254, 199, 96, 112, 70, 178, 155, 92, 36, 164, 173, 158, 104, 237, 93, 67, 213,
+        174, 165, 157, 39, 208,
+    ];
+    const CARRIER_KEY: &[u8] = &[
+        48, 129, 135, 2, 1, 0, 48, 19, 6, 7, 42, 134, 72, 206, 61, 2, 1, 6, 8, 42, 134, 72, 206,
+        61, 3, 1, 7, 4, 109, 48, 107, 2, 1, 1, 4, 32, 203, 157, 10, 119, 189, 153, 186, 104, 43,
+        21, 78, 170, 1, 87, 240, 205, 227, 168, 196, 141, 76, 209, 149, 222, 208, 177, 26, 155,
+        187, 113, 5, 239, 161, 68, 3, 66, 0, 4, 41, 137, 145, 160, 42, 144, 149, 142, 54, 81, 211,
+        232, 207, 195, 182, 234, 177, 95, 42, 39, 92, 183, 224, 141, 46, 233, 255, 84, 155, 88,
+        113, 20, 230, 111, 41, 31, 113, 3, 159, 7, 37, 57, 17, 202, 128, 16, 91, 230, 56, 82, 214,
+        175, 165, 189, 32, 28, 94, 83, 15, 239, 210, 113, 16, 253,
+    ];
+
+    /// Keep the echo peer alive until its bytes are verified, so unread carrier framing cannot reset an in-flight reply.
+    fn carried_round_trip(
+        name: &str,
+        accept: impl FnOnce(Connection) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)>
+            + Send
+            + 'static,
+        connect: impl FnOnce(Connection) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)>,
+    ) {
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (verified, wait_verified) = std::sync::mpsc::sync_channel(0);
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let (reader, writer) = accept(stream).expect("accepts carrier");
+            let mut stream = CarrierStream { reader, writer };
+            let mut buf = vec![0u8; 16 * 1024];
+            stream.read_exact(&mut buf).expect("reads");
+            stream.write_all(&buf).expect("echoes");
+            stream.flush().expect("flushes");
+            wait_verified
+                .recv_timeout(Duration::from_secs(30))
+                .expect("peer verifies the echo");
+        });
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let (reader, writer) = connect(stream).expect("connects carrier");
+        let mut stream = CarrierStream { reader, writer };
+        let sent: Vec<u8> = (0..16 * 1024).map(|i| (i % 251) as u8).collect();
+        stream.write_all(&sent).expect("writes");
+        stream.flush().expect("flushes");
+        let mut back = vec![0u8; 16 * 1024];
+        stream.read_exact(&mut back).expect("reads");
+        assert_eq!(back, sent, "{name} round trips");
+        verified
+            .send(())
+            .expect("peer stays alive for verification");
+        server.join().expect("joins");
+    }
+
+    #[test]
+    fn carried_streams_round_trip_over_ws() {
+        carried_round_trip(
+            "ws",
+            |stream| {
+                let (reader, writer) = crate::ws::accept(stream, "/tunnel")?;
+                Some((
+                    Box::new(reader) as Box<dyn Read + Send>,
+                    Box::new(writer) as Box<dyn Write + Send>,
+                ))
+            },
+            |stream| {
+                let (reader, writer) =
+                    crate::ws::connect(stream, "127.0.0.1", "/tunnel", 0, &[], &[], 0)?;
+                Some((
+                    Box::new(reader) as Box<dyn Read + Send>,
+                    Box::new(writer) as Box<dyn Write + Send>,
+                ))
+            },
+        );
+    }
+
+    #[test]
+    fn carried_streams_round_trip_over_xhttp() {
+        carried_round_trip(
+            "xhttp",
+            |stream| {
+                let (reader, writer) = crate::xhttp::accept(stream, "/share")?;
+                Some((
+                    Box::new(reader) as Box<dyn Read + Send>,
+                    Box::new(writer) as Box<dyn Write + Send>,
+                ))
+            },
+            |stream| {
+                let (reader, writer) =
+                    crate::xhttp::connect(stream, "127.0.0.1", "/share", &[], &"X".repeat(500))?;
+                Some((
+                    Box::new(reader) as Box<dyn Read + Send>,
+                    Box::new(writer) as Box<dyn Write + Send>,
+                ))
+            },
+        );
+    }
+
+    #[test]
+    fn carried_streams_round_trip_behind_the_http_camouflage() {
+        carried_round_trip(
+            "httpheader",
+            |stream| {
+                let (reader, write) =
+                    crate::httpheader::accept(stream, &["/camouflage".to_owned()], None)?;
+                Some((
+                    Box::new(reader) as Box<dyn Read + Send>,
+                    Box::new(write) as Box<dyn Write + Send>,
+                ))
+            },
+            |stream| {
+                let (reader, write) =
+                    crate::httpheader::connect(stream, "127.0.0.1", "/camouflage", &[])?;
+                Some((
+                    Box::new(reader) as Box<dyn Read + Send>,
+                    Box::new(write) as Box<dyn Write + Send>,
+                ))
+            },
+        );
+    }
+
+    #[test]
+    fn carried_streams_round_trip_past_the_upgrade() {
+        carried_round_trip(
+            "httpupgrade",
+            |stream| {
+                let (reader, write) = crate::httpupgrade::accept(stream, "/tunnel", "")?;
+                Some((
+                    Box::new(reader) as Box<dyn Read + Send>,
+                    Box::new(write) as Box<dyn Write + Send>,
+                ))
+            },
+            |stream| {
+                let (reader, write) =
+                    crate::httpupgrade::connect(stream, "127.0.0.1", "/tunnel", &[], &[])?;
+                Some((
+                    Box::new(reader) as Box<dyn Read + Send>,
+                    Box::new(write) as Box<dyn Write + Send>,
+                ))
+            },
+        );
+    }
+
+    /// Checked, not claimed: `tun` is served while the device names with no native open behind it are still refused; every served front still starts.
+    #[test]
+    fn a_device_inbound_is_refused_by_name_rather_than_served() {
+        assert!(
+            inbound_served("tun"),
+            "the native device inbound `tun` serves"
+        );
+        for name in ["utun", "wintun", "tun2socks"] {
+            assert!(
+                !inbound_served(name),
+                "the device inbound `{name}` is refused by name"
+            );
+        }
+        for name in SERVED_INBOUNDS {
+            assert!(inbound_served(name), "the front `{name}` serves");
+        }
+    }
+
+    /// The stop is registered only for the shape the listener actually binds: an ALPN list left
+    /// behind under a non-TLS carrier names no QUIC socket to stop.
+    #[test]
+    fn an_h3_alpn_without_tls_is_not_a_stoppable_h3_listener() {
+        let (cert, key, _client) = tls_cert_json();
+        let inbound = |security: &str, certificates: &str| {
+            crate::json::parse(&format!(
+                r#"{{"protocol":"vless","streamSettings":{{"network":"xhttp","security":"{security}","tlsSettings":{{"alpn":["h3"],"certificates":[{certificates}]}},"xhttpSettings":{{"path":"/x"}}}}}}"#
+            ))
+            .expect("parses")
+        };
+        let certificates = format!(r#"{{"certificate": {cert}, "key": {key}}}"#);
+        assert!(inbound_is_xhttp_h3(&inbound("tls", &certificates)));
+        assert!(
+            !inbound_is_xhttp_h3(&inbound("tls", "")),
+            "an identity that cannot load never binds the QUIC listener"
+        );
+        assert!(
+            !inbound_is_xhttp_h3(&inbound("none", &certificates)),
+            "a non-TLS listener holds no QUIC socket"
+        );
+        assert!(
+            !inbound_is_xhttp_h3(&inbound("reality", &certificates)),
+            "a REALITY listener never binds the h3 lane"
+        );
+    }
+
+    /// The X25519 key behind `ECH_CONFIG`'s public half, for one loopback listener.
+    const ECH_PRIVATE_KEY: [u8; 32] = [
+        0x78, 0xb5, 0xc8, 0x5f, 0x0f, 0x03, 0x50, 0x06, 0x9b, 0x97, 0x32, 0x9f, 0x44, 0x8e, 0xbe,
+        0x95, 0x8e, 0x4b, 0x34, 0x77, 0x71, 0x3d, 0x5a, 0xc6, 0x51, 0x0c, 0x69, 0x51, 0x98, 0xd1,
+        0xe8, 0x78,
+    ];
+
+    /// An `ECHConfig` for `public.test` whose X25519 public half matches `ECH_PRIVATE_KEY`.
+    const ECH_CONFIG: &[u8] = &[
+        0xfe, 0x0d, 0x00, 0x3a, 0x07, 0x00, 0x20, 0x00, 0x20, 0x2a, 0xb0, 0xe0, 0x4c, 0x48, 0x44,
+        0x9d, 0xa1, 0x19, 0x81, 0x50, 0xc8, 0xf0, 0x45, 0xf0, 0x35, 0xd0, 0xb8, 0xb1, 0xca, 0xc4,
+        0x0c, 0x29, 0xcd, 0x46, 0x0b, 0xbf, 0xae, 0x95, 0xb8, 0xd7, 0x03, 0x00, 0x04, 0x00, 0x01,
+        0x00, 0x01, 0x00, 0x0b, 0x70, 0x75, 0x62, 0x6c, 0x69, 0x63, 0x2e, 0x74, 0x65, 0x73, 0x74,
+        0x00, 0x00,
+    ];
+
+    fn ech_config_list() -> Vec<u8> {
+        let mut list = Vec::with_capacity(2 + ECH_CONFIG.len());
+        list.extend_from_slice(&(ECH_CONFIG.len() as u16).to_be_bytes());
+        list.extend_from_slice(ECH_CONFIG);
+        list
+    }
+
+    /// A valid ECH config the fixture server does not hold.
+    fn stale_ech_config_list() -> Vec<u8> {
+        [
+            0x00, 0x3f, 0xfe, 0x0d, 0x00, 0x3b, 0x00, 0x00, 0x20, 0x00, 0x20, 0x6e, 0x80, 0x2c,
+            0x26, 0x2c, 0xf7, 0x22, 0x4d, 0xea, 0x31, 0xcb, 0xc3, 0x71, 0x13, 0x4a, 0xc6, 0x85,
+            0x23, 0x4f, 0xd0, 0x71, 0x40, 0xa3, 0x8f, 0x0a, 0xa4, 0x6f, 0x0d, 0xd0, 0xb0, 0xc9,
+            0x7a, 0x00, 0x04, 0x00, 0x01, 0x00, 0x01, 0x00, 0x0c, 0x63, 0x61, 0x72, 0x72, 0x69,
+            0x65, 0x72, 0x2e, 0x74, 0x65, 0x73, 0x74, 0x00, 0x00,
+        ]
+        .to_vec()
+    }
+
+    fn ech_server_key_tlv() -> Vec<u8> {
+        ech_server_keys(&ECH_PRIVATE_KEY, ECH_CONFIG)
+    }
+
+    fn ech_server_keys(private: &[u8], config: &[u8]) -> Vec<u8> {
+        let mut keys = Vec::with_capacity(4 + private.len() + config.len());
+        keys.extend_from_slice(&(private.len() as u16).to_be_bytes());
+        keys.extend_from_slice(private);
+        keys.extend_from_slice(&(config.len() as u16).to_be_bytes());
+        keys.extend_from_slice(config);
+        keys
+    }
+
+    /// A stream that keeps every byte the peer read beside passing it through.
+    struct Recording<S> {
+        inner: S,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl<S: std::io::Read> std::io::Read for Recording<S> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let read = self.inner.read(buf)?;
+            self.seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(&buf[..read]);
+            Ok(read)
+        }
+    }
+
+    impl<S: std::io::Write> std::io::Write for Recording<S> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.inner.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    fn hello_extensions(record: &[u8]) -> Vec<(u16, &[u8])> {
+        assert_eq!(record[0], 0x16, "a handshake record");
+        let record_len = usize::from(record[3]) << 8 | usize::from(record[4]);
+        let handshake = &record[5..5 + record_len];
+        assert_eq!(handshake[0], 0x01, "a ClientHello");
+        let body_len = usize::from(handshake[1]) << 16
+            | usize::from(handshake[2]) << 8
+            | usize::from(handshake[3]);
+        let body = &handshake[4..4 + body_len];
+        let mut at = 2 + 32;
+        at += 1 + usize::from(body[at]);
+        at += 2 + (usize::from(body[at]) << 8 | usize::from(body[at + 1]));
+        at += 1 + usize::from(body[at]);
+        let ext_len = usize::from(body[at]) << 8 | usize::from(body[at + 1]);
+        at += 2;
+        let end = at + ext_len;
+        let mut out = Vec::new();
+        while at < end {
+            let kind = u16::from_be_bytes([body[at], body[at + 1]]);
+            let len = usize::from(body[at + 2]) << 8 | usize::from(body[at + 3]);
+            out.push((kind, &body[at + 4..at + 4 + len]));
+            at += 4 + len;
+        }
+        out
+    }
+
+    fn hello_server_name(record: &[u8]) -> Vec<u8> {
+        let (_, body) = hello_extensions(record)
+            .into_iter()
+            .find(|(kind, _)| *kind == 0x0000)
+            .expect("the hello has an SNI extension");
+        let len = usize::from(body[3]) << 8 | usize::from(body[4]);
+        body[5..5 + len].to_vec()
+    }
+
+    fn accept_within(listener: &crate::conn::Listener, deadline: std::time::Instant) -> Connection {
+        listener.set_nonblocking(true).expect("a polled listener");
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).expect("a blocking stream");
+                    return stream;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the dial did not connect again before the deadline"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("accepts: {error}"),
+            }
+        }
+    }
+
+    fn carried_tls_configs() -> (
+        std::sync::Arc<ferrox_core::tls::TlsServerConfig>,
+        ferrox_core::tls::TlsConfig,
+    ) {
+        let server = std::sync::Arc::new(ferrox_core::tls::TlsServerConfig {
+            certs: vec![ferrox_core::tls::CertEntry {
+                cert_chain: vec![CARRIER_CERT.to_vec()],
+                key_der: CARRIER_KEY.to_vec(),
+                key_kind: ferrox_core::tls::ServerKeyKind::Pkcs8,
+                reload: None,
+                ocsp: None,
+            }],
+            alpn: Vec::default(),
+            min_version: None,
+            max_version: None,
+            cipher_suites: Vec::new(),
+            curves: Vec::new(),
+            send_tickets: true,
+            reject_unknown_sni: false,
+            server_config_cache: std::sync::Arc::default(),
+            issuer: None,
+            ech_server_keys: None,
+            master_key_log: None,
+            kernel_tx: false,
+            kernel_rx: false,
+        });
+        let client = ferrox_core::tls::TlsConfig {
+            server_name: "carrier.test".to_owned(),
+            alpn: std::sync::Arc::default(),
+            roots: vec![CARRIER_CERT.to_vec()].into(),
+            pins: ferrox_core::foxy::pin::Pins::default(),
+            cert_pins: std::sync::Arc::default(),
+            verify_names: std::sync::Arc::default(),
+            cipher_suites: std::sync::Arc::default(),
+            curves: std::sync::Arc::default(),
+            insecure: false,
+            resumption: true,
+            fingerprint: None,
+            ech_config_list: None,
+            websocket: false,
+            master_key_log: None,
+            client_cert: None,
+            client_random: None,
+            padding: None,
+            ..Default::default()
+        };
+        (server, client)
+    }
+
+    /// A TLS 1.2-only dial reads inside its session lock, so the split must arm that read.
+    #[test]
+    fn a_legacy_tls_read_yields_the_relay_lane() {
+        let (server, mut client) = carried_tls_configs();
+        let mut server = (*server).clone();
+        server.min_version = Some(0x0303);
+        server.max_version = Some(0x0303);
+        server.cipher_suites = vec![0xc02b];
+        client.cipher_suites = vec![0xc02b].into();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let serving = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let mut session = ferrox_core::tls::accept(&server, stream).expect("accepts tls");
+            session.handshake().expect("server handshake");
+            let _ = stop_rx.recv();
+        });
+        let conn = Connection::connect(("127.0.0.1", port)).expect("connects");
+        let mut session = ferrox_core::tls::connect(&client, conn).expect("dials");
+        session.handshake().expect("client handshake");
+        assert!(
+            !session.separates_ciphertext(),
+            "a TLS 1.2-only dial rides the legacy lane"
+        );
+        let close = session.get_ref().try_clone().expect("clone");
+        let out = session.get_ref().try_clone().expect("clone");
+        let (mut reader, _writer) = session_halves(session, out);
+        let (verdict_tx, verdict_rx) = std::sync::mpsc::channel();
+        let running = std::thread::spawn(move || {
+            let mut buf = [0u8; 16];
+            let began = std::time::Instant::now();
+            let verdict = reader.read(&mut buf);
+            let _ = verdict_tx.send((verdict, began.elapsed()));
+        });
+        if let Ok((verdict, took)) = verdict_rx.recv_timeout(Duration::from_millis(500)) {
+            assert!(
+                took < Duration::from_millis(400),
+                "the legacy read yielded after {took:?}"
+            );
+            assert!(
+                verdict.as_ref().is_err_and(is_timeout),
+                "the legacy read timed out, got {verdict:?}"
+            );
+        } else {
+            let _ = close.shutdown(Shutdown::Both);
+            let _ = running.join();
+            let _ = stop_tx.send(());
+            panic!("the legacy read held the relay lane");
+        }
+        let _ = close.shutdown(Shutdown::Both);
+        running.join().expect("reader thread");
+        let _ = stop_tx.send(());
+        serving.join().expect("server thread");
+    }
+
+    /// `allowInsecure` dials with no root at all: the handshake still completes against a
+    /// certificate no store holds, and the session speaks both ways.
+    trait FakeIo: Read + Write {}
+    impl<T: Read + Write> FakeIo for T {}
+    type FakeStream = Box<dyn FakeIo + Send>;
+
+    fn socks_tls_carrier(path: Option<&str>) -> Carrier {
+        match path {
+            Some(path) => Carrier::Ws {
+                path: path.to_owned(),
+                ed: 0,
+            },
+            None => Carrier::Raw(ferrox_core::finalmask::Chain::default()),
+        }
+    }
+
+    fn tls_accept_fake(
+        stream: Connection,
+        server_config: &Arc<ferrox_core::tls::TlsServerConfig>,
+        path: Option<&str>,
+    ) -> Option<FakeStream> {
+        use ferrox_core::tls::TlsProvider as _;
+        let mut tls = ferrox_core::tls::accept(server_config, stream).ok()?;
+        tls.handshake().ok()?;
+        let Some(path) = path else {
+            return Some(Box::new(tls));
+        };
+        let out = tls.get_ref().get_ref().try_clone().ok()?;
+        let shared = Arc::new(Mutex::new(tls));
+        let out = Arc::new(Mutex::new(Sealed::new(out)));
+        let reader = TlsHalf::<_, Connection> {
+            session: Arc::clone(&shared),
+            out: Arc::clone(&out),
+            driven: None,
+            sleep_on_timeout: true,
+        };
+        let writer = TlsHalf::<_, Connection> {
+            session: shared,
+            out,
+            driven: None,
+            sleep_on_timeout: true,
+        };
+        let (reader, writer) = crate::ws::accept_split(reader, writer, path)?;
+        Some(Box::new(CarrierStream { reader, writer }))
+    }
+
+    fn kcp_tls_serve(
+        server_config: Arc<ferrox_core::tls::TlsServerConfig>,
+        serve: impl FnOnce(&mut FakeStream) + Send + 'static,
+    ) -> (u16, std::sync::mpsc::Sender<()>, thread::JoinHandle<()>) {
+        let listener = ferrox_core::kcp::Listener::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+        )
+        .expect("binds");
+        let port = listener.local_addr().port();
+        let (done, wait) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let conn = listener.accept().expect("accepts");
+            let Ok(mut tls) =
+                ferrox_core::tls::accept(&server_config, KcpIo::new(Arc::clone(&conn)))
+            else {
+                return;
+            };
+            if !shake_tls(&mut tls) {
+                return;
+            }
+            let mut stream: FakeStream = Box::new(tls);
+            serve(&mut stream);
+            let _ = wait.recv();
+        });
+        (port, done, server)
+    }
+
+    fn read_exact_stream(stream: &mut FakeStream, mut buf: &mut [u8]) -> Option<()> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !buf.is_empty() {
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            match stream.read(buf) {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Ok(0) | Err(_) => return None,
+                Ok(read) => buf = &mut buf[read..],
+            }
+        }
+        Some(())
+    }
+
+    fn serve_fake_socks(stream: &mut FakeStream) -> Option<()> {
+        socks_grant(stream)?;
+        let mut buf = [0u8; 1024];
+        loop {
+            match stream.read(&mut buf) {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Ok(0) | Err(_) => return None,
+                Ok(read) => {
+                    stream.write_all(&buf[..read]).ok()?;
+                }
+            }
+        }
+    }
+
+    fn serve_fake_socks_once(stream: &mut FakeStream) -> Option<()> {
+        socks_grant(stream)?;
+        let mut ping = [0u8; 4];
+        read_exact_stream(stream, &mut ping)?;
+        stream.write_all(&ping).ok()?;
+        Some(())
+    }
+
+    fn serve_fake_socks_late(stream: &mut FakeStream) -> Option<()> {
+        socks_grant(stream)?;
+        let mut ping = [0u8; 4];
+        read_exact_stream(stream, &mut ping)?;
+        thread::sleep(Duration::from_millis(200));
+        stream.write_all(&ping).ok()?;
+        Some(())
+    }
+
+    fn socks_grant(stream: &mut FakeStream) -> Option<()> {
+        let mut greeting = [0u8; 3];
+        read_exact_stream(stream, &mut greeting)?;
+        if greeting != [5, 1, 0] {
+            return None;
+        }
+        stream.write_all(&[5, 0]).ok()?;
+        let mut head = [0u8; 4];
+        read_exact_stream(stream, &mut head)?;
+        match head[3] {
+            1 => read_exact_stream(stream, &mut [0u8; 6])?,
+            3 => {
+                let mut len = [0u8; 1];
+                read_exact_stream(stream, &mut len)?;
+                read_exact_stream(stream, &mut vec![0u8; len[0] as usize + 2])?;
+            }
+            4 => read_exact_stream(stream, &mut [0u8; 18])?,
+            _ => return None,
+        }
+        stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).ok()?;
+        Some(())
+    }
+
+    fn socks_tls_over_carrier_reaches_echo(path: Option<&str>) {
+        let (server_config, client_config) = carried_tls_configs();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let server_addr: SocketAddr = listener.local_addr().expect("addr");
+        let server_path = path.map(str::to_owned);
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
+            let mut tls = tls_accept_fake(stream, &server_config, server_path.as_deref())
+                .expect("tls over carrier");
+            let _ = serve_fake_socks(&mut tls);
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_addr = front.local_addr().expect("addr");
+        let relay_path = path.map(str::to_owned);
+        let relaying = thread::spawn(move || {
+            let (client, _) = front.accept().expect("front accepts");
+            let socks = SocksOut {
+                address: "127.0.0.1".to_owned(),
+                port: server_addr.port(),
+                credential: crate::socks::Credential::default(),
+                version: crate::socks::Version::V5,
+                tls: Some(Arc::new(client_config)),
+                carrier: socks_tls_carrier(relay_path.as_deref()),
+                host: "carrier.test".to_owned(),
+                carrier_headers: Vec::new(),
+                heartbeat: 0,
+            };
+            dial_socks_outbound(
+                &client,
+                &Outbound::Socks(socks),
+                &server_addr,
+                &Destination::from(server_addr),
+            );
+        });
+        let mut client = Connection::connect(front_addr).expect("front connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        drop(client);
+        server.join().expect("server joins");
+        relaying.join().expect("relaying joins");
+    }
+
+    #[test]
+    fn socks_tls_over_raw_reaches_echo() {
+        socks_tls_over_carrier_reaches_echo(None);
+    }
+
+    #[test]
+    fn socks_tls_over_ws_reaches_echo() {
+        socks_tls_over_carrier_reaches_echo(Some("/w"));
+    }
+
+    fn serve_fake_http_proxy(stream: &mut FakeStream) {
+        let Some((head, at)) = read_exact_head(stream, HTTP_HEAD_LIMIT, budgets::head_arrival())
+        else {
+            return;
+        };
+        if stream.write_all(b"HTTP/1.1 200 OK\r\n\r\nboot").is_err() {
+            return;
+        }
+        if at < head.len() && stream.write_all(&head[at..]).is_err() {
+            return;
+        }
+        let mut buf = [0u8; 1024];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    if stream.write_all(&buf[..n]).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    fn serve_fake_http_proxy_once(stream: &mut FakeStream) -> Option<()> {
+        let (head, at) = read_exact_head(stream, HTTP_HEAD_LIMIT, budgets::head_arrival())?;
+        stream.write_all(b"HTTP/1.1 200 OK\r\n\r\nboot").ok()?;
+        if at < head.len() {
+            stream.write_all(&head[at..]).ok()?;
+        }
+        let mut ping = [0u8; 4];
+        read_exact_stream(stream, &mut ping)?;
+        stream.write_all(&ping).ok()?;
+        Some(())
+    }
+
+    fn http_tls_over_carrier_reaches_echo(path: Option<&str>) {
+        let (server_config, client_config) = carried_tls_configs();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let server_addr: SocketAddr = listener.local_addr().expect("addr");
+        let server_path = path.map(str::to_owned);
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
+            let mut tls = tls_accept_fake(stream, &server_config, server_path.as_deref())
+                .expect("tls over carrier");
+            serve_fake_http_proxy(&mut tls);
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_addr = front.local_addr().expect("addr");
+        let relay_path = path.map(str::to_owned);
+        let relaying = thread::spawn(move || {
+            let (client, _) = front.accept().expect("front accepts");
+            let http = HttpOut {
+                address: "127.0.0.1".to_owned(),
+                port: server_addr.port(),
+                tls: Some(Arc::new(client_config)),
+                carrier: socks_tls_carrier(relay_path.as_deref()),
+                host: "carrier.test".to_owned(),
+                carrier_headers: Vec::new(),
+                heartbeat: 0,
+                headers: Vec::new(),
+                user: None,
+                pass: None,
+            };
+            dial_http_outbound(
+                &client,
+                &server_addr,
+                &http,
+                &Destination::from(server_addr),
+                Ladder::global(),
+            );
+        });
+        let mut client = Connection::connect(front_addr).expect("front connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let mut early = [0u8; 4];
+        client.read_exact(&mut early).expect("early bytes");
+        assert_eq!(&early, b"boot");
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        drop(client);
+        server.join().expect("server joins");
+        relaying.join().expect("relaying joins");
+    }
+
+    #[test]
+    fn http_tls_over_raw_reaches_echo() {
+        http_tls_over_carrier_reaches_echo(None);
+    }
+
+    #[test]
+    fn http_tls_over_ws_reaches_echo() {
+        http_tls_over_carrier_reaches_echo(Some("/w"));
+    }
+
+    fn socks_tls_over_kcp_echo(half_close: bool) {
+        let (server_config, client_config) = carried_tls_configs();
+        let (kcp_port, done, server) = kcp_tls_serve(server_config, move |stream| {
+            let _ = if half_close {
+                serve_fake_socks_late(stream)
+            } else {
+                serve_fake_socks_once(stream)
+            };
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_addr = front.local_addr().expect("addr");
+        let relaying = thread::spawn(move || {
+            let (client, _) = front.accept().expect("front accepts");
+            let socks = SocksOut {
+                address: "127.0.0.1".to_owned(),
+                port: kcp_port,
+                credential: crate::socks::Credential::default(),
+                version: crate::socks::Version::V5,
+                tls: Some(Arc::new(client_config)),
+                carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
+                host: "carrier.test".to_owned(),
+                carrier_headers: Vec::new(),
+                heartbeat: 0,
+            };
+            let server_addr = format!("127.0.0.1:{kcp_port}").parse().expect("addr");
+            dial_socks_outbound(
+                &client,
+                &Outbound::Socks(socks),
+                &server_addr,
+                &Destination::from(server_addr),
+            );
+        });
+        let mut client = Connection::connect(front_addr).expect("front connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        client.write_all(b"ping").expect("writes");
+        if half_close {
+            client.shutdown(Shutdown::Write).expect("half-closes");
+        }
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        drop(client);
+        let _ = done.send(());
+        server.join().expect("server joins");
+        relaying.join().expect("relaying joins");
+    }
+
+    #[test]
+    fn socks_tls_over_kcp_reaches_echo() {
+        socks_tls_over_kcp_echo(false);
+    }
+
+    #[test]
+    fn socks_tls_over_kcp_answers_after_the_client_half_closes() {
+        socks_tls_over_kcp_echo(true);
+    }
+
+    #[test]
+    fn http_tls_over_kcp_reaches_echo() {
+        let (server_config, client_config) = carried_tls_configs();
+        let (kcp_port, done, server) = kcp_tls_serve(server_config, |stream| {
+            let _ = serve_fake_http_proxy_once(stream);
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_addr = front.local_addr().expect("addr");
+        let relaying = thread::spawn(move || {
+            let (client, _) = front.accept().expect("front accepts");
+            let http = HttpOut {
+                address: "127.0.0.1".to_owned(),
+                port: kcp_port,
+                tls: Some(Arc::new(client_config)),
+                carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
+                host: "carrier.test".to_owned(),
+                carrier_headers: Vec::new(),
+                heartbeat: 0,
+                headers: Vec::new(),
+                user: None,
+                pass: None,
+            };
+            let server_addr = format!("127.0.0.1:{kcp_port}").parse().expect("addr");
+            dial_http_outbound(
+                &client,
+                &server_addr,
+                &http,
+                &Destination::from(server_addr),
+                Ladder::global(),
+            );
+        });
+        let mut client = Connection::connect(front_addr).expect("front connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let mut early = [0u8; 4];
+        client.read_exact(&mut early).expect("early bytes");
+        assert_eq!(&early, b"boot");
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        drop(client);
+        let _ = done.send(());
+        server.join().expect("server joins");
+        relaying.join().expect("relaying joins");
+    }
+
+    #[test]
+    fn an_insecure_dial_speaks_the_whole_session() {
+        use ferrox_core::tls::TlsProvider as _;
+        use std::io::Read as _;
+        use std::io::Write as _;
+
+        let (server_config, _client_config) = carried_tls_configs();
+        let insecure = ferrox_core::tls::TlsConfig {
+            server_name: "anything.test".to_owned(),
+            alpn: std::sync::Arc::default(),
+            roots: std::sync::Arc::from(Vec::new()),
+            pins: ferrox_core::foxy::pin::Pins::default(),
+            cert_pins: std::sync::Arc::default(),
+            verify_names: std::sync::Arc::default(),
+            cipher_suites: std::sync::Arc::default(),
+            curves: std::sync::Arc::default(),
+            insecure: true,
+            resumption: true,
+            fingerprint: None,
+            ech_config_list: None,
+            websocket: false,
+            master_key_log: None,
+            client_cert: None,
+            client_random: None,
+            padding: None,
+            ..Default::default()
+        };
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut buf = [0u8; 4];
+            tls.read_exact(&mut buf).expect("reads");
+            tls.write_all(&buf).expect("echoes");
+            tls.flush().expect("flushes");
+        });
+        let mut session = ferrox_core::tls::RustlsProvider::connect(
+            &insecure,
+            Connection::connect(("127.0.0.1", port)).expect("connects"),
+        )
+        .expect("opens");
+        session.handshake().expect("handshakes");
+        session.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        session.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        drop(session);
+        server.join().expect("joins");
+    }
+
+    /// A dialled carrier's reader drives the transport: the wait a read parks on is not the lock
+    /// the writer seals under, so a silent peer costs the other direction nothing.
+    #[test]
+    fn a_dialled_carrier_read_is_driven_and_leaves_the_lock_to_the_writer() {
+        use ferrox_core::tls::TlsProvider as _;
+        use std::io::Read as _;
+        use std::io::Write as _;
+        use std::time::Instant;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let server: SocketAddr = listener.local_addr().expect("addr");
+        let (release, hold) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            // Holds the session up without writing, as an edge does while waiting for the next frame.
+            let _ = hold.recv_timeout(Duration::from_secs(10));
+        });
+
+        let session = dial_tls_session(&server, &client_config, None).expect("dialled");
+        let (reader, writer, raw) = session.into_halves().expect("halves");
+        assert!(
+            reader.driven.is_some(),
+            "the carrier's reader drives the transport, so a parked read holds no session lock"
+        );
+        let polling = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pump_polling = Arc::clone(&polling);
+        let reading = thread::spawn(move || {
+            let mut peer = reader;
+            let began = Instant::now();
+            let mut buf = [0u8; 512];
+            while began.elapsed() < Duration::from_secs(4) {
+                pump_polling.store(true, std::sync::atomic::Ordering::Release);
+                let _ = peer.read(&mut buf);
+                pump_polling.store(false, std::sync::atomic::Ordering::Release);
+            }
+        });
+        // The write pump has to arrive on a session the read pump is polling, so the test waits for a read in flight rather than for a moment to pass: an uncontended session answers any write.
+        let waited = Instant::now();
+        while !polling.load(std::sync::atomic::Ordering::Acquire)
+            && waited.elapsed() < Duration::from_secs(5)
+        {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            polling.load(std::sync::atomic::Ordering::Acquire),
+            "the read pump was not polling after {:?}",
+            waited.elapsed()
+        );
+
+        let mut sink = SessionSink { half: writer, raw };
+        for _ in 0..3 {
+            let began = Instant::now();
+            sink.write_all(b"ping")
+                .expect("writes while the read pump polls");
+            let waited = began.elapsed();
+            assert!(
+                waited < Duration::from_millis(200),
+                "the write pump waited {waited:?} for a session the read pump holds"
+            );
+        }
+        let _ = reading.join();
+        let _ = release.send(());
+    }
+
+    /// A read that parks in the transport, one owned by the driver: the session's lock must stay with the writer until a poll returns.
+    #[test]
+    fn a_parked_tls_read_leaves_the_lock_to_the_writer() {
+        use ferrox_core::tls::TlsProvider as _;
+        use std::io::Read as _;
+        use std::io::Write as _;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let server: SocketAddr = listener.local_addr().expect("addr");
+        let (release, hold) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            // The served side stays silent: the only content is the read parked in the session.
+            let _ = hold.recv_timeout(Duration::from_secs(10));
+        });
+
+        let session = dial_tls_session(&server, &client_config, None).expect("dialled");
+        // A parked read that waits out a long timeout; before the split this park holds the session's lock.
+        session
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("arms the parked read");
+        let transport = session.get_ref().try_clone().expect("dups the transport");
+        let (reader, writer) = session_halves(session, transport);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (wrote_tx, wrote_rx) = std::sync::mpsc::channel();
+        let reading = thread::spawn(move || {
+            let mut reader = reader;
+            started_tx.send(()).ok();
+            let _ = reader.read(&mut [0u8; 512]);
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the read starts");
+        // One beat: the read is inside the transport's wait by the time the writer arrives.
+        thread::sleep(Duration::from_millis(50));
+        let writing = thread::spawn(move || {
+            let mut writer = writer;
+            let ok = writer.write_all(b"ping").is_ok();
+            wrote_tx.send(ok).ok();
+        });
+        let wrote = wrote_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap_or_default();
+        let _ = release.send(());
+        assert!(wrote, "a write waited on a session the parked read holds");
+        let _ = writing.join();
+        let _ = reading.join();
+    }
+
+    struct Served {
+        wire: Connection,
+        read_entered: Arc<AtomicBool>,
+        opened: Arc<AtomicBool>,
+        sealed: Arc<AtomicBool>,
+    }
+
+    impl Read for Served {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.read_entered.store(true, Ordering::Release);
+            self.wire.read(buf)
+        }
+    }
+
+    impl Write for Served {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.sealed.store(true, Ordering::Release);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ferrox_core::tls::RecordAlignment for Served {}
+
+    impl Drivable for Served {
+        fn transport(&self) -> Option<Connection> {
+            self.wire.try_clone().ok()
+        }
+    }
+
+    impl CipherOpen for Served {
+        fn open(&mut self, ciphertext: &[u8], _buf: &mut [u8]) -> std::io::Result<(usize, usize)> {
+            self.opened.store(true, Ordering::Release);
+            Ok((0, ciphertext.len()))
+        }
+
+        fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize> {
+            self.sealed.store(true, Ordering::Release);
+            out.extend_from_slice(plaintext);
+            Ok(plaintext.len())
+        }
+    }
+
+    struct EchoOnce {
+        hold: std::sync::mpsc::Receiver<()>,
+        sent: bool,
+    }
+
+    impl Read for EchoOnce {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.sent || self.hold.recv().is_err() {
+                return Ok(0);
+            }
+            self.sent = true;
+            let n = buf.len().min(6);
+            buf[..n].copy_from_slice(&b"hello!"[..n]);
+            Ok(n)
+        }
+    }
+
+    impl Write for EchoOnce {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn holds(flag: &AtomicBool, budget: Duration) -> bool {
+        let began = Instant::now();
+        while !flag.load(Ordering::Acquire) && began.elapsed() < budget {
+            thread::sleep(Duration::from_millis(1));
+        }
+        flag.load(Ordering::Acquire)
+    }
+
+    /// A served Vision read parks on the transport, not on the session. A Windows duplicate can
+    /// outlive the timeout meant to release the shared lock, so the echo's write must not wait
+    /// for the read at all: the driven shape pairs an opened session with a transport park.
+    #[test]
+    fn a_served_vision_read_parks_off_the_sessions_lock() {
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let wire = Connection::connect(addr).expect("connects");
+        let (far, _) = listener.accept().expect("accepts");
+        let read_entered = Arc::new(AtomicBool::new(false));
+        let opened = Arc::new(AtomicBool::new(false));
+        let sealed = Arc::new(AtomicBool::new(false));
+        let (release, hold) = std::sync::mpsc::channel();
+        let ended = Arc::new(AtomicBool::new(false));
+        let closed = Arc::clone(&ended);
+        let close: Arc<dyn Fn() + Send + Sync> =
+            Arc::new(move || closed.store(true, Ordering::Release));
+        let session = Served {
+            wire,
+            read_entered: Arc::clone(&read_entered),
+            opened: Arc::clone(&opened),
+            sealed: Arc::clone(&sealed),
+        };
+        let relay = thread::spawn(move || {
+            relay_vision(
+                session,
+                None,
+                &[0u8; 16],
+                Half::shared(EchoOnce { hold, sent: false }),
+                &close,
+                Vec::new(),
+            );
+        });
+        let began = Instant::now();
+        while !read_entered.load(Ordering::Acquire)
+            && !opened.load(Ordering::Acquire)
+            && began.elapsed() < Duration::from_secs(5)
+        {
+            thread::sleep(Duration::from_millis(1));
+        }
+        // The shape is the proof, not the clock: a driven read opens the session and never reads it.
+        assert!(
+            opened.load(Ordering::Acquire),
+            "the served Vision link did not take the driven shape"
+        );
+        assert!(
+            !read_entered.load(Ordering::Acquire),
+            "the served Vision link read the session instead of the transport"
+        );
+        release.send(()).expect("releases the echo");
+        let wrote = holds(&sealed, Duration::from_secs(2));
+        let _ = far.shutdown(Shutdown::Both);
+        assert!(
+            holds(&ended, Duration::from_secs(2)),
+            "the relay never ended"
+        );
+        join_thread_within(relay, Duration::from_secs(5), "served Vision relay");
+        assert!(
+            wrote,
+            "the echo's write waited on the read parked in the session"
+        );
+    }
+
+    struct Undrivable {
+        entered: Arc<AtomicBool>,
+        opened: Arc<AtomicBool>,
+        wrote: Arc<AtomicBool>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl Read for Undrivable {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            self.entered.store(true, Ordering::Release);
+            let _ = self.release.recv();
+            Ok(0)
+        }
+    }
+
+    impl Write for Undrivable {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.wrote.store(true, Ordering::Release);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ferrox_core::tls::RecordAlignment for Undrivable {}
+
+    impl Drivable for Undrivable {
+        fn transport(&self) -> Option<Connection> {
+            None
+        }
+    }
+
+    impl CipherOpen for Undrivable {
+        fn open(&mut self, ciphertext: &[u8], _buf: &mut [u8]) -> std::io::Result<(usize, usize)> {
+            self.opened.store(true, Ordering::Release);
+            Ok((0, ciphertext.len()))
+        }
+
+        fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize> {
+            self.wrote.store(true, Ordering::Release);
+            out.extend_from_slice(plaintext);
+            Ok(plaintext.len())
+        }
+    }
+
+    /// An undrivable session keeps the shared shape: the read enters the session with no open behind it, and the echo still crosses.
+    #[test]
+    fn a_served_vision_without_a_transport_keeps_the_shared_lock() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let opened = Arc::new(AtomicBool::new(false));
+        let wrote = Arc::new(AtomicBool::new(false));
+        let (release, gated) = std::sync::mpsc::channel();
+        let ended = Arc::new(AtomicBool::new(false));
+        let closed = Arc::clone(&ended);
+        let close: Arc<dyn Fn() + Send + Sync> =
+            Arc::new(move || closed.store(true, Ordering::Release));
+        let session = Undrivable {
+            entered: Arc::clone(&entered),
+            opened: Arc::clone(&opened),
+            wrote: Arc::clone(&wrote),
+            release: gated,
+        };
+        let (ready, hold) = std::sync::mpsc::channel();
+        ready.send(()).expect("arms the echo");
+        let relay = thread::spawn(move || {
+            relay_vision(
+                session,
+                None,
+                &[0u8; 16],
+                Half::shared(EchoOnce { hold, sent: false }),
+                &close,
+                Vec::new(),
+            );
+        });
+        assert!(
+            holds(&entered, Duration::from_secs(5)),
+            "the undrivable session was never read"
+        );
+        assert!(
+            !opened.load(Ordering::Acquire),
+            "the undrivable session took the driven shape"
+        );
+        release.send(()).expect("releases the read");
+        assert!(
+            holds(&wrote, Duration::from_secs(2)),
+            "the fallback never relayed the echo"
+        );
+        assert!(
+            holds(&ended, Duration::from_secs(2)),
+            "the fallback never ended"
+        );
+        join_thread_within(relay, Duration::from_secs(5), "served Vision fallback");
+    }
+
+    fn tls_over_carrier(
+        name: &str,
+        accept: impl FnOnce(Connection) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)>
+            + Send
+            + 'static,
+        connect: impl FnOnce(Connection) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)>,
+    ) {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .expect("timeout");
+            let (reader, writer) = accept(stream).expect("accepts carrier");
+            let mut tls =
+                ferrox_core::tls::accept(&server_config, CarrierStream { reader, writer })
+                    .expect("configures");
+            tls.handshake().expect("handshakes");
+            let mut buf = [0u8; 4];
+            tls.read_exact(&mut buf).expect("reads");
+            tls.write_all(&buf).expect("echoes");
+        });
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let (reader, writer) = connect(stream).expect("connects carrier");
+        let mut tls = ferrox_core::tls::connect(&client_config, CarrierStream { reader, writer })
+            .expect("configures");
+        tls.handshake().expect("handshakes over {name}");
+        tls.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        tls.read_exact(&mut back).expect("reads");
+        assert_eq!(&back, b"ping", "{name} carries the session");
+        server.join().expect("joins");
+    }
+
+    #[test]
+    fn tls_handshakes_over_ws_messages() {
+        tls_over_carrier(
+            "ws",
+            |stream| {
+                let (reader, writer) = crate::ws::accept(stream, "/tunnel")?;
+                Some((
+                    Box::new(reader) as Box<dyn Read + Send>,
+                    Box::new(writer) as Box<dyn Write + Send>,
+                ))
+            },
+            |stream| {
+                let (reader, writer) =
+                    crate::ws::connect(stream, "127.0.0.1", "/tunnel", 0, &[], &[], 0)?;
+                Some((
+                    Box::new(reader) as Box<dyn Read + Send>,
+                    Box::new(writer) as Box<dyn Write + Send>,
+                ))
+            },
+        );
+    }
+
+    #[test]
+    fn tls_handshakes_over_xhttp_chunks() {
+        tls_over_carrier(
+            "xhttp",
+            |stream| {
+                let (reader, writer) = crate::xhttp::accept(stream, "/share")?;
+                Some((
+                    Box::new(reader) as Box<dyn Read + Send>,
+                    Box::new(writer) as Box<dyn Write + Send>,
+                ))
+            },
+            |stream| {
+                let (reader, writer) =
+                    crate::xhttp::connect(stream, "127.0.0.1", "/share", &[], &"X".repeat(500))?;
+                Some((
+                    Box::new(reader) as Box<dyn Read + Send>,
+                    Box::new(writer) as Box<dyn Write + Send>,
+                ))
+            },
+        );
+    }
+
+    /// A peer quiet past one quantum still handshakes: idle retries to the deadline; silence is not a refusal.
+    #[test]
+    fn a_peer_quiet_past_one_quantum_still_handshakes() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream.set_read_timeout(Some(RELAY_POLL)).expect("timeout");
+            let Some(mut tls) = accept_tls_session(stream, &server_config) else {
+                panic!("handshakes past the pause");
+            };
+            let mut buf = [0u8; 4];
+            let mut at = 0;
+            // The 1 ms probe is the handshake's claim, not the payload's: a loaded machine's read times out and is asked again.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while at < buf.len() {
+                match tls.read(&mut buf[at..]) {
+                    Ok(0) => break,
+                    Ok(n) => at += n,
+                    Err(error) if is_timeout(&error) => {
+                        assert!(Instant::now() < deadline, "the client's ping arrives");
+                    }
+                    Err(error) => panic!("reads: {error}"),
+                }
+            }
+            assert_eq!(at, buf.len(), "the client's ping arrives");
+            tls.write_all(&buf).expect("echoes");
+        });
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
+        thread::sleep(RELAY_POLL * 5);
+        let mut tls = ferrox_core::tls::connect(&client_config, stream).expect("configures");
+        tls.handshake().expect("handshakes");
+        tls.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        tls.read_exact(&mut back).expect("reads");
+        assert_eq!(&back, b"ping");
+        server.join().expect("joins");
+    }
+
+    /// Silence past the budget is death, not scheduling: a peer that opens the connection and never sends must not pin the raw VLESS handshake thread forever.
+    #[test]
+    fn a_silent_peer_cannot_pin_a_raw_vless_handshake() {
+        budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
+        let id = [0x11u8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let serving = crate::budgets::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless_raw(stream, &one_vless_user(&id), true, None);
+            let _ = done_tx.send(());
+        });
+        let _peer = Connection::connect(addr).expect("connects");
+        let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
+        budgets::clear();
+        returned.expect("the bounded request read returns instead of pinning the thread");
+        serving.join().expect("joins");
+    }
+
+    /// Silence past the budget is death, not scheduling: a peer that opens the connection and never sends must not pin the raw Trojan handshake thread forever.
+    #[test]
+    fn a_silent_peer_cannot_pin_a_raw_trojan_handshake() {
+        budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
+        let key = [b'k'; 56];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let serving = crate::budgets::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_trojan_raw(stream, &[key], true);
+            let _ = done_tx.send(());
+        });
+        let _peer = Connection::connect(addr).expect("connects");
+        let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
+        budgets::clear();
+        returned.expect("the bounded request read returns instead of pinning the thread");
+        serving.join().expect("joins");
+    }
+
+    /// Silence past the budget is death, not scheduling: a peer that opens the socks front and never greets must not pin its handler thread forever.
+    #[test]
+    fn a_silent_peer_cannot_pin_the_socks_greeting() {
+        budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let serving = crate::budgets::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_socks(stream, &freedom(), &no_accounts());
+            let _ = done_tx.send(());
+        });
+        let _peer = Connection::connect(addr).expect("connects");
+        let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
+        budgets::clear();
+        returned.expect("the bounded greeting read returns instead of pinning the thread");
+        serving.join().expect("joins");
+    }
+
+    /// The budget bounds each read the greeting is made of, not only the first: a peer that selects a method and then stalls before naming its target costs the same budget.
+    #[test]
+    fn a_peer_stalled_mid_greeting_cannot_pin_the_socks_front() {
+        budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let serving = crate::budgets::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_socks(stream, &freedom(), &no_accounts());
+            let _ = done_tx.send(());
+        });
+        // The peer stays open and says nothing more, so the request read expires rather than seeing a close.
+        let mut peer = Connection::connect(addr).expect("connects");
+        peer.write_all(&[5, 1, 0]).expect("greets");
+        let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
+        budgets::clear();
+        returned.expect("the bounded request read returns instead of pinning the thread");
+        serving.join().expect("joins");
+    }
+
+    /// A peer that finishes the websocket upgrade and then goes quiet costs a handshake budget, not a thread.
+    #[test]
+    fn a_silent_peer_cannot_pin_a_ws_handshake() {
+        budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
+        let id = [0x22u8; 16];
+        let carrier = Carrier::Ws {
+            path: "/p".to_owned(),
+            ed: 0,
+        };
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let serving = crate::budgets::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless(stream, &one_vless_user(&id), &carrier, true, None, None);
+            let _ = done_tx.send(());
+        });
+        let mut peer = Connection::connect(addr).expect("connects");
+        peer.write_all(b"GET /p HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\n\
+                         Connection: Upgrade\r\nSec-WebSocket-Key: aGVsbG8gd29ybGQxMjM0NQ==\r\n\r\n")
+            .expect("upgrades");
+        let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
+        budgets::clear();
+        returned.expect("the budgeted frame read returns instead of pinning the thread");
+        drop(peer);
+        serving.join().expect("joins");
+    }
+
+    /// A peer that rides the upgrade response then stops speaking releases the handshake thread.
+    #[test]
+    fn a_silent_peer_cannot_pin_an_httpupgrade_handshake() {
+        budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
+        let id = [0x23u8; 16];
+        let carrier = Carrier::HttpUpgrade {
+            path: "/p".to_owned(),
+            host: String::new(),
+        };
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let serving = crate::budgets::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless(stream, &one_vless_user(&id), &carrier, true, None, None);
+            let _ = done_tx.send(());
+        });
+        let mut peer = Connection::connect(addr).expect("connects");
+        peer.write_all(
+            b"GET /p HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+        )
+        .expect("upgrades");
+        let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
+        budgets::clear();
+        returned.expect("the bounded request read returns instead of pinning the thread");
+        drop(peer);
+        serving.join().expect("joins");
+    }
+
+    /// A peer whose head passes camouflage but whose body never arrives still dies on the budget.
+    #[test]
+    fn a_silent_peer_cannot_pin_an_httpheader_handshake() {
+        budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
+        let id = [0x24u8; 16];
+        let carrier = Carrier::HttpHeader {
+            paths: vec!["/p".to_owned()],
+            path: "/p".to_owned(),
+            response: None,
+        };
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let serving = crate::budgets::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless(stream, &one_vless_user(&id), &carrier, true, None, None);
+            let _ = done_tx.send(());
+        });
+        let mut peer = Connection::connect(addr).expect("connects");
+        peer.write_all(b"GET /p HTTP/1.1\r\nHost: h\r\n\r\n")
+            .expect("sends head");
+        let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
+        budgets::clear();
+        returned.expect("the bounded request read returns instead of pinning the thread");
+        drop(peer);
+        serving.join().expect("joins");
+    }
+
+    /// Silence before the preface is death, not scheduling: a peer that opens a gRPC connection and never sends must not pin the accept thread past the head's budget.
+    #[test]
+    fn a_silent_peer_cannot_pin_a_grpc_preface() {
+        budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
+        let id = [0x25u8; 16];
+        let carrier = Carrier::Grpc(crate::config::GrpcSettings::path("/p"));
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let serving = crate::budgets::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless(stream, &one_vless_user(&id), &carrier, true, None, None);
+            let _ = done_tx.send(());
+        });
+        let _peer = Connection::connect(addr).expect("connects");
+        let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
+        budgets::clear();
+        returned.expect("the bounded preface read returns instead of pinning the thread");
+        serving.join().expect("joins");
+    }
+
+    /// A peer that sends the 24-octet preface and then stops speaking dies on the same budget: the request headers are read under the clock the preface started on.
+    #[test]
+    fn a_silent_peer_cannot_pin_a_grpc_request_head() {
+        budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
+        let id = [0x26u8; 16];
+        let carrier = Carrier::Grpc(crate::config::GrpcSettings::path("/p"));
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let serving = crate::budgets::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless(stream, &one_vless_user(&id), &carrier, true, None, None);
+            let _ = done_tx.send(());
+        });
+        let mut peer = Connection::connect(addr).expect("connects");
+        peer.write_all(crate::h2::MAGIC).expect("sends the preface");
+        let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
+        budgets::clear();
+        returned.expect("the bounded header read returns instead of pinning the thread");
+        drop(peer);
+        serving.join().expect("joins");
+    }
+
+    /// A client that completes the gRPC handshake and never sends its first hunk releases the serve thread: the opening request is decoded under the reader's own budget, the way the websocket frames are.
+    #[test]
+    fn a_silent_peer_cannot_pin_a_grpc_vless_request() {
+        budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
+        let id = [0x27u8; 16];
+        let carrier = Carrier::Grpc(crate::config::GrpcSettings::path("/p"));
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let serving = crate::budgets::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless(stream, &one_vless_user(&id), &carrier, true, None, None);
+            let _ = done_tx.send(());
+        });
+        let stream = Connection::connect(addr).expect("connects");
+        let (_reader, _writer) = crate::grpc::connect(stream, "127.0.0.1", "/p").expect("dials");
+        let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
+        budgets::clear();
+        returned.expect("the bounded request read returns instead of pinning the thread");
+        serving.join().expect("joins");
+    }
+
+    /// A session inbound whose peer answers the head and then stops speaking releases the serve thread: the dispatcher's poll makes the session read answer, and the request's own clock makes it refuse.
+    #[test]
+    fn a_silent_peer_cannot_pin_a_grpc_tls_vless_request() {
+        budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
+
+        let (server_config, client_config) = carried_tls_configs();
+        let id = [0x28u8; 16];
+        let carrier = Carrier::Grpc(crate::config::GrpcSettings::path("/p"));
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let serving = crate::budgets::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless_tls(
+                stream,
+                &one_vless_user(&id),
+                true,
+                &carrier,
+                &server_config,
+                None,
+                None,
+            );
+            let _ = done_tx.send(());
+        });
+        let session = dial_tls_session(&addr, &client_config, None).expect("dialled");
+        let transport = session.get_ref().try_clone().expect("dups the transport");
+        let (read, write) = session_halves(session, transport);
+        let (_reader, _writer) =
+            crate::grpc::connect_split(read, write, "127.0.0.1", "/p").expect("dials the head");
+        let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
+        budgets::clear();
+        returned.expect("the bounded session request read returns instead of pinning the thread");
+        serving.join().expect("joins");
+    }
+
+    /// A trojan inbound over gRPC whose peer answers the head and never writes its hash releases the serve thread: the carrier puts its clock away with the head, so the request reads under its own.
+    #[test]
+    fn a_silent_peer_cannot_pin_a_grpc_trojan_request() {
+        budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
+        let key = trojan_key("secret");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let serving = crate::budgets::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_trojan_grpc(
+                stream,
+                &[key],
+                &crate::config::GrpcSettings::path("/p"),
+                true,
+            );
+            let _ = done_tx.send(());
+        });
+        let stream = Connection::connect(addr).expect("connects");
+        let (_reader, _writer) = crate::grpc::connect(stream, "127.0.0.1", "/p").expect("dials");
+        let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
+        budgets::clear();
+        returned.expect("the bounded request read returns instead of pinning the thread");
+        serving.join().expect("joins");
+    }
+
+    /// A KCP session that registers with a prefix and then falls silent dies on the wall-clock budget, not on the poll quantum.
+    #[test]
+    fn a_silent_peer_cannot_pin_a_kcp_handshake() {
+        budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
+        let id = [0x25u8; 16];
+        let kcp_addr: SocketAddr = "127.0.0.1:0".parse().expect("addr");
+        let listener =
+            ferrox_core::kcp::Listener::bind(kcp_addr, ferrox_core::kcp::Config::default())
+                .expect("binds");
+        let kcp_port = listener.local_addr().port();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let serving = crate::budgets::spawn(move || {
+            let conn = listener.accept().expect("accepts");
+            serve_vless_kcp(
+                &conn,
+                &one_vless_user(&id),
+                true,
+                crate::stats::Meter::default(),
+            );
+            let _ = done_tx.send(());
+        });
+        let server_addr: SocketAddr = format!("127.0.0.1:{kcp_port}").parse().expect("addr");
+        let peer = ferrox_core::kcp::dial(
+            server_addr,
+            ferrox_core::kcp::Config::default(),
+            ferrox_core::kcp::fresh_conversation(),
+        )
+        .expect("dials");
+        // One small packet registers the session; after it the peer never speaks again.
+        peer.write(b"he").expect("writes a prefix");
+        let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
+        budgets::clear();
+        returned.expect("the bounded request read returns instead of pinning the thread");
+        drop(peer);
+        serving.join().expect("joins");
+    }
+
+    /// A trojan peer that never finishes the password line releases the handshake thread.
+    #[test]
+    fn a_silent_peer_cannot_pin_a_trojan_handshake() {
+        budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
+        let key = [b'a'; 56];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let serving = crate::budgets::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_trojan_raw(stream, &[key], true);
+            let _ = done_tx.send(());
+        });
+        let mut peer = Connection::connect(addr).expect("connects");
+        peer.write_all(b"not-a-password-yet")
+            .expect("writes a prefix");
+        let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
+        budgets::clear();
+        returned.expect("the bounded password read returns instead of pinning the thread");
+        drop(peer);
+        serving.join().expect("joins");
+    }
+
+    /// A mux carrier's `[0, 0]` rides the first reply frame (xray flushes them together), so the opener must hand the carrier over before the answer head exists.
+    #[test]
+    fn vless_mux_opener_does_not_wait_for_the_answer_head() {
+        budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(300)),
+            ..Default::default()
+        });
+        let id = [0x27u8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let server = crate::budgets::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            let mut header = [0u8; 19];
+            stream.read_exact(&mut header).expect("reads a mux header");
+            assert_eq!(&header[1..17], &id);
+            assert_eq!(header[18], 3);
+            let mut frame = [0u8; 9];
+            stream.read_exact(&mut frame).expect("reads a frame first");
+            stream.write_all(&[0, 0]).expect("answers");
+            stream.write_all(b"pong").expect("replies");
+        });
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: addr.port(),
+            id,
+            carrier: Carrier::Raw(Chain::default()),
+            host: String::new(),
+            mux: Mux::default(),
+            pool: Pools::default(),
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            encryption: None,
+        };
+        let mut uplink =
+            vless_mux_plain(&addr, &vless).expect("opens before the answer head arrives");
+        let frame = ferrox_core::mux::Outgoing::bare(
+            1,
+            ferrox_core::mux::Status::Keep,
+            ferrox_core::mux::DATA,
+        );
+        let mut bytes = vec![0u8; frame.frame_len(1)];
+        frame.encode_into(Some(&[0u8][..]), &mut bytes);
+        uplink.write.write_all(&bytes).expect("writes a frame");
+        let mut back = [0u8; 4];
+        uplink
+            .read
+            .read_exact(&mut back)
+            .expect("reads past the head");
+        assert_eq!(&back, b"pong");
+        drop(uplink);
+        budgets::clear();
+        server.join().expect("joins");
+    }
+
+    /// A legal answer header that declares add-ons is consumed whole, so no add-on byte reaches the relay as payload.
+    #[test]
+    fn a_vless_answer_with_addons_is_stripped_whole() {
+        let mut reader = ReplyReader::new(std::io::Cursor::new(vec![0, 2, 8, 1, b'o', b'k']));
+        let mut body = Vec::new();
+        reader.read_to_end(&mut body).expect("reads the body");
+        assert_eq!(&body, b"ok");
+
+        let mut short = ReplyReader::new(std::io::Cursor::new(vec![0, 2, 8]));
+        let mut body = Vec::new();
+        assert!(
+            short.read_to_end(&mut body).is_err(),
+            "a truncated add-on block is refused"
+        );
+    }
+
+    /// A server that holds its `[0, 0]` until the first payload arrives — xray with padding and zeronet both do — must not deadlock the client: the client has to start the upload before it waits on the response.
+    #[test]
+    fn vless_client_pumps_the_upload_before_reading_the_response() {
+        let id = [0x26u8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            // Read the request, then wait for payload before answering: a response-withholding server.
+            let Some((got, _flow, cmd, _target)) = decode_request(&mut stream) else {
+                panic!("reads a vless header");
+            };
+            assert_eq!(got, id);
+            assert_eq!(cmd, 1);
+            let mut payload = [0u8; 4];
+            stream
+                .read_exact(&mut payload)
+                .expect("reads payload before answering");
+            stream.write_all(&[0, 0]).expect("answers");
+            stream.write_all(&payload).expect("echoes");
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            carrier: Carrier::Raw(Chain::default()),
+            host: String::new(),
+            mux: Mux::default(),
+            pool: Pools::default(),
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            encryption: None,
+        };
+        let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+        let relaying = thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            dial_vless(
+                &stream,
+                &server_addr,
+                &vless,
+                Some(&Destination::from(target)),
+                Ladder::global(),
+            );
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client
+            .read_exact(&mut back)
+            .expect("echoes through a withheld response");
+        assert_eq!(&back, b"ping");
+        drop(client);
+        server.join().expect("joins");
+        relaying.join().expect("joins");
+    }
+
+    /// The payload grace is a ceiling on a refusal, not a delay before the upload: a raw client that already has bytes must hand them to a response-withholding edge at once, or the first write of every upload waits out the grace while the edge waits for that write.
+    #[test]
+    fn vless_raw_client_pumps_the_upload_before_the_payload_grace_expires() {
+        budgets::apply(&crate::config::Budgets {
+            payload_grace: Some(Duration::from_millis(500)),
+            ..Default::default()
+        });
+        let id = [0x28u8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = crate::budgets::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let Some((got, _flow, cmd, _target)) = decode_request(&mut stream) else {
+                panic!("reads a vless header");
+            };
+            assert_eq!(got, id);
+            assert_eq!(cmd, 1);
+            stream
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .expect("timeout");
+            let mut payload = [0u8; 4];
+            if stream.read_exact(&mut payload).is_err() {
+                return;
+            }
+            stream.write_all(&[0, 0]).expect("answers");
+            stream.write_all(&payload).expect("echoes");
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            carrier: Carrier::Raw(Chain::default()),
+            host: String::new(),
+            mux: Mux::default(),
+            pool: Pools::default(),
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            encryption: None,
+        };
+        let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+        let relaying = crate::budgets::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            dial_vless(
+                &stream,
+                &server_addr,
+                &vless,
+                Some(&Destination::from(target)),
+                Ladder::global(),
+            );
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        let echoed = client.read_exact(&mut back).is_ok();
+        budgets::clear();
+        drop(client);
+        server.join().expect("joins");
+        relaying.join().expect("joins");
+        assert!(echoed, "the first write did not wait out the payload grace");
+        assert_eq!(&back, b"ping");
+    }
+
+    /// The edge has to see the name the client was given: a client that looks it up first sends an address for a host it never kept, and the lookup itself is visible to whoever watches its resolver.
+    #[test]
+    fn vless_sends_the_destination_name_to_the_edge() {
+        const HOST: &str = "www.example.com";
+        let id = [0x26u8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let mut head = [0u8; 23];
+            stream.read_exact(&mut head).expect("reads a vless header");
+            assert_eq!(&head[1..17], &id[..], "the user");
+            assert_eq!(&head[17..19], &[0, 1][..], "no addons, a connect");
+            assert_eq!(&head[19..21], &8443u16.to_be_bytes()[..], "the port");
+            assert_eq!(head[21], 2, "the domain family, not a resolved address");
+            assert_eq!(head[22] as usize, HOST.len(), "and its whole length");
+            let mut name = vec![0u8; HOST.len()];
+            stream.read_exact(&mut name).expect("reads the name");
+            assert_eq!(name, HOST.as_bytes());
+            let mut payload = [0u8; 4];
+            stream
+                .read_exact(&mut payload)
+                .expect("reads the payload of a named target");
+            stream.write_all(&[0, 0]).expect("answers");
+            stream.write_all(&payload).expect("echoes");
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            carrier: Carrier::Raw(Chain::default()),
+            host: String::new(),
+            mux: Mux::default(),
+            pool: Pools::default(),
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            encryption: None,
+        };
+        let asked = Destination::Name(HOST.to_owned(), 8443);
+        let relaying = thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            dial_vless(
+                &stream,
+                &server_addr,
+                &vless,
+                Some(&asked),
+                Ladder::global(),
+            );
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client
+            .read_exact(&mut back)
+            .expect("a named target still round-trips");
+        assert_eq!(&back, b"ping");
+        drop(client);
+        server.join().expect("joins");
+        relaying.join().expect("joins");
+    }
+
+    /// Two address conventions live in the tree: VLESS and `VMess` number a domain 2 with the port before the address, Trojan and the Shadowsocks family number it 3 with the port after. A writer that picks the other byte hands the edge a header it reads as an address.
+    #[test]
+    fn each_writer_numbers_a_name_by_its_own_convention() {
+        const HOST: &str = "www.example.com";
+        let asked = Destination::Name(HOST.to_owned(), 8443);
+        assert_eq!(asked.addr_len(), HOST.len() + 2);
+        assert_eq!(asked.authority(), "www.example.com:8443");
+        let atyp = [2u8, HOST.len() as u8];
+        let head = vless_header(&[0x26u8; 16], 1, &asked);
+        let tail = head.len() - asked.addr_len();
+        assert_eq!(&head[tail..tail + 2], &atyp[..], "vless: family 2");
+        assert_eq!(&head[tail + 2..], HOST.as_bytes());
+        let atyp = [3u8, HOST.len() as u8];
+        let head = trojan_header(&[0x5au8; 56], 1, &asked);
+        let tail = head.len() - 4 - asked.addr_len();
+        assert_eq!(&head[tail..tail + 2], &atyp[..], "trojan: family 3");
+        let mut want = HOST.as_bytes().to_vec();
+        want.extend_from_slice(&8443u16.to_be_bytes());
+        want.extend_from_slice(b"\r\n");
+        assert_eq!(&head[tail + 2..], want, "and the port after the address");
+    }
+
+    /// The header's stack path must not move a byte: for IPv4 (68) and IPv6 (80) the
+    /// fixed buffer spells the exact same wire the heap path would, and for a name it
+    /// still falls back to the Vec, so every destination dials identical bytes.
+    #[test]
+    fn trojan_header_builds_identical_bytes_for_every_destination() {
+        let key = [0x5au8; 56];
+        for target in [
+            Destination::from("192.0.2.53:8080".parse::<SocketAddr>().expect("IPv4")),
+            Destination::from("[2001:db8::1]:443".parse::<SocketAddr>().expect("IPv6")),
+            Destination::Name("www.example.com".to_owned(), 8443),
+        ] {
+            let mut want = key.to_vec();
+            want.extend_from_slice(b"\r\n\x01");
+            target.push_addr(&mut want, 4, 3);
+            want.extend_from_slice(&target.port().to_be_bytes());
+            want.extend_from_slice(b"\r\n");
+            let header = trojan_header(&key, 1, &target);
+            assert_eq!(&*header, want.as_slice(), "{}", target.authority());
+        }
+    }
+
+    /// The link parser's encoder and the dial's encoder are two routes to one wire: same key, same family numbering, same bytes for every destination and both commands.
+    #[test]
+    fn the_link_encoder_and_the_dial_encoder_write_one_header() {
+        let password = "an-example-shared-password";
+        let link = ferrox_core::trojan::TrojanLink::parse(&format!(
+            "trojan://{password}@example.com:443?security=tls"
+        ))
+        .expect("parses");
+        assert_eq!(link.key(), &trojan_key(password), "one key derivation");
+        for target in [
+            Destination::from("192.0.2.53:8080".parse::<SocketAddr>().expect("IPv4")),
+            Destination::from("[2001:db8::1]:443".parse::<SocketAddr>().expect("IPv6")),
+            Destination::Name("www.example.com".to_owned(), 8443),
+            Destination::Name("a".repeat(255), 53),
+        ] {
+            let host = match &target {
+                Destination::Name(host, _) => host.clone(),
+                Destination::Address(address) => address.ip().to_string(),
+            };
+            for (command, byte) in [
+                (ferrox_core::trojan::Command::Connect, 1u8),
+                (ferrox_core::trojan::Command::Udp, 3),
+            ] {
+                assert_eq!(
+                    link.encode_header(command, &host, target.port()),
+                    &trojan_header(link.key(), byte, &target)[..],
+                    "{host} cmd {byte}"
+                );
+            }
+        }
+    }
+
+    /// The pump belongs to the carrier, not to the socket: a WebSocket server that holds its `[0, 0]` until the first frame arrives must not deadlock either.
+    #[test]
+    fn vless_websocket_client_pumps_the_upload_before_reading_the_response() {
+        let id = [0x27u8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let Some((mut reader, writer)) = crate::ws::accept(stream, "/p") else {
+                panic!("accepts the upgrade");
+            };
+            let Some((got, _flow, cmd, _target)) = decode_request(&mut reader) else {
+                panic!("reads a vless header");
+            };
+            assert_eq!(got, id);
+            assert_eq!(cmd, 1);
+            let mut payload = [0u8; 4];
+            read_exact(&mut reader, &mut payload).expect("reads payload before answering");
+            assert!(writer.send(&[0, 0]), "answers");
+            assert!(writer.send(&payload), "echoes");
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            carrier: Carrier::Ws {
+                path: "/p".to_owned(),
+                ed: 0,
+            },
+            host: "127.0.0.1".to_owned(),
+            mux: Mux::default(),
+            pool: Pools::default(),
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            encryption: None,
+        };
+        let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+        let relaying = thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            dial_vless(
+                &stream,
+                &server_addr,
+                &vless,
+                Some(&Destination::from(target)),
+                Ladder::global(),
+            );
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        let echoed = client.read_exact(&mut back).is_ok();
+        budgets::clear();
+        drop(client);
+        server.join().expect("joins");
+        relaying.join().expect("joins");
+        assert!(echoed, "the first write did not wait out the payload grace");
+        assert_eq!(&back, b"ping");
+    }
+
+    /// `HTTPUpgrade` is a carrier too, and its server may hold the `[0, 0]` until the first payload arrives: the pump must start before the payload grace, not after it.
+    #[test]
+    fn vless_httpupgrade_client_pumps_the_upload_before_the_payload_grace_expires() {
+        budgets::apply(&crate::config::Budgets {
+            payload_grace: Some(Duration::from_millis(500)),
+            ..Default::default()
+        });
+        let id = [0x29u8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = crate::budgets::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let (mut reader, mut writer) =
+                crate::httpupgrade::accept(stream, "/p", "").expect("accepts the upgrade");
+            reader.set_poll(Some(Duration::from_millis(200)));
+            let Some((got, _flow, cmd, _target)) = decode_request(&mut reader) else {
+                panic!("reads a vless header");
+            };
+            assert_eq!(got, id);
+            assert_eq!(cmd, 1);
+            let mut payload = [0u8; 4];
+            reader
+                .read_exact(&mut payload)
+                .expect("reads payload before answering");
+            writer.write_all(&[0, 0]).expect("answers");
+            writer.write_all(&payload).expect("echoes");
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            carrier: Carrier::HttpUpgrade {
+                path: "/p".to_owned(),
+                host: "127.0.0.1".to_owned(),
+            },
+            host: "127.0.0.1".to_owned(),
+            mux: Mux::default(),
+            pool: Pools::default(),
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            encryption: None,
+        };
+        let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+        let relaying = crate::budgets::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            dial_vless(
+                &stream,
+                &server_addr,
+                &vless,
+                Some(&Destination::from(target)),
+                Ladder::global(),
+            );
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        let echoed = client.read_exact(&mut back).is_ok();
+        budgets::clear();
+        drop(client);
+        server.join().expect("joins");
+        relaying.join().expect("joins");
+        assert!(echoed, "the first write did not wait out the payload grace");
+        assert_eq!(&back, b"ping");
+    }
+
+    /// The pump belongs to the carrier, and REALITY is a carrier: a REALITY server that holds its `[0, 0]` until the first payload record arrives must not deadlock the client either.
+    #[test]
+    fn vless_reality_client_pumps_the_upload_before_reading_the_response() {
+        budgets::apply(&crate::config::Budgets {
+            payload_grace: Some(Duration::from_millis(500)),
+            ..Default::default()
+        });
+        let id = uuid_bytes(REALITY_TEST_ID).expect("id");
+        let server_config = reality_server_config();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let server_addr = listener.local_addr().expect("addr");
+        let server = crate::budgets::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let edges = reality_edges(&server_config, &stream);
+            let Ok(ferrox_core::tls::RealityAccept::Session(mut session)) =
+                ferrox_core::tls::RealityServer::accept(
+                    &server_config,
+                    unix_millis(),
+                    stream,
+                    edges,
+                )
+            else {
+                panic!("the peer handshakes, it is not proxied to the cover origin");
+            };
+            assert!(shake_tls(&mut session), "handshakes");
+            let Some((got, _flow, cmd, _target)) = decode_request(&mut session) else {
+                panic!("reads a vless header");
+            };
+            assert_eq!(got, id);
+            assert_eq!(cmd, 1);
+            session
+                .transport()
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .expect("timeout");
+            let mut payload = [0u8; 4];
+            session
+                .read_exact(&mut payload)
+                .expect("reads payload before answering");
+            session.write_all(&[0, 0]).expect("answers");
+            session.write_all(&payload).expect("echoes");
+        });
+        let public =
+            x25519_dalek::x25519(REALITY_TEST_PRIVATE, x25519_dalek::X25519_BASEPOINT_BYTES);
+        let root = crate::json::parse(&reality_client_json(
+            server_addr.port(),
+            &b64url(&public),
+            "",
+        ))
+        .expect("parses");
+        let Outbound::Vless(vless) = find_outbound(&root)
+            .expect("a REALITY outbound")
+            .expect("the config names one")
+        else {
+            panic!("the outbound dials VLESS");
+        };
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+        let relaying = crate::budgets::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            dial_vless(
+                &stream,
+                &server_addr,
+                &vless,
+                Some(&Destination::from(target)),
+                Ladder::global(),
+            );
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client
+            .read_exact(&mut back)
+            .expect("echoes through a withheld answer");
+        assert_eq!(&back, b"ping");
+        drop(client);
+        server.join().expect("joins");
+        relaying.join().expect("joins");
+    }
+
+    fn socks_tls_root(stream: &str) -> crate::json::Json {
+        crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "socks",
+                "settings": {{"servers": [{{"address": "127.0.0.1", "port": 443}}]}},
+                "streamSettings": {{{stream}}}}}]}}"#
+        ))
+        .expect("parses")
+    }
+
+    fn http_tls_root(stream: &str) -> crate::json::Json {
+        crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "http",
+                "settings": {{"servers": [{{"address": "127.0.0.1", "port": 443}}]}},
+                "streamSettings": {{{stream}}}}}]}}"#
+        ))
+        .expect("parses")
+    }
+
+    fn vnext_tls_root(protocol: &str, stream: &str) -> crate::json::Json {
+        crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "{protocol}",
+                "settings": {{"vnext": [{{"address": "127.0.0.1", "port": 443,
+                    "users": [{{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}}]}}]}},
+                "streamSettings": {{{stream}}}}}]}}"#
+        ))
+        .expect("parses")
+    }
+
+    fn trojan_tls_root(stream: &str) -> crate::json::Json {
+        crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "trojan",
+                "settings": {{"servers": [{{"address": "127.0.0.1", "port": 443,
+                    "password": "secret"}}]}},
+                "streamSettings": {{{stream}}}}}]}}"#
+        ))
+        .expect("parses")
+    }
+
+    fn tls_stream_cases(ca_json: &str) -> Vec<(String, String)> {
+        vec![
+            (
+                "raw".to_owned(),
+                format!(
+                    r#""network": "tcp", "security": "tls", "tlsSettings": {{"serverName": "tls.test", "caCertFile": "{ca_json}", "alpn": ["h2"]}}"#
+                ),
+            ),
+            (
+                "kcp".to_owned(),
+                format!(
+                    r#""network": "kcp", "security": "tls", "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
+                ),
+            ),
+            (
+                "ws".to_owned(),
+                format!(
+                    r#""network": "ws", "security": "tls", "wsSettings": {{"path": "/w"}}, "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
+                ),
+            ),
+            (
+                "grpc".to_owned(),
+                format!(
+                    r#""network": "grpc", "security": "tls", "grpcSettings": {{"serviceName": "svc"}}, "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
+                ),
+            ),
+            (
+                "xhttp".to_owned(),
+                format!(
+                    r#""network": "xhttp", "security": "tls", "xhttpSettings": {{"path": "/share"}}, "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
+                ),
+            ),
+            (
+                "httpupgrade".to_owned(),
+                format!(
+                    r#""network": "httpupgrade", "security": "tls", "httpupgradeSettings": {{"path": "/u"}}, "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
+                ),
+            ),
+            (
+                "httpheader".to_owned(),
+                format!(
+                    r#""network": "tcp", "security": "tls", "tcpSettings": {{"header": {{"type": "http", "request": {{"path": ["/c"]}}}}}}, "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
+                ),
+            ),
+        ]
+    }
+
+    fn carrier_tag(carrier: &Carrier) -> &'static str {
+        match carrier {
+            Carrier::Raw(_) => "raw",
+            Carrier::Ws { .. } => "ws",
+            Carrier::HttpUpgrade { .. } => "httpupgrade",
+            Carrier::Grpc(_) => "grpc",
+            Carrier::Xhttp { .. } => "xhttp",
+            Carrier::HttpHeader { .. } => "httpheader",
+            Carrier::Kcp(_) => "kcp",
+            _ => "other",
+        }
+    }
+
+    #[test]
+    fn vless_tls_outbound_parses_diallable_carriers() {
+        let (ca, ca_json) = stage_ca_pem("vless-tls");
+        for (want, stream) in tls_stream_cases(&ca_json) {
+            let root = vnext_tls_root("vless", &stream);
+            let out = find_vless_outbound(&root).expect("finds {want} tls");
+            assert_eq!(carrier_tag(&out.carrier), want, "{want}");
+            assert!(out.tls.is_some(), "{want}");
+        }
+        let tls = find_vless_outbound(&vnext_tls_root("vless", &tls_stream_cases(&ca_json)[0].1))
+            .expect("finds raw")
+            .tls
+            .expect("carries tls");
+        assert_eq!(tls.server_name, "tls.test");
+        assert_eq!(&*tls.alpn, &[b"h2".to_vec()]);
+        let staged = crate::quic::parse_ca_pem(&std::fs::read(&ca).expect("the staged ca"));
+        assert!(
+            staged.iter().all(|anchor| tls.roots.contains(anchor)),
+            "caCertFile joins the pool the dial verifies with, beside the store"
+        );
+        assert!(!tls.insecure, "raw honors allowInsecure=false by default");
+        for (want, stream) in tls_stream_cases(&ca_json) {
+            let out = find_vless_outbound(&vnext_tls_root("vless", &stream)).expect("finds {want}");
+            assert!(!out.tls.as_ref().expect("carries tls").insecure, "{want}");
+        }
+        let insecure = format!(
+            r#""network": "tcp", "security": "tls", "tlsSettings": {{"caCertFile": "{ca_json}", "allowInsecure": true}}"#
+        );
+        let insecure = find_vless_outbound(&vnext_tls_root("vless", &insecure))
+            .expect("allowInsecure builds the outbound");
+        assert!(insecure.tls.expect("carries tls").insecure, "allowInsecure");
+        for network in ["quic", "kcp", "hysteria"] {
+            let stream = format!(
+                r#""network": "{network}", "security": "tls", "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
+            );
+            let root = vnext_tls_root("vless", &stream);
+            match network {
+                // The transports that carry their own session keep their own dial: quic handshakes above it, and KCP wraps the connection.
+                "quic" => {
+                    let out = find_vless_outbound(&root).expect("quic keeps its own dial");
+                    assert!(matches!(out.carrier, Carrier::Quic));
+                    assert!(out.tls.is_none());
+                }
+                "kcp" => {
+                    let out = find_vless_outbound(&root).expect("kcp wraps its transport");
+                    assert!(matches!(out.carrier, Carrier::Kcp(_)));
+                    assert!(out.tls.is_some(), "the kcp session carries tls");
+                }
+                "hysteria" => {
+                    let out = find_vless_outbound(&root).expect("hysteria carries its own tls");
+                    assert!(matches!(out.carrier, Carrier::Hysteria(_)));
+                    assert!(out.tls.is_none(), "the carrier's tls is not a second layer");
+                }
+                _ => assert!(find_vless_outbound(&root).is_none(), "{network}"),
+            }
+        }
+        let muxed = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "vless", "mux": {{"enabled": true}},
+                "settings": {{"vnext": [{{"address": "127.0.0.1", "port": 443,
+                    "users": [{{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}}]}}]}},
+                "streamSettings": {{"network": "tcp", "security": "tls",
+                    "tlsSettings": {{"caCertFile": "{ca_json}"}}}}}}]}}"#
+        ))
+        .expect("parses");
+        let muxed = find_vless_outbound(&muxed).expect("tls carries the muxed outbound");
+        assert!(muxed.tls.is_some(), "the session is still tls");
+        assert!(muxed.mux.tcp.is_some(), "the mux rides the tls carrier");
+        let kcp = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "vless", "mux": {"enabled": true},
+                "settings": {"vnext": [{"address": "127.0.0.1", "port": 443,
+                    "users": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]}]},
+                "streamSettings": {"network": "kcp"}}]}"#,
+        )
+        .expect("parses");
+        let kcp = find_vless_outbound(&kcp).expect("kcp carries the mux");
+        assert!(kcp.mux.tcp.is_some(), "the codec rides the kcp session");
+        let _ = std::fs::remove_file(&ca);
+    }
+
+    #[test]
+    fn trojan_tls_outbound_parses_diallable_carriers() {
+        let (ca, ca_json) = stage_ca_pem("trojan-tls");
+        for (want, stream) in tls_stream_cases(&ca_json) {
+            let root = trojan_tls_root(&stream);
+            let out = find_trojan_outbound(&root).expect("finds {want} tls");
+            assert_eq!(carrier_tag(&out.carrier), want, "{want}");
+            assert!(out.tls.is_some(), "{want}");
+        }
+        let out = find_trojan_outbound(&trojan_tls_root(&tls_stream_cases(&ca_json)[0].1))
+            .expect("finds raw");
+        assert_eq!(out.tls.expect("carries tls").server_name, "tls.test");
+        for network in ["quic", "kcp", "hysteria"] {
+            let stream = format!(
+                r#""network": "{network}", "security": "tls", "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
+            );
+            let root = trojan_tls_root(&stream);
+            match network {
+                "kcp" => {
+                    let out = find_trojan_outbound(&root).expect("kcp wraps its transport");
+                    assert!(matches!(out.carrier, Carrier::Kcp(_)));
+                    assert!(out.tls.is_some(), "the kcp session carries tls");
+                }
+                "quic" => {
+                    let out = find_trojan_outbound(&root).expect("quic carries its own tls");
+                    assert!(matches!(out.carrier, Carrier::Quic));
+                    assert!(out.tls.is_none(), "the carrier's tls is not a second layer");
+                }
+                "hysteria" => {
+                    let out = find_trojan_outbound(&root).expect("hysteria carries its own tls");
+                    assert!(matches!(out.carrier, Carrier::Hysteria(_)));
+                    assert!(out.tls.is_none(), "the carrier's tls is not a second layer");
+                }
+                _ => assert!(find_trojan_outbound(&root).is_none(), "{network}"),
+            }
+        }
+        let plain = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "trojan",
+                "settings": {"servers": [{"address": "127.0.0.1", "port": 443,
+                    "password": "secret"}]},
+                "streamSettings": {"network": "tcp"}}]}"#,
+        )
+        .expect("parses");
+        let out = find_trojan_outbound(&plain).expect("finds plain");
+        assert!(out.tls.is_none());
+        let _ = std::fs::remove_file(&ca);
+    }
+
+    #[test]
+    fn vmess_tls_outbound_parses_diallable_carriers() {
+        let (ca, ca_json) = stage_ca_pem("vmess-tls");
+        for (want, stream) in tls_stream_cases(&ca_json) {
+            let root = vnext_tls_root("vmess", &stream);
+            let out = find_vmess_outbound(&root).expect("finds {want} tls");
+            assert_eq!(carrier_tag(&out.carrier), want, "{want}");
+            assert!(out.tls.is_some(), "{want}");
+        }
+        for network in ["quic", "kcp", "hysteria"] {
+            let stream = format!(
+                r#""network": "{network}", "security": "tls", "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
+            );
+            let root = vnext_tls_root("vmess", &stream);
+            match network {
+                "kcp" => {
+                    let out = find_vmess_outbound(&root).expect("kcp wraps its transport");
+                    assert!(matches!(out.carrier, Carrier::Kcp(_)));
+                    assert!(out.tls.is_some(), "the kcp session carries tls");
+                }
+                "quic" => {
+                    let out = find_vmess_outbound(&root).expect("quic carries its own tls");
+                    assert!(matches!(out.carrier, Carrier::Quic));
+                    assert!(out.quic_roots.is_some(), "the quic dial trusts the ca");
+                    assert!(out.tls.is_none(), "no second handshake above quic");
+                }
+                "hysteria" => {
+                    let out = find_vmess_outbound(&root).expect("hysteria carries its own tls");
+                    assert!(matches!(out.carrier, Carrier::Hysteria(_)));
+                    assert!(
+                        out.hysteria_roots.is_some(),
+                        "the hysteria dial trusts the ca"
+                    );
+                    assert!(out.tls.is_none(), "no second handshake above hysteria");
+                }
+                _ => unreachable!(),
+            }
+        }
+        let plain = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "vmess",
+                "settings": {"vnext": [{"address": "127.0.0.1", "port": 443,
+                    "users": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]}]},
+                "streamSettings": {"network": "tcp"}}]}"#,
+        )
+        .expect("parses");
+        let out = find_vmess_outbound(&plain).expect("finds plain");
+        assert!(out.tls.is_none());
+        assert!(
+            !out.auth_len,
+            "the default account does not ask for the experiment"
+        );
+        let experiment = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "vmess",
+                "settings": {"vnext": [{"address": "127.0.0.1", "port": 443,
+                    "users": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                        "experiments": "AuthenticatedLength|"}]}]},
+                "streamSettings": {"network": "tcp"}}]}"#,
+        )
+        .expect("parses");
+        assert!(
+            find_vmess_outbound(&experiment)
+                .expect("finds the experiment")
+                .auth_len,
+            "the account's experiments select the authenticated length"
+        );
+        let none = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "vmess",
+                "settings": {"vnext": [{"address": "127.0.0.1", "port": 443,
+                    "users": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                        "security": "none", "experiments": "AuthenticatedLength|"}]}]},
+                "streamSettings": {"network": "tcp"}}]}"#,
+        )
+        .expect("parses");
+        let out = find_vmess_outbound(&none).expect("finds the experiment");
+        assert!(out.auth_len);
+        assert_eq!(
+            out.cipher,
+            crate::vmess::Cipher::Auto,
+            "security none is the reference's auto"
+        );
+        let plain_none = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "vmess",
+                "settings": {"vnext": [{"address": "127.0.0.1", "port": 443,
+                    "users": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                        "security": "none"}]}]},
+                "streamSettings": {"network": "tcp"}}]}"#,
+        )
+        .expect("parses");
+        let out = find_vmess_outbound(&plain_none).expect("finds plain none");
+        assert_eq!(
+            out.cipher,
+            crate::vmess::Cipher::Auto,
+            "security none without an experiment is still the reference's auto"
+        );
+        let _ = std::fs::remove_file(&ca);
+    }
+
+    /// `infra/conf/vmess.go` (`VMessInboundConfig.Build`) aliases `users` to `clients` when
+    /// `clients` is present; a config the reference serves cannot lose an account here.
+    #[test]
+    fn vmess_inbound_serves_every_user_under_either_spelling() {
+        let users = crate::json::parse(
+            r#"{"settings":{"users":[
+                {"id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","email":"a","level":1,
+                    "experiments":"NoTerminationSignal"},
+                {"id":"11111111-2222-3333-4444-555555555555","email":"b","level":2}
+            ]}}"#,
+        )
+        .expect("parses");
+        let rows = inbound_vmess_users(&users).list();
+        assert_eq!(rows.len(), 2, "every settings.users entry is served");
+        assert_eq!((rows[0].email.as_str(), rows[0].level), ("a", 1));
+        assert!(rows[0].no_termination);
+        assert_eq!((rows[1].email.as_str(), rows[1].level), ("b", 2));
+        let both = crate::json::parse(
+            r#"{"settings":{
+                "users":[{"id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","email":"a"}],
+                "clients":[{"id":"11111111-2222-3333-4444-555555555555","email":"c"}]
+            }}"#,
+        )
+        .expect("parses");
+        let rows = inbound_vmess_users(&both).list();
+        assert_eq!(rows.len(), 1, "clients names the whole table when present");
+        assert_eq!(rows[0].email, "c");
+    }
+
+    #[test]
+    fn socks_tls_outbound_parses_diallable_carriers() {
+        let (ca, ca_json) = stage_ca_pem("socks-tls");
+        for (want, stream) in tls_stream_cases(&ca_json) {
+            let root = socks_tls_root(&stream);
+            let out = find_socks_outbound(&root).expect("finds {want} tls");
+            assert_eq!(carrier_tag(&out.carrier), want, "{want}");
+            assert!(out.tls.is_some(), "{want}");
+        }
+        for network in ["quic", "hysteria"] {
+            let stream = format!(
+                r#""network": "{network}", "security": "tls", "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
+            );
+            assert!(
+                find_socks_outbound(&socks_tls_root(&stream)).is_none(),
+                "{network}"
+            );
+        }
+        let plain = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "socks",
+                "settings": {"servers": [{"address": "127.0.0.1", "port": 443}]},
+                "streamSettings": {"network": "tcp"}}]}"#,
+        )
+        .expect("parses");
+        assert!(find_socks_outbound(&plain)
+            .expect("finds plain")
+            .tls
+            .is_none());
+        let _ = std::fs::remove_file(&ca);
+    }
+
+    #[test]
+    fn http_tls_outbound_parses_diallable_carriers() {
+        let (ca, ca_json) = stage_ca_pem("http-tls");
+        for (want, stream) in tls_stream_cases(&ca_json) {
+            let root = http_tls_root(&stream);
+            let out = find_http_outbound(&root).expect("finds {want} tls");
+            assert_eq!(carrier_tag(&out.carrier), want, "{want}");
+            assert!(out.tls.is_some(), "{want}");
+        }
+        for network in ["quic", "hysteria"] {
+            let stream = format!(
+                r#""network": "{network}", "security": "tls", "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
+            );
+            assert!(
+                find_http_outbound(&http_tls_root(&stream)).is_none(),
+                "{network}"
+            );
+        }
+        let plain = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "http",
+                "settings": {"servers": [{"address": "127.0.0.1", "port": 443}]},
+                "streamSettings": {"network": "tcp"}}]}"#,
+        )
+        .expect("parses");
+        assert!(find_http_outbound(&plain)
+            .expect("finds plain")
+            .tls
+            .is_none());
+        let _ = std::fs::remove_file(&ca);
+    }
+
+    /// A carrier the dial does not implement must be refused at parse time, not sent as raw TCP to the configured server with its transport ignored.
+    #[test]
+    fn vmess_refuses_carriers_it_does_not_dial() {
+        for network in ["http", "h3", "masque"] {
+            let stream = format!(r#""network": "{network}", "security": "none""#);
+            assert!(
+                find_vmess_outbound(&vnext_tls_root("vmess", &stream)).is_none(),
+                "{network} is not dialled"
+            );
+        }
+    }
+
+    /// A store's `security: tls` names the handshake its own lanes speak, so the outbound keeps that config on the carrier and adds no second handshake; reality stays refused, as the store refuses it.
+    #[test]
+    fn an_xdrive_outbound_keeps_the_stores_lanes_tls() {
+        let folder = format!("/tmp/ferrox-xdrive-lanes-{}", std::process::id());
+        let stream = |security: &str| {
+            format!(
+                r#""network": "xdrive", "security": "{security}",
+                    "xdriveSettings": {{"service": "local", "remoteFolder": "{folder}"}},
+                    "tlsSettings": {{"serverName": "store.test", "allowInsecure": true}}"#
+            )
+        };
+        let trojan = find_trojan_outbound(&trojan_tls_root(&stream("tls")))
+            .expect("the store carries the session");
+        let Carrier::Xdrive { settings } = &trojan.carrier else {
+            panic!("the carrier is the store");
+        };
+        assert!(trojan.tls.is_none(), "the store's lanes own the handshake");
+        assert_eq!(settings.security, "tls");
+        assert_eq!(
+            settings
+                .tls
+                .as_ref()
+                .expect("the lanes carry tls")
+                .server_name,
+            "store.test"
+        );
+        {
+            let out = find_vless_outbound(&vnext_tls_root("vless", &stream("tls")))
+                .expect("vless keeps the store");
+            assert!(matches!(out.carrier, Carrier::Xdrive { .. }));
+            assert!(out.tls.is_none());
+        }
+        {
+            let out = find_vmess_outbound(&vnext_tls_root("vmess", &stream("tls")))
+                .expect("vmess keeps the store");
+            assert!(matches!(out.carrier, Carrier::Xdrive { .. }));
+            assert!(out.tls.is_none());
+        }
+        assert!(find_trojan_outbound(&trojan_tls_root(&stream("reality"))).is_none());
+        assert!(find_vless_outbound(&vnext_tls_root("vless", &stream("reality"))).is_none());
+        assert!(find_vmess_outbound(&vnext_tls_root("vmess", &stream("reality"))).is_none());
+    }
+
+    /// `VMess` carries the same REALITY identity VLESS and Trojan do: the outbound keeps the sealed
+    /// handshake and adds no TLS layer above it.
+    #[test]
+    fn vmess_reality_outbound_parses_its_identity() {
+        let public =
+            x25519_dalek::x25519(REALITY_TEST_PRIVATE, x25519_dalek::X25519_BASEPOINT_BYTES);
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds":[{{"protocol":"vmess","settings":{{"vnext":[{{"address":"127.0.0.1","port":443,"users":[{{"id":"{REALITY_TEST_ID}"}}]}}]}},"streamSettings":{{"network":"tcp","security":"reality","realitySettings":{{"serverName":"{REALITY_TEST_SNI}","publicKey":"{}","shortId":"{REALITY_TEST_SHORT}","fingerprint":"chrome"}}}}}}]}}"#,
+            b64url(&public),
+        ))
+        .expect("parses");
+        let out = find_vmess_outbound(&root).expect("dials raw REALITY");
+        assert!(out.reality.is_some());
+        assert!(out.tls.is_none());
+        assert!(matches!(out.carrier, Carrier::Raw(_)));
+    }
+
+    /// `Shadowsocks` dials REALITY on the raw carrier and every carried lane the `VLESS`,
+    /// `VMess` and Trojan rows ship, so the outbound builds and the refusal stays silent.
+    #[test]
+    fn shadowsocks_reality_outbound_parses_its_identity() {
+        let public =
+            x25519_dalek::x25519(REALITY_TEST_PRIVATE, x25519_dalek::X25519_BASEPOINT_BYTES);
+        let key = b64url(&public);
+        for method in ["aes-256-gcm", "2022-blake3-aes-128-gcm"] {
+            let dials = |stream: &str| {
+                let json = format!(
+                    r#"{{"outbounds":[{{"protocol":"shadowsocks","settings":{{"servers":[{{"address":"127.0.0.1","port":443,"method":"{method}","password":"secret"}}]}},"streamSettings":{{{stream},"security":"reality","realitySettings":{{"serverName":"{REALITY_TEST_SNI}","publicKey":"{key}","shortId":"{REALITY_TEST_SHORT}","fingerprint":"chrome"}}}}}}]}}"#
+                );
+                let root = crate::json::parse(&json).expect("parses");
+                let out = find_shadowsocks_outbound(&root)?;
+                assert!(out.reality.is_some(), "{method} keeps the identity");
+                assert!(out.tls.is_none(), "{method} adds no tls above REALITY");
+                let outbound = root
+                    .get("outbounds")
+                    .and_then(Json::as_arr)
+                    .and_then(|list| list.first())
+                    .expect("outbound")
+                    .clone();
+                let server = lane_server(outbound.get("settings"), "servers")?.clone();
+                assert!(
+                    ss_outbound_refusal(&outbound, &server).is_none(),
+                    "{method} is not refused"
+                );
+                Some(out)
+            };
+            let raw = dials(r#""network": "tcp""#).expect("raw REALITY dials");
+            assert!(matches!(raw.carrier, Carrier::Raw(_)));
+            assert!(dials(r#""network": "ws""#).is_some(), "ws REALITY dials");
+            assert!(
+                dials(r#""network": "httpupgrade""#).is_some(),
+                "httpupgrade REALITY dials"
+            );
+            assert!(
+                dials(r#""network": "grpc""#).is_some(),
+                "grpc REALITY dials"
+            );
+            assert!(
+                dials(r#""network": "xhttp""#).is_some(),
+                "xhttp REALITY dials"
+            );
+            assert!(
+                dials(
+                    r#""network": "tcp", "tcpSettings": {"header": {"type": "http", "request": {"path": "/"}}}"#
+                )
+                .is_some(),
+                "http-header REALITY dials"
+            );
+            assert!(
+                dials(r#""network": "quic""#).is_none(),
+                "quic REALITY has no second handshake to add"
+            );
+            assert!(
+                dials(r#""network": "kcp""#).is_some(),
+                "kcp REALITY dials the carried tunnel"
+            );
+        }
+    }
+
+    /// The REALITY session sits above the raw socket and below the SS handshake, so a
+    /// byte the client writes reaches the echoed target and comes back sealed.
+    #[test]
+    fn shadowsocks_reality_raw_dials_over_loopback() {
+        let public =
+            x25519_dalek::x25519(REALITY_TEST_PRIVATE, x25519_dalek::X25519_BASEPOINT_BYTES);
+        let key = b64url(&public);
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let inbound = crate::json::parse(
+            r#"{"protocol":"shadowsocks","settings":{"method":"aes-256-gcm","password":"an-example-shared-password"}}"#,
+        )
+        .expect("parses");
+        let accounts = ss_accounts(
+            &inbound,
+            "127.0.0.1",
+            "an-example-shared-password".to_owned(),
+            "aes-256-gcm".to_owned(),
+            &std::collections::HashSet::new(),
+        );
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let Ok(out) = stream.try_clone() else {
+                return;
+            };
+            serve_carrier_reality(stream, &reality_server_config(), move |mut session| {
+                if !shake_tls(&mut session) {
+                    return;
+                }
+                let (reader, writer) = session_halves(session, out);
+                let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+                serve_ss_tls_session(reader, writer, &accounts, true, &close);
+            });
+        });
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds":[{{"protocol":"shadowsocks","settings":{{"servers":[{{"address":"127.0.0.1","port":{port},"method":"aes-256-gcm","password":"an-example-shared-password"}}]}},"streamSettings":{{"network":"tcp","security":"reality","realitySettings":{{"serverName":"{REALITY_TEST_SNI}","publicKey":"{key}","shortId":"{REALITY_TEST_SHORT}","fingerprint":"chrome"}}}}}}]}}"#
+        ))
+        .expect("parses");
+        let ss = find_shadowsocks_outbound(&root).expect("dials raw REALITY");
+        let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let echo_port = echo_loop();
+        let asked = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let ladder: &'static Ladder = Box::leak(Box::new(Ladder::new()));
+        thread::spawn(move || {
+            let (socket, _) = downstream.accept().expect("accepts");
+            dial_shadowsocks(&socket, &server, &ss, &asked, ladder);
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping", "the reality lane echoes");
+        assert_eq!(
+            ladder.attempts(Rung::Raw),
+            1,
+            "the rung counts the connection"
+        );
+        assert_eq!(ladder.current(), Rung::Raw, "the working rung holds");
+        assert_eq!(ladder.climbs(), 0, "a served connection climbs nothing");
+    }
+
+    /// A REALITY inbound on a carrier the serve path cannot arm is refused before the role starts,
+    /// instead of binding a listener that drops every session.
+    #[test]
+    fn vmess_reality_inbound_refuses_an_unsupported_carrier() {
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol":"vmess","port":0,"settings":{{"clients":[{{"id":"{REALITY_TEST_ID}"}}]}},"streamSettings":{{"network":"quic","security":"reality"}}}}"#
+        ))
+        .expect("parses");
+        let (_, served) = serve_vmess_inbound("127.0.0.1:0", &inbound, true, None);
+        assert!(!served);
+    }
+
+    /// The bulk download through the same relay: the session's own buffer is finite, and a
+    /// relay that kept feeding it after the caller's window was full filled it.
+    #[test]
+    fn vless_over_tls_carries_a_bulk_download() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let id = [0x47u8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let Some((got, _flow, cmd, _target)) = decode_request(&mut tls) else {
+                panic!("reads a vless header");
+            };
+            assert_eq!(got, id);
+            assert_eq!(cmd, 1);
+            tls.write_all(&[0, 0]).expect("answers");
+            let block = vec![0x5Au8; 64 * 1024];
+            for _ in 0..16 {
+                tls.write_all(&block).expect("answers the download");
+            }
+            tls.flush().expect("flushes");
+        });
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let relay = thread::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+            let target: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+            let vless = VlessOut {
+                address: "127.0.0.1".to_owned(),
+                port,
+                id,
+                carrier: Carrier::Raw(Chain::default()),
+                host: String::new(),
+                mux: Mux::default(),
+                pool: Pools::default(),
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
+                tls: Some(Arc::new(client_config)),
+                flow: String::new(),
+                reality: None,
+                headers: Vec::new(),
+                heartbeat: 0,
+                encryption: None,
+            };
+            dial_vless(
+                &client,
+                &server,
+                &vless,
+                Some(&Destination::from(target)),
+                Ladder::global(),
+            );
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(120)))
+            .expect("timeout");
+        let mut bulk = vec![0u8; 1024 * 1024];
+        let mut at = 0;
+        while at < bulk.len() {
+            match sock.read(&mut bulk[at..]) {
+                Ok(0) => panic!("the bulk download closed after {at} bytes"),
+                Ok(n) => at += n,
+                Err(error) if is_timeout(&error) => {}
+                Err(error) => panic!("the bulk download failed: {error:?}"),
+            }
+        }
+        assert!(
+            bulk.iter().all(|byte| *byte == 0x5A),
+            "the bulk download came back altered"
+        );
+        drop(sock);
+        relay.join().expect("joins");
+        server.join().expect("joins");
+    }
+
+    /// The served half of the same lane: `serve_vless_tls` carries a megabyte from the target
+    /// to a real client session, so the download's writer is not parked behind the upload's read.
+    #[test]
+    fn a_served_tls_session_carries_a_bulk_download() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let id = [0x49u8; 16];
+        let target = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let target_addr = target.local_addr().expect("addr");
+        let filler = thread::spawn(move || {
+            let (mut stream, _) = target.accept().expect("accepts");
+            let block = vec![0x5Au8; 64 * 1024];
+            for _ in 0..16 {
+                stream.write_all(&block).expect("fills the download");
+            }
+        });
+        let inbound = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = inbound.local_addr().expect("addr").port();
+        let proxy = thread::spawn(move || {
+            let (stream, _) = inbound.accept().expect("accepts");
+            serve_vless_tls(
+                stream,
+                &one_vless_user(&id),
+                true,
+                &Carrier::Raw(Chain::default()),
+                &server_config,
+                None,
+                None,
+            );
+        });
+        let mut session = ferrox_core::tls::RustlsProvider::connect(
+            &client_config,
+            Connection::connect(("127.0.0.1", port)).expect("connects"),
+        )
+        .expect("opens");
+        session.handshake().expect("handshakes");
+        let header = vless_header(&id, 1, &Destination::from(target_addr));
+        session.write_all(&header).expect("writes the request");
+        let mut answer = [0u8; 2];
+        session.read_exact(&mut answer).expect("reads the answer");
+        let mut bulk = vec![0u8; 1024 * 1024];
+        let mut at = 0;
+        while at < bulk.len() {
+            match session.read(&mut bulk[at..]) {
+                Ok(0) => panic!("the bulk download closed after {at} bytes"),
+                Ok(n) => at += n,
+                Err(error) if is_timeout(&error) => {}
+                Err(error) => panic!("the bulk download failed: {error:?}"),
+            }
+        }
+        assert!(
+            bulk.iter().all(|byte| *byte == 0x5A),
+            "the bulk download came back altered"
+        );
+        drop(session);
+        proxy.join().expect("joins");
+        filler.join().expect("joins");
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn a_pipelined_vision_xudp_frame_reaches_the_mux_reader() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+
+        impl Read for Sink {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Ok(0)
+            }
+        }
+
+        impl Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl ferrox_core::tls::RecordAlignment for Sink {}
+
+        let (server_config, client_config) = carried_tls_configs();
+        let id = [0x57u8; 16];
+        let echo_port = udp_echo_loop();
+        let echo_addr: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless_tls(
+                stream,
+                &[VlessUser {
+                    id,
+                    flow: Flow::Vision,
+                    email: String::new(),
+                    level: 0,
+                    reverse: None,
+                }],
+                true,
+                &Carrier::Raw(Chain::default()),
+                &server_config,
+                None,
+                None,
+            );
+        });
+        let conn = Connection::connect(("127.0.0.1", port)).expect("connects");
+        conn.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let mut tls =
+            ferrox_core::tls::RustlsProvider::connect(&client_config, conn).expect("opens");
+        tls.handshake().expect("handshakes");
+
+        let new = ferrox_core::mux::Outgoing {
+            id: 1,
+            status: ferrox_core::mux::Status::New,
+            options: ferrox_core::mux::DATA,
+            target: Some(mux_target_of(echo_addr)),
+            global_id: Some([7u8; ferrox_core::mux::GLOBAL_ID]),
+        };
+        let mut frame = vec![0u8; new.frame_len(4)];
+        let written = new.encode_into(Some(b"ping"), &mut frame);
+        frame.truncate(written);
+
+        let framed = Arc::new(Mutex::new(Vec::new()));
+        let (_, mut vision) = crate::vision::Link::split(
+            Sink(Arc::clone(&framed)),
+            Sink(Arc::clone(&framed)),
+            None,
+            None,
+            &id,
+        );
+        vision.write_all(&frame).expect("frames");
+        vision.flush().expect("flushes");
+
+        let mut head = vec![0u8];
+        head.extend_from_slice(&id);
+        head.push(VLESS_VISION_ADDONS.len() as u8);
+        head.extend_from_slice(VLESS_VISION_ADDONS);
+        head.push(3);
+        let framed = framed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        head.extend_from_slice(&framed);
+        tls.write_all(&head).expect("writes");
+        tls.flush().expect("flushes");
+
+        let mut answer = [0u8; 2];
+        tls.read_exact(&mut answer).expect("reads the answer");
+        assert_eq!(answer, [0, 0]);
+
+        let mut vision = crate::vision::Link::new(tls, None, &id);
+        let mut reply = [0u8; 128];
+        let mut filled = 0;
+        let incoming = loop {
+            match vision.read(&mut reply[filled..]) {
+                Ok(0) => panic!("the reply closed after {filled} bytes"),
+                Ok(n) => {
+                    filled += n;
+                    match ferrox_core::mux::decode(
+                        &reply[..filled],
+                        ferrox_core::mux::NewTail::Forward,
+                    ) {
+                        Ok((incoming, _)) => break incoming,
+                        Err(
+                            ferrox_core::mux::Error::Short { .. }
+                            | ferrox_core::mux::Error::Truncated,
+                        ) => {}
+                        Err(error) => panic!("decodes the reply: {error:?}"),
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => panic!("reads the reply: {error:?}"),
+            }
+        };
+        assert_eq!(incoming.status, ferrox_core::mux::Status::Keep);
+        assert_eq!(incoming.data, Some(&b"ping"[..]));
+        drop(vision);
+        server.join().expect("joins");
+    }
+
+    #[test]
+    fn vless_over_tls_carries_an_echo() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let id = [0x44u8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            echo_trace(&format!("srv {port} accepted"));
+            let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            echo_trace(&format!("srv {port} handshook"));
+            let Some((got, _flow, cmd, _target)) = decode_request(&mut tls) else {
+                panic!("reads a vless header");
+            };
+            assert_eq!(got, id);
+            assert_eq!(cmd, 1);
+            echo_trace(&format!("srv {port} header ok"));
+            tls.write_all(&[0, 0]).expect("answers");
+            let mut buf = [0u8; 4];
+            tls.read_exact(&mut buf).expect("reads");
+            echo_trace(&format!("srv {port} ping read"));
+            tls.write_all(&buf).expect("echoes");
+        });
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let relay = thread::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+            let target: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+            let vless = VlessOut {
+                address: "127.0.0.1".to_owned(),
+                port,
+                id,
+                carrier: Carrier::Raw(Chain::default()),
+                host: String::new(),
+                mux: Mux::default(),
+                pool: Pools::default(),
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
+                tls: Some(Arc::new(client_config)),
+                flow: String::new(),
+                reality: None,
+                headers: Vec::new(),
+                heartbeat: 0,
+                encryption: None,
+            };
+            echo_trace(&format!("cli {port} dialing"));
+            dial_vless(
+                &client,
+                &server,
+                &vless,
+                Some(&Destination::from(target)),
+                Ladder::global(),
+            );
+            echo_trace(&format!("cli {port} relay over"));
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(120)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping");
+        drop(sock);
+        relay.join().expect("joins");
+        server.join().expect("joins");
+    }
+
+    /// A raw TLS client must pump before it waits for the answer: an edge that holds its response until it sees payload would otherwise deadlock the opening write.
+    #[test]
+    fn vless_tls_raw_client_pumps_the_upload_before_the_response() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        budgets::apply(&crate::config::Budgets {
+            payload_grace: Some(Duration::from_millis(500)),
+            ..Default::default()
+        });
+        let (server_config, client_config) = carried_tls_configs();
+        let id = [0x4Bu8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = crate::budgets::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let Some((got, _flow, cmd, _target)) = decode_request(&mut tls) else {
+                panic!("reads a vless header");
+            };
+            assert_eq!(got, id);
+            assert_eq!(cmd, 1);
+            tls.get_ref()
+                .get_ref()
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .expect("timeout");
+            let mut ping = [0u8; 4];
+            if tls.read_exact(&mut ping).is_err() {
+                return;
+            }
+            tls.write_all(&[0, 0]).expect("answers");
+            tls.write_all(&ping).expect("echoes");
+        });
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let relay = crate::budgets::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+            let target: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+            let vless = VlessOut {
+                address: "127.0.0.1".to_owned(),
+                port,
+                id,
+                carrier: Carrier::Raw(Chain::default()),
+                host: String::new(),
+                mux: Mux::default(),
+                pool: Pools::default(),
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
+                tls: Some(Arc::new(client_config)),
+                flow: String::new(),
+                reality: None,
+                headers: Vec::new(),
+                heartbeat: 0,
+                encryption: None,
+            };
+            dial_vless(
+                &client,
+                &server,
+                &vless,
+                Some(&Destination::from(target)),
+                Ladder::global(),
+            );
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping");
+        budgets::clear();
+        drop(sock);
+        relay.join().expect("joins");
+        server.join().expect("joins");
+    }
+
+    /// xray-core buffers the VLESS `[0, 0]` until the target first writes, so a TLS-carried relay must start before it waits for the answer.
+    #[test]
+    fn vless_tls_carried_client_pumps_the_upload_before_the_response() {
+        for carrier in [
+            Carrier::Ws {
+                path: "/vless-ws".to_owned(),
+                ed: 0,
+            },
+            Carrier::Grpc(crate::config::GrpcSettings::path("/vless-grpc")),
+        ] {
+            vless_tls_carried_upload_before_response(carrier, false);
+        }
+    }
+
+    /// A client that has sent its last byte may half-close and still receive an answer the target sends afterwards, so the response lane outlives the upload's EOF by its own budget.
+    #[test]
+    fn vless_tls_ws_answers_after_the_client_half_closes() {
+        vless_tls_carried_upload_before_response(
+            Carrier::Ws {
+                path: "/vless-ws".to_owned(),
+                ed: 0,
+            },
+            true,
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn vless_tls_carried_upload_before_response(carrier: Carrier, half_close: bool) {
+        const UPLOAD: usize = 2 * 1024 * 1024;
+        let (server_config, client_config) = carried_tls_configs();
+        let id = [0x4Cu8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (uploaded_tx, uploaded_rx) = std::sync::mpsc::channel();
+        let served_carrier = carrier.clone();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let raw = stream.try_clone().expect("clones");
+            let session = accept_tls_session(stream, &server_config).expect("tls");
+            let (reader, writer) = session_halves(session, raw);
+            let (mut reader, mut writer): (Box<dyn Read + Send>, Box<dyn Write + Send>) =
+                match &served_carrier {
+                    Carrier::Ws { path, .. } => {
+                        let (reader, writer) =
+                            crate::ws::accept_split(reader, writer, path).expect("ws upgrade");
+                        (Box::new(reader), Box::new(writer))
+                    }
+                    Carrier::Grpc(settings) => {
+                        let (reader, writer) =
+                            crate::grpc::accept_split_with(reader, writer, settings)
+                                .expect("grpc accept");
+                        (Box::new(reader), Box::new(writer))
+                    }
+                    _ => unreachable!("the test drives the two tls carried carriers"),
+                };
+            let Some((got, _flow, cmd, _target)) = decode_request(&mut reader) else {
+                panic!("reads a vless header");
+            };
+            assert_eq!(got, id);
+            assert_eq!(cmd, 1);
+            let mut chunk = vec![0u8; 64 * 1024];
+            let mut total = 0;
+            while total < UPLOAD {
+                let want = (UPLOAD - total).min(chunk.len());
+                read_exact(&mut reader, &mut chunk[..want])
+                    .expect("the upload arrives before the response header");
+                total += want;
+            }
+            uploaded_tx.send(()).expect("signals");
+            if half_close {
+                thread::sleep(Duration::from_millis(200));
+            }
+            writer.write_all(&[0, 0]).expect("response header");
+            writer.write_all(b"pong").expect("echoes after the header");
+            writer.flush().expect("flushes");
+        });
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let downstream_port = downstream.local_addr().expect("addr").port();
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            carrier,
+            host: "127.0.0.1".to_owned(),
+            mux: Mux::default(),
+            pool: Pools::default(),
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: Some(Arc::new(client_config)),
+            flow: String::new(),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            encryption: None,
+        };
+        let relaying = thread::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+            let target: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+            dial_vless(
+                &client,
+                &server,
+                &vless,
+                Some(&Destination::from(target)),
+                Ladder::global(),
+            );
+        });
+        let mut sock = Connection::connect(("127.0.0.1", downstream_port)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let uploading = thread::spawn(move || {
+            let upload = vec![0x5Au8; UPLOAD];
+            sock.write_all(&upload).expect("writes");
+            sock
+        });
+        uploaded_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the server saw the upload before flushing the header");
+        let mut sock = uploading.join().expect("joins");
+        if half_close {
+            sock.shutdown(Shutdown::Write).expect("half-closes");
+        }
+        let mut reply = [0u8; 4];
+        Read::read_exact(&mut sock, &mut reply).expect("reads after the header");
+        assert_eq!(&reply, b"pong");
+        drop(sock);
+        server.join().expect("joins");
+        relaying.join().expect("joins");
+    }
+
+    /// The listener's ECH path reaches the same VLESS relay as a plain TLS listener: the client's
+    /// offer is accepted, the inner name is the configured one, and the target still echoes.
+    #[test]
+    fn vless_over_ech_tls_carries_an_echo() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (server_config, mut client_config) = carried_tls_configs();
+        let mut server_config = (*server_config).clone();
+        server_config.ech_server_keys = Some(ech_server_key_tlv().into());
+        let server_config = std::sync::Arc::new(server_config);
+        client_config.ech_config_list = Some(ech_config_list().into());
+
+        let id = [0x4Au8; 16];
+        let target = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let target_addr = target.local_addr().expect("addr");
+        let filler = thread::spawn(move || {
+            let (mut stream, _) = target.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(120)))
+                .expect("timeout");
+            let mut buf = [0u8; 512];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        stream.write_all(&buf[..n]).expect("echoes");
+                        stream.flush().expect("flushes");
+                    }
+                }
+            }
+        });
+        let inbound = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = inbound.local_addr().expect("addr").port();
+        let proxy = thread::spawn(move || {
+            let (stream, _) = inbound.accept().expect("accepts");
+            serve_vless_tls(
+                stream,
+                &one_vless_user(&id),
+                true,
+                &Carrier::Raw(Chain::default()),
+                &server_config,
+                None,
+                None,
+            );
+        });
+        let mut session = ferrox_core::tls::RustlsProvider::connect(
+            &client_config,
+            Connection::connect(("127.0.0.1", port)).expect("connects"),
+        )
+        .expect("opens");
+        session.handshake().expect("handshakes");
+        let header = vless_header(&id, 1, &Destination::from(target_addr));
+        session.write_all(&header).expect("writes the request");
+        let mut answer = [0u8; 2];
+        session.read_exact(&mut answer).expect("reads the answer");
+        session.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        session.read_exact(&mut back).expect("reads the echo");
+        assert_eq!(&back, b"ping");
+        drop(session);
+        proxy.join().expect("joins");
+        filler.join().expect("joins");
+    }
+
+    /// A rejected offer is dialled once more with the list the server returned.
+    #[test]
+    fn a_rejected_ech_offer_retries_once_with_the_servers_list() {
+        use ferrox_core::tls::TlsProvider as _;
+        use std::io::Read as _;
+        use std::io::Write as _;
+
+        let (server_config, mut client_config) = carried_tls_configs();
+        let mut server_config = (*server_config).clone();
+        server_config.ech_server_keys = Some(ech_server_key_tlv().into());
+        let server_config = std::sync::Arc::new(server_config);
+        client_config.ech_config_list = Some(stale_ech_config_list().into());
+
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let server = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let first = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let stream = accept_within(&listener, deadline);
+            let mut rejected = ferrox_core::tls::accept(
+                &server_config,
+                Recording {
+                    inner: stream,
+                    seen: std::sync::Arc::clone(&first),
+                },
+            )
+            .expect("accepts");
+            let _ = rejected.handshake();
+            drop(rejected);
+            let first_hello = first
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+
+            let second = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let stream = accept_within(&listener, deadline);
+            let mut accepted = ferrox_core::tls::accept(
+                &server_config,
+                Recording {
+                    inner: stream,
+                    seen: std::sync::Arc::clone(&second),
+                },
+            )
+            .expect("accepts");
+            accepted.handshake().expect("the retry is accepted");
+            let second_hello = second
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let mut buf = [0u8; 4];
+            accepted.read_exact(&mut buf).expect("reads");
+            accepted.write_all(&buf).expect("echoes");
+            accepted.flush().expect("flushes");
+            (first_hello, second_hello)
+        });
+
+        let mut session = dial_tls_session(&addr, &client_config, None).expect("retries");
+        session
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        session.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        session.read_exact(&mut back).expect("reads");
+        assert_eq!(&back, b"ping");
+        drop(session);
+        let (first_hello, second_hello) = server.join().expect("joins");
+        assert_eq!(
+            hello_server_name(&first_hello),
+            b"carrier.test".to_vec(),
+            "the stale offer's outer name is its own public name"
+        );
+        assert_eq!(
+            hello_server_name(&second_hello),
+            b"public.test".to_vec(),
+            "the retry presents the public name the server's list names, not the configured host"
+        );
+    }
+
+    /// A second answer after the retry is the dial's last ask: no third hello is sent.
+    #[test]
+    fn a_retry_is_the_dials_last_ask() {
+        use ferrox_core::tls::TlsProvider as _;
+        use ferrox_core::wireguard::device::public_key;
+
+        let (server_config, mut client_config) = carried_tls_configs();
+        let mut first = (*server_config).clone();
+        first.ech_server_keys = Some(ech_server_key_tlv().into());
+        let first = std::sync::Arc::new(first);
+        let stale = stale_ech_config_list();
+        let mut other_config = ECH_CONFIG.to_vec();
+        other_config[4] = 0x08;
+        let other_private = [0x5a; 32];
+        other_config[7..39].copy_from_slice(&public_key(&other_private));
+        let mut second = (*server_config).clone();
+        second.ech_server_keys = Some(ech_server_keys(&other_private, &other_config).into());
+        let second = std::sync::Arc::new(second);
+        client_config.ech_config_list = Some(stale.into());
+
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let handshakes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&handshakes);
+        let server = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let mut held = Vec::new();
+            for config in [first, second] {
+                let stream = accept_within(&listener, deadline);
+                let mut session =
+                    ferrox_core::tls::accept(&config, stream).expect("accepts the hello");
+                // A rejecting server still finishes under the outer name, so the dial count is the gate.
+                let _ = session.handshake();
+                held.push(session);
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            (listener, held)
+        });
+
+        let retried = dial_tls_session(&addr, &client_config, None);
+        let (listener, held) = server.join().expect("joins");
+        drop(held);
+        assert_eq!(
+            handshakes.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the dial stops after the retry instead of asking a third time"
+        );
+        assert!(
+            retried.is_some(),
+            "the retry's answer stands; the count is what forbids a third ClientHello"
+        );
+        listener.set_nonblocking(true).expect("a polled listener");
+        assert!(
+            matches!(
+                listener.accept(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ),
+            "the dial connected a third time after the second rejection"
+        );
+    }
+
+    #[test]
+    fn vless_over_tls_vision_carries_an_echo() {
+        let (server_config, client_config) = carried_tls_configs();
+        let id = [0x46u8; 16];
+        let target = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let target_addr = target.local_addr().expect("addr");
+        let filler = thread::spawn(move || {
+            let (mut stream, _) = target.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(120)))
+                .expect("timeout");
+            let mut buf = [0u8; 512];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        stream.write_all(&buf[..n]).expect("echoes");
+                        stream.flush().expect("flushes");
+                    }
+                }
+            }
+        });
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless_tls(
+                stream,
+                &[VlessUser {
+                    id,
+                    flow: Flow::Vision,
+                    email: String::new(),
+                    level: 0,
+                    reverse: None,
+                }],
+                true,
+                &Carrier::Raw(Chain::default()),
+                &server_config,
+                None,
+                None,
+            );
+        });
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let relay = thread::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+            let vless = VlessOut {
+                address: "127.0.0.1".to_owned(),
+                port,
+                id,
+                carrier: Carrier::Raw(Chain::default()),
+                host: String::new(),
+                mux: Mux::default(),
+                pool: Pools::default(),
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
+                tls: Some(Arc::new(client_config)),
+                flow: ferrox_core::vless::VISION_FLOW.to_owned(),
+                reality: None,
+                headers: Vec::new(),
+                heartbeat: 0,
+                encryption: None,
+            };
+            echo_trace(&format!("cli {port} dialing"));
+            dial_vless(
+                &client,
+                &server,
+                &vless,
+                Some(&Destination::from(target_addr)),
+                Ladder::global(),
+            );
+            echo_trace(&format!("cli {port} relay over"));
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(120)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping");
+        drop(sock);
+        relay.join().expect("joins");
+        server.join().expect("joins");
+        filler.join().expect("joins");
+    }
+
+    /// The plain-TLS dial hands the raw socket to the same Link the answer pump framed, so an inner TLS record reaches the server unframed after the direct command.
+    #[test]
+    fn vless_over_tls_vision_direct_switch_carries_inner_tls() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let echo_config = Arc::clone(&server_config);
+        let relay_config = client_config.clone();
+        let id = [0x4Eu8; 16];
+        let inner = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let inner_addr = inner.local_addr().expect("addr");
+        let echo = thread::spawn(move || {
+            let (stream, _) = inner.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::accept(&echo_config, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut buf = [0u8; 4096];
+            loop {
+                match tls.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        tls.write_all(&buf[..n]).expect("echoes");
+                        tls.flush().expect("flushes");
+                    }
+                }
+            }
+        });
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless_tls(
+                stream,
+                &[VlessUser {
+                    id,
+                    flow: Flow::Vision,
+                    email: String::new(),
+                    level: 0,
+                    reverse: None,
+                }],
+                true,
+                &Carrier::Raw(Chain::default()),
+                &server_config,
+                None,
+                None,
+            );
+        });
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let relay = thread::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+            let vless = VlessOut {
+                address: "127.0.0.1".to_owned(),
+                port,
+                id,
+                carrier: Carrier::Raw(Chain::default()),
+                host: String::new(),
+                mux: Mux::default(),
+                pool: Pools::default(),
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
+                tls: Some(Arc::new(relay_config)),
+                flow: ferrox_core::vless::VISION_FLOW.to_owned(),
+                reality: None,
+                headers: Vec::new(),
+                heartbeat: 0,
+                encryption: None,
+            };
+            dial_vless(
+                &client,
+                &server,
+                &vless,
+                Some(&Destination::from(inner_addr)),
+                Ladder::global(),
+            );
+        });
+        let user = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        user.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let mut inner = ferrox_core::tls::connect(&client_config, user).expect("inner configures");
+        inner.handshake().expect("inner handshakes");
+        for round in 0..4 {
+            let payload = format!("plain vision inner tls round {round}");
+            inner.write_all(payload.as_bytes()).expect("writes");
+            inner.flush().expect("flushes");
+            let mut echoed = vec![0; payload.len()];
+            inner.read_exact(&mut echoed).expect("echoes");
+            assert_eq!(echoed, payload.as_bytes());
+        }
+        drop(inner);
+        relay.join().expect("joins");
+        server.join().expect("joins");
+        echo.join().expect("joins");
+    }
+
+    /// Vision's first upload is a framed record, not raw TLS content: the pump must start before the payload grace and write through the same Link the relay keeps.
+    #[test]
+    fn vless_vision_pumps_the_upload_before_the_payload_grace_expires() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        budgets::apply(&crate::config::Budgets {
+            payload_grace: Some(Duration::from_millis(500)),
+            ..Default::default()
+        });
+        let (server_config, client_config) = carried_tls_configs();
+        let id = [0x4Du8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (seen, framed) = std::sync::mpsc::channel();
+        let server = crate::budgets::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let Some((got, flow, cmd, _target)) = decode_request(&mut tls) else {
+                panic!("reads a vless header");
+            };
+            assert_eq!(got, id);
+            assert_eq!(flow, Flow::Vision);
+            assert_eq!(cmd, 1);
+            tls.write_all(&[0, 0]).expect("answers");
+            let mut link = crate::vision::Link::new(tls, None, &id);
+            let mut first = [0u8; 4];
+            link.read_exact(&mut first)
+                .expect("reads the pumped upload");
+            assert_eq!(&first, b"ping");
+            link.write_all(&first).expect("echoes the pumped upload");
+            let mut second = [0u8; 4];
+            link.read_exact(&mut second)
+                .expect("reads the relayed upload");
+            assert_eq!(&second, b"pong");
+            link.write_all(&second).expect("echoes the relayed upload");
+            let _ = seen.send(true);
+        });
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        let relay = crate::budgets::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let vless = VlessOut {
+                address: "127.0.0.1".to_owned(),
+                port,
+                id,
+                carrier: Carrier::Raw(Chain::default()),
+                host: String::new(),
+                mux: Mux::default(),
+                pool: Pools::default(),
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
+                tls: Some(Arc::new(client_config)),
+                flow: ferrox_core::vless::VISION_FLOW.to_owned(),
+                reality: None,
+                headers: Vec::new(),
+                heartbeat: 0,
+                encryption: None,
+            };
+            let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+            dial_vless_tls(
+                &client,
+                &server_addr,
+                &vless,
+                Some(&Destination::from(target)),
+            );
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping");
+        sock.write_all(b"pong").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"pong");
+        let framed = framed
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the server sees both writes");
+        budgets::clear();
+        drop(sock);
+        relay.join().expect("joins");
+        server.join().expect("joins");
+        assert!(
+            framed,
+            "the first write did not reach the server as a Vision frame"
+        );
+    }
+
+    #[test]
+    fn vless_vision_relays_an_upload_a_server_never_answers() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let id = [0x4Fu8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let Some((got, flow, cmd, _target)) = decode_request(&mut tls) else {
+                panic!("reads a vless header");
+            };
+            assert_eq!(got, id);
+            assert_eq!(flow, Flow::Vision);
+            assert_eq!(cmd, 1);
+            let mut link = crate::vision::Link::new(tls, None, &id);
+            let mut first = [0u8; 4];
+            link.read_exact(&mut first).expect("reads the upload");
+            assert_eq!(&first, b"ping");
+            // Never answer `[0, 0]`: an upload-only flow leaves no downstream byte to flush it with.
+            let mut rest = [0u8; 64];
+            let _ = link.read(&mut rest);
+        });
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        let (done, finished) = std::sync::mpsc::channel();
+        let relay = crate::budgets::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let vless = VlessOut {
+                address: "127.0.0.1".to_owned(),
+                port,
+                id,
+                carrier: Carrier::Raw(Chain::default()),
+                host: String::new(),
+                mux: Mux::default(),
+                pool: Pools::default(),
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
+                tls: Some(Arc::new(client_config)),
+                flow: ferrox_core::vless::VISION_FLOW.to_owned(),
+                reality: None,
+                headers: Vec::new(),
+                heartbeat: 0,
+                encryption: None,
+            };
+            let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+            dial_vless_tls(
+                &client,
+                &server_addr,
+                &vless,
+                Some(&Destination::from(target)),
+            );
+            let _ = done.send(());
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.write_all(b"ping").expect("writes");
+        drop(sock);
+        finished
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the relay ends when the upload ends");
+        relay.join().expect("joins");
+        server.join().expect("joins");
+    }
+
+    #[test]
+    fn vless_tls_hands_an_unanswered_upload_to_the_relay() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let id = [0x4Fu8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (uploaded, seen) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let Some((got, flow, cmd, _target)) = decode_request(&mut tls) else {
+                panic!("reads a vless header");
+            };
+            assert_eq!(got, id);
+            assert_eq!(flow, Flow::None);
+            assert_eq!(cmd, 1);
+            let mut first = [0u8; 4];
+            tls.read_exact(&mut first).expect("reads the upload");
+            assert_eq!(&first, b"ping");
+            let _ = uploaded.send(());
+            // Never answer `[0, 0]` and keep the connection open: an upload-only flow leaves no downstream byte to flush it with.
+            let mut rest = [0u8; 64];
+            let _ = tls.read(&mut rest);
+        });
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        let (done, finished) = std::sync::mpsc::channel();
+        let relay = crate::budgets::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let vless = VlessOut {
+                address: "127.0.0.1".to_owned(),
+                port,
+                id,
+                carrier: Carrier::Raw(Chain::default()),
+                host: String::new(),
+                mux: Mux::default(),
+                pool: Pools::default(),
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
+                tls: Some(Arc::new(client_config)),
+                flow: String::new(),
+                reality: None,
+                headers: Vec::new(),
+                heartbeat: 0,
+                encryption: None,
+            };
+            let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+            dial_vless_tls(
+                &client,
+                &server_addr,
+                &vless,
+                Some(&Destination::from(target)),
+            );
+            let _ = done.send(());
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.write_all(b"ping").expect("writes");
+        seen.recv_timeout(Duration::from_secs(2))
+            .expect("the server reads the upload");
+        finished
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the dial hands the relay back while the server withholds its answer");
+        drop(sock);
+        relay.join().expect("joins");
+        server.join().expect("joins");
+    }
+
+    #[test]
+    fn vless_raw_hands_an_unanswered_upload_to_the_relay() {
+        let id = [0x4Fu8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (uploaded, seen) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let Some((got, flow, cmd, _target)) = decode_request(&mut stream) else {
+                panic!("reads a vless header");
+            };
+            assert_eq!(got, id);
+            assert_eq!(flow, Flow::None);
+            assert_eq!(cmd, 1);
+            let mut first = [0u8; 4];
+            stream.read_exact(&mut first).expect("reads the upload");
+            assert_eq!(&first, b"ping");
+            let _ = uploaded.send(());
+            // Never answer `[0, 0]` and keep the connection open: an upload-only flow leaves no downstream byte to flush it with.
+            let mut rest = [0u8; 64];
+            let _ = stream.read(&mut rest);
+        });
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        let (done, finished) = std::sync::mpsc::channel();
+        let relay = crate::budgets::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let vless = VlessOut {
+                address: "127.0.0.1".to_owned(),
+                port,
+                id,
+                carrier: Carrier::Raw(Chain::default()),
+                host: String::new(),
+                mux: Mux::default(),
+                pool: Pools::default(),
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
+                tls: None,
+                flow: String::new(),
+                reality: None,
+                headers: Vec::new(),
+                heartbeat: 0,
+                encryption: None,
+            };
+            let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+            dial_vless(
+                &client,
+                &server_addr,
+                &vless,
+                Some(&Destination::from(target)),
+                Ladder::global(),
+            );
+            let _ = done.send(());
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.write_all(b"ping").expect("writes");
+        seen.recv_timeout(Duration::from_secs(2))
+            .expect("the server reads the upload before it answers");
+        finished
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the dial hands the relay back while the server withholds its answer");
+        drop(sock);
+        relay.join().expect("joins");
+        server.join().expect("joins");
+    }
+
+    #[test]
+    fn vless_raw_reports_a_bad_answer_as_a_dial_failure() {
+        let id = [0x5Au8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let Some((got, _, _, _)) = decode_request(&mut stream) else {
+                panic!("reads a vless header");
+            };
+            assert_eq!(got, id);
+            stream.write_all(&[1, 0]).expect("refuses the answer");
+            let mut rest = [0u8; 64];
+            let _ = stream.read(&mut rest);
+        });
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        let (done, finished) = std::sync::mpsc::channel();
+        let relay = crate::budgets::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let vless = VlessOut {
+                address: "127.0.0.1".to_owned(),
+                port,
+                id,
+                carrier: Carrier::Raw(Chain::default()),
+                host: String::new(),
+                mux: Mux::default(),
+                pool: Pools::default(),
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
+                tls: None,
+                flow: String::new(),
+                reality: None,
+                headers: Vec::new(),
+                heartbeat: 0,
+                encryption: None,
+            };
+            let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+            dial_vless(
+                &client,
+                &server_addr,
+                &vless,
+                Some(&Destination::from(target)),
+                Ladder::global(),
+            );
+            let _ = done.send(());
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        let mut probe = [0u8; 1];
+        match sock.read(&mut probe) {
+            Ok(0) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            other => panic!("a refused answer closes the flow: {other:?}"),
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(failure) = last_dial_failure_at(server_addr) {
+                assert_eq!(failure.stage, ferrox_core::failure::Stage::RequestSent);
+                assert_eq!(failure.kind, ferrox_core::failure::Kind::Dropped);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the refused answer was not reported: {:?}",
+                last_dial_failure()
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        finished
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the dial hands the relay back after the refusal");
+        drop(sock);
+        relay.join().expect("joins");
+        server.join().expect("joins");
+    }
+
+    #[test]
+    fn a_late_reply_survives_the_client_half_close() {
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let mut app = Connection::connect(front.local_addr().expect("addr")).expect("connects");
+        let relay_side = front.accept().expect("accepts").0;
+        let back = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let mut server = Connection::connect(back.local_addr().expect("addr")).expect("connects");
+        let server_side = back.accept().expect("accepts").0;
+        relay_side.set_read_timeout(Some(RELAY_POLL)).expect("arms");
+        server_side
+            .set_read_timeout(Some(RELAY_POLL))
+            .expect("arms");
+        let close = shutdown_pair(app.try_clone().ok(), server.try_clone().ok());
+        relay_shared_late(Half::socket(relay_side), Half::socket(server_side), &close);
+
+        app.write_all(b"ping").expect("writes");
+        app.shutdown(Shutdown::Write).expect("half-closes");
+        let mut got = [0u8; 4];
+        server.read_exact(&mut got).expect("reads the request");
+        assert_eq!(&got, b"ping");
+        server.write_all(b"pong").expect("answers late");
+        app.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("arms");
+        app.read_exact(&mut got)
+            .expect("reads the reply after the upload ended");
+        assert_eq!(&got, b"pong");
+        drop(server);
+    }
+
+    #[test]
+    fn trojan_over_tls_carries_an_echo() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let key = trojan_key("an-example-shared-password");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            echo_trace(&format!("srv {port} accepted"));
+            let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            echo_trace(&format!("srv {port} handshook"));
+            let Some((cmd, _target)) = decode_trojan_request(&mut tls, &[key]) else {
+                panic!("reads a trojan header");
+            };
+            assert_eq!(cmd, 1);
+            echo_trace(&format!("srv {port} header ok"));
+            let mut buf = [0u8; 4];
+            tls.read_exact(&mut buf).expect("reads");
+            echo_trace(&format!("srv {port} ping read"));
+            tls.write_all(&buf).expect("echoes");
+        });
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let relay = thread::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+            let target: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+            let trojan = TrojanOut {
+                address: "127.0.0.1".to_owned(),
+                port,
+                key,
+                carrier: Carrier::Raw(Chain::default()),
+                host: String::new(),
+                tls: Some(Arc::new(client_config)),
+                headers: Vec::new(),
+                heartbeat: 0,
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
+                mux: Mux::default(),
+                pool: Pools::default(),
+                reality: None,
+            };
+            echo_trace(&format!("cli {port} dialing"));
+            dial_trojan(
+                &client,
+                &server,
+                &trojan,
+                &Destination::from(target),
+                Ladder::global(),
+            );
+            echo_trace(&format!("cli {port} relay over"));
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(120)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping");
+        drop(sock);
+        relay.join().expect("joins");
+        server.join().expect("joins");
+    }
+
+    fn tls_cert_json() -> (String, String, Arc<ferrox_core::tls::TlsConfig>) {
+        let minted =
+            rcgen::generate_simple_self_signed(vec!["carrier.test".to_owned()]).expect("mints");
+        let pem_json = |pem: &str| -> String {
+            format!(
+                "\"{}\"",
+                pem.trim_end().replace('\r', "").replace('\n', "\\n")
+            )
+        };
+        let cert = pem_json(&minted.cert.pem());
+        let key = pem_json(&minted.signing_key.serialize_pem());
+        let client = Arc::new(ferrox_core::tls::TlsConfig {
+            server_name: "carrier.test".to_owned(),
+            alpn: std::sync::Arc::default(),
+            roots: vec![minted.cert.der().to_vec()].into(),
+            pins: ferrox_core::foxy::pin::Pins::default(),
+            ..Default::default()
+        });
+        (cert, key, client)
+    }
+
+    /// A trojan listener that declares tls answers the handshake its config names, on every carrier the outbound already dials.
+    #[test]
+    fn a_trojan_inbound_that_declares_tls_answers_every_carrier() {
+        let (cert, key, client) = tls_cert_json();
+        let cases = [
+            ("raw", r#""network": "tcp""#),
+            ("ws", r#""network": "ws", "wsSettings": {"path": "/t"}"#),
+            (
+                "httpupgrade",
+                r#""network": "httpupgrade", "httpupgradeSettings": {"path": "/u"}"#,
+            ),
+            (
+                "grpc",
+                r#""network": "grpc", "grpcSettings": {"serviceName": "/TunnelService/Tun"}"#,
+            ),
+            (
+                "xhttp",
+                r#""network": "xhttp", "xhttpSettings": {"path": "/x"}"#,
+            ),
+            (
+                "httpheader",
+                r#""network": "tcp", "tcpSettings": {"header": {"type": "http", "request": {"path": ["/c"]}}}"#,
+            ),
+        ];
+        for (tag, stream) in cases {
+            let inbound = crate::json::parse(&format!(
+                r#"{{"protocol": "trojan", "settings": {{"clients": [{{"password": "secret"}}]}},
+                    "streamSettings": {{{stream}, "security": "tls",
+                        "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
+            ))
+            .expect("parses");
+            // The inbound binds its own port, so the fixture reserves one and hands it over before the listener starts.
+            let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let port = probe.local_addr().expect("addr").port();
+            drop(probe);
+            let address = format!("127.0.0.1:{port}");
+            serve_trojan_inbound(&address, &inbound, true, None);
+            let waited = Instant::now();
+            while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                assert!(
+                    waited.elapsed() < Duration::from_secs(10),
+                    "{tag} listener never bound"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let echo_port = echo.local_addr().expect("addr").port();
+            thread::spawn(move || {
+                let (mut socket, _) = echo.accept().expect("accepts");
+                let mut buf = [0u8; 1024];
+                loop {
+                    let Ok(read) = socket.read(&mut buf) else {
+                        return;
+                    };
+                    if read == 0 || socket.write_all(&buf[..read]).is_err() {
+                        return;
+                    }
+                }
+            });
+            let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let dport = downstream.local_addr().expect("addr").port();
+            let asked: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+            let trojan = TrojanOut {
+                address: "127.0.0.1".to_owned(),
+                port,
+                key: trojan_key("secret"),
+                carrier: inbound_carrier(&inbound),
+                host: "127.0.0.1".to_owned(),
+                tls: Some(Arc::clone(&client)),
+                headers: Vec::new(),
+                heartbeat: 0,
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
+                mux: Mux::default(),
+                pool: Pools::default(),
+                reality: None,
+            };
+            let listener: SocketAddr = address.parse().expect("addr");
+            thread::spawn(move || {
+                let (socket, _) = downstream.accept().expect("accepts");
+                dial_trojan(
+                    &socket,
+                    &listener,
+                    &trojan,
+                    &Destination::from(asked),
+                    Ladder::global(),
+                );
+            });
+            let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+            sock.set_read_timeout(Some(Duration::from_secs(30)))
+                .expect("timeout");
+            sock.write_all(b"ping").expect("writes");
+            assert_eq!(&read_echo(&mut sock), b"ping", "{tag} over tls echoes");
+        }
+    }
+
+    /// A non-trojan TLS client on a listener with fallbacks reaches the cover site, with the PROXY head its xver asks for.
+    #[test]
+    fn a_trojan_tls_fallback_reaches_the_cover_site() {
+        let (cert, key, client) = tls_cert_json();
+        let cover = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let cover_port = cover.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut socket, _) = cover.accept().expect("accepts");
+            let mut buf = [0u8; 1024];
+            loop {
+                match socket.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        if socket.write_all(&buf[..n]).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "trojan",
+                "settings": {{"clients": [{{"password": "secret"}}],
+                    "fallbacks": [{{"dest": "127.0.0.1:{cover_port}", "xver": 1}}]}},
+                "streamSettings": {{"network": "tcp", "security": "tls",
+                    "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
+        ))
+        .expect("parses");
+        let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let address = format!("127.0.0.1:{port}");
+        assert!(serve_trojan_inbound(&address, &inbound, true, None));
+        let waited = Instant::now();
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(
+                waited.elapsed() < Duration::from_secs(10),
+                "trojan listener never bound"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let addr: SocketAddr = address.parse().expect("addr");
+        let mut session = dial_tls_session(&addr, &client, None).expect("dialled");
+        session.write_all(b"hello\n").expect("writes");
+        let mut got = Vec::new();
+        let mut buf = [0u8; 1024];
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(5) {
+            match session.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(error) if is_timeout(&error) => {}
+                Err(_) => break,
+            }
+            if got.ends_with(b"hello\n") {
+                break;
+            }
+        }
+        assert!(
+            got.starts_with(b"PROXY TCP4 "),
+            "the fallback head rides the cover-site stream: {got:?}"
+        );
+        assert!(
+            got.ends_with(b"hello\n"),
+            "the cover site echoes the probe: {got:?}"
+        );
+    }
+
+    /// A per-process offset below the ephemeral range: two worktrees' suites share these fixed
+    /// probe ports, and a leaked suite must not take another's.
+    fn trojan_probe_base() -> u16 {
+        22000 + (std::process::id() as u16 % 256) * 32
+    }
+
+    fn trojan_mux_probe_port() -> u16 {
+        static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+        loop {
+            let port =
+                trojan_probe_base() + 100 + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+                return port;
+            }
+        }
+    }
+
+    /// A trojan client that pipelines its first payload with the request header keeps it: the
+    /// probe's first read stops at the header and the relay forwards what rode behind it.
+    #[test]
+    fn a_trojan_tls_probe_keeps_the_payload_that_rides_with_the_header() {
+        let (cert, key, client) = tls_cert_json();
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = echo.accept().expect("accepts");
+            relay(&stream, &stream);
+        });
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "trojan",
+                "settings": {{"clients": [{{"password": "secret"}}],
+                    "fallbacks": [{{"dest": "127.0.0.1:{echo_port}"}}]}},
+                "streamSettings": {{"network": "tcp", "security": "tls",
+                    "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
+        ))
+        .expect("parses");
+        let port = trojan_probe_base() + 15;
+        let address = format!("127.0.0.1:{port}");
+        assert!(serve_trojan_inbound(&address, &inbound, true, None));
+        let waited = Instant::now();
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(
+                waited.elapsed() < Duration::from_secs(10),
+                "trojan listener never bound"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let addr: SocketAddr = address.parse().expect("addr");
+        let mut session = dial_tls_session(&addr, &client, None).expect("dialled");
+        let mut request = Vec::new();
+        request.extend_from_slice(&trojan_key("secret"));
+        request.extend_from_slice(b"\r\n\x01\x01\x7f\x00\x00\x01");
+        request.extend_from_slice(&echo_port.to_be_bytes());
+        request.extend_from_slice(b"\r\nearly");
+        session.write_all(&request).expect("writes");
+        let mut got = Vec::new();
+        let mut buf = [0u8; 16];
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(5) {
+            match session.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(error) if is_timeout(&error) => {}
+                Err(_) => break,
+            }
+            if got == b"early" {
+                break;
+            }
+        }
+        assert_eq!(
+            got, b"early",
+            "the pipelined payload reaches the target and returns"
+        );
+    }
+
+    /// A trojan UDP client that pipelines its first datagram with the request header keeps it.
+    #[test]
+    fn a_trojan_tls_udp_probe_keeps_the_datagram_that_rides_with_the_header() {
+        let (cert, key, client) = tls_cert_json();
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut buf = vec![0u8; UDP_BUF];
+            while let Ok((n, src)) = echo.recv_from(&mut buf) {
+                if echo.send_to(&buf[..n], src).is_err() {
+                    return;
+                }
+            }
+        });
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "trojan",
+                "settings": {{"clients": [{{"password": "secret"}}],
+                    "fallbacks": [{{"dest": "127.0.0.1:9"}}]}},
+                "streamSettings": {{"network": "tcp", "security": "tls",
+                    "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
+        ))
+        .expect("parses");
+        let port = trojan_probe_base() + 16;
+        let address = format!("127.0.0.1:{port}");
+        assert!(serve_trojan_inbound(&address, &inbound, true, None));
+        let waited = Instant::now();
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(
+                waited.elapsed() < Duration::from_secs(10),
+                "trojan listener never bound"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let addr: SocketAddr = address.parse().expect("addr");
+        let mut session = dial_tls_session(&addr, &client, None).expect("dialled");
+        let mut request = Vec::new();
+        request.extend_from_slice(&trojan_key("secret"));
+        request.extend_from_slice(b"\r\n\x03\x01\x7f\x00\x00\x01");
+        request.extend_from_slice(&echo_port.to_be_bytes());
+        request.extend_from_slice(b"\r\n");
+        request.push(1);
+        request.extend_from_slice(&[127, 0, 0, 1]);
+        request.extend_from_slice(&echo_port.to_be_bytes());
+        request.extend_from_slice(&5u16.to_be_bytes());
+        request.extend_from_slice(b"\r\nearly");
+        session.write_all(&request).expect("writes");
+        let mut got = Vec::new();
+        let mut buf = [0u8; 64];
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(5) {
+            match session.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(error) if is_timeout(&error) => {}
+                Err(_) => break,
+            }
+            if got.ends_with(b"early") {
+                break;
+            }
+        }
+        assert!(
+            got.ends_with(b"early"),
+            "the pipelined datagram reaches the target and returns: {got:?}"
+        );
+    }
+
+    /// The vmess listener reads its stream settings: a tls inbound answers the handshake before any carrier.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one block per carrier table row; splitting hides that they share the dial and read"
+    )]
+    #[test]
+    fn a_vmess_inbound_that_declares_tls_answers_every_carrier() {
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::a_vmess_inbound_that_declares_tls_answers_every_carrier",
+        ) {
+            return;
+        }
+        let (cert, key, client) = tls_cert_json();
+        let cases = [
+            ("raw", r#""network": "tcp""#),
+            ("ws", r#""network": "ws", "wsSettings": {"path": "/t"}"#),
+            (
+                "httpupgrade",
+                r#""network": "httpupgrade", "httpupgradeSettings": {"path": "/u"}"#,
+            ),
+            (
+                "grpc",
+                r#""network": "grpc", "grpcSettings": {"serviceName": "/TunnelService/Tun"}"#,
+            ),
+            (
+                "xhttp",
+                r#""network": "xhttp", "xhttpSettings": {"path": "/x"}"#,
+            ),
+            (
+                "httpheader",
+                r#""network": "tcp", "tcpSettings": {"header": {"type": "http", "request": {"path": ["/c"]}}}"#,
+            ),
+        ];
+        for (tag, stream) in cases {
+            let inbound = crate::json::parse(&format!(
+                r#"{{"protocol": "vmess", "settings": {{"clients": [{{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}}]}},
+                    "streamSettings": {{{stream}, "security": "tls",
+                        "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
+            ))
+            .expect("parses");
+            let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let port = probe.local_addr().expect("addr").port();
+            drop(probe);
+            let address = format!("127.0.0.1:{port}");
+            serve_vmess_inbound(&address, &inbound, true, None);
+            let waited = Instant::now();
+            while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                assert!(
+                    waited.elapsed() < Duration::from_secs(10),
+                    "{tag} listener never bound"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let echo_port = echo.local_addr().expect("addr").port();
+            thread::spawn(move || {
+                let (mut socket, _) = echo.accept().expect("accepts");
+                let mut buf = [0u8; 1024];
+                loop {
+                    let Ok(read) = socket.read(&mut buf) else {
+                        return;
+                    };
+                    if read == 0 || socket.write_all(&buf[..read]).is_err() {
+                        return;
+                    }
+                }
+            });
+            let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let dport = downstream.local_addr().expect("addr").port();
+            let asked: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+            let vmess = VmessOut {
+                address: "127.0.0.1".to_owned(),
+                port,
+                id: uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id"),
+                cipher: crate::vmess::Cipher::Auto,
+                auth_len: false,
+                no_termination: false,
+                carrier: inbound_carrier(&inbound),
+                host: "127.0.0.1".to_owned(),
+                tls: Some(Arc::clone(&client)),
+                reality: None,
+                headers: Vec::new(),
+                heartbeat: 0,
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
+                mux: Mux::default(),
+                pool: Pools::default(),
+            };
+            let listener: SocketAddr = address.parse().expect("addr");
+            thread::spawn(move || {
+                let (socket, _) = downstream.accept().expect("accepts");
+                dial_vmess(
+                    &socket,
+                    &listener,
+                    &vmess,
+                    &Destination::from(asked),
+                    Ladder::global(),
+                );
+            });
+            let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+            sock.set_read_timeout(Some(Duration::from_millis(200)))
+                .expect("timeout");
+            sock.write_all(b"ping").expect("writes");
+            let start = Instant::now();
+            let patience = budgets::handshake() + Duration::from_secs(5);
+            let mut back = [0u8; 4];
+            let mut at = 0;
+            while at < back.len() {
+                match sock.read(&mut back[at..]) {
+                    Ok(0) => panic!("{tag} over tls closed before echoing"),
+                    Ok(n) => at += n,
+                    Err(error) if is_timeout(&error) && start.elapsed() < patience => {}
+                    Err(error) => panic!("{tag} over tls did not echo: {error:?}"),
+                }
+            }
+            assert_eq!(&back, b"ping", "{tag} over tls echoes");
+        }
+    }
+
+    /// One UDP echo answers two datagrams through a carrier, with the header inside the session the carrier names.
+    fn assert_trojan_udp_echo(
+        tag: &str,
+        inbound: &Json,
+        port: u16,
+        client: Option<&Arc<ferrox_core::tls::TlsConfig>>,
+        udp: &UdpSocket,
+    ) {
+        let trojan = TrojanOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            key: trojan_key("secret"),
+            carrier: inbound_carrier(inbound),
+            host: "127.0.0.1".to_owned(),
+            tls: client.cloned(),
+            headers: Vec::new(),
+            heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            mux: Mux::default(),
+            pool: Pools::default(),
+            reality: None,
+        };
+        assert_trojan_udp_echo_with(tag, &trojan, udp);
+    }
+
+    fn assert_trojan_udp_echo_with(tag: &str, trojan: &TrojanOut, udp: &UdpSocket) {
+        let trojan = trojan.clone();
+        assert_udp_echo_association(tag, udp, move |relay| {
+            serve_socks_udp_trojan(relay, &trojan, None);
+        });
+    }
+
+    fn assert_vless_udp_echo_with(tag: &str, vless: &VlessOut, udp: &UdpSocket) {
+        let vless = vless.clone();
+        assert_udp_echo_association(tag, udp, move |relay| {
+            serve_socks_udp_vless(relay, &vless, None);
+        });
+    }
+
+    /// The socks side of a UDP association: an echo peer, the association served on its own relay socket, and two datagrams a quarter second apart.
+    fn assert_udp_echo_association(
+        tag: &str,
+        udp: &UdpSocket,
+        serve: impl FnOnce(&UdpSocket) + Send + 'static,
+    ) {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut buf = vec![0u8; UDP_BUF];
+            while let Ok((n, src)) = echo.recv_from(&mut buf) {
+                if echo.send_to(&buf[..n], src).is_err() {
+                    return;
+                }
+            }
+        });
+        let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").expect("binds"));
+        let relay_addr = relay.local_addr().expect("addr");
+        let served = Arc::clone(&relay);
+        thread::spawn(move || serve(&served));
+        udp.connect(relay_addr).expect("the association relay");
+        udp.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let payloads = [format!("ping-{echo_port}"), format!("pong-{echo_port}")];
+        let mut frame = Vec::new();
+        for payload in payloads.iter().map(String::as_bytes) {
+            let datagram = socks_udp_frame(&mut frame, &target, payload);
+            assert_eq!(
+                socks_udp_answer(udp, datagram, payload, tag),
+                target,
+                "{tag}"
+            );
+            // Past RELAY_POLL, so an association that polls instead of parking is gone by the second datagram.
+            thread::sleep(Duration::from_millis(250));
+        }
+    }
+
+    /// A stale frame can land on a reused relay port and a lane can drop a datagram: resend until the deadline, so a lost packet is not a failed association.
+    fn socks_udp_answer(udp: &UdpSocket, frame: &[u8], want: &[u8], tag: &str) -> SocketAddr {
+        udp.set_read_timeout(Some(Duration::from_millis(250)))
+            .expect("timeout");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut back = vec![0u8; UDP_BUF];
+        loop {
+            udp.send(frame).expect("sends");
+            let until = Instant::now() + Duration::from_millis(250);
+            while Instant::now() < until {
+                let Ok(n) = udp.recv(&mut back) else {
+                    break;
+                };
+                if let Some((source, payload)) = parse_socks_udp(&back[..n]) {
+                    if payload == want {
+                        return source;
+                    }
+                }
+            }
+            assert!(Instant::now() < deadline, "{tag} never answers {want:?}");
+        }
+    }
+
+    /// Every carrier the outbound dials carries the association, plain and under TLS.
+    #[test]
+    fn a_trojan_udp_association_crosses_every_carrier() {
+        let (cert, key, client) = tls_cert_json();
+        let carriers = [
+            ("raw", r#""network": "tcp""#),
+            ("ws", r#""network": "ws", "wsSettings": {"path": "/t"}"#),
+            (
+                "httpupgrade",
+                r#""network": "httpupgrade", "httpupgradeSettings": {"path": "/u"}"#,
+            ),
+            (
+                "grpc",
+                r#""network": "grpc", "grpcSettings": {"serviceName": "/TunnelService/Tun"}"#,
+            ),
+            (
+                "xhttp",
+                r#""network": "xhttp", "xhttpSettings": {"path": "/x", "mode": "stream-one"}"#,
+            ),
+            (
+                "httpheader",
+                r#""network": "tcp", "tcpSettings": {"header": {"type": "http", "request": {"path": ["/c"]}}}"#,
+            ),
+            ("kcp", r#""network": "kcp""#),
+        ];
+        let mut held = Vec::new();
+        for (index, (tag, stream)) in carriers.into_iter().enumerate() {
+            for (tls_index, tls) in [false, true].into_iter().enumerate() {
+                let security = if tls {
+                    format!(
+                        r#", "security": "tls",
+                            "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}"#
+                    )
+                } else {
+                    String::new()
+                };
+                let inbound = crate::json::parse(&format!(
+                    r#"{{"protocol": "trojan", "settings": {{"clients": [{{"password": "secret"}}]}},
+                        "streamSettings": {{{stream}{security}}}}}"#
+                ))
+                .expect("parses");
+                let port = trojan_probe_base() + (index * 2 + tls_index) as u16;
+                let address = format!("127.0.0.1:{port}");
+                assert!(
+                    serve_trojan_inbound(&address, &inbound, true, None),
+                    "{tag}"
+                );
+                // A KCP listener binds before it returns; a stream listener binds on its own thread.
+                if tag != "kcp" {
+                    let waited = Instant::now();
+                    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                        assert!(
+                            waited.elapsed() < Duration::from_secs(10),
+                            "{tag} listener never bound"
+                        );
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                }
+                let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+                assert_trojan_udp_echo(tag, &inbound, port, tls.then_some(&client), &udp);
+                // Held for the test: a leaked association still addresses the port it last saw, and a freed one can become a later call's relay.
+                held.push(udp);
+            }
+        }
+    }
+
+    /// The association rides REALITY on every carrier, with mux off, so the datagram path selects the session before the header.
+    #[test]
+    fn a_trojan_udp_association_crosses_reality() {
+        let carriers = [
+            ("raw", r#""network": "tcp""#),
+            ("ws", r#""network": "ws", "wsSettings": {"path": "/t"}"#),
+            (
+                "httpupgrade",
+                r#""network": "httpupgrade", "httpupgradeSettings": {"path": "/u"}"#,
+            ),
+            (
+                "grpc",
+                r#""network": "grpc", "grpcSettings": {"serviceName": "/TunnelService/Tun"}"#,
+            ),
+            (
+                "xhttp",
+                r#""network": "xhttp", "xhttpSettings": {"path": "/x", "mode": "stream-one"}"#,
+            ),
+            (
+                "httpheader",
+                r#""network": "tcp", "tcpSettings": {"header": {"type": "http", "request": {"path": ["/c"]}}}"#,
+            ),
+            ("kcp", r#""network": "kcp""#),
+        ];
+        let mut held = Vec::new();
+        for (index, (tag, stream)) in carriers.into_iter().enumerate() {
+            let inbound = trojan_reality_inbound(stream);
+            let port = trojan_probe_base() + 48 + index as u16;
+            let address = format!("127.0.0.1:{port}");
+            assert!(
+                serve_trojan_inbound(&address, &inbound, true, None),
+                "{tag}"
+            );
+            if tag != "kcp" {
+                let waited = Instant::now();
+                while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                    assert!(
+                        waited.elapsed() < Duration::from_secs(10),
+                        "{tag} listener never bound"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+            let trojan = find_trojan_outbound(&trojan_reality_outbound(stream, port))
+                .unwrap_or_else(|| panic!("{tag} reality outbound"));
+            assert!(trojan.reality.is_some(), "{tag} dials reality");
+            let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+            assert_trojan_udp_echo_with(tag, &trojan, &udp);
+            held.push(udp);
+        }
+    }
+
+    fn trojan_reality_inbound(stream: &str) -> Json {
+        crate::json::parse(&format!(
+            r#"{{"protocol": "trojan", "settings": {{"clients": [{{"password": "secret"}}]}},
+                "streamSettings": {{{stream}, "security": "reality",
+                    "realitySettings": {{"privateKey": "{}",
+                        "shortIds": ["{REALITY_TEST_SHORT}"],
+                        "serverNames": ["{REALITY_TEST_SNI}"]}}}}}}"#,
+            b64url(&REALITY_TEST_PRIVATE),
+        ))
+        .expect("parses")
+    }
+
+    fn trojan_reality_outbound(stream: &str, port: u16) -> Json {
+        let public =
+            x25519_dalek::x25519(REALITY_TEST_PRIVATE, x25519_dalek::X25519_BASEPOINT_BYTES);
+        crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "trojan",
+                "settings": {{"servers": [{{"address": "127.0.0.1", "port": {port},
+                    "password": "secret"}}]}},
+                "streamSettings": {{{stream}, "security": "reality",
+                    "realitySettings": {{"serverName": "{REALITY_TEST_SNI}",
+                        "publicKey": "{}", "shortId": "{REALITY_TEST_SHORT}",
+                        "fingerprint": "chrome"}}}}}}]}}"#,
+            b64url(&public),
+        ))
+        .expect("parses")
+    }
+
+    fn trojan_reality_client() -> Arc<ferrox_core::tls::RealityClientConfig> {
+        let public =
+            x25519_dalek::x25519(REALITY_TEST_PRIVATE, x25519_dalek::X25519_BASEPOINT_BYTES);
+        Arc::new(ferrox_core::tls::RealityClientConfig {
+            server_name: REALITY_TEST_SNI.to_owned(),
+            public_key: public,
+            short_id: [1, 35, 69, 103, 137, 171, 205, 239],
+            fingerprint: "chrome".to_owned(),
+            key_log: None,
+            mldsa65_verify: None,
+        })
+    }
+
+    /// The key-log sink is part of a pooled connection's identity: a second outbound naming another
+    /// `masterKeyLog` must not reuse a connection whose secrets went to the first file.
+    #[test]
+    fn a_reality_pool_partitions_by_its_key_log_sink() {
+        let server = SocketAddr::from(([127, 0, 0, 1], 443));
+        let vless = header_test_outbound();
+        let settings = xhttp_settings("/keylog");
+        let base = trojan_reality_client();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock")
+            .as_nanos();
+        let first_path = std::env::temp_dir().join(format!(
+            "ferrox-reality-pool-first-{}-{stamp}.log",
+            std::process::id()
+        ));
+        let second_path = std::env::temp_dir().join(format!(
+            "ferrox-reality-pool-second-{}-{stamp}.log",
+            std::process::id()
+        ));
+        let nested = std::env::temp_dir().join(format!(
+            "ferrox-reality-pool-nested-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&nested).expect("the nested directory");
+        let equivalent_path = nested
+            .join("..")
+            .join(first_path.file_name().expect("a file name"));
+        let mut first = (*base).clone();
+        first.key_log = Some(Arc::new(
+            ferrox_core::tls::MasterKeyLog::open(first_path.to_string_lossy().as_ref())
+                .expect("opens"),
+        ));
+        let mut second = (*base).clone();
+        second.key_log = Some(Arc::new(
+            ferrox_core::tls::MasterKeyLog::open(second_path.to_string_lossy().as_ref())
+                .expect("opens"),
+        ));
+        let mut equivalent = (*base).clone();
+        equivalent.key_log = Some(Arc::new(
+            ferrox_core::tls::MasterKeyLog::open(equivalent_path.to_string_lossy().as_ref())
+                .expect("opens"),
+        ));
+        let first = Arc::new(first);
+        let second = Arc::new(second);
+        let equivalent = Arc::new(equivalent);
+        let first_pool = reality_xmux(&server, &vless, &first, &settings);
+        let second_pool = reality_xmux(&server, &vless, &second, &settings);
+        let first_again = reality_xmux(&server, &vless, &equivalent, &settings);
+        drop(first);
+        drop(second);
+        drop(equivalent);
+        let _ = std::fs::remove_file(&first_path);
+        let _ = std::fs::remove_file(&second_path);
+        let _ = std::fs::remove_dir_all(&nested);
+        assert!(
+            !Arc::ptr_eq(&first_pool, &second_pool),
+            "two key-log sinks shared one pooled connection"
+        );
+        assert!(
+            Arc::ptr_eq(&first_pool, &first_again),
+            "equivalent key-log paths did not share a pool"
+        );
+    }
+
+    /// A trojan listener that declares reality without an identity is refused by name: serving it as plaintext would be a silent downgrade.
+    #[test]
+    fn a_trojan_reality_inbound_without_identity_is_refused_not_downgraded() {
+        let inbound = crate::json::parse(
+            r#"{"protocol": "trojan", "settings": {"clients": [{"password": "secret"}]},
+                "streamSettings": {"network": "tcp", "security": "reality"}}"#,
+        )
+        .expect("parses");
+        assert!(!serve_trojan_inbound("127.0.0.1:9", &inbound, true, None));
+    }
+
+    /// REALITY answers every TCP carrier the outbound dials, and a wrong public key never reaches the header.
+    #[test]
+    fn a_trojan_reality_inbound_answers_every_tcp_carrier() {
+        let carriers = [
+            ("raw", r#""network": "tcp""#),
+            ("ws", r#""network": "ws", "wsSettings": {"path": "/t"}"#),
+            (
+                "httpupgrade",
+                r#""network": "httpupgrade", "httpupgradeSettings": {"path": "/u"}"#,
+            ),
+            (
+                "grpc",
+                r#""network": "grpc", "grpcSettings": {"serviceName": "/TunnelService/Tun"}"#,
+            ),
+            (
+                "xhttp",
+                r#""network": "xhttp", "xhttpSettings": {"path": "/x", "mode": "stream-one"}"#,
+            ),
+            (
+                "httpheader",
+                r#""network": "tcp", "tcpSettings": {"header": {"type": "http", "request": {"path": ["/c"]}}}"#,
+            ),
+        ];
+        for (index, (tag, stream)) in carriers.into_iter().enumerate() {
+            let inbound = trojan_reality_inbound(stream);
+            let port = trojan_probe_base() + 32 + index as u16;
+            let address = format!("127.0.0.1:{port}");
+            assert!(
+                serve_trojan_inbound(&address, &inbound, true, None),
+                "{tag}"
+            );
+            let waited = Instant::now();
+            while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                assert!(
+                    waited.elapsed() < Duration::from_secs(10),
+                    "{tag} listener never bound"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            let echo_port = echo_loop();
+            let trojan = find_trojan_outbound(&trojan_reality_outbound(stream, port))
+                .unwrap_or_else(|| panic!("{tag} reality outbound"));
+            assert!(trojan.reality.is_some(), "{tag} dials reality");
+            let target = Destination::from(
+                format!("127.0.0.1:{echo_port}")
+                    .parse::<SocketAddr>()
+                    .expect("addr"),
+            );
+            let listener: SocketAddr = address.parse().expect("addr");
+            let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let dport = downstream.local_addr().expect("addr").port();
+            thread::spawn(move || {
+                let (socket, _) = downstream.accept().expect("accepts");
+                dial_trojan(&socket, &listener, &trojan, &target, Ladder::global());
+            });
+            let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+            sock.set_read_timeout(Some(Duration::from_secs(30)))
+                .expect("timeout");
+            sock.write_all(b"ping").expect("writes");
+            assert_eq!(&read_echo(&mut sock), b"ping", "{tag} over reality echoes");
+        }
+    }
+
+    /// The reference chooses HTTP/2 for every REALITY xHTTP session, so a Trojan REALITY dial must
+    /// open with the preface rather than an H1 head.
+    #[test]
+    fn a_trojan_reality_xhttp_dial_opens_with_the_h2_preface() {
+        const WITNESS: &str = "/trojan-reality-h2";
+        let stream = format!(
+            r#""network": "xhttp", "xhttpSettings": {{"path": "{WITNESS}", "mode": "stream-one"}}"#
+        );
+        let inbound = trojan_reality_inbound(&stream);
+        let port = trojan_mux_probe_port();
+        let address = format!("127.0.0.1:{port}");
+        assert!(serve_trojan_inbound(&address, &inbound, true, None));
+        let waited = Instant::now();
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(
+                waited.elapsed() < Duration::from_secs(10),
+                "trojan listener never bound"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let echo_port = echo_loop();
+        let trojan = find_trojan_outbound(&trojan_reality_outbound(&stream, port))
+            .expect("reality xhttp outbound");
+        assert!(trojan.reality.is_some());
+        let target = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let server: SocketAddr = address.parse().expect("addr");
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (socket, _) = downstream.accept().expect("accepts");
+            dial_trojan(&socket, &server, &trojan, &target, Ladder::global());
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping");
+        assert!(
+            H2_DIAL_WITNESS
+                .lock()
+                .expect("witness lock")
+                .iter()
+                .any(|path| path == WITNESS),
+            "the Trojan REALITY xHTTP dial did not open with the H2 preface"
+        );
+    }
+
+    /// KCP carries the REALITY session above the connection both roles, as it carries TLS.
+    #[test]
+    fn a_trojan_reality_kcp_inbound_answers_the_session() {
+        let inbound = trojan_reality_inbound(r#""network": "kcp""#);
+        let port = trojan_probe_base() + 17;
+        let address = format!("127.0.0.1:{port}");
+        assert!(serve_trojan_inbound(&address, &inbound, true, None));
+        let echo_port = echo_loop();
+        let trojan = find_trojan_outbound(&trojan_reality_outbound(r#""network": "kcp""#, port))
+            .expect("reality kcp outbound");
+        assert!(trojan.reality.is_some());
+        let target = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let conn = ferrox_core::kcp::dial(
+            format!("127.0.0.1:{port}").parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+            ferrox_core::kcp::fresh_conversation(),
+        )
+        .expect("dials");
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (socket, _) = downstream.accept().expect("accepts");
+            dial_trojan_kcp(&socket, &conn, &trojan, &target);
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(
+            &read_echo(&mut sock),
+            b"ping",
+            "the header rides the session"
+        );
+    }
+
+    fn assert_trojan_mux_tcp_echo(
+        tag: &'static str,
+        serve: impl FnOnce(Connection) + Send + 'static,
+        trojan: TrojanOut,
+    ) {
+        let echo_port = echo_loop();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve(stream);
+        });
+        let mut trojan = trojan;
+        trojan.port = port;
+        let target = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            assert!(
+                dial_trojan_mux(&client, &trojan, &target),
+                "{tag} opens the mux"
+            );
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping", "{tag} mux echoes");
+    }
+
+    fn assert_trojan_mux_against_inbound(
+        tag: &'static str,
+        inbound: &Json,
+        mut trojan: TrojanOut,
+        wait_for_tcp: bool,
+    ) {
+        let port = trojan_mux_probe_port();
+        let address = format!("127.0.0.1:{port}");
+        assert!(serve_trojan_inbound(&address, inbound, true, None), "{tag}");
+        if wait_for_tcp {
+            let waited = Instant::now();
+            while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                assert!(
+                    waited.elapsed() < Duration::from_secs(10),
+                    "{tag} listener never bound"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        } else {
+            thread::sleep(Duration::from_millis(50));
+        }
+        let echo_port = echo_loop();
+        trojan.port = port;
+        trojan.carrier = inbound_carrier(inbound);
+        let target = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            assert!(
+                dial_trojan_mux(&client, &trojan, &target),
+                "{tag} opens the mux"
+            );
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping", "{tag} mux echoes");
+    }
+
+    /// A muxed TCP stream rides one session on every carrier xray pairs with mux, plain, under
+    /// TLS, and under REALITY.
+    #[test]
+    fn a_trojan_mux_carries_a_tcp_stream_over_every_carrier() {
+        let carriers = [
+            ("raw", r#""network": "tcp""#),
+            ("ws", r#""network": "ws", "wsSettings": {"path": "/t"}"#),
+            (
+                "httpupgrade",
+                r#""network": "httpupgrade", "httpupgradeSettings": {"path": "/u"}"#,
+            ),
+            (
+                "grpc",
+                r#""network": "grpc", "grpcSettings": {"serviceName": "/TunnelService/Tun"}"#,
+            ),
+            (
+                "xhttp",
+                r#""network": "xhttp", "xhttpSettings": {"path": "/x", "mode": "stream-one"}"#,
+            ),
+            (
+                "httpheader",
+                r#""network": "tcp", "tcpSettings": {"header": {"type": "http", "request": {"path": ["/c"]}}}"#,
+            ),
+        ];
+        let key = trojan_key("secret");
+        let base = TrojanOut {
+            address: "127.0.0.1".to_owned(),
+            port: 0,
+            key,
+            carrier: Carrier::Raw(Chain::default()),
+            host: "127.0.0.1".to_owned(),
+            tls: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            mux: Mux::on(),
+            pool: Pools::default(),
+            reality: None,
+        };
+        for (tag, stream) in carriers {
+            let inbound = crate::json::parse(&format!(
+                r#"{{"protocol": "trojan", "settings": {{"clients": [{{"password": "secret"}}]}},
+                    "streamSettings": {{{stream}}}}}"#
+            ))
+            .expect("parses");
+            assert_trojan_mux_against_inbound(tag, &inbound, base.clone(), true);
+        }
+        let (cert, cert_key, client) = tls_cert_json();
+        for (tag, stream) in carriers {
+            let inbound = crate::json::parse(&format!(
+                r#"{{"protocol": "trojan", "settings": {{"clients": [{{"password": "secret"}}]}},
+                    "streamSettings": {{{stream}, "security": "tls",
+                        "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {cert_key}}}]}}}}}}"#
+            ))
+            .expect("parses");
+            let trojan = TrojanOut {
+                tls: Some(Arc::clone(&client)),
+                ..base.clone()
+            };
+            assert_trojan_mux_against_inbound(tag, &inbound, trojan, true);
+        }
+        for (tag, stream) in carriers {
+            let inbound = trojan_reality_inbound(stream);
+            let mut trojan = find_trojan_outbound(&trojan_reality_outbound(stream, 0))
+                .unwrap_or_else(|| panic!("{tag} reality outbound"));
+            trojan.mux = Mux::on();
+            assert_trojan_mux_against_inbound(tag, &inbound, trojan, true);
+        }
+        let kcp = crate::json::parse(
+            r#"{"protocol": "trojan", "settings": {"clients": [{"password": "secret"}]},
+                "streamSettings": {"network": "kcp"}}"#,
+        )
+        .expect("parses");
+        assert_trojan_mux_against_inbound("kcp", &kcp, base.clone(), false);
+        let kcp_tls = crate::json::parse(&format!(
+            r#"{{"protocol": "trojan", "settings": {{"clients": [{{"password": "secret"}}]}},
+                "streamSettings": {{"network": "kcp", "security": "tls",
+                    "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {cert_key}}}]}}}}}}"#
+        ))
+        .expect("parses");
+        let kcp_tls_out = TrojanOut {
+            tls: Some(Arc::clone(&client)),
+            ..base.clone()
+        };
+        assert_trojan_mux_against_inbound("kcp-tls", &kcp_tls, kcp_tls_out, false);
+        let kcp_reality = trojan_reality_inbound(r#""network": "kcp""#);
+        let mut kcp_reality_out =
+            find_trojan_outbound(&trojan_reality_outbound(r#""network": "kcp""#, 0))
+                .expect("reality kcp outbound");
+        kcp_reality_out.mux = Mux::on();
+        assert_trojan_mux_against_inbound("kcp-reality", &kcp_reality, kcp_reality_out, false);
+    }
+
+    fn assert_vless_mux_tcp_echo(
+        tag: &'static str,
+        serve: impl FnOnce(Connection) + Send + 'static,
+        vless: VlessOut,
+    ) {
+        let echo_port = echo_loop();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve(stream);
+        });
+        let mut vless = vless;
+        vless.port = port;
+        let target = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let Some(pool) = vless.tcp_pool() else {
+                panic!("{tag} opens the mux")
+            };
+            assert!(dial_pooled_mux(&client, &pool, &target), "{tag} dials");
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping", "{tag} mux echoes");
+    }
+
+    fn assert_vless_mux_against_inbound(
+        tag: &'static str,
+        inbound: &Json,
+        mut vless: VlessOut,
+        wait_for_tcp: bool,
+    ) {
+        let port = trojan_mux_probe_port();
+        let address = format!("127.0.0.1:{port}");
+        assert!(
+            serve_vless_inbound(
+                &address,
+                inbound,
+                true,
+                "test",
+                &crate::reverse::Portals::default(),
+                None
+            ),
+            "{tag}"
+        );
+        if wait_for_tcp {
+            let waited = Instant::now();
+            while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                assert!(
+                    waited.elapsed() < Duration::from_secs(10),
+                    "{tag} listener never bound"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        } else {
+            thread::sleep(Duration::from_millis(50));
+        }
+        let echo_port = echo_loop();
+        vless.port = port;
+        vless.carrier = inbound_carrier(inbound);
+        let target = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let Some(pool) = vless.tcp_pool() else {
+                panic!("{tag} opens the mux")
+            };
+            assert!(dial_pooled_mux(&client, &pool, &target), "{tag} dials");
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping", "{tag} mux echoes");
+    }
+
+    /// A muxed VLESS stream rides one session on every carrier xray pairs with mux, plain, under
+    /// TLS, and under REALITY.
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn a_vless_mux_carries_a_tcp_stream_over_every_carrier() {
+        let carriers = [
+            ("raw", r#""network": "tcp""#),
+            ("ws", r#""network": "ws", "wsSettings": {"path": "/t"}"#),
+            (
+                "httpupgrade",
+                r#""network": "httpupgrade", "httpupgradeSettings": {"path": "/u"}"#,
+            ),
+            (
+                "grpc",
+                r#""network": "grpc", "grpcSettings": {"serviceName": "/TunnelService/Tun"}"#,
+            ),
+            (
+                "xhttp",
+                r#""network": "xhttp", "xhttpSettings": {"path": "/x", "mode": "stream-one"}"#,
+            ),
+            (
+                "httpheader",
+                r#""network": "tcp", "tcpSettings": {"header": {"type": "http", "request": {"path": ["/c"]}}}"#,
+            ),
+        ];
+        let id = uuid_bytes(REALITY_TEST_ID).expect("id");
+        let base = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: 0,
+            id,
+            carrier: Carrier::Raw(Chain::default()),
+            host: "127.0.0.1".to_owned(),
+            headers: Vec::new(),
+            heartbeat: 0,
+            mux: Mux::on(),
+            pool: Pools::default(),
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            encryption: None,
+        };
+        let carrier_of = |stream: &str| {
+            let inbound = crate::json::parse(&format!(
+                r#"{{"protocol": "vless", "settings": {{}}, "streamSettings": {{{stream}}}}}"#
+            ))
+            .expect("parses");
+            inbound_carrier(&inbound)
+        };
+        for (tag, stream) in carriers {
+            let carrier = carrier_of(stream);
+            let users = one_vless_user(&id);
+            let out = VlessOut {
+                carrier: carrier.clone(),
+                ..base.clone()
+            };
+            assert_vless_mux_tcp_echo(
+                tag,
+                move |stream| serve_vless(stream, &users, &carrier, true, None, None),
+                out,
+            );
+        }
+        for (tag, stream) in carriers {
+            let carrier = carrier_of(stream);
+            let (server, client) = carried_tls_configs();
+            let users = one_vless_user(&id);
+            let out = VlessOut {
+                carrier: carrier.clone(),
+                tls: Some(Arc::new(client)),
+                ..base.clone()
+            };
+            assert_vless_mux_tcp_echo(
+                tag,
+                move |stream| {
+                    serve_vless_tls(stream, &users, true, &carrier, &server, None, None);
+                },
+                out,
+            );
+        }
+        for (tag, stream) in carriers {
+            let carrier = carrier_of(stream);
+            let server = Arc::new(reality_server_config());
+            let users = one_vless_user(&id);
+            let out = VlessOut {
+                carrier: carrier.clone(),
+                reality: Some(trojan_reality_client()),
+                ..base.clone()
+            };
+            assert_vless_mux_tcp_echo(
+                tag,
+                move |stream| {
+                    serve_vless_reality(stream, &users, true, &carrier, &server, None, None);
+                },
+                out,
+            );
+        }
+        let kcp = crate::json::parse(&format!(
+            r#"{{"protocol": "vless", "settings": {{"clients": [{{"id": "{REALITY_TEST_ID}"}}]}},
+                "streamSettings": {{"network": "kcp"}}}}"#
+        ))
+        .expect("parses");
+        let kcp_out = VlessOut {
+            carrier: inbound_carrier(&kcp),
+            ..base.clone()
+        };
+        assert_vless_mux_against_inbound("kcp", &kcp, kcp_out, false);
+        let (cert, cert_key, client) = tls_cert_json();
+        let kcp_tls = crate::json::parse(&format!(
+            r#"{{"protocol": "vless", "settings": {{"clients": [{{"id": "{REALITY_TEST_ID}"}}]}},
+                "streamSettings": {{"network": "kcp", "security": "tls",
+                    "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {cert_key}}}]}}}}}}"#
+        ))
+        .expect("parses");
+        let kcp_tls_out = VlessOut {
+            carrier: inbound_carrier(&kcp_tls),
+            tls: Some(client),
+            ..base.clone()
+        };
+        assert_vless_mux_against_inbound("kcp-tls", &kcp_tls, kcp_tls_out, false);
+        let kcp_reality = crate::json::parse(&format!(
+            r#"{{"protocol": "vless", "settings": {{"clients": [{{"id": "{REALITY_TEST_ID}"}}]}},
+                "streamSettings": {{"network": "kcp", "security": "reality",
+                    "realitySettings": {{"privateKey": "{}",
+                        "shortIds": ["{REALITY_TEST_SHORT}"],
+                        "serverNames": ["{REALITY_TEST_SNI}"]}}}}}}"#,
+            b64url(&REALITY_TEST_PRIVATE),
+        ))
+        .expect("parses");
+        let kcp_reality_out = VlessOut {
+            carrier: inbound_carrier(&kcp_reality),
+            reality: Some(trojan_reality_client()),
+            ..base.clone()
+        };
+        assert_vless_mux_against_inbound("kcp-reality", &kcp_reality, kcp_reality_out, false);
+        let (client_string, server_string) =
+            ferrox_core::vless_encryption::generate_pair(true, "native", "1rtt", "600");
+        let client = vless_client_encryption(Some(&client_string))
+            .expect("client")
+            .expect("engine");
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol":"vless","settings":{{"decryption":"{server_string}"}}}}"#
+        ))
+        .expect("parses");
+        let decryption = crate::config::server_decryption(&inbound)
+            .expect("decryption")
+            .expect("engine");
+        let carrier = carrier_of(r#""network": "ws", "wsSettings": {"path": "/t"}"#);
+        let users = one_vless_user(&id);
+        let out = VlessOut {
+            carrier: carrier.clone(),
+            encryption: Some(Arc::clone(&client)),
+            ..base.clone()
+        };
+        assert_vless_mux_tcp_echo(
+            "ws-encrypted",
+            move |stream| {
+                serve_vless(stream, &users, &carrier, true, None, Some(&decryption));
+            },
+            out,
+        );
+    }
+
+    /// The rendezvous request and the sing-mux session ride the same VLESS raw carrier in both roles.
+    #[test]
+    fn a_vless_singmux_carries_a_tcp_stream_on_each_protocol() {
+        let id = uuid_bytes(REALITY_TEST_ID).expect("id");
+        let carrier = Carrier::Raw(Chain::default());
+        for protocol in [
+            crate::singmux::Protocol::Smux,
+            crate::singmux::Protocol::Yamux,
+            crate::singmux::Protocol::H2Mux,
+        ] {
+            let users = one_vless_user(&id);
+            let out = VlessOut {
+                address: "127.0.0.1".to_owned(),
+                port: 0,
+                id,
+                carrier: carrier.clone(),
+                host: "127.0.0.1".to_owned(),
+                headers: Vec::new(),
+                heartbeat: 0,
+                mux: Mux {
+                    protocol: Some(protocol),
+                    ..Mux::on()
+                },
+                pool: Pools::default(),
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
+                tls: None,
+                flow: String::new(),
+                reality: None,
+                encryption: None,
+            };
+            let serve_carrier = carrier.clone();
+            assert_vless_mux_tcp_echo(
+                match protocol {
+                    crate::singmux::Protocol::Smux => "smux",
+                    crate::singmux::Protocol::Yamux => "yamux",
+                    crate::singmux::Protocol::H2Mux => "h2mux",
+                },
+                move |stream| {
+                    serve_vless(stream, &users, &serve_carrier, true, None, None);
+                },
+                out,
+            );
+        }
+    }
+
+    /// A muxed TCP stream rides one session on a raw carrier, plain, under TLS, and under REALITY.
+    #[test]
+    fn a_trojan_mux_carries_a_tcp_stream_over_raw_tls_and_reality() {
+        let key = trojan_key("secret");
+        let (server_config, client_config) = carried_tls_configs();
+        let mux = Mux {
+            enabled: true,
+            tcp: Some(128),
+            xudp: Xudp::Shared,
+            udp443: Udp443::Reject,
+            ..Mux::default()
+        };
+        let raw = TrojanOut {
+            address: "127.0.0.1".to_owned(),
+            port: 0,
+            key,
+            carrier: Carrier::Raw(Chain::default()),
+            host: "127.0.0.1".to_owned(),
+            tls: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            mux,
+            pool: Pools::default(),
+            reality: None,
+        };
+        assert_trojan_mux_tcp_echo(
+            "raw",
+            move |stream| serve_trojan_raw(stream, &[key], true),
+            raw.clone(),
+        );
+        let tls = TrojanOut {
+            tls: Some(Arc::new(client_config)),
+            ..raw.clone()
+        };
+        let tls_server = Arc::clone(&server_config);
+        assert_trojan_mux_tcp_echo(
+            "tls",
+            move |stream| {
+                serve_trojan_tls(
+                    stream,
+                    &[key],
+                    &Carrier::Raw(Chain::default()),
+                    true,
+                    &tls_server,
+                    None,
+                );
+            },
+            tls,
+        );
+        let reality = TrojanOut {
+            reality: Some(trojan_reality_client()),
+            ..raw
+        };
+        let reality_server = reality_server_config();
+        assert_trojan_mux_tcp_echo(
+            "reality",
+            move |stream| {
+                serve_trojan_reality(
+                    stream,
+                    &[key],
+                    &Carrier::Raw(Chain::default()),
+                    true,
+                    &reality_server,
+                    None,
+                );
+            },
+            reality,
+        );
+    }
+
+    /// A muxed UDP association rides one session on raw and REALITY, and on a non-raw ws
+    /// carrier plain and under TLS.
+    #[test]
+    fn a_trojan_mux_carries_a_udp_association_over_raw_and_reality() {
+        let plain = crate::json::parse(
+            r#"{"protocol": "trojan", "settings": {"clients": [{"password": "secret"}]}}"#,
+        )
+        .expect("parses");
+        let reality = trojan_reality_inbound(r#""network": "tcp""#);
+        let ws = crate::json::parse(
+            r#"{"protocol": "trojan", "settings": {"clients": [{"password": "secret"}]},
+                "streamSettings": {"network": "ws", "wsSettings": {"path": "/t"}}}"#,
+        )
+        .expect("parses");
+        let (cert, cert_key, client) = tls_cert_json();
+        let ws_tls = crate::json::parse(&format!(
+            r#"{{"protocol": "trojan", "settings": {{"clients": [{{"password": "secret"}}]}},
+                "streamSettings": {{"network": "ws", "wsSettings": {{"path": "/t"}},
+                    "security": "tls",
+                    "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {cert_key}}}]}}}}}}"#
+        ))
+        .expect("parses");
+        let mux = Mux {
+            enabled: true,
+            tcp: Some(128),
+            xudp: Xudp::Shared,
+            udp443: Udp443::Reject,
+            ..Mux::default()
+        };
+        for (tag, inbound, reality, tls) in [
+            ("raw", plain, None, None),
+            ("reality", reality, Some(trojan_reality_client()), None),
+            ("ws", ws, None, None),
+            ("ws-tls", ws_tls, None, Some(client)),
+        ] {
+            let port = trojan_mux_probe_port();
+            let address = format!("127.0.0.1:{port}");
+            assert!(
+                serve_trojan_inbound(&address, &inbound, true, None),
+                "{tag}"
+            );
+            let waited = Instant::now();
+            while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                assert!(
+                    waited.elapsed() < Duration::from_secs(10),
+                    "{tag} listener never bound"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            let trojan = TrojanOut {
+                address: "127.0.0.1".to_owned(),
+                port,
+                key: trojan_key("secret"),
+                carrier: inbound_carrier(&inbound),
+                host: "127.0.0.1".to_owned(),
+                tls,
+                headers: Vec::new(),
+                heartbeat: 0,
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
+                mux,
+                pool: Pools::default(),
+                reality,
+            };
+            let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+            assert_trojan_udp_echo_with(tag, &trojan, &udp);
+        }
+    }
+
+    /// A listener whose port is already taken is refused, not announced as served: the bind is the listener's verdict, not a thread's later accident.
+    #[test]
+    fn a_kcp_listener_that_cannot_bind_is_not_reported_served() {
+        let held = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = held.local_addr().expect("addr").port();
+        let inbound = crate::json::parse(
+            r#"{"protocol": "trojan", "settings": {"clients": [{"password": "secret"}]},
+                "streamSettings": {"network": "kcp"}}"#,
+        )
+        .expect("parses");
+        assert!(
+            !serve_trojan_inbound(&format!("127.0.0.1:{port}"), &inbound, true, None),
+            "a listener whose port is taken is not reported served"
+        );
+    }
+
+    #[test]
+    fn a_vless_kcp_inbound_reports_a_taken_port() {
+        let held = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = held.local_addr().expect("addr").port();
+        let inbound = crate::json::parse(
+            r#"{"protocol": "vless", "settings": {"clients": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]},
+                "streamSettings": {"network": "kcp"}}"#,
+        )
+        .expect("parses");
+        assert!(
+            !serve_vless_inbound(
+                &format!("127.0.0.1:{port}"),
+                &inbound,
+                true,
+                "test",
+                &crate::reverse::Portals::default(),
+                None
+            ),
+            "a listener whose port is taken is not reported served"
+        );
+    }
+
+    /// A trojan listener that declares tls over KCP answers the session its config names: the request is read off the records, not the plaintext header.
+    #[test]
+    fn a_trojan_kcp_inbound_that_declares_tls_answers_the_session() {
+        let (cert, key, client) = tls_cert_json();
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "trojan", "settings": {{"clients": [{{"password": "secret"}}]}},
+                "streamSettings": {{"network": "kcp", "security": "tls",
+                    "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
+        ))
+        .expect("parses");
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let address = format!("127.0.0.1:{port}");
+        serve_trojan_inbound(&address, &inbound, true, None);
+        let echo_port = echo_loop();
+        let conn = ferrox_core::kcp::dial(
+            format!("127.0.0.1:{port}").parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+            ferrox_core::kcp::fresh_conversation(),
+        )
+        .expect("dials");
+        let mut tls =
+            ferrox_core::tls::RustlsProvider::connect(&client, KcpIo::new(Arc::clone(&conn)))
+                .expect("opens");
+        assert!(shake_tls(&mut tls), "handshakes");
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        tls.write_all(&trojan_header(
+            &trojan_key("secret"),
+            1,
+            &Destination::from(target),
+        ))
+        .expect("writes the header");
+        tls.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        ferrox_core::tls::read_exact(&mut tls, &mut back).expect("echoes");
+        assert_eq!(&back, b"ping", "the tls arm over kcp echoes");
+        conn.close();
+    }
+
+    /// An authenticated Trojan TCP flow holds the online lease until its relay ends.
+    #[test]
+    fn a_trojan_tcp_flow_holds_the_online_lease_until_its_relay_ends() {
+        let _stats = crate::stats::test_lock();
+        crate::stats::clear();
+        enable_user_stats();
+        let echo_port = echo_loop();
+        let key = trojan_key("secret");
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = tunnel.local_addr().expect("addr").port();
+        let serving = thread::spawn(move || {
+            let source: SocketAddr = "192.0.2.10:1234".parse().expect("address");
+            let _flow = crate::accesslog::flow(Some(source), "trojan-online@example", 1);
+            let (stream, _) = tunnel.accept().expect("accepts");
+            serve_trojan_raw(stream, &[key], true);
+        });
+        let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let target = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        client
+            .write_all(&trojan_header(&key, 1, &target))
+            .expect("writes");
+        client.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut client), b"ping");
+        let holding = counted(|snapshot| snapshot.online.get("trojan-online@example") == Some(&1));
+        assert_eq!(
+            holding.online.get("trojan-online@example"),
+            Some(&1),
+            "the authenticated relay holds the lease"
+        );
+        drop(client);
+        serving.join().expect("serves");
+        let ended = counted(|snapshot| !snapshot.online.contains_key("trojan-online@example"));
+        assert_eq!(
+            ended.online.get("trojan-online@example"),
+            None,
+            "the lease ends with the relay"
+        );
+        crate::stats::clear();
+    }
+
+    /// A production KCP listener moves both the inbound and the authenticated user's counters.
+    #[test]
+    fn a_trojan_kcp_front_counts_the_flow_it_relays() {
+        let _stats = crate::stats::test_lock();
+        crate::stats::clear();
+        enable_user_stats();
+        let echo_port = echo_loop();
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let inbound = crate::json::parse(
+            r#"{"protocol": "trojan", "tag": "kcp-trojan",
+                "settings": {"clients": [{"password": "secret",
+                    "email": "kcp-trojan@example", "level": 1}]},
+                "streamSettings": {"network": "kcp"}}"#,
+        )
+        .expect("parses");
+        let address = format!("127.0.0.1:{port}");
+        assert!(serve_trojan_inbound(&address, &inbound, true, None));
+        let key = trojan_key("secret");
+        let conn = ferrox_core::kcp::dial(
+            format!("127.0.0.1:{port}").parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+            ferrox_core::kcp::fresh_conversation(),
+        )
+        .expect("dials");
+        let target = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        conn.write(&trojan_header(&key, 1, &target))
+            .expect("writes");
+        let baseline = crate::stats::snapshot();
+        let before_inbound = baseline
+            .inbound
+            .get("kcp-trojan")
+            .copied()
+            .unwrap_or_default();
+        let before_user = baseline
+            .user
+            .get("kcp-trojan@example")
+            .copied()
+            .unwrap_or_default();
+        conn.write(b"ping").expect("writes");
+        conn.set_read_deadline(std::time::Instant::now() + Duration::from_secs(10));
+        let mut back = [0u8; 4];
+        let mut at = 0;
+        while at < back.len() {
+            let n = conn.read(&mut back[at..]).expect("echoes");
+            if n == 0 {
+                break;
+            }
+            at += n;
+        }
+        assert_eq!(&back, b"ping");
+        let snapshot = counted(|now| {
+            now.inbound
+                .get("kcp-trojan")
+                .is_some_and(|row| row.downlink > before_inbound.downlink)
+                && now
+                    .user
+                    .get("kcp-trojan@example")
+                    .is_some_and(|row| row.downlink > before_user.downlink)
+        });
+        let inbound = &snapshot.inbound["kcp-trojan"];
+        assert!(
+            inbound.uplink > before_inbound.uplink,
+            "the relayed request moved the inbound uplink counter"
+        );
+        assert!(
+            inbound.downlink > before_inbound.downlink,
+            "the relayed reply moved the inbound downlink counter"
+        );
+        let user = &snapshot.user["kcp-trojan@example"];
+        assert!(
+            user.uplink > before_user.uplink,
+            "the relayed request moved the user uplink counter"
+        );
+        assert!(
+            user.downlink > before_user.downlink,
+            "the relayed reply moved the user downlink counter"
+        );
+        conn.close();
+    }
+
+    /// KCP is the transport and the security rides it, as it does upstream: the dial's header goes out inside the session, not before it.
+    #[test]
+    fn a_trojan_kcp_dial_under_tls_wraps_the_header_in_the_session() {
+        let (server_config, client_config) = carried_tls_configs();
+        let key = trojan_key("secret");
+        let echo_port = echo_loop();
+        let listener = ferrox_core::kcp::Listener::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+        )
+        .expect("binds");
+        let kcp_port = listener.local_addr().port();
+        let server = thread::spawn(move || {
+            let conn = listener.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::accept(&server_config, KcpIo::new(Arc::clone(&conn)))
+                .expect("accepts");
+            assert!(shake_tls(&mut tls), "handshakes");
+            let (cmd, _asked) = decode_trojan_request(&mut tls, &[key]).expect("reads the header");
+            assert_eq!(cmd, 1);
+            let mut back = [0u8; 4];
+            ferrox_core::tls::read_exact(&mut tls, &mut back).expect("reads ping");
+            tls.write_all(&back).expect("echoes");
+            let mut seen = [0u8; 1];
+            ferrox_core::tls::read_exact(&mut tls, &mut seen).expect("sees the echo land");
+        });
+        let trojan = TrojanOut {
+            address: "127.0.0.1".to_owned(),
+            port: kcp_port,
+            key,
+            carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
+            host: "127.0.0.1".to_owned(),
+            tls: Some(Arc::new(client_config)),
+            headers: Vec::new(),
+            heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            mux: Mux::default(),
+            pool: Pools::default(),
+            reality: None,
+        };
+        let target = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let conn = ferrox_core::kcp::dial(
+            format!("127.0.0.1:{kcp_port}").parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+            ferrox_core::kcp::fresh_conversation(),
+        )
+        .expect("dials");
+        thread::spawn(move || {
+            let (socket, _) = downstream.accept().expect("accepts");
+            dial_trojan_kcp(&socket, &conn, &trojan, &target);
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(
+            &read_echo(&mut sock),
+            b"ping",
+            "the header rides the session"
+        );
+        sock.write_all(b"!").expect("confirms the echo");
+        drop(sock);
+        server.join().expect("joins");
+    }
+
+    /// A production Shadowsocks KCP listener moves the inbound and the authenticated user's counters, as the TCP front does.
+    #[test]
+    fn a_shadowsocks_kcp_front_counts_the_flow_it_relays() {
+        let _stats = crate::stats::test_lock();
+        crate::stats::clear();
+        enable_user_stats();
+        let echo_port = echo_loop();
+        let inbound = crate::json::parse(
+            r#"{"protocol": "shadowsocks", "tag": "ss-kcp-in",
+                "settings": {"method": "aes-256-gcm", "users": [
+                    {"password": "ss-password", "email": "ss@example", "level": 1}]},
+                "streamSettings": {"network": "kcp"}}"#,
+        )
+        .expect("parses");
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let address = format!("127.0.0.1:{port}");
+        assert!(
+            serve_shadowsocks_inbound(
+                &address,
+                &inbound,
+                true,
+                &std::collections::HashSet::new(),
+                None,
+            ),
+            "the kcp listener arms"
+        );
+        let ss = ShadowsocksOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            method: "aes-256-gcm".to_owned(),
+            password: "ss-password".to_owned(),
+            carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
+            host: "127.0.0.1".to_owned(),
+            mux: Mux::default(),
+            pool: Pools::default(),
+            tls: None,
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            hysteria_roots: None,
+        };
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let asked = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        thread::spawn(move || {
+            let (socket, _) = downstream.accept().expect("accepts");
+            if let Some(session) = kcp_dial_session(&ss.carrier, &ss.address, ss.port) {
+                dial_ss_kcp(&socket, &session, &ss, &asked);
+            }
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping");
+        let snapshot = counted(|now| {
+            now.user
+                .get("ss@example")
+                .is_some_and(|row| row.uplink > 0 && row.downlink > 0)
+        });
+        let inbound = &snapshot.inbound["ss-kcp-in"];
+        assert!(
+            inbound.uplink > 0 && inbound.downlink > 0,
+            "the relayed flow moved the inbound counters"
+        );
+    }
+
+    /// A shadowsocks listener that declares tls over KCP answers the session its config names: the salt and the request ride the records, not the plaintext datagram.
+    #[test]
+    fn a_shadowsocks_kcp_inbound_that_declares_tls_answers_the_session() {
+        let (cert, key, client) = tls_cert_json();
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "shadowsocks", "settings": {{"password": "an-example-shared-password", "method": "aes-256-gcm"}},
+                "streamSettings": {{"network": "kcp", "security": "tls",
+                    "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
+        ))
+        .expect("parses");
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let address = format!("127.0.0.1:{port}");
+        serve_shadowsocks_inbound(
+            &address,
+            &inbound,
+            true,
+            &std::collections::HashSet::new(),
+            None,
+        );
+        let echo_port = echo_loop();
+        let conn = ferrox_core::kcp::dial(
+            format!("127.0.0.1:{port}").parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+            ferrox_core::kcp::fresh_conversation(),
+        )
+        .expect("dials");
+        let mut tls =
+            ferrox_core::tls::RustlsProvider::connect(&client, KcpIo::new(Arc::clone(&conn)))
+                .expect("opens");
+        assert!(shake_tls(&mut tls), "handshakes");
+        let target = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let (send, recv) = crate::shadowsocks::client_send_handshake(
+            &mut tls,
+            "an-example-shared-password",
+            "aes-256-gcm",
+            &target,
+        )
+        .expect("writes the header");
+        let (reader, writer) = session_halves(tls, KcpIo::new(Arc::clone(&conn)));
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let closer = Arc::clone(&conn);
+        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+        let pump = thread::spawn(move || {
+            let (socket, _) = downstream.accept().expect("accepts");
+            crate::shadowsocks::pump_relay_carried(&socket, reader, writer, &close, send, recv);
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(
+            &read_echo(&mut sock),
+            b"ping",
+            "the tls arm over kcp echoes"
+        );
+        drop(sock);
+        let _ = pump.join();
+        conn.close();
+    }
+
+    #[test]
+    fn a_shadowsocks_inbound_that_names_no_network_opens_nothing() {
+        let inbound = crate::json::parse(
+            r#"{"protocol":"shadowsocks","port":0,"settings":{"network":[],"password":"an-example-shared-password","method":"aes-256-gcm"}}"#,
+        )
+        .expect("parses");
+        assert!(
+            !serve_shadowsocks_inbound(
+                "127.0.0.1:0",
+                &inbound,
+                true,
+                &std::collections::HashSet::new(),
+                None
+            ),
+            "a network list with neither tcp nor udp opens no listener"
+        );
+    }
+
+    /// The dial half of the same row: a shadowsocks outbound that declares tls writes its request inside the session, not ahead of it.
+    #[test]
+    fn a_shadowsocks_kcp_dial_under_tls_wraps_the_header_in_the_session() {
+        let (cert, key, client) = tls_cert_json();
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "shadowsocks", "settings": {{"password": "an-example-shared-password", "method": "aes-256-gcm"}},
+                "streamSettings": {{"network": "kcp", "security": "tls",
+                    "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
+        ))
+        .expect("parses");
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        serve_shadowsocks_inbound(
+            &format!("127.0.0.1:{port}"),
+            &inbound,
+            true,
+            &std::collections::HashSet::new(),
+            None,
+        );
+        let ss = ShadowsocksOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            method: "aes-256-gcm".to_owned(),
+            password: "an-example-shared-password".to_owned(),
+            carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
+            host: "127.0.0.1".to_owned(),
+            mux: Mux::default(),
+            pool: Pools::default(),
+            tls: Some(client),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            hysteria_roots: None,
+        };
+        let conn = ferrox_core::kcp::dial(
+            format!("127.0.0.1:{port}").parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+            ferrox_core::kcp::fresh_conversation(),
+        )
+        .expect("dials");
+        let echo_port = echo_loop();
+        let asked = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let pump = thread::spawn(move || {
+            let (socket, _) = downstream.accept().expect("accepts");
+            dial_ss_kcp(&socket, &conn, &ss, &asked);
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(
+            &read_echo(&mut sock),
+            b"ping",
+            "the shadowsocks tls arm over kcp echoes"
+        );
+        drop(sock);
+        let _ = pump.join();
+    }
+
+    /// A shadowsocks listener and dial that declare tls answer the handshake before any non-KCP carrier.
+    #[test]
+    fn a_shadowsocks_inbound_that_declares_tls_answers_every_carrier() {
+        let (cert, key, client) = tls_cert_json();
+        let cases = [
+            ("raw", r#""network": "tcp""#),
+            ("ws", r#""network": "ws", "wsSettings": {"path": "/t"}"#),
+            (
+                "httpupgrade",
+                r#""network": "httpupgrade", "httpupgradeSettings": {"path": "/u"}"#,
+            ),
+            (
+                "grpc",
+                r#""network": "grpc", "grpcSettings": {"serviceName": "/TunnelService/Tun"}"#,
+            ),
+            (
+                "xhttp",
+                r#""network": "xhttp", "xhttpSettings": {"path": "/x"}"#,
+            ),
+            (
+                "httpheader",
+                r#""network": "tcp", "tcpSettings": {"header": {"type": "http", "request": {"path": ["/c"]}}}"#,
+            ),
+        ];
+        for (tag, stream) in cases {
+            let inbound = crate::json::parse(&format!(
+                r#"{{"protocol": "shadowsocks", "settings": {{"password": "an-example-shared-password", "method": "aes-256-gcm"}},
+                    "streamSettings": {{{stream}, "security": "tls",
+                        "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
+            ))
+            .expect("parses");
+            let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let port = probe.local_addr().expect("addr").port();
+            drop(probe);
+            let address = format!("127.0.0.1:{port}");
+            serve_shadowsocks_inbound(
+                &address,
+                &inbound,
+                true,
+                &std::collections::HashSet::new(),
+                None,
+            );
+            let waited = Instant::now();
+            while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                assert!(
+                    waited.elapsed() < Duration::from_secs(10),
+                    "{tag} listener never bound"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            let echo_port = echo_loop();
+            let ss = ShadowsocksOut {
+                address: "127.0.0.1".to_owned(),
+                port,
+                method: "aes-256-gcm".to_owned(),
+                password: "an-example-shared-password".to_owned(),
+                carrier: inbound_carrier(&inbound),
+                host: "127.0.0.1".to_owned(),
+                mux: Mux::default(),
+                pool: Pools::default(),
+                tls: Some(Arc::clone(&client)),
+                reality: None,
+                headers: Vec::new(),
+                heartbeat: 0,
+                hysteria_roots: None,
+            };
+            let listener: SocketAddr = address.parse().expect("addr");
+            let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let dport = downstream.local_addr().expect("addr").port();
+            let asked = Destination::from(
+                format!("127.0.0.1:{echo_port}")
+                    .parse::<SocketAddr>()
+                    .expect("addr"),
+            );
+            thread::spawn(move || {
+                let (socket, _) = downstream.accept().expect("accepts");
+                dial_shadowsocks(&socket, &listener, &ss, &asked, Ladder::global());
+            });
+            let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+            sock.set_read_timeout(Some(Duration::from_secs(30)))
+                .expect("timeout");
+            sock.write_all(b"ping").expect("writes");
+            assert_eq!(&read_echo(&mut sock), b"ping", "{tag} over tls echoes");
+        }
+    }
+
+    #[test]
+    fn a_shadowsocks_outbound_keeps_tls_on_a_non_kcp_carrier() {
+        let root = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "shadowsocks", "settings": {"servers": [{"address": "192.0.2.1", "port": 443, "method": "aes-256-gcm", "password": "secret"}]}, "streamSettings": {"network": "ws", "security": "tls", "wsSettings": {"path": "/t"}, "tlsSettings": {"allowInsecure": true}}}]}"#,
+        )
+        .expect("parses");
+        let out = find_shadowsocks_outbound(&root).expect("finds");
+        assert!(matches!(out.carrier, Carrier::Ws { .. }));
+        assert!(out.tls.is_some(), "the tls row is kept");
+    }
+
+    /// xray's sender-side multiplex switch reaches the shadowsocks dial, which is what opens the session.
+    #[test]
+    fn a_shadowsocks_outbound_reads_the_mux_switch() {
+        let root = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "shadowsocks", "settings": {"servers": [{"address": "192.0.2.1", "port": 443, "method": "aes-256-gcm", "password": "secret"}]}, "mux": {"enabled": true}}]}"#,
+        )
+        .expect("parses");
+        let out = find_shadowsocks_outbound(&root).expect("finds");
+        assert_eq!(out.mux.tcp, Some(128), "xray folds 0 to the 128 floor");
+        assert_eq!(
+            out.mux.udp_manager(),
+            Some(128),
+            "a zero xudp pool rides the mux"
+        );
+        assert_eq!(
+            out.mux.udp_443("192.0.2.1:443".parse().expect("addr")),
+            Udp443::Reject,
+            "xray's default refuses udp/443"
+        );
+        let empty = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "shadowsocks", "settings": {"servers": [{"address": "192.0.2.1", "port": 443, "method": "aes-256-gcm", "password": "secret"}]}, "mux": {"enabled": true, "xudpProxyUDP443": ""}}]}"#,
+        )
+        .expect("parses");
+        let empty = find_shadowsocks_outbound(&empty).expect("finds");
+        assert_eq!(
+            empty.mux.udp443,
+            Udp443::Reject,
+            "an empty policy is xray's default"
+        );
+        let direct = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "shadowsocks", "settings": {"servers": [{"address": "192.0.2.1", "port": 443, "method": "aes-256-gcm", "password": "secret"}]}, "mux": {"enabled": true, "xudpConcurrency": -1, "xudpProxyUDP443": "skip"}}]}"#,
+        )
+        .expect("parses");
+        let direct = find_shadowsocks_outbound(&direct).expect("finds");
+        assert_eq!(
+            direct.mux.udp_manager(),
+            None,
+            "a negative xudp pool sends UDP direct"
+        );
+        assert_eq!(
+            direct.mux.udp443,
+            Udp443::Skip,
+            "the udp/443 policy is read"
+        );
+        let tcp_off = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "shadowsocks", "settings": {"servers": [{"address": "192.0.2.1", "port": 443, "method": "aes-256-gcm", "password": "secret"}]}, "mux": {"enabled": true, "concurrency": -1}}]}"#,
+        )
+        .expect("parses");
+        let tcp_off = find_shadowsocks_outbound(&tcp_off).expect("finds");
+        assert_eq!(
+            tcp_off.mux.tcp, None,
+            "a negative tcp pool turns the session off"
+        );
+        assert_eq!(
+            tcp_off.mux.udp_manager(),
+            None,
+            "udp follows the pool it rides"
+        );
+        let own = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "shadowsocks", "settings": {"servers": [{"address": "192.0.2.1", "port": 443, "method": "aes-256-gcm", "password": "secret"}]}, "mux": {"enabled": true, "concurrency": 300, "xudpConcurrency": 7, "xudpProxyUDP443": "allow"}}]}"#,
+        )
+        .expect("parses");
+        let own = find_shadowsocks_outbound(&own).expect("finds");
+        assert_eq!(own.mux.tcp, Some(300), "a count over 128 is kept");
+        assert_eq!(own.mux.udp_manager(), Some(7), "xudp gets its own pool");
+        assert_eq!(
+            own.mux.udp_443("192.0.2.1:443".parse().expect("addr")),
+            Udp443::Allow,
+            "the policy names the datagram it allows"
+        );
+        let off = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "shadowsocks", "settings": {"servers": [{"address": "192.0.2.1", "port": 443, "method": "aes-256-gcm", "password": "secret"}]}, "mux": {"enabled": false, "xudpProxyUDP443": "skip"}}]}"#,
+        )
+        .expect("parses");
+        let off = find_shadowsocks_outbound(&off).expect("finds");
+        assert_eq!(off.mux, Mux::default(), "a disabled mux carries nothing");
+    }
+
+    /// The reference refuses the outbound when `xudpProxyUDP443` names a policy it does not know.
+    #[test]
+    fn an_unknown_udp_443_policy_refuses_the_outbound() {
+        let root = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "shadowsocks", "settings": {"servers": [{"address": "192.0.2.1", "port": 443, "method": "aes-256-gcm", "password": "secret"}]}, "mux": {"enabled": true, "xudpProxyUDP443": "drop"}}]}"#,
+        )
+        .expect("parses");
+        assert!(find_shadowsocks_outbound(&root).is_none());
+    }
+
+    /// The vmess dial carries its request in the session too, so a tls kcp row speaks the same bytes both roles.
+    #[test]
+    fn a_vmess_kcp_dial_under_tls_wraps_the_header_in_the_session() {
+        let (cert, key, client) = tls_cert_json();
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "vmess", "settings": {{"clients": [{{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}}]}},
+                "streamSettings": {{"network": "kcp", "security": "tls",
+                    "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
+        ))
+        .expect("parses");
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        serve_vmess_inbound(&format!("127.0.0.1:{port}"), &inbound, true, None);
+        let vmess = VmessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id: uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id"),
+            cipher: crate::vmess::Cipher::Auto,
+            auth_len: false,
+            no_termination: false,
+            carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
+            host: "127.0.0.1".to_owned(),
+            tls: Some(client),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            mux: Mux::default(),
+            pool: Pools::default(),
+        };
+        let conn = ferrox_core::kcp::dial(
+            format!("127.0.0.1:{port}").parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+            ferrox_core::kcp::fresh_conversation(),
+        )
+        .expect("dials");
+        let echo_port = echo_loop();
+        let asked = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let pump = thread::spawn(move || {
+            let (socket, _) = downstream.accept().expect("accepts");
+            dial_vmess_kcp(&socket, &conn, &vmess, &asked);
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(
+            &read_echo(&mut sock),
+            b"ping",
+            "the vmess tls arm over kcp echoes"
+        );
+        drop(sock);
+        let _ = pump.join();
+    }
+
+    fn xdrive_mux_settings(tag: &str) -> (std::path::PathBuf, String) {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-xdrive-{tag}-{}-{stamp}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let folder = dir.to_str().expect("utf-8 folder").replace('\\', "\\\\");
+        let settings = format!(
+            r#""network": "xdrive", "security": "tls",
+                "xdriveSettings": {{"service": "local", "remoteFolder": "{folder}",
+                    "segmentBytes": 512, "flushIntervalMs": 2, "pollIntervalMs": 2,
+                    "maxPollIntervalMs": 8, "sessionTtlSeconds": 10}},
+                "tlsSettings": {{"allowInsecure": true}}"#
+        );
+        (dir, settings)
+    }
+
+    fn xdrive_dispatch_mux_echo(tag: &str, out: &Outbound) {
+        let echo_port = echo_loop();
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut client = tunnel_stream(
+            out,
+            Destination::from(target),
+            Duration::from_secs(30),
+            Front::Socks,
+            tag,
+        )
+        .expect("tunnel");
+        client.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut client), b"ping", "{tag} echoes");
+    }
+
+    fn xdrive_dispatch_xudp(tag: &str, out: Outbound) {
+        let echo_port = udp_echo_loop();
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let relay_addr = relay.local_addr().expect("addr");
+        thread::spawn(move || serve_udp_lane(&relay, &out, None, None));
+        let source = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        source
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut datagram = vec![0u8, 0, 0];
+        push_socks_addr(&mut datagram, &target);
+        datagram.extend_from_slice(b"xudp-ping");
+        source.send_to(&datagram, relay_addr).expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        let (n, _) = source.recv_from(&mut back).expect("echoes");
+        let (from, payload) = parse_socks_udp(&back[..n]).expect("splits");
+        assert_eq!(from, target, "{tag}");
+        assert_eq!(payload, b"xudp-ping", "{tag}");
+    }
+
+    #[test]
+    fn an_xdrive_vless_mux_carries_a_tcp_stream() {
+        let _stats = crate::stats::test_lock();
+        let (dir, settings) = xdrive_mux_settings("vless-mux");
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "vless",
+                "settings": {{"clients": [{{"id": "{uuid}"}}]}},
+                "streamSettings": {{{settings}}}}}"#
+        ))
+        .expect("parses");
+        assert!(serve_vless_inbound(
+            "127.0.0.1:9",
+            &inbound,
+            true,
+            "test",
+            &crate::reverse::Portals::default(),
+            None
+        ));
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "vless",
+                "settings": {{"vnext": [{{"address": "127.0.0.1", "port": 443,
+                    "users": [{{"id": "{uuid}"}}]}}]}},
+                "streamSettings": {{{settings}}},
+                "mux": {{"enabled": true}}}}]}}"#
+        ))
+        .expect("parses");
+        let Outbound::Vless(mut vless) = find_outbound(&root)
+            .expect("parses")
+            .expect("the config names a vless outbound")
+        else {
+            panic!("the outbound dials vless");
+        };
+        vless.mux = Mux::on();
+        xdrive_dispatch_mux_echo("xdrive-vless-mux", &Outbound::Vless(vless));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_xdrive_vless_xudp_association_carries_a_datagram() {
+        let _stats = crate::stats::test_lock();
+        let (dir, settings) = xdrive_mux_settings("vless-xudp");
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "vless",
+                "settings": {{"clients": [{{"id": "{uuid}"}}]}},
+                "streamSettings": {{{settings}}}}}"#
+        ))
+        .expect("parses");
+        assert!(serve_vless_inbound(
+            "127.0.0.1:9",
+            &inbound,
+            true,
+            "test",
+            &crate::reverse::Portals::default(),
+            None
+        ));
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "vless",
+                "settings": {{"vnext": [{{"address": "127.0.0.1", "port": 443,
+                    "users": [{{"id": "{uuid}"}}]}}]}},
+                "streamSettings": {{{settings}}},
+                "mux": {{"enabled": true}}}}]}}"#
+        ))
+        .expect("parses");
+        let Outbound::Vless(mut vless) = find_outbound(&root)
+            .expect("parses")
+            .expect("the config names a vless outbound")
+        else {
+            panic!("the outbound dials vless");
+        };
+        vless.mux = Mux {
+            enabled: true,
+            tcp: Some(128),
+            xudp: Xudp::Own(8),
+            udp443: Udp443::Reject,
+            ..Mux::default()
+        };
+        let echo_port = udp_echo_loop();
+        let out = Outbound::Vless(vless);
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let relay_addr = relay.local_addr().expect("addr");
+        thread::spawn(move || serve_udp_lane(&relay, &out, None, None));
+        let source = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        source
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut datagram = vec![0u8, 0, 0];
+        push_socks_addr(&mut datagram, &target);
+        datagram.extend_from_slice(b"xudp-ping");
+        source.send_to(&datagram, relay_addr).expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        let (n, _) = source.recv_from(&mut back).expect("echoes");
+        let (from, payload) = parse_socks_udp(&back[..n]).expect("splits");
+        assert_eq!(from, target);
+        assert_eq!(payload, b"xudp-ping");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_xdrive_trojan_mux_carries_a_tcp_stream() {
+        let _stats = crate::stats::test_lock();
+        let (dir, settings) = xdrive_mux_settings("trojan-mux");
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "trojan",
+                "settings": {{"clients": [{{"password": "secret"}}]}},
+                "streamSettings": {{{settings}}}}}"#
+        ))
+        .expect("parses");
+        assert!(serve_trojan_inbound("127.0.0.1:9", &inbound, true, None));
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "trojan",
+                "settings": {{"servers": [{{"address": "127.0.0.1", "port": 443,
+                    "password": "secret"}}]}},
+                "streamSettings": {{{settings}}},
+                "mux": {{"enabled": true}}}}]}}"#
+        ))
+        .expect("parses");
+        let Outbound::Trojan(mut trojan) = find_outbound(&root)
+            .expect("parses")
+            .expect("the config names a trojan outbound")
+        else {
+            panic!("the outbound dials trojan");
+        };
+        trojan.mux = Mux::on();
+        xdrive_dispatch_mux_echo("xdrive-trojan-mux", &Outbound::Trojan(trojan));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_xdrive_shadowsocks_mux_carries_a_tcp_stream() {
+        let _stats = crate::stats::test_lock();
+        let (dir, settings) = xdrive_mux_settings("ss-mux");
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "shadowsocks",
+                "settings": {{"password": "ss-mux-pass", "method": "aes-256-gcm"}},
+                "streamSettings": {{{settings}}}}}"#
+        ))
+        .expect("parses");
+        assert!(serve_shadowsocks_inbound(
+            "127.0.0.1:9",
+            &inbound,
+            true,
+            &std::collections::HashSet::new(),
+            None
+        ));
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "shadowsocks",
+                "settings": {{"servers": [{{"address": "127.0.0.1", "port": 443,
+                    "method": "aes-256-gcm", "password": "ss-mux-pass"}}]}},
+                "streamSettings": {{{settings}}},
+                "mux": {{"enabled": true}}}}]}}"#
+        ))
+        .expect("parses");
+        let Outbound::Shadowsocks(mut ss) = find_outbound(&root)
+            .expect("parses")
+            .expect("the config names a shadowsocks outbound")
+        else {
+            panic!("the outbound dials shadowsocks");
+        };
+        ss.mux = Mux::on();
+        xdrive_dispatch_mux_echo("xdrive-ss-mux", &Outbound::Shadowsocks(ss));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vmess_xdrive_carries_a_tcp_stream() {
+        let _stats = crate::stats::test_lock();
+        let (dir, settings) = xdrive_mux_settings("vmess-direct");
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "vmess",
+                "settings": {{"clients": [{{"id": "{uuid}"}}]}},
+                "streamSettings": {{{settings}}}}}"#
+        ))
+        .expect("parses");
+        let (_, served) = serve_vmess_inbound("127.0.0.1:9", &inbound, true, None);
+        assert!(served);
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "vmess",
+                "settings": {{"vnext": [{{"address": "127.0.0.1", "port": 443,
+                    "users": [{{"id": "{uuid}"}}]}}]}},
+                "streamSettings": {{{settings}}}}}]}}"#
+        ))
+        .expect("parses");
+        let Outbound::Vmess(mut vmess) = find_outbound(&root)
+            .expect("parses")
+            .expect("the config names a vmess outbound")
+        else {
+            panic!("the outbound dials vmess");
+        };
+        vmess.mux = Mux::default();
+        xdrive_dispatch_mux_echo("xdrive-vmess-direct", &Outbound::Vmess(vmess));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A peer that waits for the first mux frame must not hold the opener: the response is read by
+    /// the demux thread, not at session startup.
+    #[test]
+    fn a_vmess_kcp_mux_opens_before_the_server_answers() {
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::a_vmess_kcp_mux_opens_before_the_server_answers",
+        ) {
+            return;
+        }
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "vmess",
+                "settings": {{"clients": [{{"id": "{uuid}"}}]}},
+                "streamSettings": {{"network": "kcp"}}}}"#
+        ))
+        .expect("parses");
+        let Carrier::Kcp(config) = inbound_carrier(&inbound) else {
+            panic!("the inbound names kcp");
+        };
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let serve: KcpServe = Arc::new(|conn| {
+            thread::sleep(Duration::from_secs(2));
+            conn.close();
+        });
+        assert!(serve_kcp_bound(
+            &format!("127.0.0.1:{port}"),
+            config,
+            &serve,
+            &inbound
+        ));
+        thread::sleep(Duration::from_millis(50));
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "vmess",
+                "settings": {{"vnext": [{{"address": "127.0.0.1", "port": {port},
+                    "users": [{{"id": "{uuid}"}}]}}]}},
+                "streamSettings": {{"network": "kcp"}}}}]}}"#
+        ))
+        .expect("parses");
+        let Outbound::Vmess(vmess) = find_outbound(&root)
+            .expect("parses")
+            .expect("the config names a vmess outbound")
+        else {
+            panic!("the outbound dials vmess");
+        };
+        assert!(matches!(vmess.carrier, Carrier::Kcp(_)));
+        let started = Instant::now();
+        let uplink = open_vmess_mux_kcp(&vmess).expect("opens without a response");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the opener waits for a response"
+        );
+        (uplink.close)();
+    }
+
+    /// KCP carries the `VMess` mux session the way it carries the direct request; the opener writes the
+    /// request and its response seal above the session instead of a loopback carrier.
+    #[test]
+    fn a_vmess_kcp_mux_carries_a_tcp_stream() {
+        if !crate::conn::in_a_quiet_process("proxy::tests::a_vmess_kcp_mux_carries_a_tcp_stream") {
+            return;
+        }
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "vmess",
+                "settings": {{"clients": [{{"id": "{uuid}"}}]}},
+                "streamSettings": {{"network": "kcp"}}}}"#
+        ))
+        .expect("parses");
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let (_, served) = serve_vmess_inbound(&format!("127.0.0.1:{port}"), &inbound, true, None);
+        assert!(served);
+        thread::sleep(Duration::from_millis(50));
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "vmess",
+                "settings": {{"vnext": [{{"address": "127.0.0.1", "port": {port},
+                    "users": [{{"id": "{uuid}"}}]}}]}},
+                "streamSettings": {{"network": "kcp"}},
+                "mux": {{"enabled": true}}}}]}}"#
+        ))
+        .expect("parses");
+        let out = find_outbound(&root)
+            .expect("parses")
+            .expect("the config names a vmess outbound");
+        assert!(matches!(&out, Outbound::Vmess(vmess) if matches!(vmess.carrier, Carrier::Kcp(_))));
+        let echo_port = echo_loop();
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut client = tunnel_stream(
+            &out,
+            Destination::from(target),
+            Duration::from_secs(30),
+            Front::Socks,
+            "vmess-kcp-mux",
+        )
+        .expect("tunnel");
+        client.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut client), b"ping");
+    }
+
+    #[test]
+    fn an_xdrive_vmess_mux_carries_a_tcp_stream() {
+        let _stats = crate::stats::test_lock();
+        let (dir, settings) = xdrive_mux_settings("vmess-mux");
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "vmess",
+                "settings": {{"clients": [{{"id": "{uuid}"}}]}},
+                "streamSettings": {{{settings}}}}}"#
+        ))
+        .expect("parses");
+        let (_, served) = serve_vmess_inbound("127.0.0.1:9", &inbound, true, None);
+        assert!(served);
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "vmess",
+                "settings": {{"vnext": [{{"address": "127.0.0.1", "port": 443,
+                    "users": [{{"id": "{uuid}"}}]}}]}},
+                "streamSettings": {{{settings}}},
+                "mux": {{"enabled": true}}}}]}}"#
+        ))
+        .expect("parses");
+        let Outbound::Vmess(mut vmess) = find_outbound(&root)
+            .expect("parses")
+            .expect("the config names a vmess outbound")
+        else {
+            panic!("the outbound dials vmess");
+        };
+        vmess.mux = Mux::on();
+        xdrive_dispatch_mux_echo("xdrive-vmess-mux", &Outbound::Vmess(vmess));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_xdrive_trojan_xudp_association_carries_a_datagram() {
+        let _stats = crate::stats::test_lock();
+        let (dir, settings) = xdrive_mux_settings("trojan-xudp");
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "trojan",
+                "settings": {{"clients": [{{"password": "secret"}}]}},
+                "streamSettings": {{{settings}}}}}"#
+        ))
+        .expect("parses");
+        assert!(serve_trojan_inbound("127.0.0.1:9", &inbound, true, None));
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "trojan",
+                "settings": {{"servers": [{{"address": "127.0.0.1", "port": 443,
+                    "password": "secret"}}]}},
+                "streamSettings": {{{settings}}},
+                "mux": {{"enabled": true}}}}]}}"#
+        ))
+        .expect("parses");
+        let Outbound::Trojan(mut trojan) = find_outbound(&root)
+            .expect("parses")
+            .expect("the config names a trojan outbound")
+        else {
+            panic!("the outbound dials trojan");
+        };
+        trojan.mux = Mux {
+            enabled: true,
+            tcp: Some(128),
+            xudp: Xudp::Own(8),
+            udp443: Udp443::Reject,
+            ..Mux::default()
+        };
+        xdrive_dispatch_xudp("xdrive-trojan-xudp", Outbound::Trojan(trojan));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_xdrive_shadowsocks_xudp_association_carries_a_datagram() {
+        let _stats = crate::stats::test_lock();
+        let (dir, settings) = xdrive_mux_settings("ss-xudp");
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "shadowsocks",
+                "settings": {{"password": "ss-mux-pass", "method": "aes-256-gcm"}},
+                "streamSettings": {{{settings}}}}}"#
+        ))
+        .expect("parses");
+        assert!(serve_shadowsocks_inbound(
+            "127.0.0.1:9",
+            &inbound,
+            true,
+            &std::collections::HashSet::new(),
+            None
+        ));
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "shadowsocks",
+                "settings": {{"servers": [{{"address": "127.0.0.1", "port": 443,
+                    "method": "aes-256-gcm", "password": "ss-mux-pass"}}]}},
+                "streamSettings": {{{settings}}},
+                "mux": {{"enabled": true}}}}]}}"#
+        ))
+        .expect("parses");
+        let Outbound::Shadowsocks(mut ss) = find_outbound(&root)
+            .expect("parses")
+            .expect("the config names a shadowsocks outbound")
+        else {
+            panic!("the outbound dials shadowsocks");
+        };
+        ss.mux = Mux {
+            enabled: true,
+            tcp: Some(128),
+            xudp: Xudp::Own(8),
+            udp443: Udp443::Reject,
+            ..Mux::default()
+        };
+        xdrive_dispatch_xudp("xdrive-ss-xudp", Outbound::Shadowsocks(ss));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_xdrive_vmess_xudp_association_carries_a_datagram() {
+        let _stats = crate::stats::test_lock();
+        let (dir, settings) = xdrive_mux_settings("vmess-xudp");
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "vmess",
+                "settings": {{"clients": [{{"id": "{uuid}"}}]}},
+                "streamSettings": {{{settings}}}}}"#
+        ))
+        .expect("parses");
+        let (_, served) = serve_vmess_inbound("127.0.0.1:9", &inbound, true, None);
+        assert!(served);
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "vmess",
+                "settings": {{"vnext": [{{"address": "127.0.0.1", "port": 443,
+                    "users": [{{"id": "{uuid}"}}]}}]}},
+                "streamSettings": {{{settings}}},
+                "mux": {{"enabled": true}}}}]}}"#
+        ))
+        .expect("parses");
+        let Outbound::Vmess(mut vmess) = find_outbound(&root)
+            .expect("parses")
+            .expect("the config names a vmess outbound")
+        else {
+            panic!("the outbound dials vmess");
+        };
+        vmess.mux = Mux {
+            enabled: true,
+            tcp: Some(128),
+            xudp: Xudp::Own(8),
+            udp443: Udp443::Reject,
+            ..Mux::default()
+        };
+        xdrive_dispatch_xudp("xdrive-vmess-xudp", Outbound::Vmess(vmess));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The store is the transport, so an xdrive row that declares tls parses and dials: both roles read the folder the config names.
+    #[test]
+    fn a_trojan_xdrive_dial_under_tls_reaches_the_store() {
+        let _stats = crate::stats::test_lock();
+        crate::stats::clear();
+        enable_user_stats();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-xdrive-dial-{}-{stamp}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A windows temp path reaches the config with backslashes, and a JSON string takes none of them raw.
+        let folder = dir.to_str().expect("utf-8 folder").replace('\\', "\\\\");
+        let settings = format!(
+            r#""network": "xdrive", "security": "tls",
+                "xdriveSettings": {{"service": "local", "remoteFolder": "{folder}",
+                    "segmentBytes": 512, "flushIntervalMs": 2, "pollIntervalMs": 2,
+                    "maxPollIntervalMs": 8, "sessionTtlSeconds": 10}},
+                "tlsSettings": {{"allowInsecure": true}}"#
+        );
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "trojan", "tag": "xdrive-in",
+                "settings": {{"clients": [{{"password": "secret",
+                    "email": "trojan-xdrive@example", "level": 1}}]}},
+                "streamSettings": {{{settings}}}}}"#
+        ))
+        .expect("parses");
+        assert!(
+            serve_trojan_inbound("127.0.0.1:9", &inbound, true, None),
+            "the store listener arms"
+        );
+        let Outbound::Trojan(trojan) = find_outbound(&trojan_tls_root(&settings))
+            .expect("parses")
+            .expect("the config names a trojan outbound")
+        else {
+            panic!("the outbound dials trojan");
+        };
+        let echo_port = echo_loop();
+        let target = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let relay = thread::spawn(move || {
+            let (socket, _) = downstream.accept().expect("accepts");
+            dial_trojan_xdrive_until(&socket, &trojan, &target, Duration::from_secs(5));
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping", "the store's session relays");
+        let snapshot = counted(|now| {
+            now.inbound
+                .get("xdrive-in")
+                .is_some_and(|row| row.uplink > 0 && row.downlink > 0)
+                && now
+                    .user
+                    .get("trojan-xdrive@example")
+                    .is_some_and(|row| row.uplink > 0 && row.downlink > 0)
+        });
+        let inbound = &snapshot.inbound["xdrive-in"];
+        assert!(
+            inbound.uplink > 0,
+            "the request reached the inbound counter"
+        );
+        assert!(inbound.downlink > 0, "the reply left it");
+        let user = &snapshot.user["trojan-xdrive@example"];
+        assert!(user.uplink > 0, "the authenticated user's uplink moved");
+        assert!(user.downlink > 0, "and the downlink too");
+        drop(sock);
+        join_thread_within(relay, Duration::from_secs(30), "the store's session");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A VLESS front over the store moves the inbound and the authenticated user's counters, with no socket between them.
+    #[test]
+    fn a_vless_xdrive_front_counts_the_flow_it_relays() {
+        let _stats = crate::stats::test_lock();
+        crate::stats::clear();
+        enable_user_stats();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-xdrive-vless-{}-{stamp}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let folder = dir.to_str().expect("utf-8 folder").replace('\\', "\\\\");
+        let settings = format!(
+            r#""network": "xdrive", "security": "tls",
+                "xdriveSettings": {{"service": "local", "remoteFolder": "{folder}",
+                    "segmentBytes": 512, "flushIntervalMs": 2, "pollIntervalMs": 2,
+                    "maxPollIntervalMs": 8, "sessionTtlSeconds": 10}},
+                "tlsSettings": {{"allowInsecure": true}}"#
+        );
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "vless", "tag": "xdrive-in",
+                "settings": {{"clients": [{{"id": "{uuid}", "email": "xdrive@example", "level": 1}}]}},
+                "streamSettings": {{{settings}}}}}"#
+        ))
+        .expect("parses");
+        assert!(
+            serve_vless_inbound(
+                "127.0.0.1:9",
+                &inbound,
+                true,
+                "test",
+                &crate::reverse::Portals::default(),
+                None
+            ),
+            "the store listener arms"
+        );
+        let Outbound::Vless(vless) = find_outbound(&vnext_tls_root("vless", &settings))
+            .expect("parses")
+            .expect("the config names a vless outbound")
+        else {
+            panic!("the outbound dials vless");
+        };
+        let echo_port = echo_loop();
+        let target = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let relay = thread::spawn(move || {
+            let (socket, _) = downstream.accept().expect("accepts");
+            dial_vless_xdrive_until(&socket, &vless, &target, Duration::from_secs(5));
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping", "the store's session relays");
+        let snapshot = counted(|now| {
+            now.inbound
+                .get("xdrive-in")
+                .is_some_and(|row| row.uplink > 0 && row.downlink > 0)
+                && now
+                    .user
+                    .get("xdrive@example")
+                    .is_some_and(|row| row.uplink > 0 && row.downlink > 0)
+        });
+        let inbound = &snapshot.inbound["xdrive-in"];
+        assert!(
+            inbound.uplink > 0,
+            "the request reached the inbound counter"
+        );
+        assert!(inbound.downlink > 0, "the reply left it");
+        let user = &snapshot.user["xdrive@example"];
+        assert!(user.uplink > 0, "the authenticated user's uplink moved");
+        assert!(user.downlink > 0, "and the downlink too");
+        drop(sock);
+        join_thread_within(relay, Duration::from_secs(30), "the store's session");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A target that answers only after the upload ends still reaches the app: the response wait is a relay budget, not the store's poll linger.
+    #[test]
+    fn an_xdrive_relay_reads_a_response_after_the_upload_ends() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-xdrive-late-{}-{stamp}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let folder = dir.to_str().expect("utf-8 folder").replace('\\', "\\\\");
+        let settings = format!(
+            r#""network": "xdrive", "security": "tls",
+                "xdriveSettings": {{"service": "local", "remoteFolder": "{folder}",
+                    "segmentBytes": 512, "flushIntervalMs": 2, "pollIntervalMs": 2,
+                    "maxPollIntervalMs": 8, "sessionTtlSeconds": 10}},
+                "tlsSettings": {{"allowInsecure": true}}"#
+        );
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "trojan", "settings": {{"clients": [{{"password": "secret"}}]}},
+                "streamSettings": {{{settings}}}}}"#
+        ))
+        .expect("parses");
+        assert!(
+            serve_trojan_inbound("127.0.0.1:9", &inbound, true, None),
+            "the store listener arms"
+        );
+        let Outbound::Trojan(trojan) = find_outbound(&trojan_tls_root(&settings))
+            .expect("parses")
+            .expect("the config names a trojan outbound")
+        else {
+            panic!("the outbound dials trojan");
+        };
+        let echo_port = delayed_echo_loop(Duration::from_millis(100));
+        let target = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let relay = thread::spawn(move || {
+            let (socket, _) = downstream.accept().expect("accepts");
+            // The same grain this witness already arms its own read timeout and its join at: on a loaded runner the store's round trip is late, never wrong.
+            dial_trojan_xdrive_until(&socket, &trojan, &target, Duration::from_secs(5));
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        sock.shutdown(Shutdown::Write).expect("ends the upload");
+        assert_eq!(
+            &read_echo(&mut sock),
+            b"ping",
+            "a response after the upload ends reaches the app"
+        );
+        drop(sock);
+        join_thread_within(relay, Duration::from_secs(30), "the delayed response");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store peer that goes quiet without publishing an end cannot pin the relay: once our own source is done the report stops after the store's own round trip of silence.
+    #[test]
+    fn an_xdrive_relay_leaves_a_peer_that_never_ends() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-xdrive-linger-{}-{stamp}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let folder = dir.to_str().expect("utf-8 folder").replace('\\', "\\\\");
+        let settings = crate::json::parse(&format!(
+            r#"{{"network": "xdrive", "security": "tls",
+                "xdriveSettings": {{"service": "local", "remoteFolder": "{folder}",
+                    "segmentBytes": 512, "flushIntervalMs": 2, "pollIntervalMs": 2,
+                    "maxPollIntervalMs": 8, "sessionTtlSeconds": 60}},
+                "tlsSettings": {{"allowInsecure": true}}}}"#
+        ))
+        .expect("parses");
+        let settings = crate::xdrive::Settings::from_json(Some(&settings)).expect("settings");
+        let session = settings.dial(Some(("127.0.0.1", 9))).expect("dials");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let peer = thread::spawn(move || {
+            let (socket, _) = listener.accept().expect("accepts");
+            drop(socket);
+        });
+        let app = Connection::connect(("127.0.0.1", port)).expect("connects");
+        let relay = thread::spawn(move || {
+            xdrive_relay_until(&app, session, Duration::from_millis(100));
+        });
+        join_thread_within(relay, Duration::from_secs(5), "a peer that never ends");
+        peer.join().expect("the peer closes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn vmess_carriers() -> Vec<Carrier> {
+        vec![
+            Carrier::Raw(Chain::default()),
+            Carrier::Ws {
+                path: "/vmess-ws".to_owned(),
+                ed: 0,
+            },
+            Carrier::Grpc(crate::config::GrpcSettings::path("/Tun".to_owned())),
+            Carrier::Xhttp {
+                settings: xhttp_settings("/vmess-xhttp"),
+            },
+            Carrier::HttpUpgrade {
+                path: "/vmess-upgrade".to_owned(),
+                host: String::new(),
+            },
+            Carrier::HttpHeader {
+                paths: vec!["/vmess-header".to_owned()],
+                path: "/vmess-header".to_owned(),
+                response: None,
+            },
+        ]
+    }
+
+    fn serve_vmess_carrier(
+        stream: Connection,
+        id: [u8; 16],
+        carrier: &Carrier,
+        server: Option<&Arc<ferrox_core::tls::TlsServerConfig>>,
+    ) {
+        let users = crate::vmess::Users::single(id);
+        if let Some(server) = server {
+            serve_vmess_tls(stream, &users, carrier, true, server);
+            return;
+        }
+        match carrier {
+            Carrier::Raw(_) => crate::vmess::serve(stream, &users, true),
+            Carrier::Ws { path, .. } => crate::vmess::serve_ws(stream, path, &users, true),
+            Carrier::Grpc(settings) => {
+                crate::vmess::serve_grpc_with(stream, settings, &users, true);
+            }
+            Carrier::Xhttp { settings, .. } => {
+                crate::vmess::serve_xhttp(stream, settings.path.as_str(), &users, true);
+            }
+            Carrier::HttpUpgrade { path, host, .. } => {
+                crate::vmess::serve_httpupgrade(stream, path, host, &users, true);
+            }
+            Carrier::HttpHeader { path, .. } => {
+                crate::vmess::serve_httpheader(stream, path, &users, true);
+            }
+            _ => unreachable!("the test carrier list carries a server"),
+        }
+    }
+
+    fn vmess_test_out(
+        port: u16,
+        id: [u8; 16],
+        carrier: Carrier,
+        tls: Option<&(
+            Arc<ferrox_core::tls::TlsServerConfig>,
+            ferrox_core::tls::TlsConfig,
+        )>,
+    ) -> VmessOut {
+        VmessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            cipher: crate::vmess::Cipher::Auto,
+            auth_len: false,
+            no_termination: false,
+            carrier,
+            host: "127.0.0.1".to_owned(),
+            tls: tls.map(|(_, client)| Arc::new(client.clone())),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            mux: Mux::default(),
+            pool: Pools::default(),
+        }
+    }
+
+    fn vmess_tcp_over(
+        carrier: Carrier,
+        tls: Option<&(
+            Arc<ferrox_core::tls::TlsServerConfig>,
+            ferrox_core::tls::TlsConfig,
+        )>,
+    ) {
+        let echo_port = echo_loop();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let id = [0x61u8; 16];
+        let server = tls.as_ref().map(|(server, _)| Arc::clone(server));
+        let carrier_for_server = carrier.clone();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vmess_carrier(stream, id, &carrier_for_server, server.as_ref());
+        });
+        let out = vmess_test_out(port, id, carrier, tls);
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let downstream_port = downstream.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+            let target = Destination::from(
+                format!("127.0.0.1:{echo_port}")
+                    .parse::<SocketAddr>()
+                    .expect("addr"),
+            );
+            dial_vmess(&client, &server, &out, &target, Ladder::global());
+        });
+        let mut sock = Connection::connect(("127.0.0.1", downstream_port)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping");
+    }
+
+    fn udp_echo_port() -> u16 {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut buf = vec![0u8; 2048];
+            loop {
+                let Ok((read, from)) = echo.recv_from(&mut buf) else {
+                    return;
+                };
+                if echo.send_to(&buf[..read], from).is_err() {
+                    return;
+                }
+            }
+        });
+        port
+    }
+
+    /// A closed association must end its listener's session on the peer's close, not on the read deadline that would otherwise park the thread.
+    fn join_thread_within(handle: thread::JoinHandle<()>, budget: Duration, what: &str) {
+        let began = Instant::now();
+        while !handle.is_finished() {
+            assert!(
+                began.elapsed() < budget,
+                "{what} waited {:?} past its {budget:?} budget",
+                began.elapsed()
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        handle.join().expect("the thread finishes");
+    }
+
+    /// A writer that records the association's framed replies.
+    struct UdpSink(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for UdpSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("sink").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Waits for a pooled association to hand its last lane back.
+    fn wait_for_flow(flow: &Arc<RelayFinish>, budget: Duration, what: &str) {
+        let (done, wait) = std::sync::mpsc::channel();
+        flow.then(move || {
+            let _ = done.send(());
+        });
+        wait.recv_timeout(budget)
+            .unwrap_or_else(|_| panic!("{what} outlived its {budget:?} budget"));
+    }
+
+    /// An echo that answers one poll late, so a caller that relays the association itself is
+    /// still inside the call when the answer arrives.
+    fn delayed_echo_port(delay: Duration) -> u16 {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut buf = vec![0u8; 2048];
+            loop {
+                let Ok((read, from)) = echo.recv_from(&mut buf) else {
+                    return;
+                };
+                thread::sleep(delay);
+                if echo.send_to(&buf[..read], from).is_err() {
+                    return;
+                }
+            }
+        });
+        port
+    }
+
+    /// A one-datagram association leaves when its uplink ends: the reply loop used to park its
+    /// thread on the 120 s idle deadline after the forward leg had already finished.
+    #[test]
+    fn a_finished_udp_association_leaves_without_the_idle_deadline() {
+        let echo = udp_echo_port();
+        let target: SocketAddr = format!("127.0.0.1:{echo}").parse().expect("addr");
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&4u16.to_be_bytes());
+        wire.extend_from_slice(b"ping");
+        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let flow = serve_udp_stream(
+            std::io::Cursor::new(wire),
+            UdpSink(Arc::clone(&bytes)),
+            &target,
+            Vec::new(),
+            &close,
+        );
+        wait_for_flow(
+            &flow,
+            Duration::from_secs(5),
+            "the finished UDP association",
+        );
+        let bytes = bytes.lock().expect("sink");
+        assert_eq!(&bytes[2..], b"ping", "the echo reached the writer");
+    }
+
+    /// An answer still owed when the uplink ends reaches the client: the association used to close
+    /// on the first poll after the forward leg, before a delayed target had spoken.
+    #[test]
+    fn a_delayed_answer_survives_the_uplink_closing() {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let echo_addr = echo.local_addr().expect("addr");
+        thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            let Ok((n, from)) = echo.recv_from(&mut buf) else {
+                return;
+            };
+            thread::sleep(Duration::from_millis(100));
+            let _ = echo.send_to(&buf[..n], from);
+        });
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&4u16.to_be_bytes());
+        wire.extend_from_slice(b"ping");
+        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let flow = serve_udp_stream(
+            std::io::Cursor::new(wire),
+            UdpSink(Arc::clone(&bytes)),
+            &echo_addr,
+            Vec::new(),
+            &close,
+        );
+        wait_for_flow(&flow, Duration::from_secs(5), "the delayed UDP association");
+        let bytes = bytes.lock().expect("sink");
+        assert_eq!(&bytes[2..], b"ping", "the late echo reached the writer");
+    }
+
+    /// The association runs on the relay lanes, not the caller's thread: a one-datagram call must
+    /// hand its thread back before the target answers, or every association costs one.
+    #[test]
+    fn a_udp_association_does_not_hold_its_callers_thread() {
+        let echo = delayed_echo_port(Duration::from_millis(400));
+        let target: SocketAddr = format!("127.0.0.1:{echo}").parse().expect("addr");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds the association");
+        let port = listener.local_addr().expect("addr").port();
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let (server, _) = listener.accept().expect("accepts");
+        let mut carried = Vec::new();
+        carried.extend_from_slice(&4u16.to_be_bytes());
+        carried.extend_from_slice(b"ping");
+        let (called, call) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            serve_vless_udp(server, &target, carried);
+            let _ = called.send(());
+        });
+        call.recv_timeout(Duration::from_millis(200))
+            .expect("the association held its caller thread");
+        let mut head = [0u8; 2];
+        client.read_exact(&mut head).expect("the reply head");
+        assert_eq!(head, [0, 0], "the association accepted the command");
+        let mut len = [0u8; 2];
+        client.read_exact(&mut len).expect("the reply length");
+        let mut answer = vec![0u8; usize::from(u16::from_be_bytes(len))];
+        client.read_exact(&mut answer).expect("the late echo");
+        assert_eq!(answer, b"ping", "the echo reached the client");
+    }
+
+    fn vmess_udp_over(
+        carrier: Carrier,
+        tls: Option<&(
+            Arc<ferrox_core::tls::TlsServerConfig>,
+            ferrox_core::tls::TlsConfig,
+        )>,
+    ) {
+        let echo_port = udp_echo_port();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let id = [0x62u8; 16];
+        let server = tls.as_ref().map(|(server, _)| Arc::clone(server));
+        let carrier_for_server = carrier.clone();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vmess_carrier(stream, id, &carrier_for_server, server.as_ref());
+        });
+        let out = vmess_test_out(port, id, carrier, tls);
+        vmess_udp_association(&out, echo_port);
+    }
+
+    fn vmess_udp_association(out: &VmessOut, echo_port: u16) {
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        relay
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let source = Arc::new(Mutex::new(Some(relay.local_addr().expect("addr"))));
+        let dest: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut up =
+            dial_vmess_udp_uplink(out, &dest, &relay, source).expect("opens the association");
+        let mut staging = Vec::new();
+        let mut pad = crate::vmess::PadSource::fresh().expect("entropy");
+        assert!(crate::vmess::write_frame(
+            &mut up.write,
+            &mut up.send,
+            b"ping",
+            &mut staging,
+            &mut pad,
+        ));
+        let mut buf = [0u8; 2048];
+        let local = relay.local_addr().expect("addr");
+        let read = loop {
+            let (read, from) = relay.recv_from(&mut buf).expect("reply");
+            if from == local {
+                break read;
+            }
+        };
+        let (_, payload) = parse_socks_udp(&buf[..read]).expect("frames the reply");
+        assert_eq!(payload, b"ping");
+        (up.close)();
+        join(&up.done);
+    }
+
+    fn vmess_udp_over_kcp(
+        tls: Option<&(
+            Arc<ferrox_core::tls::TlsServerConfig>,
+            ferrox_core::tls::TlsConfig,
+        )>,
+    ) {
+        let echo_port = udp_echo_port();
+        let listener = ferrox_core::kcp::Listener::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+        )
+        .expect("binds");
+        let port = listener.local_addr().port();
+        let id = [0x62u8; 16];
+        let server = tls.map(|(server, _)| Arc::clone(server));
+        thread::spawn(move || {
+            let users = crate::vmess::Users::single(id);
+            let conn = listener.accept().expect("accepts");
+            if let Some(server) = server {
+                serve_vmess_kcp_tls(&conn, &users, true, &server, crate::stats::Meter::default());
+                return;
+            }
+            let (reader, writer, close) = kcp_parts(&conn);
+            crate::vmess::serve_kcp(reader, writer, &users, true, &close);
+        });
+        let out = vmess_test_out(
+            port,
+            id,
+            Carrier::Kcp(ferrox_core::kcp::Config::default()),
+            tls,
+        );
+        vmess_udp_association(&out, echo_port);
+    }
+
+    fn vmess_udp_over_xdrive() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-vmess-xdrive-{}-{stamp}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let folder = dir.to_str().expect("utf-8 folder").replace('\\', "\\\\");
+        let settings = crate::json::parse(&format!(
+            r#"{{"network": "xdrive", "security": "tls",
+                "xdriveSettings": {{"service": "local", "remoteFolder": "{folder}",
+                    "segmentBytes": 512, "flushIntervalMs": 2, "pollIntervalMs": 2,
+                    "maxPollIntervalMs": 8, "sessionTtlSeconds": 60}},
+                "tlsSettings": {{"allowInsecure": true}}}}"#
+        ))
+        .expect("parses");
+        let settings = crate::xdrive::Settings::from_json(Some(&settings)).expect("settings");
+        let echo_port = udp_echo_port();
+        let id = [0x62u8; 16];
+        let users = crate::vmess::Users::single(id);
+        let accept: crate::xdrive::Accept =
+            Arc::new(move |session| serve_vmess_xdrive(session, &users, true));
+        settings
+            .listen(Some(("127.0.0.1", 9)), accept)
+            .expect("listens");
+        let out = vmess_test_out(
+            9,
+            id,
+            Carrier::Xdrive {
+                settings: Box::new(settings.clone()),
+            },
+            None,
+        );
+        vmess_udp_association(&out, echo_port);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A configured TCP inbound binds on its worker, so the TLS dial waits until that listener answers.
+    #[test]
+    fn a_vmess_inbound_naming_tls_answers_the_session() {
+        let echo_port = echo_loop();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir();
+        let cert_path = dir.join(format!(
+            "ferrox-vmess-tls-{}-{stamp}.pem",
+            std::process::id()
+        ));
+        let key_path = dir.join(format!(
+            "ferrox-vmess-key-{}-{stamp}.pem",
+            std::process::id()
+        ));
+        std::fs::write(
+            &cert_path,
+            crate::quic::der_to_pem(CARRIER_CERT, "CERTIFICATE"),
+        )
+        .expect("stages cert");
+        std::fs::write(
+            &key_path,
+            crate::quic::der_to_pem(CARRIER_KEY, "PRIVATE KEY"),
+        )
+        .expect("stages key");
+        let cert = cert_path
+            .to_str()
+            .expect("ascii")
+            .to_owned()
+            .replace('\\', "\\\\");
+        let key = key_path
+            .to_str()
+            .expect("ascii")
+            .to_owned()
+            .replace('\\', "\\\\");
+        let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let text = format!(
+            r#"{{"inbounds":[{{"protocol":"vmess","listen":"127.0.0.1","port":{port},"settings":{{"clients":[{{"id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}}]}},"streamSettings":{{"network":"tcp","security":"tls","tlsSettings":{{"certificates":[{{"certificateFile":"{cert}","keyFile":"{key}"}}]}}}}}}]}}"#
+        );
+        let root = crate::json::parse(&text).expect("parses");
+        let opened = serve_inbounds(
+            "test",
+            &root,
+            Some(&freedom()),
+            None,
+            true,
+            &crate::reverse::Portals::default(),
+            None,
+            None,
+        );
+        assert_eq!(opened, 1, "a vmess inbound that names tls is served");
+        drop(connect_until(port));
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let tls = carried_tls_configs();
+        let out = vmess_test_out(port, id, Carrier::Raw(Chain::default()), Some(&tls));
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let downstream_port = downstream.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+            let target = Destination::from(
+                format!("127.0.0.1:{echo_port}")
+                    .parse::<SocketAddr>()
+                    .expect("addr"),
+            );
+            dial_vmess(&client, &server, &out, &target, Ladder::global());
+        });
+        let mut sock = connect_until(downstream_port);
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping");
+        let _ = std::fs::remove_file(cert_path);
+        let _ = std::fs::remove_file(key_path);
+    }
+
+    /// xray-core buffers the response header until the target first writes, so an upload-only
+    /// flow never flushes it. The client must start forwarding before it waits for that header,
+    /// or a bulk upload fills the socket and the server waits for bytes the client has not sent.
+    #[test]
+    fn a_vmess_tls_bulk_upload_reaches_the_peer_before_the_response_header() {
+        for carrier in [
+            Carrier::Raw(Chain::default()),
+            Carrier::Ws {
+                path: "/vmess-ws".to_owned(),
+                ed: 0,
+            },
+        ] {
+            vmess_tls_upload_before_response_header(carrier);
+        }
+    }
+
+    fn vmess_tls_upload_before_response_header(carrier: Carrier) {
+        const UPLOAD: usize = 2 * 1024 * 1024;
+        let (server_config, client_config) = carried_tls_configs();
+        let id = [0x61u8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (uploaded_tx, uploaded_rx) = std::sync::mpsc::channel();
+        let out = vmess_test_out(
+            port,
+            id,
+            carrier.clone(),
+            Some(&(Arc::clone(&server_config), client_config)),
+        );
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let raw = stream.try_clone().expect("clones");
+            let session = accept_tls_session(stream, &server_config).expect("tls");
+            let (reader, writer) = session_halves(session, raw);
+            let (mut reader, mut writer): (Box<dyn Read + Send>, Box<dyn Write + Send>) =
+                match &carrier {
+                    Carrier::Raw(_) => (Box::new(reader), Box::new(writer)),
+                    Carrier::Ws { path, .. } => {
+                        let (reader, writer) =
+                            crate::ws::accept_split(reader, writer, path).expect("ws upgrade");
+                        (Box::new(reader), Box::new(writer))
+                    }
+                    _ => unreachable!("the test drives the two tls upload cells"),
+                };
+            let users = crate::vmess::Users::single(id);
+            let accepted =
+                crate::vmess::accept_request(&mut reader, &users).expect("the request decodes");
+            let mut recv = accepted.recv;
+            let mut scratch = Vec::new();
+            let mut total = 0;
+            while total < UPLOAD {
+                let frame = crate::vmess::read_frame(&mut reader, &mut recv, &mut scratch)
+                    .expect("the upload arrives before the response header");
+                assert!(!frame.is_empty(), "the upload ends below its length");
+                total += frame.len();
+            }
+            assert_eq!(total, UPLOAD);
+            uploaded_tx.send(()).expect("signals");
+            writer.write_all(&accepted.prefix).expect("response header");
+            writer.flush().expect("flushes");
+        });
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let downstream_port = downstream.local_addr().expect("addr").port();
+        let (dialed_tx, dialed_rx) = std::sync::mpsc::channel();
+        let relaying = thread::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+            let target = Destination::from("127.0.0.1:1".parse::<SocketAddr>().expect("addr"));
+            dial_vmess(&client, &server, &out, &target, Ladder::global());
+            dialed_tx.send(()).expect("signals");
+        });
+
+        let mut sock = connect_until(downstream_port);
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        sock.write_all(&vec![0x5Au8; UPLOAD]).expect("writes");
+        sock.shutdown(Shutdown::Write).expect("half-closes");
+        uploaded_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the server saw the upload before flushing the header");
+        dialed_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the dial returned after the lazy header");
+        server.join().expect("joins");
+        relaying.join().expect("joins");
+    }
+
+    #[test]
+    fn vmess_serves_tcp_over_every_carrier() {
+        for carrier in vmess_carriers() {
+            vmess_tcp_over(carrier, None);
+        }
+    }
+
+    #[test]
+    fn vmess_tls_serves_tcp_over_every_carrier() {
+        let tls = carried_tls_configs();
+        for carrier in vmess_carriers() {
+            vmess_tcp_over(carrier, Some(&tls));
+        }
+    }
+
+    #[test]
+    fn vmess_serves_udp_over_every_carrier() {
+        for carrier in vmess_carriers() {
+            vmess_udp_over(carrier, None);
+        }
+    }
+
+    #[test]
+    fn vmess_tls_serves_udp_over_every_carrier() {
+        let tls = carried_tls_configs();
+        for carrier in vmess_carriers() {
+            vmess_udp_over(carrier, Some(&tls));
+        }
+    }
+
+    #[test]
+    fn vmess_serves_udp_over_kcp() {
+        vmess_udp_over_kcp(None);
+    }
+
+    #[test]
+    fn vmess_tls_serves_udp_over_kcp() {
+        let tls = carried_tls_configs();
+        vmess_udp_over_kcp(Some(&tls));
+    }
+
+    #[test]
+    fn a_vmess_kcp_tls_outbound_parses_and_carries_udp() {
+        let (cert, key, _) = tls_cert_json();
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "vmess", "settings": {{"clients": [{{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}}]}},
+                "streamSettings": {{"network": "kcp", "security": "tls",
+                    "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
+        ))
+        .expect("parses");
+        let users = inbound_vmess_users(&inbound);
+        let server = inbound_tls_identity(&inbound).expect("the inbound tls identity parses");
+        // Bind before the outbound is parsed, so the test never races another test for the port.
+        let listener = ferrox_core::kcp::Listener::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+        )
+        .expect("binds");
+        let port = listener.local_addr().port();
+        let session = thread::spawn(move || {
+            let conn = listener.accept().expect("accepts");
+            serve_vmess_kcp_tls(&conn, &users, true, &server, crate::stats::Meter::default());
+        });
+        let outbound = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "vmess",
+                "settings": {{"vnext": [{{"address": "127.0.0.1", "port": {port},
+                    "users": [{{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}}]}}]}},
+                "streamSettings": {{"network": "kcp", "security": "tls",
+                    "tlsSettings": {{"allowInsecure": true}}}}}}]}}"#
+        ))
+        .expect("parses");
+        let out = find_vmess_outbound(&outbound).expect("the kcp tls outbound parses");
+        assert!(out.tls.is_some(), "the kcp session carries tls");
+        vmess_udp_association(&out, udp_echo_port());
+        join_thread_within(session, Duration::from_secs(5), "the kcp tls session");
+    }
+
+    #[test]
+    fn vmess_serves_udp_over_xdrive() {
+        vmess_udp_over_xdrive();
+    }
+
+    #[test]
+    fn vmess_over_tls_carries_an_echo() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let id = [0x33u8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            echo_trace(&format!("srv {port} accepted"));
+            let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            echo_trace(&format!("srv {port} handshook"));
+            let Some(crate::vmess::Accepted {
+                mut send,
+                mut recv,
+                prefix,
+                cmd,
+                ..
+            }) = crate::vmess::accept_request(&mut tls, &crate::vmess::Users::single(id))
+            else {
+                panic!("reads a vmess header");
+            };
+            assert_eq!(cmd, 1);
+            echo_trace(&format!("srv {port} header ok"));
+            tls.write_all(&prefix).expect("answers");
+            let mut scratch = Vec::with_capacity(16 * 1024);
+            let chunk = crate::vmess::read_frame(&mut tls, &mut recv, &mut scratch)
+                .expect("reads a frame")
+                .to_vec();
+            echo_trace(&format!("srv {port} ping read"));
+            let mut staging = Vec::with_capacity(16 * 1024);
+            let mut pad = crate::vmess::PadSource::fresh().expect("entropy");
+            assert!(crate::vmess::write_frame(
+                &mut tls,
+                &mut send,
+                &chunk,
+                &mut staging,
+                &mut pad
+            ));
+            echo_trace(&format!("srv {port} echoed vmess"));
+        });
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let relay = thread::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+            let target: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+            let vmess = VmessOut {
+                address: "127.0.0.1".to_owned(),
+                port,
+                id,
+                cipher: crate::vmess::Cipher::Auto,
+                auth_len: false,
+                no_termination: false,
+                carrier: Carrier::Raw(Chain::default()),
+                host: String::new(),
+                tls: Some(Arc::new(client_config)),
+                reality: None,
+                headers: Vec::new(),
+                heartbeat: 0,
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
+                mux: Mux::default(),
+                pool: Pools::default(),
+            };
+            echo_trace(&format!("cli {port} dialing"));
+            dial_vmess(
+                &client,
+                &server,
+                &vmess,
+                &Destination::from(target),
+                Ladder::global(),
+            );
+            echo_trace(&format!("cli {port} relay over"));
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(120)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping");
+        drop(sock);
+        relay.join().expect("joins");
+        server.join().expect("joins");
+    }
+
+    type ServerHalf = TlsHalf<ferrox_core::tls::RustlsServerProvider<Connection>>;
+
+    /// The relay arms the shared timeout to its own grain, so a quiet socket retries and only a closed one fails.
+    fn read_echo(sock: &mut Connection) -> [u8; 4] {
+        let start = std::time::Instant::now();
+        let mut back = [0u8; 4];
+        let mut at = 0;
+        while at < back.len() {
+            match sock.read(&mut back[at..]) {
+                Ok(0) => panic!(
+                    "echoes: closed after {:?}; last dial: {:?}",
+                    start.elapsed(),
+                    last_dial_failure()
+                ),
+                Ok(n) => at += n,
+                Err(error) => {
+                    assert!(
+                        is_timeout(&error) && start.elapsed() < Duration::from_secs(120),
+                        "echoes: {error:?} after {:?}; last dial: {:?}",
+                        start.elapsed(),
+                        last_dial_failure()
+                    );
+                }
+            }
+        }
+        back
+    }
+
+    enum TlsEcho {
+        Vless([u8; 16]),
+        Trojan([u8; 56]),
+        Vmess([u8; 16]),
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn tls_carried_echo(
+        kind: TlsEcho,
+        out: impl FnOnce(u16) -> Outbound + Send + 'static,
+        accept: impl FnOnce(ServerHalf, ServerHalf) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)>
+            + Send
+            + 'static,
+    ) {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (server_config, _) = carried_tls_configs();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            echo_trace(&format!("srv {port} accepted"));
+            let mut tls =
+                ferrox_core::tls::RustlsServerProvider::accept((*server_config).clone(), stream)
+                    .expect("accepts");
+            tls.handshake().expect("handshakes");
+            let out = tls.get_ref().try_clone().expect("dups the transport");
+            let shared = Arc::new(Mutex::new(tls));
+            let out = Arc::new(Mutex::new(Sealed::new(out)));
+            let (mut reader, mut writer) = accept(
+                TlsHalf {
+                    session: Arc::clone(&shared),
+                    out: Arc::clone(&out),
+                    driven: None,
+                    sleep_on_timeout: true,
+                },
+                TlsHalf {
+                    session: shared,
+                    out,
+                    driven: None,
+                    sleep_on_timeout: true,
+                },
+            )
+            .expect("accepts carrier");
+            match kind {
+                TlsEcho::Vless(id) => {
+                    let Some((got, _flow, cmd, _target)) = decode_request(&mut reader) else {
+                        panic!("reads a vless header");
+                    };
+                    assert_eq!(got, id);
+                    assert_eq!(cmd, 1);
+                    echo_trace(&format!("srv {port} header ok"));
+                    writer.write_all(&[0, 0]).expect("answers");
+                    echo_trace(&format!("srv {port} response sent"));
+                    let mut buf = [0u8; 4];
+                    reader.read_exact(&mut buf).expect("reads");
+                    echo_trace(&format!("srv {port} ping read"));
+                    writer.write_all(&buf).expect("echoes");
+                    echo_trace(&format!("srv {port} echoed vless"));
+                }
+                TlsEcho::Trojan(key) => {
+                    let Some((cmd, _target)) = decode_trojan_request(&mut reader, &[key]) else {
+                        panic!("reads a trojan header");
+                    };
+                    assert_eq!(cmd, 1);
+                    echo_trace(&format!("srv {port} header ok"));
+                    let mut buf = [0u8; 4];
+                    reader.read_exact(&mut buf).expect("reads");
+                    echo_trace(&format!("srv {port} ping read"));
+                    writer.write_all(&buf).expect("echoes");
+                    echo_trace(&format!("srv {port} echoed trojan"));
+                }
+                TlsEcho::Vmess(id) => {
+                    let Some(crate::vmess::Accepted {
+                        mut send,
+                        mut recv,
+                        prefix,
+                        cmd,
+                        ..
+                    }) =
+                        crate::vmess::accept_request(&mut reader, &crate::vmess::Users::single(id))
+                    else {
+                        panic!("reads a vmess header");
+                    };
+                    assert_eq!(cmd, 1);
+                    echo_trace(&format!("srv {port} header ok"));
+                    writer.write_all(&prefix).expect("answers");
+                    echo_trace(&format!("srv {port} response sent"));
+                    let mut scratch = Vec::with_capacity(16 * 1024);
+                    let chunk = crate::vmess::read_frame(&mut reader, &mut recv, &mut scratch)
+                        .expect("reads a frame")
+                        .to_vec();
+                    echo_trace(&format!("srv {port} ping read"));
+                    let mut staging = Vec::with_capacity(16 * 1024);
+                    let mut pad = crate::vmess::PadSource::fresh().expect("entropy");
+                    assert!(crate::vmess::write_frame(
+                        &mut writer,
+                        &mut send,
+                        &chunk,
+                        &mut staging,
+                        &mut pad
+                    ));
+                    echo_trace(&format!("srv {port} echoed vmess"));
+                }
+            }
+            // Exit only after the client closed: closing with its frames unread resets the echo with it.
+            let mut rest = [0u8; 1024];
+            while reader.read(&mut rest).unwrap_or(0) != 0 {}
+        });
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+            let target: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+            echo_trace(&format!("cli {port} dialing"));
+            dial_socks_outbound(&client, &out(port), &server, &Destination::from(target));
+            echo_trace(&format!("cli {port} relay over"));
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(120)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping");
+    }
+
+    fn tls_vless_out(
+        port: u16,
+        id: [u8; 16],
+        carrier: Carrier,
+        tls: ferrox_core::tls::TlsConfig,
+    ) -> Outbound {
+        Outbound::Vless(VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            carrier,
+            host: "127.0.0.1".to_owned(),
+            mux: Mux::default(),
+            pool: Pools::default(),
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: Some(Arc::new(tls)),
+            flow: String::new(),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            encryption: None,
+        })
+    }
+
+    fn tls_vmess_out(
+        port: u16,
+        id: [u8; 16],
+        carrier: Carrier,
+        tls: ferrox_core::tls::TlsConfig,
+    ) -> Outbound {
+        Outbound::Vmess(VmessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            cipher: crate::vmess::Cipher::Auto,
+            auth_len: false,
+            no_termination: false,
+            carrier,
+            host: "127.0.0.1".to_owned(),
+            tls: Some(Arc::new(tls)),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            mux: Mux::default(),
+            pool: Pools::default(),
+        })
+    }
+
+    fn tls_trojan_out(
+        port: u16,
+        key: [u8; 56],
+        carrier: Carrier,
+        tls: ferrox_core::tls::TlsConfig,
+    ) -> Outbound {
+        Outbound::Trojan(TrojanOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            key,
+            carrier,
+            host: "127.0.0.1".to_owned(),
+            tls: Some(Arc::new(tls)),
+            headers: Vec::new(),
+            heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            mux: Mux::default(),
+            pool: Pools::default(),
+            reality: None,
+        })
+    }
+
+    fn tls_ss_out(
+        port: u16,
+        password: &str,
+        method: &str,
+        carrier: Carrier,
+        tls: ferrox_core::tls::TlsConfig,
+    ) -> Outbound {
+        Outbound::Shadowsocks(ShadowsocksOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            method: method.to_owned(),
+            password: password.to_owned(),
+            carrier,
+            host: "127.0.0.1".to_owned(),
+            headers: Vec::new(),
+            heartbeat: 0,
+            mux: Mux::default(),
+            pool: Pools::default(),
+            tls: Some(Arc::new(tls)),
+            reality: None,
+            hysteria_roots: None,
