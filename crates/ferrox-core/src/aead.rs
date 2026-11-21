@@ -23,6 +23,9 @@ pub fn chacha20_poly1305_seal_in_place_unfused(
     state.finish()
 }
 
+/// The longest message where the fused head still saves a pass; above it the two-call shape fills whole passes and is cheaper.
+const FUSED_HEAD_BYTES: usize = 448;
+
 fn mac(state: &mut Poly1305, aad: &[u8], ciphertext: &[u8]) {
     for section in [aad, ciphertext] {
         state.update(section);
@@ -41,6 +44,9 @@ pub fn chacha20_poly1305_seal_in_place(
     aad: &[u8],
     buf: &mut [u8],
 ) -> [u8; 16] {
+    if buf.len() > FUSED_HEAD_BYTES {
+        return chacha20_poly1305_seal_in_place_unfused(key, nonce, aad, buf);
+    }
     let mut one_time = [0u8; 32];
     fill_exact_with_head(key, nonce, 0, &mut one_time, buf);
 
@@ -62,6 +68,22 @@ pub fn chacha20_poly1305_seal_from(
         dst.len(),
         "the source and the wire are the same message"
     );
+    seal_from_initialized(key, nonce, aad, src, dst)
+}
+
+fn seal_from_initialized(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    src: &[u8],
+    dst: &mut [u8],
+) -> [u8; 16] {
+    if src.len() > FUSED_HEAD_BYTES {
+        crate::record::fill_exact_from(key, nonce, 1, src, dst);
+        let mut state = Poly1305::new(&poly_key(key, nonce));
+        mac(&mut state, aad, dst);
+        return state.finish();
+    }
     let mut one_time = [0u8; 32];
     crate::record::fill_exact_with_head_from(key, nonce, 0, &mut one_time, src, dst);
 
@@ -86,17 +108,12 @@ pub fn chacha20_poly1305_seal_from_uninit(
         dst.len(),
         "the source and the wire are the same message"
     );
-    let mut one_time = [0u8; 32];
     // SAFETY: write_bytes initializes every byte before the slice exists; the fill overwrites all of them.
     let dst_initialized = unsafe {
         std::ptr::write_bytes(dst.as_mut_ptr(), 0, dst.len());
         std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), dst.len())
     };
-    crate::record::fill_exact_with_head_from(key, nonce, 0, &mut one_time, src, dst_initialized);
-
-    let mut state = Poly1305::new(&one_time);
-    mac(&mut state, aad, dst_initialized);
-    state.finish()
+    seal_from_initialized(key, nonce, aad, src, dst_initialized)
 }
 
 #[must_use]
@@ -180,6 +197,43 @@ mod tests {
                 unsafe { std::slice::from_raw_parts(uninit.as_ptr().cast::<u8>(), uninit.len()) };
             assert_eq!(uninit, in_place, "uninit ciphertext at length {len}");
             assert_eq!(plain, original, "source at length {len}");
+        }
+    }
+
+    #[test]
+    fn the_seal_is_the_unfused_seal_on_both_sides_of_the_fused_head_cutoff() {
+        let key = [0x5bu8; 32];
+        let nonce = [0xa7u8; 12];
+        let aad = b"a header";
+        for len in [
+            0, 1, 63, 64, 65, 255, 256, 257, 447, 448, 449, 1023, 1024, 1025, 4095, 4096, 4097,
+            16384,
+        ] {
+            let plain: Vec<u8> = (0..len)
+                .map(|i| (i as u8).wrapping_mul(251).wrapping_add(11))
+                .collect();
+            let mut fused = plain.clone();
+            let mut unfused = plain.clone();
+            let fused_tag = chacha20_poly1305_seal_in_place(&key, &nonce, aad, &mut fused);
+            let unfused_tag =
+                chacha20_poly1305_seal_in_place_unfused(&key, &nonce, aad, &mut unfused);
+            assert_eq!(fused, unfused, "ciphertext at length {len}");
+            assert_eq!(fused_tag, unfused_tag, "tag at length {len}");
+
+            let mut from = vec![0u8; len];
+            let from_tag = chacha20_poly1305_seal_from(&key, &nonce, aad, &plain, &mut from);
+            assert_eq!(from, unfused, "from ciphertext at length {len}");
+            assert_eq!(from_tag, unfused_tag, "from tag at length {len}");
+
+            let mut uninit: Vec<std::mem::MaybeUninit<u8>> =
+                (0..len).map(|_| std::mem::MaybeUninit::uninit()).collect();
+            let uninit_tag =
+                chacha20_poly1305_seal_from_uninit(&key, &nonce, aad, &plain, &mut uninit);
+            // SAFETY: seal_from_uninit wrote every byte of the destination.
+            let uninit =
+                unsafe { std::slice::from_raw_parts(uninit.as_ptr().cast::<u8>(), uninit.len()) };
+            assert_eq!(uninit, unfused, "uninit ciphertext at length {len}");
+            assert_eq!(uninit_tag, unfused_tag, "uninit tag at length {len}");
         }
     }
 

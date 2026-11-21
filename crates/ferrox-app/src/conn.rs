@@ -2531,7 +2531,7 @@ fn same_socket_object(listed: &std::path::Path, path: &std::path::Path) -> bool 
 fn macos_socket_table() -> Option<Vec<u8>> {
     let name = c"net.local.stream.pcblist64";
     // A table that grows between the size probe and the read refuses the read, so ask again rather than forget the socket.
-    for _ in 0..4 {
+    for _ in 0..16 {
         let mut len = 0usize;
         // SAFETY: the name is NUL-terminated and the null pointers ask only for the required size.
         let asked = unsafe {
@@ -5157,8 +5157,15 @@ mod tests {
             Listener::Tcp(_) => panic!("a unix target binds a unix listener"),
         };
         drop(listener);
+        let names = (0..16).find_map(|_| {
+            let names = socket_table_names(&path);
+            if names.is_none() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            names
+        });
         assert_eq!(
-            socket_table_names(&path),
+            names,
             Some(false),
             "the accepted connection does not own the published path"
         );
