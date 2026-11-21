@@ -2493,8 +2493,10 @@ fn macos_table_names(table: &[u8], path: &std::path::Path) -> Option<bool> {
                                         == path_name.to_string_lossy().to_lowercase()
                                 })
                             });
+                            // A relative bind resolves against the binder's directory, not this process's, so its row cannot be attributed from here.
                             let moved = same_name && std::fs::symlink_metadata(row).is_err();
-                            if same_socket_object(row, path)
+                            if (row.is_relative() && same_name)
+                                || same_socket_object(row, path)
                                 || (listening && staged_sibling(listed, path))
                                 || moved
                             {
@@ -3433,14 +3435,29 @@ fn windows_delete_stale(path: &std::path::Path, before: Option<&(u32, u64)>) -> 
     use std::os::windows::io::AsRawHandle as _;
     const DELETE: u32 = 0x0001_0000;
     const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     #[repr(C)]
     struct FileDispositionInfo {
         delete_file: u8,
     }
+    #[repr(C)]
+    struct FileBasicInfo {
+        creation_time: i64,
+        last_access_time: i64,
+        last_write_time: i64,
+        change_time: i64,
+        file_attributes: u32,
+    }
     #[link(name = "kernel32")]
     extern "system" {
+        fn GetFileInformationByHandleEx(
+            handle: *mut core::ffi::c_void,
+            class: i32,
+            info: *mut core::ffi::c_void,
+            size: u32,
+        ) -> i32;
         fn SetFileInformationByHandle(
             handle: *mut core::ffi::c_void,
             class: i32,
@@ -3449,7 +3466,7 @@ fn windows_delete_stale(path: &std::path::Path, before: Option<&(u32, u64)>) -> 
         ) -> i32;
     }
     let file = match std::fs::OpenOptions::new()
-        .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+        .access_mode(DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
         .share_mode(0)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
@@ -3485,6 +3502,38 @@ fn windows_delete_stale(path: &std::path::Path, before: Option<&(u32, u64)>) -> 
                 "a unix listen path was replaced while binding",
             ))
         }
+    }
+    let mut basic = FileBasicInfo {
+        creation_time: 0,
+        last_access_time: 0,
+        last_write_time: 0,
+        change_time: 0,
+        file_attributes: 0,
+    };
+    // SAFETY: the handle is live and `basic` is the class's structure.
+    let read = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            0,
+            (&raw mut basic).cast(),
+            std::mem::size_of::<FileBasicInfo>() as u32,
+        )
+    };
+    if read == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    basic.file_attributes &= !0x1;
+    // SAFETY: the handle is live and `basic` is the class's structure.
+    let cleared = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            0,
+            (&raw const basic).cast(),
+            std::mem::size_of::<FileBasicInfo>() as u32,
+        )
+    };
+    if cleared == 0 {
+        return Err(io::Error::last_os_error());
     }
     let disposition = FileDispositionInfo { delete_file: 1 };
     // SAFETY: the handle is live and `disposition` is the class's structure.
@@ -5209,10 +5258,16 @@ mod tests {
         std::fs::rename(&old_dir, &new_dir).expect("moves the directory");
         let new_path = new_dir.join(&name);
         let alt_path = new_dir.join(name.to_uppercase());
+        // A case-sensitive volume gives the alternate spelling a name of its own, so probe the spelling the rename actually kept.
+        let probe_path = if alt_path.exists() {
+            alt_path.clone()
+        } else {
+            new_path.clone()
+        };
         let mut clients = Vec::new();
         let mut refused = false;
         while clients.len() < 4096 {
-            match std::os::unix::net::UnixStream::connect(&alt_path) {
+            match std::os::unix::net::UnixStream::connect(&probe_path) {
                 Ok(client) => clients.push(client),
                 Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
                     refused = true;
@@ -5225,20 +5280,20 @@ mod tests {
         assert!(refused, "the full moved queue refused a connection");
         let table = macos_socket_table().expect("reads the macOS socket table");
         assert_eq!(
-            macos_table_names(&table, &alt_path),
+            macos_table_names(&table, &probe_path),
             None,
             "the read table names the moved listener"
         );
         assert_ne!(
-            socket_table_names(&alt_path),
+            socket_table_names(&probe_path),
             Some(false),
             "an alternate spelling still names the moved listener"
         );
         assert!(
-            probe_unix(&alt_path).is_err(),
+            probe_unix(&probe_path).is_err(),
             "a full queue behind the alternate spelling keeps its path"
         );
-        let target = parse_target(&format!("unix:{}", alt_path.display())).expect("parses");
+        let target = parse_target(&format!("unix:{}", probe_path.display())).expect("parses");
         assert!(
             Listener::bind(&target).is_err(),
             "a live moved listener keeps its name"

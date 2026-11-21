@@ -586,12 +586,23 @@ fn serve_inbounds_counted(
 ) -> usize {
     if fallible {
         FALLIBLE_BIND.with(|fallible| fallible.set(true));
+        let requested = if test {
+            Vec::new()
+        } else {
+            proposed_listen_addresses(root)
+        };
         let mut closing = CLOSING
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        closing.retain(|stop| !stop.is_closed());
-        if !closing.is_empty() {
-            eprintln!("inbound add refused: a previous listener is still closing");
+        closing.retain(|entry| !entry.stop.is_settled());
+        if closing.iter().any(|entry| {
+            entry.endpoints.iter().any(|held| {
+                requested
+                    .iter()
+                    .any(|wanted| endpoints_conflict(held, wanted))
+            })
+        }) {
+            eprintln!("inbound add refused: a previous listener on this address is still closing");
             FALLIBLE_BIND.with(|fallible| fallible.set(false));
             return 0;
         }
@@ -639,6 +650,9 @@ fn serve_inbounds_counted(
             }
             register_inbound_sniffing(inbound, label, &addresses);
             let handler_stop = api.map(|_| Arc::new(Stop::new()));
+            if let Some(stop) = handler_stop.as_ref().filter(|_| fallible) {
+                stop.track_sessions();
+            }
             let handler_tag = inbound_tag(inbound);
             let handler_raw = seed.and_then(|seed| {
                 let tag = handler_tag.as_deref().unwrap_or_default();
@@ -1000,12 +1014,26 @@ fn serve_inbounds_counted(
                     for address in &armed_addresses {
                         wake_listener(stop, address);
                     }
-                    if !handler_stops.is_empty() && !stop.wait_closed() {
-                        eprintln!("inbound rollback: a listener is still closing");
+                    let waited = !handler_stops.is_empty();
+                    let closed = !waited || stop.wait_closed();
+                    stop.shutdown_sessions();
+                    let drained = stop.wait_drained();
+                    if !closed || !drained {
+                        eprintln!("inbound rollback: a listener or session is still closing");
+                        let mut endpoints: Vec<String> = handler_stops
+                            .iter()
+                            .map(|(_, address)| address.clone())
+                            .chain(armed_addresses.iter().cloned())
+                            .collect();
+                        endpoints.sort();
+                        endpoints.dedup();
                         CLOSING
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .push(Arc::clone(stop));
+                            .push(Closing {
+                                stop: Arc::clone(stop),
+                                endpoints,
+                            });
                     }
                 }
                 inbounds = before;
@@ -1287,7 +1315,53 @@ thread_local! {
     static BIND_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-static CLOSING: std::sync::Mutex<Vec<Arc<Stop>>> = std::sync::Mutex::new(Vec::new());
+/// A rollback's stop and the endpoints its failed add may still hold, so only an add that reaches one waits.
+struct Closing {
+    stop: Arc<Stop>,
+    endpoints: Vec<String>,
+}
+
+static CLOSING: std::sync::Mutex<Vec<Closing>> = std::sync::Mutex::new(Vec::new());
+
+/// Every address this config names, before a test takes its ephemeral port, so an overlapping add can be told apart from an unrelated one.
+fn proposed_listen_addresses(root: &Json) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(list) = root.get("inbounds").and_then(Json::as_arr) {
+        for inbound in list {
+            let protocol =
+                canonical_protocol(inbound.get("protocol").and_then(Json::as_str).unwrap_or(""));
+            for address in serve_addresses(inbound, protocol).unwrap_or_default() {
+                if !address.is_empty() && !out.contains(&address) {
+                    out.push(address);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Two listen addresses contend for one socket: an equal port on the same or a wildcard address, or the same unix path.
+fn endpoints_conflict(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    let (Ok(crate::conn::Target::Ip(left)), Ok(crate::conn::Target::Ip(right))) =
+        (parse_target(left), parse_target(right))
+    else {
+        #[cfg(any(unix, windows))]
+        return matches!(
+            (parse_target(left), parse_target(right)),
+            (
+                Ok(crate::conn::Target::Unix(left)),
+                Ok(crate::conn::Target::Unix(right))
+            ) if left == right
+        );
+        #[cfg(not(any(unix, windows)))]
+        return false;
+    };
+    left.port() == right.port()
+        && (left.ip().is_unspecified() || right.ip().is_unspecified() || left.ip() == right.ip())
+}
 
 fn bind_failed() {
     BIND_FAILED.with(|failed| failed.set(true));
@@ -1304,7 +1378,25 @@ pub(crate) struct Stop {
     stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
     listeners: std::sync::atomic::AtomicUsize,
     closed: std::sync::Mutex<bool>,
+    sessions: std::sync::Mutex<HashMap<u64, Connection>>,
+    next_session: std::sync::atomic::AtomicU64,
+    track_sessions: AtomicBool,
     wake: std::sync::Condvar,
+}
+
+/// One accepted session's registration: the stop holds a socket clone it can shut down, and the guard removes it when the work ends.
+struct TrackedSession {
+    stop: Arc<Stop>,
+    id: u64,
+}
+
+impl Drop for TrackedSession {
+    fn drop(&mut self) {
+        if let Ok(mut sessions) = self.stop.sessions.lock() {
+            sessions.remove(&self.id);
+        }
+        self.stop.wake.notify_all();
+    }
 }
 
 impl Stop {
@@ -1337,6 +1429,58 @@ impl Stop {
 
     pub(crate) fn is_closed(&self) -> bool {
         self.closed.lock().is_ok_and(|closed| *closed)
+    }
+
+    fn is_settled(&self) -> bool {
+        self.is_closed()
+            && self
+                .sessions
+                .lock()
+                .is_ok_and(|sessions| sessions.is_empty())
+    }
+
+    fn track_sessions(&self) {
+        self.track_sessions.store(true, Ordering::Relaxed);
+    }
+
+    /// Registers an accepted stream so rollback can shut it down and wait for its work to leave.
+    fn track_session(self: &Arc<Self>, stream: &Connection) -> Option<TrackedSession> {
+        if !self.track_sessions.load(Ordering::Relaxed) {
+            return None;
+        }
+        let clone = stream.try_clone().ok()?;
+        let id = self.next_session.fetch_add(1, Ordering::Relaxed);
+        self.sessions.lock().ok()?.insert(id, clone);
+        Some(TrackedSession {
+            stop: Arc::clone(self),
+            id,
+        })
+    }
+
+    fn shutdown_sessions(&self) {
+        if let Ok(sessions) = self.sessions.lock() {
+            for stream in sessions.values() {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        }
+    }
+
+    fn wait_drained(&self) -> bool {
+        let Ok(mut sessions) = self.sessions.lock() else {
+            return false;
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !sessions.is_empty() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            let Ok(next) = self.wake.wait_timeout(sessions, left) else {
+                return false;
+            };
+            sessions = next.0;
+        }
+        true
     }
 
     pub(crate) fn mark_closed(&self) {
@@ -6252,10 +6396,12 @@ fn accept_listener(
             let stream = with_account(stream, role.account(), false);
             // The ClientHello peek runs on a setup lane, so a stalled hello cannot hold the accept loop.
             let accepted_at = Instant::now();
-            let mut work = Some((role, stream, sniffing));
+            let session = stop.as_ref().and_then(|stop| stop.track_session(&stream));
+            let mut work = Some((role, stream, sniffing, session));
             lane_pool::submit_setup(
                 Box::new(move || {
-                    if let Some((role, stream, sniffing)) = work.take() {
+                    if let Some((role, stream, sniffing, session)) = work.take() {
+                        let _session = session;
                         // The header handshake reads the peer's first bytes; the lane spends what is left of the handshake budget, queue time included.
                         let budget = budgets::handshake();
                         let waited = accepted_at.elapsed();
@@ -6276,10 +6422,12 @@ fn accept_listener(
         let tag = tag.map(str::to_owned);
         let accepted_at = Instant::now();
         if role.tcp_stream() {
-            let mut work = Some((stream, role, tag, sniffing));
+            let session = stop.as_ref().and_then(|stop| stop.track_session(&stream));
+            let mut work = Some((stream, role, tag, sniffing, session));
             lane_pool::submit_setup(
                 Box::new(move || {
-                    if let Some((stream, role, tag, sniffing)) = work.take() {
+                    if let Some((stream, role, tag, sniffing, session)) = work.take() {
+                        let _session = session;
                         serve_accepted(stream, role, tag.as_deref(), sniffing, accepted_at);
                     }
                     lane_pool::Next::Done
@@ -6287,7 +6435,9 @@ fn accept_listener(
                 Box::new(|| {}),
             );
         } else {
+            let session = stop.as_ref().and_then(|stop| stop.track_session(&stream));
             thread::spawn(move || {
+                let _session = session;
                 serve_accepted(stream, role, tag.as_deref(), sniffing, accepted_at);
             });
         }
@@ -18117,7 +18267,26 @@ fn serve_shadowsocks_inbound_wake(
     let carrier = inbound_carrier(inbound);
     let (tcp, udp) = inbound_ss_networks(inbound);
     let accounts = ss_accounts(inbound, address, password, method, configured);
-    let udp_accounts = (udp && matches!(carrier, Carrier::Raw(_))).then(|| Arc::clone(&accounts));
+    let mut udp_accounts =
+        (udp && matches!(carrier, Carrier::Raw(_))).then(|| Arc::clone(&accounts));
+    if let Some(front) = &udp_accounts {
+        // A 2022 datagram front opens with a parsed key; one it cannot parse would drop its socket after the add reported success.
+        let parsed = ferrox_core::shadowsocks2022::Method::parse(&front.method);
+        if parsed.is_some_and(|parsed| {
+            ferrox_core::shadowsocks2022::parse_psk_list(&front.password, parsed.key_len())
+                .is_none()
+        }) {
+            eprintln!(
+                "shadowsocks 2022 udp on {address}: the password is not a valid key for `{}`",
+                front.method
+            );
+            if FALLIBLE_BIND.with(std::cell::Cell::get) {
+                bind_failed();
+                return 0;
+            }
+            udp_accounts = None;
+        }
+    }
     if udp && udp_accounts.is_none() {
         // A carrier that frames streams cannot carry datagrams; say so in one line instead of binding nothing and reporting a live inbound.
         eprintln!(
@@ -30411,6 +30580,7 @@ fn serve_udp_lane_with(
                 socks.version,
                 associate,
                 peer,
+                stop,
             );
         }
         Outbound::Psiphon(lane) => {
@@ -30421,6 +30591,7 @@ fn serve_udp_lane_with(
                 lane.version(),
                 associate,
                 peer,
+                stop,
             );
         }
         Outbound::Dns(dns) => serve_dns_udp(relay, dns, peer),
@@ -30788,6 +30959,7 @@ fn retire_udp_lanes(
 ///
 /// The control leg stays open for the association's life: dropping it ends the
 /// association, and the server stops relaying.
+#[allow(clippy::too_many_arguments)]
 fn serve_socks_udp_client(
     relay: &UdpSocket,
     server: SocketAddr,
@@ -30795,6 +30967,7 @@ fn serve_socks_udp_client(
     version: crate::socks::Version,
     associate: Option<&Connection>,
     peer: Option<IpAddr>,
+    cancel: Option<&AtomicBool>,
 ) {
     if version == crate::socks::Version::V4 {
         return;
@@ -30855,6 +31028,9 @@ fn serve_socks_udp_client(
     let mut buf = udp_buffer();
     let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
     loop {
+        if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+            break;
+        }
         match relay.recv_from(&mut buf) {
             Ok((n, src)) => {
                 if !source_admitted(peer, pinned, src) {
@@ -30883,7 +31059,8 @@ fn serve_socks_udp_client(
                 if is_udp_gone(&error) {
                     thread::sleep(UDP_POLL);
                 }
-                if peer_left(&control)
+                if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+                    || peer_left(&control)
                     || associate.is_some_and(peer_left)
                     || idle_for(&activity) >= idle
                 {
