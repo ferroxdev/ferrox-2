@@ -16375,6 +16375,7 @@ fn hc_content_length(head: &str) -> Option<usize> {
 }
 
 #[allow(clippy::too_many_lines)]
+#[cfg(test)]
 fn serve_trojan_inbound(
     address: &str,
     inbound: &Json,
@@ -18089,6 +18090,7 @@ fn serve_ss_tls_front(
     Some(1)
 }
 
+#[cfg(test)]
 fn serve_shadowsocks_inbound(
     address: &str,
     inbound: &Json,
