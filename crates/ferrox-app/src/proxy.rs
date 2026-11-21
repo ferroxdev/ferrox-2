@@ -10201,24 +10201,13 @@ impl MuxWire {
 }
 
 /// Where a bridge's returned flows leave this host: the route plan when the config carries rules,
-/// else the one configured outbound. The portal's own tag is a lane the plan may name, and a flow
-/// that lands on anything but freedom is refused rather than sent back through this bridge.
+/// else the one configured outbound. A flow may name any outbound the config routes to.
 struct BridgeLane {
     plan: Option<Arc<RoutePlan>>,
     fixed: Option<Outbound>,
-    tag: String,
 }
 
 impl BridgeLane {
-    fn of(tag: &str, route: Option<&Arc<RouteShared>>, outbound: Option<&Outbound>) -> Self {
-        Self {
-            plan: route
-                .map(|shared| Arc::new(RoutePlan::new(Arc::clone(shared), None, None, false))),
-            fixed: outbound.cloned(),
-            tag: tag.to_owned(),
-        }
-    }
-
     fn with_inbound(
         tag: &str,
         route: Option<&Arc<RouteShared>>,
@@ -10234,7 +10223,6 @@ impl BridgeLane {
                 ))
             }),
             fixed: outbound.cloned(),
-            tag: tag.to_owned(),
         }
     }
 
@@ -10247,41 +10235,47 @@ impl BridgeLane {
 
     fn tcp(&self, target: &MuxTarget) -> Option<Connection> {
         let asked = target.destination();
-        match self.pick(&asked, crate::router::Network::Tcp).as_deref() {
-            Some(Outbound::Freedom(freedom)) => freedom_socket(freedom, &asked)
+        let picked = self.pick(&asked, crate::router::Network::Tcp)?.into_owned();
+        match picked {
+            Outbound::Freedom(freedom) => freedom_socket(&freedom, &asked)
                 .filter(|address| {
                     !freedom.blocks(crate::router::Network::Tcp, address.ip(), address.port())
                 })
                 .and_then(|address| dial_or_report(&address))
                 .map(|stream| stream.with_mask(freedom.fragment.as_deref())),
-            Some(Outbound::Block(_)) => None,
-            _ => {
-                refuse_bridge_lane(&self.tag);
-                None
-            }
+            Outbound::Block(_) => None,
+            out => bridge_tunnel(out, asked),
         }
     }
 
     fn udp(&self, target: &MuxTarget) -> bool {
         let asked = target.destination();
-        match self.pick(&asked, crate::router::Network::Udp).as_deref() {
-            Some(Outbound::Freedom(_)) => true,
-            Some(Outbound::Block(_)) => false,
-            _ => {
-                refuse_bridge_lane(&self.tag);
-                false
-            }
-        }
+        matches!(
+            self.pick(&asked, crate::router::Network::Udp).as_deref(),
+            Some(Outbound::Freedom(_))
+        )
     }
 }
 
-fn refuse_bridge_lane(tag: &str) {
-    static SAID: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    let said = SAID.get_or_init(|| Mutex::new(HashSet::new()));
-    let Ok(mut said) = said.lock() else { return };
-    if said.insert(tag.to_owned()) {
-        eprintln!("reverse: bridge `{tag}` routed a flow to an outbound that is not freedom; it is dropped");
-    }
+/// A stream through any outbound the config names: the flow crosses one loopback pair, the same
+/// hop every front uses when it needs a stream from a lane that hands back a relay.
+fn bridge_tunnel(out: Outbound, target: Destination) -> Option<Connection> {
+    let (client, server) = crate::reverse::loopback_pair()?;
+    thread::Builder::new()
+        .name("ferrox-reverse-bridge".to_owned())
+        .spawn(move || {
+            serve_connect(
+                server,
+                &out,
+                &target,
+                Front::Probe,
+                &[],
+                None,
+                FlowFacts::default(),
+            );
+        })
+        .ok()?;
+    Some(client)
 }
 
 /// Serves one bridge session: the portal's flows arrive as mux frames over `wire`, and each leaves
@@ -10300,7 +10294,7 @@ fn serve_bridge_mux(
 /// Starts every bridge the config names; each monitor keeps one session per portal tag alive.
 fn start_bridges(root: &Json, outbound: Option<&Outbound>, route: Option<&Arc<RouteShared>>) {
     for (tag, vless) in find_bridges(root) {
-        let lane = Arc::new(BridgeLane::of(&tag, route, outbound));
+        let lane = Arc::new(BridgeLane::with_inbound(&tag, route, outbound));
         crate::reverse::monitor(&tag, move |_| {
             let (client, server) = crate::reverse::loopback_pair()?;
             let tunnel = crate::reverse::Tunnel::from_connection(&server)?;
@@ -10308,7 +10302,7 @@ fn start_bridges(root: &Json, outbound: Option<&Outbound>, route: Option<&Arc<Ro
             let edge = resolve_outbound(&vless.address, vless.port)?;
             let dial = vless.clone();
             thread::spawn(move || {
-                dial_vless(&client, &edge, &dial, None, Ladder::global());
+                dial_vless_reverse(&client, &edge, &dial);
             });
             let worker_state = Arc::clone(&state);
             let worker_lane = Arc::clone(&lane);
@@ -11031,26 +11025,30 @@ fn serve_vless_quic(
     let mut stream = stream;
     let decoded = decode_request_bounded_gated(
         &mut stream,
-        |id, flow, cmd, _, _| {
-            freedom
-                && users.iter().any(|user| {
-                    same_vless_user(&user.id, &id)
-                        && user.reverse.is_none()
-                        && vless_flow_ok(user, flow, cmd, false)
-                })
-        },
+        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom, false),
         resolve_endpoint,
     );
     let Some((got, flow, cmd, target)) = decoded else {
         stream.close();
         return;
     };
-    // Vision framing and reverse accounts ride their own carriers: a QUIC stream carries the reference's three session kinds.
+    let ask = reverse_ask(users, &got, flow, cmd);
+    if let ReverseAsk::Allowed(portal) = ask {
+        let reader = stream.clone();
+        let stop = stream.clone();
+        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || stop.close());
+        attach_reverse(portal, reader, stream, close);
+        return;
+    }
+    if matches!(ask, ReverseAsk::Refused) {
+        stream.close();
+        return;
+    }
     let Some(user) = users.iter().find(|user| same_vless_user(&user.id, &got)) else {
         stream.close();
         return;
     };
-    if !freedom || user.reverse.is_some() || !vless_flow_ok(user, flow, cmd, false) {
+    if !freedom || !vless_flow_ok(user, flow, cmd, false) {
         stream.close();
         return;
     }
@@ -11093,25 +11091,33 @@ fn serve_vless_quic_sealed(
 ) {
     let decoded = decode_request_bounded_gated(
         &mut sealed,
-        |id, flow, cmd, _, _| {
-            freedom
-                && users.iter().any(|user| {
-                    same_vless_user(&user.id, &id)
-                        && user.reverse.is_none()
-                        && vless_flow_ok(user, flow, cmd, false)
-                })
-        },
+        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom, false),
         resolve_endpoint,
     );
     let Some((got, flow, cmd, target)) = decoded else {
         stop.close();
         return;
     };
+    let ask = reverse_ask(users, &got, flow, cmd);
+    if let ReverseAsk::Allowed(portal) = ask {
+        let Some((reader, writer)) = sealed.into_split() else {
+            stop.close();
+            return;
+        };
+        let closer = stop.clone();
+        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+        attach_reverse(portal, reader, writer, close);
+        return;
+    }
+    if matches!(ask, ReverseAsk::Refused) {
+        stop.close();
+        return;
+    }
     let Some(user) = users.iter().find(|user| same_vless_user(&user.id, &got)) else {
         stop.close();
         return;
     };
-    if !freedom || user.reverse.is_some() || !vless_flow_ok(user, flow, cmd, false) {
+    if !freedom || !vless_flow_ok(user, flow, cmd, false) {
         stop.close();
         return;
     }
@@ -11410,6 +11416,16 @@ fn serve_session_ws<R: Read + Send + 'static + RelayPoll, W: FrameWrite + 'stati
         echo_trace("session ws vless decode refused");
         return;
     };
+    let ask = reverse_ask(users, &got, flow, cmd);
+    if !matches!(ask, ReverseAsk::NotReverse) {
+        let closer = cwriter.clone();
+        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+        let refused = close.clone();
+        if !reverse_carried(ask, creader, cwriter, close) {
+            refused();
+        }
+        return;
+    }
     if !vless_user_allows(users, &got, flow, cmd, freedom, false) {
         echo_trace("session ws vless id or cmd refused");
         return;
@@ -11621,6 +11637,15 @@ pub(crate) fn serve_session_xhttp_with<R: crate::proxy::WindowRead + Send + 'sta
         cwriter.finish();
         return;
     };
+    let ask = reverse_ask(users, &got, flow, cmd);
+    if !matches!(ask, ReverseAsk::NotReverse) {
+        let closer = cwriter.clone();
+        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.finish());
+        if !reverse_carried(ask, creader, cwriter.clone(), close) {
+            cwriter.finish();
+        }
+        return;
+    }
     if !vless_user_allows(users, &got, flow, cmd, freedom, true) {
         echo_trace("session xhttp vless id or cmd refused");
         cwriter.finish();
@@ -11710,6 +11735,13 @@ fn serve_session_httpupgrade<
         crate::httpupgrade::quiet(&raw);
         return;
     };
+    let ask = reverse_ask(users, &got, flow, cmd);
+    if !matches!(ask, ReverseAsk::NotReverse) {
+        if !reverse_carried(ask, creader, cwriter, Arc::clone(&close)) {
+            crate::httpupgrade::quiet(&raw);
+        }
+        return;
+    }
     if !vless_user_allows(users, &got, flow, cmd, freedom, false) {
         echo_trace("session httpupgrade vless id or cmd refused");
         crate::httpupgrade::quiet(&raw);
@@ -11784,6 +11816,15 @@ fn serve_session_httpheader<
         echo_trace("session httpheader vless decode refused");
         return;
     };
+    let ask = reverse_ask(users, &got, flow, cmd);
+    if !matches!(ask, ReverseAsk::NotReverse) {
+        let closer = Arc::clone(&close);
+        let refused = Arc::clone(&close);
+        if !reverse_carried(ask, creader, cwriter, closer) {
+            refused();
+        }
+        return;
+    }
     if !vless_user_allows(users, &got, flow, cmd, freedom, false) {
         echo_trace("session httpheader vless id or cmd refused");
         return;
@@ -14267,6 +14308,40 @@ fn dial_vless(
     }
 }
 
+/// The bridge's own session: command 4 over whichever carrier the outbound names, then the
+/// portal's empty response. The stream arms share `dial_vless`; the four carriers whose dial is
+/// not a ladder rung take their own opener here.
+fn dial_vless_reverse(client: &Connection, server: &SocketAddr, vless: &VlessOut) {
+    let Some(header) = vless_request_header(vless, None) else {
+        return;
+    };
+    match &vless.carrier {
+        Carrier::Quic => {
+            if vless.encryption.is_some() {
+                dial_vless_quic_sealed(client, vless, None);
+            } else if let Some(cfg) = vless.reality.as_deref() {
+                dial_vless_quic_reality(client, vless, None, cfg);
+            } else {
+                crate::quic::dial_pooled_with(client, &vless_quic_dial(vless), &header, true);
+            }
+        }
+        Carrier::Kcp(_) => {
+            if let Some(conn) = kcp_dial_session(&vless.carrier, &vless.address, vless.port) {
+                dial_vless_kcp_header(client, &conn, vless, &header);
+            }
+        }
+        Carrier::Hysteria(_) => {
+            if let Some(dial) = hysteria_dial_session(vless) {
+                crate::hysteria::dial_header(client, &dial, &header, 2);
+            }
+        }
+        Carrier::Xdrive { .. } => {
+            dial_vless_xdrive_header(client, vless, &header, budgets::relay_stall());
+        }
+        _ => dial_vless(client, server, vless, None, Ladder::global()),
+    }
+}
+
 fn dial_vless_encrypted_raw(
     client: &Connection,
     server: &SocketAddr,
@@ -14884,7 +14959,16 @@ fn serve_vless_kcp(
     ) else {
         return;
     };
-    // A mux or reverse header names no destination, so the gate above never saw it.
+    let ask = reverse_ask(users, &got, flow, cmd);
+    if let ReverseAsk::Allowed(portal) = ask {
+        let (reader, writer, close) = kcp_parts_metered(conn, meter);
+        attach_reverse(portal, reader, writer, close);
+        return;
+    }
+    if matches!(ask, ReverseAsk::Refused) {
+        return;
+    }
+    // A mux header names no destination, so the gate above never saw it.
     if !allows(&got, flow, cmd) {
         return;
     }
@@ -15144,6 +15228,18 @@ fn serve_vless_hysteria(mut io: crate::hysteria::Flow, users: &[VlessUser], free
         io.close();
         return;
     };
+    let ask = reverse_ask(users, &got, flow, cmd);
+    if let ReverseAsk::Allowed(portal) = ask {
+        let reader = io.clone();
+        let closer = io.clone();
+        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+        attach_reverse(portal, reader, io, close);
+        return;
+    }
+    if matches!(ask, ReverseAsk::Refused) {
+        io.close();
+        return;
+    }
     let Some(user) = users
         .iter()
         .find(|user| same_vless_user(&user.id, &got) && vless_flow_ok(user, flow, cmd, false))
@@ -15333,8 +15429,17 @@ fn dial_vless_kcp(
     target: &Destination,
 ) {
     let header = vless_header(&vless.id, 1, target);
+    dial_vless_kcp_header(client, conn, vless, &header);
+}
+
+fn dial_vless_kcp_header(
+    client: &Connection,
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    vless: &VlessOut,
+    header: &[u8],
+) {
     if let Some(cfg) = vless.tls.as_deref() {
-        relay_kcp_under_tls(client, conn, cfg, &header, |session| {
+        relay_kcp_under_tls(client, conn, cfg, header, |session| {
             read_vless_response(session).is_some()
         });
         return;
@@ -15343,12 +15448,12 @@ fn dial_vless_kcp(
         let Some(session) = kcp_reality_connect(conn, cfg) else {
             return;
         };
-        relay_kcp_under(client, conn, session, &header, |session| {
+        relay_kcp_under(client, conn, session, header, |session| {
             read_vless_response(session).is_some()
         });
         return;
     }
-    if conn.write(&header).is_err() {
+    if conn.write(header).is_err() {
         return;
     }
     let mut io = KcpIo::new(Arc::clone(conn));
@@ -16004,13 +16109,20 @@ fn dial_vless_xdrive_until(
     target: &Destination,
     response_wait: Duration,
 ) {
+    let header = vless_header(&vless.id, 1, target);
+    dial_vless_xdrive_header(client, vless, &header, response_wait);
+}
+
+fn dial_vless_xdrive_header(
+    client: &Connection,
+    vless: &VlessOut,
+    header: &[u8],
+    response_wait: Duration,
+) {
     let Some(mut session) = xdrive_dial_session(&vless.carrier, &vless.address, vless.port) else {
         return;
     };
-    if session
-        .write_all(&vless_header(&vless.id, 1, target))
-        .is_err()
-    {
+    if session.write_all(header).is_err() {
         return;
     }
     let mut up = session.clone();
@@ -16154,15 +16266,25 @@ fn serve_vless_xdrive(mut session: crate::xdrive::Conn, users: &[VlessUser], fre
     ) else {
         return;
     };
-    // A mux or reverse header names no destination, so the gate above never saw it.
+    let ask = reverse_ask(users, &got, flow, cmd);
+    if let ReverseAsk::Allowed(portal) = ask {
+        let reader = session.clone();
+        let closer = session.clone();
+        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+        attach_reverse(portal, reader, session, close);
+        return;
+    }
+    if matches!(ask, ReverseAsk::Refused) {
+        return;
+    }
+    // A mux header names no destination, so the gate above never saw it.
     if !vless_user_allows(users, &got, flow, cmd, freedom, false) {
         return;
     }
-    let Some(user) = users.iter().find(|user| {
-        same_vless_user(&user.id, &got)
-            && user.reverse.is_none()
-            && vless_flow_ok(user, flow, cmd, false)
-    }) else {
+    let Some(user) = users
+        .iter()
+        .find(|user| same_vless_user(&user.id, &got) && vless_flow_ok(user, flow, cmd, false))
+    else {
         return;
     };
     session = session.with_meter(crate::stats::user(&user.email, user.level));
@@ -18984,8 +19106,11 @@ fn dial_vless_hysteria_reality(
     crate::hysteria::relay(client, &closer);
 }
 
-fn dial_vless_quic_sealed(client: &Connection, vless: &VlessOut, target: &Destination) {
+fn dial_vless_quic_sealed(client: &Connection, vless: &VlessOut, target: Option<&Destination>) {
     let Some(encryption) = &vless.encryption else {
+        return;
+    };
+    let Some(header) = vless_request_header(vless, target) else {
         return;
     };
     let Some(pooled) = crate::quic::pumped_stream_within(&vless_quic_dial(vless), budgets::dial())
@@ -19004,9 +19129,7 @@ fn dial_vless_quic_sealed(client: &Connection, vless: &VlessOut, target: &Destin
         }
     };
     sealed.get_mut().rearm(budgets::dial());
-    if sealed
-        .write_all(&vless_header(&vless.id, 1, target))
-        .is_err()
+    if sealed.write_all(&header).is_err()
         || read_vless_response(&mut HandshakeDeadline {
             inner: &mut sealed,
             until: Instant::now() + budgets::dial(),
@@ -28627,7 +28750,7 @@ fn serve_connect_at(
                 return;
             }
             if vless.encryption.is_some() {
-                dial_vless_quic_sealed(&client, vless, asked);
+                dial_vless_quic_sealed(&client, vless, Some(asked));
             } else {
                 crate::quic::dial_pooled(&client, &vless_quic_dial(vless), asked);
             }
@@ -41081,17 +41204,13 @@ fn vless_user_allows(
     freedom: bool,
     udp: bool,
 ) -> bool {
-    if cmd == 4
-        && users
-            .iter()
-            .any(|user| same_vless_user(&user.id, got) && user.reverse.is_some())
-    {
-        static SAID: OnceLock<()> = OnceLock::new();
-        if SAID.set(()).is_ok() {
-            eprintln!(
-                "vless: a reverse session rides raw, tls, reality, ws, grpc, httpupgrade and httpheader only; this carrier's request is refused"
-            );
-        }
+    if cmd == 4 {
+        return users.iter().any(|user| {
+            same_vless_user(&user.id, got)
+                && user.reverse.is_some()
+                && user.flow == Flow::None
+                && flow == Flow::None
+        });
     }
     freedom
         && (matches!(cmd, 1 | 3) || (udp && cmd == 2))
@@ -44683,14 +44802,9 @@ fn find_bridges(root: &Json) -> Vec<(String, VlessOut)> {
                 );
             }
             let vless = vless_outbound(outbound, server)?;
-            if !matches!(
+            if matches!(
                 vless.carrier,
-                Carrier::Raw(_)
-                    | Carrier::Ws { .. }
-                    | Carrier::HttpUpgrade { .. }
-                    | Carrier::Grpc(_)
-                    | Carrier::HttpHeader { .. }
-                    | Carrier::Xhttp { .. }
+                Carrier::Masque | Carrier::Http | Carrier::Unknown { .. }
             ) {
                 eprintln!(
                     "vless: reverse bridge `{tag}` names a carrier that cannot carry a reverse session"
@@ -87422,7 +87536,7 @@ mod reverse_tests {
     }
 
     #[test]
-    fn a_reverse_request_names_no_target_and_a_forward_one_never_uses_a_reverse_user() {
+    fn a_reverse_request_names_no_target_and_a_reverse_user_forwards_nothing() {
         let id = [7u8; 16];
         assert_eq!(
             vless_reverse_header(&id),
@@ -87451,14 +87565,7 @@ mod reverse_tests {
             reverse_ask(&forward, &[9u8; 16], Flow::None, 4),
             ReverseAsk::NotReverse
         ));
-        assert!(!vless_user_allows(
-            &reverse,
-            &id,
-            Flow::None,
-            4,
-            true,
-            false
-        ));
+        assert!(vless_user_allows(&reverse, &id, Flow::None, 4, true, false));
         assert!(vless_user_allows(&forward, &id, Flow::None, 1, true, false));
     }
 
@@ -87497,6 +87604,39 @@ mod reverse_tests {
         );
         drop(peer);
         serving.join().expect("joins");
+    }
+
+    #[test]
+    fn a_reverse_account_attaches_a_kcp_session_without_freedom() {
+        let id = [7u8; 16];
+        let portal = crate::reverse::Portal::new("portal");
+        let users = reverse_user(&portal, id);
+        let listener = ferrox_core::kcp::Listener::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+        )
+        .expect("binds");
+        let kcp_port = listener.local_addr().port();
+        let serving = thread::spawn(move || {
+            let conn = listener.accept().expect("accepts");
+            serve_vless_kcp(&conn, &users, false, crate::stats::Meter::default());
+        });
+        let peer = ferrox_core::kcp::dial(
+            format!("127.0.0.1:{kcp_port}").parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+            ferrox_core::kcp::fresh_conversation(),
+        )
+        .expect("dials");
+        peer.write(&vless_reverse_header(&id)).expect("requests");
+        peer.set_read_deadline(Instant::now() + Duration::from_secs(5));
+        let mut ack = [0u8; 2];
+        assert_eq!(peer.read(&mut ack).expect("portal answers"), 2);
+        assert_eq!(ack, [0, 0]);
+        serving.join().expect("joins");
+        assert!(
+            portal.pick().is_some(),
+            "the portal attached the reverse session"
+        );
     }
 
     /// A reverse account's command 4 attaches on a sealed raw session with no Freedom outbound:
@@ -87667,6 +87807,63 @@ mod reverse_tests {
             "the response was dropped with the half-closed request body"
         );
         answering.join().expect("the target answers");
+    }
+
+    fn read_exact_bytes(stream: &mut std::net::TcpStream, bytes: &mut [u8]) {
+        stream.read_exact(bytes).expect("socks server reads");
+    }
+
+    #[test]
+    fn a_bridge_lane_routes_a_flow_through_a_socks_outbound() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let server_addr = listener.local_addr().expect("addr");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            let mut greeting = [0u8; 3];
+            read_exact_bytes(&mut stream, &mut greeting);
+            assert_eq!(greeting, [5, 1, 0]);
+            stream.write_all(&[5, 0]).expect("greeting");
+            let mut head = [0u8; 4];
+            read_exact_bytes(&mut stream, &mut head);
+            match head[3] {
+                1 => read_exact_bytes(&mut stream, &mut [0u8; 6]),
+                3 => {
+                    let mut len = [0u8; 1];
+                    read_exact_bytes(&mut stream, &mut len);
+                    let mut rest = [0u8; 257];
+                    read_exact_bytes(&mut stream, &mut rest[..len[0] as usize + 2]);
+                }
+                4 => read_exact_bytes(&mut stream, &mut [0u8; 18]),
+                other => panic!("unexpected address type {other}"),
+            }
+            stream
+                .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .expect("grant");
+            let mut ping = [0u8; 4];
+            read_exact_bytes(&mut stream, &mut ping);
+            assert_eq!(&ping, b"ping");
+            stream.write_all(&ping).expect("echo");
+        });
+
+        let outbound = Outbound::Socks(SocksOut::new(
+            "127.0.0.1",
+            server_addr.port(),
+            "",
+            "",
+            crate::socks::Version::V5,
+        ));
+        let lane = BridgeLane::with_inbound("bridge", None, Some(&outbound));
+        let mut stream = lane
+            .tcp(&MuxTarget::Name("echo.test".to_owned(), 80))
+            .expect("the lane dials the outbound");
+        stream.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        stream.read_exact(&mut back).expect("reads");
+        assert_eq!(&back, b"ping");
+        server.join().expect("server joins");
     }
 
     fn portal_echo(payload: &[u8]) {
