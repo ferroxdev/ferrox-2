@@ -1269,3 +1269,17 @@ obfs-evasion noise-syscalls-per-flow UNBLESSED scripts/count-ops.sh
 obfs-evasion decoy-syscalls-per-hello UNBLESSED scripts/count-ops.sh
 obfs-evasion noise-copies-per-packet UNBLESSED scripts/count-ops.sh
 obfs-evasion evasion-time UNBLESSED bench.yml
+
+shadowsocks master-key-scratch-heap-buffers 0 ferrox-core-shadowsocks::tests::a_master_key_is_one_allocation
+shadowsocks master-key-ns-per-key 411.5 .github/workflows/bench.yml
+mux-variants udp-datagram-read-allocations-per-established-lane 0 ferrox-app-proxy::datagram_room_tests::a_datagram_read_reuses_one_room_over_a_stream
+tuic uni-read-buffer-allocations-per-run 1 ferrox-app-tuic::tests::a_uni_run_is_one_allocation
+tuic uni-read-copies-per-packet 0 ferrox-app-tuic::tests::a_uni_run_shares_one_buffer_across_its_packets
+tuic uni-read-first-frame-tail-allocations 0 ferrox-app-tuic::tests::a_uni_run_keeps_only_the_partial_tail
+wireguard routed-lane-datagram-copies-per-datagram 0 ferrox-app-wg::tests::a_routed_datagram_reaches_its_lane_in_the_readers_buffer
+wireguard stack-reply-copies-per-datagram 0 ferrox-app-wg-stack::tests::a_reply_datagram_reaches_its_lane_in_the_readers_buffer
+carrier-masque h3-lane-prefix-bytes-moved-per-datagram 0 ferrox-app-masque::tests::a_lane_datagram_keeps_its_prefix
+carrier-hysteria datagram-host-allocations-per-datagram 0 ferrox-app-hysteria-v1::tests::a_datagram_host_is_the_address_text_without_the_heap
+carrier-hysteria established-destination-allocations-per-datagram 0 ferrox-app-hysteria-v1::tests::an_established_destination_costs_no_key_and_no_insert
+socks reply-head-allocations-per-reply-datagram 0 ferrox-app-proxy::tests::a_reply_head_is_written_without_a_buffer
+socks reply-ns-per-reply 2.3 .github/workflows/bench.yml

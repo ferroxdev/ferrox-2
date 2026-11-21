@@ -391,6 +391,114 @@ fn checksum_section(out: &mut String) {
     let _ = writeln!(out, "| eight bytes at a time | {wide_best:.1} |");
 }
 
+/// The master key and the SOCKS UDP reply head: both replaced a scratch buffer with a write into
+/// a room the caller already holds.
+const KEY_BYTES: usize = 64;
+const KEY_PASSWORD: &str = "an-example-shared-password";
+const REPLY_HEAD: usize = 22;
+const REPLY_PAYLOAD: usize = 1200;
+
+fn key_section(out: &mut String) {
+    for (password, len) in [(KEY_PASSWORD, KEY_BYTES), ("secret", 32)] {
+        assert_eq!(
+            ferrox_core::shadowsocks::MasterKey::new(password, len).as_bytes(),
+            ferrox_core::shadowsocks::reference_master_key(password, len).as_slice(),
+            "{password}/{len}"
+        );
+    }
+    let joined = || {
+        let start = Instant::now();
+        for _ in 0..PACKETS {
+            let key =
+                ferrox_core::shadowsocks::reference_master_key(black_box(KEY_PASSWORD), KEY_BYTES);
+            let _ = black_box(key.as_slice());
+        }
+        start.elapsed().as_nanos() as f64 / PACKETS as f64
+    };
+    let streamed = || {
+        let start = Instant::now();
+        for _ in 0..PACKETS {
+            let key = ferrox_core::shadowsocks::MasterKey::new(black_box(KEY_PASSWORD), KEY_BYTES);
+            let _ = black_box(key.as_bytes());
+        }
+        start.elapsed().as_nanos() as f64 / PACKETS as f64
+    };
+    let mut joined_best = f64::MAX;
+    let mut streamed_best = f64::MAX;
+    for round in 0..ROUNDS {
+        if round % 2 == 0 {
+            joined_best = joined_best.min(joined());
+            streamed_best = streamed_best.min(streamed());
+        } else {
+            streamed_best = streamed_best.min(streamed());
+            joined_best = joined_best.min(joined());
+        }
+    }
+    let _ = writeln!(out, "\n## shadowsocks master key ({KEY_BYTES} bytes)");
+    let _ = writeln!(out, "| path | ns/key |");
+    let _ = writeln!(out, "|---|---:|");
+    let _ = writeln!(out, "| joined scratch buffer | {joined_best:.1} |");
+    let _ = writeln!(out, "| one hash context | {streamed_best:.1} |");
+}
+
+fn reply_section(out: &mut String) {
+    let target = ferrox_core::socks::Target::V6(
+        [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        53,
+    );
+    let payload = [0x5au8; REPLY_PAYLOAD];
+    let head = ferrox_core::socks::datagram_header_len(&target);
+    assert_eq!(head, REPLY_HEAD, "the longest head is the fixed room");
+    let mut joined = Vec::new();
+    ferrox_core::socks::datagram(&target, &payload, &mut joined);
+    let mut written = [0u8; REPLY_HEAD];
+    written[..3].copy_from_slice(&[0, 0, 0]);
+    target.encode_into(&mut written[3..]);
+    assert_eq!(
+        &written[..head],
+        &joined[..head],
+        "both shapes write one head"
+    );
+    let one_buffer = || {
+        let start = Instant::now();
+        for _ in 0..PACKETS {
+            let mut frame = Vec::with_capacity(head + payload.len());
+            ferrox_core::socks::datagram(&target, black_box(&payload), &mut frame);
+            let _ = black_box(frame.as_slice());
+        }
+        start.elapsed().as_nanos() as f64 / PACKETS as f64
+    };
+    let mut room = [0u8; REPLY_HEAD];
+    let mut split = || {
+        let start = Instant::now();
+        for _ in 0..PACKETS {
+            room[..3].copy_from_slice(&[0, 0, 0]);
+            target.encode_into(&mut room[3..]);
+            let _ = black_box((black_box(&room[..head]), black_box(&payload[..])));
+        }
+        start.elapsed().as_nanos() as f64 / PACKETS as f64
+    };
+    let mut joined_best = f64::MAX;
+    let mut split_best = f64::MAX;
+    for round in 0..ROUNDS {
+        if round % 2 == 0 {
+            joined_best = joined_best.min(one_buffer());
+            split_best = split_best.min(split());
+        } else {
+            split_best = split_best.min(split());
+            joined_best = joined_best.min(one_buffer());
+        }
+    }
+    let _ = writeln!(out, "\n## SOCKS UDP reply ({REPLY_PAYLOAD}-byte payload)");
+    let _ = writeln!(out, "| path | ns/reply |");
+    let _ = writeln!(out, "|---|---:|");
+    let _ = writeln!(out, "| head and payload in one buffer | {joined_best:.1} |");
+    let _ = writeln!(
+        out,
+        "| head room, payload where it lies | {split_best:.1} |"
+    );
+}
+
 pub(crate) fn report() -> String {
     let address = ferrox_core::tuic::address_port("example.com", 443).expect("an address");
     let payload = [7u8; 1200];
@@ -463,5 +571,7 @@ pub(crate) fn report() -> String {
     sink_section(&mut out);
     packet_map_section(&mut out);
     checksum_section(&mut out);
+    key_section(&mut out);
+    reply_section(&mut out);
     out
 }

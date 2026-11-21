@@ -130,6 +130,8 @@ graph TD
 | realm-candidate-sorts | 1 | ferrox-core-realm::tests::a_candidate_walk_sorts_once_and_an_expansion_sorts_twice |
 | realm-expansion-sorts | 2 | ferrox-core-realm::tests::a_candidate_walk_sorts_once_and_an_expansion_sorts_twice |
 | upnp-mapped-externals | 1 | ferrox-app-hysteria-realm::tests::a_gateway_maps_the_port_and_names_its_external_address |
+| datagram-host-allocations-per-datagram | 0 | ferrox-app-hysteria-v1::tests::a_datagram_host_is_the_address_text_without_the_heap |
+| established-destination-allocations-per-datagram | 0 | ferrox-app-hysteria-v1::tests::an_established_destination_costs_no_key_and_no_insert |
 <!-- counts:end -->
 
 ## Ops

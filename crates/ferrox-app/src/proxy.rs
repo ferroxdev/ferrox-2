@@ -8464,21 +8464,14 @@ fn serve_singmux_datagram(stream: crate::singmux::Stream, target: &Destination, 
     let read_done = Arc::clone(&up_done);
     let up = RelayPool::global().run(move || {
         let mut stream = stream;
-        let mut head = [0u8; 2];
-        loop {
-            if stream.read_exact(&mut head).is_err() {
-                break;
-            }
-            let len = usize::from(u16::from_be_bytes(head));
-            let mut data = vec![0u8; len];
-            if len > 0 && stream.read_exact(&mut data).is_err() {
-                break;
-            }
-            let _ = send.send(&data);
+        let mut data = Vec::new();
+        while let Some(len) = read_datagram_room(&mut stream, &mut data) {
+            let _ = send.send(&data[..len]);
         }
         read_done.store(true, Ordering::Relaxed);
     });
     let mut buf = udp_buffer();
+    let mut frame = Vec::with_capacity(3);
     let mut first = true;
     let idle = budgets::udp_idle();
     let mut quiet = Instant::now();
@@ -8486,7 +8479,7 @@ fn serve_singmux_datagram(stream: crate::singmux::Stream, target: &Destination, 
         match socket.recv(&mut buf) {
             Ok(n) => {
                 quiet = Instant::now();
-                let mut frame = Vec::with_capacity(n + 3);
+                frame.clear();
                 if first {
                     frame.push(0);
                     first = false;
@@ -8528,21 +8521,17 @@ fn serve_singmux_packet_addr(stream: crate::singmux::Stream) {
     let read_done = Arc::clone(&up_done);
     let up = RelayPool::global().run(move || {
         let mut stream = stream;
+        let mut data = Vec::new();
         while let Some(destination) = read_socks_addr(&mut stream) {
-            let mut head = [0u8; 2];
-            if stream.read_exact(&mut head).is_err() {
+            let Some(len) = read_datagram_room(&mut stream, &mut data) else {
                 break;
-            }
-            let len = usize::from(u16::from_be_bytes(head));
-            let mut data = vec![0u8; len];
-            if len > 0 && stream.read_exact(&mut data).is_err() {
-                break;
-            }
-            let _ = packet_addr_send(&send, &data, destination);
+            };
+            let _ = packet_addr_send(&send, &data[..len], destination);
         }
         read_done.store(true, Ordering::Relaxed);
     });
     let mut buf = udp_buffer();
+    let mut frame = Vec::with_capacity(HEAD + 3);
     let mut first = true;
     let idle = budgets::udp_idle();
     let mut quiet = Instant::now();
@@ -8550,7 +8539,7 @@ fn serve_singmux_packet_addr(stream: crate::singmux::Stream) {
         match socket.recv_from(&mut buf) {
             Ok((n, source)) => {
                 quiet = Instant::now();
-                let mut frame = Vec::with_capacity(n + HEAD + 3);
+                frame.clear();
                 if first {
                     frame.push(0);
                     first = false;
@@ -33121,9 +33110,9 @@ fn serve_socks_udp_pool<F, G>(
             let Some(peer) = *slot else {
                 return;
             };
-            let mut head = Vec::with_capacity(HEAD);
-            let out = socks_udp_frame(&mut head, &target.unwrap_or(dest), data);
-            let _ = sink_reply.send_to(out, peer);
+            let mut room = [0u8; HEAD];
+            let head = socks_udp_head_into(&mut room, &target.unwrap_or(dest));
+            let _ = send_to_two(&sink_reply, head, data, peer);
         });
         if let Some(flow) = pool.udp(dest, id.as_ref(), &buf[at..at + len], &deliver) {
             flows.insert(dest, flow);
@@ -34309,6 +34298,22 @@ fn read_udp_datagram(stream: &mut dyn Read, buf: &mut [u8]) -> Option<usize> {
         return None;
     }
     read_exact(stream, &mut buf[..len]).ok()?;
+    Some(len)
+}
+
+/// Read one length-prefixed datagram into a room that keeps its capacity across calls: only a
+/// datagram longer than any before it grows the room, so a steady stream costs no allocation and
+/// the bytes read are the frame's own. A zero-length datagram is a datagram, not an end.
+fn read_datagram_room(stream: &mut dyn Read, room: &mut Vec<u8>) -> Option<usize> {
+    let mut len = [0u8; 2];
+    read_exact(stream, &mut len).ok()?;
+    let len = usize::from(u16::from_be_bytes(len));
+    if room.len() < len {
+        room.resize(len, 0);
+    }
+    if len > 0 {
+        read_exact(stream, &mut room[..len]).ok()?;
+    }
     Some(len)
 }
 
@@ -40152,6 +40157,27 @@ fn socks_udp_head(out: &mut Vec<u8>, dest: &SocketAddr) {
     out.clear();
     out.extend_from_slice(&[0, 0, 0]);
     push_socks_addr(out, dest);
+}
+
+/// The same head for a literal destination, written into the caller's `HEAD`-byte room: the
+/// longest head is a type byte, sixteen address bytes and a port, so the fixed room holds any.
+fn socks_udp_head_into<'a>(room: &'a mut [u8; HEAD], dest: &SocketAddr) -> &'a [u8] {
+    room[..3].copy_from_slice(&[0, 0, 0]);
+    let used = match dest {
+        SocketAddr::V4(dest) => {
+            room[3] = 1;
+            room[4..8].copy_from_slice(&dest.ip().octets());
+            room[8..10].copy_from_slice(&dest.port().to_be_bytes());
+            10
+        }
+        SocketAddr::V6(dest) => {
+            room[3] = 4;
+            room[4..20].copy_from_slice(&dest.ip().octets());
+            room[20..22].copy_from_slice(&dest.port().to_be_bytes());
+            22
+        }
+    };
+    &room[..used]
 }
 
 /// The SOCKS5 UDP frame to send for a datagram: the head and the payload.
@@ -77785,6 +77811,35 @@ mod tests {
         );
     }
 
+    /// The reply head is written into a fixed 22-byte room, so the frame costs no buffer of
+    /// its own and the head is still byte for byte the one the tree builds.
+    #[test]
+    fn a_reply_head_is_written_without_a_buffer() {
+        let mut room = [0u8; HEAD];
+        for dest in ["198.51.100.7:443", "[2001:db8::7]:443"] {
+            let dest: SocketAddr = dest.parse().expect("addr");
+            let mut want = Vec::new();
+            socks_udp_head(&mut want, &dest);
+            let (len, counts) =
+                ferrox_core::alloc_count::measure(|| socks_udp_head_into(&mut room, &dest).len());
+            assert_eq!(counts.allocs, 0, "the head costs no buffer of its own");
+            assert_eq!(&room[..len], &want[..], "the head is the tree's own bytes");
+            let into = socks_udp_head_into(&mut room, &dest);
+            assert_eq!(
+                into.as_ptr() as usize,
+                room.as_ptr() as usize,
+                "the head is the caller's room"
+            );
+            let (before, counts) = ferrox_core::alloc_count::measure(|| {
+                let mut head = Vec::with_capacity(HEAD);
+                socks_udp_head(&mut head, &dest);
+                head
+            });
+            assert_eq!(before, want, "both shapes write the same head");
+            assert_eq!(counts.allocs, 1, "the old shape allocated the head");
+        }
+    }
+
     /// The IPv6 header has its own length, and a matching frame is still handed back by
     /// pointer rather than rebuilt into the caller's buffer.
     #[test]
@@ -88429,5 +88484,73 @@ mod h2_carrier_tests {
             out.lock().expect("lock").ends_with(b"0\r\n\r\n"),
             "the refusal did not end the carrier"
         );
+    }
+}
+
+#[cfg(test)]
+mod datagram_room_tests {
+    use super::*;
+
+    /// The room a lane reads its datagrams into keeps its capacity: only a longer datagram grows
+    /// it, and every read lands in the same allocation, so a steady stream allocates nothing.
+    #[test]
+    fn a_datagram_read_reuses_one_room_over_a_stream() {
+        let frames = [vec![1u8; 10], vec![2u8; 10], vec![3u8; 6000], vec![4u8; 10]];
+        let mut wire = Vec::new();
+        for frame in &frames {
+            wire.extend_from_slice(&(frame.len() as u16).to_be_bytes());
+            wire.extend_from_slice(frame);
+        }
+        let mut cursor = std::io::Cursor::new(wire);
+        let mut room = Vec::new();
+        for frame in &frames {
+            let len = read_datagram_room(&mut cursor, &mut room).expect("a frame");
+            assert_eq!(&room[..len], &frame[..], "the frame's own bytes");
+        }
+        let warm = room.capacity();
+        let base = room.as_ptr();
+        let mut cursor = std::io::Cursor::new(same_wire());
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            for _ in 0..4 {
+                assert_eq!(read_datagram_room(&mut cursor, &mut room), Some(10));
+            }
+        });
+        assert_eq!(counts.allocs, 0, "a warmed room is written in place");
+        assert_eq!(counts.bytes, 0, "and nothing is allocated behind it");
+        assert_eq!(room.capacity(), warm, "the room's capacity is steady");
+        assert_eq!(room.as_ptr(), base, "and its allocation never moved");
+
+        // The shape this replaced: every datagram read into a buffer of its own.
+        let wire = same_wire();
+        let (read, before) = ferrox_core::alloc_count::measure(|| {
+            let mut cursor = std::io::Cursor::new(wire);
+            let mut frames = Vec::with_capacity(4);
+            for _ in 0..4 {
+                let mut len = [0u8; 2];
+                cursor.read_exact(&mut len).expect("a length");
+                let mut frame = vec![0u8; usize::from(u16::from_be_bytes(len))];
+                cursor.read_exact(&mut frame).expect("a frame");
+                frames.push(frame);
+            }
+            frames
+        });
+        assert_eq!(before.allocs, 5, "a list and a buffer per datagram");
+        assert!(
+            counts.allocs < before.allocs,
+            "the room is the cheaper shape"
+        );
+        assert!(
+            read.iter().all(|frame| frame == &[5u8; 10][..]),
+            "and both read the same bytes"
+        );
+    }
+
+    fn same_wire() -> Vec<u8> {
+        let mut wire = Vec::new();
+        for _ in 0..4 {
+            wire.extend_from_slice(&10u16.to_be_bytes());
+            wire.extend_from_slice(&[5u8; 10]);
+        }
+        wire
     }
 }

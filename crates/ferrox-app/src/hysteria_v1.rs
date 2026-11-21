@@ -390,6 +390,7 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial, peer: Option<std::net::I
     let mut wire = Vec::with_capacity(UDP_TARGET_BUF + 64);
     let mut out = Unfilled::<MAX_DATAGRAM>::new();
     let mut packet = 0u16;
+    let mut host_room = [0u8; HOST_ROOM];
     let mut stream: Option<Flow> = None;
     while let Ok((n, src)) = relay.recv_from(&mut buf) {
         if !crate::proxy::source_ip_ok(peer, src) {
@@ -411,10 +412,11 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial, peer: Option<std::net::I
             Some(_) => {}
         }
         drop(client);
+        let Some(host) = host_of(dest.ip(), &mut host_room) else {
+            continue;
+        };
         if stream.is_none() {
-            let Some((flow, session_id)) =
-                open_udp_flow(&session, &dest.ip().to_string(), dest.port())
-            else {
+            let Some((flow, session_id)) = open_udp_flow(&session, host, dest.port()) else {
                 break;
             };
             stream = Some(flow);
@@ -444,11 +446,10 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial, peer: Option<std::net::I
             continue;
         };
         drop(held);
-        let host = dest.ip().to_string();
         packet = packet.wrapping_add(1);
         let message = UdpMessage {
             session: session_id,
-            host: &host,
+            host,
             port: dest.port(),
             packet,
             frag: 0,
@@ -612,35 +613,52 @@ fn touch(last: &Arc<Mutex<Instant>>) {
     }
 }
 
+/// The destination an established association already resolved, or the literal it names
+/// registered once: a datagram on that path neither clones its key nor rewrites the table.
+fn dest_of(
+    dests: &mut HashMap<(String, u16), SocketAddr>,
+    literal: Option<SocketAddr>,
+    key: &(String, u16),
+) -> Option<SocketAddr> {
+    if let Some(peer) = dests.get(key) {
+        return Some(*peer);
+    }
+    let peer = literal?;
+    dests.insert(key.clone(), peer);
+    Some(peer)
+}
+
 impl UdpFlow {
     fn track(&mut self, key: &(String, u16)) -> bool {
         let now = Instant::now();
-        if !self.used.contains_key(key) {
-            while self.used.len() >= MAX_UDP_ASSOCIATIONS {
-                let mut victim = None;
-                let mut oldest = now;
-                for (other, at) in &self.used {
-                    if other == key
-                        || self.resolving.contains(other)
-                        || self.waiting.contains_key(other)
-                    {
-                        continue;
-                    }
-                    if *at <= oldest {
-                        oldest = *at;
-                        victim = Some(other.clone());
-                    }
+        if let Some(at) = self.used.get_mut(key) {
+            *at = now;
+            return true;
+        }
+        while self.used.len() >= MAX_UDP_ASSOCIATIONS {
+            let mut victim = None;
+            let mut oldest = now;
+            for (other, at) in &self.used {
+                if other == key
+                    || self.resolving.contains(other)
+                    || self.waiting.contains_key(other)
+                {
+                    continue;
                 }
-                let Some(victim) = victim else {
-                    break;
-                };
-                self.used.remove(&victim);
-                self.dests.remove(&victim);
-                self.defrags.remove(&victim);
+                if *at <= oldest {
+                    oldest = *at;
+                    victim = Some(other.clone());
+                }
             }
-            if self.used.len() >= MAX_UDP_ASSOCIATIONS {
-                return false;
-            }
+            let Some(victim) = victim else {
+                break;
+            };
+            self.used.remove(&victim);
+            self.dests.remove(&victim);
+            self.defrags.remove(&victim);
+        }
+        if self.used.len() >= MAX_UDP_ASSOCIATIONS {
+            return false;
         }
         self.used.insert(key.clone(), now);
         true
@@ -839,6 +857,18 @@ fn bind_target(peer: SocketAddr) -> Option<UdpSocket> {
     })
 }
 
+/// The longest text an IP address takes: a mixed IPv6 is 45 bytes.
+const HOST_ROOM: usize = 46;
+
+/// The address as the wire spells it, formatted into the caller's room so a datagram's host
+/// costs no heap.
+fn host_of(ip: IpAddr, room: &mut [u8; HOST_ROOM]) -> Option<&str> {
+    let mut cursor = &mut room[..];
+    write!(cursor, "{ip}").ok()?;
+    let len = HOST_ROOM - cursor.len();
+    std::str::from_utf8(&room[..len]).ok()
+}
+
 fn target_addr(sock: &UdpSocket, peer: SocketAddr) -> SocketAddr {
     if sock.local_addr().is_ok_and(|local| local.is_ipv6()) {
         if let SocketAddr::V4(v4) = peer {
@@ -860,6 +890,7 @@ fn udp_reader(
     let mut wire = Vec::new();
     let mut out = Unfilled::<MAX_DATAGRAM>::new();
     let mut packet = 0u16;
+    let mut host_room = [0u8; HOST_ROOM];
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -894,10 +925,12 @@ fn udp_reader(
             break;
         };
         packet = packet.wrapping_add(1);
-        let host = from.ip().to_string();
+        let Some(host) = host_of(from.ip(), &mut host_room) else {
+            continue;
+        };
         let message = UdpMessage {
             session,
-            host: &host,
+            host,
             port: from.port(),
             packet,
             frag: 0,
@@ -983,13 +1016,12 @@ fn relay_datagrams(
             return;
         }
         if lane.flows.contains_key(&session) {
-            let host = message.host.to_owned();
-            let port = message.port;
-            let key = (host.clone(), port);
-            let literal = host
+            let key = (message.host.to_owned(), message.port);
+            let literal = key
+                .0
                 .parse::<IpAddr>()
                 .ok()
-                .map(|ip| SocketAddr::new(ip, port));
+                .map(|ip| SocketAddr::new(ip, message.port));
             let room = MAX_PENDING_RESOLVERS.saturating_sub(lane.resolving);
             let mut assembled = Vec::new();
             let forged;
@@ -1010,9 +1042,8 @@ fn relay_datagrams(
                 forged = whole.is_err();
                 match whole {
                     Ok(Some(message)) => {
-                        let peer = flow.dests.get(&key).copied().or(literal);
+                        let peer = dest_of(&mut flow.dests, literal, &key);
                         if let Some(peer) = peer {
-                            flow.dests.insert(key.clone(), peer);
                             flow.waiting.remove(&key);
                             let _ = flow
                                 .target
@@ -2049,5 +2080,91 @@ mod tests {
         flow.waiting.insert(fresh.clone(), Vec::new());
         assert_eq!(flow.start_waiting(1), vec![fresh.clone()]);
         assert!(flow.resolving.contains(&fresh));
+    }
+
+    /// A datagram on a known association refreshes both tables in place: no key is cloned and
+    /// no table is rewritten.
+    #[test]
+    fn an_established_destination_costs_no_key_and_no_insert() {
+        let key = ("example.test".to_owned(), 53);
+        let peer: SocketAddr = "203.0.113.9:53".parse().expect("addr");
+        let mut dests = HashMap::new();
+        dests.insert(key.clone(), peer);
+        let (back, counts) = ferrox_core::alloc_count::measure(|| dest_of(&mut dests, None, &key));
+        assert_eq!(counts.allocs, 0, "the established destination costs no key");
+        assert_eq!(back, Some(peer));
+        assert_eq!(dests.len(), 1, "the table is not rewritten");
+        let ((), before) = ferrox_core::alloc_count::measure(|| {
+            let mut table = HashMap::new();
+            table.insert(key.clone(), peer);
+        });
+        assert!(
+            before.allocs > counts.allocs,
+            "the old shape cloned the key each time"
+        );
+
+        let literal = ("203.0.113.9".to_owned(), 53);
+        let (back, _) =
+            ferrox_core::alloc_count::measure(|| dest_of(&mut dests, Some(peer), &literal));
+        assert_eq!(back, Some(peer), "a literal resolves to itself");
+        assert_eq!(dests.len(), 2, "and it is registered once");
+
+        let target = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let mut flow = UdpFlow {
+            target: Arc::new(target),
+            dests: HashMap::new(),
+            waiting: HashMap::new(),
+            resolving: HashSet::new(),
+            defrags: HashMap::new(),
+            used: HashMap::new(),
+            last: Arc::new(Mutex::new(Instant::now())),
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        flow.used.insert(key.clone(), Instant::now());
+        let (kept, counts) = ferrox_core::alloc_count::measure(|| flow.track(&key));
+        assert!(kept);
+        assert_eq!(counts.allocs, 0, "tracking a known key costs no key");
+        assert_eq!(flow.used.len(), 1);
+        let ((), before) = ferrox_core::alloc_count::measure(|| {
+            flow.used.insert(key.clone(), Instant::now());
+        });
+        assert!(
+            before.allocs > counts.allocs,
+            "the old shape cloned the key per datagram"
+        );
+    }
+
+    /// The host a datagram's message carries is the address's own text, written into a stack
+    /// room, so a datagram that names a literal costs no heap.
+    #[test]
+    fn a_datagram_host_is_the_address_text_without_the_heap() {
+        let mut room = [0u8; HOST_ROOM];
+        let ip: IpAddr = "2001:db8::1".parse().expect("an address");
+        let (mine, counts) = ferrox_core::alloc_count::measure(|| host_of(ip, &mut room));
+        assert_eq!(counts.allocs, 0, "the host is written into the room");
+        assert_eq!(mine, Some("2001:db8::1"), "and it is the address's text");
+        let (text, before) = ferrox_core::alloc_count::measure(|| ip.to_string());
+        assert!(
+            before.allocs > counts.allocs,
+            "the old shape allocated the text"
+        );
+        assert_eq!(
+            &text[..],
+            mine.expect("the room's text"),
+            "of the same text"
+        );
+        for text in [
+            "10.0.0.2",
+            "::1",
+            "::ffff:10.0.0.2",
+            "ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255",
+        ] {
+            let ip: IpAddr = text.parse().expect("an address");
+            assert_eq!(
+                host_of(ip, &mut room),
+                Some(ip.to_string().as_str()),
+                "{text}"
+            );
+        }
     }
 }

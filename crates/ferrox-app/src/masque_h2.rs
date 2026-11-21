@@ -3263,7 +3263,7 @@ mod tests {
             0,
             "the packet went straight to its lane"
         );
-        assert_eq!(received.recv().expect("delivered"), packet);
+        assert_eq!(received.recv().expect("delivered").packet(), packet);
     }
 
     #[test]

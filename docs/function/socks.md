@@ -96,6 +96,8 @@ graph TD
 | socks4-xray-scenario-tests-passing | 1 | scripts/run-upstream-suite.sh |
 | http-fallback-requests-served | 1 | ferrox-app-proxy::tests::a_socks_front_serves_an_http_outbound_that_offers_its_account |
 | http-fallback-scenario-tests-passing | 1 | scripts/run-upstream-suite.sh |
+| reply-head-allocations-per-reply-datagram | 0 | ferrox-app-proxy::tests::a_reply_head_is_written_without_a_buffer |
+| reply-ns-per-reply | 2.3 | .github/workflows/bench.yml |
 <!-- counts:end -->
 
 The first row after the ops row is the identity claim itself: ten recorded runs — six handshakes and four datagram frames — compared octet for octet against the pinned Go's own writer. The greeting row is the one-method rule the pinned writers follow, pinned as bytes (`[5, 1, 0]` and `[5, 1, 2]`) rather than as a count of what the code happens to send. The request and credential rows are the byte counts a reader can check by hand: a `CONNECT` for an IPv4 literal is ten octets (`[5, 1, 0]` plus the type byte, four address bytes and two port bytes), and the RFC 1929 block for a one-byte name and a one-byte password is five (`[1, 1, u, 1, p]`). The datagram row is the frame's overhead — the two reserved bytes, the fragment byte, the address type byte, the address and the port — which is ten octets before the payload.
@@ -161,6 +163,8 @@ The oracle script's sixth handshake line, added with the remaining fixtures (#11
 ## Time
 
 The matrix's `socks-raw-down-8` cell is 8 concurrent 256 MiB downloads through one SOCKS server with 64 KiB reads; it prices bulk throughput, not a single dial. On `benchmark-matrix.yml` run `43292720499` (tier `standard`, 3 repeats, commit `8a714d3`, AMD EPYC 7763, load 2.08) this tree moved **2658 MiB/s** through the pinned `xray-core` server and **2808 MiB/s** as the server under the pinned `xray-core` client, against `xray-core`'s **1913** and **1913**. That is **1.39x** on the client leg and **1.47x** on the server leg; the cell's absolute leader on this run is `sing-box` at **2933** and **3321**, so the row beats the reference without leading every engine. This tree's CPU cost is **160 ms/GiB** against `xray-core`'s **880**. The absolute medians follow the runner — the same code measured **4442** and **4446 MiB/s** on run `43275405213`'s Xeon 6973P host — so the ratio against `xray-core` is the number this page gates. The handshake is amortised over the cell, so these medians bound a regression in the relay, not a per-dial latency.
+
+The reply head has its own bench cell, `ferrox-bench`'s `SOCKS UDP reply (1200-byte payload)` section, which times the shape this row removed against the one that ships: the head and payload joined in one buffer against the head written into a 22-byte room with the payload left where the caller holds it. The equality gate inside the section compares the two heads byte for byte before either is timed. One `bench.yml` run (`44899712863`) read linux x86_64 **28.1 → 2.3 ns/reply**, linux aarch64 **51.9 → 4.3**, macos aarch64 **43.2 → 2.9**, windows x86_64 **60.8 → 4.3**: 12x to 15x. The one-buffer shape pays both the 1200-byte payload copy and the allocation and free of the buffer it copies into; the shipped shape pays neither, and this cell does not separate the two, so the ratio is attributed to both.
 
 ## What we removed
 

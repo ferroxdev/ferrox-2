@@ -94,6 +94,8 @@ Every row is a claim with a checker that runs. `scripts/method-counts.txt` holds
 | stream-udp-payload-buffers-per-datagram | 1 | ferrox-app-shadowsocks::tests::an_opened_payload_is_the_callers_own_bytes |
 | stream-udp-datagram-reallocations-after-the-first | 0 | ferrox-app-shadowsocks::tests::an_opened_payload_is_the_callers_own_bytes |
 
+| master-key-scratch-heap-buffers | 0 | ferrox-core-shadowsocks::tests::a_master_key_is_one_allocation |
+| master-key-ns-per-key | 411.5 | .github/workflows/bench.yml |
 <!-- counts:end -->
 
 What those per-batch rows add up to, as arithmetic on the rows and not as a measurement: one GiB in each direction is 65 540 chunks of 16 383 B. The uplink used to pay a read and a write for every one of them (131 080) and the downlink a read per 32 798 B window and a write per chunk (98 345), which is 229 425 syscalls per GiB both legs together. A batch is four chunks, so the uplink is 32 770 and the downlink 32 790: **65 560**, 3.5× fewer. No strace has counted this on a live relay — `scripts/count-ops.sh` counts retired instructions in a unit test, not syscalls on a socket, and every loopback test in this tree is told not to gate a syscall count — so the figure is what the gated rows imply, named here rather than blessed anywhere. What is measured is what the kernel work costs: the Time section's matched pair of `shadowsocks-raw-down-8` cells puts throughput against the reference at 1.162× before and 1.394× after, with disjoint intervals.
@@ -137,6 +139,8 @@ So the batch buys about 20% more throughput and pays about 20% more CPU per GiB 
 The relay harness (`parity.yml` gate 5: 1 flow × 65 536 × 65 536 B, 4 engines × 5 paired repeats, `linux x86_64`) agrees, more quietly: before, throughput vs `xray-core` median 0.923× [0.858, 0.978] and CPU per GiB 0.888× [0.787, 0.989] (under the reference on both); after, 1.026× [0.952, 1.083] and 1.082× [1.003, 1.138] (over it on both). Every interval includes 1.0, so this harness resolves direction, not 5% — and the direction matches what the matrix cell proves.
 
 The byte-differential is re-measured, not assumed: the run passes `gate 1: bit-identical at 7200 shapes`, `gate 7: 7 seal rows, ciphertext and tag identical`, and `gate 9: 10 cipher rows, byte-identical and zero allocations per chunk` on all four runners. Gate 9's self-timed seal rows are printed, not gated; the batch moves no byte of the cipher, so any difference there is a machine difference, reported as that.
+
+The master key has its own bench cell, `ferrox-bench`'s `shadowsocks master key (64 bytes)` section: `reference_master_key` is the joined scratch shape this crate used to derive a chained key, and `MasterKey::new` is the context that replaced it, timed alternately over the same password with the two keys compared before either is timed. One `bench.yml` run (`44899712863`, `ubuntu-latest`, 4 logical CPUs) read **433.0 → 411.5 ns/key**, and the other three runners agreed in direction and size: linux aarch64 **428.9 → 394.6**, macos aarch64 **466.2 → 441.8**, windows x86_64 **670.0 → 558.8**. No runner is slower on the context; the saving is what the three scratch joins of the measured 64-byte key cost (a 32-byte key joins once, a 16-byte key never), and the MD5 rounds themselves are unchanged.
 
 ## What we removed
 

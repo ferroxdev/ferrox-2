@@ -2672,7 +2672,7 @@ fn io(
 }
 
 enum Delivery {
-    Udp(Sender<Vec<u8>>),
+    Udp(Sender<wg_stack::LanePacket>),
     Stack,
 }
 
@@ -2697,7 +2697,11 @@ fn delivery(routes: &UdpRoutes, packet: &[u8]) -> Option<Delivery> {
 pub(crate) fn deliver(to_stack: &Sender<Packet>, routes: &UdpRoutes, packet: &[u8]) {
     match delivery(routes, packet) {
         Some(Delivery::Udp(lane)) => {
-            let _ = lane.send(packet.to_vec());
+            let _ = lane.send(wg_stack::LanePacket {
+                bytes: packet.to_vec(),
+                at: 0,
+                recycle: None,
+            });
         }
         Some(Delivery::Stack) => {
             let _ = to_stack.send(Packet {
@@ -2711,19 +2715,17 @@ pub(crate) fn deliver(to_stack: &Sender<Packet>, routes: &UdpRoutes, packet: &[u
 }
 
 /// Hand a datagram's inner packet to the stack or a UDP lane, retaining the prefix the stack records as its offset.
-fn deliver_owned(
-    to_stack: &Sender<Packet>,
-    routes: &UdpRoutes,
-    mut datagram: Vec<u8>,
-    offset: usize,
-) {
+fn deliver_owned(to_stack: &Sender<Packet>, routes: &UdpRoutes, datagram: Vec<u8>, offset: usize) {
     let Some(to) = delivery(routes, &datagram[offset..]) else {
         return;
     };
     match to {
         Delivery::Udp(lane) => {
-            datagram.drain(..offset);
-            let _ = lane.send(datagram);
+            let _ = lane.send(wg_stack::LanePacket {
+                bytes: datagram,
+                at: offset,
+                recycle: None,
+            });
         }
         Delivery::Stack => {
             let _ = to_stack.send(Packet {
@@ -5521,6 +5523,65 @@ mod tests {
             delivered.bytes.capacity(),
             capacity,
             "the buffer did not grow on its way to the stack"
+        );
+    }
+
+    /// A datagram that reaches a lane keeps its prefix: the lane reads the packet at its
+    /// offset rather than a copy that moved it.
+    #[test]
+    fn a_lane_datagram_keeps_its_prefix() {
+        let (to_stack, _stack_rx) = mpsc::channel();
+        let (lane, lanes) = mpsc::channel();
+        let mut table = HashMap::new();
+        table.insert(4321, lane);
+        let routes = Arc::new(Mutex::new(table));
+        let payload = b"ping";
+        let mut packet = Vec::new();
+        assert!(connectip::udp_datagram(
+            &connectip::UdpDatagram {
+                source: &[10, 14, 0, 2],
+                destination: &[192, 0, 2, 1],
+                source_port: 1234,
+                destination_port: 4321,
+                payload: &payload[..],
+            },
+            &mut packet,
+        ));
+        let mut datagram = Vec::with_capacity(4 + packet.len());
+        connectip::datagram_prefix(4, &mut datagram);
+        datagram.extend_from_slice(&packet);
+        let base = datagram.as_ptr();
+        let offset = datagram.len() - packet.len();
+        let prefix = datagram[..offset].to_vec();
+        deliver_owned(&to_stack, &routes, datagram, offset);
+        let handed = lanes.recv().expect("the lane's packet");
+        assert_eq!(handed.at, offset, "the prefix stays an offset");
+        assert_eq!(
+            handed.bytes.as_ptr(),
+            base,
+            "the lane reads the buffer that arrived"
+        );
+        assert_eq!(&handed.bytes[handed.at..], packet.as_slice());
+        assert_eq!(
+            &handed.bytes[..offset],
+            &prefix[..],
+            "and the prefix is still where it arrived"
+        );
+
+        // The shape this replaced: drain the prefix, moving every packet byte forward.
+        let mut drained = handed.bytes.clone();
+        let moved = drained.len() - offset;
+        drained.drain(..offset);
+        assert_eq!(
+            drained.as_slice(),
+            packet.as_slice(),
+            "the old shape fronted it"
+        );
+        assert_eq!(moved, packet.len(), "and moved every packet byte");
+        assert_eq!(
+            &handed.bytes[offset..],
+            &drained[..],
+            "the new shape reads the same packet where it lies"
         );
     }
 
