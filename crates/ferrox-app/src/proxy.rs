@@ -77996,3 +77996,8887 @@ mod tests {
         let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
+            let (stream, _) = tunnel.accept().expect("accepts");
+            serve_vless_raw(stream, &one_vless_user(&id_bytes), true, None);
+        });
+        let root = loopback_root(&format!(
+            r#"{{"tag":"tunnel-in","protocol":"vless","listen":"127.0.0.1","port":{tunnel_port},"settings":{{"clients":[{{"id":"{id}"}}]}}}}"#,
+        ));
+        let out = resolve_loopback(&root, "tunnel-in", true).expect("resolves");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
+        request.extend_from_slice(&echo_port.to_be_bytes());
+        client.write_all(&request).expect("connects");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(reply[1], 0);
+        let payload: Vec<u8> = (0..65536).map(|i| (i % 251) as u8).collect();
+        client.write_all(&payload).expect("writes");
+        let mut back = vec![0u8; 65536];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(back, payload, "a re-injected stream is byte-identical");
+    }
+
+    /// The loopback outbound's own sniffer runs on the re-inject: the named
+    /// inbound dials the sniffed name, not the address the front was asked for.
+    #[test]
+    fn a_loopback_sniffing_overrides_the_re_inject_destination() {
+        let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let id_bytes = uuid_bytes(id).expect("id");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = vec![0u8; 65536];
+            loop {
+                let Ok(read) = stream.read(&mut buf) else {
+                    return;
+                };
+                if read == 0 || stream.write_all(&buf[..read]).is_err() {
+                    return;
+                }
+            }
+        });
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let tunnel_port = tunnel.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = tunnel.accept().expect("accepts");
+            serve_vless_raw(stream, &one_vless_user(&id_bytes), true, None);
+        });
+        let root = crate::json::parse(&format!(
+            r#"{{"inbounds":[{{"tag":"tunnel-in","protocol":"vless","listen":"127.0.0.1","port":{tunnel_port},"settings":{{"clients":[{{"id":"{id}"}}]}}}}],"outbounds":[{{"tag":"again","protocol":"loopback","settings":{{"inboundTag":"tunnel-in","sniffing":{{"enabled":true,"destOverride":["http"]}}}}}}]}}"#,
+        ))
+        .expect("parses");
+        let out = resolve_loopback(&root, "tunnel-in", true).expect("resolves");
+        assert!(
+            matches!(out, Outbound::Loopback(_)),
+            "sniffing wraps the dial"
+        );
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        let mut request = vec![5, 1, 0, 1, 127, 0, 0, 2];
+        request.extend_from_slice(&echo_port.to_be_bytes());
+        client.write_all(&request).expect("connects");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(reply[1], 0);
+        let head =
+            format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{echo_port}\r\nConnection: close\r\n\r\n");
+        client.write_all(head.as_bytes()).expect("writes the head");
+        let mut back = vec![0u8; head.len()];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(back, head.as_bytes(), "the sniffed name is dialled");
+    }
+
+    /// A `routeOnly` sniffer routes by the sniffed name but leaves the dial target where the front
+    /// asked, as the reference's dispatcher does.
+    #[test]
+    fn a_route_only_loopback_sniffer_routes_by_name_and_dials_the_original_address() {
+        let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = vec![0u8; 65536];
+            loop {
+                let Ok(read) = stream.read(&mut buf) else {
+                    return;
+                };
+                if read == 0 || stream.write_all(&buf[..read]).is_err() {
+                    return;
+                }
+            }
+        });
+        let out = route_outbound(
+            &format!(
+                r#"{{"inbounds":[{{"tag":"tunnel-in","protocol":"vless","listen":"127.0.0.1","port":1,"settings":{{"clients":[{{"id":"{id}"}}]}}}}],"outbounds":[{{"tag":"again","protocol":"loopback","settings":{{"inboundTag":"tunnel-in","sniffing":{{"enabled":true,"routeOnly":true,"destOverride":["http"]}}}}}},{{"tag":"direct","protocol":"freedom"}}],"routing":{{"rules":[{{"type":"field","domain":["sniffed.example"],"outboundTag":"direct"}}]}}}}"#,
+            ),
+            Some("front"),
+            true,
+        );
+        let front_port = socks_front_with(out);
+        let mut client = socks_tcp_client(front_port, echo_port);
+        let head = "GET / HTTP/1.1\r\nHost: sniffed.example\r\nConnection: close\r\n\r\n";
+        client.write_all(head.as_bytes()).expect("writes the head");
+        let mut back = vec![0u8; head.len()];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(
+            back,
+            head.as_bytes(),
+            "the domain rule routes while the original address is dialled"
+        );
+    }
+
+    /// The second pass keeps the account the front authenticated, so a `user` rule reaches it.
+    #[test]
+    fn a_loopback_second_pass_keeps_the_authenticated_user() {
+        let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_addr = echo.local_addr().expect("addr");
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 64];
+            loop {
+                let Ok(read) = stream.read(&mut buf) else {
+                    return;
+                };
+                if read == 0 || stream.write_all(&buf[..read]).is_err() {
+                    return;
+                }
+            }
+        });
+        let out = route_outbound(
+            &format!(
+                r#"{{"inbounds":[{{"tag":"tunnel-in","protocol":"vless","listen":"127.0.0.1","port":1,"settings":{{"clients":[{{"id":"{id}"}}]}}}}],"outbounds":[{{"tag":"again","protocol":"loopback","settings":{{"inboundTag":"tunnel-in"}}}},{{"tag":"direct","protocol":"freedom"}}],"routing":{{"rules":[{{"type":"field","inboundTag":["tunnel-in"],"user":["alice"],"outboundTag":"direct"}}]}}}}"#,
+            ),
+            Some("front"),
+            true,
+        );
+        let accounts = SocksAccounts {
+            password: true,
+            pairs: vec![SocksAccount {
+                user: "alice".to_owned(),
+                pass: "secret".to_owned(),
+                email: "alice".to_owned(),
+                level: 0,
+            }],
+        };
+        let front_port = socks_front_with_accounts(out, accounts);
+        let mut client = socks_ask_with_credential(front_port, echo_addr, "alice", "secret");
+        client.write_all(b"user").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(
+            &back, b"user",
+            "the user rule sees the authenticated account"
+        );
+    }
+
+    /// A loopback outbound is a routing target, not just the single front lane:
+    /// a config whose default is loopback builds and re-injects.
+    #[test]
+    fn a_loopback_outbound_is_a_route_target() {
+        let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let id_bytes = uuid_bytes(id).expect("id");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 64];
+            loop {
+                let Ok(read) = stream.read(&mut buf) else {
+                    return;
+                };
+                if read == 0 || stream.write_all(&buf[..read]).is_err() {
+                    return;
+                }
+            }
+        });
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let tunnel_port = tunnel.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = tunnel.accept().expect("accepts");
+            serve_vless_raw(stream, &one_vless_user(&id_bytes), true, None);
+        });
+        let out = route_outbound(
+            &format!(
+                r#"{{"inbounds":[{{"tag":"tunnel-in","protocol":"vless","listen":"127.0.0.1","port":{tunnel_port},"settings":{{"clients":[{{"id":"{id}"}}]}}}}],"outbounds":[{{"tag":"again","protocol":"loopback","settings":{{"inboundTag":"tunnel-in"}}}},{{"tag":"direct","protocol":"freedom"}}],"routing":{{"rules":[]}}}}"#,
+            ),
+            None,
+            false,
+        );
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
+        request.extend_from_slice(&echo_port.to_be_bytes());
+        client.write_all(&request).expect("connects");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(reply[1], 0);
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    /// The named inbound's own routing rules run on the re-inject: a rule keyed
+    /// on `inboundTag` sends the flow to a lane the unrouted dial could not take.
+    #[test]
+    fn a_loopback_consults_the_named_inbounds_rules() {
+        let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 64];
+            loop {
+                let Ok(read) = stream.read(&mut buf) else {
+                    return;
+                };
+                if read == 0 || stream.write_all(&buf[..read]).is_err() {
+                    return;
+                }
+            }
+        });
+        let out = route_outbound(
+            &format!(
+                r#"{{"inbounds":[{{"tag":"tunnel-in","protocol":"vless","listen":"127.0.0.1","port":1,"settings":{{"clients":[{{"id":"{id}"}}]}}}}],"outbounds":[{{"tag":"again","protocol":"loopback","settings":{{"inboundTag":"tunnel-in"}}}},{{"tag":"direct","protocol":"freedom"}}],"routing":{{"rules":[{{"type":"field","inboundTag":["tunnel-in"],"outboundTag":"direct"}}]}}}}"#,
+            ),
+            Some("front"),
+            true,
+        );
+        let front_port = socks_front_with(out);
+        let mut client = socks_tcp_client(front_port, echo_port);
+        client.write_all(b"second pass").expect("writes");
+        let mut back = [0u8; 11];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"second pass");
+    }
+
+    /// UDP takes the same re-inject: the association frames its datagram over
+    /// the redialled TCP session the way a direct dial would.
+    #[test]
+    fn a_re_injected_udp_association_carries_a_datagram() {
+        let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let id_bytes = uuid_bytes(id).expect("id");
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut buf = vec![0u8; UDP_BUF];
+            loop {
+                let Ok((n, src)) = echo.recv_from(&mut buf) else {
+                    return;
+                };
+                if echo.send_to(&buf[..n], src).is_err() {
+                    return;
+                }
+            }
+        });
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let tunnel_port = tunnel.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = tunnel.accept().expect("accepts");
+            serve_vless_raw(stream, &one_vless_user(&id_bytes), true, None);
+        });
+        let root = crate::json::parse(&format!(
+            r#"{{"inbounds":[{{"tag":"tunnel-in","protocol":"vless","listen":"127.0.0.1","port":{tunnel_port},"settings":{{"clients":[{{"id":"{id}"}}]}}}}],"outbounds":[{{"tag":"again","protocol":"loopback","settings":{{"inboundTag":"tunnel-in","sniffing":{{"enabled":true,"destOverride":["quic"]}}}}}}]}}"#,
+        ))
+        .expect("parses");
+        let out = resolve_loopback(&root, "tunnel-in", true).expect("resolves");
+        assert!(matches!(out, Outbound::Loopback(_)));
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(&reply[..4], &[5, 0, 0, 1]);
+        let relay: SocketAddr = SocketAddr::new(
+            std::net::IpAddr::V4([127, 0, 0, 1].into()),
+            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+        );
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        udp.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let mut datagram = vec![0u8, 0, 0];
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        push_socks_addr(&mut datagram, &target);
+        datagram.extend_from_slice(b"ping");
+        udp.send_to(&datagram, relay).expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        let (n, _) = udp.recv_from(&mut back).expect("echoes");
+        let (source, payload) = parse_socks_udp(&back[..n]).expect("splits");
+        assert_eq!(source, target);
+        assert_eq!(payload, b"ping");
+    }
+
+    /// An edge that names no protocol the lane speaks is silent on that carrier, so the flow that learns it pays one dial and the next pays none.
+    #[test]
+    fn a_silent_carrier_is_dialled_once_rather_than_once_per_rung() {
+        use ferrox_core::tls::TlsProvider as _;
+        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+        let (server_config, _) = carried_tls_configs();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let edge: SocketAddr = listener.local_addr().expect("addr");
+        let asked = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&asked);
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let Ok(mut tls) = ferrox_core::tls::RustlsServerProvider::accept(
+                    (*server_config).clone(),
+                    stream,
+                ) else {
+                    continue;
+                };
+                let _ = tls.handshake();
+            }
+        });
+
+        let edge_carrier = crate::foxy::Carrier::H1;
+        let foxy = FoxyOut {
+            account: None,
+            country: "US".to_owned(),
+            carrier: edge_carrier,
+            upstream: None,
+            ladder: vec![ferrox_core::foxy::Candidate {
+                host: std::sync::Arc::from("carrier.test"),
+                port: edge.port(),
+                country: "US".to_owned(),
+                city: String::new(),
+            }],
+            stored: None,
+            unauthenticated: std::sync::Arc::new(AtomicBool::new(false)),
+            limited_strikes: std::sync::Arc::new(AtomicU32::new(0)),
+            limited_until: std::sync::Arc::new(AtomicU64::new(0)),
+            carrier_dead: std::sync::Arc::new(std::sync::Mutex::new(
+                ferrox_core::foxy::Refusals::new(32),
+            )),
+            edge_strikes: std::sync::Arc::new(std::sync::Mutex::new(
+                ferrox_core::foxy::EdgeStrikes::new(32),
+            )),
+            roots: vec![CARRIER_CERT.to_vec()].into(),
+            pins: ferrox_core::foxy::pin::Pins::default(),
+            pass: ferrox_core::foxy::Pass {
+                token: std::sync::Arc::from("the-pass"),
+                expires_at: None,
+                quota_remaining: None,
+                quota_reset: None,
+                quota_limit: None,
+            },
+            edge_address: Some(edge),
+            direct_ports: Vec::new(),
+            direct_suffixes: Vec::new(),
+            exit_probe: None,
+            verified: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            probe_unavailable: std::sync::Arc::new(AtomicBool::new(false)),
+            exit_probe_running: std::sync::Arc::new(AtomicBool::new(false)),
+            exit_refuted_until: std::sync::Arc::new(AtomicU64::new(0)),
+            selected: carrier_slots(),
+        };
+        let target = Destination::Name("target.test".to_owned(), 443);
+
+        assert!(
+            matches!(foxy_open(&foxy, &target), FoxyOpen::Refused(_)),
+            "an edge that names no protocol carries nothing"
+        );
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            1,
+            "a named carrier is one rung, not the three its order repeats"
+        );
+
+        assert!(
+            matches!(foxy_open(&foxy, &target), FoxyOpen::Refused(_)),
+            "the silence is still the answer"
+        );
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            1,
+            "a carrier the edge went silent on is not probed again inside the window"
+        );
+
+        // The window, not the verdict: an edge left alone for its quarantine is asked again the moment it ends.
+        let edge = &foxy.ladder[0];
+        if let Ok(mut cache) = foxy.carrier_dead.lock() {
+            cache.remember(
+                edge_carrier.key(),
+                &edge.host,
+                edge.port,
+                now_secs().saturating_sub(1),
+            );
+        }
+        assert!(
+            matches!(foxy_open(&foxy, &target), FoxyOpen::Refused(_)),
+            "the edge still names no protocol"
+        );
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            2,
+            "a rested carrier is asked again once its window has run out"
+        );
+    }
+
+    /// The connect-ip lane marks a silent carrier dead the same way the TCP flow does, so it must not knock on it again with the next packet: a lane whose carriers are all dead opens nothing, and one whose window has rested is asked again.
+    #[test]
+    fn the_connect_ip_lane_leaves_a_dead_carrier_dead() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let edge: SocketAddr = listener.local_addr().expect("addr");
+        let asked = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&asked);
+        // A silent edge: it accepts, names nothing and hangs up, which is a dead carrier rather than a live one.
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        let edge_carrier = crate::foxy::Carrier::H2;
+        let foxy = FoxyOut {
+            account: None,
+            country: "US".to_owned(),
+            carrier: crate::foxy::Carrier::Auto,
+            upstream: None,
+            ladder: vec![ferrox_core::foxy::Candidate {
+                host: std::sync::Arc::from("carrier.test"),
+                port: edge.port(),
+                country: "US".to_owned(),
+                city: String::new(),
+            }],
+            stored: None,
+            unauthenticated: std::sync::Arc::new(AtomicBool::new(false)),
+            limited_strikes: std::sync::Arc::new(AtomicU32::new(0)),
+            limited_until: std::sync::Arc::new(AtomicU64::new(0)),
+            carrier_dead: std::sync::Arc::new(std::sync::Mutex::new(
+                ferrox_core::foxy::Refusals::new(32),
+            )),
+            edge_strikes: std::sync::Arc::new(std::sync::Mutex::new(
+                ferrox_core::foxy::EdgeStrikes::new(32),
+            )),
+            roots: Vec::new().into(),
+            pins: ferrox_core::foxy::pin::Pins::default(),
+            pass: ferrox_core::foxy::Pass {
+                token: std::sync::Arc::from("the-pass"),
+                expires_at: None,
+                quota_remaining: None,
+                quota_reset: None,
+                quota_limit: None,
+            },
+            edge_address: Some(edge),
+            direct_ports: Vec::new(),
+            direct_suffixes: Vec::new(),
+            exit_probe: None,
+            verified: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            probe_unavailable: std::sync::Arc::new(AtomicBool::new(false)),
+            exit_probe_running: std::sync::Arc::new(AtomicBool::new(false)),
+            exit_refuted_until: std::sync::Arc::new(AtomicU64::new(0)),
+            selected: carrier_slots(),
+        };
+        // Both capsule carriers are known silent, and neither is to be knocked on again inside its window.
+        for carrier in crate::foxy::Carrier::ip_order() {
+            if let Ok(mut cache) = foxy.carrier_dead.lock() {
+                cache.remember(
+                    carrier.key(),
+                    &foxy.ladder[0].host,
+                    foxy.ladder[0].port,
+                    now_secs() + CARRIER_DEAD_SECS,
+                );
+            }
+        }
+        let mut tunnel = None;
+        let mut source = [0u8; 16];
+        let mut width = 0usize;
+        assert!(
+            !open_foxy_ip_tunnel(&foxy, &mut tunnel, &mut source, &mut width),
+            "an edge silent on every capsule carrier grants no address"
+        );
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            0,
+            "the silence the lane already knows is not probed again on this packet"
+        );
+        // The window, not the verdict: a carrier left alone for its quarantine is asked again when it ends.
+        if let Ok(mut cache) = foxy.carrier_dead.lock() {
+            cache.clear(
+                edge_carrier.key(),
+                &foxy.ladder[0].host,
+                foxy.ladder[0].port,
+            );
+        }
+        assert!(
+            !open_foxy_ip_tunnel(&foxy, &mut tunnel, &mut source, &mut width),
+            "the rested carrier still has nothing to open"
+        );
+        assert_ne!(
+            asked.load(Ordering::SeqCst),
+            0,
+            "a rested carrier is asked again once its window has run out"
+        );
+    }
+
+    #[test]
+    fn rate_limit_backoff_climbs_and_clears() {
+        let strikes = AtomicU32::new(0);
+        let until = AtomicU64::new(0);
+        assert!(!edge_limited(&until, 1_000));
+        assert_eq!(note_limited(&strikes, &until, 1_000), 1_030);
+        assert!(edge_limited(&until, 1_000));
+        assert!(!edge_limited(&until, 1_030));
+        assert_eq!(note_limited(&strikes, &until, 1_030), 1_060);
+        assert_eq!(note_limited(&strikes, &until, 1_060), 1_120);
+        assert!(edge_limited(&until, 1_061));
+        clear_limited(&strikes, &until);
+        assert!(!edge_limited(&until, 1_061));
+    }
+
+    #[test]
+    fn socks_dials_vless_over_kcp_to_echo() {
+        let echo_port = echo_loop();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let serve: KcpServe = Arc::new(move |conn| {
+            serve_vless_kcp(
+                conn,
+                &one_vless_user(&id),
+                true,
+                crate::stats::Meter::default(),
+            );
+        });
+        let kcp_port = kcp_loop_with(serve);
+        let front_port = socks_front_with(Outbound::Vless(VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: kcp_port,
+            id,
+            carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
+            host: "127.0.0.1".to_owned(),
+            mux: Mux::default(),
+            pool: Pools::default(),
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            encryption: None,
+        }));
+        let mut client = socks_tcp_client(front_port, echo_port);
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    #[test]
+    fn trojan_over_kcp_reaches_echo() {
+        let echo_port = echo_loop();
+        let key = trojan_key("secret");
+        let listener = ferrox_core::kcp::Listener::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+        )
+        .expect("binds");
+        let kcp_port = listener.local_addr().port();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let conn = listener.accept().expect("accepts");
+            serve_trojan_kcp(
+                &conn,
+                &[key],
+                &[InboundAccount::default()],
+                true,
+                crate::stats::Meter::default(),
+            );
+            // The relay hands off, so the session outlives this call: keep the listener's feed alive.
+            let _ = done_rx.recv();
+        });
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let server_addr: SocketAddr = format!("127.0.0.1:{kcp_port}").parse().expect("addr");
+        let conn = ferrox_core::kcp::dial(
+            server_addr,
+            ferrox_core::kcp::Config::default(),
+            ferrox_core::kcp::fresh_conversation(),
+        )
+        .expect("dials");
+        conn.write(&trojan_header(&key, 1, &Destination::from(target)))
+            .expect("writes");
+        conn.write(b"ping").expect("writes");
+        conn.set_read_deadline(std::time::Instant::now() + std::time::Duration::from_secs(10));
+        let mut back = [0u8; 4];
+        let mut at = 0;
+        while at < 4 {
+            let n = conn.read(&mut back[at..]).expect("echoes");
+            if n == 0 {
+                break;
+            }
+            at += n;
+        }
+        assert_eq!(&back, b"ping");
+        conn.close();
+        let _ = done_tx.send(());
+        server.join().expect("joins");
+    }
+
+    #[test]
+    fn socks_dials_trojan_over_kcp_to_echo() {
+        let echo_port = echo_loop();
+        let key = trojan_key("secret");
+        let serve: KcpServe = Arc::new(move |conn| {
+            serve_trojan_kcp(
+                conn,
+                &[key],
+                &[InboundAccount::default()],
+                true,
+                crate::stats::Meter::default(),
+            );
+        });
+        let kcp_port = kcp_loop_with(serve);
+        let front_port = socks_front_with(Outbound::Trojan(TrojanOut {
+            address: "127.0.0.1".to_owned(),
+            port: kcp_port,
+            key,
+            carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
+            host: "127.0.0.1".to_owned(),
+            tls: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            mux: Mux::default(),
+            pool: Pools::default(),
+            reality: None,
+        }));
+        let mut client = socks_tcp_client(front_port, echo_port);
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    #[test]
+    fn socks_dials_vmess_over_kcp_to_echo() {
+        let echo_port = echo_loop();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let users = crate::vmess::Users::single(id);
+        let serve: KcpServe = Arc::new(move |conn| {
+            let (reader, writer, close) = kcp_parts(conn);
+            crate::vmess::serve_kcp(reader, writer, &users, true, &close);
+        });
+        let kcp_port = kcp_loop_with(serve);
+        let front_port = socks_front_with(Outbound::Vmess(VmessOut {
+            address: "127.0.0.1".to_owned(),
+            port: kcp_port,
+            id,
+            cipher: crate::vmess::Cipher::Auto,
+            auth_len: false,
+            no_termination: false,
+            carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
+            host: "127.0.0.1".to_owned(),
+            tls: None,
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            mux: Mux::default(),
+            pool: Pools::default(),
+        }));
+        let mut client = socks_tcp_client(front_port, echo_port);
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    /// A route plan built the way `serve_root` builds it, so the tests exercise the registry and the
+    /// rule evaluation a served config uses rather than a hand-made table.
+    fn route_outbound(json: &str, tag: Option<&str>, source_known: bool) -> Outbound {
+        let root = crate::json::parse(json).expect("parses");
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("builds");
+        Outbound::Route(Arc::new(RoutePlan::new(
+            shared,
+            tag.map(str::to_owned),
+            None,
+            source_known,
+        )))
+    }
+
+    /// The address form an outbound's request carries for a named target: `targetStrategy` resolves it before the protocol builds the request, as the reference's outbound handler does.
+    #[test]
+    fn an_outbound_target_strategy_sends_the_resolved_family() {
+        let server = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let server_port = server.local_addr().expect("addr").port();
+        let seen = thread::spawn(move || {
+            let (mut stream, _) = server.accept().expect("accepts");
+            let mut greet = [0u8; 3];
+            stream.read_exact(&mut greet).expect("greets");
+            stream.write_all(&[5, 0]).expect("picks no auth");
+            let mut head = [0u8; 4];
+            stream.read_exact(&mut head).expect("asks");
+            let rest = match head[3] {
+                1 => 6,
+                3 => {
+                    let mut len = [0u8; 1];
+                    stream.read_exact(&mut len).expect("length");
+                    usize::from(len[0]) + 2
+                }
+                4 => 18,
+                _ => 0,
+            };
+            let mut tail = vec![0u8; rest];
+            stream.read_exact(&mut tail).expect("the address");
+            stream
+                .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .expect("grants");
+            head[3]
+        });
+        let out = route_outbound(
+            &format!(
+                r#"{{"routing":{{}},"outbounds":[{{"protocol":"socks","targetStrategy":"useIPv4","settings":{{"servers":[{{"address":"127.0.0.1","port":{server_port}}}]}}}}]}}"#
+            ),
+            None,
+            false,
+        );
+        let front_port = socks_front_with(out);
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("the method");
+        // The front is asked for the name, so nothing but the lane can resolve it.
+        let mut request = vec![5, 1, 0, 3, 9];
+        request.extend_from_slice(b"localhost");
+        request.extend_from_slice(&80u16.to_be_bytes());
+        client.write_all(&request).expect("asks");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("the front grants");
+        assert_eq!(reply[1], 0);
+        assert_eq!(
+            seen.join().expect("joins"),
+            0x01,
+            "a useIPv4 lane sends the A record, never the name"
+        );
+    }
+
+    /// `targetStrategy` is read at the outbound level, an unknown name refuses at start as the
+    /// reference does, and a config naming only it still builds the plan that carries it.
+    #[test]
+    fn a_target_strategy_is_read_and_an_unknown_one_refuses() {
+        let named = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"socks","targetStrategy":"useIPv4"}]}"#,
+        )
+        .expect("parses");
+        assert!(routing_for(&named).expect("parses").is_some());
+        let refused = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"socks","targetStrategy":"preferIp"}]}"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            routing_for(&refused).expect_err("refuses"),
+            "unsupported target domain strategy: preferIp"
+        );
+    }
+
+    /// The reference migrates an outbound-level `targetStrategy` onto a freedom lane, and it wins
+    /// over the name the lane's settings carries.
+    #[test]
+    fn a_freedom_outbound_prefers_the_outbound_target_strategy() {
+        let both = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"freedom","targetStrategy":"useIPv4","settings":{"domainStrategy":"useIPv6"}}]}"#,
+        )
+        .expect("parses");
+        let freedom = find_freedom_outbound(&both)
+            .expect("parses")
+            .expect("a lane");
+        assert_eq!(freedom.domain, FreedomDomain::UseIp4);
+        let settings_only = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"freedom","settings":{"domainStrategy":"useIPv6"}}]}"#,
+        )
+        .expect("parses");
+        let freedom = find_freedom_outbound(&settings_only)
+            .expect("parses")
+            .expect("a lane");
+        assert_eq!(freedom.domain, FreedomDomain::UseIp6);
+    }
+
+    /// A strategy resolves a name to the family it names, leaves an address target alone, and a
+    /// forced one refuses a name no answer of its family reaches.
+    #[test]
+    fn a_target_strategy_picks_the_family_it_names() {
+        let name = Destination::Name("localhost".to_owned(), 443);
+        let TargetPick::Address(Destination::Address(address)) =
+            resolve_target(&name, FreedomDomain::UseIp4)
+        else {
+            panic!("a useIPv4 lane resolves a name the host answers");
+        };
+        assert!(address.is_ipv4());
+        let address = Destination::Address("127.0.0.1:443".parse().expect("addr"));
+        assert!(matches!(
+            resolve_target(&address, FreedomDomain::ForceIp4),
+            TargetPick::Keep
+        ));
+        let unresolvable = Destination::Name("no-such-host.invalid".to_owned(), 80);
+        assert!(matches!(
+            resolve_target(&unresolvable, FreedomDomain::ForceIp4),
+            TargetPick::Refuse
+        ));
+        assert!(matches!(
+            resolve_target(&unresolvable, FreedomDomain::UseIp4),
+            TargetPick::Keep
+        ));
+    }
+
+    /// `sendThrough` reads an address and a CIDR, rolls inside the subnet, and refuses a prefix the
+    /// reference refuses.
+    #[test]
+    fn send_through_reads_an_address_and_a_cidr() {
+        let address = crate::json::parse(r#"{"sendThrough":"127.0.0.2"}"#).expect("parses");
+        assert_eq!(
+            parse_send_through(&address).expect("parses"),
+            Some(SendThrough::Address("127.0.0.2".parse().expect("ip")))
+        );
+        let cidr = crate::json::parse(r#"{"sendThrough":"198.18.0.0/15"}"#).expect("parses");
+        assert_eq!(
+            parse_send_through(&cidr).expect("parses"),
+            Some(SendThrough::Cidr {
+                base: "198.18.0.0".parse().expect("ip"),
+                prefix: 15,
+            })
+        );
+        let rolled = parse_send_through(&cidr)
+            .expect("parses")
+            .expect("a source")
+            .address()
+            .expect("an address");
+        let IpAddr::V4(rolled) = rolled else {
+            panic!("an IPv4 CIDR rolls an IPv4 source");
+        };
+        let base: std::net::Ipv4Addr = "198.18.0.0".parse().expect("ip");
+        assert_eq!(
+            u32::from(rolled) & (u32::MAX << 17),
+            u32::from(base),
+            "the roll stays inside the /15"
+        );
+        let bad = crate::json::parse(r#"{"sendThrough":"198.18.0.0/33"}"#).expect("parses");
+        assert_eq!(
+            parse_send_through(&bad),
+            Err("unable to send through: 198.18.0.0/33".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_cidr_without_entropy_does_not_dial_unbound() {
+        let source = SendThrough::Cidr {
+            base: "198.18.0.0".parse().expect("ip"),
+            prefix: 15,
+        };
+        FAIL_ENTROPY.with(|flag| flag.set(true));
+        let resolved = resolve_source(Some(source));
+        FAIL_ENTROPY.with(|flag| flag.set(false));
+        assert!(
+            resolved.is_err(),
+            "entropy failure must not become an unbound dial"
+        );
+    }
+
+    /// A config with no `routing` block still builds the plan that carries `sendThrough`, and one
+    /// without a source stays on the static outbound path.
+    #[test]
+    fn a_config_without_routing_still_carries_send_through() {
+        let named = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"freedom","sendThrough":"127.0.0.2"}]}"#,
+        )
+        .expect("parses");
+        assert!(routing_for(&named).expect("parses").is_some());
+        let plain =
+            crate::json::parse(r#"{"outbounds":[{"protocol":"freedom"}]}"#).expect("parses");
+        assert!(routing_for(&plain).expect("parses").is_none());
+    }
+
+    /// The source a freedom flow leaves from is the one its outbound named, not the OS default.
+    #[test]
+    fn an_outbound_send_through_binds_the_source_the_config_names() {
+        let root = crate::json::parse(
+            r#"{"routing":{},"outbounds":[{"protocol":"freedom","sendThrough":"127.0.0.2"}]}"#,
+        )
+        .expect("parses");
+        let routing = routing_for(&root).expect("parses").expect("a plan");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("builds");
+        let plan = RoutePlan::new(shared, None, None, false);
+        let asked = Destination::Name("127.0.0.1".to_owned(), 9);
+        let (lane, _tag) = plan.lane_with_protocol(
+            &asked,
+            crate::router::Network::Tcp,
+            None,
+            FlowFacts::default(),
+        );
+        assert!(
+            matches!(&*lane, Outbound::Freedom(_)),
+            "the default freedom lane"
+        );
+        let source = SEND_THROUGH
+            .with(std::cell::Cell::get)
+            .expect("the lane carries a source");
+        assert_eq!(
+            source.address().expect("an address"),
+            "127.0.0.2".parse::<IpAddr>().expect("ip")
+        );
+        let _guard = SendThroughGuard::enter(SEND_THROUGH.with(std::cell::Cell::take));
+        // Linux owns all of 127/8 on loopback, so the bind is witnessed where a 127.0.0.2 source routes.
+        #[cfg(target_os = "linux")]
+        {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("echo binds");
+            let port = listener.local_addr().expect("address").port();
+            let (peers, seen) = std::sync::mpsc::channel();
+            let echo = std::thread::spawn(move || {
+                if let Ok((stream, peer)) = listener.accept() {
+                    let _ = peers.send(peer.ip());
+                    drop(stream);
+                }
+            });
+            let target: SocketAddr = format!("127.0.0.1:{port}").parse().expect("target");
+            assert!(
+                dial_or_report(&target).is_some(),
+                "the dial reaches the echo"
+            );
+            let peer = seen
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the echo saw the peer");
+            echo.join().expect("echo");
+            assert_eq!(peer, "127.0.0.2".parse::<IpAddr>().expect("source"));
+        }
+    }
+
+    /// A tagged datagram leaves through the named outbound's own UDP lane: the hop's freedom
+    /// redirect is the only way the closed target answers, so a direct fallback cannot pass.
+    #[test]
+    fn a_tagged_udp_dial_reaches_the_named_hop() {
+        if !crate::conn::in_a_quiet_process("proxy::tests::a_tagged_udp_dial_reaches_the_named_hop")
+        {
+            return;
+        }
+        let echo_port = udp_echo_loop();
+        let closed = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind");
+        let closed_port = closed.local_addr().expect("address").port();
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds":[
+                {{"tag":"direct","protocol":"freedom","streamSettings":{{"sockopt":{{"dialerProxy":"hop"}}}}}},
+                {{"tag":"hop","protocol":"freedom","settings":{{"redirect":"127.0.0.1:{echo_port}"}}}}
+            ],"routing":{{}}}}"#
+        ))
+        .expect("parses");
+        let routing = crate::router::Routing::parse(&root)
+            .expect("parses")
+            .expect("routing");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("shared");
+        let plan = RoutePlan::new(shared, None, None, false);
+        let lane = plan.udp_out(&Association::Default).expect("a lane");
+        let out = Outbound::clone(&lane);
+        let lane =
+            spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip"), None, None).expect("a lane");
+        let client = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("client");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let mut frame = Vec::new();
+        let target = SocketAddr::from(([127, 0, 0, 1], closed_port));
+        let request = socks_udp_frame(&mut frame, &target, b"ping");
+        client.send_to(request, lane.address).expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        let (n, _) = client.recv_from(&mut back).expect("echoes");
+        let (_, payload) = parse_socks_udp(&back[..n]).expect("frame");
+        assert_eq!(payload, b"ping");
+    }
+
+    /// A hop with no datagram lane is refused before the caller gets a socket that never answers.
+    #[test]
+    fn a_tagged_udp_lane_refuses_a_hop_without_datagrams() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[
+                {"tag":"direct","protocol":"freedom","streamSettings":{"sockopt":{"dialerProxy":"hop"}}},
+                {"tag":"hop","protocol":"http","settings":{"servers":[{"address":"127.0.0.1","port":1}]}}
+            ],"routing":{}}"#,
+        )
+        .expect("parses");
+        let routing = crate::router::Routing::parse(&root)
+            .expect("parses")
+            .expect("routing");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("shared");
+        let options = crate::sockopt::parse_outbound(Some(
+            &crate::json::parse(r#"{"dialerProxy":"hop"}"#).expect("parses"),
+        ))
+        .expect("parses")
+        .expect("options");
+        options.install_route(&shared);
+        assert!(
+            dial_udp_through_proxy(SocketAddr::from(([127, 0, 0, 1], 53)), "hop", &options)
+                .is_none(),
+            "an HTTP hop carries no datagrams"
+        );
+    }
+
+    /// A tagged dial does not draw the original source: the hop supplies its own.
+    #[test]
+    fn a_tagged_dial_skips_the_original_source_draw() {
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::a_tagged_dial_skips_the_original_source_draw",
+        ) {
+            return;
+        }
+        let echo_port = echo_loop();
+        let root = crate::json::parse(
+            r#"{"outbounds":[
+                {"tag":"proxy","protocol":"freedom","sendThrough":"198.18.0.0/15","streamSettings":{"sockopt":{"dialerProxy":"hop"}}},
+                {"tag":"hop","protocol":"freedom"}
+            ],"routing":{}}"#,
+        )
+        .expect("parses");
+        let routing = crate::router::Routing::parse(&root)
+            .expect("parses")
+            .expect("routing");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("shared");
+        let plan = RoutePlan::new(shared, None, None, false);
+        let target = SocketAddr::from(([127, 0, 0, 1], echo_port));
+        {
+            let asked = Destination::from(target);
+            let (lane, tag) = plan.lane_with_protocol(
+                &asked,
+                crate::router::Network::Tcp,
+                None,
+                FlowFacts::default(),
+            );
+            assert!(matches!(&*lane, Outbound::Freedom(_)));
+            assert_eq!(tag.as_deref(), Some("proxy"));
+        }
+        FAIL_ENTROPY.with(|flag| flag.set(true));
+        let dialed = dial(&target);
+        FAIL_ENTROPY.with(|flag| flag.set(false));
+        let mut stream = dialed.expect("the tagged dial skips the original source");
+        stream.write_all(b"ping").expect("writes");
+        let mut said = [0u8; 4];
+        stream.read_exact(&mut said).expect("echoes");
+        assert_eq!(&said, b"ping");
+    }
+
+    /// A KCP carrier rides the tagged socket: the shim frames each segment into the hop's UDP
+    /// lane, the hop redirects the closed target to the KCP listener, and the answer comes back.
+    #[test]
+    fn a_kcp_dial_rides_the_tagged_hop_to_its_server() {
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::a_kcp_dial_rides_the_tagged_hop_to_its_server",
+        ) {
+            return;
+        }
+        let config = ferrox_core::kcp::Config::default();
+        let server = Arc::new(
+            ferrox_core::kcp::Listener::bind(SocketAddr::from(([127, 0, 0, 1], 0)), config.clone())
+                .expect("bind"),
+        );
+        let server_port = server.local_addr().port();
+        let closed = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind");
+        let closed_port = closed.local_addr().expect("address").port();
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds":[
+                {{"tag":"direct","protocol":"freedom","streamSettings":{{"sockopt":{{"dialerProxy":"hop"}}}}}},
+                {{"tag":"hop","protocol":"freedom","settings":{{"redirect":"127.0.0.1:{server_port}"}}}}
+            ],"routing":{{}}}}"#
+        ))
+        .expect("parses");
+        let routing = crate::router::Routing::parse(&root)
+            .expect("parses")
+            .expect("routing");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("shared");
+        let options = crate::sockopt::parse_outbound(Some(
+            &crate::json::parse(r#"{"dialerProxy":"hop"}"#).expect("parses"),
+        ))
+        .expect("parses")
+        .expect("options");
+        options.install_route(&shared);
+        let _opts = DialSockoptsGuard::enter(Some(Arc::new(options)));
+        let conn =
+            kcp_dial_session(&Carrier::Kcp(config), "127.0.0.1", closed_port).expect("tagged dial");
+        conn.write(b"tagged kcp").expect("write");
+        let (accepted, session) = std::sync::mpsc::channel();
+        let _acceptor = {
+            let server = Arc::clone(&server);
+            thread::spawn(move || {
+                if let Ok(session) = server.accept() {
+                    let _ = accepted.send(session);
+                }
+            })
+        };
+        let session = session
+            .recv_timeout(Duration::from_secs(5))
+            .expect("session accepted");
+        let mut buf = [0u8; 256];
+        session.set_read_deadline(Instant::now() + Duration::from_secs(5));
+        let n = session.read(&mut buf).expect("server read");
+        assert_eq!(&buf[..n], b"tagged kcp");
+        drop(conn);
+        server.close();
+    }
+
+    /// A `dialerProxy` hop carries the outbound's own dial: the freedom lane reaches the echo only
+    /// after the named HTTP proxy has seen the CONNECT, and it sees it exactly once.
+    #[test]
+    fn a_dialer_proxy_hop_carries_the_outbound_dial() {
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::a_dialer_proxy_hop_carries_the_outbound_dial",
+        ) {
+            return;
+        }
+        let echo_port = echo_loop();
+        let (hop_port, recorded) = fake_http_proxy_recording();
+        let config = format!(
+            r#"{{"outbounds":[
+                {{"tag":"proxy","protocol":"freedom","streamSettings":{{"sockopt":{{"dialerProxy":"hop"}}}}}},
+                {{"tag":"hop","protocol":"http","settings":{{"servers":[{{"address":"127.0.0.1","port":{hop_port}}}]}}}}
+            ],"routing":{{}}}}"#
+        );
+        let front = socks_front_with(route_outbound(&config, Some("in"), true));
+        let mut client = socks_tcp_client(front, echo_port);
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        let seen = recorded
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the hop carried the dial");
+        assert_eq!(seen.port(), echo_port);
+        assert!(
+            recorded.recv_timeout(Duration::from_millis(100)).is_err(),
+            "one connection, one hop dial"
+        );
+    }
+
+    /// A sing-box `detour` is the same edge as `dialerProxy`: the named HTTP proxy sees the
+    /// CONNECT the terminal freedom dial makes.
+    #[test]
+    fn a_detour_hop_carries_the_outbound_dial() {
+        if !crate::conn::in_a_quiet_process("proxy::tests::a_detour_hop_carries_the_outbound_dial")
+        {
+            return;
+        }
+        let echo_port = echo_loop();
+        let (hop_port, recorded) = fake_http_proxy_recording();
+        let config = format!(
+            r#"{{"outbounds":[
+                {{"tag":"proxy","protocol":"freedom","detour":"hop"}},
+                {{"tag":"hop","protocol":"http","settings":{{"servers":[{{"address":"127.0.0.1","port":{hop_port}}}]}}}}
+            ],"routing":{{}}}}"#
+        );
+        let front = socks_front_with(route_outbound(&config, Some("in"), true));
+        let mut client = socks_tcp_client(front, echo_port);
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        let seen = recorded
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the detour carried the dial");
+        assert_eq!(seen.port(), echo_port);
+    }
+
+    /// A probe target keeps its own tag even when its detour is the default, so the hop's loop
+    /// check compares the two names rather than refusing the probe as a dial to itself.
+    #[test]
+    fn a_probe_target_keeps_its_own_tag_when_its_hop_is_the_default() {
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::a_probe_target_keeps_its_own_tag_when_its_hop_is_the_default",
+        ) {
+            return;
+        }
+        let echo_port = echo_loop();
+        let (hop_port, recorded) = fake_http_proxy_recording();
+        let config = format!(
+            r#"{{"outbounds":[
+                {{"tag":"default","protocol":"http","settings":{{"servers":[{{"address":"127.0.0.1","port":{hop_port}}}]}}}},
+                {{"tag":"probe","protocol":"freedom","detour":"default"}}
+            ],"routing":{{}}}}"#
+        );
+        let root = crate::json::parse(&config).expect("parses");
+        let routing = routing_for(&root).expect("parses").expect("a plan");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("builds");
+        let config = root
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .expect("outbounds")
+            .iter()
+            .find(|outbound| outbound.get("tag").and_then(Json::as_str) == Some("probe"))
+            .expect("the tag");
+        let out = build_outbound(config, "probe").expect("builds");
+        let target = shared.probe_target_with("probe", out);
+        let mut client = target
+            .probe_stream(
+                &Destination::Address(SocketAddr::from(([127, 0, 0, 1], echo_port))),
+                Duration::from_secs(5),
+            )
+            .expect("the probe dials");
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        let seen = recorded
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the default hop carried the probe");
+        assert_eq!(seen.port(), echo_port);
+    }
+
+    /// An ordered chain dials the exit through every earlier hop: the first proxy sees the second
+    /// proxy's edge, the second sees the echo, and the bytes come back through both.
+    #[test]
+    fn an_ordered_chain_carries_tcp_through_each_hop() {
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::an_ordered_chain_carries_tcp_through_each_hop",
+        ) {
+            return;
+        }
+        let echo_port = echo_loop();
+        let (first_port, first_seen) = fake_http_proxy_recording();
+        let (second_port, second_seen) = fake_http_proxy_recording();
+        let config = format!(
+            r#"{{"outbounds":[
+                {{"tag":"chain","type":"chain","outbounds":["first","second"]}},
+                {{"tag":"first","protocol":"http","settings":{{"servers":[{{"address":"127.0.0.1","port":{first_port}}}]}}}},
+                {{"tag":"second","protocol":"http","settings":{{"servers":[{{"address":"127.0.0.1","port":{second_port}}}]}}}}
+            ],"routing":{{}}}}"#
+        );
+        let front = socks_front_with(route_outbound(&config, Some("in"), true));
+        let mut client = socks_tcp_client(front, echo_port);
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        let first = first_seen
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the first hop carried the second hop's edge");
+        assert_eq!(first.port(), second_port);
+        let second = second_seen
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the second hop carried the echo");
+        assert_eq!(second.port(), echo_port);
+    }
+
+    /// A chain's datagram lane reaches its named hop: the terminal freedom dials through the SOCKS
+    /// outbound before it, and the echo answers through both.
+    #[test]
+    fn an_ordered_chain_carries_udp_through_its_hop() {
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::an_ordered_chain_carries_udp_through_its_hop",
+        ) {
+            return;
+        }
+        let echo_port = udp_echo_loop();
+        let server_port = socks_front_with(freedom());
+        let config = format!(
+            r#"{{"outbounds":[
+                {{"tag":"chain","protocol":"chain","outbounds":["hop","exit"]}},
+                {{"tag":"hop","protocol":"socks","settings":{{"servers":[{{"address":"127.0.0.1","port":{server_port}}}]}}}},
+                {{"tag":"exit","protocol":"freedom"}}
+            ],"routing":{{}}}}"#
+        );
+        let root = crate::json::parse(&config).expect("parses");
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("shared");
+        let plan = RoutePlan::new(shared, None, None, false);
+        let picked = plan.udp_out(&Association::Default).expect("a lane");
+        let out = Outbound::clone(&picked);
+        let lane =
+            spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip"), None, None).expect("a udp lane");
+        let client = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("client");
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let mut frame = Vec::new();
+        let target = SocketAddr::from(([127, 0, 0, 1], echo_port));
+        client
+            .send_to(socks_udp_frame(&mut frame, &target, b"ping"), lane.address)
+            .expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        let (n, _) = client.recv_from(&mut back).expect("echoes");
+        let (_, payload) = parse_socks_udp(&back[..n]).expect("frame");
+        assert_eq!(payload, b"ping");
+    }
+
+    /// A chain refuses a missing, self, duplicate, one-hop or badly nested list, and its own
+    /// `detour` as well as a `detour`/`dialerProxy` disagreement.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_chain_refuses_missing_self_duplicate_and_badly_nested_hops() {
+        let build = |text: &str| {
+            let root = crate::json::parse(text).expect("parses");
+            let routing = routing_for(&root).expect("parses").expect("a plan");
+            route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+        };
+        let http = |tag: &str| {
+            format!(
+                r#"{{"tag":"{tag}","protocol":"http","settings":{{"servers":[{{"address":"127.0.0.1","port":1}}]}}}}"#
+            )
+        };
+        let missing = build(&format!(
+            r#"{{"outbounds":[{{"tag":"chain","type":"chain","outbounds":["nope","{}"]}},{}],"routing":{{}}}}"#,
+            "hop",
+            http("hop")
+        ))
+        .expect_err("a missing hop is refused");
+        assert!(missing.contains("nope"), "{missing}");
+
+        let itself = build(&format!(
+            r#"{{"outbounds":[{{"tag":"chain","type":"chain","outbounds":["chain","{}"]}},{}],"routing":{{}}}}"#,
+            "hop",
+            http("hop")
+        ))
+        .expect_err("a self hop is refused");
+        assert!(itself.contains("chain"), "{itself}");
+
+        let duplicate = build(&format!(
+            r#"{{"outbounds":[{{"tag":"chain","type":"chain","outbounds":["hop","hop"]}},{}],"routing":{{}}}}"#,
+            http("hop")
+        ))
+        .expect_err("a duplicate hop is refused");
+        assert!(duplicate.contains("twice"), "{duplicate}");
+
+        let one = build(&format!(
+            r#"{{"outbounds":[{{"tag":"chain","type":"chain","outbounds":["hop"]}},{}],"routing":{{}}}}"#,
+            http("hop")
+        ))
+        .expect_err("a one-hop chain is refused");
+        assert!(one.contains("fewer than two"), "{one}");
+
+        let nested = build(&format!(
+            r#"{{"outbounds":[
+                {{"tag":"outer","type":"chain","outbounds":["first","inner"]}},
+                {{"tag":"inner","type":"chain","outbounds":["second","last"]}},
+                {}, {}, {}
+            ],"routing":{{}}}}"#,
+            http("first"),
+            http("second"),
+            http("last")
+        ))
+        .expect_err("a nested chain outside the first position is refused");
+        assert!(nested.contains("first position"), "{nested}");
+
+        let cyclic = build(&format!(
+            r#"{{"outbounds":[
+                {{"tag":"a","type":"chain","outbounds":["b","c"]}},
+                {{"tag":"b","type":"chain","outbounds":["a","d"]}},
+                {}, {}
+            ],"routing":{{}}}}"#,
+            http("c"),
+            http("d")
+        ))
+        .expect_err("a chain cycle is refused");
+        assert!(cyclic.contains("loops"), "{cyclic}");
+
+        let own_detour = build(&format!(
+            r#"{{"outbounds":[
+                {{"tag":"chain","type":"chain","detour":"hop","outbounds":["hop","last"]}},
+                {}, {}
+            ],"routing":{{}}}}"#,
+            http("hop"),
+            http("last")
+        ))
+        .expect_err("a chain cannot also name a detour");
+        assert!(own_detour.contains("outbounds list"), "{own_detour}");
+
+        let both = build(&format!(
+            r#"{{"outbounds":[
+                {{"tag":"proxy","protocol":"freedom","detour":"a","streamSettings":{{"sockopt":{{"dialerProxy":"b"}}}}}},
+                {}, {}
+            ],"routing":{{}}}}"#,
+            http("a"),
+            http("b")
+        ))
+        .expect_err("two different edges are refused");
+        assert!(both.contains("both"), "{both}");
+
+        let detour_cycle = build(
+            r#"{"outbounds":[
+                {"tag":"a","protocol":"freedom","detour":"b"},
+                {"tag":"b","protocol":"freedom","detour":"a"}
+            ],"routing":{}}"#,
+        )
+        .expect_err("a detour cycle is refused");
+        assert!(detour_cycle.contains("loop"), "{detour_cycle}");
+
+        let flattened = build(&format!(
+            r#"{{"outbounds":[
+                {{"tag":"outer","type":"chain","outbounds":["inner","last"]}},
+                {{"tag":"inner","type":"chain","outbounds":["first","second"]}},
+                {}, {}, {}
+            ],"routing":{{}}}}"#,
+            http("first"),
+            http("second"),
+            http("last")
+        ))
+        .expect("a chain nested first flattens");
+        assert!(flattened.tagged.contains_key("outer"));
+
+        let no_routing = crate::json::parse(&format!(
+            r#"{{"outbounds":[
+                {{"tag":"chain","type":"chain","outbounds":["first","last"]}},
+                {}, {}
+            ]}}"#,
+            http("first"),
+            http("last")
+        ))
+        .expect("parses");
+        assert!(
+            routing_for(&no_routing).expect("parses").is_some(),
+            "a chain needs the route table even when the config has no routing block"
+        );
+    }
+
+    /// A hop whose carrier binds its own socket cannot take the predecessor's local front, so the
+    /// chain refuses it instead of reaching the peer from this machine.
+    #[test]
+    fn a_chain_refuses_a_hop_that_binds_its_own_socket() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[
+                {"tag":"chain","type":"chain","outbounds":["first","exit"]},
+                {"tag":"first","protocol":"http","settings":{"servers":[{"address":"127.0.0.1","port":1}]}},
+                {"tag":"exit","protocol":"hysteria","settings":{"version":1,"address":"127.0.0.1","port":443,"auth":"pw"},"streamSettings":{"network":"hysteria","security":"tls","tlsSettings":{"serverName":"example.com","obfs":"key"}}}
+            ],"routing":{}}"#,
+        )
+        .expect("parses");
+        let routing = routing_for(&root).expect("parses").expect("a plan");
+        let error = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect_err("a self-socket hop after the first is refused");
+        assert!(error.contains("cannot dial through"), "{error}");
+
+        let datagram = crate::json::parse(
+            r#"{"outbounds":[
+                {"tag":"chain","type":"chain","outbounds":["first","exit"]},
+                {"tag":"first","protocol":"http","settings":{"servers":[{"address":"127.0.0.1","port":1}]}},
+                {"tag":"exit","protocol":"shadowsocks","settings":{"servers":[{"address":"127.0.0.1","port":1,"method":"aes-128-gcm","password":"pw"}]}}
+            ],"routing":{}}"#,
+        )
+        .expect("parses");
+        let routing = routing_for(&datagram).expect("parses").expect("a plan");
+        let error = route_shared(
+            &datagram,
+            routing,
+            &crate::reverse::Portals::default(),
+            None,
+        )
+        .expect_err("a raw Shadowsocks hop would lose the hop above it");
+        assert!(error.contains("cannot dial through"), "{error}");
+    }
+
+    /// A chain tag's health target is its exit lane with the hop's options, and a direct-only
+    /// inbound does not accept it as a direct route.
+    #[test]
+    fn a_chain_probe_target_and_direct_proof_read_its_exit() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[
+                {"tag":"chain","type":"chain","outbounds":["hop","exit"]},
+                {"tag":"hop","protocol":"http","settings":{"servers":[{"address":"127.0.0.1","port":1}]}},
+                {"tag":"exit","protocol":"freedom"}
+            ],"routing":{}}"#,
+        )
+        .expect("parses");
+        let routing = routing_for(&root).expect("parses").expect("a plan");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("builds");
+        let target = shared
+            .probe_target("chain")
+            .expect("the chain has a target");
+        assert_eq!(target.tag.as_deref(), Some("chain"));
+        let lane = chain_lane_tag("chain", 0);
+        assert_eq!(
+            target
+                .sockopts
+                .as_deref()
+                .and_then(|options| options.dialer_proxy()),
+            Some(lane.as_str())
+        );
+        assert!(!direct_tag(&shared, "chain"));
+    }
+
+    /// A probe target for a tag no rule selected keeps the hop that tag's config names.
+    #[test]
+    fn a_probe_target_keeps_the_detour_of_an_unselected_tag() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[
+                {"tag":"default","protocol":"freedom"},
+                {"tag":"hop","protocol":"http","settings":{"servers":[{"address":"127.0.0.1","port":1}]}},
+                {"tag":"unselected","protocol":"freedom","detour":"hop"}
+            ],"routing":{}}"#,
+        )
+        .expect("parses");
+        let routing = routing_for(&root).expect("parses").expect("a plan");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("builds");
+        assert!(!shared.tagged.contains_key("unselected"));
+        let config = root
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .expect("outbounds")
+            .iter()
+            .find(|outbound| outbound.get("tag").and_then(Json::as_str) == Some("unselected"))
+            .expect("the tag");
+        let out = build_outbound(config, "unselected").expect("builds");
+        let target = shared.probe_target_with("unselected", out);
+        assert_eq!(target.tag.as_deref(), Some("unselected"));
+        assert_eq!(
+            target
+                .sockopts
+                .as_deref()
+                .and_then(|options| options.dialer_proxy()),
+            Some("hop")
+        );
+    }
+
+    /// A probe target built outside the route still binds a carrier that reads its own spec.
+    #[test]
+    fn a_probe_target_binds_carrier_owned_options() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[
+                {"tag":"default","protocol":"freedom"},
+                {"tag":"edge","protocol":"masque","settings":{"address":"127.0.0.1","port":443},
+                 "streamSettings":{"network":"masque","security":"tls",
+                 "tlsSettings":{"serverName":"edge.example","allowInsecure":true},
+                 "sockopt":{"dialerProxy":"default"}}}
+            ],"routing":{}}"#,
+        )
+        .expect("parses");
+        let routing = routing_for(&root).expect("parses").expect("a plan");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("builds");
+        assert!(!shared.tagged.contains_key("edge"));
+        let config = root
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .expect("outbounds")
+            .iter()
+            .find(|outbound| outbound.get("tag").and_then(Json::as_str) == Some("edge"))
+            .expect("the tag");
+        let out = build_outbound(config, "edge").expect("builds");
+        let target = shared.probe_target_with("edge", out);
+        let Outbound::Masque(masque) = &target.out else {
+            panic!("the target is the masque carrier");
+        };
+        assert!(masque.route_bound());
+    }
+
+    /// The socket options an outbound's `streamSettings.sockopt` names are the ones the socket its
+    /// dial makes carries, not the OS defaults.
+    #[cfg(unix)]
+    #[test]
+    fn an_outbound_sockopt_reaches_the_dial_socket() {
+        use std::os::fd::AsRawFd as _;
+
+        let root = crate::json::parse(
+            r#"{"routing":{},"outbounds":[{"protocol":"freedom","streamSettings":{"sockopt":{"tcpKeepAliveIdle":11,"tcpKeepAliveInterval":7}}}]}"#,
+        )
+        .expect("parses");
+        let routing = routing_for(&root).expect("parses").expect("a plan");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("builds");
+        let plan = RoutePlan::new(shared, None, None, false);
+        let asked = Destination::Name("127.0.0.1".to_owned(), 9);
+        let (_lane, _tag) = plan.lane_with_protocol(
+            &asked,
+            crate::router::Network::Tcp,
+            None,
+            FlowFacts::default(),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("echo binds");
+        let target: SocketAddr = listener.local_addr().expect("address");
+        let echo = std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                drop(stream);
+            }
+        });
+        let stream = dial_or_report(&target).expect("the dial reaches the echo");
+        let fd = stream.as_raw_fd();
+        assert_ne!(
+            socket_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE),
+            0,
+            "the outbound's keepalive reaches the socket"
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(socket_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPALIVE), 11);
+        #[cfg(target_os = "linux")]
+        assert_eq!(socket_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE), 11);
+        assert_eq!(socket_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL), 7);
+        echo.join().expect("echo");
+    }
+
+    #[cfg(unix)]
+    fn socket_int(fd: std::os::fd::RawFd, level: libc::c_int, name: libc::c_int) -> i32 {
+        let mut value = 0i32;
+        let mut len = std::mem::size_of_val(&value) as libc::socklen_t;
+        // SAFETY: the descriptor is live and the value buffer is writable.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                level,
+                name,
+                std::ptr::addr_of_mut!(value).cast(),
+                &raw mut len,
+            )
+        };
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+        value
+    }
+
+    /// A `WireGuard` server datagram takes the tag its rules pick for UDP, follows that freedom's
+    /// redirect, and reports the reply as the original target the inner packet named.
+    #[test]
+    fn a_wireguard_server_datagram_takes_its_udp_lane_and_redirect() {
+        let echo = std::net::UdpSocket::bind("127.0.0.1:0").expect("echo");
+        let echo_port = echo.local_addr().expect("address").port();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            if let Ok((n, from)) = echo.recv_from(&mut buf) {
+                let _ = echo.send_to(&buf[..n], from);
+            }
+        });
+        let config = format!(
+            r#"{{"routing":{{"rules":[{{"network":"tcp","outboundTag":"tcp"}},{{"network":"udp","outboundTag":"udp"}}]}},"outbounds":[{{"tag":"tcp","protocol":"freedom","settings":{{"redirect":"127.0.0.1:1"}}}},{{"tag":"udp","protocol":"freedom","settings":{{"redirect":"127.0.0.1:{echo_port}"}}}}]}}"#
+        );
+        let plan = route_outbound(&config, None, false);
+        let (to_tunnel, replies) = std::sync::mpsc::channel();
+        let target: std::net::SocketAddr = "192.0.2.1:7".parse().unwrap();
+        let source: std::net::SocketAddr = "10.0.0.2:1234".parse().unwrap();
+        let last_used = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        let (uplink, _) = crate::wg_stack::server_udp(
+            ([0x11; 32], source, target),
+            std::time::Instant::now(),
+            &last_used,
+            &plan,
+            &to_tunnel,
+            ferrox_core::wireguard::transport::HEADER_SIZE,
+        )
+        .expect("lane");
+        let mut buf = Vec::new();
+        let frame = socks_udp_frame(&mut buf, &target, b"hi");
+        uplink.send(frame).expect("send");
+        let packet = replies.recv_timeout(Duration::from_secs(5)).expect("reply");
+        let header = ferrox_core::wireguard::transport::HEADER_SIZE;
+        let datagram = ferrox_core::foxy::connectip::udp_from_packet(&packet[header..])
+            .expect("inner datagram");
+        assert_eq!(datagram.payload, b"hi");
+        assert_eq!(
+            datagram.source,
+            target
+                .ip()
+                .to_string()
+                .parse::<std::net::IpAddr>()
+                .map(|ip| match ip {
+                    std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
+                    std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
+                })
+                .unwrap()
+        );
+        assert_eq!(datagram.source_port, target.port());
+        assert_ne!(
+            last_used.load(Ordering::Relaxed),
+            u64::MAX,
+            "the reply refreshes the lane's activity"
+        );
+    }
+
+    /// Replies are activity too: a lane whose requests paused but whose target keeps answering
+    /// must not lose the reader that turns those answers back into packets.
+    #[test]
+    fn a_reply_stream_keeps_the_freedom_lane_reading() {
+        let target = std::net::UdpSocket::bind("127.0.0.1:0").expect("target");
+        let target_addr = target.local_addr().expect("address");
+        target
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            let Ok((n, client)) = target.recv_from(&mut buf) else {
+                return;
+            };
+            let _ = target.send_to(&buf[..n], client);
+            for _ in 0..7 {
+                std::thread::sleep(Duration::from_millis(50));
+                let _ = target.send_to(b"tick", client);
+            }
+            if let Ok((n, client)) = target.recv_from(&mut buf) {
+                let _ = target.send_to(&buf[..n], client);
+            }
+        });
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("relay");
+        let relay_addr = relay.local_addr().expect("address");
+        relay
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .expect("timeout");
+        let _serving = std::thread::spawn(move || {
+            serve_socks_udp_freedom(&relay, &FreedomOut::default(), None, None, None, None);
+        });
+        let client = UdpSocket::bind("127.0.0.1:0").expect("client");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let mut buf = Vec::new();
+        let mut back = vec![0u8; UDP_BUF];
+        let frame = socks_udp_frame(&mut buf, &target_addr, b"one");
+        client.send_to(frame, relay_addr).expect("send");
+        let mut payloads = Vec::new();
+        for _ in 0..8 {
+            let (n, _) = client.recv_from(&mut back).expect("reply");
+            let (_, payload) = parse_socks_udp(&back[..n]).expect("frame");
+            payloads.push(payload.to_vec());
+        }
+        assert_eq!(payloads[0].as_slice(), b"one");
+        assert!(
+            payloads[1..]
+                .iter()
+                .all(|payload| payload.as_slice() == b"tick"),
+            "the replies cross the lane while requests are paused"
+        );
+        let frame = socks_udp_frame(&mut buf, &target_addr, b"two");
+        client.send_to(frame, relay_addr).expect("send");
+        let (n, _) = client.recv_from(&mut back).expect("reply");
+        let (_, payload) = parse_socks_udp(&back[..n]).expect("frame");
+        assert_eq!(payload, b"two");
+    }
+
+    /// A freedom datagram leaves from the source its outbound named, as a TCP flow from it does.
+    #[test]
+    fn a_freedom_datagram_lane_binds_the_source_the_config_names() {
+        let root = crate::json::parse(
+            r#"{"routing":{},"outbounds":[{"protocol":"freedom","sendThrough":"127.0.0.2"}]}"#,
+        )
+        .expect("parses");
+        let routing = routing_for(&root).expect("parses").expect("a plan");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("builds");
+        let plan = RoutePlan::new(shared, None, None, false);
+        let lane = plan.udp_out(&Association::Default).expect("a lane");
+        assert!(
+            matches!(&*lane, Outbound::Freedom(_)),
+            "the default freedom lane"
+        );
+        let source = SEND_THROUGH
+            .with(std::cell::Cell::get)
+            .expect("the datagram lane carries a source");
+        assert_eq!(
+            source.address().expect("an address"),
+            "127.0.0.2".parse::<IpAddr>().expect("ip")
+        );
+        // Linux owns all of 127/8 on loopback, so the bind is witnessed where a 127.0.0.2 source routes.
+        #[cfg(target_os = "linux")]
+        {
+            let echo = std::net::UdpSocket::bind("127.0.0.1:0").expect("echo");
+            let echo_addr = echo.local_addr().expect("address");
+            echo.set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            let (peers, seen) = std::sync::mpsc::channel();
+            let replied = std::thread::spawn(move || {
+                let mut buf = [0u8; 1500];
+                if let Ok((n, peer)) = echo.recv_from(&mut buf) {
+                    let _ = peers.send(peer.ip());
+                    let _ = echo.send_to(&buf[..n], peer);
+                }
+            });
+            let out = Outbound::clone(&lane);
+            let lane =
+                spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip"), None, None).expect("a lane");
+            let client = std::net::UdpSocket::bind("127.0.0.1:0").expect("client");
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            let mut frame = Vec::new();
+            let request = socks_udp_frame(&mut frame, &echo_addr, b"one");
+            client.send_to(request, lane.address).expect("send");
+            let mut back = vec![0u8; UDP_BUF];
+            let (n, _) = client.recv_from(&mut back).expect("reply");
+            let (_, payload) = parse_socks_udp(&back[..n]).expect("frame");
+            assert_eq!(payload, b"one");
+            let peer = seen
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the echo saw the peer");
+            replied.join().expect("echo");
+            assert_eq!(peer, "127.0.0.2".parse::<IpAddr>().expect("source"));
+        }
+    }
+
+    /// A direct datagram's uplink follows its destination's family, so an IPv6 target is reached.
+    #[test]
+    fn a_freedom_datagram_lane_reaches_an_ipv6_destination() {
+        let echo = std::net::UdpSocket::bind("[::1]:0").expect("echo");
+        let echo_addr = echo.local_addr().expect("address");
+        echo.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let replied = std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            if let Ok((n, peer)) = echo.recv_from(&mut buf) {
+                let _ = echo.send_to(&buf[..n], peer);
+            }
+        });
+        let out = Outbound::Freedom(Arc::new(FreedomOut::default()));
+        let lane =
+            spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip"), None, None).expect("a lane");
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").expect("client");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let mut frame = Vec::new();
+        let request = socks_udp_frame(&mut frame, &echo_addr, b"six");
+        client.send_to(request, lane.address).expect("send");
+        let mut back = vec![0u8; UDP_BUF];
+        let (n, _) = client.recv_from(&mut back).expect("reply");
+        let (_, payload) = parse_socks_udp(&back[..n]).expect("frame");
+        replied.join().expect("echo");
+        assert_eq!(payload, b"six");
+    }
+
+    /// The outbound's `sockopt` reaches the datagram socket: an option the OS refuses stops that
+    /// uplink instead of being dropped, while the same lane without it answers.
+    #[test]
+    fn a_refused_datagram_sockopt_stops_the_uplink() {
+        fn answers(config: &str) -> bool {
+            let root = crate::json::parse(config).expect("parses");
+            let routing = routing_for(&root).expect("parses").expect("a plan");
+            let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+                .expect("builds");
+            let plan = RoutePlan::new(shared, None, None, false);
+            let out = Outbound::clone(&plan.udp_out(&Association::Default).expect("a lane"));
+            let echo = std::net::UdpSocket::bind("127.0.0.1:0").expect("echo");
+            let echo_addr = echo.local_addr().expect("address");
+            echo.set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 1500];
+                if let Ok((n, peer)) = echo.recv_from(&mut buf) {
+                    let _ = echo.send_to(&buf[..n], peer);
+                }
+            });
+            let lane =
+                spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip"), None, None).expect("a lane");
+            let client = std::net::UdpSocket::bind("127.0.0.1:0").expect("client");
+            client
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("timeout");
+            let mut frame = Vec::new();
+            let request = socks_udp_frame(&mut frame, &echo_addr, b"one");
+            client.send_to(request, lane.address).expect("send");
+            let mut back = vec![0u8; UDP_BUF];
+            client.recv_from(&mut back).is_ok()
+        }
+        assert!(
+            answers(r#"{"routing":{},"outbounds":[{"protocol":"freedom"}]}"#),
+            "the plain lane answers"
+        );
+        assert!(
+            !answers(
+                r#"{"routing":{},"outbounds":[{"protocol":"freedom","streamSettings":{"sockopt":{"customSockopt":[{"type":"int","level":"999","opt":"999","value":"1"}]}}}]}"#
+            ),
+            "a refused option stops the datagram"
+        );
+    }
+
+    /// A routing script picks the lane before the (empty) rule table, and its error closes the
+    /// flow instead of falling back to the default handler.
+    #[test]
+    fn a_routing_script_picks_the_lane_and_closes_on_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-proxy-script-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let script = dir.join("route.lua");
+        std::fs::write(
+            &script,
+            r#"
+function HandleRoute(ctx, inbound, sourcePort, targetPort, localPort, targetDomain, network, protocol)
+  if targetDomain == "blocked.test" then return "block" end
+  if targetDomain == "broken.test" then error("script failed") end
+  return nil
+end
+"#,
+        )
+        .expect("write");
+        let config = format!(
+            r#"{{"routing":{{"script":{:?}}},"outbounds":[{{"tag":"direct","protocol":"freedom"}},{{"tag":"block","protocol":"blackhole"}}]}}"#,
+            script.display().to_string()
+        );
+        let plan = route_outbound(&config, Some("in"), false);
+        let Outbound::Route(plan) = plan else {
+            panic!("the config is routed");
+        };
+        let blocked = Destination::Name("blocked.test".to_owned(), 80);
+        let (picked, tag) = plan.lane(&blocked, crate::router::Network::Tcp, None, None);
+        assert_eq!(tag.as_deref(), Some("block"));
+        assert!(matches!(&*picked, Outbound::Block(_)));
+        let other = Destination::Name("other.test".to_owned(), 80);
+        let (_, tag) = plan.lane(&other, crate::router::Network::Tcp, None, None);
+        assert_eq!(tag.as_deref(), Some("direct"));
+        let broken = Destination::Name("broken.test".to_owned(), 80);
+        let (picked, tag) = plan.lane(&broken, crate::router::Network::Tcp, None, None);
+        assert_eq!(tag, None);
+        assert!(matches!(&*picked, Outbound::Block(_)));
+    }
+
+    /// One SOCKS CONNECT by name, granted; the caller writes the payload or reads the close.
+    fn socks_name_client(front_port: u16, name: &str, port: u16) -> Connection {
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        let mut request = vec![5, 1, 0, 3, name.len() as u8];
+        request.extend_from_slice(name.as_bytes());
+        request.extend_from_slice(&port.to_be_bytes());
+        client.write_all(&request).expect("connects");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(reply[1], 0, "granted before the lane is chosen");
+        client
+    }
+
+    /// A config whose only outbound is the sink takes it: the lane a front
+    /// gets is the answer, and the answer is the reference's.
+    #[test]
+    fn a_config_whose_only_outbound_is_the_sink_serves_the_sink() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"blackhole","settings":{"response":{"type":"http"}}}]}"#,
+        )
+        .expect("parses");
+        let Some(Outbound::Block(answer)) = find_outbound(&root).expect("the config names one")
+        else {
+            panic!("the sink is the only outbound");
+        };
+        assert_eq!(answer.bytes(), ferrox_core::blackhole::HTTP_403);
+    }
+
+    /// The default is the first configured outbound, not the first protocol the finders happen to support.
+    #[test]
+    fn the_first_outbound_is_the_default_when_a_later_one_is_buildable() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"direct","protocol":"freedom","settings":{}},{"tag":"edge","protocol":"masque","settings":{"address":"127.0.0.1","port":443},"streamSettings":{"network":"masque","security":"tls","tlsSettings":{"serverName":"edge.example","allowInsecure":true}}}]}"#,
+        )
+        .expect("parses");
+        assert!(
+            matches!(find_outbound(&root), Ok(Some(Outbound::Freedom(_)))),
+            "a later masque outbound became the default"
+        );
+    }
+
+    /// xray's `direct` outbound is the handler `freedom` names: a config with only that outbound serves the direct lane.
+    #[test]
+    fn the_direct_outbound_is_the_freedom_lane() {
+        let root = crate::json::parse(r#"{"outbounds":[{"protocol":"direct","settings":{}}]}"#)
+            .expect("parses");
+        assert!(
+            matches!(find_outbound(&root), Ok(Some(Outbound::Freedom(_)))),
+            "the alias resolves to the direct dial"
+        );
+    }
+
+    /// A `block` outbound is the blackhole handler under xray's other name, both as the only lane and as a rule's tag.
+    #[test]
+    fn a_block_outbound_is_the_sink_under_either_name() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"block","settings":{"response":{"type":"http"}}}]}"#,
+        )
+        .expect("parses");
+        let Ok(Some(Outbound::Block(answer))) = find_outbound(&root) else {
+            panic!("the alias finds the sink");
+        };
+        assert_eq!(answer.bytes(), ferrox_core::blackhole::HTTP_403);
+
+        let echo_port = echo_loop();
+        let config = r#"{"outbounds":[{"tag":"direct","protocol":"direct","settings":{}},{"tag":"b","protocol":"block","settings":{"response":{"type":"http"}}}],
+            "routing":{"rules":[{"type":"field","domain":["full:blocked.test"],"outboundTag":"b"}]}}"#;
+        let front = socks_front_with(route_outbound(config, Some("in"), true));
+        let mut blocked = socks_name_client(front, "blocked.test", echo_port);
+        let mut answer = Vec::new();
+        blocked.read_to_end(&mut answer).expect("closes");
+        assert_eq!(answer, ferrox_core::blackhole::HTTP_403);
+    }
+
+    /// The sink answers the front's client with the reference's bytes and dials
+    /// nothing: the destination it was asked for never sees a connection.
+    #[test]
+    fn a_blackhole_front_answers_the_client_and_dials_nothing() {
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let front = socks_front_with(Outbound::Block(ferrox_core::blackhole::Response::Http));
+        let mut client = socks_tcp_client(front, port);
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).expect("closes");
+        assert_eq!(got, ferrox_core::blackhole::HTTP_403);
+        listener.set_nonblocking(true).expect("nonblocking");
+        assert!(
+            listener.accept().is_err(),
+            "the sink dialled the destination it was asked for"
+        );
+    }
+
+    fn blackhole_inbound(protocol: &str, settings: &str) -> u16 {
+        let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let text = format!(
+            r#"{{"inbounds":[{{"protocol":"{protocol}","listen":"127.0.0.1","port":{port}{settings}}}]}}"#
+        );
+        let root = crate::json::parse(&text).expect("parses");
+        let opened = serve_inbounds(
+            "test",
+            &root,
+            None,
+            None,
+            false,
+            &crate::reverse::Portals::default(),
+            None,
+            None,
+        );
+        assert_eq!(opened, 1, "the blackhole inbound opens");
+        port
+    }
+
+    /// The sink's inbound role answers with the reference's bytes and ends the flow, under either
+    /// name, and the silent answer writes nothing.
+    #[test]
+    fn a_blackhole_inbound_serves_all_three_answers() {
+        let port = blackhole_inbound("blackhole", r#","settings":{"response":{"type":"http"}}"#);
+        let mut client = connect_until(port);
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: blocked.test\r\n\r\n")
+            .expect("writes");
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("half-closes");
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).expect("closes");
+        assert_eq!(got, ferrox_core::blackhole::HTTP_403);
+        assert_eq!(got.len(), 101, "the inbound writes the oracle's answer");
+
+        let port = blackhole_inbound(
+            "block",
+            r#","settings":{"response":{"type":"custom","customResponseData":"QllF"}}"#,
+        );
+        let mut client = connect_until(port);
+        client.write_all(b"x").expect("writes");
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("half-closes");
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).expect("closes");
+        assert_eq!(got, b"BYE");
+
+        let port = blackhole_inbound("blackhole", "");
+        let mut client = connect_until(port);
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            client.read(&mut buf).expect("closes"),
+            0,
+            "nothing was written"
+        );
+    }
+
+    /// The first configured outbound is xray's default handler, and the rule's tag is the only one
+    /// that decides before it: a name rule blocks without ever resolving the name.
+    #[test]
+    fn a_domain_rule_chooses_the_lane_before_the_front_dials() {
+        let echo_port = echo_loop();
+        let config = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[{"type":"field","domain":["full:blocked.test"],"outboundTag":"block"}]}}"#;
+        let front = socks_front_with(route_outbound(config, Some("in"), true));
+        let mut blocked = socks_name_client(front, "blocked.test", echo_port);
+        let mut rest = Vec::new();
+        blocked.read_to_end(&mut rest).expect("closes");
+        assert!(rest.is_empty(), "a blocked flow carried {rest:?}");
+
+        let front = socks_front_with(route_outbound(config, Some("in"), true));
+        let mut allowed = socks_tcp_client(front, echo_port);
+        allowed.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        allowed.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    /// The inbound's tag is part of the flow, so two fronts on one table take different lanes.
+    #[test]
+    fn an_inbound_tag_rule_reaches_only_the_inbound_it_names() {
+        let echo_port = echo_loop();
+        let config = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[{"type":"field","inboundTag":["pinned"],"outboundTag":"block"}]}}"#;
+        let pinned = socks_front_with(route_outbound(config, Some("pinned"), true));
+        let mut blocked = socks_tcp_client(pinned, echo_port);
+        let mut buf = [0u8; 1];
+        assert_eq!(blocked.read(&mut buf).expect("closes"), 0);
+
+        let other = socks_front_with(route_outbound(config, Some("other"), true));
+        let mut allowed = socks_tcp_client(other, echo_port);
+        allowed.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        allowed.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    /// A rule the management API adds after startup routes a flow that arrives after the call, and
+    /// removing it puts the next flow back on the default lane.
+    #[test]
+    fn an_added_rule_routes_a_flow_that_arrives_after_the_call() {
+        let echo_port = echo_loop();
+        let config = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[{"type":"field","domain":["full:other.test"],"outboundTag":"block"}]}}"#;
+        let root = crate::json::parse(config).expect("parses");
+        let runtime = test_runtime(&root);
+        let shared = Arc::clone(runtime.route.as_ref().expect("route"));
+        let front = |shared: &Arc<RouteShared>| {
+            socks_front_with(Outbound::Route(Arc::new(RoutePlan::new(
+                Arc::clone(shared),
+                Some("in".to_owned()),
+                None,
+                true,
+            ))))
+        };
+
+        let mut before = socks_tcp_client(front(&shared), echo_port);
+        before.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        before.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+
+        let rule = crate::json::parse(
+            r#"{"type":"field","ruleTag":"blocked","ip":["127.0.0.1"],"outboundTag":"block"}"#,
+        )
+        .expect("parses");
+        runtime.add_rules(&[rule], true).expect("adds");
+        let mut blocked = socks_tcp_client(front(&shared), echo_port);
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            blocked.read(&mut buf).expect("closes"),
+            0,
+            "the rule the call added blocks a flow that starts after it"
+        );
+
+        runtime.remove_rules("blocked").expect("removes");
+        let mut after = socks_tcp_client(front(&shared), echo_port);
+        after.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        after.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    /// A rule added after startup changes the lane a SOCKS UDP association picks, not just the TCP
+    /// path: the association decision is read from the live table, never cached at startup.
+    #[test]
+    fn an_added_rule_changes_a_udp_association() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+                "routing":{"rules":[{"type":"field","inboundTag":["other"],"outboundTag":"block"}]}}"#,
+        )
+        .expect("parses");
+        let runtime = test_runtime(&root);
+        let shared = Arc::clone(runtime.route.as_ref().expect("route"));
+        let plan = RoutePlan::new(Arc::clone(&shared), Some("in".to_owned()), None, true);
+        assert!(
+            matches!(plan.association(), Association::Default),
+            "no rule names the inbound yet"
+        );
+
+        let rule = crate::json::parse(
+            r#"{"type":"field","ruleTag":"blocked","inboundTag":["in"],"outboundTag":"block"}"#,
+        )
+        .expect("parses");
+        runtime.add_rules(&[rule], true).expect("adds");
+        assert!(
+            matches!(plan.association(), Association::Tag(tag) if tag == "block"),
+            "the added rule changes the association decision"
+        );
+
+        runtime.remove_rules("blocked").expect("removes");
+        assert!(
+            matches!(plan.association(), Association::Default),
+            "removing the rule puts the association back on the default lane"
+        );
+    }
+
+    /// Split egress: one catch-all `network: udp` rule sends every datagram to a second outbound
+    /// while TCP keeps the first. The association collapses to that tag, so the lane is opened once
+    /// per association rather than chosen per datagram, and the destination's family or a DNS port
+    /// changes nothing.
+    #[test]
+    fn a_udp_rule_splits_datagrams_without_moving_tcp() {
+        let out = route_outbound(
+            r#"{"outbounds":[{"tag":"foxy","protocol":"freedom"},{"tag":"udp-warp","protocol":"blackhole"}],
+                "routing":{"rules":[{"type":"field","network":"udp","outboundTag":"udp-warp"}]}}"#,
+            Some("in"),
+            true,
+        );
+        let Outbound::Route(plan) = &out else {
+            panic!("a route plan");
+        };
+        let tcp = [
+            Destination::Address("192.0.2.10:443".parse().expect("v4")),
+            Destination::Address("[2001:db8::10]:443".parse().expect("v6")),
+            Destination::Name("example.test".to_owned(), 443),
+        ];
+        for asked in &tcp {
+            let (picked, tag) = plan.lane(asked, crate::router::Network::Tcp, None, None);
+            assert!(matches!(&*picked, Outbound::Freedom(_)), "{asked:?}");
+            assert_eq!(tag.as_deref(), Some("foxy"), "TCP stays on the first lane");
+        }
+        let udp = [
+            Destination::Address("192.0.2.10:53".parse().expect("v4")),
+            Destination::Address("[2001:db8::10]:53".parse().expect("v6")),
+            Destination::Name("dns.test".to_owned(), 53),
+            Destination::Address("192.0.2.10:443".parse().expect("v4 quic")),
+        ];
+        for asked in &udp {
+            let (picked, tag) = plan.lane(asked, crate::router::Network::Udp, None, None);
+            assert!(matches!(&*picked, Outbound::Block(_)), "{asked:?}");
+            assert_eq!(tag.as_deref(), Some("udp-warp"), "{asked:?}");
+        }
+        let association = plan.association();
+        assert!(
+            matches!(&association, Association::Tag(tag) if tag == "udp-warp"),
+            "one catch-all rule fixes the association"
+        );
+        assert!(matches!(
+            &*plan.udp_out(&association).expect("the lane"),
+            Outbound::Block(_)
+        ));
+    }
+
+    /// The TUN front rides the same split: its direct datagram lane asks the live table and gives
+    /// the rule's dialect settings to the dial, and a SOCKS UDP lane opens that server's
+    /// association with no loopback association between the device and the relay. Every datagram
+    /// then carries its own destination to the echo.
+    #[test]
+    fn a_device_datagram_lane_takes_the_udp_rule() {
+        let target = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let target_addr = target.local_addr().expect("addr");
+        let stop = Arc::new(AtomicBool::new(false));
+        let echo_stop = Arc::clone(&stop);
+        target
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("timeout");
+        let echo = thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while !echo_stop.load(Ordering::Relaxed) {
+                let Ok((n, src)) = target.recv_from(&mut buf) else {
+                    continue;
+                };
+                let _ = target.send_to(&buf[..n], src);
+            }
+        });
+        let server = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let server_port = server.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = server.accept().expect("accepts");
+            serve_socks(stream, &freedom(), &no_accounts());
+        });
+        let out = route_outbound(
+            &format!(
+                r#"{{"outbounds":[{{"tag":"foxy","protocol":"freedom"}},
+                    {{"tag":"udp-socks","protocol":"socks","settings":{{"servers":[{{"address":"127.0.0.1","port":{server_port}}}]}}}}],
+                    "routing":{{"rules":[{{"type":"field","network":"udp","outboundTag":"udp-socks"}}]}}}}"#
+            ),
+            Some("in"),
+            true,
+        );
+        let datagram = device_datagram(&out).expect("the UDP lane is a direct association");
+        assert!(datagram.ready(), "the live rule picks the socks lane");
+        let direct = datagram.open().expect("the association opens");
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        socket.connect(direct.relay).expect("connects");
+        let mut frame = vec![0, 0, 0];
+        push_socks_addr(&mut frame, &target_addr);
+        frame.extend_from_slice(b"split");
+        socket.send(&frame).expect("sends");
+        let mut back = vec![0u8; 2048];
+        let (n, _) = socket.recv_from(&mut back).expect("the echo");
+        let (from, payload) = parse_socks_udp(&back[..n]).expect("the frame");
+        assert_eq!(payload, b"split");
+        assert_eq!(from, target_addr);
+        stop.store(true, Ordering::Relaxed);
+        echo.join().expect("the echo worker stops");
+    }
+
+    /// A rule the management API adds before the first datagram is the lane the handler opens,
+    /// and removing it drops that lane instead of leaving the old SOCKS server in place. The
+    /// lane's `sendThrough` reaches the worker's dial rather than staying on the startup thread.
+    #[test]
+    fn a_tun_datagram_lane_follows_the_live_rule_and_its_dial_settings() {
+        let server = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let server_port = server.local_addr().expect("addr").port();
+        let (peer_tx, peer_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (stream, _) = server.accept().expect("accepts");
+            peer_tx
+                .send(stream.peer_addr().expect("peer"))
+                .expect("reports");
+            serve_socks(stream, &freedom(), &no_accounts());
+        });
+        // Linux owns 127/8, so only there does binding 127.0.0.2 witness this source.
+        let dial_source = if cfg!(target_os = "linux") {
+            "127.0.0.2"
+        } else {
+            "127.0.0.1"
+        };
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds":[{{"tag":"foxy","protocol":"freedom"}},
+                {{"tag":"udp-socks","protocol":"socks","sendThrough":"{dial_source}",
+                  "settings":{{"servers":[{{"address":"127.0.0.1","port":{server_port}}}]}}}}],
+                "routing":{{"rules":[{{"type":"field","network":"udp","domain":["full:quic.test"],
+                  "outboundTag":"udp-socks"}}]}}}}"#
+        ))
+        .expect("parses");
+        let runtime = test_runtime(&root);
+        let shared = Arc::clone(runtime.route.as_ref().expect("route"));
+        let out = Outbound::Route(Arc::new(RoutePlan::new(
+            Arc::clone(&shared),
+            Some("in".to_owned()),
+            None,
+            true,
+        )));
+        let datagram = device_datagram(&out).expect("a route plan can supply a lane");
+        assert!(
+            !datagram.ready(),
+            "a destination rule leaves the association split"
+        );
+        assert!(
+            datagram.open().is_none(),
+            "a split association has no one lane"
+        );
+
+        let rule = crate::json::parse(
+            r#"{"type":"field","ruleTag":"udp-lane","network":"udp","outboundTag":"udp-socks"}"#,
+        )
+        .expect("parses");
+        runtime.add_rules(&[rule], true).expect("adds");
+        assert!(datagram.ready(), "the catch-all rule makes the lane stable");
+        let direct = datagram.open().expect("the live rule opens the socks lane");
+        let peer = peer_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the lane dials");
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            peer.ip(),
+            "127.0.0.2".parse::<IpAddr>().expect("source"),
+            "the lane's sendThrough reached the worker's dial"
+        );
+        #[cfg(not(target_os = "linux"))]
+        let _ = peer;
+        drop(direct);
+
+        runtime.remove_rules("udp-lane").expect("removes");
+        assert!(
+            !datagram.ready(),
+            "removing the catch-all returns the association to split"
+        );
+        assert!(
+            datagram.open().is_none(),
+            "no stale socks lane survives the removal"
+        );
+    }
+
+    /// A rule that names a destination cannot fix one lane per association, so the same split
+    /// stays per datagram instead of silently sending the rest to one tag.
+    #[test]
+    fn a_destination_udp_rule_leaves_the_association_split() {
+        let out = route_outbound(
+            r#"{"outbounds":[{"tag":"foxy","protocol":"freedom"},{"tag":"udp-warp","protocol":"blackhole"}],
+                "routing":{"rules":[{"type":"field","network":"udp","domain":["full:quic.test"],"outboundTag":"udp-warp"}]}}"#,
+            Some("in"),
+            true,
+        );
+        let Outbound::Route(plan) = &out else {
+            panic!("a route plan");
+        };
+        assert!(matches!(plan.association(), Association::Split));
+        let (picked, tag) = plan.lane(
+            &Destination::Name("quic.test".to_owned(), 443),
+            crate::router::Network::Udp,
+            None,
+            None,
+        );
+        assert!(matches!(&*picked, Outbound::Block(_)));
+        assert_eq!(tag.as_deref(), Some("udp-warp"));
+        let (picked, tag) = plan.lane(
+            &Destination::Name("other.test".to_owned(), 443),
+            crate::router::Network::Udp,
+            None,
+            None,
+        );
+        assert!(matches!(&*picked, Outbound::Freedom(_)));
+        assert_eq!(
+            tag.as_deref(),
+            Some("foxy"),
+            "an unmatched datagram keeps the default lane"
+        );
+    }
+
+    /// A server inbound never evaluates a rule, so a rule the API adds for one must agree with its
+    /// direct dial; a blocking target would be stored and silently ignored, so the call refuses it.
+    #[test]
+    fn a_rule_that_cannot_reach_a_server_inbound_is_refused_by_add_rule() {
+        let root = crate::json::parse(
+            r#"{"inbounds":[{"tag":"served","protocol":"vless","listen":"127.0.0.1","port":12345,
+                "settings":{"clients":[{"id":"8b2f3c1e-6a3e-4a56-9b8c-7f0b2a1d4c5e"}]}},
+                {"tag":"client","protocol":"socks","listen":"127.0.0.1","port":12346,"settings":{"auth":"noauth"}}],
+                "outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"},{"tag":"remote","protocol":"vmess","settings":{"vnext":[{"address":"127.0.0.1","port":1,"users":[{"id":"8b2f3c1e-6a3e-4a56-9b8c-7f0b2a1d4c5e"}]}]}}],
+                "routing":{"rules":[{"type":"field","inboundTag":["client"],"domain":["full:other.test"],"outboundTag":"block"},{"type":"field","inboundTag":["client"],"domain":["full:remote.test"],"outboundTag":"remote"}]}}"#,
+        )
+        .expect("parses");
+        let runtime = test_runtime(&root);
+        let before = runtime.listed_rules().len();
+        let blocked = crate::json::parse(
+            r#"{"type":"field","ruleTag":"blocked","inboundTag":["served"],"outboundTag":"remote"}"#,
+        )
+        .expect("parses");
+        let error = runtime
+            .add_rules(&[blocked], true)
+            .expect_err("the server inbound dials direct");
+        assert!(
+            error.contains("served") && error.contains("remote"),
+            "{error}"
+        );
+        assert_eq!(
+            runtime.listed_rules().len(),
+            before,
+            "the refused rule never entered the table"
+        );
+
+        let allowed = crate::json::parse(
+            r#"{"type":"field","ruleTag":"served-direct","inboundTag":["served"],"outboundTag":"direct"}"#,
+        )
+        .expect("parses");
+        runtime
+            .add_rules(&[allowed], true)
+            .expect("a direct rule for the server inbound is added");
+        assert_eq!(runtime.listed_rules().len(), before + 1);
+    }
+
+    /// A default outbound that is not freedom is not the direct dial a server inbound serves, even
+    /// though its tag is the default: a rule naming it would be stored and never evaluated.
+    #[test]
+    fn a_server_rule_naming_a_non_freedom_default_is_refused() {
+        let root = crate::json::parse(
+            r#"{"inbounds":[{"tag":"served","protocol":"vless","listen":"127.0.0.1","port":12345,
+                "settings":{"clients":[{"id":"8b2f3c1e-6a3e-4a56-9b8c-7f0b2a1d4c5e"}]}}],
+                "outbounds":[{"tag":"default","protocol":"vmess","settings":{"vnext":[{"address":"127.0.0.1","port":1,"users":[{"id":"8b2f3c1e-6a3e-4a56-9b8c-7f0b2a1d4c5e"}]}]}}],"routing":{}}"#,
+        )
+        .expect("parses");
+        let runtime = test_runtime(&root);
+        let rule = crate::json::parse(
+            r#"{"type":"field","ruleTag":"served-default","inboundTag":["served"],"outboundTag":"default"}"#,
+        )
+        .expect("parses");
+        let error = runtime
+            .add_rules(&[rule], true)
+            .expect_err("the default outbound is not freedom");
+        assert!(error.contains("default"), "{error}");
+    }
+
+    /// `direct_tag` reads the live outbound table: a tag removed and re-added as a non-freedom lane
+    /// is no longer direct, and a removed default tag is no longer the direct dial.
+    #[test]
+    fn a_server_rule_reads_the_live_directness_of_its_target() {
+        let root = crate::json::parse(
+            r#"{"inbounds":[{"tag":"served","protocol":"vless","listen":"127.0.0.1","port":12345,
+                "settings":{"clients":[{"id":"8b2f3c1e-6a3e-4a56-9b8c-7f0b2a1d4c5e"}]}}],
+                "outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"alt","protocol":"freedom"}],
+                "routing":{"rules":[{"type":"field","inboundTag":["client"],"outboundTag":"alt"}]}}"#,
+        )
+        .expect("parses");
+        let runtime = test_runtime(&root);
+        let shared = Arc::clone(runtime.route.as_ref().expect("route"));
+        let rule = |tag: &str| {
+            crate::json::parse(&format!(
+                r#"{{"type":"field","ruleTag":"served-{tag}","inboundTag":["served"],"outboundTag":"{tag}"}}"#
+            ))
+            .expect("parses")
+        };
+
+        shared.remove_outbound("alt");
+        shared
+            .add_outbound(
+                "alt",
+                Outbound::Block(ferrox_core::blackhole::Response::None),
+            )
+            .expect("re-adds alt as a block");
+        let error = runtime
+            .add_rules(&[rule("alt")], true)
+            .expect_err("alt now blocks, so the server cannot dial it direct");
+        assert!(error.contains("alt"), "{error}");
+
+        shared.remove_outbound("direct");
+        let error = runtime
+            .add_rules(&[rule("direct")], true)
+            .expect_err("the default tag was removed, so it no longer dials direct");
+        assert!(error.contains("direct"), "{error}");
+
+        shared
+            .add_outbound("direct", freedom())
+            .expect("restores the default as freedom");
+        shared.remove_outbound("alt");
+        shared
+            .add_outbound("alt", freedom())
+            .expect("re-adds alt as freedom");
+        runtime
+            .add_rules(&[rule("alt")], true)
+            .expect("a live freedom tag is still a direct dial");
+    }
+
+    #[test]
+    fn adding_a_blocked_outbound_cannot_break_a_running_server_route() {
+        let root = crate::json::parse(
+            r#"{"inbounds":[{"tag":"served","protocol":"vless","listen":"127.0.0.1","port":12345,
+                "settings":{"clients":[{"id":"8b2f3c1e-6a3e-4a56-9b8c-7f0b2a1d4c5e"}]}}],
+                "outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"alt","protocol":"freedom"}],
+                "routing":{"rules":[{"type":"field","inboundTag":["served"],"outboundTag":"alt"}]}}"#,
+        )
+        .expect("parses");
+        let runtime = test_runtime(&root);
+        let shared = Arc::clone(runtime.route.as_ref().expect("route"));
+        shared.remove_outbound("alt");
+        let error = shared
+            .add_outbound(
+                "alt",
+                Outbound::Block(ferrox_core::blackhole::Response::None),
+            )
+            .expect_err("the served inbound still needs a direct lane");
+        assert!(error.contains("alt"), "{error}");
+        shared
+            .add_outbound("alt", freedom())
+            .expect("a direct lane keeps the server route valid");
+    }
+
+    /// A `vlessRoute` rule reads the route id a flow carries: a socks flow carries none, so it reads
+    /// 0 and a list holding 0 blocks it, while a list of ids the client never sent leaves it alone.
+    #[test]
+    fn a_vless_route_rule_reads_the_zero_a_socks_flow_carries() {
+        let echo_port = echo_loop();
+        let config = |routes: &str| {
+            format!(
+                r#"{{"outbounds":[{{"tag":"direct","protocol":"freedom"}},{{"tag":"block","protocol":"blackhole"}}],
+                "routing":{{"rules":[{{"type":"field","vlessRoute":{routes},"outboundTag":"block"}}]}}}}"#
+            )
+        };
+        let blocked_front = socks_front_with(route_outbound(&config(r#"["0"]"#), Some("in"), true));
+        let mut blocked = socks_tcp_client(blocked_front, echo_port);
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            blocked.read(&mut buf).expect("closes"),
+            0,
+            "a flow that sent no route id reads 0, which the rule names"
+        );
+
+        let other_front = socks_front_with(route_outbound(&config(r#"["7"]"#), Some("in"), true));
+        let mut allowed = socks_tcp_client(other_front, echo_port);
+        allowed.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        allowed.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    /// The authenticated account's email is part of the flow: a `user` rule blocks that account
+    /// and leaves another account of the same front on the default lane.
+    #[test]
+    fn a_user_rule_reaches_only_the_account_it_names() {
+        let echo_port = echo_loop();
+        let config = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[{"type":"field","user":["a@x"],"outboundTag":"block"}]}}"#;
+        let accounts = socks_accounts(
+            &crate::json::parse(
+                r#"{"settings":{"auth":"password","accounts":[
+                    {"user":"a","pass":"a","email":"a@x"},
+                    {"user":"b","pass":"b","email":"b@x"}]}}"#,
+            )
+            .expect("parses"),
+        );
+        let blocked_front =
+            socks_front_with_accounts(route_outbound(config, Some("in"), true), accounts.clone());
+        let mut blocked = socks_ask_with_credential(
+            blocked_front,
+            SocketAddr::from(([127, 0, 0, 1], echo_port)),
+            "a",
+            "a",
+        );
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            blocked.read(&mut buf).expect("closes"),
+            0,
+            "the account the rule names is blocked"
+        );
+
+        let allowed_front =
+            socks_front_with_accounts(route_outbound(config, Some("in"), true), accounts);
+        let mut allowed = socks_ask_with_credential(
+            allowed_front,
+            SocketAddr::from(([127, 0, 0, 1], echo_port)),
+            "b",
+            "b",
+        );
+        allowed.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        allowed.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    /// The forward front sets the attributes xray's plain-HTTP handler does: the uppercased method,
+    /// the percent-decoded path without its query, and the head's headers.
+    #[test]
+    fn an_attrs_rule_reads_the_head_a_forward_front_carried() {
+        let echo = echo_loop();
+        let config = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[{"type":"field","attrs":{":path":"^/blocked"},"outboundTag":"block"}]}}"#;
+        let blocked_front = http_front_with(route_outbound(config, Some("in"), true));
+        let mut blocked = Connection::connect(("127.0.0.1", blocked_front)).expect("connects");
+        blocked
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        blocked
+            .write_all(
+                format!(
+                    "GET http://127.0.0.1:{echo}/blo%63ked/x?q=1 HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .expect("gets");
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            blocked.read(&mut buf).expect("closes"),
+            0,
+            "the decoded path names the block"
+        );
+
+        let allowed_front = http_front_with(route_outbound(config, Some("in"), true));
+        let mut allowed = Connection::connect(("127.0.0.1", allowed_front)).expect("connects");
+        allowed
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        allowed
+            .write_all(
+                format!(
+                    "GET http://127.0.0.1:{echo}/ok HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .expect("gets");
+        let head =
+            read_http_head(&mut allowed, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("echoes the head");
+        assert_eq!(
+            head,
+            format!("GET /ok HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\n\r\n").into_bytes()
+        );
+    }
+
+    /// The reference sets an empty `User-Agent` before it collects attributes, so a head that sent
+    /// none still holds the `^$` pattern a rule names.
+    #[test]
+    fn an_attrs_rule_reads_the_empty_user_agent_the_front_inserts() {
+        let echo = echo_loop();
+        let config = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[{"type":"field","attrs":{"user-agent":"^$"},"outboundTag":"block"}]}}"#;
+        let blocked_front = http_front_with(route_outbound(config, Some("in"), true));
+        let mut blocked = Connection::connect(("127.0.0.1", blocked_front)).expect("connects");
+        blocked
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        blocked
+            .write_all(
+                format!(
+                    "GET http://127.0.0.1:{echo}/ok HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .expect("gets");
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            blocked.read(&mut buf).expect("closes"),
+            0,
+            "the empty user agent names the block"
+        );
+
+        let allowed_front = http_front_with(route_outbound(config, Some("in"), true));
+        let mut allowed = Connection::connect(("127.0.0.1", allowed_front)).expect("connects");
+        allowed
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        allowed
+            .write_all(
+                format!(
+                    "GET http://127.0.0.1:{echo}/ok HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\n\
+                     User-Agent: probe\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .expect("gets");
+        let head =
+            read_http_head(&mut allowed, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("echoes the head");
+        assert_eq!(
+            head,
+            format!("GET /ok HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\nUser-Agent: probe\r\n\r\n")
+                .into_bytes()
+        );
+    }
+
+    /// A `User-Agent` whose value is not UTF-8 still holds a value for the rules: the empty
+    /// pattern must not match it, so the request is forwarded.
+    #[test]
+    fn a_non_utf8_user_agent_is_not_the_empty_one() {
+        let echo = echo_loop();
+        let config = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[{"type":"field","attrs":{"user-agent":"^$"},"outboundTag":"block"}]}}"#;
+        let front = http_front_with(route_outbound(config, Some("in"), true));
+        let mut client = Connection::connect(("127.0.0.1", front)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let mut head = format!(
+            "GET http://127.0.0.1:{echo}/ok HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\nUser-Agent: "
+        )
+        .into_bytes();
+        head.push(0xff);
+        head.extend_from_slice(b"\r\n\r\n");
+        client.write_all(&head).expect("gets");
+        let seen = read_http_head(&mut client, HEAD_LIMIT_TEST, HEAD_DEADLINE)
+            .expect("the request is forwarded, not blocked");
+        let mut left =
+            format!("GET /ok HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\nUser-Agent: ").into_bytes();
+        left.push(0xff);
+        left.extend_from_slice(b"\r\n\r\n");
+        assert_eq!(seen, left);
+    }
+
+    /// What the origin sees after the removal is the head minus the credential line, in place; what the rules see is that head minus every field the hop-by-hop list owns. Both are asserted on one request, so a walk that kept a line or lost one shows up as bytes.
+    #[test]
+    fn the_forwarded_head_is_what_the_removal_left() {
+        let echo = echo_loop();
+        let front = |attrs: &str| {
+            let config = format!(
+                r#"{{"outbounds":[{{"tag":"direct","protocol":"freedom"}},{{"tag":"block","protocol":"blackhole"}}],
+                    "routing":{{"rules":[{{"type":"field","attrs":{attrs},"outboundTag":"block"}}]}}}}"#
+            );
+            http_front_with(route_outbound(&config, Some("in"), true))
+        };
+        let ask = |front: u16| {
+            let mut client = Connection::connect(("127.0.0.1", front)).expect("connects");
+            client
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .expect("timeout");
+            client
+                .write_all(
+                    format!(
+                        "GET http://127.0.0.1:{echo}/ok HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\n\
+                         User-Agent: probe\r\nX-Request-Id: 0123\r\n\
+                         Connection: keep-alive\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .expect("gets");
+            client
+        };
+        let mut blocked = ask(front(r#"{"user-agent":"^probe$"}"#));
+        let mut one = [0u8; 1];
+        assert_eq!(
+            blocked.read(&mut one).expect("closes"),
+            0,
+            "a field the head sent under its own name reaches the rules"
+        );
+        let left = format!(
+            "GET /ok HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\nUser-Agent: probe\r\n\
+             X-Request-Id: 0123\r\nConnection: keep-alive\r\n\r\n"
+        )
+        .into_bytes();
+        for attrs in [
+            r#"{"proxy-authorization":"^Basic"}"#,
+            r#"{"connection":"^keep-alive$"}"#,
+            r#"{"keep-alive":"^$"}"#,
+        ] {
+            let mut client = ask(front(attrs));
+            let head = read_http_head(&mut client, HEAD_LIMIT_TEST, HEAD_DEADLINE)
+                .expect("echoes the head");
+            assert_eq!(head, left, "{attrs} names a field the removal took");
+        }
+    }
+
+    /// The HTTP sniffer sets the attributes before the rules run, so a head it reads off a socks flow
+    /// routes that flow even though the domain it named is where the flow goes.
+    #[test]
+    fn an_attrs_rule_reads_the_head_the_sniffer_read() {
+        let echo = echo_loop();
+        let config = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[{"type":"field","attrs":{":method":"^PUT$"},"outboundTag":"block"}]}}"#;
+        let value =
+            crate::json::parse(r#"{"enabled":true,"destOverride":["http"]}"#).expect("json");
+        let sniffing = crate::sniff::parse(Some(&value)).expect("sniffing");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = front.local_addr().expect("addr").port();
+        let out = route_outbound(config, Some("in"), true);
+        thread::spawn(move || {
+            crate::sniff::install_current(sniffing);
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+        });
+        let mut blocked = socks_ask(port, SocketAddr::from(([127, 0, 0, 1], echo)));
+        blocked
+            .write_all(
+                format!("PUT /blocked HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\n\r\n").as_bytes(),
+            )
+            .expect("puts");
+        let mut buf = [0u8; 1];
+        assert!(
+            matches!(blocked.read(&mut buf), Ok(0) | Err(_)),
+            "the sniffed method names the block"
+        );
+
+        let value =
+            crate::json::parse(r#"{"enabled":true,"destOverride":["http"]}"#).expect("json");
+        let sniffing = crate::sniff::parse(Some(&value)).expect("sniffing");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = front.local_addr().expect("addr").port();
+        let out = route_outbound(config, Some("in"), true);
+        thread::spawn(move || {
+            crate::sniff::install_current(sniffing);
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+        });
+        let mut allowed = socks_ask(port, SocketAddr::from(([127, 0, 0, 1], echo)));
+        let head = format!("GET /blocked HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\n");
+        allowed
+            .write_all(format!("{head}\r\n").as_bytes())
+            .expect("gets");
+        let mut back = vec![0u8; head.len() + 2];
+        allowed.read_exact(&mut back).expect("echoes");
+        assert_eq!(back, format!("{head}\r\n").into_bytes());
+    }
+
+    /// A datagram names its own destination, so an association the rules could split runs one lane
+    /// per chosen tag: the blocked destination is dropped, and the allowed one still reaches its echo.
+    #[test]
+    fn an_association_the_rules_could_split_runs_one_lane_per_tag() {
+        let blocked = udp_echo_loop();
+        let allowed = udp_echo_loop();
+        let config = format!(
+            r#"{{"outbounds":[{{"tag":"direct","protocol":"freedom"}},{{"tag":"block","protocol":"blackhole"}}],
+            "routing":{{"rules":[
+                {{"type":"field","port":{blocked},"outboundTag":"block"}},
+                {{"type":"field","inboundTag":["in"],"outboundTag":"direct"}}]}}}}"#
+        );
+        let front = socks_front_with(route_outbound(&config, Some("in"), true));
+        let mut client = Connection::connect(("127.0.0.1", front)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(reply[1], 0, "the split association is served: {reply:?}");
+        let relay: SocketAddr = SocketAddr::new(
+            std::net::IpAddr::V4([127, 0, 0, 1].into()),
+            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+        );
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        udp.set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("timeout");
+        let frame = |port: u16, payload: &[u8]| {
+            let mut datagram = vec![0u8, 0, 0];
+            push_socks_addr(
+                &mut datagram,
+                &format!("127.0.0.1:{port}").parse().expect("addr"),
+            );
+            datagram.extend_from_slice(payload);
+            datagram
+        };
+        udp.send_to(&frame(blocked, b"drop"), relay).expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        if let Ok((n, from)) = udp.recv_from(&mut back) {
+            panic!(
+                "the blocked lane answered from {from} with {:?}",
+                &back[..n]
+            );
+        }
+        let source = udp_roundtrip(&udp, relay, &frame(allowed, b"ping"), b"ping");
+        assert_eq!(source.port(), allowed);
+    }
+
+    /// A split association lives on its control connection: once the client drops it, the relay
+    /// and its lanes must end, or a lane's late answer can land on the next association's reused
+    /// port.
+    #[test]
+    fn a_split_udp_association_ends_with_its_control_connection() {
+        let config = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[
+                {"type":"field","port":1,"outboundTag":"block"},
+                {"type":"field","inboundTag":["in"],"outboundTag":"direct"}]}}"#;
+        let out = route_outbound(config, Some("in"), true);
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = front.local_addr().expect("addr").port();
+        let (done, finished) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+            let _ = done.send(());
+        });
+        let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(reply[1], 0, "the split association is served: {reply:?}");
+        drop(client);
+        assert!(
+            finished.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "the split association outlived its control connection"
+        );
+    }
+
+    /// The control close is noticed while datagrams keep arriving, not only on an idle tick: a
+    /// steady stream used to keep the relay alive after the client had gone.
+    #[test]
+    fn a_split_udp_association_ends_under_a_datagram_stream() {
+        let allowed = udp_echo_loop();
+        let config = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[
+                {"type":"field","port":1,"outboundTag":"block"},
+                {"type":"field","inboundTag":["in"],"outboundTag":"direct"}]}}"#;
+        let out = route_outbound(config, Some("in"), true);
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = front.local_addr().expect("addr").port();
+        let (done, finished) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+            let _ = done.send(());
+        });
+        let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(reply[1], 0, "the split association is served: {reply:?}");
+        let relay: SocketAddr = SocketAddr::new(
+            std::net::IpAddr::V4([127, 0, 0, 1].into()),
+            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+        );
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let mut frame = vec![0u8, 0, 0];
+        push_socks_addr(
+            &mut frame,
+            &format!("127.0.0.1:{allowed}").parse().expect("addr"),
+        );
+        frame.extend_from_slice(b"ping");
+        udp_roundtrip(&udp, relay, &frame, b"ping");
+        drop(client);
+        udp.set_read_timeout(Some(Duration::from_millis(20)))
+            .expect("timeout");
+        let stop = Arc::new(AtomicBool::new(false));
+        let sending = Arc::clone(&stop);
+        let stream = thread::spawn(move || {
+            let mut back = vec![0u8; UDP_BUF];
+            while !sending.load(Ordering::Relaxed) {
+                let _ = udp.send_to(&frame, relay);
+                let _ = udp.recv_from(&mut back);
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let ended = finished.recv_timeout(Duration::from_secs(2)).is_ok();
+        stop.store(true, Ordering::Relaxed);
+        let _ = stream.join();
+        assert!(
+            ended,
+            "the split association outlived its control under a datagram stream"
+        );
+    }
+
+    /// An inner split lane is spoken to by the splitter's relay address, not the remote control
+    /// peer: the handler must validate the peer the dispatcher passes, or a remote client's valid
+    /// datagrams die at the lane's source check.
+    #[test]
+    fn a_split_udp_lane_accepts_its_own_relay_sender() {
+        let Ok(front) = crate::conn::test_bind("127.0.0.2:0") else {
+            return;
+        };
+        let port = front.local_addr().expect("addr").port();
+        let config = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[
+                {"type":"field","port":1,"outboundTag":"block"},
+                {"type":"field","inboundTag":["in"],"outboundTag":"direct"}]}}"#;
+        let out = route_outbound(config, Some("in"), true);
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+        });
+        let Ok(mut client) = Connection::connect(("127.0.0.2", port)) else {
+            return;
+        };
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(reply[1], 0, "the split association is served: {reply:?}");
+        assert_eq!(
+            reply[3], 1,
+            "the relay answer is an IPv4 address: {reply:?}"
+        );
+        let relay = SocketAddr::new(
+            IpAddr::V4(std::net::Ipv4Addr::new(
+                reply[4], reply[5], reply[6], reply[7],
+            )),
+            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+        );
+        let allowed = udp_echo_loop();
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let mut frame = vec![0u8, 0, 0];
+        push_socks_addr(
+            &mut frame,
+            &format!("127.0.0.1:{allowed}").parse().expect("addr"),
+        );
+        frame.extend_from_slice(b"ping");
+        assert!(
+            udp_roundtrip_within(&udp, relay, &frame, b"ping", Duration::from_secs(2)).is_some(),
+            "the lane rejected the splitter's own relay address"
+        );
+        drop(client);
+    }
+
+    /// Silence past the budget is death here too: a sniffed association with no traffic hands its
+    /// thread back at `udp_idle` even while its control stays open.
+    #[test]
+    fn a_quiet_sniffed_udp_association_hands_its_thread_back() {
+        budgets::apply(&crate::config::Budgets {
+            udp_idle: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
+        let value =
+            crate::json::parse(r#"{"enabled":true,"destOverride":["http"]}"#).expect("json");
+        let sniffing = crate::sniff::parse(Some(&value)).expect("sniffing");
+        let out = freedom();
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = front.local_addr().expect("addr").port();
+        let (done, finished) = std::sync::mpsc::channel();
+        let serving = crate::budgets::spawn(move || {
+            crate::sniff::install_current(sniffing);
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+            let _ = done.send(());
+        });
+        let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(reply[1], 0, "the sniffed association is served: {reply:?}");
+        let ended = finished
+            .recv_timeout(Duration::from_millis(250) + Duration::from_secs(5))
+            .is_ok();
+        budgets::clear();
+        if ended {
+            serving.join().expect("joins");
+        }
+        assert!(ended, "a quiet sniffed association ends on its idle budget");
+    }
+
+    /// A sniffed association lives on its control connection too: dropping the control ends the
+    /// relay instead of waiting out `udp_idle`.
+    #[test]
+    fn a_sniffed_udp_association_ends_with_its_control_connection() {
+        let value =
+            crate::json::parse(r#"{"enabled":true,"destOverride":["http"]}"#).expect("json");
+        let sniffing = crate::sniff::parse(Some(&value)).expect("sniffing");
+        let out = freedom();
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = front.local_addr().expect("addr").port();
+        let (done, finished) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            crate::sniff::install_current(sniffing);
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+            let _ = done.send(());
+        });
+        let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(reply[1], 0, "the sniffed association is served: {reply:?}");
+        drop(client);
+        assert!(
+            finished.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "the sniffed association outlived its control connection"
+        );
+    }
+
+    /// A split association resolves the process from the UDP sender, not the TCP control
+    /// connection: the control connection's port names no UDP socket.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_split_udp_association_names_the_process_from_the_datagram_sender() {
+        let echo = udp_echo_loop();
+        let blocked = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[
+                {"type":"field","process":["self/"],"outboundTag":"block"},
+                {"type":"field","inboundTag":["in"],"outboundTag":"direct"}]}}"#;
+        let allowed = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[
+                {"type":"field","process":["not-this-process"],"outboundTag":"block"},
+                {"type":"field","inboundTag":["in"],"outboundTag":"direct"}]}}"#;
+        let associate = |config: &str| {
+            let front = socks_front_with(route_outbound(config, Some("in"), true));
+            let mut client = Connection::connect(("127.0.0.1", front)).expect("connects");
+            client
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .expect("timeout");
+            client.write_all(&[5, 1, 0]).expect("greets");
+            let mut method = [0u8; 2];
+            client.read_exact(&mut method).expect("selects");
+            client
+                .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+                .expect("associates");
+            let mut reply = [0u8; 10];
+            client.read_exact(&mut reply).expect("replies");
+            assert_eq!(reply[1], 0, "the split association is served: {reply:?}");
+            let relay: SocketAddr = SocketAddr::new(
+                std::net::IpAddr::V4([127, 0, 0, 1].into()),
+                u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+            );
+            (client, relay)
+        };
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let mut frame = vec![0u8, 0, 0];
+        push_socks_addr(
+            &mut frame,
+            &format!("127.0.0.1:{echo}").parse().expect("addr"),
+        );
+        frame.extend_from_slice(b"drop");
+        let (_blocked_client, relay) = associate(blocked);
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        // A connected probe takes only this relay's datagrams, so another association on loopback cannot answer for it.
+        probe.connect(relay).expect("connects");
+        probe
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("timeout");
+        probe.send(&frame).expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        assert!(
+            probe.recv(&mut back).is_err(),
+            "the sender's process names the block"
+        );
+        let (_allowed_client, relay) = associate(allowed);
+        let source = udp_roundtrip(&udp, relay, &frame, b"drop");
+        assert_eq!(
+            source.port(),
+            echo,
+            "the same lane echoes when the rule misses"
+        );
+    }
+
+    /// A split association keeps the client's name: a domain rule drops the datagram before any
+    /// resolver sees it, and an address datagram still rides the same association.
+    #[test]
+    fn a_split_association_routes_a_datagram_by_its_name() {
+        let allowed = udp_echo_loop();
+        let config = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[
+                {"type":"field","domain":["full:blocked.test"],"outboundTag":"block"},
+                {"type":"field","inboundTag":["in"],"outboundTag":"direct"}]}}"#;
+        let front = socks_front_with(route_outbound(config, Some("in"), true));
+        let mut client = Connection::connect(("127.0.0.1", front)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(reply[1], 0, "the split association is served: {reply:?}");
+        let relay: SocketAddr = SocketAddr::new(
+            std::net::IpAddr::V4([127, 0, 0, 1].into()),
+            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+        );
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        // A connected probe takes only this relay's datagrams, and one source keeps the datagrams in order.
+        probe.connect(relay).expect("connects");
+        let name_frame = |name: &str, port: u16| {
+            let mut datagram = vec![0u8, 0, 0, 3, name.len() as u8];
+            datagram.extend_from_slice(name.as_bytes());
+            datagram.extend_from_slice(&port.to_be_bytes());
+            datagram.extend_from_slice(b"drop");
+            datagram
+        };
+        probe
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("timeout");
+        probe.send(&name_frame("blocked.test", 443)).expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        assert!(
+            probe.recv(&mut back).is_err(),
+            "a name rule drops it before a resolver sees it"
+        );
+        let mut frame = vec![0u8, 0, 0];
+        push_socks_addr(
+            &mut frame,
+            &format!("127.0.0.1:{allowed}").parse().expect("addr"),
+        );
+        frame.extend_from_slice(b"ping");
+        probe
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .expect("timeout");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            assert!(Instant::now() < deadline, "no echo to {frame:?}");
+            probe.send(&frame).expect("sends");
+            let Ok(n) = probe.recv(&mut back) else {
+                continue;
+            };
+            let Some((_, payload)) = parse_socks_udp(&back[..n]) else {
+                continue;
+            };
+            assert_ne!(
+                payload, b"drop",
+                "a name rule drops it before a resolver sees it"
+            );
+            if payload == b"ping" {
+                break;
+            }
+        }
+    }
+
+    /// A lane whose loop ended is retired, so the next datagram for its tag opens a fresh socket
+    /// rather than writing to one nobody reads.
+    #[test]
+    fn a_finished_udp_lane_is_retired_before_its_key_is_reused() {
+        let address: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+        let key = "lane";
+        let handle = thread::spawn(|| {});
+        while !handle.is_finished() {
+            thread::yield_now();
+        }
+        let waker = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let mut lanes = HashMap::from([(
+            key.to_owned(),
+            UdpLane {
+                address,
+                handle,
+                waker,
+            },
+        )]);
+        let mut replies = HashSet::from([address]);
+        let _ = retire_finished_lane(&mut lanes, &mut replies, key);
+        assert!(!lanes.contains_key(key));
+        assert!(!replies.contains(&address));
+    }
+
+    /// A balancer picks a lane per flow: the round robin walks the selected tags in config order,
+    /// and a strategy with no observatory falls back where the reference does.
+    #[test]
+    fn a_balancer_rule_picks_its_lane_per_flow() {
+        let out = route_outbound(
+            r#"{"outbounds":[{"tag":"lane-b","protocol":"blackhole"},{"tag":"lane-a","protocol":"freedom"}],
+                "routing":{"balancers":[{"tag":"pool","selector":["lane-"],"strategy":"roundRobin"}],
+                "rules":[{"type":"field","network":"tcp","balancerTag":"pool"}]}}"#,
+            Some("in"),
+            true,
+        );
+        let Outbound::Route(plan) = &out else {
+            panic!("a route plan");
+        };
+        let asked = Destination::Name("echo.test".to_owned(), 443);
+        assert!(
+            matches!(
+                &*plan.pick(&asked, crate::router::Network::Tcp, None, None),
+                Outbound::Freedom(_)
+            ),
+            "candidates are ordered by tag, not by config order"
+        );
+        assert!(matches!(
+            &*plan.pick(&asked, crate::router::Network::Tcp, None, None),
+            Outbound::Block(_)
+        ));
+        assert!(matches!(
+            &*plan.pick(&asked, crate::router::Network::Tcp, None, None),
+            Outbound::Freedom(_)
+        ));
+
+        let out = route_outbound(
+            r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"spare","protocol":"freedom"}],
+                "routing":{"balancers":[{"tag":"pool","selector":["spare"],"strategy":"leastPing","fallbackTag":"direct"}],
+                "rules":[{"type":"field","network":"tcp","balancerTag":"pool"}]}}"#,
+            Some("in"),
+            true,
+        );
+        let Outbound::Route(plan) = &out else {
+            panic!("a route plan");
+        };
+        let (picked, tag) = plan.lane(&asked, crate::router::Network::Tcp, None, None);
+        assert!(matches!(&*picked, Outbound::Freedom(_)));
+        assert_eq!(
+            tag.as_deref(),
+            Some("direct"),
+            "an observatory-less pick falls back"
+        );
+    }
+
+    /// A balancer tag and an outbound tag may be the same name; an `outboundTag` rule still takes
+    /// that outbound, where a `balancerTag` rule takes the drawing.
+    #[test]
+    fn an_outbound_tag_that_shares_a_balancer_tag_is_still_an_outbound() {
+        let out = route_outbound(
+            r#"{"outbounds":[{"tag":"pool","protocol":"freedom"},{"tag":"lane-a","protocol":"blackhole"}],
+                "routing":{"balancers":[{"tag":"pool","selector":["lane-"],"strategy":"roundRobin"}],
+                "rules":[{"type":"field","network":"tcp","outboundTag":"pool"}]}}"#,
+            Some("in"),
+            true,
+        );
+        let Outbound::Route(plan) = &out else {
+            panic!("a route plan");
+        };
+        let asked = Destination::Name("echo.test".to_owned(), 443);
+        let (picked, tag) = plan.lane(&asked, crate::router::Network::Tcp, None, None);
+        assert!(matches!(&*picked, Outbound::Freedom(_)));
+        assert_eq!(tag.as_deref(), Some("pool"));
+    }
+
+    /// A `dialerProxy` that names a missing, self or cyclic outbound is a startup refusal, and a
+    /// `fragment` the config names is built as the hop it is; an empty name stays a direct dial.
+    #[test]
+    fn the_route_registry_resolves_dialer_proxy_hops() {
+        let build = |text: &str| {
+            let root = crate::json::parse(text).expect("parses");
+            let routing = routing_for(&root).expect("parses").expect("a plan");
+            route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+        };
+
+        let missing = build(
+            r#"{"outbounds":[{"tag":"proxy","protocol":"freedom",
+                "streamSettings":{"sockopt":{"dialerProxy":"nope"}}}],"routing":{}}"#,
+        )
+        .expect_err("a missing hop is refused");
+        assert!(missing.contains("nope"), "{missing}");
+
+        let itself = build(
+            r#"{"outbounds":[{"tag":"proxy","protocol":"freedom",
+                "streamSettings":{"sockopt":{"dialerProxy":"proxy"}}}],"routing":{}}"#,
+        )
+        .expect_err("a self hop is refused");
+        assert!(itself.contains("proxy"), "{itself}");
+
+        let cyclic = build(
+            r#"{"outbounds":[
+                {"tag":"proxy","protocol":"freedom","streamSettings":{"sockopt":{"dialerProxy":"hop"}}},
+                {"tag":"hop","protocol":"freedom","streamSettings":{"sockopt":{"dialerProxy":"proxy"}}}
+            ],"routing":{}}"#,
+        )
+        .expect_err("a cycle is refused");
+        assert!(
+            cyclic.contains("dialerProxy") && cyclic.contains("loop"),
+            "{cyclic}"
+        );
+
+        let empty = build(
+            r#"{"outbounds":[{"tag":"proxy","protocol":"freedom",
+                "streamSettings":{"sockopt":{"dialerProxy":""}}}],"routing":{}}"#,
+        )
+        .expect("an empty name is direct");
+        assert!(
+            empty.tagged.is_empty(),
+            "no hop entry is built for an empty name"
+        );
+
+        let fragment = build(
+            r#"{"outbounds":[
+                {"tag":"proxy","protocol":"freedom","streamSettings":{"sockopt":{"dialerProxy":"fragment"}}},
+                {"tag":"fragment","protocol":"freedom","settings":{"fragment":{"packets":"tlshello","lengths":[11]}}}
+            ],"routing":{}}"#,
+        )
+        .expect("a fragment hop builds");
+        assert!(
+            fragment.tagged.contains_key("fragment"),
+            "the named fragment is reachable at the dial seam"
+        );
+    }
+
+    /// The hop a `dialerProxy` names is borrowed from the registry, not cloned per connection: the
+    /// old lookup copied the whole outbound before handing it to the hop thread.
+    #[test]
+    fn a_dialer_proxy_hop_is_borrowed_from_the_registry() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[
+                {"tag":"proxy","protocol":"freedom","streamSettings":{"sockopt":{"dialerProxy":"hop"}}},
+                {"tag":"hop","protocol":"http","settings":{"servers":[{"address":"127.0.0.1","port":8080}]}}
+            ],"routing":{}}"#,
+        )
+        .expect("parses");
+        let routing = routing_for(&root).expect("parses").expect("a plan");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("builds");
+        let (hop, borrowed) = ferrox_core::alloc_count::measure(|| shared.outbound_ref("hop"));
+        assert_eq!(
+            borrowed.allocs, 0,
+            "the hop borrows the registry: {borrowed:?}"
+        );
+        assert_eq!(
+            hop.map(std::ptr::from_ref),
+            shared.tagged.get("hop").map(std::ptr::from_ref),
+            "the hop is the registry's own outbound"
+        );
+        let (copied, cloned) = ferrox_core::alloc_count::measure(|| shared.outbound_for("hop"));
+        assert!(copied.is_some());
+        assert!(
+            cloned.allocs > 0,
+            "the old lookup copied the outbound: {cloned:?}"
+        );
+    }
+
+    /// A tag a rule names but no outbound carries, a tag named twice, and a blackhole mode this tree
+    /// does not write are all startup refusals: none of them becomes an inert rule or a silent drop.
+    #[test]
+    fn the_route_registry_refuses_what_it_cannot_build() {
+        let missing = crate::json::parse(
+            r#"{"outbounds":[{"tag":"direct","protocol":"freedom"}],
+                "routing":{"rules":[{"outboundTag":"nope","domain":["full:blocked.test"]}]}}"#,
+        )
+        .expect("parses");
+        let routing = crate::router::Routing::parse_in(&missing, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let error = route_shared(&missing, routing, &crate::reverse::Portals::default(), None)
+            .expect_err("refused");
+        assert!(error.contains("nope"), "{error}");
+
+        let twice = crate::json::parse(
+            r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"direct","protocol":"blackhole"}],"routing":{}}"#,
+        )
+        .expect("parses");
+        let routing = crate::router::Routing::parse_in(&twice, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let error = route_shared(&twice, routing, &crate::reverse::Portals::default(), None)
+            .expect_err("refused");
+        assert!(
+            error.contains("twice") || error.contains("named twice"),
+            "{error}"
+        );
+
+        let response = crate::json::parse(
+            r#"{"outbounds":[{"tag":"drop","protocol":"blackhole","settings":{"response":{"type":"teapot"}}}],"routing":{}}"#,
+        )
+        .expect("parses");
+        let routing = crate::router::Routing::parse_in(&response, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let error = route_shared(
+            &response,
+            routing,
+            &crate::reverse::Portals::default(),
+            None,
+        )
+        .expect_err("refused");
+        assert!(error.contains("teapot"), "{error}");
+
+        let response = crate::json::parse(
+            r#"{"outbounds":[{"tag":"drop","protocol":"blackhole","settings":{"response":"http"}}],"routing":{}}"#,
+        )
+        .expect("parses");
+        let routing = crate::router::Routing::parse_in(&response, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let error = route_shared(
+            &response,
+            routing,
+            &crate::reverse::Portals::default(),
+            None,
+        )
+        .expect_err("refused");
+        assert!(error.contains("object"), "{error}");
+    }
+
+    /// A decision on a literal address reads the tables and returns a borrowed lane: no buffer, no
+    /// name, no lookup. The count is a gate on the per-flow path, not on a test that re-derives it.
+    #[test]
+    fn a_route_decision_on_a_literal_address_allocates_nothing() {
+        let out = route_outbound(
+            r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+                "routing":{"rules":[{"type":"field","port":443,"ip":["198.51.100.0/24"],"outboundTag":"block"}]}}"#,
+            Some("in"),
+            true,
+        );
+        let Outbound::Route(plan) = &out else {
+            panic!("a route plan");
+        };
+        let asked = Destination::Address("198.51.100.7:443".parse().expect("addr"));
+        let (picked, counts) = ferrox_core::alloc_count::measure(|| {
+            plan.pick(&asked, crate::router::Network::Tcp, None, None)
+        });
+        assert!(matches!(&*picked, Outbound::Block(_)), "the rule decides");
+        assert_eq!(counts.allocs, 0, "{counts:?}");
+    }
+
+    /// The fallback is the first configured outbound even when no rule names it, as the reference's
+    /// default handler is.
+    #[test]
+    fn the_first_configured_outbound_answers_unmatched_flows() {
+        let out = route_outbound(
+            r#"{"outbounds":[{"tag":"drop","protocol":"blackhole"},{"tag":"direct","protocol":"freedom"}],"routing":{}}"#,
+            None,
+            false,
+        );
+        let Outbound::Route(plan) = &out else {
+            panic!("a route plan");
+        };
+        let asked = Destination::Name("example.test".to_owned(), 80);
+        assert!(matches!(
+            &*plan.pick(&asked, crate::router::Network::Tcp, None, None),
+            Outbound::Block(_)
+        ));
+    }
+
+    #[test]
+    fn socks_dials_ss_over_kcp_to_echo() {
+        let echo_port = echo_loop();
+        let password = "an-example-shared-password".to_owned();
+        let method = "aes-256-gcm".to_owned();
+        let serve_users = crate::shadowsocks::account(&password, &method);
+        let serve: KcpServe = Arc::new(move |conn| {
+            let (reader, writer, close) = kcp_parts(conn);
+            crate::shadowsocks::serve_kcp(reader, writer, &serve_users, true, &close);
+        });
+        let kcp_port = kcp_loop_with(serve);
+        let front_port = socks_front_with(Outbound::Shadowsocks(ShadowsocksOut {
+            address: "127.0.0.1".to_owned(),
+            port: kcp_port,
+            method,
+            password,
+            carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
+            host: "127.0.0.1".to_owned(),
+            mux: Mux::default(),
+            pool: Pools::default(),
+            tls: None,
+            reality: None,
+            hysteria_roots: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+        }));
+        let mut client = socks_tcp_client(front_port, echo_port);
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    /// The reply destination of an ASSOCIATE lane belongs to the peer that first sent; a later sender from another address is dropped, not rebinded.
+    #[test]
+    fn a_socks_udp_association_pins_the_first_source_and_drops_others() {
+        let first: SocketAddr = "127.0.0.1:5001".parse().expect("addr");
+        let other: SocketAddr = "127.0.0.1:5002".parse().expect("addr");
+        let slot: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+        let mut pinned = None;
+        assert!(
+            source_admitted(None, pinned, first),
+            "the first sender opens the association"
+        );
+        pin_source(&mut pinned, &slot, first);
+        assert!(
+            source_admitted(None, pinned, first),
+            "a repeat from the pinned peer keeps"
+        );
+        assert!(
+            !source_admitted(None, pinned, other),
+            "a different address does not rebind the reply destination"
+        );
+        assert_eq!(
+            *slot.lock().expect("locks"),
+            Some(first),
+            "the pinned peer is still the first one"
+        );
+    }
+
+    /// A 2022 multi-user inbound carries one identity per client PSK in the same order as the joined password's tail; the master is not named.
+    #[test]
+    fn a_2022_multi_user_inbound_yields_one_identity_per_client_psk() {
+        let inbound = crate::json::parse(
+            r#"{"protocol": "shadowsocks", "settings": {"method": "2022-blake3-aes-256-gcm", "password": "master:alpha:bravo", "users": [
+                {"email": "alice@example", "level": 2},
+                {"email": "bob@example", "level": 0}]}}"#,
+        )
+        .expect("parses");
+        let accounts = ss_accounts(
+            &inbound,
+            "127.0.0.1:0",
+            "master:alpha:bravo".to_owned(),
+            "2022-blake3-aes-256-gcm".to_owned(),
+            &std::collections::HashSet::new(),
+        );
+        assert!(accounts.is_2022, "the method names a 2022 cipher");
+        assert_eq!(
+            accounts.identities.as_slice(),
+            &[
+                ("alice@example".to_owned(), 2u32),
+                ("bob@example".to_owned(), 0u32)
+            ],
+            "each user's identity is at its PSK's index in the joined password's tail"
+        );
+    }
+
+    /// A 2022 inbound whose `users` array runs past its password's client-PSK tail is a config error; the fix warns once and drops the excess so no identity is looked up past its PSK.
+    #[test]
+    fn a_2022_users_array_longer_than_the_client_psks_truncates_to_the_shorter_list() {
+        use base64::Engine as _;
+        let key = |b: u8| base64::engine::general_purpose::STANDARD.encode(vec![b; 32]);
+        let password = format!("{}:{}:{}", key(1), key(2), key(3));
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "shadowsocks", "settings": {{"method": "2022-blake3-aes-256-gcm", "password": "{password}", "users": [
+                {{"email": "alice@example", "level": 2}},
+                {{"email": "bob@example", "level": 0}},
+                {{"email": "carol@example", "level": 1}}]}}}}"#
+        ))
+        .expect("parses");
+        let accounts = ss_accounts(
+            &inbound,
+            "127.0.0.1:0",
+            password.clone(),
+            "2022-blake3-aes-256-gcm".to_owned(),
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(
+            accounts.identities.as_slice(),
+            &[
+                ("alice@example".to_owned(), 2u32),
+                ("bob@example".to_owned(), 0u32),
+            ],
+            "carol has no PSK to match, so the fix drops her rather than serve a mismatched identity"
+        );
+    }
+
+    /// A 2022 inbound whose `users` array names fewer users than its password has client PSKs still
+    /// names every PSK: the unnamed tail counts against the inbound rather than going unattributed.
+    #[test]
+    fn a_2022_users_array_shorter_than_the_client_psks_names_the_tail_after_the_inbound() {
+        use base64::Engine as _;
+        let key = |b: u8| base64::engine::general_purpose::STANDARD.encode(vec![b; 32]);
+        let password = format!("{}:{}:{}", key(1), key(2), key(3));
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "shadowsocks", "tag": "ss-in", "settings": {{"method": "2022-blake3-aes-256-gcm", "password": "{password}", "users": [
+                {{"email": "alice@example", "level": 2}}]}}}}"#
+        ))
+        .expect("parses");
+        let accounts = ss_accounts(
+            &inbound,
+            "127.0.0.1:0",
+            password.clone(),
+            "2022-blake3-aes-256-gcm".to_owned(),
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(
+            accounts.identities.as_slice(),
+            &[
+                ("alice@example".to_owned(), 2u32),
+                ("ss-in#1".to_owned(), 0u32)
+            ],
+            "the second PSK has no user entry, so its traffic belongs to the inbound"
+        );
+    }
+
+    /// A fallback name derived from an inbound's tag must not collide with a configured user's
+    /// email: two accounts sharing a name would share one meter and one access-log identity.
+    #[test]
+    fn a_2022_fallback_identity_does_not_collide_with_a_configured_user() {
+        use base64::Engine as _;
+        let key = |b: u8| base64::engine::general_purpose::STANDARD.encode(vec![b; 32]);
+        let password = format!("{}:{}:{}", key(1), key(2), key(3));
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "shadowsocks", "tag": "alice@example", "settings": {{"method": "2022-blake3-aes-256-gcm", "password": "{password}", "users": [
+                {{"email": "alice@example", "level": 2}}]}}}}"#
+        ))
+        .expect("parses");
+        let accounts = ss_accounts(
+            &inbound,
+            "127.0.0.1:0",
+            password.clone(),
+            "2022-blake3-aes-256-gcm".to_owned(),
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(
+            accounts.identities.as_slice(),
+            &[
+                ("alice@example".to_owned(), 2u32),
+                ("alice@example#1".to_owned(), 0u32)
+            ],
+            "the unnamed PSK needs a name of its own, not the configured user's"
+        );
+    }
+
+    /// A generated fallback name must not equal another inbound's configured email, whichever
+    /// inbound the config declares first: both would otherwise share one statistics key.
+    #[test]
+    fn a_generated_identity_avoids_another_inbounds_configured_email_in_either_order() {
+        use base64::Engine as _;
+        let key = |b: u8| base64::engine::general_purpose::STANDARD.encode(vec![b; 32]);
+        let password = format!("{}:{}:{}", key(1), key(2), key(3));
+        let named = format!(
+            r#"{{"protocol": "shadowsocks", "tag": "ss-in", "settings": {{"method": "2022-blake3-aes-256-gcm", "password": "{password}", "users": [{{"email": "alice@example"}}]}}}}"#
+        );
+        let other = r#"{"protocol": "socks", "settings": {"clients": [{"email": "ss-in#1"}]}}"#;
+        for list in [format!("[{named},{other}]"), format!("[{other},{named}]")] {
+            let root = crate::json::parse(&format!(r#"{{"inbounds":{list}}}"#)).expect("parses");
+            let reserved = configured_emails(&root);
+            let inbound = crate::json::parse(&named).expect("parses");
+            let accounts = ss_accounts(
+                &inbound,
+                "127.0.0.1:0",
+                password.clone(),
+                "2022-blake3-aes-256-gcm".to_owned(),
+                &reserved,
+            );
+            assert_eq!(
+                accounts.identities[1].0, "ss-in#1#",
+                "the unnamed PSK's name steps past the other inbound's configured user"
+            );
+        }
+    }
+
+    /// The renamed generated identity and the reserved configured email are separate statistics
+    /// keys, so their traffic never lands in one counter.
+    #[test]
+    fn a_generated_identity_and_a_reserved_email_count_separately() {
+        let _guard = crate::stats::test_lock();
+        crate::stats::clear();
+        let root = crate::json::parse(
+            r#"{"stats":{},"policy":{"levels":{"0":{"statsUserUplink":true}}}}"#,
+        )
+        .expect("parses");
+        crate::policy::install(&root).expect("policy installs");
+        crate::stats::install(&root).expect("stats installs");
+        crate::stats::user("ss-in#1#", 0).read(4);
+        crate::stats::user("ss-in#1", 0).read(7);
+        let snapshot = crate::stats::snapshot();
+        assert_eq!(snapshot.user["ss-in#1#"].uplink, 4);
+        assert_eq!(snapshot.user["ss-in#1"].uplink, 7);
+        crate::stats::clear();
+    }
+
+    /// A 2022 single-password inbound names no users array, so its identities list stays empty and the flow reads the inbound's own default.
+    #[test]
+    fn a_2022_single_password_inbound_carries_no_per_user_identity() {
+        let inbound = crate::json::parse(
+            r#"{"protocol": "shadowsocks", "settings": {"method": "2022-blake3-aes-128-gcm", "password": "secret"}}"#,
+        )
+        .expect("parses");
+        let accounts = ss_accounts(
+            &inbound,
+            "127.0.0.1:0",
+            "secret".to_owned(),
+            "2022-blake3-aes-128-gcm".to_owned(),
+            &std::collections::HashSet::new(),
+        );
+        assert!(accounts.is_2022, "the method names a 2022 cipher");
+        assert!(
+            accounts.identities.is_empty(),
+            "one PSK has no per-user identity list to build"
+        );
+    }
+}
+
+/// The readiness seam on the hosts without `splice`: the same fixed worker set and the same
+/// one-wake drives-both-legs shape as the Linux pump, with a buffered copy where the descriptor
+/// cannot cross a pipe. A leg parks in `poll`, not in `read`, so the thread a flow costs is the
+/// worker that has work, not one per direction.
+#[cfg(not(target_os = "linux"))]
+mod poll_copy {
+    use super::{Connection, RelayBuf, RelayEnd, Shutdown};
+    use std::io::{self, Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc, Mutex, OnceLock};
+    use std::time::Duration;
+
+    /// One readiness event can carry many buffers; a bounded loop keeps `poll` off the hot path without starving the flow beside it.
+    const MAX_COPY_ROUNDS: usize = 16;
+
+    #[cfg(unix)]
+    type Row = libc::pollfd;
+    #[cfg(windows)]
+    type Row = windows_sys::Win32::Networking::WinSock::WSAPOLLFD;
+
+    #[cfg(unix)]
+    fn read_events() -> i16 {
+        libc::POLLIN
+    }
+
+    #[cfg(windows)]
+    fn read_events() -> i16 {
+        use windows_sys::Win32::Networking::WinSock::{POLLIN, POLLRDNORM};
+        POLLIN | POLLRDNORM
+    }
+
+    #[cfg(unix)]
+    fn write_events() -> i16 {
+        libc::POLLOUT
+    }
+
+    #[cfg(windows)]
+    fn write_events() -> i16 {
+        use windows_sys::Win32::Networking::WinSock::POLLOUT;
+        POLLOUT
+    }
+
+    #[cfg(unix)]
+    fn ready_mask() -> i16 {
+        libc::POLLIN | libc::POLLOUT | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL
+    }
+
+    #[cfg(windows)]
+    fn ready_mask() -> i16 {
+        use windows_sys::Win32::Networking::WinSock::{
+            POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT, POLLRDNORM,
+        };
+        POLLIN | POLLRDNORM | POLLOUT | POLLHUP | POLLERR | POLLNVAL
+    }
+
+    #[cfg(unix)]
+    fn connection_row(connection: &Connection, events: i16) -> Row {
+        use std::os::fd::AsRawFd;
+        libc::pollfd {
+            fd: connection.as_raw_fd(),
+            events,
+            revents: 0,
+        }
+    }
+
+    #[cfg(windows)]
+    fn connection_row(connection: &Connection, events: i16) -> Row {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::SOCKET;
+        windows_sys::Win32::Networking::WinSock::WSAPOLLFD {
+            fd: connection.as_raw_socket() as SOCKET,
+            events,
+            revents: 0,
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait(rows: &mut [Row], timeout: libc::c_int) -> Option<usize> {
+        loop {
+            let answered =
+                unsafe { libc::poll(rows.as_mut_ptr(), rows.len() as libc::nfds_t, timeout) };
+            if answered >= 0 {
+                return Some(answered as usize);
+            }
+            if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                return None;
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn wait(rows: &mut [Row], timeout: i32) -> Option<usize> {
+        use windows_sys::Win32::Networking::WinSock::WSAPoll;
+        let answered = unsafe { WSAPoll(rows.as_mut_ptr(), rows.len() as u32, timeout) };
+        (answered >= 0).then_some(answered as usize)
+    }
+
+    fn is_ready(row: Row) -> bool {
+        row.revents & ready_mask() != 0
+    }
+
+    fn would_block(error: &io::Error) -> bool {
+        matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+        )
+    }
+
+    fn arm(connections: [&Connection; 4]) -> bool {
+        for connection in connections {
+            if connection.set_nonblocking(true).is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[cfg(unix)]
+    struct Wake {
+        read: libc::c_int,
+        write: libc::c_int,
+    }
+
+    #[cfg(unix)]
+    impl Wake {
+        fn new() -> Option<Self> {
+            let mut fds = [-1; 2];
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+                return None;
+            }
+            for fd in fds {
+                if unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } < 0
+                    || unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0
+                {
+                    for fd in fds {
+                        unsafe {
+                            libc::close(fd);
+                        }
+                    }
+                    return None;
+                }
+            }
+            Some(Self {
+                read: fds[0],
+                write: fds[1],
+            })
+        }
+
+        fn row(&self) -> Row {
+            libc::pollfd {
+                fd: self.read,
+                events: libc::POLLIN,
+                revents: 0,
+            }
+        }
+
+        fn wake(&self) {
+            let byte = 1u8;
+            unsafe {
+                libc::write(self.write, std::ptr::addr_of!(byte).cast(), 1);
+            }
+        }
+
+        fn drain(&self) {
+            let mut scratch = [0u8; 64];
+            loop {
+                let got =
+                    unsafe { libc::read(self.read, scratch.as_mut_ptr().cast(), scratch.len()) };
+                if got <= 0 {
+                    return;
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Wake {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.read);
+                libc::close(self.write);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    struct Wake {
+        read: std::net::TcpStream,
+        write: std::net::TcpStream,
+    }
+
+    #[cfg(windows)]
+    impl Wake {
+        fn new() -> Option<Self> {
+            use std::net::{TcpListener, TcpStream};
+            let listener = TcpListener::bind(("127.0.0.1", 0)).ok()?;
+            let address = listener.local_addr().ok()?;
+            let write = TcpStream::connect(address).ok()?;
+            let (read, _) = listener.accept().ok()?;
+            read.set_nonblocking(true).ok()?;
+            write.set_nonblocking(true).ok()?;
+            Some(Self { read, write })
+        }
+
+        fn row(&self) -> Row {
+            use std::os::windows::io::AsRawSocket;
+            use windows_sys::Win32::Networking::WinSock::SOCKET;
+            windows_sys::Win32::Networking::WinSock::WSAPOLLFD {
+                fd: self.read.as_raw_socket() as SOCKET,
+                events: read_events(),
+                revents: 0,
+            }
+        }
+
+        fn wake(&self) {
+            let mut write = &self.write;
+            let _ = write.write(&[1]);
+        }
+
+        fn drain(&self) {
+            let mut scratch = [0u8; 64];
+            let mut read = &self.read;
+            loop {
+                match read.read(&mut scratch) {
+                    Ok(0) => return,
+                    Ok(_) => {}
+                    Err(error) if would_block(&error) => return,
+                    Err(_) => return,
+                }
+            }
+        }
+    }
+
+    struct Direction {
+        src: Connection,
+        dst: Connection,
+        bytes: RelayBuf,
+        filled: usize,
+        off: usize,
+        src_at_eof: bool,
+        ended: bool,
+        /// The stall budget this direction was born with, as the copying leg read it once per leg.
+        stall_budget: Duration,
+        /// The first write that found no room, cleared by the next byte the destination takes.
+        stalled: Option<std::time::Instant>,
+    }
+
+    impl Direction {
+        fn new(src: Connection, dst: Connection) -> Self {
+            Self {
+                src,
+                dst,
+                bytes: RelayBuf::new(),
+                filled: 0,
+                off: 0,
+                src_at_eof: false,
+                ended: false,
+                stall_budget: crate::budgets::relay_stall(),
+                stalled: None,
+            }
+        }
+
+        fn can_ingest(&self) -> bool {
+            !self.ended && !self.src_at_eof && self.filled == 0
+        }
+
+        fn can_drain(&self) -> bool {
+            !self.ended && self.off < self.filled
+        }
+
+        fn advance(&mut self) {
+            if self.ended {
+                return;
+            }
+            for _ in 0..MAX_COPY_ROUNDS {
+                if self.off == self.filled {
+                    self.off = 0;
+                    self.filled = 0;
+                }
+                let mut ingested = false;
+                if self.can_ingest() {
+                    match self.src.read(self.bytes.as_mut()) {
+                        Ok(0) => self.src_at_eof = true,
+                        Ok(n) => {
+                            let _ = self.bytes.filled(n);
+                            self.filled = n;
+                            ingested = true;
+                        }
+                        Err(error) if would_block(&error) => {}
+                        Err(_) => {
+                            self.end();
+                            return;
+                        }
+                    }
+                }
+                while self.off < self.filled {
+                    match self.dst.write(&self.bytes.prefix(self.filled)[self.off..]) {
+                        Ok(0) => {
+                            self.end();
+                            return;
+                        }
+                        Ok(n) => {
+                            self.off += n;
+                            self.stalled = None;
+                        }
+                        Err(error) if would_block(&error) => {
+                            self.stalled.get_or_insert_with(std::time::Instant::now);
+                            break;
+                        }
+                        Err(_) => {
+                            self.end();
+                            return;
+                        }
+                    }
+                }
+                if self.off == self.filled {
+                    self.off = 0;
+                    self.filled = 0;
+                    self.stalled = None;
+                }
+                if self.src_at_eof && self.filled == 0 {
+                    self.end();
+                    return;
+                }
+                if !ingested || self.off < self.filled {
+                    break;
+                }
+            }
+        }
+
+        fn stalled_for_budget(&self) -> bool {
+            self.stalled
+                .is_some_and(|since| since.elapsed() >= self.stall_budget)
+        }
+
+        /// The flow has given up: close both halves so neither leg waits on the other.
+        fn abandon(&mut self) {
+            self.ended = true;
+            self.stalled = None;
+            let _ = self.src.shutdown(Shutdown::Both);
+            let _ = self.dst.shutdown(Shutdown::Both);
+        }
+
+        fn end(&mut self) {
+            if self.ended {
+                return;
+            }
+            self.ended = true;
+            self.stalled = None;
+            let _ = self.dst.shutdown(Shutdown::Write);
+        }
+    }
+
+    struct Flow {
+        directions: Vec<Direction>,
+        done: Vec<mpsc::Sender<Result<(), ()>>>,
+    }
+
+    impl Flow {
+        fn finished(&self) -> bool {
+            self.directions.iter().all(|d| d.ended)
+        }
+
+        fn give_up(&mut self) {
+            for direction in &mut self.directions {
+                direction.abandon();
+            }
+        }
+    }
+
+    impl Drop for Flow {
+        fn drop(&mut self) {
+            // Restore blocking before the joiner wakes; a duplicate shares the descriptor's status flags.
+            for direction in &self.directions {
+                let _ = direction.src.set_nonblocking(false);
+                let _ = direction.dst.set_nonblocking(false);
+            }
+            for done in self.done.drain(..) {
+                let _ = done.send(Ok(()));
+            }
+        }
+    }
+
+    struct Worker {
+        queue: Mutex<Vec<Flow>>,
+        wake: Wake,
+    }
+
+    impl Worker {
+        fn spawn() -> Option<Arc<Self>> {
+            let wake = Wake::new()?;
+            let worker = Arc::new(Self {
+                queue: Mutex::new(Vec::new()),
+                wake,
+            });
+            let loop_worker = Arc::clone(&worker);
+            std::thread::Builder::new()
+                .name("ferrox-relay".into())
+                .spawn(move || run(&loop_worker))
+                .ok()?;
+            Some(worker)
+        }
+
+        fn push(&self, flow: Flow) {
+            if let Ok(mut queue) = self.queue.lock() {
+                queue.push(flow);
+            }
+            self.wake.wake();
+        }
+
+        fn take(&self) -> Vec<Flow> {
+            let mut queue = match self.queue.lock() {
+                Ok(queue) => queue,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            std::mem::take(&mut *queue)
+        }
+    }
+
+    fn run(worker: &Worker) {
+        let mut flows: Vec<Flow> = Vec::new();
+        let mut rows: Vec<Row> = Vec::with_capacity(64);
+        let mut owners: Vec<(usize, usize)> = Vec::with_capacity(64);
+        loop {
+            flows.extend(worker.take());
+            if flows.iter().any(Flow::finished) {
+                flows.retain(|flow| !flow.finished());
+            }
+            rows.clear();
+            owners.clear();
+            rows.push(worker.wake.row());
+            owners.push((usize::MAX, usize::MAX));
+            for (flow_index, flow) in flows.iter().enumerate() {
+                for (direction_index, direction) in flow.directions.iter().enumerate() {
+                    if direction.can_ingest() {
+                        rows.push(connection_row(&direction.src, read_events()));
+                        owners.push((flow_index, direction_index));
+                    }
+                    if direction.can_drain() {
+                        rows.push(connection_row(&direction.dst, write_events()));
+                        owners.push((flow_index, direction_index));
+                    }
+                }
+            }
+            let mut timeout = -1;
+            for flow in &flows {
+                for direction in &flow.directions {
+                    if let Some(since) = direction.stalled {
+                        let left = direction.stall_budget.saturating_sub(since.elapsed());
+                        let millis = i32::try_from(left.as_millis()).unwrap_or(i32::MAX);
+                        timeout = if timeout < 0 {
+                            millis
+                        } else {
+                            timeout.min(millis)
+                        };
+                    }
+                }
+            }
+            let answered = wait(&mut rows, timeout);
+            for flow in &mut flows {
+                if flow.directions.iter().any(Direction::stalled_for_budget) {
+                    flow.give_up();
+                }
+            }
+            if answered.is_none() {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            for index in 0..rows.len() {
+                if !is_ready(rows[index]) {
+                    continue;
+                }
+                let (flow_index, direction_index) = owners[index];
+                if flow_index == usize::MAX {
+                    worker.wake.drain();
+                    continue;
+                }
+                if let Some(direction) = flows
+                    .get_mut(flow_index)
+                    .and_then(|flow| flow.directions.get_mut(direction_index))
+                {
+                    direction.advance();
+                }
+            }
+        }
+    }
+
+    fn worker_count() -> usize {
+        match std::thread::available_parallelism() {
+            Ok(count) => count.get().min(8),
+            Err(_) => 1,
+        }
+    }
+
+    fn workers() -> &'static Vec<Arc<Worker>> {
+        static WORKERS: OnceLock<Vec<Arc<Worker>>> = OnceLock::new();
+        WORKERS.get_or_init(|| {
+            (0..worker_count())
+                .filter_map(|_| Worker::spawn())
+                .collect()
+        })
+    }
+
+    fn next() -> &'static Worker {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let all = workers();
+        let index = NEXT.fetch_add(1, Ordering::Relaxed) % all.len();
+        &all[index]
+    }
+
+    pub(super) fn available() -> bool {
+        #[cfg(windows)]
+        {
+            false
+        }
+        #[cfg(not(windows))]
+        {
+            !workers().is_empty()
+        }
+    }
+
+    /// Windows keeps the lane pool: `WSAPoll` costs more per wake than a timed read, and the pool already runs both directions.
+    pub(super) fn handoff(
+        client_read: Connection,
+        target_write: Connection,
+        target_read: Connection,
+        client_write: Connection,
+    ) -> (RelayEnd, RelayEnd) {
+        let (first_tx, first_rx) = mpsc::channel::<Result<(), ()>>();
+        let (second_tx, second_rx) = mpsc::channel::<Result<(), ()>>();
+        if !arm([&client_read, &target_write, &target_read, &client_write]) {
+            for connection in [&client_read, &target_write, &target_read, &client_write] {
+                let _ = connection.set_nonblocking(false);
+            }
+            std::thread::spawn(move || {
+                super::relay_owned(client_read, target_write, target_read, client_write, None);
+                let _ = first_tx.send(Ok(()));
+                let _ = second_tx.send(Ok(()));
+            });
+            return (first_rx, second_rx);
+        }
+        let worker = next();
+        let first = Direction::new(client_read, target_write);
+        let second = Direction::new(target_read, client_write);
+        worker.push(Flow {
+            directions: vec![first, second],
+            done: vec![first_tx, second_tx],
+        });
+        (first_rx, second_rx)
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod poll_relay {
+    use super::{AnswerHooks, Connection, Shutdown, SplicePipe};
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc, Mutex, OnceLock};
+    use std::time::Duration;
+
+    const SPLICE_F_NONBLOCK: libc::c_uint = 0x002;
+    const MAX_SPLICE_ROUNDS: usize = 16;
+
+    fn retryable() -> bool {
+        matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINTR | libc::EAGAIN)
+        )
+    }
+
+    /// Ingest splices that found no slot in a pipe that still held byte room: the wake the
+    /// back-off exists to stop. Counted only under `cfg(test)`, so a production build emits nothing.
+    #[cfg(test)]
+    static IDLE_INGESTS: AtomicUsize = AtomicUsize::new(0);
+
+    #[cfg(test)]
+    pub(crate) fn idle_ingests() -> usize {
+        IDLE_INGESTS.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn note_idle_ingest(pending: usize, capacity: usize) {
+        if pending > 0 && pending < capacity {
+            IDLE_INGESTS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline]
+    fn note_idle_ingest(_pending: usize, _capacity: usize) {}
+
+    /// Bytes the pump has moved with `splice` rather than through a buffer: the one count a
+    /// relay that fell back to `relay_owned` cannot produce.
+    #[cfg(test)]
+    static SPLICED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+    #[cfg(test)]
+    pub(crate) fn spliced_bytes() -> usize {
+        SPLICED_BYTES.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn note_spliced(moved: usize) {
+        SPLICED_BYTES.fetch_add(moved, Ordering::Relaxed);
+    }
+
+    /// The pool's width: the number of flows whose wakes do not queue behind one another.
+    #[cfg(test)]
+    pub(crate) fn pool_width() -> usize {
+        workers().len()
+    }
+
+    #[cfg(not(test))]
+    #[inline]
+    fn note_spliced(_moved: usize) {}
+
+    /// A blocking socket parks the worker inside a splice when a wake arrives for a
+    /// queue that has gone — `SPLICE_F_NONBLOCK` guards the pipe half only. `held` stops
+    /// the descriptor being recycled under a restore that writes back the flags it found.
+    struct SpliceGuard {
+        held: Connection,
+        saved: libc::c_int,
+    }
+
+    impl SpliceGuard {
+        fn arm(socket: &Connection) -> std::io::Result<Option<Self>> {
+            let held = socket.try_clone()?;
+            let fd = held.as_raw_fd();
+            let saved = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if saved < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if saved & libc::O_NONBLOCK != 0 {
+                return Ok(None);
+            }
+            if unsafe { libc::fcntl(fd, libc::F_SETFL, saved | libc::O_NONBLOCK) } < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(Some(Self { held, saved }))
+        }
+    }
+
+    impl Drop for SpliceGuard {
+        fn drop(&mut self) {
+            unsafe {
+                libc::fcntl(self.held.as_raw_fd(), libc::F_SETFL, self.saved);
+            }
+        }
+    }
+
+    /// Every socket the flow splices, not only the half a wake reported: one wake drives
+    /// both legs. Armed while both directions hold a pipe, because a direction without one
+    /// hands its sockets to `copy_all_memcpy`, which ends on the first error and would read
+    /// `EAGAIN` as EOF. Descriptors shared by two directions arm once. A socket that was
+    /// already nonblocking needs no guard; one whose flags cannot be read or written refuses
+    /// the splice and lets the caller fall back to the buffered relay.
+    fn arm_flow(
+        client_read: &Connection,
+        target_write: &Connection,
+        target_read: &Connection,
+        client_write: &Connection,
+    ) -> Option<[Option<SpliceGuard>; 4]> {
+        let mut guards: [Option<SpliceGuard>; 4] = [None, None, None, None];
+        for (slot, socket) in
+            guards
+                .iter_mut()
+                .zip([client_read, target_write, target_read, client_write])
+        {
+            *slot = SpliceGuard::arm(socket).ok()?;
+        }
+        Some(guards)
+    }
+
+    /// The VLESS `[version, 0]` answer, held out of the pipe before the first payload byte
+    /// leaves: the lane that would otherwise strip it in user space hands the pipe the job.
+    struct StripAnswer {
+        head: [u8; 2],
+        filled: usize,
+        hooks: Option<AnswerHooks>,
+    }
+
+    impl StripAnswer {
+        fn new(hooks: AnswerHooks) -> Self {
+            Self {
+                head: [0; 2],
+                filled: 0,
+                hooks: Some(hooks),
+            }
+        }
+    }
+
+    struct Direction {
+        src: Connection,
+        dst: Connection,
+        pipe: Option<SplicePipe>,
+        pending: usize,
+        /// A pending answer the pipe must not drain past.
+        answer: Option<StripAnswer>,
+        /// The last ingest splice moved nothing: a pipe ring runs out of slots before it
+        /// runs out of byte capacity, so an honest `POLLIN` can still have nowhere to put
+        /// what it sees, and a level-triggered one would wake us forever. The drain that
+        /// frees a slot clears it.
+        ingest_stalled: bool,
+        src_at_eof: bool,
+        ended: bool,
+        /// The stall budget this direction was born with, as the copying leg read it once per leg.
+        stall_budget: Duration,
+        /// The first drain that found no room, cleared by the next byte the destination takes.
+        stalled: Option<std::time::Instant>,
+        /// When this half closed, so the other half's absent answer is bounded from the same
+        /// moment the lane path bounds it.
+        ended_at: Option<std::time::Instant>,
+    }
+
+    impl Direction {
+        fn new(
+            src: Connection,
+            dst: Connection,
+            pipe: Option<SplicePipe>,
+            stall_budget: Duration,
+        ) -> Self {
+            Self {
+                src,
+                dst,
+                pipe,
+                pending: 0,
+                answer: None,
+                ingest_stalled: false,
+                src_at_eof: false,
+                ended: false,
+                stall_budget,
+                stalled: None,
+                ended_at: None,
+            }
+        }
+
+        /// Whether a `POLLIN` on `src` could move bytes: `pending` is in bytes and the
+        /// kernel's `EAGAIN` is about slots, so an empty pipe is the one state where the
+        /// byte capacity is certainly available. With `pending` held the drain keeps
+        /// `POLLOUT` armed, which is the wake that frees a slot and re-arms this half.
+        fn can_ingest(&self) -> bool {
+            let has_room = match &self.pipe {
+                Some(pipe) => self.pending < pipe.capacity,
+                None => true,
+            };
+            !self.src_at_eof && has_room && (self.pending == 0 || !self.ingest_stalled)
+        }
+
+        fn can_drain(&self) -> bool {
+            self.pending > 0 && self.answer.is_none()
+        }
+
+        /// Hand this direction the answer a lane would have stripped before relaying.
+        fn answering(mut self, answer: Option<AnswerHooks>) -> Self {
+            self.answer = answer.map(StripAnswer::new);
+            self
+        }
+
+        /// Strip the answer the pipe holds before the first payload byte drains, a read at a
+        /// time so a pipe carrying half of it never parks a worker. Returns false when the flow
+        /// must stop: the peer closed or refused before its answer was whole.
+        fn strip_answer(&mut self, pipe_read: libc::c_int) -> bool {
+            let Some(mut answer) = self.answer.take() else {
+                return true;
+            };
+            while answer.filled < answer.head.len() && self.pending > 0 {
+                let at = answer.filled;
+                let got = unsafe {
+                    libc::read(
+                        pipe_read,
+                        answer.head[at..].as_mut_ptr().cast(),
+                        answer.head.len() - at,
+                    )
+                };
+                if got <= 0 {
+                    if got < 0 && retryable() {
+                        self.answer = Some(answer);
+                        return true;
+                    }
+                    self.answer = Some(answer);
+                    self.abandon();
+                    return false;
+                }
+                let got = got as usize;
+                self.pending -= got;
+                answer.filled += got;
+            }
+            if answer.filled < answer.head.len() {
+                if !self.src_at_eof {
+                    self.answer = Some(answer);
+                    return true;
+                }
+                self.answer = Some(answer);
+                self.abandon();
+                return false;
+            }
+            let acceptable = answer.hooks.is_none()
+                || ferrox_core::vless::VlessLink::decode_response_header(&answer.head).is_ok();
+            if acceptable {
+                if let Some(hooks) = answer.hooks.take() {
+                    (hooks.success)();
+                }
+                return true;
+            }
+            self.answer = Some(answer);
+            self.abandon();
+            false
+        }
+
+        fn advance(&mut self) {
+            if self.ended {
+                return;
+            }
+            let Some(pipe) = self.pipe.as_ref() else {
+                super::copy_all_memcpy(&mut self.src, &mut self.dst);
+                self.end();
+                return;
+            };
+            let capacity = pipe.capacity;
+            let pipe_read = pipe.fds[0];
+            let pipe_write = pipe.fds[1];
+            for _ in 0..MAX_SPLICE_ROUNDS {
+                let mut progressed = false;
+                if self.can_ingest() {
+                    let moved = unsafe {
+                        libc::splice(
+                            self.src.as_raw_fd(),
+                            std::ptr::null_mut(),
+                            pipe_write,
+                            std::ptr::null_mut(),
+                            capacity.saturating_sub(self.pending),
+                            SPLICE_F_NONBLOCK,
+                        )
+                    };
+                    if moved > 0 {
+                        self.pending += moved as usize;
+                        note_spliced(moved as usize);
+                        self.ingest_stalled = false;
+                        progressed = true;
+                    } else if moved == 0 {
+                        self.src_at_eof = true;
+                    } else if !retryable() {
+                        self.stop();
+                        return;
+                    } else {
+                        note_idle_ingest(self.pending, capacity);
+                        self.ingest_stalled = true;
+                    }
+                }
+                if !self.strip_answer(pipe_read) {
+                    return;
+                }
+                while self.can_drain() {
+                    let moved = unsafe {
+                        libc::splice(
+                            pipe_read,
+                            std::ptr::null_mut(),
+                            self.dst.as_raw_fd(),
+                            std::ptr::null_mut(),
+                            self.pending,
+                            SPLICE_F_NONBLOCK,
+                        )
+                    };
+                    if moved > 0 {
+                        self.pending -= moved as usize;
+                        self.ingest_stalled = false;
+                        self.stalled = None;
+                        progressed = true;
+                        continue;
+                    }
+                    if moved < 0 && !retryable() {
+                        self.stop();
+                        return;
+                    }
+                    if moved < 0
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN)
+                    {
+                        self.stalled.get_or_insert_with(std::time::Instant::now);
+                    }
+                    break;
+                }
+                if self.pending == 0 {
+                    self.stalled = None;
+                }
+                if self.src_at_eof && self.pending == 0 {
+                    self.end();
+                    return;
+                }
+                if !progressed {
+                    break;
+                }
+            }
+        }
+
+        fn stalled_for_budget(&self) -> bool {
+            self.stalled
+                .is_some_and(|since| since.elapsed() >= self.stall_budget)
+        }
+
+        /// An answer the pipe still owes is refused once, whichever way the half ends: the
+        /// lane path reports the failed handshake on every one of its exits, and a reset or a
+        /// closed peer must not be the pump's silent exception.
+        fn refuse_answer(&mut self) {
+            if let Some(hooks) = self.answer.take().and_then(|answer| answer.hooks) {
+                (hooks.refused)();
+            }
+        }
+
+        /// The flow has given up: close both halves so neither leg waits on the other.
+        fn abandon(&mut self) {
+            self.refuse_answer();
+            self.ended = true;
+            self.stalled = None;
+            self.ended_at.get_or_insert_with(std::time::Instant::now);
+            let _ = self.src.shutdown(Shutdown::Both);
+            let _ = self.dst.shutdown(Shutdown::Both);
+        }
+
+        /// A half that closed before the answer arrived refuses it, the same verdict the lane
+        /// path reaches when its idle bound passes: the answer's hook runs once and the wait
+        /// stops holding the flow.
+        fn expire_unanswered(&mut self) {
+            self.stop();
+        }
+
+        /// An error that ends one half refuses the answer it still owed, then closes the way
+        /// every other completed half does.
+        fn stop(&mut self) {
+            self.refuse_answer();
+            self.end();
+        }
+
+        fn end(&mut self) {
+            if self.ended {
+                return;
+            }
+            self.ended = true;
+            self.stalled = None;
+            self.ended_at.get_or_insert_with(std::time::Instant::now);
+            let _ = self.dst.shutdown(Shutdown::Write);
+        }
+    }
+
+    struct Flow {
+        directions: Vec<Direction>,
+        // The arm lives here so a detached hand-off can restore it when both directions end.
+        guards: Option<[Option<SpliceGuard>; 4]>,
+        done: Vec<mpsc::Sender<Result<(), ()>>>,
+    }
+
+    impl Flow {
+        fn finished(&self) -> bool {
+            self.directions.iter().all(|d| d.ended)
+        }
+
+        fn give_up(&mut self) {
+            for direction in &mut self.directions {
+                direction.abandon();
+            }
+        }
+
+        /// When this direction's wait on an answer it has not seen began: its sibling closed
+        /// with the answer still asleep, so the grace the lane path gives the reply starts
+        /// here too, and a peer that never answers cannot park the flow.
+        fn answer_since(&self, index: usize) -> Option<std::time::Instant> {
+            let direction = &self.directions[index];
+            if direction.answer.is_none() || direction.ended {
+                return None;
+            }
+            self.directions
+                .iter()
+                .enumerate()
+                .filter(|(other, _)| *other != index)
+                .filter_map(|(_, other)| other.ended_at)
+                .max()
+        }
+    }
+
+    impl Drop for Flow {
+        fn drop(&mut self) {
+            // Restore the sockets' flags before the joiner wakes, as the caller found them.
+            drop(self.guards.take());
+            for done in self.done.drain(..) {
+                let _ = done.send(Ok(()));
+            }
+        }
+    }
+
+    struct Worker {
+        queue: Mutex<Vec<Flow>>,
+        wake: [libc::c_int; 2],
+    }
+
+    impl Worker {
+        fn spawn() -> Option<Arc<Self>> {
+            let mut wake = [-1; 2];
+            if unsafe { libc::pipe(wake.as_mut_ptr()) } != 0 {
+                return None;
+            }
+            for (fd, flags) in [
+                (wake[0], libc::O_NONBLOCK),
+                (wake[1], libc::O_CLOEXEC | libc::O_NONBLOCK),
+            ] {
+                unsafe {
+                    libc::fcntl(fd, libc::F_SETFL, flags);
+                }
+            }
+            let worker = Arc::new(Self {
+                queue: Mutex::new(Vec::new()),
+                wake,
+            });
+            let loop_worker = Arc::clone(&worker);
+            let spawned = std::thread::Builder::new()
+                .name("ferrox-relay".into())
+                .spawn(move || run(&loop_worker));
+            if spawned.is_err() {
+                unsafe {
+                    libc::close(wake[0]);
+                    libc::close(wake[1]);
+                }
+                return None;
+            }
+            Some(worker)
+        }
+
+        fn push(&self, flow: Flow) {
+            if let Ok(mut queue) = self.queue.lock() {
+                queue.push(flow);
+            }
+            let byte = 1u8;
+            unsafe {
+                libc::write(self.wake[1], std::ptr::addr_of!(byte).cast(), 1);
+            }
+        }
+
+        fn take(&self) -> Vec<Flow> {
+            let mut queue = match self.queue.lock() {
+                Ok(queue) => queue,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            std::mem::take(&mut *queue)
+        }
+
+        fn drain_wake(&self) {
+            let mut scratch = [0u8; 64];
+            loop {
+                let got =
+                    unsafe { libc::read(self.wake[0], scratch.as_mut_ptr().cast(), scratch.len()) };
+                if got <= 0 {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// The wake the pump must not sleep through: a drain waiting on room and an answer waiting
+    /// on a sibling's close are both bounded, so `poll` gets the nearer deadline.
+    fn poll_timeout(flows: &[Flow]) -> i32 {
+        let mut timeout = -1;
+        for flow in flows {
+            for (index, direction) in flow.directions.iter().enumerate() {
+                let left = match direction.stalled {
+                    Some(since) => Some(direction.stall_budget.saturating_sub(since.elapsed())),
+                    None => flow
+                        .answer_since(index)
+                        .map(|since| direction.stall_budget.saturating_sub(since.elapsed())),
+                };
+                if let Some(left) = left {
+                    let millis = i32::try_from(left.as_millis()).unwrap_or(i32::MAX);
+                    timeout = if timeout < 0 {
+                        millis
+                    } else {
+                        timeout.min(millis)
+                    };
+                }
+            }
+        }
+        timeout
+    }
+
+    /// A half still owing an answer whose sibling has closed for the whole grace is refused
+    /// here, the same verdict the lane path reaches when its idle bound passes.
+    fn expire_answers(flows: &mut [Flow]) {
+        for flow in flows {
+            for index in 0..flow.directions.len() {
+                let budget = flow.directions[index].stall_budget;
+                if flow
+                    .answer_since(index)
+                    .is_some_and(|since| since.elapsed() >= budget)
+                {
+                    flow.directions[index].expire_unanswered();
+                }
+            }
+        }
+    }
+
+    fn run(worker: &Worker) {
+        let mut flows: Vec<Flow> = Vec::new();
+        let mut pfds: Vec<libc::pollfd> = Vec::with_capacity(64);
+        let mut owners: Vec<(usize, usize)> = Vec::with_capacity(64);
+        loop {
+            flows.extend(worker.take());
+            if flows.iter().any(Flow::finished) {
+                flows.retain(|flow| !flow.finished());
+            }
+            for flow in &mut flows {
+                for direction in &mut flow.directions {
+                    if direction.can_drain() && direction.stalled.is_none() {
+                        direction.stalled = Some(std::time::Instant::now());
+                    }
+                }
+            }
+            expire_answers(&mut flows);
+            pfds.clear();
+            owners.clear();
+            pfds.push(libc::pollfd {
+                fd: worker.wake[0],
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            owners.push((usize::MAX, usize::MAX));
+            for (flow_index, flow) in flows.iter().enumerate() {
+                for (direction_index, direction) in flow.directions.iter().enumerate() {
+                    if direction.ended {
+                        continue;
+                    }
+                    if direction.can_ingest() {
+                        pfds.push(libc::pollfd {
+                            fd: direction.src.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        });
+                        owners.push((flow_index, direction_index));
+                    }
+                    if direction.can_drain() {
+                        pfds.push(libc::pollfd {
+                            fd: direction.dst.as_raw_fd(),
+                            events: libc::POLLOUT,
+                            revents: 0,
+                        });
+                        owners.push((flow_index, direction_index));
+                    }
+                }
+            }
+            let timeout = poll_timeout(&flows);
+            let answered =
+                unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, timeout) };
+            if answered < 0 {
+                continue;
+            }
+            for flow in &mut flows {
+                if flow.directions.iter().any(Direction::stalled_for_budget) {
+                    flow.give_up();
+                }
+            }
+            for (index, entry) in pfds.iter().enumerate() {
+                if entry.revents == 0 {
+                    continue;
+                }
+                let (flow_index, direction_index) = owners[index];
+                if flow_index == usize::MAX {
+                    worker.drain_wake();
+                    continue;
+                }
+                if let Some(direction) = flows
+                    .get_mut(flow_index)
+                    .and_then(|flow| flow.directions.get_mut(direction_index))
+                {
+                    direction.advance();
+                }
+            }
+        }
+    }
+
+    /// A lane is parked in `poll`, not busy, so the pool sizes to the widest cell's flows: eight,
+    /// one per flow, doubled from the cores and capped at sixteen.
+    fn worker_count() -> usize {
+        match std::thread::available_parallelism() {
+            Ok(count) => (count.get() * 2).clamp(8, 16),
+            Err(_) => 8,
+        }
+    }
+
+    fn workers() -> &'static Vec<Arc<Worker>> {
+        static WORKERS: OnceLock<Vec<Arc<Worker>>> = OnceLock::new();
+        WORKERS.get_or_init(|| {
+            (0..worker_count())
+                .filter_map(|_| Worker::spawn())
+                .collect()
+        })
+    }
+
+    fn next() -> &'static Worker {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let all = workers();
+        let index = NEXT.fetch_add(1, Ordering::Relaxed) % all.len();
+        &all[index]
+    }
+
+    pub(super) fn available() -> bool {
+        !workers().is_empty()
+    }
+
+    /// Arm both directions on a worker and return their ends. An answer the dial has not seen
+    /// rides the reply direction, which strips it before its first payload byte drains.
+    pub(super) fn handoff(
+        client_read: Connection,
+        target_write: Connection,
+        target_read: Connection,
+        client_write: Connection,
+        answer: Option<super::AnswerHooks>,
+    ) -> (super::RelayEnd, super::RelayEnd) {
+        if let (Some(first_pipe), Some(second_pipe)) = (SplicePipe::new(), SplicePipe::new()) {
+            if let Some(guards) = arm_flow(&client_read, &target_write, &target_read, &client_write)
+            {
+                let worker = next();
+                let (first_tx, first_rx) = mpsc::channel::<Result<(), ()>>();
+                let (second_tx, second_rx) = mpsc::channel::<Result<(), ()>>();
+                let forward_stall = client_read
+                    .policy()
+                    .or_else(|| target_write.policy())
+                    .and_then(|flow| flow.conn_idle())
+                    .unwrap_or_else(crate::budgets::relay_stall);
+                let reply_stall = target_read
+                    .policy()
+                    .or_else(|| client_write.policy())
+                    .and_then(|flow| flow.conn_idle())
+                    .unwrap_or_else(crate::budgets::relay_stall);
+                let first =
+                    Direction::new(client_read, target_write, Some(first_pipe), forward_stall);
+                let second =
+                    Direction::new(target_read, client_write, Some(second_pipe), reply_stall)
+                        .answering(answer);
+                worker.push(Flow {
+                    directions: vec![first, second],
+                    guards: Some(guards),
+                    done: vec![first_tx, second_tx],
+                });
+                return (first_rx, second_rx);
+            }
+        }
+        let (first_tx, first_rx) = mpsc::channel::<Result<(), ()>>();
+        let (second_tx, second_rx) = mpsc::channel::<Result<(), ()>>();
+        std::thread::spawn(move || {
+            super::relay_owned(client_read, target_write, target_read, client_write, answer);
+            let _ = first_tx.send(Ok(()));
+            let _ = second_tx.send(Ok(()));
+        });
+        (first_rx, second_rx)
+    }
+
+    /// The arm's truth table, in the two units it mixes: `pending` counts bytes and the
+    /// kernel's `EAGAIN` from `splice_to_pipe` counts slots, so a ring that holds bytes with a
+    /// stall recorded has byte room and nowhere to put anything. That is the wake the pump must
+    /// not take, and `can_drain` staying true over it is what keeps one fd armed, so the
+    /// direction waits on the drain instead of spinning on the source.
+    #[cfg(test)]
+    #[test]
+    fn no_pollin_is_armed_on_a_ring_that_holds_bytes_it_cannot_take() {
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = front.local_addr().expect("addr").port();
+        let src = Connection::connect(("127.0.0.1", port)).expect("dials");
+        let (dst, _) = front.accept().expect("accepts");
+        let mut direction =
+            Direction::new(src, dst, SplicePipe::new(), crate::budgets::relay_stall());
+        let Some(pipe) = direction.pipe.as_ref() else {
+            panic!("a splice pipe is there to size the ring");
+        };
+        let capacity = pipe.capacity;
+
+        direction.pending = 0;
+        direction.ingest_stalled = true;
+        assert!(
+            direction.can_ingest(),
+            "an empty ring has room whatever the last attempt did"
+        );
+        assert!(!direction.can_drain(), "an empty ring has nothing to drain");
+
+        direction.pending = capacity / 2;
+        direction.ingest_stalled = false;
+        assert!(
+            direction.can_ingest(),
+            "half a ring with no stall recorded is an ingest worth arming for"
+        );
+        direction.ingest_stalled = true;
+        assert!(
+            !direction.can_ingest(),
+            "the same half ring after an ingest found no slot is a wake that moves nothing"
+        );
+        assert!(
+            direction.can_drain(),
+            "the drain that frees a slot stays armed, so the direction waits on an fd rather \
+             than spinning on one it cannot serve"
+        );
+
+        direction.pending = capacity;
+        assert!(
+            !direction.can_ingest() && direction.can_drain(),
+            "a ring full of bytes is the state the byte predicate already refused"
+        );
+
+        direction.pending = 0;
+        direction.ingest_stalled = false;
+        direction.src_at_eof = true;
+        assert!(
+            !direction.can_ingest(),
+            "an exhausted source is never armed"
+        );
+        direction.src_at_eof = false;
+        direction.pipe = None;
+        assert!(
+            direction.can_ingest(),
+            "a leg with no pipe reads its own socket"
+        );
+    }
+}
+
+#[cfg(test)]
+mod relay_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    const PATIENCE: Duration = Duration::from_secs(30);
+
+    const REQUEST: &[u8] = b"both ways at once";
+    const REPLY: &[u8] = b"and back";
+
+    fn read_all(stream: &mut Connection) -> Vec<u8> {
+        let mut got = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return got,
+                Ok(n) => got.extend_from_slice(&chunk[..n]),
+            }
+        }
+    }
+
+    fn listener() -> Listener {
+        crate::conn::test_bind("127.0.0.1:0").expect("binds")
+    }
+
+    fn port_of(listener: &Listener) -> u16 {
+        listener.local_addr().expect("addr").port()
+    }
+
+    fn relayed(payload: Vec<u8>) -> Vec<u8> {
+        let front = listener();
+        let front_port = port_of(&front);
+        let back = listener();
+        let back_port = port_of(&back);
+        let front_far = thread::spawn(move || {
+            let (mut stream, _) = front.accept().expect("accepts");
+            stream.set_read_timeout(Some(PATIENCE)).expect("timeout");
+            stream.write_all(&payload).expect("writes");
+            let _ = stream.shutdown(Shutdown::Write);
+            read_all(&mut stream);
+        });
+        let back_far = thread::spawn(move || {
+            let (mut stream, _) = back.accept().expect("accepts");
+            stream.set_read_timeout(Some(PATIENCE)).expect("timeout");
+            read_all(&mut stream)
+        });
+
+        let client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        let target = Connection::connect(("127.0.0.1", back_port)).expect("connects");
+        let relay_side = thread::spawn(move || relay(&client, &target));
+
+        let got = back_far.join().expect("joins");
+        front_far.join().expect("joins");
+        relay_side.join().expect("joins");
+        got
+    }
+
+    #[test]
+    fn a_body_of_every_length_survives_the_event_loop() {
+        for len in [
+            0usize, 1, 63, 64, 65, 4095, 4096, 4097, 65_535, 262_144, 300_000,
+        ] {
+            let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            assert_eq!(
+                relayed(payload.clone()),
+                payload,
+                "the event loop moved {len} bytes as something else"
+            );
+        }
+    }
+
+    #[test]
+    fn one_flow_carries_both_directions() {
+        let front = listener();
+        let front_port = port_of(&front);
+        let back = listener();
+        let back_port = port_of(&back);
+        let front_far = thread::spawn(move || {
+            let (mut stream, _) = front.accept().expect("accepts");
+            stream.set_read_timeout(Some(PATIENCE)).expect("timeout");
+            stream.write_all(REQUEST).expect("writes");
+            let _ = stream.shutdown(Shutdown::Write);
+            read_all(&mut stream)
+        });
+        let back_far = thread::spawn(move || {
+            let (mut stream, _) = back.accept().expect("accepts");
+            stream.set_read_timeout(Some(PATIENCE)).expect("timeout");
+            let got = read_all(&mut stream);
+            let _ = stream.write_all(REPLY);
+            got
+        });
+
+        let client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        let target = Connection::connect(("127.0.0.1", back_port)).expect("connects");
+        thread::spawn(move || relay(&client, &target))
+            .join()
+            .expect("joins");
+
+        assert_eq!(
+            front_far.join().expect("joins"),
+            REPLY,
+            "the reply did not survive the client's half-close"
+        );
+        assert_eq!(
+            back_far.join().expect("joins"),
+            REQUEST,
+            "the bytes were altered on the way through"
+        );
+    }
+
+    const CHUNK: usize = 65_536;
+
+    /// The client of the stalled flow: `rounds` chunks of `chunk_len` as fast as the socket
+    /// takes them, then a half-close, reporting how much got out.
+    ///
+    /// `patience` is how long one write waits for room in a socket whose reader has stopped:
+    /// a destination that reads nothing parks the writer, and the arm that ends the wait is
+    /// the test's own, so a fixture never sits out the suite's default.
+    fn push_until_refused(
+        listener: &Listener,
+        rounds: usize,
+        chunk_len: usize,
+        patience: Duration,
+    ) -> usize {
+        let (mut stream, _) = listener.accept().expect("accepts");
+        stream.set_write_timeout(Some(patience)).expect("timeout");
+        let body: Vec<u8> = (0..chunk_len).map(|i| (i % 251) as u8).collect();
+        let mut written = 0usize;
+        for _ in 0..rounds {
+            let mut off = 0;
+            while off < body.len() {
+                match stream.write(&body[off..]) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        off += n;
+                        written += n;
+                    }
+                }
+            }
+            if off < body.len() {
+                break;
+            }
+        }
+        let _ = stream.shutdown(Shutdown::Write);
+        written
+    }
+
+    /// The destination of the stalled flow: it reads none of the flow until the
+    /// neighbours have been collected, then reports how much of it reached it.
+    #[cfg(not(target_os = "windows"))]
+    fn hold_then_read(listener: &Listener, release: &mpsc::Receiver<()>) -> usize {
+        let (mut stream, _) = listener.accept().expect("accepts");
+        stream.set_read_timeout(Some(PATIENCE)).expect("timeout");
+        let _ = release.recv();
+        read_all(&mut stream).len()
+    }
+
+    /// A destination that reads one segment every 2 ms: the flow never fully parks, so neither
+    /// does the pump, and a wake the ring cannot serve is one it is handed again a moment later.
+    #[cfg(target_os = "linux")]
+    fn trickle_then_read(listener: &Listener, release: &mpsc::Receiver<()>, want: usize) -> usize {
+        let (mut stream, _) = listener.accept().expect("accepts");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .expect("timeout");
+        let mut got = vec![0u8; want];
+        let mut total = 0usize;
+        while release.try_recv().is_err() {
+            match stream.read(&mut got) {
+                Ok(0) => return total,
+                Ok(n) => total += n,
+                Err(_) => {}
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        let _ = stream.set_read_timeout(Some(PATIENCE));
+        total + read_all(&mut stream).len()
+    }
+
+    /// One neighbour peer: one chunk, a half-close, and the same bytes back.
+    #[cfg(not(target_os = "windows"))]
+    fn write_then_read_back(stream: &mut Connection) -> usize {
+        stream.set_write_timeout(Some(PATIENCE)).expect("timeout");
+        stream.set_read_timeout(Some(PATIENCE)).expect("timeout");
+        let body: Vec<u8> = (0..CHUNK).map(|i| (i % 191) as u8).collect();
+        if stream.write_all(&body).is_err() {
+            return 0;
+        }
+        let _ = stream.shutdown(Shutdown::Write);
+        read_all(stream).len()
+    }
+
+    /// One neighbour origin: it reads the whole body and echoes it back.
+    #[cfg(not(target_os = "windows"))]
+    fn read_then_echo_back(stream: &mut Connection) {
+        stream.set_read_timeout(Some(PATIENCE)).expect("timeout");
+        stream.set_write_timeout(Some(PATIENCE)).expect("timeout");
+        let body = read_all(stream);
+        if stream.write_all(&body).is_ok() {
+            let _ = stream.shutdown(Shutdown::Write);
+        }
+    }
+
+    /// One flow whose destination stops reading, driven beside sixteen flows that
+    /// answer promptly. A destination that is merely slow must make that flow
+    /// wait; it must not take the flows behind it down with it, and it does: one
+    /// `advance` runs both legs on any wake, and `SPLICE_F_NONBLOCK` only keeps the
+    /// *pipe* side from blocking, so the leg `poll` never reported ready is spliced
+    /// on a descriptor nobody said was able to take it — which parks the worker
+    /// inside the kernel instead of answering `EAGAIN`. Every other flow queued on
+    /// that worker freezes with it, which is how one stalled connection becomes
+    /// five unrelated red tests. Sixteen neighbours over at most eight workers
+    /// guarantees at least two of them share the parked one, so the freeze names
+    /// itself. The fallback copy path gives every direction its own thread and
+    /// cannot be poisoned, so the witness is the Linux job. Loopback only, dials
+    /// nothing.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn a_stalled_destination_does_not_freeze_the_flows_behind_it() {
+        const ROUNDS: usize = 512;
+        const NEIGHBOURS: usize = 16;
+
+        let stalled_front = listener();
+        let stalled_front_port = port_of(&stalled_front);
+        let stalled_back = listener();
+        let stalled_back_port = port_of(&stalled_back);
+        let (release, drain_now) = mpsc::channel::<()>();
+        let feeding =
+            thread::spawn(move || push_until_refused(&stalled_front, ROUNDS, CHUNK, PATIENCE));
+        let draining = thread::spawn(move || hold_then_read(&stalled_back, &drain_now));
+        let stalled_client = Connection::connect(("127.0.0.1", stalled_front_port)).expect("dials");
+        let stalled_target = Connection::connect(("127.0.0.1", stalled_back_port)).expect("dials");
+        let (ended, returned) = mpsc::channel::<()>();
+        let stalled_side = ended.clone();
+        let stalled_relay = thread::spawn(move || {
+            relay(&stalled_client, &stalled_target);
+            let _ = stalled_side.send(());
+        });
+
+        let front = listener();
+        let front_port = port_of(&front);
+        let back = listener();
+        let back_port = port_of(&back);
+        let (seen, counted) = mpsc::channel();
+        let peers = thread::spawn(move || {
+            let mut feeders = Vec::with_capacity(NEIGHBOURS);
+            for _ in 0..NEIGHBOURS {
+                let (mut stream, _) = front.accept().expect("accepts");
+                let seen = seen.clone();
+                feeders.push(thread::spawn(move || {
+                    let _ = seen.send(write_then_read_back(&mut stream));
+                }));
+            }
+            feeders
+        });
+        let echo = thread::spawn(move || {
+            for _ in 0..NEIGHBOURS {
+                let (mut stream, _) = back.accept().expect("accepts");
+                thread::spawn(move || read_then_echo_back(&mut stream));
+            }
+        });
+
+        for _ in 0..NEIGHBOURS {
+            let client = Connection::connect(("127.0.0.1", front_port)).expect("dials");
+            let target = Connection::connect(("127.0.0.1", back_port)).expect("dials");
+            let closed = ended.clone();
+            thread::spawn(move || {
+                relay(&client, &target);
+                let _ = closed.send(());
+            });
+        }
+        drop(ended);
+
+        let mut arrived = Vec::with_capacity(NEIGHBOURS);
+        while arrived.len() < NEIGHBOURS {
+            match counted.recv_timeout(PATIENCE) {
+                Ok(len) => arrived.push(len),
+                Err(_) => break,
+            }
+        }
+        let _ = release.send(());
+        let held = draining.join().expect("joins");
+        let pushed = feeding.join().expect("joins");
+        for feeder in peers.join().expect("joins") {
+            feeder.join().expect("joins");
+        }
+        echo.join().expect("joins");
+
+        let mut closed = 0usize;
+        while closed < NEIGHBOURS + 1 {
+            match returned.recv_timeout(PATIENCE) {
+                Ok(()) => closed += 1,
+                Err(_) => break,
+            }
+        }
+
+        assert!(
+            arrived.len() == NEIGHBOURS && arrived.iter().all(|len| *len == CHUNK),
+            "a flow with a stalled destination was driven beside {NEIGHBOURS} that answer \
+             promptly: {arrived:?} of them came back with {CHUNK} bytes, and the stalled one had \
+             {pushed} written and {held} drained"
+        );
+        assert_eq!(
+            closed,
+            NEIGHBOURS + 1,
+            "the flows a parked worker was holding never closed with it"
+        );
+        assert_eq!(
+            held, pushed,
+            "the stalled flow did not carry everything its client managed to write ({pushed} \
+             bytes) once its destination read again ({held} drained)"
+        );
+        stalled_relay.join().expect("joins");
+    }
+
+    /// A leg parked inside the kernel costs the flow its join budget, the same bound the
+    /// fallback joins on, instead of the thread that started it. Loopback only, dials nothing;
+    /// the Linux job owns the splice pump.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_parked_splice_leg_costs_the_join_budget_not_a_thread() {
+        const JOINED: Duration = Duration::from_millis(250);
+        const SLACK: Duration = Duration::from_secs(10);
+        // The front's own write arm: the destination reads nothing, so the write parks, and the arm is this test's.
+        const ARMED: Duration = Duration::from_millis(250);
+
+        budgets::apply(&crate::config::Budgets {
+            relay_join: Some(JOINED),
+            ..Default::default()
+        });
+        let front = listener();
+        let front_port = port_of(&front);
+        let back = listener();
+        let back_port = port_of(&back);
+        let (release, hold) = mpsc::channel::<()>();
+        let feeding = thread::spawn(move || push_until_refused(&front, 512, CHUNK, ARMED));
+        let parked = thread::spawn(move || {
+            let (_stream, _) = back.accept().expect("accepts");
+            let _ = hold.recv();
+        });
+        let client = Connection::connect(("127.0.0.1", front_port)).expect("dials");
+        let target = Connection::connect(("127.0.0.1", back_port)).expect("dials");
+        let began = std::time::Instant::now();
+        relay(&client, &target);
+        let took = began.elapsed();
+        // Restored before the fixture's own teardown, so a leg another test is joining never reads this table.
+        budgets::clear();
+        let _ = release.send(());
+        let pushed = feeding.join().expect("joins");
+
+        assert!(
+            pushed > 0,
+            "the front wrote {pushed} bytes into a destination that read none"
+        );
+        assert!(
+            took >= JOINED,
+            "the relay gave up after {took:?}, before its {JOINED:?} join budget"
+        );
+        assert!(
+            took < JOINED * 2 + SLACK,
+            "the parked leg cost {took:?}, not its {JOINED:?} join budget:\n{}",
+            crate::census::dump()
+        );
+        parked.join().expect("joins");
+    }
+
+    /// A peer that takes the downlink, reads none of the flow and never closes costs the stall
+    /// budget instead of the thread: the leg writing into it gives up at its arm and closes both
+    /// halves of that socket, which wakes the partner leg on a POSIX read parked in that socket —
+    /// on Windows nothing wakes it, so an un-armed read carries the same arm and ends at it. A half-close
+    /// wakes nothing anywhere, since the peer never reads the FIN. The buffered copy is what this
+    /// shape runs; the Linux pump keeps its own stalled-destination witness above. Loopback only.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_downlink_peer_that_reads_nothing_is_given_up_on_at_its_named_stall() {
+        const STALLED: Duration = Duration::from_millis(250);
+        const CEILING: Duration = Duration::from_secs(10);
+
+        budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(STALLED),
+            ..Default::default()
+        });
+        let front = listener();
+        let front_port = port_of(&front);
+        let back = listener();
+        let back_port = port_of(&back);
+        let (release, hold) = mpsc::channel::<()>();
+        let silent = thread::spawn(move || {
+            let (_stream, _) = front.accept().expect("accepts");
+            let _ = hold.recv();
+        });
+        let pushing = thread::spawn(move || push_until_refused(&back, 512, CHUNK, PATIENCE));
+        let client = Connection::connect(("127.0.0.1", front_port)).expect("dials");
+        let target = Connection::connect(("127.0.0.1", back_port)).expect("dials");
+
+        let began = std::time::Instant::now();
+        relay(&client, &target);
+        let took = began.elapsed();
+        // `relay` returns with its four duplicates gone, so these are the last handles: closing them stops the destination waiting out its own write timeout.
+        drop((client, target));
+        let _ = release.send(());
+        let pushed = pushing.join().expect("joins");
+        budgets::clear();
+
+        assert!(
+            pushed > 0,
+            "the destination wrote {pushed} bytes into a client that read none"
+        );
+        assert!(
+            took >= STALLED,
+            "the relay gave up after {took:?}, before its {STALLED:?} stall budget"
+        );
+        assert!(
+            took < CEILING,
+            "the relay took {took:?} to end a flow whose downlink peer reads nothing, so a leg \
+             is parked past its stall budget:\n{}",
+            crate::census::dump()
+        );
+        silent.join().expect("joins");
+    }
+
+    /// The two loopback ends a carried relay needs, each with a holder thread that takes the
+    /// upload, reads none of the download and never closes, so nothing but an armed wait can end
+    /// the leg parked behind it.
+    struct Carried {
+        write: Connection,
+        destination: Connection,
+        release: (mpsc::Sender<()>, mpsc::Sender<()>),
+        holders: Vec<thread::JoinHandle<()>>,
+    }
+
+    impl Carried {
+        fn open(patience: Duration) -> Carried {
+            let carrier = listener();
+            let carrier_port = port_of(&carrier);
+            let (carrier_go, carrier_hold) = mpsc::channel::<()>();
+            let peer = listener();
+            let peer_port = port_of(&peer);
+            let (peer_go, peer_hold) = mpsc::channel::<()>();
+            let holders = vec![
+                thread::spawn(move || {
+                    let (_stream, _) = carrier.accept().expect("accepts");
+                    let _ = carrier_hold.recv_timeout(patience);
+                }),
+                thread::spawn(move || {
+                    let (_stream, _) = peer.accept().expect("accepts");
+                    let _ = peer_hold.recv_timeout(patience);
+                }),
+            ];
+            let write = Connection::connect(("127.0.0.1", carrier_port)).expect("dials");
+            let destination = Connection::connect(("127.0.0.1", peer_port)).expect("dials");
+            Carried {
+                write,
+                destination,
+                release: (carrier_go, peer_go),
+                holders,
+            }
+        }
+
+        /// Sends each holder away, so its accepted stream goes with it and any leg parked behind
+        /// one wakes, then joins them.
+        fn close(self) {
+            let Carried {
+                write,
+                destination,
+                release,
+                holders,
+            } = self;
+            drop((write, destination));
+            let _ = release.0.send(());
+            let _ = release.1.send(());
+            for holder in holders {
+                let _ = holder.join();
+            }
+        }
+    }
+
+    /// A peer that takes the upload, reads none of the download and never closes ends the carried
+    /// relay's inline leg at its own end of stream, and what that leg hands its sibling is a
+    /// *write* half-close, which wakes a parked read on no platform: the leg blocked in that read
+    /// has to notice the sibling's end, or the flow waits for a thread that never returns. Loopback
+    /// only, dials nothing.
+    #[test]
+    fn a_carried_relay_ends_the_leg_behind_a_peer_that_reads_nothing() {
+        const STALLED: Duration = Duration::from_secs(30);
+        const CEILING: Duration = Duration::from_secs(10);
+
+        budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(STALLED),
+            ..Default::default()
+        });
+        let carried = Carried::open(CEILING * 4);
+        let write = carried.write.try_clone().expect("clones");
+        let destination = carried.destination.try_clone().expect("clones");
+        let (handed, joined) = mpsc::channel();
+        let began = std::time::Instant::now();
+        let relayed = crate::budgets::spawn(move || {
+            if let Some(flow) = relay_carried(std::io::empty(), &write, &destination) {
+                flow.wait();
+            }
+            let _ = handed.send(began.elapsed());
+        });
+
+        let Ok(took) = joined.recv_timeout(CEILING) else {
+            let held = crate::census::dump();
+            carried.close();
+            budgets::clear();
+            panic!("the carried relay never handed back over a peer that reads nothing:\n{held}");
+        };
+        let held = crate::census::dump();
+        // Restored before the verdicts, so a leg another test is joining never reads this table.
+        budgets::clear();
+        let _ = relayed.join();
+        carried.close();
+
+        assert!(
+            took < crate::budgets::RELAY_RESPONSE_IDLE * 3,
+            "the carried relay handed back after {took:?}, at its peer's {STALLED:?} read arm \
+             rather than on the sibling's end"
+        );
+        assert!(
+            took < CEILING,
+            "the carried relay took {took:?} to end a flow behind a peer that reads nothing, so a \
+             leg is parked past its stall budget:\n{held}"
+        );
+    }
+
+    /// The handoff is immediate and the sibling's end is the wake: the caller gets the flow back
+    /// without waiting, and a leg armed far past that budget still ends when the other leg does,
+    /// so no worker is stranded at its arm. Loopback only, dials nothing.
+    #[test]
+    fn a_carried_relay_gives_up_on_a_parked_leg_at_its_join_budget() {
+        const JOINED: Duration = Duration::from_millis(250);
+        const ARMED: Duration = Duration::from_secs(30);
+        const CEILING: Duration = Duration::from_secs(10);
+
+        budgets::apply(&crate::config::Budgets {
+            relay_join: Some(JOINED),
+            relay_stall: Some(ARMED),
+            ..Default::default()
+        });
+        let carried = Carried::open(ARMED);
+        let began = std::time::Instant::now();
+        let flow = relay_carried(std::io::empty(), &carried.write, &carried.destination)
+            .expect("both halves clone");
+        let handed = began.elapsed();
+        flow.wait();
+        let took = began.elapsed();
+        let held = crate::census::dump();
+        budgets::clear();
+        carried.close();
+
+        assert!(
+            handed < JOINED,
+            "the caller waited {handed:?} for a parked leg, past its {JOINED:?} join budget"
+        );
+        assert!(
+            took < ARMED,
+            "the leg parked behind a peer that reads nothing ended after {took:?}, at its \
+             {ARMED:?} arm rather than on the sibling's end:\n{held}"
+        );
+        assert!(took < CEILING, "the flow never handed back:\n{held}");
+    }
+
+    /// A pipe ring's slots go before its bytes: 512-byte segments arriving one wake at a time
+    /// stuff the ring at its slot ceiling while byte room remains, so an honest `POLLIN` still
+    /// has nowhere to put what it sees. The destination has to be *moving* for that to spin —
+    /// measured against a pump that re-arms the wake, this shape cost 78 183 of its 79 013
+    /// wakes as ingest splices that moved nothing in a 400 ms window, with the pump's cpu at
+    /// the whole of it, while a destination that reads nothing at all parks the ring full and
+    /// registers none. The same window on the shipped pump measures 2, and the limit is the
+    /// distance between those two with room for the rest of the suite's flows. Loopback only;
+    /// the Linux job owns the splice pump.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_trickling_destination_does_not_spin_the_pump() {
+        const SEGMENT: usize = 512;
+        const ROUNDS: usize = 8_192;
+        const WINDOW: Duration = Duration::from_millis(400);
+        const SPIN_LIMIT: usize = 1_000;
+
+        let stalled_front = listener();
+        let stalled_front_port = port_of(&stalled_front);
+        let stalled_back = listener();
+        let stalled_back_port = port_of(&stalled_back);
+        let (release, drain_now) = mpsc::channel::<()>();
+        let feeding =
+            thread::spawn(move || push_until_refused(&stalled_front, ROUNDS, SEGMENT, PATIENCE));
+        let draining = thread::spawn(move || trickle_then_read(&stalled_back, &drain_now, SEGMENT));
+        let stalled_client = Connection::connect(("127.0.0.1", stalled_front_port)).expect("dials");
+        let stalled_target = Connection::connect(("127.0.0.1", stalled_back_port)).expect("dials");
+        let stalled_relay = thread::spawn(move || relay(&stalled_client, &stalled_target));
+
+        thread::sleep(Duration::from_millis(200));
+        let before = poll_relay::idle_ingests();
+        thread::sleep(WINDOW);
+        let idle = poll_relay::idle_ingests().saturating_sub(before);
+
+        let _ = release.send(());
+        let held = draining.join().expect("joins");
+        let pushed = feeding.join().expect("joins");
+        stalled_relay.join().expect("joins");
+
+        assert!(
+            idle < SPIN_LIMIT,
+            "the pump ran {idle} ingest splices that moved nothing across a {} ms window of a \
+             flow whose ring was out of slots: a wake the ring cannot serve must not be re-armed",
+            WINDOW.as_millis(),
+        );
+        assert_eq!(
+            held, pushed,
+            "the trickling flow carried {held} bytes of the {pushed} its client wrote"
+        );
+    }
+
+    /// A half-closed direct flow whose peer stays open and silent hands its threads back on the
+    /// response grace: the reply leg reads with a bound and checks the sibling's end, so a peer
+    /// that never closes cannot park a thread for the life of the process.
+    #[cfg(windows)]
+    #[test]
+    fn a_half_closed_direct_flow_hands_its_threads_back() {
+        let front = listener();
+        let front_port = port_of(&front);
+        let back = listener();
+        let back_port = port_of(&back);
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("dials the front");
+        let (client_local, _) = front.accept().expect("accepts the client");
+        let _peer = Connection::connect(("127.0.0.1", back_port)).expect("dials the back");
+        let (target_local, _) = back.accept().expect("accepts the peer");
+        client
+            .set_read_timeout(Some(PATIENCE))
+            .expect("client timeout");
+
+        let client_read = client_local.try_clone().expect("clones");
+        let client_write = client_local.try_clone().expect("clones");
+        let target_write = target_local.try_clone().expect("clones");
+        client.shutdown(Shutdown::Write).expect("half-closes");
+        let (handed, parked) = mpsc::channel();
+        let relay = thread::spawn(move || {
+            relay_vectored_direct(client_read, target_write, target_local, client_write);
+            let _ = handed.send(());
+        });
+        parked.recv_timeout(Duration::from_secs(10)).expect(
+            "a peer that stayed open and silent parked the direct relay past its response grace",
+        );
+        relay.join().expect("joins");
+
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            client
+                .read(&mut byte)
+                .expect("a silent peer must not outlive the grace"),
+            0,
+            "the half-closed flow stayed open past its response grace"
+        );
+    }
+
+    /// The two ends of a raw VLESS relay: the client's socket and the server's, each with the
+    /// far end held by the test.
+    #[cfg(target_os = "linux")]
+    fn raw_answer_pair() -> (Connection, Connection, Connection, Connection) {
+        let front = listener();
+        let front_port = port_of(&front);
+        let back = listener();
+        let back_port = port_of(&back);
+        let client = Connection::connect(("127.0.0.1", front_port)).expect("dials the front");
+        let (client_local, _) = front.accept().expect("accepts the client");
+        let peer = Connection::connect(("127.0.0.1", back_port)).expect("dials the back");
+        let (target_local, _) = back.accept().expect("accepts the peer");
+        client
+            .set_read_timeout(Some(PATIENCE))
+            .expect("client timeout");
+        peer.set_read_timeout(Some(PATIENCE)).expect("peer timeout");
+        (client, client_local, target_local, peer)
+    }
+
+    /// A raw VLESS dial hands the pump a reply lane that has not seen its answer, and the pipe
+    /// owns the strip: the client's payload must ride `splice(2)`, not the lane pool's buffer.
+    /// Before that hand-off moved, this was red — the answering lane allocated no splice pipe,
+    /// because every byte of its ``[0, 0]`` and its payload crossed a user-space buffer.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_answering_handoff_strips_the_answer_on_the_splice_pump() {
+        let (mut client, client_local, target_local, mut peer) = raw_answer_pair();
+        let succeeded = Arc::new(AtomicBool::new(false));
+        let refused = Arc::new(AtomicBool::new(false));
+        let pipes = splice_pipes_allocated();
+        relay_handoff_answering(
+            &client_local,
+            &target_local,
+            Box::new({
+                let flag = Arc::clone(&succeeded);
+                move || flag.store(true, Ordering::SeqCst)
+            }),
+            Arc::new({
+                let flag = Arc::clone(&refused);
+                move || flag.store(true, Ordering::SeqCst)
+            }),
+        );
+        let allocated = splice_pipes_allocated() - pipes;
+        assert!(
+            allocated >= 2,
+            "the answering handoff allocated {allocated} splice pipes: its reply lane is still \
+             copying every byte through a user-space buffer"
+        );
+        peer.write_all(b"\x00\x00hello")
+            .expect("the server answers with payload");
+        let mut down = [0u8; 5];
+        client
+            .read_exact(&mut down)
+            .expect("the client reads the payload");
+        assert_eq!(&down, b"hello", "the answer reached the client as payload");
+        assert!(
+            succeeded.load(Ordering::SeqCst),
+            "a valid answer never reported success"
+        );
+        assert!(
+            !refused.load(Ordering::SeqCst),
+            "a valid answer reported a refusal"
+        );
+        client.write_all(b"ping").expect("the client uploads");
+        let mut up = [0u8; 4];
+        peer.read_exact(&mut up)
+            .expect("the server reads the upload");
+        assert_eq!(&up, b"ping");
+        let _ = client.shutdown(Shutdown::Both);
+        let _ = peer.shutdown(Shutdown::Both);
+    }
+
+    /// The splice pool holds one lane per flow of the widest standard cell, the width the
+    /// carriered pool holds at eight: a wake that finds every lane busy waits for another flow's
+    /// service, which is the 141-against-158 MiB/s seven lanes measured on `lane_pool`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_splice_pool_holds_a_lane_per_flow_of_the_widest_cell() {
+        let width = poll_relay::pool_width();
+        assert!(
+            width >= 8,
+            "the splice pump pools {width} lanes for an eight-flow cell, so the eighth flow's \
+             wake queues behind another flow's service"
+        );
+    }
+
+    /// A server that withholds its answer until it sees payload must not hold the upload: the
+    /// pump forwards payload while the reply lane is still waiting for ``[0, 0]``.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_answering_handoff_relays_the_upload_before_the_answer() {
+        let (mut client, client_local, target_local, mut peer) = raw_answer_pair();
+        let succeeded = Arc::new(AtomicBool::new(false));
+        relay_handoff_answering(
+            &client_local,
+            &target_local,
+            Box::new({
+                let flag = Arc::clone(&succeeded);
+                move || flag.store(true, Ordering::SeqCst)
+            }),
+            Arc::new(|| {}),
+        );
+        client
+            .write_all(b"ping")
+            .expect("the client uploads before any answer");
+        let mut up = [0u8; 4];
+        peer.read_exact(&mut up)
+            .expect("the upload reaches a server that has not answered");
+        assert_eq!(&up, b"ping");
+        peer.write_all(b"\x00\x00pong")
+            .expect("the server answers now");
+        let mut down = [0u8; 4];
+        client
+            .read_exact(&mut down)
+            .expect("the client reads the payload");
+        assert_eq!(&down, b"pong");
+        assert!(
+            succeeded.load(Ordering::SeqCst),
+            "an answer sent after the upload never reported success"
+        );
+        let _ = client.shutdown(Shutdown::Both);
+        let _ = peer.shutdown(Shutdown::Both);
+    }
+
+    /// An answer that arrives in halves must stay out of the payload: the pipe holds the first
+    /// byte and the wake on the second completes the strip before any drain.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_answering_handoff_holds_a_half_answer_out_of_the_payload() {
+        let (mut client, client_local, target_local, mut peer) = raw_answer_pair();
+        let succeeded = Arc::new(AtomicBool::new(false));
+        relay_handoff_answering(
+            &client_local,
+            &target_local,
+            Box::new({
+                let flag = Arc::clone(&succeeded);
+                move || flag.store(true, Ordering::SeqCst)
+            }),
+            Arc::new(|| {}),
+        );
+        peer.write_all(b"\x00").expect("half the answer");
+        thread::sleep(Duration::from_millis(50));
+        peer.write_all(b"\x00hello")
+            .expect("the rest of the answer and the payload");
+        let mut down = [0u8; 5];
+        client
+            .read_exact(&mut down)
+            .expect("the client reads the payload");
+        assert_eq!(
+            &down, b"hello",
+            "a byte of the split answer reached the client with the payload"
+        );
+        assert!(
+            succeeded.load(Ordering::SeqCst),
+            "a split answer never reported success"
+        );
+        let _ = client.shutdown(Shutdown::Both);
+        let _ = peer.shutdown(Shutdown::Both);
+    }
+
+    /// A refused answer ends the flow on the pump: the client sees the close and the refusal
+    /// reports once, and nothing of the answer reaches the payload.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_answering_handoff_refuses_a_bad_answer_on_the_pump() {
+        let (mut client, client_local, target_local, mut peer) = raw_answer_pair();
+        let succeeded = Arc::new(AtomicBool::new(false));
+        let refused = Arc::new(AtomicBool::new(false));
+        relay_handoff_answering(
+            &client_local,
+            &target_local,
+            Box::new({
+                let flag = Arc::clone(&succeeded);
+                move || flag.store(true, Ordering::SeqCst)
+            }),
+            Arc::new({
+                let flag = Arc::clone(&refused);
+                move || flag.store(true, Ordering::SeqCst)
+            }),
+        );
+        peer.write_all(b"\x07\x00nope")
+            .expect("the server answers with a bad version");
+        let deadline = std::time::Instant::now() + PATIENCE;
+        let mut byte = [0u8; 1];
+        loop {
+            match client.read(&mut byte) {
+                Ok(0) => break,
+                Ok(_) => panic!("the refused answer reached the client as payload"),
+                Err(error) if is_timeout(&error) => assert!(
+                    std::time::Instant::now() < deadline,
+                    "a refused answer left the client open"
+                ),
+                Err(_) => break,
+            }
+        }
+        assert!(
+            refused.load(Ordering::SeqCst),
+            "a refused answer never reported the refusal"
+        );
+        assert!(
+            !succeeded.load(Ordering::SeqCst),
+            "a refused answer reported success"
+        );
+    }
+
+    /// A half that closed before the answer arrived must not hold the flow: the lane path hands
+    /// its thread back after the configured grace, and the pipe owes the same verdict on the same
+    /// clock — the answer is refused once and the client's read half sees EOF instead of a wait.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_answer_that_never_arrives_ends_the_half_closed_flow() {
+        let (mut client, client_local, target_local, mut peer) = raw_answer_pair();
+        let target_local = target_local.with_policy(Some(crate::policy::Flow {
+            handshake: None,
+            conn_idle: Some(Duration::from_millis(200)),
+            uplink_only: None,
+            downlink_only: None,
+            buffer: None,
+        }));
+        let success = Arc::new(AtomicBool::new(false));
+        let refused = Arc::new(AtomicBool::new(false));
+        relay_handoff_answering(
+            &client_local,
+            &target_local,
+            Box::new({
+                let flag = Arc::clone(&success);
+                move || flag.store(true, Ordering::SeqCst)
+            }),
+            Arc::new({
+                let flag = Arc::clone(&refused);
+                move || flag.store(true, Ordering::SeqCst)
+            }),
+        );
+        client.write_all(b"payload").expect("uploads");
+        client.shutdown(Shutdown::Write).expect("half-closes");
+        let mut heard = [0u8; 16];
+        let mut uploaded = 0usize;
+        while uploaded < b"payload".len() {
+            uploaded += peer.read(&mut heard).expect("reads the upload");
+        }
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("client timeout");
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            client
+                .read(&mut byte)
+                .expect("a silent answer must not outlive the grace"),
+            0,
+            "the half-closed flow stayed open past its answer grace"
+        );
+        assert!(
+            refused.load(Ordering::SeqCst),
+            "the silent answer never reported the refusal"
+        );
+        assert!(
+            !success.load(Ordering::SeqCst),
+            "an answer that never arrived reported success"
+        );
+    }
+
+    /// A reset can end the reply half after one answer byte, and the rung still has to hear
+    /// that the dial failed: the pipe refuses the answer on its error exit the way the lane
+    /// path refuses it on every exit, once, with no payload served.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_answering_handoff_refuses_an_answer_lost_to_a_reset() {
+        let (mut client, client_local, target_local, mut peer) = raw_answer_pair();
+        let succeeded = Arc::new(AtomicBool::new(false));
+        let refusals = Arc::new(AtomicUsize::new(0));
+        relay_handoff_answering(
+            &client_local,
+            &target_local,
+            Box::new({
+                let flag = Arc::clone(&succeeded);
+                move || flag.store(true, Ordering::SeqCst)
+            }),
+            Arc::new({
+                let count = Arc::clone(&refusals);
+                move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }
+            }),
+        );
+        peer.write_all(&[0u8]).expect("half an answer");
+        linger_zero(&peer);
+        drop(peer);
+        let mut heard = [0u8; 8];
+        loop {
+            match client.read(&mut heard) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        assert_eq!(
+            refusals.load(Ordering::SeqCst),
+            1,
+            "a reset before the answer completed refused it once"
+        );
+        assert!(
+            !succeeded.load(Ordering::SeqCst),
+            "an answer cut short reported success"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linger_zero(connection: &Connection) {
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let set = unsafe {
+            libc::setsockopt(
+                std::os::fd::AsRawFd::as_raw_fd(connection),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                std::ptr::addr_of!(linger).cast(),
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(set, 0, "linger zero is set");
+    }
+
+    /// The two clones `relay_carried` shares one socket: a finished upload used
+    /// to `shutdown(Both)` it, aborting the download direction's still-open read
+    /// so the reply never arrived. The upload here is already empty, so the relay
+    /// reaches its teardown before the target answers; only a `Write` half-close
+    /// leaves the peer's read intact for the sibling thread to carry the reply.
+    /// Loopback only, dials nothing.
+    #[test]
+    fn a_finished_upload_does_not_drop_the_response() {
+        let carrier = listener();
+        let carrier_port = port_of(&carrier);
+        let target = listener();
+        let target_port = port_of(&target);
+
+        let answered = thread::spawn(move || {
+            let (mut stream, _) = target.accept().expect("accepts");
+            stream.set_read_timeout(Some(PATIENCE)).expect("timeout");
+            let _ = read_all(&mut stream);
+            stream.write_all(REPLY).expect("answers");
+            let _ = stream.shutdown(Shutdown::Write);
+        });
+        let collected = thread::spawn(move || {
+            let (mut stream, _) = carrier.accept().expect("accepts");
+            stream.set_read_timeout(Some(PATIENCE)).expect("timeout");
+            read_all(&mut stream)
+        });
+
+        let write = Connection::connect(("127.0.0.1", carrier_port)).expect("dials carrier");
+        let peer = Connection::connect(("127.0.0.1", target_port)).expect("dials target");
+        let reader: &[u8] = &[];
+        relay_carried(reader, &write, &peer);
+
+        answered.join().expect("target joins");
+        let got = collected.join().expect("carrier joins");
+        assert_eq!(got, REPLY, "a finished upload must not drop the reply");
+    }
+
+    /// One user, one reader and one relay thread per flow, all sixteen running at once, each flow
+    /// moving thirty-two splice pipes' worth: the multi-connection regime the references sustain at
+    /// gigabits, and the one a stalled flow poisons for its neighbours. Every count a stall needs to
+    /// name itself is published, so the failure says which flow, how far in, how far out and how
+    /// many relays ended. Loopback only, dials nothing.
+    #[test]
+    fn sixteen_flows_at_once_all_arrive_whole() {
+        const FLOWS: usize = 16;
+        const CHUNK: usize = 65_536;
+        const ROUNDS: usize = 128;
+        const LEN: usize = CHUNK * ROUNDS;
+
+        let front = Arc::new(listener());
+        let front_port = port_of(&front);
+        let back = Arc::new(listener());
+        let back_port = port_of(&back);
+
+        let sent: Arc<[std::sync::atomic::AtomicUsize]> = (0..FLOWS)
+            .map(|_| std::sync::atomic::AtomicUsize::new(0))
+            .collect();
+
+        let mut users = Vec::with_capacity(FLOWS);
+        for user in 0..FLOWS {
+            let sent = Arc::clone(&sent);
+            let front = Arc::clone(&front);
+            users.push(thread::spawn(move || {
+                let (mut stream, _) = front.accept().expect("accepts");
+                stream.set_write_timeout(Some(PATIENCE)).expect("timeout");
+                let chunk: Vec<u8> = (0..CHUNK).map(|i| ((i + user) % 251) as u8).collect();
+                let mut wrote = 0usize;
+                for _ in 0..ROUNDS {
+                    if stream.write_all(&chunk).is_err() {
+                        break;
+                    }
+                    wrote += CHUNK;
+                    sent[user].store(wrote, Ordering::Relaxed);
+                }
+                let _ = stream.shutdown(Shutdown::Write);
+                // handed back so the kernel's unsent bytes live until the counts are read
+                stream
+            }));
+        }
+        let mut readers = Vec::with_capacity(FLOWS);
+        for _ in 0..FLOWS {
+            let back = Arc::clone(&back);
+            readers.push(thread::spawn(move || {
+                let (mut stream, _) = back.accept().expect("accepts");
+                stream.set_read_timeout(Some(PATIENCE)).expect("timeout");
+                let mut arrived = 0usize;
+                let mut chunk = vec![0u8; CHUNK];
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => return arrived,
+                        Ok(took) => arrived += took,
+                    }
+                }
+            }));
+        }
+
+        let (ended, watched) = mpsc::channel();
+        let mut relays = Vec::with_capacity(FLOWS);
+        for _ in 0..FLOWS {
+            let client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+            let target = Connection::connect(("127.0.0.1", back_port)).expect("connects");
+            let ended = ended.clone();
+            relays.push(thread::spawn(move || {
+                relay(&client, &target);
+                let _ = ended.send(());
+            }));
+        }
+        drop(ended);
+
+        let arrived: Vec<usize> = readers
+            .into_iter()
+            .map(|reader| reader.join().expect("reads"))
+            .collect();
+        let mut finished = 0usize;
+        for _ in 0..FLOWS {
+            if watched.recv_timeout(PATIENCE).is_err() {
+                break;
+            }
+            finished += 1;
+        }
+        let written: Vec<usize> = (0..FLOWS)
+            .map(|user| sent[user].load(Ordering::Relaxed))
+            .collect();
+        assert!(
+            arrived.iter().all(|count| *count == LEN) && finished == FLOWS,
+            "{FLOWS} concurrent flows of {LEN} bytes each arrived {arrived:?}, were written \
+             {written:?}, and {finished} of {FLOWS} relays ended"
+        );
+
+        for user in users {
+            user.join().expect("feeds");
+        }
+        for relay_side in relays {
+            relay_side.join().expect("joins");
+        }
+    }
+    /// A header that lands in two reads is completed, counted useful once, and stripped before the payload.
+    #[test]
+    fn a_split_answer_is_stripped_before_the_payload() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let targets = listener();
+        let mut target =
+            Connection::connect(targets.local_addr().expect("addr")).expect("connects");
+        let (src, _) = targets.accept().expect("accepts");
+        src.set_read_timeout(Some(Duration::from_millis(10)))
+            .expect("timeout");
+        let clients = listener();
+        let mut client =
+            Connection::connect(clients.local_addr().expect("addr")).expect("connects");
+        let (dst, _) = clients.accept().expect("accepts");
+        let refused = Arc::new(AtomicUsize::new(0));
+        let success = Arc::new(AtomicUsize::new(0));
+        let (r, s) = (Arc::clone(&refused), Arc::clone(&success));
+        let hooks = AnswerHooks {
+            success: Box::new(move || {
+                s.fetch_add(1, Ordering::Relaxed);
+            }),
+            refused: Arc::new(move || {
+                r.fetch_add(1, Ordering::Relaxed);
+            }),
+        };
+        let mut copy = TcpCopy::new(src, dst).answering(hooks);
+        copy.reply_idle = Duration::from_secs(120);
+        let flow = RelayFinish::new(false, Arc::new(|| {}), None);
+
+        target.write_all(&[0]).expect("half a header");
+        assert_eq!(
+            copy.step(&flow),
+            Next::Idle,
+            "a half header waits for its other byte"
+        );
+        assert_eq!(success.load(Ordering::Relaxed), 0);
+
+        target
+            .write_all(&[0, b'o', b'k'])
+            .expect("the rest and a payload");
+        assert_eq!(copy.step(&flow), Next::More);
+        assert_eq!(
+            success.load(Ordering::Relaxed),
+            1,
+            "the validated answer counts once"
+        );
+        assert_eq!(
+            copy.reply_idle,
+            crate::budgets::RELAY_RESPONSE_IDLE,
+            "the answer wait's grace ends with the answer"
+        );
+        assert_eq!(copy.step(&flow), Next::Idle);
+        let mut got = [0u8; 2];
+        client.read_exact(&mut got).expect("reads");
+        assert_eq!(&got, b"ok");
+        assert_eq!(refused.load(Ordering::Relaxed), 0);
+    }
+
+    /// A bad answer refuses the flow exactly once, however many steps the lane runs afterwards.
+    #[test]
+    fn a_refused_answer_reports_once_and_ends_the_lane() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let targets = listener();
+        let mut target =
+            Connection::connect(targets.local_addr().expect("addr")).expect("connects");
+        let (src, _) = targets.accept().expect("accepts");
+        let clients = listener();
+        let _client = Connection::connect(clients.local_addr().expect("addr")).expect("connects");
+        let (dst, _) = clients.accept().expect("accepts");
+        let refused = Arc::new(AtomicUsize::new(0));
+        let success = Arc::new(AtomicUsize::new(0));
+        let (r, s) = (Arc::clone(&refused), Arc::clone(&success));
+        let hooks = AnswerHooks {
+            success: Box::new(move || {
+                s.fetch_add(1, Ordering::Relaxed);
+            }),
+            refused: Arc::new(move || {
+                r.fetch_add(1, Ordering::Relaxed);
+            }),
+        };
+        let mut copy = TcpCopy::new(src, dst).answering(hooks);
+        let flow = RelayFinish::new(false, Arc::new(|| {}), None);
+
+        target.write_all(&[1, 0]).expect("refuses the answer");
+        assert_eq!(copy.step(&flow), Next::Done);
+        assert_eq!(copy.step(&flow), Next::Done);
+        assert_eq!(refused.load(Ordering::Relaxed), 1);
+        assert_eq!(success.load(Ordering::Relaxed), 0);
+    }
+
+    /// EOF before the header is a refusal, reported once.
+    #[test]
+    fn an_answer_that_ends_before_its_header_is_refused_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let targets = listener();
+        let mut target =
+            Connection::connect(targets.local_addr().expect("addr")).expect("connects");
+        let (src, _) = targets.accept().expect("accepts");
+        let clients = listener();
+        let _client = Connection::connect(clients.local_addr().expect("addr")).expect("connects");
+        let (dst, _) = clients.accept().expect("accepts");
+        let refused = Arc::new(AtomicUsize::new(0));
+        let success = Arc::new(AtomicUsize::new(0));
+        let (r, s) = (Arc::clone(&refused), Arc::clone(&success));
+        let hooks = AnswerHooks {
+            success: Box::new(move || {
+                s.fetch_add(1, Ordering::Relaxed);
+            }),
+            refused: Arc::new(move || {
+                r.fetch_add(1, Ordering::Relaxed);
+            }),
+        };
+        let mut copy = TcpCopy::new(src, dst).answering(hooks);
+        let flow = RelayFinish::new(false, Arc::new(|| {}), None);
+
+        target.write_all(&[0]).expect("half a header");
+        target.shutdown(Shutdown::Write).expect("ends the answer");
+        assert_eq!(copy.step(&flow), Next::Done);
+        assert_eq!(copy.step(&flow), Next::Done);
+        assert_eq!(refused.load(Ordering::Relaxed), 1);
+        assert_eq!(success.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[cfg(test)]
+mod foxy_exit_tests {
+    use super::{
+        exit_agrees, pick_verified_edge, probe_settled, probes_reachable, sweep_verdict, Sweep,
+    };
+
+    #[test]
+    fn a_sweep_that_reached_the_edges_and_agreed_with_none_is_itself_an_answer() {
+        assert_eq!(
+            sweep_verdict(&[Some(false), Some(true), Some(true)]),
+            Sweep::Agreed(1),
+            "a pick beats every refusal before and after it"
+        );
+        assert_eq!(
+            sweep_verdict(&[Some(false), Some(false)]),
+            Sweep::Refuted,
+            "the pin is not what this runner gets, and asking again buys the same refusal"
+        );
+        assert_eq!(
+            sweep_verdict(&[None, Some(false)]),
+            Sweep::Refuted,
+            "one edge answering wrongly is still an answer"
+        );
+        assert_eq!(
+            sweep_verdict(&[None, None]),
+            Sweep::Unreachable,
+            "nothing answering means this runner cannot carry a probe at all"
+        );
+        assert_eq!(
+            sweep_verdict(&[]),
+            Sweep::Unreachable,
+            "and no edge to ask is the same verdict"
+        );
+    }
+
+    #[test]
+    fn a_pinned_country_accepts_its_own_exit_and_refuses_a_single_edge_anycast_that_egresses_elsewhere(
+    ) {
+        assert!(exit_agrees("US", "US"));
+        assert!(exit_agrees("us", "US"));
+        assert!(!exit_agrees("US", "CA"));
+        assert!(
+            exit_agrees(ferrox_core::foxy::catalog::RECOMMENDED, "CA"),
+            "the recommended location accepts wherever the nearest edge exits"
+        );
+    }
+
+    #[test]
+    fn the_preferred_edge_is_the_first_one_whose_exit_agrees_not_the_first_one_opened() {
+        // A `us` label that egresses elsewhere must not win over the next edge that truly exits US.
+        assert_eq!(
+            pick_verified_edge(&[Some(false), Some(true), Some(true)]),
+            Some(1)
+        );
+        assert_eq!(
+            pick_verified_edge(&[None, Some(false), Some(true)]),
+            Some(2)
+        );
+        assert_eq!(pick_verified_edge(&[Some(true)]), Some(0));
+    }
+
+    #[test]
+    fn no_agreeing_exit_leaves_the_label_order_untouched_rather_than_pinning_a_wrong_edge() {
+        assert_eq!(pick_verified_edge(&[]), None);
+        assert_eq!(pick_verified_edge(&[Some(false), None, Some(false)]), None);
+    }
+
+    #[test]
+    fn a_runner_that_carries_no_probe_stops_trying_instead_of_failing_every_flow() {
+        assert!(!probes_reachable(&[None, None, None]));
+        assert!(probes_reachable(&[None, Some(false)]));
+        assert!(!probes_reachable(&[]));
+    }
+
+    #[test]
+    fn the_walk_ends_at_the_agreeing_edge_without_losing_the_pick() {
+        for answers in [
+            vec![Some(true)],
+            vec![Some(false), Some(true), Some(false)],
+            vec![None, Some(false), Some(true), None],
+            vec![Some(false), None, Some(false)],
+            vec![None, None],
+            vec![],
+        ] {
+            let whole = pick_verified_edge(&answers);
+            // The walk truncates where `probe_settled` first fires; the truncated table must pick the same edge.
+            let mut walked = 0usize;
+            while walked < answers.len() {
+                walked += 1;
+                if probe_settled(&answers[..walked]) {
+                    break;
+                }
+            }
+            assert_eq!(
+                whole,
+                pick_verified_edge(&answers[..walked]),
+                "{walked} probe(s) of {answers:?} lost the pick"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod census_tests {
+    use super::*;
+    use crate::census;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    const PATIENCE: Duration = Duration::from_secs(10);
+
+    /// A stream that answers nothing until its lift is dropped: the in-memory peer a census dump is taken against.
+    struct Silent {
+        until_lifted: mpsc::Receiver<()>,
+    }
+
+    impl Read for Silent {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            let _ = self.until_lifted.recv();
+            Ok(0)
+        }
+    }
+
+    /// The census line a parked thread's named wait holds, once it is there: registration happens on that thread, so a dump taken too early says nothing yet.
+    fn wait_for(name: &str, waiter: std::thread::ThreadId) -> String {
+        let until = Instant::now() + PATIENCE;
+        loop {
+            if let Some(found) = census::held(name, waiter) {
+                return found;
+            }
+            assert!(
+                Instant::now() < until,
+                "`{name}` never registered itself in the census:\n{}",
+                census::dump()
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// The same line without naming its thread: a lane's park is not the caller's.
+    fn wait_for_any(name: &str, needle: &str) -> String {
+        let named = format!("name={name} ");
+        let until = Instant::now() + PATIENCE;
+        loop {
+            if let Some(found) = census::dump()
+                .lines()
+                .find(|line| line.contains(&named) && line.contains(needle))
+            {
+                return found.to_owned();
+            }
+            assert!(
+                Instant::now() < until,
+                "`{name}` never registered itself in the census:\n{}",
+                census::dump()
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn a_parked_leg_read_names_the_descriptor_it_waits_on() {
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let back = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let back_port = back.local_addr().expect("addr").port();
+        let reader = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        let sink = Connection::connect(("127.0.0.1", back_port)).expect("connects");
+        // Both peers stay open and say nothing, so the only progress a leg can make is its own bound.
+        let _silent_front = front.accept().map(|(stream, _)| stream).expect("accepts");
+        let _silent_back = back.accept().map(|(stream, _)| stream).expect("accepts");
+        reader
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("bounds the leg");
+        let (reports, reported) = mpsc::channel();
+        let leg = thread::spawn(move || {
+            let mut reader = reader;
+            let mut sink = sink;
+            let _ = reports.send((census::handle(&reader), census::handle(&sink)));
+            copy_all_memcpy(&mut reader, &mut sink);
+        });
+        let leg_id = leg.thread().id();
+        let (read_fd, write_fd) = reported
+            .recv_timeout(PATIENCE)
+            .expect("the leg reports both descriptors");
+        assert_ne!(
+            read_fd, write_fd,
+            "one descriptor for both legs proves nothing"
+        );
+        let held = wait_for("relay-leg-read", leg_id);
+        assert!(held.contains(&format!("fd={read_fd} ")), "{held}");
+        // The arm a caller gave the leg is the arm the census reports, so a stall shows its own bound instead of pretending to be unbounded.
+        assert!(held.contains("armed=2s "), "{held}");
+        leg.join().expect("joins");
+        assert!(
+            census::held("relay-leg-read", leg_id).is_none(),
+            "a returned leg is still in the census:\n{}",
+            census::dump()
+        );
+    }
+
+    #[test]
+    fn a_parked_tunnel_leg_reports_the_time_it_has_waited() {
+        // Dropping the sender is what lifts the park, so the leg returns on its own.
+        let (lift, until_lifted) = mpsc::channel::<()>();
+        let leg = thread::spawn(move || {
+            let half = Half::shared(Silent { until_lifted });
+            half.read_once(&mut [0u8; 16])
+        });
+        let leg_id = leg.thread().id();
+        let held = wait_for("tunnel-leg-read", leg_id);
+        // A leg through the shared relay half is a `dyn Read`, so no descriptor reaches its census line.
+        assert!(held.contains("fd=none "), "{held}");
+        thread::sleep(Duration::from_millis(30));
+        let held =
+            census::held("tunnel-leg-read", leg_id).expect("the leg left the census while parked");
+        assert!(census::number(&held, "waited") >= 30, "{held}");
+        drop(lift);
+        leg.join().expect("joins").expect("reads");
+        assert!(
+            census::held("tunnel-leg-read", leg_id).is_none(),
+            "a returned leg is still in the census:\n{}",
+            census::dump()
+        );
+    }
+
+    #[test]
+    fn a_parked_join_reports_the_budget_it_armed() {
+        let (handed, receiver) = mpsc::channel::<Result<(), ()>>();
+        let budget = Duration::from_millis(500);
+        let waiter = thread::spawn(move || join_within(&receiver, budget));
+        let waiter_id = waiter.thread().id();
+        let held = wait_for("relay-join", waiter_id);
+        assert!(held.contains("armed=500ms "), "{held}");
+        assert!(held.contains("fd=none "), "{held}");
+        thread::sleep(Duration::from_millis(30));
+        let held =
+            census::held("relay-join", waiter_id).expect("the join left the census while parked");
+        assert!(census::number(&held, "waited") >= 30, "{held}");
+        // A partner whose sender is gone hands back on its own, so the park ends before its budget.
+        drop(handed);
+        assert!(
+            waiter.join().expect("joins"),
+            "a gone partner is not a finished flow"
+        );
+        assert!(
+            census::held("relay-join", waiter_id).is_none(),
+            "a returned join is still in the census:\n{}",
+            census::dump()
+        );
+    }
+
+    /// The carried relay's upload leg parks in a *write* on a lane, once its peer stops taking
+    /// bytes, and a write half-close on the sibling wakes nothing: the census line names that
+    /// write with the stall it was armed with, and the lane hands back at that bound instead of
+    /// holding the carrier's thread. The caller hands the flow on at once, so it cannot be the
+    /// parking thread. The leg writes through the peer socket's own clone, whose descriptor is
+    /// not the caller's, so the line has to name a descriptor rather than match a number.
+    /// Loopback only, dials nothing.
+    #[test]
+    fn a_parked_carrier_write_gives_up_at_the_stall_it_reports() {
+        const STALLED: Duration = Duration::from_millis(250);
+        const CEILING: Duration = Duration::from_secs(10);
+        const UPLOAD: usize = 16 << 20;
+
+        budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(STALLED),
+            ..Default::default()
+        });
+        let carrier = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let carrier_port = carrier.local_addr().expect("addr").port();
+        let peer = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let peer_port = peer.local_addr().expect("addr").port();
+        let write = Connection::connect(("127.0.0.1", carrier_port)).expect("connects");
+        let destination = Connection::connect(("127.0.0.1", peer_port)).expect("connects");
+        // Both peers stay open and read nothing, so the only progress either leg can make is its own bound.
+        let _silent_carrier = carrier.accept().map(|(stream, _)| stream).expect("accepts");
+        let _silent_peer = peer.accept().map(|(stream, _)| stream).expect("accepts");
+        let (handed, joined) = mpsc::channel();
+        let began = Instant::now();
+        let leg = crate::budgets::spawn(move || {
+            let flow = relay_carried(
+                std::io::Cursor::new(vec![0u8; UPLOAD]),
+                &write,
+                &destination,
+            )
+            .expect("hands the flow on");
+            let _ = handed.send(began.elapsed());
+            flow
+        });
+        let took = joined
+            .recv_timeout(CEILING)
+            .expect("the carried relay hands the flow on without waiting on its upload");
+        assert!(
+            took < STALLED,
+            "the carried relay held the caller for {took:?}, past its upload's {STALLED:?} write arm"
+        );
+        // Another test's carrier write runs under the default arm at the same time: this flow's line is the one that names its own 250 ms clock, and the thread id is what the clean-up follows.
+        let held = wait_for_any("carrier-write", "armed=250ms ");
+        assert!(!held.contains("fd=none "), "{held}");
+        let owner = held
+            .split(" waited=")
+            .next()
+            .expect("the census line names its wait");
+        budgets::clear();
+        let until = Instant::now() + CEILING;
+        while census::dump().lines().any(|line| line.starts_with(owner)) {
+            assert!(
+                Instant::now() < until,
+                "the upload never handed its lane back over a peer that stopped taking bytes:\n{}",
+                census::dump()
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let flow = leg.join().expect("joins");
+        flow.wait();
+        assert!(
+            census::dump().lines().all(|line| !line.starts_with(owner)),
+            "a lane's write outlived the flow:\n{}",
+            census::dump()
+        );
+    }
+}
+
+#[cfg(test)]
+mod foxy_ping_tests {
+    use super::foxy_edge_row;
+    use ferrox_core::foxy::Candidate;
+
+    fn edge() -> Candidate {
+        Candidate {
+            host: std::sync::Arc::from("us.m1.example"),
+            port: 2499,
+            country: "US".to_owned(),
+            city: "SFO".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_pinged_row_carries_the_reading_and_a_silent_edge_carries_a_null() {
+        assert_eq!(
+            foxy_edge_row(&edge(), Some(41)),
+            r#"{"host":"us.m1.example","port":2499,"city":"SFO","country":"US","ms":41}"#
+        );
+        assert_eq!(
+            foxy_edge_row(&edge(), None),
+            r#"{"host":"us.m1.example","port":2499,"city":"SFO","country":"US","ms":null}"#,
+            "an unanswered edge is still a row: silence is the reading"
+        );
+    }
+}
+
+#[cfg(test)]
+mod foxy_split_tests {
+    use super::{foxy_splits, Destination};
+
+    fn named(host: &str, port: u16) -> Destination {
+        Destination::Name(host.to_owned(), port)
+    }
+
+    #[test]
+    fn an_excluded_domain_takes_its_own_name_and_its_subdomains_but_not_a_name_that_merely_ends_with_it(
+    ) {
+        let suffixes = vec!["example.com".to_owned()];
+        assert!(foxy_splits(&[], &suffixes, &named("example.com", 443)));
+        assert!(foxy_splits(&[], &suffixes, &named("a.example.com", 443)));
+        assert!(foxy_splits(&[], &suffixes, &named("A.Example.COM", 443)));
+        assert!(!foxy_splits(&[], &suffixes, &named("notexample.com", 443)));
+        assert!(!foxy_splits(
+            &[],
+            &suffixes,
+            &named("example.com.evil", 443)
+        ));
+    }
+
+    #[test]
+    fn a_starred_or_dotted_suffix_reads_as_the_same_exclusion() {
+        for spelling in ["*.example.com", ".example.com", "example.com."] {
+            let suffixes = vec![spelling.to_owned()];
+            assert!(
+                foxy_splits(&[], &suffixes, &named("a.example.com", 443)),
+                "{spelling} did not cover a subdomain"
+            );
+            assert!(
+                !foxy_splits(&[], &suffixes, &named("badexample.com", 443)),
+                "{spelling} leaked to a name that merely ends with the suffix"
+            );
+        }
+    }
+
+    #[test]
+    fn an_excluded_port_leaves_whatever_the_name() {
+        assert!(foxy_splits(
+            &[22, 53],
+            &[],
+            &Destination::Address("192.0.2.7:53".parse().expect("addr"))
+        ));
+        assert!(foxy_splits(&[22, 53], &[], &named("anything.example", 22)));
+        assert!(!foxy_splits(
+            &[22, 53],
+            &[],
+            &named("anything.example", 443)
+        ));
+    }
+
+    #[test]
+    fn a_domain_list_does_not_decide_an_address() {
+        let suffixes = vec!["0.2.7".to_owned()];
+        assert!(!foxy_splits(
+            &[],
+            &suffixes,
+            &Destination::Address("192.0.2.7:443".parse().expect("addr"))
+        ));
+    }
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::{resolve_bounded, resolve_probe};
+    use std::time::{Duration, Instant};
+
+    /// `getaddrinfo` has no deadline of its own: a resolver that never answers must not park the
+    /// flow thread that asked, so the lookup is bounded by the dial budget and times out empty.
+    #[test]
+    fn a_name_lookup_that_never_answers_does_not_park_its_flow() {
+        let (release, wait) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        let addrs = resolve_bounded(
+            "stalled.invalid",
+            443,
+            Duration::from_millis(50),
+            move |_, _| {
+                let _ = wait.recv();
+                Ok(Vec::new())
+            },
+        );
+        assert!(addrs.is_none(), "a timed-out lookup has no answer");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the lookup waited out the stuck resolver instead of its budget: {}ms",
+            started.elapsed().as_millis()
+        );
+        // A lookup that timed out may already have dropped the queued closure, so the release is best effort.
+        let _ = release.send(());
+    }
+
+    /// A flow pays a queue send, not a thread start: repeated lookups reuse the same bounded set.
+    #[test]
+    fn repeated_lookups_reuse_the_bounded_workers() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        for _ in 0..super::RESOLVE_WORKERS * 2 {
+            let seen = std::sync::Arc::clone(&seen);
+            let addrs = resolve_bounded("localhost", 80, Duration::from_secs(5), move |_, _| {
+                seen.lock()
+                    .expect("seen")
+                    .insert(std::thread::current().id());
+                Ok(vec![std::net::SocketAddr::from(([127, 0, 0, 1], 80))])
+            })
+            .expect("the pooled lookup answered");
+            assert_eq!(addrs.len(), 1);
+        }
+        let workers = seen.lock().expect("seen").len();
+        assert!(
+            workers <= super::RESOLVE_WORKERS,
+            "spawned {workers} resolver threads for {} lookups",
+            super::RESOLVE_WORKERS * 2
+        );
+    }
+
+    /// A probe fan-out must not take a worker the next dial waits on, so the two lookups land on
+    /// different sets of long-lived resolver threads.
+    #[test]
+    fn probe_lookups_use_their_own_workers() {
+        let dial = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let probe = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen = std::sync::Arc::clone(&dial);
+        assert!(
+            resolve_bounded("dial.invalid", 443, Duration::from_secs(1), move |_, _| {
+                *seen.lock().expect("dial worker") = Some(std::thread::current().id());
+                Ok(Vec::new())
+            })
+            .is_some()
+        );
+        let seen = std::sync::Arc::clone(&probe);
+        assert!(
+            resolve_probe("probe.invalid", 443, Duration::from_secs(1), move |_, _| {
+                *seen.lock().expect("probe worker") = Some(std::thread::current().id());
+                Ok(Vec::new())
+            })
+            .is_some()
+        );
+        let dial = dial.lock().expect("dial worker").expect("dial ran");
+        let probe = probe.lock().expect("probe worker").expect("probe ran");
+        assert_ne!(dial, probe, "a probe shared the dial resolver pool");
+    }
+
+    /// A timeout or a resolver error has no answer; a genuine empty answer is still an answer the
+    /// caller may cache.
+    #[test]
+    fn a_failed_lookup_is_not_an_empty_answer() {
+        let failed = resolve_bounded("failed.invalid", 443, Duration::from_secs(1), |_, _| {
+            Err(std::io::Error::other("no answer"))
+        });
+        assert!(failed.is_none(), "a failed lookup has no answer to cache");
+        let empty = resolve_bounded("empty.invalid", 443, Duration::from_secs(1), |_, _| {
+            Ok(Vec::new())
+        });
+        assert_eq!(
+            empty,
+            Some(Vec::new()),
+            "an empty answer is still an answer"
+        );
+    }
+
+    /// A job whose caller already gave up is dropped before the resolver is asked.
+    #[test]
+    fn an_expired_queued_lookup_is_skipped() {
+        let (queue, receiver) = std::sync::mpsc::sync_channel(1);
+        let (reply, _answer) = std::sync::mpsc::sync_channel(1);
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = std::sync::Arc::clone(&ran);
+        queue
+            .send(super::ResolveJob {
+                host: "expired.invalid".to_owned(),
+                port: 443,
+                deadline: Instant::now(),
+                lookup: Box::new(move |_, _| {
+                    seen.store(true, std::sync::atomic::Ordering::Relaxed);
+                    Ok(Vec::new())
+                }),
+                reply,
+            })
+            .expect("queues the expired job");
+        drop(queue);
+        super::resolve_worker(&std::sync::Mutex::new(receiver));
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::Relaxed),
+            "expired work still ran"
+        );
+    }
+
+    /// A worker parked in a resolver does not own the queue: another worker takes the next job.
+    #[test]
+    fn a_stalled_worker_does_not_hold_the_next_lookup() {
+        let (started, began) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let stalled = std::thread::spawn(move || {
+            resolve_bounded(
+                "stalled.invalid",
+                443,
+                Duration::from_secs(5),
+                move |_, _| {
+                    let _ = started.send(());
+                    let _ = wait.recv();
+                    Ok(Vec::new())
+                },
+            )
+        });
+        began
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the stalled lookup reached a worker");
+        let fresh = resolve_bounded("fresh.invalid", 443, Duration::from_secs(1), |_, _| {
+            Ok(vec![std::net::SocketAddr::from(([192, 0, 2, 7], 443))])
+        });
+        assert_eq!(
+            fresh,
+            Some(vec![std::net::SocketAddr::from(([192, 0, 2, 7], 443))]),
+            "a stalled worker held the next lookup"
+        );
+        release.send(()).expect("releases the stalled worker");
+        let _answer = stalled.join().expect("joins the stalled lookup");
+    }
+}
+
+#[cfg(test)]
+mod dns_lane_tests {
+    use super::*;
+
+    /// The question the lane answers to: the id, one question, the name, the type,
+    /// class IN.
+    fn dns_question(name: &str, qtype: u16) -> Vec<u8> {
+        let mut query = vec![0x12, 0x34, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        for label in name.split('.').filter(|label| !label.is_empty()) {
+            query.push(label.len() as u8);
+            query.extend_from_slice(label.as_bytes());
+        }
+        query.push(0);
+        query.extend(&qtype.to_be_bytes());
+        query.extend([0, 1]);
+        query
+    }
+
+    fn direct_rule() -> Vec<ferrox_core::dns::Rule> {
+        vec![ferrox_core::dns::Rule {
+            qtypes: Vec::new(),
+            domains: None,
+            action: ferrox_core::dns::Action::Direct,
+            rcode: 0,
+        }]
+    }
+
+    /// A literal name is the lookup's own answer: the address it parsed and the record list around it.
+    #[test]
+    fn a_literal_lookup_answers_without_a_socket_addr_buffer() {
+        let (resolve, counts) = ferrox_core::alloc_count::measure(|| dns_lookup(b"192.0.2.9."));
+        let ferrox_core::dns::Resolve::Records { rdata, ttl } = resolve else {
+            panic!("a literal is a record list");
+        };
+        assert_eq!(rdata, vec![vec![192, 0, 2, 9]]);
+        assert_eq!(ttl, 300);
+        assert_eq!(counts.allocs, 2, "the record list and its one address");
+    }
+
+    /// A cached name answers from the refcounted entry: the record list and its one address, and no
+    /// copy of the cache's own vector.
+    #[test]
+    fn a_cached_lookup_answers_without_a_copy_of_the_cache() {
+        remember_lookup("cached.test", 0, &[SocketAddr::from(([192, 0, 2, 7], 0))]);
+        let _ = crate::dnsapp::installed();
+        let (resolve, counts) = ferrox_core::alloc_count::measure(|| dns_lookup(b"cached.test."));
+        let ferrox_core::dns::Resolve::Records { rdata, ttl } = resolve else {
+            panic!("a cached name is a record list");
+        };
+        assert_eq!(rdata, vec![vec![192, 0, 2, 7]]);
+        assert_eq!(ttl, 300);
+        assert_eq!(counts.allocs, 2, "the record list and its one address");
+    }
+
+    /// The stream lane's framing read: eight framed messages cost one buffer, not one each, and the
+    /// buffer it reads them into neither moves nor grows for them.
+    #[test]
+    fn the_stream_lane_reads_every_message_into_one_buffer() {
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let stream = Connection::connect(("127.0.0.1", port)).expect("dials");
+        let (mut peer, _) = listener.accept().expect("accepts");
+        let frames: Vec<Vec<u8>> = (0..8)
+            .map(|n| dns_question(&format!("q{n}.test."), 1))
+            .collect();
+        let sent = frames.clone();
+        let writer = std::thread::spawn(move || {
+            for frame in &sent {
+                let head = (frame.len() as u16).to_be_bytes();
+                std::io::Write::write_all(&mut peer, &head).expect("the length leaves");
+                std::io::Write::write_all(&mut peer, frame).expect("the body leaves");
+            }
+        });
+        let mut stream = stream;
+        let mut body = Vec::new();
+        let mut body_init = 0usize;
+        let ((base, capacity), counts) = ferrox_core::alloc_count::measure(|| {
+            let mut base = 0usize;
+            let mut capacity = 0usize;
+            for (n, frame) in frames.iter().enumerate() {
+                // SAFETY: `body_init` describes `body`, whose room this test owns.
+                let read = unsafe { read_dns_source(&mut stream, &mut body, &mut body_init) }
+                    .expect("a message");
+                assert_eq!(read, frame.as_slice());
+                if n == 0 {
+                    base = body.as_ptr() as usize;
+                    capacity = body.capacity();
+                }
+            }
+            (base, capacity)
+        });
+        writer.join().expect("the writer ends");
+        assert_eq!(
+            counts.allocs, 1,
+            "one buffer for the lane, not one per message"
+        );
+        assert_eq!(body.as_ptr() as usize, base, "the buffer never moves");
+        assert_eq!(body.capacity(), capacity, "nor grows for them");
+    }
+
+    #[test]
+    fn a_dns_datagram_rides_the_route_s_lane() {
+        let query = dns_question("nameserver.test.", 16);
+        let answer = b"an answer the lane carries back".to_vec();
+        let upstream = UdpSocket::bind("127.0.0.1:0").expect("nameserver binds");
+        let target = upstream.local_addr().expect("addr");
+        let seen = query.clone();
+        let sent = answer.clone();
+        let server = std::thread::spawn(move || {
+            let mut buf = udp_buffer();
+            let (read, from) = upstream.recv_from(&mut buf).expect("query arrives");
+            assert_eq!(&buf[..read], seen);
+            upstream.send_to(&sent, from).expect("answer leaves");
+        });
+        let dns = Outbound::Dns(DnsOut {
+            tcp: Some(false),
+            address: None,
+            port: 0,
+            rules: direct_rule(),
+        });
+        let got = dns_udp_with(&dns, target, &query, Duration::from_secs(2)).expect("lane answers");
+        server.join().expect("server ends");
+        assert_eq!(got, answer);
+    }
+
+    #[test]
+    fn a_dns_stream_rides_the_route_s_lane() {
+        let query = dns_question("nameserver.test.", 16);
+        let answer = b"a framed answer the lane carries".to_vec();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("nameserver binds");
+        let target = listener.local_addr().expect("addr");
+        let seen = query.clone();
+        let sent = answer.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let mut head = [0u8; 2];
+            std::io::Read::read_exact(&mut stream, &mut head).expect("length arrives");
+            let mut body = vec![0u8; usize::from(u16::from_be_bytes(head))];
+            std::io::Read::read_exact(&mut stream, &mut body).expect("query arrives");
+            assert_eq!(body, seen);
+            let out = (sent.len() as u16).to_be_bytes();
+            std::io::Write::write_all(&mut stream, &out).expect("length leaves");
+            std::io::Write::write_all(&mut stream, &sent).expect("answer leaves");
+        });
+        let dns = Outbound::Dns(DnsOut {
+            tcp: Some(true),
+            address: None,
+            port: 0,
+            rules: direct_rule(),
+        });
+        let mut stream =
+            dns_stream_with(&dns, Destination::Address(target), Duration::from_secs(2))
+                .expect("lane opens");
+        let head = (query.len() as u16).to_be_bytes();
+        std::io::Write::write_all(&mut stream, &head).expect("length leaves");
+        std::io::Write::write_all(&mut stream, &query).expect("query leaves");
+        let mut back = [0u8; 2];
+        std::io::Read::read_exact(&mut stream, &mut back).expect("answer length arrives");
+        let mut body = vec![0u8; usize::from(u16::from_be_bytes(back))];
+        std::io::Read::read_exact(&mut stream, &mut body).expect("answer arrives");
+        server.join().expect("server ends");
+        assert_eq!(body, answer);
+    }
+
+    #[test]
+    fn the_dns_stream_lane_relays_a_direct_query_byte_for_byte() {
+        let query = dns_question("nameserver.test.", 16);
+        let reply = b"the relay must relay these bytes whole".as_slice();
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("front binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("nameserver binds");
+        let up_port = listener.local_addr().expect("addr").port();
+        let up_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), up_port);
+        let dns = DnsOut {
+            tcp: None,
+            address: None,
+            port: 0,
+            rules: direct_rule(),
+        };
+        let client = Connection::connect(("127.0.0.1", front.local_addr().expect("addr").port()))
+            .expect("dials");
+        let (mut app_side, _) = front.accept().expect("accepts");
+        let head = (query.len() as u16).to_be_bytes();
+        std::thread::scope(|scope| {
+            scope.spawn(|| serve_dns_tcp(client, &dns, &Destination::Address(up_addr)));
+            let received = query.clone();
+            let nameserver = scope.spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accepts");
+                let mut head = [0u8; 2];
+                read_exact(&mut stream, &mut head).expect("the length arrives");
+                let size = usize::from(u16::from_be_bytes(head));
+                let mut body = vec![0u8; size];
+                read_exact(&mut stream, &mut body).expect("the query arrives");
+                assert_eq!(body, received);
+                let own = (reply.len() as u16).to_be_bytes();
+                let parts = [&own[..], reply];
+                write_all_parts::<2>(&mut stream, parts.as_slice()).expect("the answer leaves");
+            });
+            std::io::Write::write_all(&mut app_side, &head).expect("query length leaves");
+            std::io::Write::write_all(&mut app_side, &query).expect("query leaves");
+            let mut read = [0u8; 2];
+            read_exact(&mut app_side, &mut read).expect("answer length arrives");
+            let mut answer = vec![0u8; usize::from(u16::from_be_bytes(read))];
+            read_exact(&mut app_side, &mut answer).expect("answer arrives");
+            assert_eq!(answer, reply);
+            drop(app_side);
+            nameserver.join().expect("nameserver leg");
+        });
+    }
+
+    #[test]
+    fn the_dns_datagram_lane_relays_a_direct_datagram_byte_for_byte() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").expect("nameserver binds");
+        let up_addr = upstream.local_addr().expect("addr");
+        let relay: &'static UdpSocket = Box::leak(Box::new(
+            UdpSocket::bind("127.0.0.1:0").expect("relay binds"),
+        ));
+        let dns: &'static DnsOut = Box::leak(Box::new(DnsOut {
+            tcp: Some(false),
+            address: None,
+            port: 0,
+            rules: direct_rule(),
+        }));
+        let app = UdpSocket::bind("127.0.0.1:0").expect("app binds");
+        std::thread::spawn(move || serve_dns_udp(relay, dns, None));
+        let mut packet = Vec::new();
+        let query = dns_question("nameserver.test.", 16);
+        {
+            let mut frame = Vec::new();
+            let framed = socks_udp_frame(&mut frame, &up_addr, &query);
+            packet.extend_from_slice(framed);
+        }
+        let relay_token = relay.local_addr().expect("addr");
+        app.send_to(&packet, relay_token).expect("sends");
+        let mut back = udp_buffer();
+        let (read, lane) = upstream.recv_from(&mut back).expect("query arrives");
+        assert_eq!(&back[..read], &query);
+        // The answer's bytes are whatever the nameserver writes back: the relay is byte-neutral.
+        let answer = b"a name in the wire is a name regardless of width";
+        // The reply goes to the source the query named, the way any server answers.
+        upstream.send_to(answer, lane).expect("answers");
+        let mut back = udp_buffer();
+        let (read, _) = app.recv_from(&mut back).expect("answer arrives");
+        let mut expected = Vec::new();
+        let framed = socks_udp_frame(&mut expected, &up_addr, answer);
+        assert_eq!(&back[..read], framed);
+    }
+
+    #[test]
+    fn the_dns_datagram_lane_answers_a_hijack_from_the_resolver() {
+        let relay: &'static UdpSocket = Box::leak(Box::new(
+            UdpSocket::bind("127.0.0.1:0").expect("relay binds"),
+        ));
+        let dns: &'static DnsOut = Box::leak(Box::new(DnsOut {
+            tcp: None,
+            address: None,
+            port: 0,
+            rules: Vec::new(),
+        }));
+        let app = UdpSocket::bind("127.0.0.1:0").expect("app binds");
+        std::thread::spawn(move || serve_dns_udp(relay, dns, None));
+        let mut packet = Vec::new();
+        let query = dns_question("localhost.", 1);
+        let up_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 53);
+        {
+            let mut frame = Vec::new();
+            let framed = socks_udp_frame(&mut frame, &up_addr, &query);
+            packet.extend_from_slice(framed);
+        }
+        let relay_token = relay.local_addr().expect("addr");
+        app.send_to(&packet, relay_token).expect("sends");
+        let mut back = udp_buffer();
+        let (read, _) = app.recv_from(&mut back).expect("answer arrives");
+        // The frame names the destination the datagram itself asked: RSV, FRAG, the v4 ATYP, the port, the address, then the answer whole.
+        assert_eq!(&back[..10], &[0, 0, 0, 1, 127, 0, 0, 1, 0, 53]);
+        let answer = &back[10..read];
+        assert_eq!(&answer[..2], &[0x12, 0x34], "the id echoes");
+        assert!(answer[2] & 0x80 == 0x80, "the header marks the response");
+        assert!(
+            answer.windows(4).any(|piece| piece == [127, 0, 0, 1]),
+            "the resolver's loopback record rides the answer"
+        );
+    }
+
+    /// The v2 records the reference writes for the ends it names: a v4 pair carries twelve
+    /// address bytes, a v6 end of a v4 remote carries none, and a v4 end beside a v6 spills
+    /// as its mapped sixteen.
+    #[test]
+    fn a_v2_fallback_record_writes_the_ends_the_reference_writes() {
+        let tag = |v: &Vec<u8>| v[12];
+        let v4 = fallback_record(
+            "192.0.2.1:1111".parse::<SocketAddr>().expect("v4"),
+            "192.0.2.2:2222".parse::<SocketAddr>().expect("v4"),
+        );
+        assert_eq!(&v4[..12], b"\r\n\r\n\x00\r\nQUIT\n");
+        assert_eq!(tag(&v4), 0x21);
+        assert_eq!(v4.len(), 28, "signature, family, twelve bytes, two ports");
+        assert_eq!(&v4[16..20], &[192, 0, 2, 1]);
+        assert_eq!(&v4[20..24], &[192, 0, 2, 2]);
+        assert_eq!(&v4[24..26], &1111_u16.to_be_bytes());
+        assert_eq!(&v4[26..28], &2222_u16.to_be_bytes());
+
+        let crossed = fallback_record(
+            "192.0.2.1:1111".parse::<SocketAddr>().expect("v4"),
+            "[fd00::1]:2222".parse::<SocketAddr>().expect("v6"),
+        );
+        assert_eq!(&crossed[..16], &v4[..16], "the remote names the record");
+        assert_eq!(
+            crossed.len(),
+            24,
+            "no local address bytes reach a v4 remote record"
+        );
+
+        let mapped = fallback_record(
+            "[fd00::1]:1111".parse::<SocketAddr>().expect("v6"),
+            "127.0.0.1:2222".parse::<SocketAddr>().expect("v4"),
+        );
+        assert_eq!(tag(&mapped), 0x21);
+        assert_eq!(mapped[13], 0x21, "the v6 family is the record's own");
+        assert_eq!(mapped.len(), 52);
+        assert_eq!(
+            &mapped[32..48],
+            &std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped().octets(),
+            "a v4 local spills as its mapped sixteen"
+        );
+    }
+
+    #[test]
+    fn an_unknown_fallback_head_spells_the_version_s_own() {
+        assert_eq!(&fallback_unknown_head(1)[..], b"PROXY UNKNOWN\r\n");
+        assert_eq!(
+            &fallback_unknown_head(2)[..],
+            &b"\r\n\r\n\x00\r\nQUIT\n\x20\x00\x00\x00"[..]
+        );
+    }
+
+    /// A first read that answers at most `limit` bytes, the way a header can straddle two
+    /// reads on a live socket.
+    struct Chunked {
+        bytes: Vec<u8>,
+        at: usize,
+        limit: usize,
+    }
+
+    impl Read for Chunked {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.at == self.bytes.len() {
+                return Ok(0);
+            }
+            let n = self.limit.min(buf.len()).min(self.bytes.len() - self.at);
+            buf[..n].copy_from_slice(&self.bytes[self.at..self.at + n]);
+            self.at += n;
+            Ok(n)
+        }
+    }
+
+    struct Failing;
+
+    impl Read for Failing {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+        }
+    }
+
+    fn a_vless_probe(id: &[u8; 16], cmd: u8) -> Vec<u8> {
+        let mut out = vec![0u8];
+        out.extend_from_slice(id);
+        out.push(0);
+        out.push(cmd);
+        out.extend_from_slice(&8080u16.to_be_bytes());
+        out.push(ferrox_core::addr::IPV4);
+        out.extend_from_slice(&[127, 0, 0, 1]);
+        out
+    }
+
+    /// The reference's first read is the route's window and the fallback's head; its fallback
+    /// verdicts are a short read, an unknown version, or an unknown user, and nothing past them.
+    #[test]
+    fn a_probe_takes_the_reference_s_fallback_verdicts() {
+        let id = [7u8; 16];
+        let header = a_vless_probe(&id, 1);
+        let mut window = [0u8; PROBE_READ];
+
+        let mut whole = header.clone();
+        whole.extend_from_slice(b"hello");
+        let (verdict, consumed, carried) = probe_front(
+            &mut std::io::Cursor::new(whole.clone()),
+            &one_vless_user(&id),
+            &mut window,
+        );
+        assert!(
+            matches!(verdict, Probe::Decoded((got, _, 1, target)) if got == id && target.port() == 8080 && target.ip().is_loopback()),
+            "a header this inbound owns is not a probe"
+        );
+        assert_eq!(
+            &window[..consumed],
+            header.as_slice(),
+            "the window stops at the header"
+        );
+        assert_eq!(carried, b"hello", "the payload after the header is carried");
+
+        let (verdict, first, carried) = probe_front(
+            &mut Chunked {
+                bytes: header.clone(),
+                at: 0,
+                limit: 18,
+            },
+            &one_vless_user(&id),
+            &mut window,
+        );
+        assert!(matches!(verdict, Probe::Decoded(_)));
+        assert_eq!(
+            &window[..first],
+            &header[..18],
+            "the window stops at the read"
+        );
+        assert_eq!(
+            carried,
+            header[18..],
+            "the tail keeps what the parse pulled"
+        );
+
+        let mut foreign = vec![0u8];
+        foreign.extend_from_slice(&[9u8; 16]);
+        foreign.extend_from_slice(b"GET / HTTP/1.1\r\n\r\n");
+        for probe in [b"GET / HTTP/1.1\r\nHost: x\r\n\r\n".to_vec(), foreign] {
+            let (verdict, first, carried) = probe_front(
+                &mut std::io::Cursor::new(probe.clone()),
+                &one_vless_user(&id),
+                &mut window,
+            );
+            assert!(matches!(verdict, Probe::Refused), "{probe:?}");
+            assert_eq!(&window[..first], probe);
+            assert_eq!(carried, Vec::<u8>::new());
+        }
+        let short = b"GET / HTTP/1.1".to_vec();
+        let (verdict, first, carried) = probe_front(
+            &mut std::io::Cursor::new(short.clone()),
+            &one_vless_user(&id),
+            &mut window,
+        );
+        assert!(matches!(verdict, Probe::Refused));
+        assert_eq!(&window[..first], short.as_slice());
+        assert_eq!(carried, Vec::<u8>::new());
+
+        let mut no_address = a_vless_probe(&id, 1);
+        no_address.truncate(19);
+        let (verdict, _, _) = probe_front(
+            &mut std::io::Cursor::new(no_address),
+            &one_vless_user(&id),
+            &mut window,
+        );
+        assert!(
+            matches!(verdict, Probe::Dropped),
+            "the reference does not fall back past the id"
+        );
+
+        let (verdict, _, _) = probe_front(&mut Failing, &one_vless_user(&id), &mut window);
+        assert!(matches!(verdict, Probe::Dropped), "a failed read drops");
+    }
+
+    /// A header and its first payload arriving in one read: the handler forwards the payload the
+    /// parse left in the window, not just the bytes a later read pulled past it.
+    #[test]
+    fn a_decoded_header_forwards_the_first_read_s_payload() {
+        let echo = std::net::TcpListener::bind("127.0.0.1:0").expect("bind echo");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let payload = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        let (sent, got) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let Ok((mut peer, _)) = echo.accept() else {
+                return;
+            };
+            let _ = peer.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut buf = vec![0u8; payload.len()];
+            let read = peer.read_exact(&mut buf);
+            let _ = sent.send((read, buf));
+        });
+
+        let front = std::net::TcpListener::bind("127.0.0.1:0").expect("bind front");
+        let front_addr = front.local_addr().expect("front addr");
+        let client = thread::spawn(move || {
+            let mut client = std::net::TcpStream::connect(front_addr).expect("connect front");
+            let mut reply = [0u8; 2];
+            client.read_exact(&mut reply).expect("the vless reply");
+            assert_eq!(reply, [0, 0]);
+        });
+
+        let (server, _) = front.accept().expect("accept front");
+        let id = [7u8; 16];
+        let dial = move |target: &SocketAddr| Connection::connect(*target).ok();
+        let peer = server.peer_addr().ok();
+        vless_raw_reply(
+            Connection::from(server),
+            peer,
+            &one_vless_user(&id),
+            true,
+            None,
+            Opening {
+                window: &[],
+                probe: Probe::Decoded((id, Flow::None, 1, echo_addr)),
+                carried: payload.to_vec(),
+            },
+            &MuxIo {
+                dial,
+                resolve: resolve_endpoint,
+            },
+        );
+
+        let (read, buf) = got
+            .recv_timeout(Duration::from_secs(3))
+            .expect("echo answered");
+        read.expect("the upstream reads the carried payload");
+        assert_eq!(
+            buf.as_slice(),
+            &payload[..],
+            "the first read's payload reaches the uplink"
+        );
+        client.join().expect("client");
+    }
+
+    /// A probe the vless header refuses falls to the row it routes: the substitute echoes
+    /// everything back, and the probe bytes come home prefaced by the head the row's xver
+    /// asks for — the loopback's own ends spelling that head.
+    #[test]
+    fn a_refused_probe_falls_to_the_row_it_routes() {
+        let dest = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let dest_addr = dest.local_addr().expect("addr");
+        thread::spawn(move || {
+            let Ok((peer, _)) = dest.accept() else {
+                return;
+            };
+            let mut peer = Connection::from(peer);
+            let mut buf = [0u8; 256];
+            while let Ok(n) = peer.read(&mut buf) {
+                if n == 0 {
+                    return;
+                }
+                if peer.write_all(&buf[..n]).is_err() {
+                    return;
+                }
+            }
+        });
+        let rows = [Fallback {
+            name: String::new(),
+            alpn: String::new(),
+            path: String::new(),
+            network: FallbackNetwork::Tcp {
+                family: 0,
+                host: "127.0.0.1".into(),
+                port: dest_addr.port(),
+            },
+            xver: 1,
+        }];
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let front_addr = listener.local_addr().expect("addr");
+        thread::spawn(move || {
+            let Ok((front, _)) = listener.accept() else {
+                return;
+            };
+            drop(listener);
+            serve_vless_raw(
+                Connection::from(front),
+                &one_vless_user(&[0u8; 16]),
+                true,
+                Some(&rows),
+            );
+        });
+        let mut client = Connection::connect(front_addr).expect("connect");
+        client.write_all(b"not a vless probe").expect("write");
+        let _ = client.shutdown(Shutdown::Write);
+        let mut got = Vec::new();
+        let mut buf = [0u8; 256];
+        while let Ok(n) = client.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        let head = b"PROXY TCP4 127.0.0.1 127.0.0.1 ";
+        assert!(
+            got.starts_with(head),
+            "the head the row's xver asks for rides the probe: {got:?}"
+        );
+        assert!(
+            got.ends_with(b"not a vless probe"),
+            "the probe lands at the substitute and echoes back: {got:?}"
+        );
+    }
+}
+
+/// The inbound a role serves one front stream with.
+#[allow(clippy::too_many_lines)]
+fn front_dispatch(stream: Connection, role: Role) {
+    let account = role.account().cloned();
+    let source = stream.peer_addr().ok();
+    let email = account
+        .as_ref()
+        .map_or("", |account| account.email.as_str());
+    let level = account.as_ref().map_or(0, |account| account.level);
+    let _flow = crate::accesslog::flow(source, email, level);
+    dispatch(stream, role, account.as_ref());
+}
+
+fn with_account(stream: Connection, account: Option<&InboundAccount>, vmess: bool) -> Connection {
+    let Some(account) = account else {
+        return stream;
+    };
+    let stream = stream.with_policy(Some(crate::policy::flow(account.level)));
+    if vmess {
+        stream
+    } else {
+        stream.with_meter(crate::stats::user_traffic(&account.email, account.level))
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
+    let vmess = matches!(
+        role,
+        Role::Vmess { .. } | Role::VmessTls { .. } | Role::VmessReality { .. }
+    );
+    let stream = with_account(stream, account, vmess);
+    match role {
+        Role::Vless {
+            users,
+            carrier,
+            freedom,
+            fallbacks,
+            decryption,
+        } => serve_vless_shared(
+            stream,
+            &users,
+            &carrier,
+            freedom,
+            fallbacks.as_deref(),
+            decryption.as_ref(),
+        ),
+        Role::VlessTls {
+            users,
+            freedom,
+            carrier,
+            server,
+            fallbacks,
+            decryption,
+        } => serve_vless_tls(
+            stream,
+            &users,
+            freedom,
+            &carrier,
+            &server,
+            fallbacks.as_deref(),
+            decryption.as_ref(),
+        ),
+        Role::VlessReality {
+            users,
+            freedom,
+            carrier,
+            server,
+            fallbacks,
+            decryption,
+        } => serve_vless_reality(
+            stream,
+            &users,
+            freedom,
+            &carrier,
+            &server,
+            fallbacks.as_deref(),
+            decryption.as_ref(),
+        ),
+        Role::Trojan {
+            keys,
+            carrier,
+            freedom,
+            account: _,
+        } => serve_trojan(stream, &keys, &carrier, freedom),
+        Role::TrojanTls {
+            keys,
+            carrier,
+            freedom,
+            server,
+            fallbacks,
+            account: _,
+        } => serve_trojan_tls(
+            stream,
+            &keys,
+            &carrier,
+            freedom,
+            &server,
+            fallbacks.as_deref(),
+        ),
+        Role::TrojanReality {
+            keys,
+            carrier,
+            freedom,
+            server,
+            fallbacks,
+            account: _,
+        } => serve_trojan_reality(
+            stream,
+            &keys,
+            &carrier,
+            freedom,
+            &server,
+            fallbacks.as_deref(),
+        ),
+        Role::Vmess {
+            users,
+            carrier,
+            freedom,
+            account: _,
+        } => match carrier {
+            Carrier::Raw(_) => crate::vmess::serve(stream, &users, freedom),
+            Carrier::Ws { path, .. } => {
+                crate::vmess::serve_ws(stream, path.as_str(), &users, freedom);
+            }
+            Carrier::Xhttp { settings, .. } => {
+                crate::vmess::serve_xhttp_settings(stream, &settings, &users, freedom);
+            }
+            Carrier::HttpHeader {
+                paths, response, ..
+            } => {
+                crate::vmess::serve_httpheader_with(
+                    stream,
+                    &paths,
+                    &users,
+                    freedom,
+                    response.as_deref(),
+                );
+            }
+            Carrier::HttpUpgrade { path, host, .. } => {
+                crate::vmess::serve_httpupgrade(stream, path.as_str(), &host, &users, freedom);
+            }
+            Carrier::Grpc(settings) => {
+                crate::vmess::serve_grpc_muxed_with(stream, &settings, &users, freedom);
+            }
+            refused_carriers!() => {}
+        },
+        Role::VmessTls {
+            users,
+            carrier,
+            freedom,
+            server,
+            account: _,
+        } => serve_vmess_tls(stream, &users, &carrier, freedom, &server),
+        Role::VmessReality {
+            users,
+            carrier,
+            freedom,
+            server,
+            account: _,
+        } => serve_vmess_reality(stream, &users, &carrier, freedom, &server),
+        Role::Shadowsocks {
+            accounts,
+            carrier,
+            freedom,
+            tls,
+        } => serve_shadowsocks(stream, &accounts, &carrier, freedom, tls.as_deref()),
+        Role::Socks { out, accounts } => serve_socks(stream, &out, &accounts),
+        Role::Http { out, accounts } => serve_http(stream, &out, &accounts),
+        Role::Mixed { out, accounts } => serve_mixed(stream, &out, &accounts),
+        Role::Dokodemo {
+            out,
+            dest,
+            port_map,
+            follow_redirect,
+            receive_original_destination,
+            transparent,
+            mask: _,
+            listen,
+            account: door_account,
+        } => {
+            let local = stream.local_addr().ok();
+            let asked = if follow_redirect {
+                if receive_original_destination {
+                    let found = match transparent.unwrap_or(crate::sockopt::Tproxy::Redirect) {
+                        crate::sockopt::Tproxy::Tproxy => local,
+                        crate::sockopt::Tproxy::Redirect | crate::sockopt::Tproxy::Off => {
+                            match stream.socket_peer() {
+                                Ok(peer) => dokodemo_original_destination(&stream, peer, local),
+                                Err(_) => None,
+                            }
+                        }
+                    };
+                    dokodemo_redirected(found, dest.configured().as_ref(), listen)
+                } else {
+                    dest.configured()
+                }
+            } else {
+                Some(dest.resolved(local, &port_map))
+            };
+            let Some(asked) = asked else { return };
+            let level = Some(door_account.level);
+            let (dial, target, tag) = sniff_lane(&out, &asked, &stream, None, level);
+            let dest = dial.as_ref().unwrap_or(&asked);
+            serve_connect(
+                stream,
+                &target,
+                dest,
+                Front::Socks,
+                &[],
+                tag.as_deref(),
+                FlowFacts {
+                    level,
+                    ..FlowFacts::default()
+                },
+            );
+        }
+        Role::Proxied(inner) => dispatch(stream, *inner, None),
+    }
+}
+
+#[cfg(test)]
+mod reverse_tests {
+    use super::*;
+
+    fn reverse_user(portal: &Arc<crate::reverse::Portal>, id: [u8; 16]) -> [VlessUser; 1] {
+        [VlessUser {
+            id,
+            flow: Flow::None,
+            email: String::new(),
+            level: 0,
+            reverse: Some(Arc::clone(portal)),
+        }]
+    }
+
+    #[test]
+    fn a_reverse_request_names_no_target_and_a_forward_one_never_uses_a_reverse_user() {
+        let id = [7u8; 16];
+        assert_eq!(
+            vless_reverse_header(&id),
+            [&[0u8][..], &id[..], &[0, 4][..]].concat()
+        );
+        let portal = crate::reverse::Portal::new("portal");
+        let reverse = reverse_user(&portal, id);
+        let forward = one_vless_user(&id);
+        assert!(matches!(
+            reverse_ask(&reverse, &id, Flow::None, 4),
+            ReverseAsk::Allowed(_)
+        ));
+        assert!(matches!(
+            reverse_ask(&reverse, &id, Flow::None, 1),
+            ReverseAsk::Refused
+        ));
+        assert!(matches!(
+            reverse_ask(&reverse, &id, Flow::Vision, 4),
+            ReverseAsk::Refused
+        ));
+        assert!(matches!(
+            reverse_ask(&forward, &id, Flow::None, 4),
+            ReverseAsk::Refused
+        ));
+        assert!(matches!(
+            reverse_ask(&forward, &[9u8; 16], Flow::None, 4),
+            ReverseAsk::NotReverse
+        ));
+        assert!(!vless_user_allows(
+            &reverse,
+            &id,
+            Flow::None,
+            4,
+            true,
+            false
+        ));
+        assert!(vless_user_allows(&forward, &id, Flow::None, 1, true, false));
+    }
+
+    #[test]
+    fn a_reverse_account_cannot_open_a_kcp_mux() {
+        let id = [7u8; 16];
+        let portal = crate::reverse::Portal::new("portal");
+        let users = reverse_user(&portal, id);
+        let listener = ferrox_core::kcp::Listener::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+        )
+        .expect("binds");
+        let kcp_port = listener.local_addr().port();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let serving = thread::spawn(move || {
+            let conn = listener.accept().expect("accepts");
+            serve_vless_kcp(&conn, &users, true, crate::stats::Meter::default());
+            let _ = done_tx.send(());
+        });
+        let peer = ferrox_core::kcp::dial(
+            format!("127.0.0.1:{kcp_port}").parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+            ferrox_core::kcp::fresh_conversation(),
+        )
+        .expect("dials");
+        peer.write(&vless_mux_header(&id)).expect("requests");
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the handler refuses and returns");
+        peer.set_read_deadline(Instant::now() + Duration::from_secs(1));
+        let mut ack = [0u8; 2];
+        assert!(
+            !matches!(peer.read(&mut ack), Ok(2) if ack == [0, 0]),
+            "a reverse account must not receive the mux acknowledgement"
+        );
+        drop(peer);
+        serving.join().expect("joins");
+    }
+
+    /// A reverse account's command 4 attaches on a sealed raw session with no Freedom outbound:
+    /// the session forwards nothing, so it cannot depend on one.
+    #[test]
+    fn a_sealed_reverse_request_attaches_without_freedom() {
+        use ferrox_core::vless_encryption::{
+            generate_pair, Client, ClientConfig, Server, ServerConfig,
+        };
+        let id = [7u8; 16];
+        let portal = crate::reverse::Portal::new("portal");
+        let users = reverse_user(&portal, id);
+        let (encryption, decryption) = generate_pair(false, "native", "1rtt", "600s");
+        let server = Server::new(ServerConfig::parse(&decryption).expect("server config"));
+        let (client_side, server_side) = crate::reverse::loopback_pair().expect("pair");
+        client_side
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("client read timeout");
+        let closer: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let lane = thread::spawn(move || {
+            let sealed = server.handshake(server_side).expect("sealed session");
+            serve_sealed_raw(sealed, None, &users, false, &closer, None, SplitRelay);
+        });
+        let client = Client::new(ClientConfig::parse(&encryption).expect("client config"));
+        let mut stream = client.handshake(client_side).expect("client handshake");
+        stream
+            .write_all(&vless_reverse_header(&id))
+            .expect("reverse request");
+        stream.flush().expect("flush");
+        let mut reply = [1u8; 2];
+        stream
+            .read_exact(&mut reply)
+            .expect("the portal answers a reverse request even with no freedom outbound");
+        assert_eq!(reply, [0, 0]);
+        lane.join().expect("lane");
+        assert!(
+            portal.pick().is_some(),
+            "the portal attached the reverse session"
+        );
+    }
+
+    /// The same request over the split halves a carried carrier yields: the sealed arm reads the
+    /// reverse account before the Freedom gate, the way the plaintext arms do.
+    #[test]
+    fn a_carried_sealed_reverse_request_attaches_without_freedom() {
+        use ferrox_core::vless_encryption::{
+            generate_pair, Client, ClientConfig, Server, ServerConfig,
+        };
+        let id = [7u8; 16];
+        let portal = crate::reverse::Portal::new("portal");
+        let users = reverse_user(&portal, id);
+        let (encryption, decryption) = generate_pair(false, "native", "1rtt", "600s");
+        let server = Server::new(ServerConfig::parse(&decryption).expect("server config"));
+        let (client_side, server_side) = crate::reverse::loopback_pair().expect("pair");
+        let writer = server_side.try_clone().expect("split");
+        client_side
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("client read timeout");
+        let closer: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let lane = thread::spawn(move || {
+            serve_sealed_carried(server_side, writer, &users, false, &server, closer);
+        });
+        let client = Client::new(ClientConfig::parse(&encryption).expect("client config"));
+        let mut stream = client.handshake(client_side).expect("client handshake");
+        stream
+            .write_all(&vless_reverse_header(&id))
+            .expect("reverse request");
+        stream.flush().expect("flush");
+        let mut reply = [1u8; 2];
+        stream
+            .read_exact(&mut reply)
+            .expect("the portal answers a reverse request even with no freedom outbound");
+        assert_eq!(reply, [0, 0]);
+        lane.join().expect("lane");
+        assert!(
+            portal.pick().is_some(),
+            "the portal attached the reverse session"
+        );
+    }
+
+    /// A sealed request this inbound refuses still owes the peer an end of stream: an H2 response
+    /// that is neither finished nor reset leaves the client waiting for an answer that can never
+    /// come, so every refusal path runs the closer.
+    #[test]
+    fn a_refused_sealed_request_finishes_the_response() {
+        use ferrox_core::vless_encryption::{
+            generate_pair, Client, ClientConfig, Server, ServerConfig,
+        };
+        let (encryption, decryption) = generate_pair(false, "native", "1rtt", "600s");
+        let server = Server::new(ServerConfig::parse(&decryption).expect("server config"));
+        let users = one_user([7u8; 16]);
+        let (client_side, server_side) = crate::reverse::loopback_pair().expect("pair");
+        let writer = server_side.try_clone().expect("split");
+        client_side
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("client read timeout");
+        let (sender, closed) = std::sync::mpsc::channel();
+        let release: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let _ = sender.send(());
+        });
+        let lane = thread::spawn(move || {
+            serve_sealed_carried_with(
+                server_side,
+                writer,
+                &users,
+                true,
+                &server,
+                release,
+                |_| {},
+                |_| {},
+                |_| {},
+            );
+        });
+        let client = Client::new(ClientConfig::parse(&encryption).expect("client config"));
+        let mut stream = client.handshake(client_side).expect("client handshake");
+        let target = Destination::Address("127.0.0.1:9".parse().expect("address"));
+        let mut bytes = [0u8; VLESS_DIAL_HEADER_MAX];
+        let len = write_vless_header(&[9u8; 16], 1, &target, false, &mut bytes).expect("header");
+        stream.write_all(&bytes[..len]).expect("request");
+        stream.flush().expect("flush");
+        assert_eq!(
+            closed.recv_timeout(Duration::from_secs(2)),
+            Ok(()),
+            "a refused sealed request left its response unfinished"
+        );
+        lane.join().expect("lane");
+    }
+
+    /// The request body ending is a half-close, not the end of the call: the target still answers,
+    /// and its response has to reach the peer instead of dying with the uplink.
+    #[test]
+    fn a_request_body_ending_leaves_the_response_relayed() {
+        struct UploadEnded;
+        impl Read for UploadEnded {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Ok(0)
+            }
+        }
+        struct Keep(Arc<Mutex<Vec<u8>>>);
+        impl Write for Keep {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (plain, target) = crate::reverse::loopback_pair().expect("pair");
+        let answering = thread::spawn(move || {
+            let mut target = target;
+            let mut body = Vec::new();
+            let _ = target.read_to_end(&mut body);
+            let _ = target.write_all(b"done");
+        });
+        let relayed = Arc::new(Mutex::new(Vec::new()));
+        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        relay_split(UploadEnded, Keep(Arc::clone(&relayed)), &plain, &close);
+        assert_eq!(
+            relayed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)[..],
+            b"done"[..],
+            "the response was dropped with the half-closed request body"
+        );
+        answering.join().expect("the target answers");
+    }
+
+    fn portal_echo(payload: &[u8]) {
+        let echo = crate::conn::Listener::bind(&crate::conn::Target::Ip(
+            "127.0.0.1:0".parse().expect("address"),
+        ))
+        .expect("echo listener");
+        let echo_addr = echo.local_addr().expect("addr");
+        let want = payload.len();
+        thread::spawn(move || {
+            if let Ok((mut stream, _)) = echo.accept() {
+                let mut buf = vec![0u8; want];
+                if stream.read_exact(&mut buf).is_ok() {
+                    let _ = stream.write_all(&buf);
+                }
+            }
+        });
+
+        let (mut bridge_side, mut portal_side) = crate::reverse::loopback_pair().expect("pair");
+        portal_side.write_all(&[0, 0]).expect("portal reply");
+        let mut reply = [0u8; 2];
+        bridge_side.read_exact(&mut reply).expect("portal reply");
+        let portal_tunnel = crate::reverse::Tunnel::from_connection(&portal_side).expect("tunnel");
+
+        let state = crate::reverse::WorkerState::new();
+        let worker = Arc::clone(&state);
+        let wire =
+            MuxWire::Tunnel(crate::reverse::Tunnel::from_connection(&bridge_side).expect("tunnel"));
+        let dial: MuxDial = Arc::new(|target| {
+            target
+                .destination()
+                .socket()
+                .and_then(|address| Connection::connect(address).ok())
+        });
+        let udp: MuxUdpOk = Arc::new(|_| true);
+        thread::spawn(move || serve_mux_wire(&wire, &dial, &udp, Some(&worker), &[]));
+
+        let portal = crate::reverse::Portal::new("portal");
+        portal.attach(portal_tunnel).expect("session");
+
+        let (mut user, server) = crate::reverse::loopback_pair().expect("pair");
+        let portal_for_flow = Arc::clone(&portal);
+        thread::spawn(move || {
+            serve_reverse_tcp(&server, &portal_for_flow, &Destination::Address(echo_addr));
+        });
+        user.write_all(payload).expect("writes");
+        user.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let mut echoed = vec![0u8; payload.len()];
+        user.read_exact(&mut echoed).expect("reads");
+        assert_eq!(echoed, payload);
+
+        thread::sleep(Duration::from_millis(2200));
+        assert!(
+            !state.stale(Duration::from_secs(1)),
+            "the portal heartbeats the worker it attached to"
+        );
+        assert!(state.active());
+    }
+
+    #[test]
+    fn a_portal_flow_reaches_the_bridge_and_comes_back() {
+        portal_echo(b"hello");
+    }
+
+    #[test]
+    fn a_sixteen_kib_downlink_is_echoed_whole() {
+        let payload = vec![0x5a; 16 * 1024];
+        portal_echo(&payload);
+    }
+
+    /// The scan and the lookup both allocate nothing, so the allocator cannot see this; the gate is
+    /// the session's own flow count: a repeated destination must reuse its lane, not add one.
+    #[test]
+    fn a_portal_datagram_finds_its_lane_without_scanning() {
+        let exchanges: [(usize, &[u8], &[u8]); 4] = [
+            (0, b"one", b"one"),
+            (1, b"two", b"two"),
+            (2, b"three", b"three"),
+            (0, b"again", b"again"),
+        ];
+        let dests: Vec<SocketAddr> = (0..3)
+            .map(|_| {
+                let echo = UdpSocket::bind("127.0.0.1:0").expect("echo bind");
+                echo.set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("echo timeout");
+                let dest = echo.local_addr().expect("echo addr");
+                thread::spawn(move || {
+                    let mut buf = [0u8; 512];
+                    while let Ok((n, from)) = echo.recv_from(&mut buf) {
+                        if echo.send_to(&buf[..n], from).is_err() {
+                            return;
+                        }
+                    }
+                });
+                dest
+            })
+            .collect();
+
+        let (mut bridge_side, mut portal_side) = crate::reverse::loopback_pair().expect("pair");
+        portal_side.write_all(&[0, 0]).expect("portal reply");
+        let mut ack = [0u8; 2];
+        bridge_side.read_exact(&mut ack).expect("portal reply");
+        let portal_tunnel = crate::reverse::Tunnel::from_connection(&portal_side).expect("tunnel");
+
+        let worker = crate::reverse::WorkerState::new();
+        let wire =
+            MuxWire::Tunnel(crate::reverse::Tunnel::from_connection(&bridge_side).expect("tunnel"));
+        let dial: MuxDial = Arc::new(|_| None);
+        let udp: MuxUdpOk = Arc::new(|_| true);
+        thread::spawn(move || serve_mux_wire(&wire, &dial, &udp, Some(&worker), &[]));
+
+        let portal = crate::reverse::Portal::new("portal");
+        let session = portal.attach(portal_tunnel).expect("session");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.active_connections() == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            session.active_connections(),
+            1,
+            "the portal control flow did not open"
+        );
+
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("relay");
+        let relay_addr = relay.local_addr().expect("relay addr");
+        let served = Arc::clone(&portal);
+        thread::spawn(move || serve_socks_udp_portal(&relay, &served, None));
+
+        let client = UdpSocket::bind("127.0.0.1:0").expect("client");
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("client timeout");
+        let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
+        let mut buf = [0u8; 512];
+        for (known, payload, want) in exchanges {
+            let dest = dests[known];
+            let framed = socks_udp_frame(&mut frame, &dest, payload);
+            client.send_to(framed, relay_addr).expect("send");
+            let (n, _) = client.recv_from(&mut buf).expect("reply");
+            let (from, replied) = parse_socks_udp(&buf[..n]).expect("frame");
+            assert_eq!(from, dest, "the reply named another destination");
+            assert_eq!(
+                replied, want,
+                "the reply did not come back for its destination"
+            );
+        }
+        assert_eq!(
+            session.active_connections(),
+            4,
+            "the repeated destination opened a second flow instead of reusing its lane"
+        );
+    }
+}
+
+#[cfg(test)]
+mod accept_proxy_protocol_tests {
+    use super::*;
+
+    const ID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+    fn inbound(port: u16) -> Json {
+        crate::json::parse(&format!(
+            r#"{{"protocol":"vless","port":{port},"settings":{{"clients":[{{"id":"{ID}"}}]}},
+                "streamSettings":{{"network":"ws","wsSettings":{{"path":"/x","acceptProxyProtocol":true}}}}}}"#
+        ))
+        .expect("parses")
+    }
+
+    fn free_port() -> u16 {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        probe.local_addr().expect("addr").port()
+    }
+
+    fn dial(port: u16) -> Connection {
+        for _ in 0..200 {
+            if let Ok(stream) = Connection::connect(("127.0.0.1", port)) {
+                return stream;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the listener never came up");
+    }
+
+    const UPGRADE: &[u8] = b"GET /x HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\n\
+        Connection: Upgrade\r\nSec-WebSocket-Key: aGVsbG8gd29ybGQxMjM0NQ==\r\n\
+        Sec-WebSocket-Version: 13\r\n\r\n";
+
+    fn read_head(stream: &mut Connection) -> Vec<u8> {
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut got = Vec::new();
+        let mut buf = [0u8; 512];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    got.extend_from_slice(&buf[..n]);
+                    if got.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+            }
+        }
+        got
+    }
+
+    fn serve(port: u16) {
+        assert!(serve_vless_inbound(
+            &format!("127.0.0.1:{port}"),
+            &inbound(port),
+            true,
+            "test",
+            &crate::reverse::Portals::default(),
+            None
+        ));
+    }
+
+    #[test]
+    fn a_ws_inbound_with_accept_proxy_protocol_reads_the_line_before_the_upgrade() {
+        let port = free_port();
+        serve(port);
+        let mut client = dial(port);
+        client
+            .write_all(b"PROXY TCP4 192.0.2.1 192.0.2.2 1234 5678\r\n")
+            .expect("writes the header");
+        client.write_all(UPGRADE).expect("writes the upgrade");
+        let got = read_head(&mut client);
+        assert!(
+            got.starts_with(b"HTTP/1.1 101"),
+            "the upgrade after a PROXY line was not answered: {got:?}"
+        );
+    }
+
+    #[test]
+    fn a_ws_inbound_with_accept_proxy_protocol_refuses_a_bare_upgrade() {
+        let port = free_port();
+        serve(port);
+        let mut client = dial(port);
+        client.write_all(UPGRADE).expect("writes the upgrade");
+        let got = read_head(&mut client);
+        assert!(
+            !got.starts_with(b"HTTP/1.1 101"),
+            "a bare upgrade was accepted where the reference waits for the PROXY line: {got:?}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_proxy_line_closes_the_connection() {
+        let port = free_port();
+        serve(port);
+        let mut client = dial(port);
+        client
+            .write_all(b"PROXY TCP4 nope\r\n")
+            .expect("writes the header");
+        client.write_all(UPGRADE).expect("writes the upgrade");
+        let got = read_head(&mut client);
+        assert!(
+            !got.starts_with(b"HTTP/1.1 101"),
+            "a malformed PROXY line was treated as carrier data: {got:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_proxy_v1_line_is_accepted_with_or_without_fields() {
+        let port = free_port();
+        serve(port);
+        let mut client = dial(port);
+        client
+            .write_all(b"PROXY UNKNOWN ignored fields\r\n")
+            .expect("writes the header");
+        client.write_all(UPGRADE).expect("writes the upgrade");
+        let got = read_head(&mut client);
+        assert!(
+            got.starts_with(b"HTTP/1.1 101"),
+            "a PROXY UNKNOWN line with fields was refused: {got:?}"
+        );
+    }
+
+    #[test]
+    fn an_unspecified_proxy_v2_family_is_accepted() {
+        let port = free_port();
+        serve(port);
+        let mut client = dial(port);
+        let mut v2 = b"\r\n\r\n\0\r\nQUIT\n".to_vec();
+        v2.extend_from_slice(&[0x21, 0x00, 0x00, 0x0b]);
+        v2.extend_from_slice(b"example.com");
+        client.write_all(&v2).expect("writes the header");
+        client.write_all(UPGRADE).expect("writes the upgrade");
+        let got = read_head(&mut client);
+        assert!(
+            got.starts_with(b"HTTP/1.1 101"),
+            "an unspecified-family PROXY v2 header was refused: {got:?}"
+        );
+    }
+
+    #[test]
+    fn the_proxy_reported_source_reaches_the_route() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"freedom","tag":"direct"},{"protocol":"freedom","tag":"pinned"}],
+                "routing":{"rules":[{"type":"field","source":["192.0.2.1"],"outboundTag":"pinned"}]}}"#,
+        )
+        .expect("parses");
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("builds the route");
+        let plan = RoutePlan::new(shared, None, None, true);
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let client = Connection::connect(addr)
+            .expect("connects")
+            .with_peer("192.0.2.1:1234".parse().expect("source"));
+        let asked = Destination::Address("192.0.2.9:80".parse().expect("target"));
+        let (_, tag) = plan.lane(&asked, crate::router::Network::Tcp, Some(&client), None);
+        assert_eq!(tag.as_deref(), Some("pinned"));
+    }
+
+    #[test]
+    fn a_proxy_header_source_is_filtered_before_the_handshake() {
+        let port = free_port();
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol":"vless","port":{port},"settings":{{"clients":[{{"id":"{ID}"}}]}},
+                "streamSettings":{{"network":"raw","tcpSettings":{{"acceptProxyProtocol":true}},
+                "finalmask":{{"tcp":[{{"type":"filter","settings":{{"blockedSourceIPs":["192.0.2.1"]}}}}]}}}}}}"#
+        ))
+        .expect("parses");
+        assert!(serve_vless_inbound(
+            &format!("127.0.0.1:{port}"),
+            &inbound,
+            true,
+            "test",
+            &crate::reverse::Portals::default(),
+            None
+        ));
+        let mut client = dial(port);
+        client
+            .write_all(b"PROXY TCP4 192.0.2.1 192.0.2.2 1234 5678\r\n")
+            .expect("writes the header");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let mut byte = [0u8; 1];
+        let got = client.read(&mut byte);
+        let refused = got.as_ref().map_or(true, |n| *n == 0);
+        assert!(
+            refused,
+            "the socket peer, not the reported source, was filtered: {got:?}"
+        );
+    }
+
+    #[test]
+    fn a_ws_inbound_with_accept_proxy_protocol_reads_the_binary_header() {
+        let port = free_port();
+        serve(port);
+        let mut client = dial(port);
+        let mut v2 = b"\r\n\r\n\0\r\nQUIT\n".to_vec();
+        v2.extend_from_slice(&[0x21, 0x11, 0x00, 0x0c]);
+        v2.extend_from_slice(&[192, 0, 2, 1, 192, 0, 2, 2]);
+        v2.extend_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+        client.write_all(&v2).expect("writes the header");
+        client.write_all(UPGRADE).expect("writes the upgrade");
+        let got = read_head(&mut client);
+        assert!(
+            got.starts_with(b"HTTP/1.1 101"),
+            "the upgrade after a PROXY v2 header was not answered: {got:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod webhook_route_tests {
+    use super::*;
+
+    /// A receiver that answers `replies` requests with `204` and hands back what it read, head and
+    /// body together, so a test reads the exact bytes the notifier wrote.
+    fn receiver(replies: usize) -> (u16, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (send, receive) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            for _ in 0..replies {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .expect("arms");
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 512];
+                loop {
+                    let read = stream.read(&mut buf).expect("reads");
+                    if read == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..read]);
+                    let Some(head) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let length: usize = String::from_utf8_lossy(&raw[..head])
+                        .lines()
+                        .find_map(|line| line.strip_prefix("Content-Length: "))
+                        .and_then(|value| value.trim().parse().ok())
+                        .unwrap_or(0);
+                    if raw.len() >= head + 4 + length {
+                        break;
+                    }
+                }
+                send.send(String::from_utf8_lossy(&raw).into_owned()).ok();
+                stream
+                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                    .expect("replies");
+            }
+        });
+        (port, receive)
+    }
+
+    fn route_outbound(json: &str, tag: Option<&str>, source_known: bool) -> Outbound {
+        let root = crate::json::parse(json).expect("parses");
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("builds");
+        Outbound::Route(Arc::new(RoutePlan::new(
+            shared,
+            tag.map(str::to_owned),
+            None,
+            source_known,
+        )))
+    }
+
+    fn socks_front_with(out: Outbound) -> u16 {
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+        });
+        port
+    }
+
+    #[test]
+    fn a_split_udp_webhook_names_the_datagram_endpoints() {
+        let (port, receive) = receiver(1);
+        let out = route_outbound(
+            &format!(
+                r#"{{"outbounds":[{{"protocol":"freedom","tag":"direct"}}],
+                    "routing":{{"rules":[{{"network":"udp","outboundTag":"direct",
+                        "webhook":{{"url":"http://127.0.0.1:{port}/hook"}}}}]}}}}"#
+            ),
+            Some("in"),
+            true,
+        );
+        let front = socks_front_with(out);
+        let mut control = Connection::connect(("127.0.0.1", front)).expect("connects");
+        control
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        control.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        control.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        control
+            .write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        control.read_exact(&mut reply).expect("replies");
+        let relay: SocketAddr = SocketAddr::new(
+            std::net::IpAddr::V4([127, 0, 0, 1].into()),
+            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+        );
+
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let source = udp.local_addr().expect("addr");
+        let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+        let mut datagram = vec![0u8, 0, 0];
+        push_socks_addr(&mut datagram, &target);
+        datagram.extend_from_slice(b"ping");
+        udp.send_to(&datagram, relay).expect("sends");
+
+        let body = receive
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the POST");
+        assert!(
+            body.contains(&format!("\"source\":\"{source}\"")),
+            "the UDP client is the source: {body}"
+        );
+        assert!(
+            body.contains(&format!("\"inboundLocal\":\"{relay}\"")),
+            "the UDP relay is the inbound local: {body}"
+        );
+    }
+
+    #[test]
+    fn a_webhook_rule_posts_the_event_and_drops_a_duplicate_email_inside_the_window() {
+        let (port, receive) = receiver(2);
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds":[{{"protocol":"freedom","tag":"direct"}}],
+                "routing":{{"rules":[{{"domain":["example.test"],"outboundTag":"direct",
+                    "webhook":{{"url":"http://127.0.0.1:{port}/hook","deduplication":60,
+                        "headers":{{"X-Probe":"1"}}}}}}]}}}}"#
+        ))
+        .expect("parses");
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("builds the route");
+        let plan = RoutePlan::new(shared, None, None, false);
+        let asked = Destination::Name("example.test".to_owned(), 80);
+
+        let (_, tag) = plan.lane(&asked, crate::router::Network::Tcp, None, Some("a@x"));
+        assert_eq!(
+            tag.as_deref(),
+            Some("direct"),
+            "the webhook rule still routes"
+        );
+        let first = receive
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the POST");
+        assert!(
+            first.starts_with(&format!(
+                "POST /hook HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nX-Probe: 1\r\n"
+            )),
+            "{first}"
+        );
+        for field in [
+            "\"email\":\"a@x\"",
+            "\"network\":\"tcp\"",
+            "\"destination\":\"example.test:80\"",
+            "\"originalTarget\":\"tcp:example.test:80\"",
+            "\"inboundTag\":\"\"",
+            "\"inboundName\":null",
+            "\"outboundTag\":\"direct\"",
+        ] {
+            assert!(first.contains(field), "{field} is missing from {first}");
+        }
+
+        let (_, tag) = plan.lane(&asked, crate::router::Network::Tcp, None, Some("a@x"));
+        assert_eq!(tag.as_deref(), Some("direct"), "the duplicate still routes");
+        assert!(
+            receive.recv_timeout(Duration::from_millis(400)).is_err(),
+            "the window dropped the second event for the same email"
+        );
+
+        let (_, tag) = plan.lane(&asked, crate::router::Network::Tcp, None, Some("b@x"));
+        assert_eq!(tag.as_deref(), Some("direct"));
+        let third = receive
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the second POST");
+        assert!(third.contains("\"email\":\"b@x\""), "{third}");
+    }
+}
+
+#[cfg(test)]
+mod hc_tests {
+    use super::*;
+
+    fn serve(handler: HcHandler) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            handler.serve(Connection::from(stream));
+        });
+        port
+    }
+
+    fn exchange(port: u16, request: &[u8]) -> Vec<u8> {
+        let mut client = crate::conn::Connection::connect(("127.0.0.1", port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        client.write_all(request).expect("writes");
+        let mut answer = Vec::new();
+        client.read_to_end(&mut answer).expect("reads");
+        answer
+    }
+
+    #[test]
+    fn an_hc_get_answers_the_configured_body_after_the_exact_path() {
+        let port = serve(HcHandler::new("/health", String::new(), "ok"));
+        assert_eq!(
+            exchange(port, b"GET /health HTTP/1.1\r\nHost: probe\r\n\r\n"),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nok"
+        );
+    }
+
+    /// A reader that hands over `window` octets a call, so a head arriving in pieces is the same reader every run.
+    struct Trickle<'a> {
+        bytes: &'a [u8],
+        window: usize,
+    }
+
+    impl Read for Trickle<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let take = self.bytes.len().min(out.len()).min(self.window);
+            out[..take].copy_from_slice(&self.bytes[..take]);
+            self.bytes = &self.bytes[take..];
+            Ok(take)
+        }
+    }
+
+    /// The head is found at every arrival pattern: the scan resumes three octets before the seam, so a terminator split across two rounds is still found where the whole-buffer walk would have found it, and the octets handed on are the ones that arrived.
+    #[test]
+    fn an_hc_head_is_found_at_every_split_of_its_arrival() {
+        let request: &[u8] =
+            b"GET /health HTTP/1.1\r\nHost: probe\r\nX-Fill: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\r\npayload";
+        let head = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("a terminator")
+            + 4;
+        for window in 1..=request.len() {
+            let (data, end) = read_hc_head(&mut Trickle {
+                bytes: request,
+                window,
+            })
+            .unwrap_or_else(|| panic!("no head at window {window}"));
+            assert_eq!(end, head, "window {window}");
+            assert_eq!(data.as_slice(), &request[..data.len()], "window {window}");
+            assert_eq!(&data[head - 4..head], b"\r\n\r\n", "window {window}");
+        }
+    }
+
+    /// An eight-kilobyte head that arrives in sixteen 512-byte windows, its terminator in the last four octets: the shape both scans below are read on.
+    fn sixteen_windows() -> Vec<Vec<u8>> {
+        let mut head = b"GET /health HTTP/1.1\r\nHost: probe\r\n".to_vec();
+        let line: &[u8] = b"X-Fill: 0123456789012345678901234567890123456789012\r\n";
+        while head.len() + line.len() <= 8188 {
+            head.extend_from_slice(line);
+        }
+        // Whole lines only, so the filler's own octets hold no terminator.
+        head.resize(8188, b'.');
+        head.extend_from_slice(b"\r\n\r\n");
+        assert_eq!(head.len(), 8192, "a full eight-kilobyte head");
+        head.chunks(512).map(<[u8]>::to_vec).collect()
+    }
+
+    /// The scan as it stood: the whole head re-walked at four-byte windows after every round.
+    fn scan_from_the_front(rounds: &[Vec<u8>]) -> Option<usize> {
+        let mut data = Vec::new();
+        for round in rounds {
+            data.extend_from_slice(round);
+            if let Some(end) = data.windows(4).position(|window| window == b"\r\n\r\n") {
+                return Some(end + 4);
+            }
+        }
+        None
+    }
+
+    /// The front-to-back rescan and the resumed walk, on the same eight-kilobyte head arriving in sixteen windows: both answer the same offset, and only their difference is a claim about the walk. Sixty-four passes each, the offsets folded into a pinned `u32` so neither can be folded away.
+    #[test]
+    fn the_front_scan_costs_every_window_it_has_already_walked() {
+        let rounds = sixteen_windows();
+        let mut fold: u32 = 0;
+        for _ in 0..64 {
+            let end = scan_from_the_front(&rounds).expect("a head");
+            fold = fold
+                .wrapping_mul(31)
+                .wrapping_add(u32::try_from(end).expect("an offset"));
+        }
+        assert_eq!(fold, 0x1080_0000, "sixty-four front-to-back walks");
+    }
+
+    #[test]
+    fn the_seam_scan_costs_the_bytes_it_has_not_walked() {
+        let joined = sixteen_windows().concat();
+        let mut fold: u32 = 0;
+        for _ in 0..64 {
+            let end = read_hc_head(&mut Trickle {
+                bytes: &joined,
+                window: 512,
+            })
+            .map(|(_, end)| end)
+            .expect("a head");
+            fold = fold
+                .wrapping_mul(31)
+                .wrapping_add(u32::try_from(end).expect("an offset"));
+        }
+        assert_eq!(fold, 0x1080_0000, "the same sixty-four heads");
+    }
+
+    #[test]
+    fn an_hc_answer_is_prebuilt_without_allocating() {
+        let handler = HcHandler::new("/health", String::new(), "ok");
+        let base = handler.payload().as_ptr();
+        let capacity = handler.answer.capacity();
+        let (payload, counts) = ferrox_core::alloc_count::measure(|| handler.payload());
+        assert_eq!(payload.len(), 85);
+        assert_eq!(counts.allocs, 0);
+        assert_eq!(payload.as_ptr(), base);
+        assert_eq!(handler.answer.capacity(), capacity);
+    }
+
+    #[test]
+    fn an_hc_post_checks_the_body_and_a_mismatch_answers_nothing() {
+        let handler = || HcHandler::new("/health", "ping".to_owned(), "pong");
+        let port = serve(handler());
+        assert_eq!(
+            exchange(
+                port,
+                b"POST /health HTTP/1.1\r\nContent-Length: 4\r\n\r\nping"
+            ),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\npong"
+        );
+        let port = serve(handler());
+        assert_eq!(
+            exchange(port, b"GET /health HTTP/1.1\r\n\r\n"),
+            Vec::<u8>::new()
+        );
+        let port = serve(handler());
+        assert_eq!(
+            exchange(port, b"POST /health HTTP/1.1\r\n\r\nping"),
+            Vec::<u8>::new()
+        );
+        let port = serve(handler());
+        assert_eq!(
+            exchange(
+                port,
+                b"POST /health HTTP/1.1\r\nContent-Length: 4\r\n\r\nnope"
+            ),
+            Vec::<u8>::new()
+        );
+        let port = serve(handler());
+        assert_eq!(
+            exchange(port, b"GET /other HTTP/1.1\r\n\r\n"),
+            Vec::<u8>::new()
+        );
+    }
+}
+
+#[cfg(test)]
+mod h2_carrier_tests {
+    use super::*;
+
+    /// A silent h2 stream that never sends a trojan header ends at the handshake budget: the decode
+    /// claims the poll, so it cannot retry poll timeouts for the relay stall.
+    #[test]
+    fn a_silent_trojan_stream_ends_at_the_handshake_budget() {
+        struct Silent(Arc<std::sync::atomic::AtomicBool>);
+
+        impl Read for Silent {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                assert!(
+                    relay_step_owns_poll(),
+                    "a trojan decode read ran outside the poll"
+                );
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err(std::io::ErrorKind::WouldBlock.into())
+            }
+        }
+
+        impl crate::proxy::WindowRead for Silent {
+            fn read_window(&mut self) -> std::io::Result<crate::proxy::Window<'_>> {
+                unreachable!("the trojan header reads through Read")
+            }
+        }
+
+        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("lock").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl FrameWrite for Sink {
+            fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+                for part in parts {
+                    self.write_all(part).expect("sink");
+                }
+                true
+            }
+        }
+
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let out = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _cap = crate::budgets::cap_handshake(Duration::from_millis(20));
+        let began = Instant::now();
+        serve_trojan_xhttp_accepted(
+            Box::new(Silent(Arc::clone(&polled))),
+            crate::xhttp::XhttpWriter::new(Sink(Arc::clone(&out))),
+            &[[0x11u8; 56]],
+            true,
+        );
+        assert!(polled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(began.elapsed() < Duration::from_secs(2));
+        assert!(
+            out.lock().expect("lock").ends_with(b"0\r\n\r\n"),
+            "the refusal did not end the carrier"
+        );
+    }
+}
