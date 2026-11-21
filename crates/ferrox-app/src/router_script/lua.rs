@@ -126,8 +126,12 @@ impl ScriptRouter {
     /// reported before any socket opens.
     pub(crate) fn parse_in(path: &str, dirs: Vec<PathBuf>) -> Result<Self, String> {
         let name = super::resolve(path, &dirs)?;
-        let source =
-            std::fs::read(&name).map_err(|error| format!("routing script `{path}`: {error}"))?;
+        Self::parse_resolved(name, dirs)
+    }
+
+    pub(crate) fn parse_resolved(name: PathBuf, dirs: Vec<PathBuf>) -> Result<Self, String> {
+        let source = std::fs::read(&name)
+            .map_err(|error| format!("routing script `{}`: {error}", name.display()))?;
         let router = Self {
             source,
             name: name.display().to_string(),
@@ -332,6 +336,9 @@ fn call(lua: &Lua, context: ScriptContext) -> Result<Option<String>, String> {
         }
         _ => return Err("routing script outboundTag must be a string or nil".into()),
     };
+    if outbound.is_none() {
+        return Ok(None);
+    }
     if !matches!(rule, Value::Nil | Value::String(_)) {
         return Err("routing script ruleTag must be a string".into());
     }
@@ -620,6 +627,7 @@ struct IpMatcherUser {
 
 impl IpMatcherUser {
     fn matches(&self, ip: std::net::IpAddr) -> bool {
+        let ip = to4(ip).map_or(ip, IpAddr::V4);
         self.matcher.matches_override(ip, self.reverse, self.flip)
     }
 }
@@ -831,7 +839,8 @@ impl UserData for IpUser {
             Ok(!unspecified(this.0)
                 && !loopback(this.0)
                 && !multicast(this.0)
-                && !link_unicast(this.0))
+                && !link_unicast(this.0)
+                && !limited_broadcast(this.0))
         });
         methods.add_method("DefaultMask", |_, this, ()| {
             Ok(default_mask(this.0).map(MaskUser))
@@ -953,6 +962,10 @@ fn link_unicast(addr: IpAddr) -> bool {
         return octets[0] == 169 && octets[1] == 254;
     }
     matches!(addr, IpAddr::V6(ip) if ip.segments()[0] & 0xffc0 == 0xfe80)
+}
+
+fn limited_broadcast(addr: IpAddr) -> bool {
+    matches!(to4(addr), Some(ip) if ip == Ipv4Addr::BROADCAST)
 }
 
 fn default_mask(addr: IpAddr) -> Option<Vec<u8>> {
@@ -1157,6 +1170,43 @@ end
     }
 
     #[test]
+    fn a_nil_outbound_leaves_a_malformed_rule_tag_unread() {
+        let dir = dir();
+        std::fs::write(
+            dir.join("route.lua"),
+            "function HandleRoute() return nil, 7 end",
+        )
+        .expect("write");
+        let router =
+            ScriptRouter::parse_in(&dir.join("route.lua").display().to_string(), vec![dir])
+                .expect("parses");
+        assert_eq!(
+            router.route(&flow(), &callbacks(), false).expect("routes"),
+            None
+        );
+    }
+
+    #[test]
+    fn an_ip_matcher_reads_a_mapped_address_as_its_ipv4_form() {
+        use crate::json::Json;
+
+        let mut assets = Assets::new(Vec::new());
+        let matcher = ip_matcher(
+            &Json::Arr(vec![Json::Str("192.0.2.0/24".into())]),
+            &mut assets,
+            "test",
+        )
+        .expect("matcher");
+        let matcher = IpMatcherUser {
+            matcher,
+            reverse: None,
+            flip: false,
+        };
+        let mapped = IpAddr::V6(Ipv4Addr::new(192, 0, 2, 9).to_ipv6_mapped());
+        assert!(matcher.matches(mapped));
+    }
+
+    #[test]
     fn a_dns_query_returns_its_ttl_and_the_server_table_is_indexed() {
         let dir = dir();
         std::fs::write(
@@ -1228,6 +1278,7 @@ end
         assert!(multicast(multicast_mapped));
         assert!(link_unicast(mapped("::ffff:169.254.1.1")));
         assert!(link_multicast(multicast_mapped));
+        assert!(limited_broadcast(mapped("::ffff:255.255.255.255")));
     }
 
     #[test]

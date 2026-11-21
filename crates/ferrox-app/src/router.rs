@@ -1173,8 +1173,8 @@ impl Routing {
                 #[cfg(target_os = "ios")]
                 let script = {
                     // The script never runs on iOS; parse it while it resolves so a reload after the operator removes it still refreshes rules and geodata.
-                    if crate::router_script::resolve(path, &dirs).is_ok() {
-                        ScriptRouter::parse_in(path, dirs.clone())?;
+                    if let Ok(name) = crate::router_script::resolve(path, &dirs) {
+                        ScriptRouter::parse_resolved(name, dirs)?;
                     }
                     None
                 };
@@ -1251,13 +1251,6 @@ impl Routing {
             added_replaced: false,
             removed_tags: HashSet::new(),
         }))
-    }
-
-    /// Whether a script alone owns the decisions, so a geodata reload must leave the parsed table
-    /// alone: the script's own `xray.geodata` matchers read the files on every call. With rules
-    /// beside the script the table still needs rebuilding, because a script `null` falls through.
-    pub(crate) fn carries_script(&self) -> bool {
-        self.script.is_some() && self.rules.is_empty()
     }
 
     /// Move the runtime state a reparse cannot rebuild — a balancer's forced tag, weights and
@@ -7664,7 +7657,6 @@ mod tests {
         let routing = Routing::parse_in(&root, vec![dir])
             .expect("parses")
             .expect("routing");
-        assert!(!routing.carries_script());
         let flow = Flow {
             network: Network::Tcp,
             domain: Some("x.test"),

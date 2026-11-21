@@ -53,7 +53,10 @@ impl Plan {
     pub(crate) fn new(v4: bool, v6: bool, routes: &[(IpAddr, u8)], keep: &[(IpAddr, u8)]) -> Self {
         let mut plan = Self {
             routes: Vec::new(),
-            keep: keep.to_vec(),
+            keep: keep
+                .iter()
+                .map(|(address, prefix)| (network(*address, *prefix), *prefix))
+                .collect(),
         };
         let kept = |address: IpAddr, prefix: u8| {
             keep.iter().any(|(outer, outer_prefix)| {
@@ -81,10 +84,11 @@ impl Plan {
             }
         }
         for (address, prefix) in routes {
-            if plan.routes.contains(&(*address, *prefix)) || kept(*address, *prefix) {
+            let address = network(*address, *prefix);
+            if plan.routes.contains(&(address, *prefix)) || kept(address, *prefix) {
                 continue;
             }
-            plan.routes.push((*address, *prefix));
+            plan.routes.push((address, *prefix));
         }
         plan
     }
@@ -202,7 +206,7 @@ impl Guard {
                     && route.destination().is_ipv4() == v4
                     && route.if_name().is_none_or(|name| name != &self.interface)
             })
-            .max_by_key(default_metric)
+            .min_by_key(default_metric)
     }
 
     /// Keep one dialled address on the route that carried the default, so a name
@@ -329,6 +333,24 @@ fn same_family(outer: IpAddr, inner: IpAddr) -> bool {
     outer.is_ipv4() == inner.is_ipv4()
 }
 
+/// The prefix's network address, so a route config that names a host inside it installs and compares as the prefix.
+fn network(address: IpAddr, prefix: u8) -> IpAddr {
+    match address {
+        IpAddr::V4(address) => {
+            let mask = u32::MAX
+                .checked_shl(32 - u32::from(prefix.min(32)))
+                .unwrap_or(0);
+            IpAddr::V4(Ipv4Addr::from(u32::from(address) & mask))
+        }
+        IpAddr::V6(address) => {
+            let mask = u128::MAX
+                .checked_shl(128 - u32::from(prefix.min(128)))
+                .unwrap_or(0);
+            IpAddr::V6(Ipv6Addr::from(u128::from(address) & mask))
+        }
+    }
+}
+
 /// Whether `outer/prefix` contains `inner/inner_prefix`, by masked bits alone.
 fn covers(outer: IpAddr, prefix: u8, inner: IpAddr, inner_prefix: u8) -> bool {
     if prefix > inner_prefix {
@@ -391,6 +413,20 @@ mod tests {
         assert!(!plan
             .routes()
             .contains(&(IpAddr::V4(Ipv4Addr::new(10, 1, 0, 0)), 16)));
+    }
+
+    #[test]
+    fn a_named_prefix_installs_without_its_host_bits() {
+        let plan = Plan::new(
+            true,
+            false,
+            &[(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)), 16)],
+            &[(IpAddr::V4(Ipv4Addr::new(10, 2, 3, 4)), 8)],
+        );
+        assert!(plan
+            .routes()
+            .contains(&(IpAddr::V4(Ipv4Addr::new(10, 1, 0, 0)), 16)));
+        assert_eq!(plan.keep(), &[(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8)]);
     }
 
     #[test]

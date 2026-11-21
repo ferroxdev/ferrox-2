@@ -103,9 +103,13 @@ impl std::fmt::Debug for ScriptRouter {
 impl ScriptRouter {
     pub(crate) fn parse_in(path: &str, dirs: Vec<PathBuf>) -> Result<Self, String> {
         let resolved = resolve(path, &dirs)?;
+        Self::parse_resolved(resolved, dirs)
+    }
+
+    pub(crate) fn parse_resolved(name: PathBuf, _dirs: Vec<PathBuf>) -> Result<Self, String> {
         eprintln!(
             "routing script `{}`: this platform has no Lua runtime, so the script is not run",
-            resolved.display()
+            name.display()
         );
         Ok(Self)
     }
@@ -114,6 +118,7 @@ impl ScriptRouter {
         &self,
         _flow: &crate::router::Flow,
         _callbacks: &ScriptCallbacks,
+        _skip_dns: bool,
     ) -> Result<Option<String>, String> {
         Ok(None)
     }

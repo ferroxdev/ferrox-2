@@ -96,7 +96,7 @@ jobs:
           echo "HEV_TUNNEL_REV=$ref" >> "$GITHUB_ENV"
 
       - name: resolve sing-box HEAD
-        if: contains(inputs.engines, 'singbox-head')
+        if: (contains(inputs.engines, 'singbox-head') || contains(inputs.engines, 'sing-tun-head'))
         env:
           SINGBOX_REQUESTED_REF: ${{ inputs.singbox_ref }}
         run: |
@@ -154,7 +154,7 @@ jobs:
           echo "XRAY_SHA=$(git -C upstream/xray-core rev-parse HEAD)" >> "$GITHUB_ENV"
 
       - uses: actions/setup-go@v5
-        if: contains(inputs.engines, 'xray') || contains(inputs.engines, 'singbox-head')
+        if: contains(inputs.engines, 'xray') || (contains(inputs.engines, 'singbox-head') || contains(inputs.engines, 'sing-tun-head'))
         with:
           go-version: stable
 
@@ -164,7 +164,7 @@ jobs:
           ( cd upstream/xray-core && go build -trimpath -o "$RUNNER_TEMP/xray" ./main )
 
       - name: build sing-box HEAD
-        if: contains(inputs.engines, 'singbox-head')
+        if: (contains(inputs.engines, 'singbox-head') || contains(inputs.engines, 'sing-tun-head'))
         run: |
           git init --quiet "$RUNNER_TEMP/sing-box-head"
           git -C "$RUNNER_TEMP/sing-box-head" remote add origin https://github.com/SagerNet/sing-box

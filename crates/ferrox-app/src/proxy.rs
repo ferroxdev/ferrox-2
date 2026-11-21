@@ -807,15 +807,13 @@ fn serve_inbounds_counted(
                                 continue;
                             }
                             inbounds += 1;
-                        } else if serve_tun_inbound(
-                            &spec,
-                            inbound,
-                            &out,
-                            address,
-                            handler_stop.as_ref(),
-                        ) {
-                            if let Some(stop) = &handler_stop {
-                                handler_stops.push((Arc::clone(stop), address.clone()));
+                        } else if let Some(stoppable) =
+                            serve_tun_inbound(&spec, inbound, &out, address, handler_stop.as_ref())
+                        {
+                            if stoppable {
+                                if let Some(stop) = &handler_stop {
+                                    handler_stops.push((Arc::clone(stop), address.clone()));
+                                }
                             }
                             inbounds += 1;
                         }
@@ -2771,16 +2769,9 @@ pub(crate) struct RouteShared {
 
 impl RouteShared {
     /// Rebuild the rule table from the config after a geodata download, keeping the balancer state
-    /// a reparse cannot recreate. A script owns its own matchers and reads the files per call.
+    /// a reparse cannot recreate. The script is reparsed too, so its `xray.geodata` matchers see
+    /// the committed files.
     pub(crate) fn reload_routing(&self, root: &Json) -> Result<(), String> {
-        if self
-            .routing
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .carries_script()
-        {
-            return Ok(());
-        }
         let Some(mut next) = crate::router::Routing::parse_in(root, crate::router::asset_dirs())?
         else {
             return Ok(());
@@ -17963,14 +17954,15 @@ fn tun_routes(spec: &crate::tun::Spec, interface: &str, out: &Outbound, stop: Op
     }
 }
 
-/// Open the TUN device and spawn the packet handler. Returns true when the device opens.
+/// Open the TUN device and spawn the packet handler. `None` means the device did not open; `Some`
+/// names whether removal can wait for every queue to exit.
 fn serve_tun_inbound(
     spec: &crate::tun::Spec,
     inbound: &Json,
     out: &Outbound,
     _address: &str,
     stop: Option<&Arc<Stop>>,
-) -> bool {
+) -> Option<bool> {
     let stack = tun_stack(inbound);
     let native = tun_native(stack) || spec.tap();
     if spec.tap() && !tun_native(stack) {
@@ -17990,18 +17982,32 @@ fn serve_tun_inbound(
                 "tun inbound: the `{stack}` stack hands TCP to the kernel, so `dns_mode` reaches only the flows that stay in userspace"
             );
         }
-        return match crate::tun_stack::serve(spec, out, tun_mode(stack)) {
-            Ok(interface) => {
+        return match crate::tun_stack::serve(
+            spec,
+            out,
+            tun_mode(stack),
+            stop.map(|stop| stop.shared()),
+        ) {
+            Ok((interface, workers)) => {
                 if !interface.is_empty() {
                     tun_routes(spec, &interface, out, stop);
                 } else if spec.auto_route() {
                     eprintln!("tun inbound: the `{stack}` stack does not name its device, so `auto_route` is not applied");
                 }
-                true
+                let stoppable = workers.is_some();
+                if let (Some(stop), Some(workers)) = (stop.cloned(), workers) {
+                    thread::spawn(move || {
+                        for worker in workers {
+                            let _ = worker.join();
+                        }
+                        stop.mark_closed();
+                    });
+                }
+                Some(stoppable)
             }
             Err(error) => {
                 eprintln!("tun inbound: {error}");
-                false
+                None
             }
         };
     }
@@ -18013,7 +18019,7 @@ fn serve_tun_inbound(
     }
     let Ok(devices) = crate::tun::Device::open_all(spec) else {
         eprintln!("tun inbound: {}", crate::tun::refusal_reason(spec));
-        return false;
+        return None;
     };
     let interface = devices
         .first()
@@ -18056,12 +18062,13 @@ fn serve_tun_inbound(
             }
             if remaining.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
                 if let Some(stop) = closed {
+                    stop.stop();
                     stop.mark_closed();
                 }
             }
         });
     }
-    true
+    Some(true)
 }
 
 struct UdpUplink {

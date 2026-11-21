@@ -946,7 +946,8 @@ impl Device {
                     .addresses()
                     .iter()
                     .map(|(address, _)| *address)
-                    .collect();
+                    .collect::<Vec<_>>();
+                let host = addresses.clone();
                 return Ok(vec![Self {
                     handle: Handle::Session(std::sync::Arc::new(device)),
                     name: name.clone(),
@@ -956,6 +957,7 @@ impl Device {
                     bridge: Some(std::sync::Arc::new(crate::tun_tap::Bridge::new(
                         &name,
                         addresses,
+                        host,
                         spec.auto_route(),
                     ))),
                     frame: Vec::with_capacity(spec.mtu + crate::tun_tap::HEADER_LEN + 64),
@@ -1037,6 +1039,21 @@ impl Device {
             return Err(io::Error::last_os_error());
         }
         Ok(ready > 0 && (row.revents & libc::POLLIN) != 0)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn try_read_packet(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>> {
+        if self.bridge.is_some() || self.framing.header_len() != 0 {
+            return Ok(None);
+        }
+        match &self.handle {
+            Handle::Session(device) => match device.try_recv(buf) {
+                Ok(0) => Ok(None),
+                Ok(size) => Ok(Some(size)),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+                Err(error) => Err(error),
+            },
+        }
     }
 
     pub(crate) fn read_packet(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -2222,6 +2239,28 @@ impl Handler {
         #[cfg(unix)]
         if self.stopping.is_some() {
             self.device.set_nonblocking(true)?;
+        }
+        #[cfg(windows)]
+        if self.stopping.is_some() {
+            loop {
+                if self
+                    .stopping
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(Relaxed))
+                {
+                    return Ok(());
+                }
+                let Some(n) = self.device.try_read_packet(&mut buf)? else {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                };
+                if n == 0 {
+                    return Ok(());
+                }
+                if let Err(e) = self.dispatch(&buf[..n]) {
+                    eprintln!("tun dispatch: {e}");
+                }
+            }
         }
         loop {
             if self

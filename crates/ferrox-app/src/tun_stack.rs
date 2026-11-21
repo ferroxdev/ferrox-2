@@ -44,6 +44,23 @@ pub(crate) type WakeWriter = std::os::unix::net::UnixStream;
 #[cfg(not(unix))]
 pub(crate) type WakeWriter = ();
 
+/// Wait for a removable queue to carry a packet, so its stop flag is seen on an idle device.
+#[cfg(unix)]
+fn wait_readable(device: &SyncDevice, budget: std::time::Duration) -> io::Result<()> {
+    let mut row = libc::pollfd {
+        fd: device.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let millis = i32::try_from(budget.as_millis()).unwrap_or(i32::MAX);
+    // SAFETY: one descriptor the device owns, one array element, and `poll` writes only `revents`.
+    let ready = unsafe { libc::poll(&raw mut row, 1, millis) };
+    if ready < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mode {
     Userspace,
@@ -51,20 +68,25 @@ pub(crate) enum Mode {
     Hybrid,
 }
 
-/// Open the device and start the configured TCP stack, returning the interface the platform gave it so a route can name it.
-pub(crate) fn serve(spec: &Spec, out: &Outbound, mode: Mode) -> io::Result<String> {
+/// Open the device and start the configured TCP stack, returning the interface the platform gave it so a route can name it and the workers a removable inbound must join.
+pub(crate) fn serve(
+    spec: &Spec,
+    out: &Outbound,
+    mode: Mode,
+    stopping: Option<Arc<AtomicBool>>,
+) -> io::Result<(String, Option<Vec<thread::JoinHandle<()>>>)> {
     match mode {
-        Mode::Userspace => serve_userspace(spec, out),
+        Mode::Userspace => serve_userspace(spec, out, stopping),
         #[cfg(target_os = "linux")]
-        Mode::System => crate::tun_system::serve(spec, out, false),
+        Mode::System => crate::tun_system::serve(spec, out, false).map(|name| (name, None)),
         #[cfg(target_os = "linux")]
         Mode::Hybrid => match crate::tun_system::serve(spec, out, true) {
-            Ok(name) => Ok(name),
+            Ok(name) => Ok((name, None)),
             Err(error) => {
                 eprintln!(
                     "tun inbound: the hybrid stack is unavailable ({error}), using the userspace stack"
                 );
-                serve_userspace(spec, out)
+                serve_userspace(spec, out, stopping)
             }
         },
         #[cfg(not(target_os = "linux"))]
@@ -75,12 +97,16 @@ pub(crate) fn serve(spec: &Spec, out: &Outbound, mode: Mode) -> io::Result<Strin
         #[cfg(not(target_os = "linux"))]
         Mode::Hybrid => {
             eprintln!("tun inbound: the hybrid stack is Linux-only, using the userspace stack");
-            serve_userspace(spec, out)
+            serve_userspace(spec, out, stopping)
         }
     }
 }
 
-fn serve_userspace(spec: &Spec, out: &Outbound) -> io::Result<String> {
+fn serve_userspace(
+    spec: &Spec,
+    out: &Outbound,
+    stopping: Option<Arc<AtomicBool>>,
+) -> io::Result<(String, Option<Vec<thread::JoinHandle<()>>>)> {
     let (first, offload, queues) = open(spec)?;
     #[cfg(not(any(
         target_os = "android",
@@ -99,15 +125,27 @@ fn serve_userspace(spec: &Spec, out: &Outbound) -> io::Result<String> {
     ))]
     let name = String::new();
     let first = Arc::new(first);
-    spawn_queue(Arc::clone(&first), spec, offload, out.clone());
+    let mut workers = spawn_queue(
+        Arc::clone(&first),
+        spec,
+        offload,
+        out.clone(),
+        stopping.clone(),
+    );
     #[cfg(target_os = "linux")]
     for _ in 1..queues {
         let device = Arc::new(first.try_clone()?);
-        spawn_queue(device, spec, offload, out.clone());
+        workers.extend(spawn_queue(
+            device,
+            spec,
+            offload,
+            out.clone(),
+            stopping.clone(),
+        ));
     }
     #[cfg(not(target_os = "linux"))]
     let _ = queues;
-    Ok(name)
+    Ok((name, Some(workers)))
 }
 
 fn open(spec: &Spec) -> io::Result<(SyncDevice, bool, usize)> {
@@ -235,6 +273,7 @@ fn attach_addresses(device: &SyncDevice, extra: &[(IpAddr, u8)]) {
     #[cfg(any(
         target_os = "linux",
         target_os = "macos",
+        target_os = "windows",
         target_os = "freebsd",
         target_os = "netbsd",
         target_os = "openbsd"
@@ -253,6 +292,7 @@ fn attach_addresses(device: &SyncDevice, extra: &[(IpAddr, u8)]) {
     #[cfg(not(any(
         target_os = "linux",
         target_os = "macos",
+        target_os = "windows",
         target_os = "freebsd",
         target_os = "netbsd",
         target_os = "openbsd"
@@ -278,7 +318,13 @@ pub(crate) fn tcp_only_offload(device: &SyncDevice) -> bool {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outbound) {
+fn spawn_queue(
+    device: Arc<SyncDevice>,
+    spec: &Spec,
+    offload: bool,
+    out: Outbound,
+    stopping: Option<Arc<AtomicBool>>,
+) -> Vec<thread::JoinHandle<()>> {
     #[cfg(target_os = "linux")]
     let headroom = VIRTIO_NET_HDR_LEN;
     #[cfg(not(target_os = "linux"))]
@@ -297,7 +343,7 @@ fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outboun
     let stack_out = out.clone();
     let failed = Arc::new(AtomicBool::new(false));
     let stack_failed = Arc::clone(&failed);
-    thread::spawn(move || {
+    let stack = thread::spawn(move || {
         #[cfg(unix)]
         crate::wg_stack::serve_tun_device(
             config,
@@ -323,9 +369,12 @@ fn spawn_queue(device: Arc<SyncDevice>, spec: &Spec, offload: bool, out: Outboun
         );
     });
     let send_device = Arc::clone(&device);
-    thread::spawn(move || send_loop(send_device, writes, offload, headroom, &failed));
+    let send = thread::spawn(move || send_loop(send_device, writes, offload, headroom, &failed));
     let mtu = spec.mtu();
-    thread::spawn(move || recv_loop(device, packets, reused, mtu, headroom, wake_write));
+    let recv = thread::spawn(move || {
+        recv_loop(device, packets, reused, mtu, headroom, wake_write, stopping);
+    });
+    vec![stack, send, recv]
 }
 
 pub(crate) fn device_config(spec: &Spec) -> DeviceConfig {
@@ -371,17 +420,36 @@ pub(crate) fn recv_loop(
     mtu: usize,
     headroom: usize,
     wake: WakeWriter,
+    stopping: Option<Arc<AtomicBool>>,
 ) {
+    if stopping.is_some() {
+        let _ = device.set_nonblocking(true);
+    }
     let mut original = vec![0u8; VIRTIO_NET_HDR_LEN + 65_535];
     let mut bufs: Vec<Vec<u8>> = (0..IDEAL_BATCH_SIZE)
         .map(|_| vec![0u8; VIRTIO_NET_HDR_LEN + mtu])
         .collect();
     let mut sizes = vec![0usize; IDEAL_BATCH_SIZE];
     loop {
+        if stopping
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            return;
+        }
         let count =
             match device.recv_multiple(&mut original, &mut bufs, &mut sizes, VIRTIO_NET_HDR_LEN) {
-                Ok(0) => continue,
+                Ok(0) => {
+                    if stopping.is_some() {
+                        let _ = wait_readable(&device, std::time::Duration::from_millis(200));
+                    }
+                    continue;
+                }
                 Ok(count) => count,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    let _ = wait_readable(&device, std::time::Duration::from_millis(200));
+                    continue;
+                }
                 Err(error) => {
                     eprintln!("tun read: {error}");
                     return;
@@ -421,16 +489,71 @@ pub(crate) fn recv_loop(
     mtu: usize,
     _headroom: usize,
     wake: WakeWriter,
+    stopping: Option<Arc<AtomicBool>>,
 ) {
+    #[cfg(unix)]
+    if stopping.is_some() {
+        let _ = device.set_nonblocking(true);
+    }
     let mut buffer = vec![0u8; mtu.max(1500) + 64];
     loop {
-        let size = match device.recv(&mut buffer) {
-            Ok(0) => continue,
-            Ok(size) if size <= buffer.len() => size,
-            Ok(_) => continue,
-            Err(error) => {
-                eprintln!("tun read: {error}");
-                return;
+        if stopping
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            return;
+        }
+        let size = {
+            #[cfg(windows)]
+            {
+                if stopping.is_some() {
+                    match device.try_recv(&mut buffer) {
+                        Ok(0) => {
+                            thread::sleep(std::time::Duration::from_millis(1));
+                            continue;
+                        }
+                        Ok(size) => size,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(std::time::Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(error) => {
+                            eprintln!("tun read: {error}");
+                            return;
+                        }
+                    }
+                } else {
+                    match device.recv(&mut buffer) {
+                        Ok(0) => continue,
+                        Ok(size) if size <= buffer.len() => size,
+                        Ok(_) => continue,
+                        Err(error) => {
+                            eprintln!("tun read: {error}");
+                            return;
+                        }
+                    }
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                match device.recv(&mut buffer) {
+                    Ok(0) => {
+                        if stopping.is_some() {
+                            let _ = wait_readable(&device, std::time::Duration::from_millis(200));
+                        }
+                        continue;
+                    }
+                    Ok(size) if size <= buffer.len() => size,
+                    Ok(_) => continue,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        let _ = wait_readable(&device, std::time::Duration::from_millis(200));
+                        continue;
+                    }
+                    Err(error) => {
+                        eprintln!("tun read: {error}");
+                        return;
+                    }
+                }
             }
         };
         let bytes = packet_bytes(&reuse, &buffer[..size]);

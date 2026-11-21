@@ -602,7 +602,7 @@ pub(crate) fn serve(
     });
 
     let mtu = spec.mtu();
-    thread::spawn(move || tun_stack::recv_loop(device, packets, reused, mtu, 0, wake_write));
+    thread::spawn(move || tun_stack::recv_loop(device, packets, reused, mtu, 0, wake_write, None));
     Ok(name)
 }
 

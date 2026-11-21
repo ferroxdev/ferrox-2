@@ -246,8 +246,8 @@ start_engine() {
         xray) start_xray ;;
         singbox-system|sing-tun-system) start_singbox system system "$SINGBOX" ;;
         singbox-gvisor|sing-tun-gvisor) start_singbox gvisor gvisor "$SINGBOX" ;;
-        singbox-head-system) start_singbox head-system system "$SINGBOX_HEAD" ;;
-        singbox-head-gvisor) start_singbox head-gvisor gvisor "$SINGBOX_HEAD" ;;
+        singbox-head-system|sing-tun-head-system) start_singbox head-system system "$SINGBOX_HEAD" ;;
+        singbox-head-gvisor|sing-tun-head-gvisor) start_singbox head-gvisor gvisor "$SINGBOX_HEAD" ;;
         tun2socks) start_tun2socks ;;
         *) note "unknown engine $engine"; return 1 ;;
     esac
