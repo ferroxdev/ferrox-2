@@ -1228,6 +1228,7 @@ impl Inner {
 
     fn smux_loop(&self, mut read: Box<dyn Read + Send>) {
         let mut head = [0u8; SMUX_FRAME];
+        let mut data = Vec::new();
         loop {
             if self.dead() {
                 return;
@@ -1237,8 +1238,10 @@ impl Inner {
             }
             let len = usize::from(u16::from_le_bytes([head[2], head[3]]));
             let id = u32::from_le_bytes([head[4], head[5], head[6], head[7]]);
-            let mut data = vec![0u8; len];
-            if len > 0 && crate::proxy::read_exact(&mut *read, &mut data).is_err() {
+            if data.len() < len {
+                data.resize(len, 0);
+            }
+            if len > 0 && crate::proxy::read_exact(&mut *read, &mut data[..len]).is_err() {
                 return;
             }
             if self.dead() {
@@ -1252,7 +1255,7 @@ impl Inner {
                         self.defer_refusal(id);
                     }
                 }
-                SMUX_PSH => self.deliver(id, &data, false),
+                SMUX_PSH => self.deliver(id, &data[..len], false),
                 SMUX_FIN => self.deliver(id, &[], true),
                 SMUX_NOP => {}
                 _ => return,
@@ -1262,6 +1265,7 @@ impl Inner {
 
     fn yamux_loop(&self, mut read: Box<dyn Read + Send>) {
         let mut head = [0u8; 12];
+        let mut data = Vec::new();
         loop {
             if self.dead() {
                 return;
@@ -1276,13 +1280,14 @@ impl Inner {
             let flags = u16::from_be_bytes([head[2], head[3]]);
             let id = u32::from_be_bytes([head[4], head[5], head[6], head[7]]);
             let len = u32::from_be_bytes([head[8], head[9], head[10], head[11]]) as usize;
-            let mut data = Vec::new();
             if kind == YAMUX_DATA {
                 if len > H2_FRAME_CAP {
                     return;
                 }
-                data = vec![0u8; len];
-                if len > 0 && crate::proxy::read_exact(&mut *read, &mut data).is_err() {
+                if data.len() < len {
+                    data.resize(len, 0);
+                }
+                if len > 0 && crate::proxy::read_exact(&mut *read, &mut data[..len]).is_err() {
                     return;
                 }
             }
@@ -1302,7 +1307,7 @@ impl Inner {
                     if flags & YAMUX_RST != 0 {
                         self.release(id);
                     } else {
-                        self.deliver(id, &data, flags & YAMUX_FIN != 0);
+                        self.deliver(id, &data[..len], flags & YAMUX_FIN != 0);
                     }
                 }
                 YAMUX_WINDOW => {
@@ -1350,6 +1355,7 @@ impl Inner {
             }
         }
         let mut continuation: Option<(u32, Vec<u8>)> = None;
+        let mut body = Vec::new();
         loop {
             if self.dead() {
                 return;
@@ -1360,8 +1366,10 @@ impl Inner {
             if len > H2_FRAME_CAP {
                 return;
             }
-            let mut body = vec![0u8; len];
-            if len > 0 && crate::proxy::read_exact(&mut *read, &mut body).is_err() {
+            if body.len() < len {
+                body.resize(len, 0);
+            }
+            if len > 0 && crate::proxy::read_exact(&mut *read, &mut body[..len]).is_err() {
                 return;
             }
             if self.dead() {
@@ -1370,13 +1378,13 @@ impl Inner {
             match kind {
                 h2::T_SETTINGS => {
                     if flags & h2::F_ACK == 0 {
-                        self.h2_settings(&body);
+                        self.h2_settings(&body[..len]);
                         let _ =
                             self.write_frame(&h2::frame_head(0, h2::T_SETTINGS, h2::F_ACK, 0), &[]);
                     }
                 }
                 h2::T_WINDOW => {
-                    if body.len() == 4 {
+                    if len == 4 {
                         let delta = i64::from(
                             u32::from_be_bytes(body[..4].try_into().unwrap()) & 0x7fff_ffff,
                         );
@@ -1388,11 +1396,11 @@ impl Inner {
                     }
                 }
                 h2::T_DATA => {
-                    let data = h2_data(flags, &body);
-                    self.deliver_credit(id, data, flags & h2::F_END != 0, body.len());
+                    let data = h2_data(flags, &body[..len]);
+                    self.deliver_credit(id, data, flags & h2::F_END != 0, len);
                 }
                 h2::T_HEADERS => {
-                    let block = h2_headers(flags, &body);
+                    let block = h2_headers(flags, &body[..len]);
                     if block.len() > h2::HEAD_CAP {
                         return;
                     }
@@ -1404,7 +1412,7 @@ impl Inner {
                 }
                 h2::T_CONT => {
                     if let Some((stream, mut block)) = continuation.take() {
-                        let next = h2_headers(flags, &body);
+                        let next = h2_headers(flags, &body[..len]);
                         if block.len() + next.len() > h2::HEAD_CAP {
                             return;
                         }
@@ -1419,8 +1427,10 @@ impl Inner {
                 h2::T_RST => self.release(id),
                 h2::T_PING => {
                     if flags & h2::F_ACK == 0 {
-                        let _ =
-                            self.write_frame(&h2::frame_head(len, h2::T_PING, h2::F_ACK, 0), &body);
+                        let _ = self.write_frame(
+                            &h2::frame_head(len, h2::T_PING, h2::F_ACK, 0),
+                            &body[..len],
+                        );
                     }
                 }
                 h2::T_GOAWAY => return,
@@ -2031,17 +2041,20 @@ fn read_udp_packets(mut stream: Stream, deliver: &Deliver) {
     if stream.read_exact(&mut status).is_err() || status[0] != 0 {
         return;
     }
+    let mut data = Vec::new();
     loop {
         let mut head = [0u8; 2];
         if stream.read_exact(&mut head).is_err() {
             return;
         }
         let len = usize::from(u16::from_be_bytes(head));
-        let mut data = vec![0u8; len];
-        if len > 0 && stream.read_exact(&mut data).is_err() {
+        if data.len() < len {
+            data.resize(len, 0);
+        }
+        if len > 0 && stream.read_exact(&mut data[..len]).is_err() {
             return;
         }
-        deliver(&data, None);
+        deliver(&data[..len], None);
     }
 }
 
@@ -2864,6 +2877,128 @@ mod tests {
             close();
             worker.join().expect("worker");
         }
+    }
+
+    /// A session with no sinks: the loop reads its frames, delivers to nobody, and the frame
+    /// buffer is the only thing a frame may touch.
+    fn idle_session(protocol: Protocol, credits: Option<SyncSender<()>>) -> Arc<Inner> {
+        let (accept_tx, accept_rx) = channel();
+        let inner = Arc::new(Inner {
+            protocol,
+            role: Role::Client,
+            write: Mutex::new(Box::new(std::io::sink())),
+            sinks: Mutex::new(HashMap::new()),
+            resets: Mutex::new(None),
+            refusals: Mutex::new(None),
+            credits: Mutex::new(credits),
+            pending_credit: AtomicUsize::new(0),
+            pending_resets: AtomicUsize::new(0),
+            accept_tx: Mutex::new(Some(accept_tx)),
+            accept_rx: Mutex::new(accept_rx),
+            next_id: AtomicU32::new(1),
+            initial_window: Mutex::new(i64::MAX),
+            connection_window: Window::new(i64::MAX),
+            dead: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+            close: Arc::new(|| {}),
+            decoder: Mutex::new(h2::Decoder::default()),
+            self_ref: OnceLock::new(),
+        });
+        let _ = inner.self_ref.set(Arc::downgrade(&inner));
+        inner
+    }
+
+    fn data_frame(protocol: Protocol, len: usize) -> Vec<u8> {
+        match protocol {
+            Protocol::Smux => smux_head(SMUX_PSH, 1, len).to_vec(),
+            Protocol::Yamux => yamux_head(YAMUX_DATA, 0, 1, len as u32).to_vec(),
+            Protocol::H2Mux => h2::frame_head(len, h2::T_DATA, 0, 1).to_vec(),
+        }
+    }
+
+    fn read_frames(protocol: Protocol, frames: usize) -> ((), ferrox_core::alloc_count::Counts) {
+        let payload = [7u8; 64];
+        let mut script = Vec::new();
+        for _ in 0..frames {
+            script.extend_from_slice(&data_frame(protocol, payload.len()));
+            script.extend_from_slice(&payload);
+        }
+        let (credits, _wake) = sync_channel(64);
+        let session = idle_session(protocol, Some(credits));
+        let reader: Box<dyn Read + Send> = Box::new(std::io::Cursor::new(script));
+        ferrox_core::alloc_count::measure(|| session.read_loop(reader))
+    }
+
+    /// A frame's bytes land in the session's own buffer: doubling the frames leaves the session's
+    /// one allocation where it was, where the old shape built a fresh vector for every frame.
+    #[test]
+    fn a_mux_frame_is_read_into_the_sessions_own_buffer() {
+        for protocol in [Protocol::Smux, Protocol::Yamux, Protocol::H2Mux] {
+            let ((), few) = read_frames(protocol, 8);
+            let ((), many) = read_frames(protocol, 16);
+            assert_eq!(
+                few.allocs, many.allocs,
+                "{protocol:?}: no allocation scales with the frames"
+            );
+            let ((), before) = ferrox_core::alloc_count::measure(|| {
+                let mut olds = Vec::with_capacity(16);
+                for _ in 0..16 {
+                    olds.push(vec![0u8; 64]);
+                }
+                assert_eq!(olds.len(), 16);
+            });
+            assert!(
+                before.allocs >= 16 && many.allocs < before.allocs,
+                "{protocol:?}: the old shape built one vector per frame, this one none"
+            );
+        }
+    }
+
+    /// The mux UDP reader hands every payload over byte for byte, and its datagram buffer is the
+    /// stream's own: sixteen packets cost what eight did.
+    #[test]
+    fn a_mux_udp_packet_is_read_into_the_sessions_own_buffer() {
+        let word = b"pingpong";
+        let packets = |count: usize| {
+            let session = idle_session(Protocol::Smux, None);
+            let stream = session.attach(1);
+            let mut script = vec![0u8];
+            for _ in 0..count {
+                script.extend_from_slice(&(word.len() as u16).to_be_bytes());
+                script.extend_from_slice(word);
+            }
+            session.deliver(1, &script, true);
+            let seen = Arc::new(Mutex::new(Vec::<u8>::with_capacity(word.len() * count)));
+            let sink = Arc::clone(&seen);
+            let deliver: Deliver = Arc::new(move |data, _| {
+                if let Ok(mut seen) = sink.lock() {
+                    seen.extend_from_slice(data);
+                }
+            });
+            let ((), counts) =
+                ferrox_core::alloc_count::measure(|| read_udp_packets(stream, &deliver));
+            let bytes = seen.lock().expect("seen").clone();
+            (counts, bytes)
+        };
+        let (few, bytes) = packets(8);
+        assert_eq!(bytes, word.repeat(8), "every payload reaches the callback");
+        let (many, bytes) = packets(16);
+        assert_eq!(bytes, word.repeat(16), "every payload reaches the callback");
+        assert_eq!(
+            few.allocs, many.allocs,
+            "no allocation scales with the packets"
+        );
+        let ((), before) = ferrox_core::alloc_count::measure(|| {
+            let mut olds = Vec::with_capacity(16);
+            for _ in 0..16 {
+                olds.push(vec![0u8; word.len()]);
+            }
+            assert_eq!(olds.len(), 16);
+        });
+        assert!(
+            before.allocs >= 16 && many.allocs < before.allocs,
+            "the old shape built one vector per packet, this one none"
+        );
     }
 
     #[test]
