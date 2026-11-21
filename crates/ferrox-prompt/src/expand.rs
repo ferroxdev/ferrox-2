@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::markdown::{Prompt, Targets};
+use crate::markdown::{Addon, Prompt, Targets};
 use crate::state::{self, MethodRow, Pin};
 
 /// Public so `check` reports a typo'd matrix placeholder like `{methd}` instead of silently rendering the hole.
@@ -82,20 +82,59 @@ pub fn fill(prompt: &Prompt, row: &MethodRow, pins: &[Pin]) -> BTreeMap<String, 
     values
 }
 
+/// Whether the row supplies every fillable input the body and selected add-ons still need.
+pub fn fills_required(
+    prompt: &Prompt,
+    row: &MethodRow,
+    pins: &[Pin],
+    addons: &[Addon],
+    supplied: &BTreeMap<String, String>,
+) -> bool {
+    let values = fill(prompt, row, pins);
+    prompt
+        .required_inputs_for(addons)
+        .filter(|name| !supplied.contains_key(*name))
+        .filter(|name| *name != "references" && FILLABLE.contains(name))
+        .all(|name| values.contains_key(name))
+}
+
 /// The first candidate row the ledger has not served to this template, with its values; `None` is the advisor's cue to offer the next template.
+/// With `allow_unfilled`, a fully supplied row still wins, and the first drawable row is kept when none fills every input.
 pub fn next_target<'a>(
     prompt: &Prompt,
     state: &'a ProjectState,
     served: &[String],
+    addons: &[Addon],
+    supplied: &BTreeMap<String, String>,
+    allow_unfilled: bool,
 ) -> Option<(&'a MethodRow, BTreeMap<String, String>)> {
     if prompt.targets == Targets::None {
         return None;
     }
-    let row = state
+    let candidates: Vec<&MethodRow> = state
         .candidates(prompt.targets)
         .into_iter()
-        .find(|row| row.gap.is_drawable() && !served.contains(&row.key()))?;
-    Some((row, fill(prompt, row, &state.pins)))
+        .filter(|row| row.gap.is_drawable() && !served.contains(&row.key()))
+        .collect();
+    let required: Vec<&str> = prompt
+        .required_inputs_for(addons)
+        .filter(|name| !supplied.contains_key(*name))
+        .filter(|name| *name != "references" && FILLABLE.contains(name))
+        .collect();
+    let mut chosen = None;
+    for row in candidates.iter().copied() {
+        let values = fill(prompt, row, &state.pins);
+        if required.iter().all(|name| values.contains_key(*name)) {
+            chosen = Some((row, values));
+            break;
+        }
+    }
+    if chosen.is_none() && allow_unfilled {
+        chosen = candidates
+            .first()
+            .map(|row| (*row, fill(prompt, row, &state.pins)));
+    }
+    chosen
 }
 
 /// The rows a selector names: its key (`A13`), its index (`13`), or part of a method name.
@@ -353,7 +392,8 @@ update the pins, nothing per-method here
         let library = library();
         let prompt = library.prompt(1).unwrap();
         let made = state();
-        let (row, values) = next_target(prompt, &made, &[]).expect("an open row exists");
+        let (row, values) = next_target(prompt, &made, &[], &[], &BTreeMap::new(), false)
+            .expect("an open row exists");
         assert_eq!(row.key(), "A13");
         assert_eq!(values["method"], "VLESS over QUIC");
         assert_eq!(values["section"], "A");
@@ -435,15 +475,36 @@ update the pins, nothing per-method here
         });
         let open = made.candidates(Targets::Open);
         assert_eq!(open[0].key(), "D1");
-        let (row, _) = next_target(prompt, &made, &[]).expect("a drawable row exists");
+        let (row, _) = next_target(prompt, &made, &[], &[], &BTreeMap::new(), false)
+            .expect("a drawable row exists");
         assert_eq!(row.key(), "D1");
-        let served = ["D1".to_owned()];
-        let (row, _) = next_target(prompt, &made, &served).expect("a drawable row remains");
-        assert_ne!(
-            row.key(),
-            "D2",
-            "a not-scheduled row is not drawn by default"
+        let served = ["D1".to_owned(), "A13".to_owned(), "C45".to_owned()];
+        assert!(
+            next_target(prompt, &made, &served, &[], &BTreeMap::new(), false).is_none(),
+            "only a not-scheduled row remains, so there is nothing to draw"
         );
+    }
+
+    #[test]
+    fn a_parked_row_is_never_drawn_when_it_is_the_only_row_left() {
+        let library = library();
+        let prompt = library.prompt(1).unwrap();
+        let made = ProjectState {
+            methods: vec![MethodRow {
+                section: 'D',
+                index: "2".to_owned(),
+                method: "A parked row".to_owned(),
+                state: "not-scheduled".to_owned(),
+                implemented: false,
+                gap: crate::state::Gap::NotScheduled,
+                high_priority: false,
+                page: "docs/function/parked.md".to_owned(),
+                real_page: true,
+                text: "| 2 | A parked row | not-scheduled |".to_owned(),
+            }],
+            pins: Vec::new(),
+        };
+        assert!(next_target(prompt, &made, &[], &[], &BTreeMap::new(), false).is_none());
     }
 
     #[test]
@@ -451,10 +512,26 @@ update the pins, nothing per-method here
         let library = library();
         let prompt = library.prompt(1).unwrap();
         let made = state();
-        let (row, _) = next_target(prompt, &made, &["A13".to_owned()]).expect("still open rows");
+        let (row, _) = next_target(
+            prompt,
+            &made,
+            &["A13".to_owned()],
+            &[],
+            &BTreeMap::new(),
+            false,
+        )
+        .expect("still open rows");
         assert_eq!(row.key(), "C45");
         // And once both open rows are served there is nothing left for this class.
-        assert!(next_target(prompt, &made, &["A13".to_owned(), "C45".to_owned()]).is_none());
+        assert!(next_target(
+            prompt,
+            &made,
+            &["A13".to_owned(), "C45".to_owned()],
+            &[],
+            &BTreeMap::new(),
+            false
+        )
+        .is_none());
     }
 
     #[test]
@@ -462,7 +539,8 @@ update the pins, nothing per-method here
         let library = library();
         let optimise = library.prompt(2).unwrap();
         let made = state();
-        let (row, _) = next_target(optimise, &made, &[]).expect("an implemented row exists");
+        let (row, _) = next_target(optimise, &made, &[], &[], &BTreeMap::new(), false)
+            .expect("an implemented row exists");
         assert_eq!(row.key(), "A3");
     }
 
@@ -470,7 +548,7 @@ update the pins, nothing per-method here
     fn a_none_template_draws_nothing_from_the_matrix() {
         let library = library();
         let pins = library.prompt(3).unwrap();
-        assert!(next_target(pins, &state(), &[]).is_none());
+        assert!(next_target(pins, &state(), &[], &[], &BTreeMap::new(), false).is_none());
         assert!(!is_fillable(pins, &state()));
     }
 

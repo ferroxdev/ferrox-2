@@ -11,6 +11,8 @@ pub enum Value {
     Bool(bool),
     /// An integer; no floats — every number here is a count or an id, not a precision.
     Number(i64),
+    /// A count that can exceed `i64`, such as a `u64` rotation seed, printed without narrowing it.
+    Unsigned(u64),
     /// A string.
     Text(String),
     /// An array.
@@ -53,6 +55,9 @@ impl Value {
             Self::Null => out.push_str("null"),
             Self::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
             Self::Number(value) => {
+                let _ = write!(out, "{value}");
+            }
+            Self::Unsigned(value) => {
                 let _ = write!(out, "{value}");
             }
             Self::Text(value) => escape(value, out),
@@ -130,6 +135,10 @@ mod tests {
         assert_eq!(Value::Null.to_pretty(), "null\n");
         assert_eq!(Value::Bool(true).to_pretty(), "true\n");
         assert_eq!(Value::Number(-7).to_pretty(), "-7\n");
+        assert_eq!(
+            Value::Unsigned(u64::MAX).to_pretty(),
+            "18446744073709551615\n"
+        );
         assert_eq!(Value::text("hi").to_pretty(), "\"hi\"\n");
         assert_eq!(Value::List(vec![]).to_pretty(), "[]\n");
         assert_eq!(Value::Object(vec![]).to_pretty(), "{}\n");

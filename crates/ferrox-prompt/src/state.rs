@@ -84,17 +84,35 @@ impl MethodRow {
     }
 }
 
+const CLAUSE_SEPARATORS: &[char] = &[',', ';', ':', '—', '–', '-', '(', ')'];
+const NEGATION_SEPARATORS: &[char] = &[',', ';', '—', '–', '-', '(', ')'];
+
+fn clause_says_with(lower: &str, phrase: &str, separators: &[char]) -> bool {
+    lower.split(separators).any(|clause| {
+        clause.trim_matches(|character: char| {
+            character.is_whitespace() || character.is_ascii_punctuation()
+        }) == phrase
+    })
+}
+
+/// A half-role verdict names one role as the whole of what shipped, not as prose in a longer clause.
+fn half_role(lower: &str) -> bool {
+    clause_says_with(lower, "client only", CLAUSE_SEPARATORS)
+        || clause_says_with(lower, "server only", CLAUSE_SEPARATORS)
+}
+
+/// A negation is the row's verdict only when it is its own clause; a colon introduces a note about it.
+fn negated_verdict(lower: &str, phrase: &str) -> bool {
+    clause_says_with(lower, phrase, NEGATION_SEPARATORS)
+}
+
 /// A state cell's gap class, split from [`is_implemented`] so an open row still says why it is open.
 pub fn gap_of(state: &str) -> Gap {
     let lower = state.to_ascii_lowercase();
     if lower.contains("not-scheduled") || lower.contains("not scheduled") {
         return Gap::NotScheduled;
     }
-    if lower.contains("partial")
-        || lower.contains("not carried")
-        || lower.contains("client only")
-        || lower.contains("server only")
-    {
+    if lower.contains("partial") || lower.contains("not carried") || half_role(&lower) {
         return Gap::Partial;
     }
     if is_implemented(state) {
@@ -104,6 +122,9 @@ pub fn gap_of(state: &str) -> Gap {
         || lower.contains("refused")
         || lower.contains("not implemented")
         || lower.contains("not parsed")
+        || lower.contains("not yet")
+        || lower.contains("not fully")
+        || negated_verdict(&lower, "not in tree")
         || lower.contains("unimplemented")
     {
         return Gap::Planned;
@@ -146,15 +167,22 @@ pub fn is_implemented(state: &str) -> bool {
         || lower.contains("unimplemented")
         || lower.contains("not yet")
         || lower.contains("not fully")
+        || lower.contains("not-scheduled")
+        || lower.contains("not scheduled")
+        || negated_verdict(&lower, "not in tree")
+        || half_role(&lower)
         || lower.contains("refused");
-    if lower.contains("implemented") && !negated {
+    if negated {
+        return false;
+    }
+    if lower.contains("implemented") {
         return true;
     }
-    if lower.contains("in tree") && !negated {
+    if lower.contains("in tree") {
         return true;
     }
     // `both roles` with no negation reads as shipped even without the word "implemented", as in two prose table-A rows.
-    lower.contains("both roles") && !negated
+    lower.contains("both roles")
 }
 
 /// Strip the Markdown a method name is wrapped in: links become their text, emphasis and ticks drop.
@@ -258,6 +286,12 @@ fn slugify_method(method: &str) -> String {
     }
 }
 
+/// The text after an ATX heading marker, empty or separated by a space or tab, or `None` when the line is not that heading.
+fn heading_text<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
+    line.strip_prefix(marker)
+        .filter(|rest| rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\t'))
+}
+
 /// Read the matrix; empty when README cannot be read, and only numeric rows under a `### <Letter>` heading count.
 pub fn read_methods(root: &Path) -> Vec<MethodRow> {
     let Ok(text) = std::fs::read_to_string(root.join(crate::README_RELATIVE)) else {
@@ -270,9 +304,27 @@ pub fn read_methods(root: &Path) -> Vec<MethodRow> {
 pub fn methods_from_text(text: &str) -> Vec<MethodRow> {
     let mut rows = Vec::new();
     let mut section: Option<char> = None;
+    let mut fence: Option<(char, usize)> = None;
     for line in text.lines() {
+        if let Some((marker, width)) = fence {
+            if crate::markdown::closes_fence(line, marker, width) {
+                fence = None;
+            }
+            continue;
+        }
+        if let Some(open) = crate::markdown::opens_fence(line) {
+            fence = Some(open);
+            continue;
+        }
+        if line.starts_with("    ") || line.starts_with('\t') {
+            continue;
+        }
         let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("### ") {
+        if heading_text(trimmed, "##").is_some() {
+            section = None;
+            continue;
+        }
+        if let Some(rest) = heading_text(trimmed, "###") {
             // `### A — proxy protocols` — one letter, then a separator; prose headings are not sections.
             let rest = rest.trim();
             let mut chars = rest.chars();
@@ -361,7 +413,8 @@ pub fn pins_from_text(text: &str) -> Vec<Pin> {
     let mut pins = Vec::new();
     let mut current: Option<Pin> = None;
     for line in text.lines() {
-        let trimmed = line.trim();
+        let stripped = strip_toml_comment(line);
+        let trimmed = stripped.trim();
         if let Some(name) = trimmed.strip_prefix("[sources.") {
             if let Some(pin) = current.take() {
                 pins.push(pin);
@@ -404,6 +457,33 @@ pub fn pins_from_text(text: &str) -> Vec<Pin> {
         pins.push(pin);
     }
     pins
+}
+
+/// Drop an inline TOML comment without touching a `#` inside a quoted value.
+fn strip_toml_comment(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut quote = None;
+    let mut escaped = false;
+    for character in line.chars() {
+        if let Some(active) = quote {
+            out.push(character);
+            if escaped {
+                escaped = false;
+            } else if character == '\\' && active == '"' {
+                escaped = true;
+            } else if character == active {
+                quote = None;
+            }
+        } else if character == '"' || character == '\'' {
+            quote = Some(character);
+            out.push(character);
+        } else if character == '#' {
+            break;
+        } else {
+            out.push(character);
+        }
+    }
+    out
 }
 
 /// A TOML scalar string or boolean, with its quotes removed.
@@ -655,6 +735,113 @@ mod tests {
             );
             assert_eq!(row.gap, Gap::Partial, "{}: {}", row.key(), row.state);
         }
+    }
+
+    #[test]
+    fn half_roles_and_negated_verdicts_are_not_shipped() {
+        assert!(!is_implemented("implemented, client only"));
+        assert!(!is_implemented("implemented, server only"));
+        assert!(!is_implemented(
+            "implemented — client only: handshake wired"
+        ));
+        assert_eq!(
+            gap_of("implemented — client only: handshake wired"),
+            Gap::Partial
+        );
+        assert!(!is_implemented(
+            "implemented — client only - handshake wired"
+        ));
+        assert_eq!(
+            gap_of("implemented — client only - handshake wired"),
+            Gap::Partial
+        );
+        assert!(is_implemented(
+            "implemented for both roles; server only logs connection transitions"
+        ));
+        assert_eq!(
+            gap_of("implemented for both roles; server only logs connection transitions"),
+            Gap::Shipped
+        );
+        assert!(!is_implemented("not in tree"));
+        assert!(!is_implemented("in tree, not in tree"));
+        assert!(is_implemented(
+            "implemented for both roles; upstream test driver not in tree"
+        ));
+        assert_eq!(
+            gap_of("implemented for both roles; upstream test driver not in tree"),
+            Gap::Shipped
+        );
+        assert!(!is_implemented("not-scheduled — both roles still missing"));
+        assert_eq!(
+            gap_of("not-scheduled — both roles still missing"),
+            Gap::NotScheduled
+        );
+        assert_eq!(gap_of("implemented, client only"), Gap::Partial);
+        assert_eq!(gap_of("not in tree"), Gap::Planned);
+        assert_eq!(gap_of("not fully implemented"), Gap::Planned);
+    }
+
+    #[test]
+    fn a_level_two_heading_ends_the_matrix_section() {
+        let rows = methods_from_text(
+            "### A — proxy protocols\n\n| # | method | state |\n| --- | --- | --- |\n| 1 | one | planned |\n\n## Examples\n\n| 2 | two | planned |\n",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].key(), "A1");
+    }
+
+    #[test]
+    fn a_tab_after_a_heading_marker_ends_the_matrix_section() {
+        let rows = methods_from_text(
+            "### A — proxy protocols\n\n| # | method | state |\n| --- | --- | --- |\n| 1 | one | planned |\n\n##\tExamples\n\n| 2 | two | planned |\n",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].key(), "A1");
+    }
+
+    #[test]
+    fn a_bare_level_two_heading_ends_the_matrix_section() {
+        let rows = methods_from_text(
+            "### A — proxy protocols\n\n| # | method | state |\n| --- | --- | --- |\n| 1 | one | planned |\n\n##\n\n| 2 | two | planned |\n",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].key(), "A1");
+    }
+
+    #[test]
+    fn an_indented_table_line_is_code_not_a_matrix_row() {
+        let rows = methods_from_text(
+            "### A — proxy protocols\n\n| # | method | state |\n| --- | --- | --- |\n| 1 | one | planned |\n    | 99 | example | planned |\n",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].key(), "A1");
+    }
+
+    #[test]
+    fn a_heading_inside_a_fence_does_not_end_the_matrix_section() {
+        let rows = methods_from_text(
+            "### A — proxy protocols\n\n| # | method | state |\n| --- | --- | --- |\n| 1 | one | planned |\n\n```text\n## Example\n```\n\n| 2 | two | planned |\n",
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].key(), "A2");
+    }
+
+    #[test]
+    fn an_indented_heading_is_code_not_a_section_end() {
+        let rows = methods_from_text(
+            "### A — proxy protocols\n\n| # | method | state |\n| --- | --- | --- |\n| 1 | one | planned |\n\n    ## Example\n\n| 2 | two | planned |\n",
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].key(), "A2");
+    }
+
+    #[test]
+    fn an_inline_toml_comment_does_not_change_a_pin_field() {
+        let pins = pins_from_text(
+            "[sources.xray-core] # core reference\nrepo = \"https://example.test/a#b\" # pinned\nalways = true # every row\n",
+        );
+        assert_eq!(pins[0].repo, "https://example.test/a#b");
+        assert!(pins[0].always);
     }
 
     #[test]
