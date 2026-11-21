@@ -33740,3 +33740,9903 @@ impl RelayBuf {
     /// the carrier can frame as one message.
     #[must_use]
     pub fn with_limit(limit: usize) -> Self {
+        let limit = limit.clamp(1, RELAY_BUFFER);
+        let mut buf = Self::with_len(limit.min(RELAY_SMALL_BUFFER));
+        buf.limit = limit;
+        buf
+    }
+
+    /// Move the cap to the credit the peer has left; promotion stays with `filled`, so a short
+    /// transfer keeps the small window instead of copying it up before the first read.
+    pub fn set_limit(&mut self, limit: usize) {
+        self.limit = limit.clamp(1, RELAY_BUFFER);
+    }
+
+    #[must_use]
+    pub fn as_mut(&mut self) -> &mut [u8] {
+        self.ensure();
+        &mut self.bytes[..self.window.min(self.limit)]
+    }
+
+    /// Returns the window to the pool while a lane is parked: a parked direction breaks its wait at
+    /// the read clock, and the bytes it would read are not there, so it can hold no allocation. The
+    /// next step takes one again, and `held` is the witness that the park kept none.
+    pub fn release(&mut self) {
+        if self.bytes.len() == RELAY_SMALL_BUFFER || self.bytes.len() == RELAY_BUFFER {
+            give_relay_window(std::mem::take(&mut self.bytes));
+        }
+    }
+
+    fn ensure(&mut self) {
+        if self.bytes.len() >= self.window {
+            return;
+        }
+        let mut bytes = take_relay_window(self.window).unwrap_or_else(|| vec![0u8; self.window]);
+        let have = self.bytes.len();
+        bytes[..have].copy_from_slice(&self.bytes[..have]);
+        let mut old = std::mem::replace(&mut self.bytes, bytes);
+        old.truncate(have);
+        give_relay_window(old);
+    }
+
+    /// The buffer leaves the type; every later read is prefix-bounded like `open_chunk`'s or `poll_copy`'s, so bytes a read did not report are never sent.
+    #[must_use]
+    pub fn into_vec(mut self) -> Vec<u8> {
+        self.ensure();
+        self.bytes.truncate(self.window.min(self.limit));
+        std::mem::take(&mut self.bytes)
+    }
+
+    /// A read that filled the window promotes at once, and a leg whose reads are all short promotes once it has moved a whole window: `recv` returns what is queued rather than what was asked, so a busy leg would otherwise stay at 16 KiB for the life of the flow.
+    #[must_use]
+    pub fn filled(&mut self, n: usize) -> &[u8] {
+        self.ensure();
+        self.moved = self.moved.saturating_add(n);
+        if self.window < self.promote_to && (n == self.window || self.moved >= self.promote_to) {
+            self.window = self.promote_to;
+            if self.bytes.len() < self.window {
+                let head = self.bytes.len();
+                let mut promoted =
+                    take_relay_window(self.window).unwrap_or_else(|| vec![0u8; self.window]);
+                promoted[..head].copy_from_slice(&self.bytes[..head]);
+                let mut old = std::mem::replace(&mut self.bytes, promoted);
+                old.truncate(head);
+                give_relay_window(old);
+            }
+        }
+        &self.bytes[..n]
+    }
+
+    /// The bytes an earlier read left in the window, for a send that parked and is retried on a later lane step.
+    #[must_use]
+    pub fn prefix(&self, n: usize) -> &[u8] {
+        &self.bytes[..n]
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.bytes.capacity()
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn size(&self) -> usize {
+        self.window
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn held(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+impl Drop for RelayBuf {
+    fn drop(&mut self) {
+        if self.bytes.len() == RELAY_SMALL_BUFFER || self.bytes.len() == RELAY_BUFFER {
+            give_relay_window(std::mem::take(&mut self.bytes));
+        }
+    }
+}
+
+impl Default for RelayBuf {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A relay lane: one direction's loop, run a step at a time so a fixed set of threads carries
+/// every wrapped flow. A step is one read and the write it feeds, bounded by the read clock the
+/// lane's source was armed with; the step says whether the direction is still moving.
+pub(crate) mod lane_pool {
+    use super::WaitFd;
+    use std::collections::VecDeque;
+    use std::sync::{Condvar, Mutex, OnceLock, PoisonError};
+    use std::thread;
+
+    /// What one step did: moved bytes keep the lane at the head, a parked read yields to the queue, and a finished lane hands its worker on.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(crate) enum Next {
+        Done,
+        /// Nothing to read yet: the lane waits off the workers for a poll quantum.
+        Idle,
+        More,
+        /// Ready as soon as the queue gives it a turn: the step already spent its own wait.
+        Retry,
+    }
+
+    pub(crate) type Step = Box<dyn FnMut() -> Next + Send + 'static>;
+
+    pub(crate) type Complete = Box<dyn FnOnce() + Send + 'static>;
+
+    struct Lane {
+        step: Step,
+        complete: Option<Complete>,
+        /// Consecutive rounds that found nothing to read; each one doubles the wait before the next.
+        idle: u32,
+        /// A relay lane's reads hand a timeout back to the step; a setup lane's own budget owns its wait.
+        relay: bool,
+    }
+
+    impl Lane {
+        fn run(&mut self) -> Next {
+            {
+                crate::proxy::forget_wait_fd();
+                crate::proxy::forget_wait_finish();
+                crate::proxy::forget_wait_idle();
+            }
+            if self.relay {
+                let _step = crate::proxy::RelayStep::enter();
+                (self.step)()
+            } else {
+                (self.step)()
+            }
+        }
+
+        fn finish(&mut self) {
+            if let Some(complete) = self.complete.take() {
+                complete();
+            }
+        }
+    }
+
+    /// The deadline a readiness park armed, or that it armed none because its sibling still lives.
+    #[cfg(test)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum ReadyClock {
+        None,
+        At(std::time::Instant),
+    }
+
+    struct Pool {
+        ready: Mutex<VecDeque<Lane>>,
+        parked: Mutex<Parked>,
+        notify: Condvar,
+        park_wake: Condvar,
+        workers: std::sync::atomic::AtomicUsize,
+        idle: std::sync::atomic::AtomicUsize,
+        parks: std::sync::atomic::AtomicUsize,
+        cap: usize,
+        pending: Option<usize>,
+        /// Setup workers retire when the queue is empty, so their threads do not sit beside the relay lanes during a transfer.
+        idle_exit: bool,
+        /// Lanes whose source is a socket wait here; one reaper polls every descriptor and requeues
+        /// the lane that has bytes, whose sibling ends, or whose grace falls due.
+        waiting: Mutex<Vec<std::sync::Arc<ReadySlot>>>,
+        wake: Option<WakePipe>,
+        reaper: Mutex<Option<std::thread::JoinHandle<()>>>,
+        /// Slots whose sibling ended, named so the reaper drops them without scanning the parked set.
+        retired: Mutex<Vec<u64>>,
+        next_slot: std::sync::atomic::AtomicU64,
+        /// Which park branch a lane took: a readiness park is a descriptor wait, a timer park is the clock.
+        #[cfg(test)]
+        ready_parks: std::sync::atomic::AtomicUsize,
+        #[cfg(test)]
+        timer_parks: std::sync::atomic::AtomicUsize,
+        /// The deadline the last readiness park armed; `None` is a lane whose sibling has not ended.
+        #[cfg(test)]
+        last_ready_due: Mutex<Option<ReadyClock>>,
+        #[cfg(test)]
+        ended_wakes: std::sync::atomic::AtomicUsize,
+        #[cfg(test)]
+        stop: std::sync::atomic::AtomicBool,
+        #[cfg(test)]
+        handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    }
+
+    /// Lanes with nothing to read wait here, each with the instant it is due another turn.
+    #[derive(Default)]
+    struct Parked {
+        lanes: Vec<(std::time::Instant, Lane)>,
+        waking: bool,
+    }
+
+    /// A lane parked on a socket. The descriptor wakes it when the peer writes, its sibling's end
+    /// wakes it when it does not, and `due` is the grace a sibling's end leaves for the last reply.
+    pub(crate) struct ReadySlot {
+        id: u64,
+        due: std::sync::OnceLock<Option<std::time::Instant>>,
+        fd: WaitFd,
+        /// The side of the descriptor the lane waits on: a full carrier wants a write, an empty one a read.
+        write: bool,
+        finish: Option<std::sync::Arc<crate::proxy::RelayFinish>>,
+        lane: Mutex<Option<Lane>>,
+        pool: std::sync::Weak<Pool>,
+    }
+
+    impl ReadySlot {
+        fn due(&self) -> Option<std::time::Instant> {
+            self.due.get().copied().flatten()
+        }
+
+        fn is_empty(&self) -> bool {
+            self.lane
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_none()
+        }
+
+        fn take_lane(&self) -> Option<Lane> {
+            self.lane
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+        }
+
+        fn put_lane(&self, lane: Lane) {
+            *self.lane.lock().unwrap_or_else(PoisonError::into_inner) = Some(lane);
+        }
+
+        /// The sibling ended: hand this lane back now, and wake the reaper so it drops the empty slot.
+        pub(crate) fn wake_ended(&self) {
+            let Some(lane) = self.take_lane() else {
+                return;
+            };
+            let Some(pool) = self.pool.upgrade() else {
+                return;
+            };
+            #[cfg(test)]
+            pool.ended_wakes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Ok(mut retired) = pool.retired.lock() {
+                retired.push(self.id);
+            }
+            {
+                let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
+                ready.push_back(lane);
+            }
+            pool.notify.notify_all();
+            if let Some(wake) = pool.wake.as_ref() {
+                wake.post();
+            }
+        }
+    }
+
+    /// The descriptor a parker writes to wake the reaper for a lane the reaper has not seen yet.
+    #[cfg(unix)]
+    struct WakePipe {
+        read: std::os::fd::RawFd,
+        write: std::os::fd::RawFd,
+    }
+
+    #[cfg(unix)]
+    impl WakePipe {
+        fn new() -> Option<Self> {
+            let mut fds = [-1; 2];
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+                return None;
+            }
+            for fd in fds {
+                unsafe {
+                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                    let flags = libc::fcntl(fd, libc::F_GETFL);
+                    if flags >= 0 {
+                        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                    }
+                }
+            }
+            Some(Self {
+                read: fds[0],
+                write: fds[1],
+            })
+        }
+
+        fn post(&self) {
+            let byte = 1u8;
+            unsafe {
+                libc::write(self.write, std::ptr::from_ref(&byte).cast(), 1);
+            }
+        }
+
+        fn drain(&self) {
+            let mut byte = 0u8;
+            loop {
+                let read =
+                    unsafe { libc::read(self.read, std::ptr::from_mut(&mut byte).cast(), 1) };
+                if read <= 0 {
+                    return;
+                }
+            }
+        }
+
+        fn key(&self) -> WaitFd {
+            self.read
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for WakePipe {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.read);
+                libc::close(self.write);
+            }
+        }
+    }
+
+    /// The same wake on Windows: `WSAPoll` watches sockets, so a loopback datagram pair stands in
+    /// for the pipe. A full receive buffer drops the extra posts, and one already queued wakes.
+    #[cfg(windows)]
+    struct WakePipe {
+        read: std::net::UdpSocket,
+        write: std::net::UdpSocket,
+    }
+
+    #[cfg(windows)]
+    impl WakePipe {
+        fn new() -> Option<Self> {
+            let read = std::net::UdpSocket::bind("127.0.0.1:0").ok()?;
+            let write = std::net::UdpSocket::bind("127.0.0.1:0").ok()?;
+            write.connect(read.local_addr().ok()?).ok()?;
+            read.set_nonblocking(true).ok()?;
+            write.set_nonblocking(true).ok()?;
+            Some(Self { read, write })
+        }
+
+        fn post(&self) {
+            let _ = self.write.send(&[1]);
+        }
+
+        fn drain(&self) {
+            let mut byte = [0u8; 64];
+            while matches!(self.read.recv(&mut byte), Ok(n) if n > 0) {}
+        }
+
+        fn key(&self) -> WaitFd {
+            use std::os::windows::io::AsRawSocket as _;
+            self.read.as_raw_socket()
+        }
+    }
+
+    static POOL: OnceLock<std::sync::Arc<Pool>> = OnceLock::new();
+    static SETUP_POOL: OnceLock<std::sync::Arc<Pool>> = OnceLock::new();
+    static DEMUX_POOL: OnceLock<std::sync::Arc<Pool>> = OnceLock::new();
+    static BORROWED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// A server's flow parks one leg on the peer's window, so eight download lanes carry the widest
+    /// standard cell. The h2 demux runs on its own pool with its own reaper, so this caps the relay
+    /// workers, not the process. A worker starts only when a lane is queued and no worker is idle.
+    #[cfg(target_os = "linux")]
+    pub(crate) const RELAY_LANES: usize = 8;
+    /// The timer-parked hosts keep the wider set because their lanes wait without a descriptor.
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) const RELAY_LANES: usize = 8;
+
+    /// A client pumps both legs of a flow at once, so its ceiling is two legs for every flow of
+    /// the widest standard cell.
+    pub(crate) const CLIENT_LANES: usize = 16;
+
+    static PROXY_PEER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// Called once by a process whose config dials a proxy peer, before its first flow.
+    pub(crate) fn mark_proxy_peer() {
+        PROXY_PEER.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The relay ceiling for a role: the client's two legs per flow, the server's thread peak.
+    pub(crate) fn cap_for(proxy_peer: bool) -> usize {
+        if proxy_peer {
+            CLIENT_LANES
+        } else {
+            RELAY_LANES
+        }
+    }
+
+    fn relay_cap() -> usize {
+        cap_for(PROXY_PEER.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// A muxed connection's demux is the lane that turns the peer's window grants into the wake a
+    /// parked relay is waiting for, so it runs on its own workers: a full-duplex cell queues two
+    /// relay legs per flow, and a demux behind them delays every grant by a relay turn. A demux
+    /// lane parks on its connection's socket between frames, so a server carries every connection
+    /// on two workers; a process dialling a proxy peer keeps one lane per relay lane.
+    pub(crate) fn demux_lanes() -> usize {
+        if PROXY_PEER.load(std::sync::atomic::Ordering::Relaxed) {
+            relay_cap()
+        } else {
+            relay_cap().min(2)
+        }
+    }
+
+    /// Setup lanes are separate from relay lanes so a handshake parked in a read cannot take a
+    /// relay worker with it. Two keep a blocked stream setup from holding the only one.
+    #[cfg(target_os = "linux")]
+    pub(crate) const SETUP_LANES: usize = 2;
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) const SETUP_LANES: usize = 2;
+
+    /// Accepted work past the setup workers waits in this queue; past it the handshake runs on its
+    /// own thread, so a burst is slower, not refused.
+    const SETUP_PENDING: usize = 8;
+
+    /// Handshakes past the dedicated setup lanes may borrow a relay worker, so a burst keeps four
+    /// handshakes in flight without adding threads to the peak; two borrowed lanes leave four relay
+    /// workers for the flows behind them.
+    const SETUP_BORROW_LANES: usize = 2;
+
+    /// How many steps a lane may take back to back before it rejoins the queue. A cell queues two
+    /// lanes per stream against fewer threads, so a lane that never parks while it has bytes holds
+    /// one of them for the life of its flow and the lanes behind it do not run: eight steps is
+    /// shorter than the read clock it would otherwise hide behind.
+    const LANE_STREAK: usize = 8;
+
+    fn pool() -> std::sync::Arc<Pool> {
+        std::sync::Arc::clone(POOL.get_or_init(spawn_pool))
+    }
+
+    fn demux_pool() -> std::sync::Arc<Pool> {
+        std::sync::Arc::clone(DEMUX_POOL.get_or_init(|| spawn_pool_with(demux_lanes(), None)))
+    }
+
+    fn setup_pool() -> std::sync::Arc<Pool> {
+        std::sync::Arc::clone(
+            SETUP_POOL.get_or_init(|| spawn_pool_full(SETUP_LANES, Some(SETUP_PENDING), true)),
+        )
+    }
+
+    fn spawn_pool() -> std::sync::Arc<Pool> {
+        spawn_pool_with(relay_cap(), None)
+    }
+
+    fn spawn_pool_with(cap: usize, pending: Option<usize>) -> std::sync::Arc<Pool> {
+        spawn_pool_full(cap, pending, false)
+    }
+
+    fn spawn_pool_full(
+        cap: usize,
+        pending: Option<usize>,
+        idle_exit: bool,
+    ) -> std::sync::Arc<Pool> {
+        std::sync::Arc::new(Pool {
+            ready: Mutex::new(VecDeque::new()),
+            parked: Mutex::new(Parked::default()),
+            notify: Condvar::new(),
+            park_wake: Condvar::new(),
+            workers: std::sync::atomic::AtomicUsize::new(0),
+            idle: std::sync::atomic::AtomicUsize::new(0),
+            parks: std::sync::atomic::AtomicUsize::new(0),
+            cap,
+            pending,
+            idle_exit,
+            waiting: Mutex::new(Vec::new()),
+            wake: WakePipe::new(),
+            reaper: Mutex::new(None),
+            retired: Mutex::new(Vec::new()),
+            next_slot: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            ready_parks: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            timer_parks: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            last_ready_due: Mutex::new(None),
+            #[cfg(test)]
+            ended_wakes: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            stop: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            handles: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// One more worker, reserved before the spawn so concurrent submits stop at the ceiling. False
+    /// means the pool is already at its cap, or the thread could not start and the slot was returned.
+    fn grow(pool: &std::sync::Arc<Pool>) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut workers = pool.workers.load(Relaxed);
+        loop {
+            if workers >= pool.cap {
+                return false;
+            }
+            match pool.workers.compare_exchange_weak(
+                workers,
+                workers + 1,
+                std::sync::atomic::Ordering::AcqRel,
+                Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(seen) => workers = seen,
+            }
+        }
+        let worker = std::sync::Arc::clone(pool);
+        let spawned = thread::Builder::new()
+            .name("ferrox-relay-lane".into())
+            .spawn(move || worker_loop(&worker));
+        let Ok(worker) = spawned else {
+            pool.workers.fetch_sub(1, Relaxed);
+            return false;
+        };
+        #[cfg(test)]
+        pool.handles
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(worker);
+        #[cfg(not(test))]
+        drop(worker);
+        true
+    }
+
+    fn worker_loop(pool: &std::sync::Arc<Pool>) {
+        loop {
+            if stopping(pool) {
+                pool.workers
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+            let mut lane = {
+                let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
+                loop {
+                    if stopping(pool) {
+                        pool.workers
+                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    }
+                    if let Some(lane) = ready.pop_front() {
+                        break lane;
+                    }
+                    pool.idle.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let (guard, timed_out) = if pool.idle_exit {
+                        let (guard, timeout) = pool
+                            .notify
+                            .wait_timeout(ready, std::time::Duration::ZERO)
+                            .unwrap_or_else(PoisonError::into_inner);
+                        (guard, timeout.timed_out())
+                    } else {
+                        (
+                            pool.notify
+                                .wait(ready)
+                                .unwrap_or_else(PoisonError::into_inner),
+                            false,
+                        )
+                    };
+                    pool.idle.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    ready = guard;
+                    if timed_out && ready.is_empty() {
+                        pool.workers
+                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    }
+                }
+            };
+            let mut streak = 0usize;
+            loop {
+                let stepped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lane.run()));
+                match stepped {
+                    // Still has bytes: keep the worker for a streak, then rejoin the queue behind the lanes waiting there.
+                    Ok(Next::More) => {
+                        lane.idle = 0;
+                        streak += 1;
+                        if streak < LANE_STREAK {
+                            continue;
+                        }
+                        let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
+                        ready.push_back(lane);
+                        drop(ready);
+                        pool.notify.notify_one();
+                        break;
+                    }
+                    Ok(Next::Idle) => {
+                        lane.idle = lane.idle.saturating_add(1);
+                        match park_ready(pool, lane) {
+                            Ok(()) => break,
+                            Err(parked) => lane = parked,
+                        }
+                        park(pool, lane);
+                        break;
+                    }
+                    Ok(Next::Retry) => {
+                        lane.idle = 0;
+                        let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
+                        ready.push_back(lane);
+                        drop(ready);
+                        pool.notify.notify_one();
+                        break;
+                    }
+                    Ok(Next::Done) => {
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            lane.finish();
+                        }));
+                        break;
+                    }
+                    Err(_) => {
+                        eprintln!("ferrox-app: a relay lane panicked");
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            lane.finish();
+                        }));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Parks an idle lane with the instant it is due another turn; one worker pays the wait for the
+    /// whole batch, so the lanes with bytes keep the workers and the wait grows per empty round.
+    fn park(pool: &Pool, lane: Lane) {
+        park_with(pool, lane, crate::budgets::RELAY_POLL);
+    }
+
+    /// A lane inserted with an earlier deadline wakes the parker instead of waiting for the
+    /// deadline already parked.
+    fn park_with(pool: &Pool, lane: Lane, quantum: std::time::Duration) {
+        #[cfg(test)]
+        pool.timer_parks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let due = std::time::Instant::now() + wait_for(lane.idle, quantum);
+        let mut parked = pool.parked.lock().unwrap_or_else(PoisonError::into_inner);
+        if parked.waking {
+            let earlier = parked
+                .lanes
+                .iter()
+                .map(|(earliest, _)| *earliest)
+                .min()
+                .is_none_or(|earliest| due < earliest);
+            parked.lanes.push((due, lane));
+            if earlier {
+                pool.park_wake.notify_one();
+            }
+            return;
+        }
+        parked.waking = true;
+        parked.lanes.push((due, lane));
+        loop {
+            let now = std::time::Instant::now();
+            let next = parked.lanes.iter().map(|(due, _)| *due).min();
+            match next {
+                Some(next) if next > now => {
+                    let (guard, _) = pool
+                        .park_wake
+                        .wait_timeout(parked, next - now)
+                        .unwrap_or_else(PoisonError::into_inner);
+                    parked = guard;
+                }
+                None => {
+                    // A lane parked after this point finds the flag clear and pays its own wait.
+                    parked.waking = false;
+                    return;
+                }
+                Some(_) => {
+                    let mut batch = Vec::new();
+                    let mut waiting = Vec::with_capacity(parked.lanes.len());
+                    for (due, lane) in std::mem::take(&mut parked.lanes) {
+                        if due <= now {
+                            batch.push(lane);
+                        } else {
+                            waiting.push((due, lane));
+                        }
+                    }
+                    parked.lanes = waiting;
+                    pool.parks
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
+                    ready.extend(batch);
+                    drop(ready);
+                    pool.notify.notify_all();
+                }
+            }
+        }
+    }
+
+    /// The wait before an idle lane's next turn: one poll quantum, doubling per round that found
+    /// nothing, so a direction nobody writes to costs the pool almost nothing while a direction that
+    /// starts writing is still picked up within 16 ms. The first idle round waits one quantum.
+    fn wait_for(idle: u32, quantum: std::time::Duration) -> std::time::Duration {
+        quantum * (1u32 << idle.saturating_sub(1).min(4))
+    }
+
+    /// Parks an idle lane on the descriptor its read timed out on, so the peer's write wakes it
+    /// instead of the lane re-reading every poll quantum. The check falls due once per response-idle
+    /// budget, which is what notices a sibling that ended while this direction stayed quiet.
+    fn park_ready(pool: &std::sync::Arc<Pool>, lane: Lane) -> Result<(), Lane> {
+        if !lane.relay {
+            crate::proxy::forget_wait_idle();
+            return Err(lane);
+        }
+        let write = crate::proxy::write_wait_pending();
+        let Some(fd) = crate::proxy::take_wait_fd() else {
+            crate::proxy::forget_wait_idle();
+            crate::proxy::take_wait_write();
+            return Err(lane);
+        };
+        let _ = crate::proxy::take_wait_write();
+        if pool.wake.is_none() || stopping(pool) || !start_reaper(pool) {
+            return Err(lane);
+        }
+        let idle = crate::proxy::take_wait_idle().unwrap_or(crate::budgets::RELAY_RESPONSE_IDLE);
+        let slot = std::sync::Arc::new(ReadySlot {
+            id: pool
+                .next_slot
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            due: std::sync::OnceLock::new(),
+            fd,
+            write,
+            finish: crate::proxy::take_wait_finish(),
+            lane: Mutex::new(None),
+            pool: std::sync::Arc::downgrade(pool),
+        });
+        slot.put_lane(lane);
+        // Watch before reading the end, so a racing end either wakes this slot or leaves the grace it arms.
+        let ended = slot.finish.as_ref().map(|flow| flow.watch_park(&slot));
+        // A flow with a living sibling arms no read clock; a write the peer refuses is bounded even then, by the stall its blocking send used to carry.
+        let now = std::time::Instant::now();
+        let stall = now + crate::budgets::relay_stall();
+        let due = match (ended, write) {
+            (Some(Some(at)), true) => Some((at + idle).min(stall)),
+            (Some(Some(at)), false) => Some(at + idle),
+            (_, true) => Some(stall),
+            (None, false) => Some(now + idle),
+            (Some(None), false) => None,
+        };
+        let _ = slot.due.set(due);
+        #[cfg(test)]
+        {
+            *pool
+                .last_ready_due
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) =
+                Some(due.map_or(ReadyClock::None, ReadyClock::At));
+        }
+        pool.waiting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(slot);
+        if let Some(wake) = pool.wake.as_ref() {
+            wake.post();
+        }
+        #[cfg(test)]
+        pool.ready_parks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// One reaper per pool, started by the first socket lane that parks. A spawn failure leaves the
+    /// lane to the timer path rather than parked on a descriptor nobody polls.
+    fn start_reaper(pool: &std::sync::Arc<Pool>) -> bool {
+        let mut slot = pool.reaper.lock().unwrap_or_else(PoisonError::into_inner);
+        if slot.is_some() {
+            return true;
+        }
+        if stopping(pool) {
+            return false;
+        }
+        let Some(wake) = pool.wake.as_ref() else {
+            return false;
+        };
+        let Some(reactor) = Reactor::new(wake.key()) else {
+            return false;
+        };
+        let weak = std::sync::Arc::downgrade(pool);
+        let Ok(handle) = thread::Builder::new()
+            .name("ferrox-relay-ready".into())
+            .spawn(move || reaper_loop(&weak, reactor))
+        else {
+            return false;
+        };
+        *slot = Some(handle);
+        true
+    }
+
+    /// The event a descriptor reported: a write-parked lane wakes on writability, a reader on
+    /// readability, and an error wakes both.
+    #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+    struct Ready {
+        read: bool,
+        write: bool,
+    }
+
+    /// A parked lane's descriptor wait. The epoll/kqueue shape returns only the descriptors that
+    /// are ready, so a wake costs the set's ready lines instead of rebuilding a row per parked lane;
+    /// `WSAPoll` keeps the rows and reports which of them are ready.
+    struct Reactor {
+        #[cfg(target_os = "linux")]
+        ep: libc::c_int,
+        #[cfg(target_os = "macos")]
+        kq: libc::c_int,
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+        wake: libc::c_int,
+        #[cfg(windows)]
+        wake: WaitFd,
+        fds: std::collections::HashMap<WaitFd, Vec<u64>>,
+        slots: std::collections::HashMap<u64, std::sync::Arc<ReadySlot>>,
+        due: std::collections::BinaryHeap<std::cmp::Reverse<(std::time::Instant, u64)>>,
+        #[cfg(target_os = "linux")]
+        events: Vec<libc::epoll_event>,
+        #[cfg(target_os = "macos")]
+        events: Vec<libc::kevent>,
+        #[cfg(windows)]
+        rows: Vec<windows_sys::Win32::Networking::WinSock::WSAPOLLFD>,
+    }
+
+    impl Reactor {
+        #[cfg(target_os = "linux")]
+        fn new(wake: WaitFd) -> Option<Self> {
+            let ep = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+            if ep < 0 {
+                return None;
+            }
+            let mut reactor = Self {
+                ep,
+                fds: std::collections::HashMap::new(),
+                slots: std::collections::HashMap::new(),
+                due: std::collections::BinaryHeap::new(),
+                events: Vec::new(),
+            };
+            reactor
+                .events
+                .resize(64, libc::epoll_event { events: 0, u64: 0 });
+            if !reactor.add(wake, true, false) {
+                return None;
+            }
+            Some(reactor)
+        }
+
+        #[cfg(target_os = "macos")]
+        fn new(wake: WaitFd) -> Option<Self> {
+            let kq = unsafe { libc::kqueue() };
+            if kq < 0 {
+                return None;
+            }
+            let mut reactor = Self {
+                kq,
+                fds: std::collections::HashMap::new(),
+                slots: std::collections::HashMap::new(),
+                due: std::collections::BinaryHeap::new(),
+                events: Vec::new(),
+            };
+            reactor.events.resize(
+                64,
+                libc::kevent {
+                    ident: 0,
+                    filter: 0,
+                    flags: 0,
+                    fflags: 0,
+                    data: 0,
+                    udata: std::ptr::null_mut(),
+                },
+            );
+            if !reactor.add(wake, true, false) {
+                return None;
+            }
+            Some(reactor)
+        }
+
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+        fn new(wake: WaitFd) -> Option<Self> {
+            Some(Self {
+                wake,
+                fds: std::collections::HashMap::new(),
+                slots: std::collections::HashMap::new(),
+                due: std::collections::BinaryHeap::new(),
+            })
+        }
+
+        #[cfg(target_os = "linux")]
+        fn add(&mut self, fd: WaitFd, read: bool, write: bool) -> bool {
+            let mut events = 0;
+            if read {
+                events |= libc::EPOLLIN;
+            }
+            if write {
+                events |= libc::EPOLLOUT;
+            }
+            let mut row = libc::epoll_event {
+                events: u32::try_from(events).unwrap_or(u32::MAX),
+                u64: u64::try_from(fd).unwrap_or(u64::MAX),
+            };
+            let added = unsafe {
+                libc::epoll_ctl(
+                    self.ep,
+                    libc::EPOLL_CTL_ADD,
+                    fd,
+                    std::ptr::from_mut(&mut row),
+                )
+            };
+            if added == 0 {
+                return true;
+            }
+            if std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
+                return false;
+            }
+            // A reused number changes its interest, so every park refreshes the row instead of keeping the old one.
+            (unsafe {
+                libc::epoll_ctl(
+                    self.ep,
+                    libc::EPOLL_CTL_MOD,
+                    fd,
+                    std::ptr::from_mut(&mut row),
+                )
+            }) == 0
+        }
+
+        #[cfg(target_os = "linux")]
+        fn del(&mut self, fd: WaitFd) {
+            unsafe {
+                libc::epoll_ctl(self.ep, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut());
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        fn change_filter(&self, fd: WaitFd, filter: i16, flags: u16) -> bool {
+            let change = libc::kevent {
+                ident: usize::try_from(fd).unwrap_or(usize::MAX),
+                filter,
+                flags,
+                fflags: 0,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            unsafe {
+                libc::kevent(
+                    self.kq,
+                    std::ptr::from_ref(&change),
+                    1,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null(),
+                ) == 0
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        fn change(&self, fd: WaitFd, flags: u16) -> bool {
+            self.change_filter(fd, libc::EVFILT_READ, flags)
+        }
+
+        #[cfg(target_os = "macos")]
+        fn add(&mut self, fd: WaitFd, read: bool, write: bool) -> bool {
+            let read_ok = read && self.change(fd, libc::EV_ADD | libc::EV_ENABLE);
+            let write_ok = !write
+                || self.change_filter(fd, libc::EVFILT_WRITE, libc::EV_ADD | libc::EV_ENABLE);
+            if !read {
+                self.change(fd, libc::EV_DELETE);
+            }
+            if !write {
+                self.change_filter(fd, libc::EVFILT_WRITE, libc::EV_DELETE);
+            }
+            read_ok && write_ok
+        }
+
+        #[cfg(target_os = "macos")]
+        fn del(&mut self, fd: WaitFd) {
+            self.change(fd, libc::EV_DELETE);
+            self.change_filter(fd, libc::EVFILT_WRITE, libc::EV_DELETE);
+        }
+
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+        fn add(&mut self, _: WaitFd, _: bool, _: bool) -> bool {
+            true
+        }
+
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+        fn del(&mut self, _: WaitFd) {}
+
+        #[cfg(target_os = "linux")]
+        fn wait(&mut self, timeout: std::time::Duration) -> Vec<(WaitFd, Ready)> {
+            let millis =
+                libc::c_int::try_from(timeout.as_millis().max(1)).unwrap_or(libc::c_int::MAX);
+            let count = unsafe {
+                libc::epoll_wait(
+                    self.ep,
+                    self.events.as_mut_ptr(),
+                    libc::c_int::try_from(self.events.len()).unwrap_or(libc::c_int::MAX),
+                    millis,
+                )
+            };
+            if count <= 0 {
+                return Vec::new();
+            }
+            self.events[..usize::try_from(count).unwrap_or(0)]
+                .iter()
+                .map(|event| {
+                    let bits = event.events;
+                    let error = bits & (libc::EPOLLERR as u32 | libc::EPOLLHUP as u32) != 0;
+                    (
+                        libc::c_int::try_from(event.u64).unwrap_or(libc::c_int::MAX),
+                        Ready {
+                            read: error
+                                || bits & (libc::EPOLLIN as u32 | libc::EPOLLPRI as u32) != 0,
+                            write: error || bits & libc::EPOLLOUT as u32 != 0,
+                        },
+                    )
+                })
+                .collect()
+        }
+
+        #[cfg(target_os = "macos")]
+        fn wait(&mut self, timeout: std::time::Duration) -> Vec<(WaitFd, Ready)> {
+            let seconds = libc::time_t::try_from(timeout.as_secs()).unwrap_or(libc::time_t::MAX);
+            let nanos = i64::from(timeout.subsec_nanos());
+            let span = libc::timespec {
+                tv_sec: seconds,
+                tv_nsec: nanos,
+            };
+            let count = unsafe {
+                libc::kevent(
+                    self.kq,
+                    std::ptr::null(),
+                    0,
+                    self.events.as_mut_ptr(),
+                    libc::c_int::try_from(self.events.len()).unwrap_or(libc::c_int::MAX),
+                    std::ptr::from_ref(&span),
+                )
+            };
+            if count <= 0 {
+                return Vec::new();
+            }
+            self.events[..usize::try_from(count).unwrap_or(0)]
+                .iter()
+                .map(|event| {
+                    let error = event.flags & (libc::EV_ERROR | libc::EV_EOF) != 0;
+                    (
+                        libc::c_int::try_from(event.ident).unwrap_or(libc::c_int::MAX),
+                        Ready {
+                            read: error || event.filter == libc::EVFILT_READ,
+                            write: error || event.filter == libc::EVFILT_WRITE,
+                        },
+                    )
+                })
+                .collect()
+        }
+
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+        fn wait(&mut self, timeout: std::time::Duration) -> Vec<(WaitFd, Ready)> {
+            let millis =
+                libc::c_int::try_from(timeout.as_millis().max(1)).unwrap_or(libc::c_int::MAX);
+            let mut rows = Vec::with_capacity(self.fds.len() + 1);
+            rows.push(libc::pollfd {
+                fd: self.wake,
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            let parked: Vec<WaitFd> = self.fds.keys().copied().collect();
+            for fd in parked {
+                let (read, write) = self.interests(fd);
+                let mut events = 0;
+                if read {
+                    events |= libc::POLLIN;
+                }
+                if write {
+                    events |= libc::POLLOUT;
+                }
+                rows.push(libc::pollfd {
+                    fd,
+                    events,
+                    revents: 0,
+                });
+            }
+            let polled = unsafe {
+                libc::poll(
+                    rows.as_mut_ptr(),
+                    libc::nfds_t::try_from(rows.len()).unwrap_or(libc::nfds_t::MAX),
+                    millis,
+                )
+            };
+            if polled <= 0 {
+                return Vec::new();
+            }
+            rows.iter()
+                .filter(|row| row.revents != 0)
+                .map(|row| {
+                    let error = row.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0;
+                    (
+                        row.fd,
+                        Ready {
+                            read: error || row.revents & (libc::POLLIN | libc::POLLPRI) != 0,
+                            write: error || row.revents & libc::POLLOUT != 0,
+                        },
+                    )
+                })
+                .collect()
+        }
+
+        #[cfg(windows)]
+        fn new(wake: WaitFd) -> Option<Self> {
+            Some(Self {
+                wake,
+                fds: std::collections::HashMap::new(),
+                slots: std::collections::HashMap::new(),
+                due: std::collections::BinaryHeap::new(),
+                rows: Vec::new(),
+            })
+        }
+
+        // `WSAPoll` takes the whole set per wait, so a socket joins the rows and leaves with its slot.
+        #[cfg(windows)]
+        fn add(&mut self, _: WaitFd, _: bool, _: bool) -> bool {
+            true
+        }
+
+        #[cfg(windows)]
+        fn del(&mut self, _: WaitFd) {}
+
+        #[cfg(windows)]
+        fn wait(&mut self, timeout: std::time::Duration) -> Vec<(WaitFd, Ready)> {
+            use windows_sys::Win32::Networking::WinSock::{
+                WSAPoll, POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLRDNORM, POLLWRNORM, SOCKET,
+                WSAPOLLFD,
+            };
+            let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+            self.rows.clear();
+            self.rows.push(WSAPOLLFD {
+                fd: self.wake as SOCKET,
+                events: POLLIN | POLLRDNORM,
+                revents: 0,
+            });
+            let parked: Vec<WaitFd> = self.fds.keys().copied().collect();
+            for fd in parked {
+                let (read, write) = self.interests(fd);
+                let mut events = 0;
+                if read {
+                    events |= POLLIN | POLLRDNORM;
+                }
+                if write {
+                    events |= POLLWRNORM;
+                }
+                self.rows.push(WSAPOLLFD {
+                    fd: fd as SOCKET,
+                    events,
+                    revents: 0,
+                });
+            }
+            let polled = unsafe {
+                WSAPoll(
+                    self.rows.as_mut_ptr(),
+                    u32::try_from(self.rows.len()).unwrap_or(u32::MAX),
+                    millis,
+                )
+            };
+            if polled < 0 {
+                // A failed poll is a dead set: hand every parked lane back so the closed one leaves and the rest re-arm.
+                std::thread::sleep(crate::budgets::RELAY_POLL);
+                let all = Ready {
+                    read: true,
+                    write: true,
+                };
+                return self.fds.keys().map(|fd| (*fd, all)).collect();
+            }
+            if polled == 0 {
+                return Vec::new();
+            }
+            self.rows
+                .iter()
+                .filter(|row| row.revents != 0)
+                .map(|row| {
+                    let error = row.revents & (POLLERR | POLLHUP | POLLNVAL) != 0;
+                    (
+                        row.fd as WaitFd,
+                        Ready {
+                            read: error || row.revents & (POLLIN | POLLRDNORM) != 0,
+                            write: error || row.revents & POLLWRNORM != 0,
+                        },
+                    )
+                })
+                .collect()
+        }
+
+        /// Registers a fresh slot, or arms its turn a quantum out when its descriptor cannot be
+        /// watched. The last slot on a descriptor removes it.
+        fn park(&mut self, slot: std::sync::Arc<ReadySlot>) -> Option<std::sync::Arc<ReadySlot>> {
+            if slot.is_empty() {
+                return None;
+            }
+            if let Some(due) = slot.due() {
+                self.due.push(std::cmp::Reverse((due, slot.id)));
+            }
+            let fd = slot.fd;
+            let id = slot.id;
+            // A stale id can outlive its closed descriptor, so a reused number is added again.
+            self.fds.entry(fd).or_default().push(id);
+            self.slots.insert(id, slot);
+            if !self.refresh(fd) {
+                // A descriptor the reactor cannot watch keeps the poll's pace instead of spinning the worker.
+                self.due.push(std::cmp::Reverse((
+                    std::time::Instant::now() + crate::budgets::RELAY_POLL,
+                    id,
+                )));
+            }
+            None
+        }
+
+        /// The interest a descriptor's parked lanes want: a reader watches readability, a writer writability.
+        fn interests(&self, fd: WaitFd) -> (bool, bool) {
+            let mut read = false;
+            let mut write = false;
+            if let Some(ids) = self.fds.get(&fd) {
+                for id in ids {
+                    if let Some(slot) = self.slots.get(id) {
+                        if slot.write {
+                            write = true;
+                        } else {
+                            read = true;
+                        }
+                    }
+                }
+            }
+            (read, write)
+        }
+
+        /// Re-issues a descriptor's registration from the lanes still parked on it, so a slot that
+        /// wanted only writability cannot be woken by the peer's readable byte.
+        fn refresh(&mut self, fd: WaitFd) -> bool {
+            let (read, write) = self.interests(fd);
+            if !read && !write {
+                return true;
+            }
+            self.add(fd, read, write)
+        }
+
+        fn retire(&mut self, id: u64) {
+            let Some(slot) = self.slots.remove(&id) else {
+                return;
+            };
+            self.settle_fd(slot.fd);
+        }
+
+        /// Hands every slot the ready event matches back to the queue, leaving the others parked.
+        /// Level-triggered, so a lane that parks again after leaving a partial frame re-arms and
+        /// fires at once.
+        fn wake(&mut self, fd: WaitFd, ready: Ready, lanes: &mut Vec<Lane>) {
+            let Some(ids) = self.fds.get(&fd).cloned() else {
+                return;
+            };
+            let mut remaining = Vec::with_capacity(ids.len());
+            for id in ids {
+                let wanted = self.slots.get(&id).is_some_and(|slot| {
+                    if slot.write {
+                        ready.write
+                    } else {
+                        ready.read
+                    }
+                });
+                if !wanted {
+                    remaining.push(id);
+                    continue;
+                }
+                let Some(slot) = self.slots.remove(&id) else {
+                    continue;
+                };
+                let Some(lane) = slot.take_lane() else {
+                    continue;
+                };
+                if let Some(flow) = slot.finish.as_ref() {
+                    flow.unwatch_park(&slot);
+                }
+                lanes.push(lane);
+            }
+            if remaining.is_empty() {
+                self.fds.remove(&fd);
+                self.del(fd);
+            } else {
+                self.fds.insert(fd, remaining);
+                let _ = self.refresh(fd);
+            }
+        }
+
+        fn wake_due(&mut self, now: std::time::Instant, ready: &mut Vec<Lane>) {
+            while let Some(std::cmp::Reverse((at, id))) = self.due.peek().copied() {
+                if at > now {
+                    break;
+                }
+                self.due.pop();
+                let Some(slot) = self.slots.remove(&id) else {
+                    continue;
+                };
+                self.settle_fd(slot.fd);
+                let Some(lane) = slot.take_lane() else {
+                    continue;
+                };
+                if let Some(flow) = slot.finish.as_ref() {
+                    flow.unwatch_park(&slot);
+                }
+                ready.push(lane);
+            }
+        }
+
+        /// Drops a descriptor with no lanes left, or narrows the interest of the ones that remain.
+        fn settle_fd(&mut self, fd: WaitFd) {
+            let empty = self.fds.get(&fd).is_none_or(Vec::is_empty);
+            if empty {
+                self.fds.remove(&fd);
+                self.del(fd);
+            } else {
+                let _ = self.refresh(fd);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for Reactor {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.ep);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for Reactor {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.kq);
+            }
+        }
+    }
+
+    // `kevent.udata` is written only by the kernel into this thread's own output buffer, never read here.
+    #[cfg(target_os = "macos")]
+    unsafe impl Send for Reactor {}
+
+    fn reaper_loop(pool: &std::sync::Weak<Pool>, mut reactor: Reactor) {
+        loop {
+            let Some(pool) = pool.upgrade() else {
+                return;
+            };
+            if stopping(&pool) {
+                return;
+            }
+            let Some(wake) = pool.wake.as_ref() else {
+                return;
+            };
+            let retired =
+                std::mem::take(&mut *pool.retired.lock().unwrap_or_else(PoisonError::into_inner));
+            for id in retired {
+                reactor.retire(id);
+            }
+            let mut fresh = Vec::new();
+            {
+                let mut waiting = pool.waiting.lock().unwrap_or_else(PoisonError::into_inner);
+                fresh.append(&mut waiting);
+            }
+            let mut ready = Vec::new();
+            for slot in fresh {
+                let Some(slot) = reactor.park(slot) else {
+                    continue;
+                };
+                let Some(lane) = slot.take_lane() else {
+                    continue;
+                };
+                if let Some(flow) = slot.finish.as_ref() {
+                    flow.unwatch_park(&slot);
+                }
+                ready.push(lane);
+            }
+            let now = std::time::Instant::now();
+            // Only a slot that has left is stale; a parked one keeps its deadline or the lane waits forever.
+            while let Some(std::cmp::Reverse((_, id))) = reactor.due.peek().copied() {
+                if reactor.slots.contains_key(&id) {
+                    break;
+                }
+                reactor.due.pop();
+            }
+            let timeout = match reactor.due.peek().copied() {
+                Some(std::cmp::Reverse((at, _))) if at > now => at - now,
+                Some(_) => std::time::Duration::ZERO,
+                None => std::time::Duration::from_secs(1),
+            };
+            let ready_fds = reactor.wait(timeout);
+            for (fd, flags) in ready_fds {
+                if fd == wake.key() {
+                    wake.drain();
+                } else {
+                    reactor.wake(fd, flags, &mut ready);
+                }
+            }
+            reactor.wake_due(std::time::Instant::now(), &mut ready);
+            if !ready.is_empty() {
+                let mut queue = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
+                queue.extend(ready);
+                drop(queue);
+                pool.notify.notify_all();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn stopping(pool: &Pool) -> bool {
+        pool.stop.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(not(test))]
+    fn stopping(_: &Pool) -> bool {
+        false
+    }
+
+    #[cfg(test)]
+    fn shutdown(pool: &std::sync::Arc<Pool>) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
+        pool.stop.store(true, SeqCst);
+        pool.notify.notify_all();
+        drop(ready);
+        {
+            if let Some(wake) = pool.wake.as_ref() {
+                wake.post();
+            }
+            let mut reaper = pool.reaper.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(handle) = reaper.take() {
+                let _ = handle.join();
+            }
+        }
+        let handles =
+            std::mem::take(&mut *pool.handles.lock().unwrap_or_else(PoisonError::into_inner));
+        for handle in handles {
+            let _ = handle.join();
+        }
+    }
+
+    fn run_to_end(mut lane: Lane) {
+        loop {
+            let stepped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lane.run()));
+            match stepped {
+                Ok(Next::Idle | Next::More | Next::Retry) => {}
+                Ok(Next::Done) | Err(_) => {
+                    let _ =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lane.finish()));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// A setup lane the pool cannot take runs on its own thread; a thread that cannot start completes
+    /// the lane where it stands instead of panicking the caller or dropping the rest of its batch.
+    fn spawn_off_pool(lane: Lane) {
+        let slot = std::sync::Arc::new(Mutex::new(Some(lane)));
+        let body = std::sync::Arc::clone(&slot);
+        let spawned = thread::Builder::new()
+            .name("ferrox-setup-lane".into())
+            .spawn(move || {
+                if let Some(lane) = body.lock().unwrap_or_else(PoisonError::into_inner).take() {
+                    run_to_end(lane);
+                }
+            });
+        if spawned.is_err() {
+            if let Some(mut lane) = slot.lock().unwrap_or_else(PoisonError::into_inner).take() {
+                lane.finish();
+            }
+        }
+    }
+
+    /// Whether a worker can carry a submitted lane: one already lives, or the pool starts one.
+    /// False is the zero-worker case a relay must not enter, because `submit` would run the first
+    /// direction inline before its sibling was queued.
+    pub(crate) fn start() -> bool {
+        start_in(&pool())
+    }
+
+    fn start_in(pool: &std::sync::Arc<Pool>) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        pool.workers.load(Relaxed) > 0 || (!stopping(pool) && grow(pool))
+    }
+
+    pub(crate) fn submit(step: Step, complete: Complete) {
+        submit_to(&pool(), step, complete);
+    }
+
+    /// The demux of a muxed carrier, kept off the relay workers it feeds.
+    pub(crate) fn submit_demux(step: Step, complete: Complete) {
+        submit_to(&demux_pool(), step, complete);
+    }
+
+    /// A muxed stream's handshake: queued behind the accept path's setup lanes instead of taking a
+    /// thread of its own for every stream the peer opens.
+    pub(crate) fn submit_stream_setup(body: impl FnOnce() + Send + 'static) {
+        #[cfg(test)]
+        let body = crate::budgets::carrying(body);
+        let mut body = Some(body);
+        let step: Step = Box::new(move || {
+            if let Some(body) = body.take() {
+                body();
+            }
+            Next::Done
+        });
+        let setup = setup_pool();
+        if let Err(lane) = submit_to_with(&setup, step, Box::new(|| {}), false) {
+            spawn_off_pool(lane);
+        }
+    }
+
+    /// A setup lane: the accept path's handshake and dispatch, run once on a pooled worker. It does
+    /// not enter `RelayStep`, because its waits are bounded by the handshake budget, not the relay clock.
+    /// A queue that is full runs the lane on its own thread rather than refusing the connection.
+    pub(crate) fn submit_setup(step: Step, complete: Complete) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let setup = setup_pool();
+        let saturated = setup.idle.load(Relaxed) == 0 && setup.workers.load(Relaxed) >= SETUP_LANES;
+        if saturated
+            && BORROWED
+                .try_update(Relaxed, Relaxed, |borrowed| {
+                    (borrowed < SETUP_BORROW_LANES).then_some(borrowed + 1)
+                })
+                .is_ok()
+        {
+            let complete = Box::new(move || {
+                BORROWED.fetch_sub(1, Relaxed);
+                complete();
+            });
+            if let Err(lane) = submit_to_with(&pool(), step, complete, false) {
+                spawn_off_pool(lane);
+            }
+            return;
+        }
+        if let Err(lane) = submit_to_with(&setup, step, complete, false) {
+            spawn_off_pool(lane);
+        }
+    }
+
+    fn submit_to(pool: &std::sync::Arc<Pool>, step: Step, complete: Complete) {
+        let _ = submit_to_with(pool, step, complete, true);
+    }
+
+    fn submit_to_with(
+        pool: &std::sync::Arc<Pool>,
+        step: Step,
+        complete: Complete,
+        relay: bool,
+    ) -> Result<(), Lane> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let lane = Lane {
+            step,
+            complete: Some(complete),
+            idle: 0,
+            relay,
+        };
+        let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
+        if pool.pending.is_some_and(|pending| ready.len() >= pending) {
+            return Err(lane);
+        }
+        let (queued, idle) = (ready.len(), pool.idle.load(Relaxed));
+        drop(ready);
+        if queued >= idle {
+            // Nobody is parked to take it: start a lane, or leave it to the cap's workers.
+            let _ = grow(pool);
+        }
+        if pool.workers.load(Relaxed) == 0 {
+            if relay {
+                // A thread the process could not start still does the relay lane's work on the caller.
+                run_to_end(lane);
+                return Ok(());
+            }
+            // A setup lane reads the body its caller demuxes, so the caller can never run it.
+            return Err(lane);
+        }
+        ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
+        if pool.pending.is_some_and(|pending| ready.len() >= pending) {
+            return Err(lane);
+        }
+        ready.push_back(lane);
+        if pool.workers.load(Relaxed) == 0 {
+            // The last worker retired while this lock was held: no thread will take the queue.
+            let orphaned: Vec<Lane> = ready.drain(..).collect();
+            drop(ready);
+            if relay {
+                for lane in orphaned {
+                    run_to_end(lane);
+                }
+            } else {
+                // A setup lane reads the body its caller demuxes, so it leaves the caller's thread.
+                for lane in orphaned {
+                    spawn_off_pool(lane);
+                }
+            }
+            return Ok(());
+        }
+        drop(ready);
+        pool.notify.notify_one();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn parker_batches(pool: &Pool) -> usize {
+        pool.parks.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn workers() -> usize {
+        pool().workers.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn setup_workers() -> usize {
+        setup_pool()
+            .workers
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn demux_workers() -> usize {
+        demux_pool()
+            .workers
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        struct TestPool(Arc<Pool>);
+
+        impl std::ops::Deref for TestPool {
+            type Target = Arc<Pool>;
+
+            fn deref(&self) -> &Self::Target {
+                &self.0
+            }
+        }
+
+        impl Drop for TestPool {
+            fn drop(&mut self) {
+                shutdown(&self.0);
+            }
+        }
+
+        struct Gate {
+            state: Mutex<(usize, bool)>,
+            wake: Condvar,
+        }
+
+        impl Gate {
+            fn arrive_and_wait(&self) {
+                let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                state.0 += 1;
+                self.wake.notify_all();
+                while !state.1 {
+                    state = self
+                        .wake
+                        .wait(state)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+            }
+
+            fn wait_for(&self, lanes: usize, budget: Duration) -> usize {
+                let deadline = Instant::now() + budget;
+                let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                while state.0 < lanes {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+                    let (next, _) = self
+                        .wake
+                        .wait_timeout(state, left)
+                        .unwrap_or_else(PoisonError::into_inner);
+                    state = next;
+                }
+                state.0
+            }
+
+            fn release(&self) {
+                let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                state.1 = true;
+                self.wake.notify_all();
+            }
+        }
+
+        /// A client pumps both legs of a flow at once, so its ceiling is the two legs of every
+        /// flow in the widest standard cell; a server keeps its thread peak.
+        #[test]
+        fn a_client_ceiling_carries_two_legs_per_flow() {
+            assert_eq!(cap_for(false), RELAY_LANES);
+            assert_eq!(cap_for(true), CLIENT_LANES);
+            let widest = 2 * 8;
+            assert!(
+                cap_for(true) >= widest,
+                "the widest cell's eight flows queue {widest} legs against a {CLIENT_LANES}-lane ceiling"
+            );
+        }
+
+        /// Every lane in the fixed set must have a worker; eight carry a full cell because an idle
+        /// lane parks its descriptor and the reaper wakes it instead of one blocking thread per flow.
+        #[test]
+        fn every_lane_of_a_full_cell_has_a_worker() {
+            let pool = TestPool(spawn_pool());
+            // The widest cell's eight flows are blocking reads; one is the accept thread's.
+            let lanes = RELAY_LANES;
+            assert!(
+                lanes >= 6,
+                "the pool carries {lanes} lanes, below the cell's carriers"
+            );
+            let gate = Arc::new(Gate {
+                state: Mutex::new((0, false)),
+                wake: Condvar::new(),
+            });
+            let finished = Arc::new(AtomicUsize::new(0));
+            for _ in 0..lanes {
+                let gate = Arc::clone(&gate);
+                let finished = Arc::clone(&finished);
+                submit_to(
+                    &pool,
+                    Box::new(move || {
+                        gate.arrive_and_wait();
+                        Next::Done
+                    }),
+                    Box::new(move || {
+                        finished.fetch_add(1, Ordering::Relaxed);
+                    }),
+                );
+            }
+            let waiting = gate.wait_for(lanes, Duration::from_secs(5));
+            gate.release();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while finished.load(Ordering::Relaxed) < lanes && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(
+                waiting, lanes,
+                "{waiting} of {lanes} lanes reached their read: the pool cannot carry the cell"
+            );
+            assert_eq!(finished.load(Ordering::Relaxed), lanes);
+        }
+
+        /// A demux lane carries the window grant a parked relay is waiting on, so it must not
+        /// queue behind the relay workers a duplex cell fills: every relay worker blocked is the
+        /// shape of an eight-flow duplex cell, and the demux still has to run.
+        #[test]
+        fn a_demux_lane_runs_while_every_relay_worker_is_blocked() {
+            let pool = pool();
+            let gate = Arc::new(Gate {
+                state: Mutex::new((0, false)),
+                wake: Condvar::new(),
+            });
+            for _ in 0..RELAY_LANES {
+                let gate = Arc::clone(&gate);
+                submit_to(
+                    &pool,
+                    Box::new(move || {
+                        gate.arrive_and_wait();
+                        Next::Done
+                    }),
+                    Box::new(|| {}),
+                );
+            }
+            let waiting = gate.wait_for(RELAY_LANES, Duration::from_secs(5));
+            let ran = Arc::new(AtomicUsize::new(0));
+            let mark = Arc::clone(&ran);
+            submit_demux(
+                Box::new(move || {
+                    mark.fetch_add(1, Ordering::Relaxed);
+                    Next::Done
+                }),
+                Box::new(|| {}),
+            );
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while ran.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            let seen = ran.load(Ordering::Relaxed);
+            gate.release();
+            assert_eq!(
+                waiting, RELAY_LANES,
+                "{waiting} of {RELAY_LANES} relay lanes reached their read"
+            );
+            assert_eq!(seen, 1, "the demux waited behind every relay worker");
+        }
+
+        /// An idle lane must not hold a worker: the pool parks it, one parker thread pays the wait
+        /// for every parked lane, and a flow with bytes still gets its turn.
+        #[test]
+        fn an_idle_lane_waits_off_the_worker() {
+            let pool = TestPool(spawn_pool());
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let running = Arc::new(AtomicUsize::new(0));
+            let idle = RELAY_LANES - 1;
+            for _ in 0..idle {
+                let stop = Arc::clone(&stop);
+                let running = Arc::clone(&running);
+                submit_to(
+                    &pool,
+                    Box::new(move || {
+                        if stop.load(Ordering::Relaxed) {
+                            return Next::Done;
+                        }
+                        running.fetch_add(1, Ordering::Relaxed);
+                        Next::Idle
+                    }),
+                    Box::new(|| {}),
+                );
+            }
+            let before = parker_batches(&pool);
+            // A count a loaded machine cannot reach in a fixed window is a count this test cannot gate: wait for the rounds instead.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut batches = 0;
+            while batches < 2 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+                batches = parker_batches(&pool) - before;
+            }
+            stop.store(true, Ordering::Relaxed);
+            assert!(
+                batches >= 2,
+                "{idle} idle lanes cycled {batches} park rounds in five seconds"
+            );
+            assert!(running.load(Ordering::Relaxed) >= idle);
+        }
+
+        /// A relay pair must know whether a worker can carry the first lane before it submits one:
+        /// a pool that cannot start a worker hands both directions back instead of running forward inline.
+        #[test]
+        fn a_pool_with_no_worker_room_is_refused_before_either_lane_runs() {
+            let full = TestPool(spawn_pool_full(0, None, false));
+            assert!(
+                !start_in(&full),
+                "a pool capped at zero workers cannot take half a relay pair"
+            );
+            let room = TestPool(spawn_pool_full(1, None, false));
+            assert!(start_in(&room), "a pool with room starts the worker");
+        }
+
+        /// A private pool's workers must not outlive the test that made them: repeated parallel
+        /// runs would otherwise leave parked lane threads behind and skew the process-wide counts.
+        #[test]
+        fn a_private_pool_stops_its_workers_before_the_test_ends() {
+            let pool = spawn_pool();
+            let weak = Arc::downgrade(&pool);
+            submit_to(&pool, Box::new(|| Next::Idle), Box::new(|| {}));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while pool.workers.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                pool.workers.load(Ordering::Relaxed) > 0,
+                "the private pool never started a worker"
+            );
+            shutdown(&pool);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while pool.workers.load(Ordering::Relaxed) > 0 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(
+                pool.workers.load(Ordering::Relaxed),
+                0,
+                "shutdown left a private worker running"
+            );
+            drop(pool);
+            assert!(
+                weak.upgrade().is_none(),
+                "a private worker kept the pool alive"
+            );
+        }
+
+        /// A direction nobody writes to must cost the pool almost nothing: the wait before an idle
+        /// lane's next turn doubles each round, so a quiet lane is re-queued a handful of times a
+        /// fifth of a second instead of once a millisecond.
+        #[test]
+        fn an_idle_lane_backs_off_its_next_turn() {
+            let pool = TestPool(spawn_pool());
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let rounds = Arc::new(AtomicUsize::new(0));
+            let stop_lane = Arc::clone(&stop);
+            let rounds_lane = Arc::clone(&rounds);
+            submit_to(
+                &pool,
+                Box::new(move || {
+                    if stop_lane.load(Ordering::Relaxed) {
+                        return Next::Done;
+                    }
+                    rounds_lane.fetch_add(1, Ordering::Relaxed);
+                    Next::Idle
+                }),
+                Box::new(|| {}),
+            );
+            let before = parker_batches(&pool);
+            thread::sleep(Duration::from_millis(200));
+            let batches = parker_batches(&pool) - before;
+            stop.store(true, Ordering::Relaxed);
+            assert!(
+                (3..40).contains(&batches),
+                "one idle lane was re-queued {batches} times in 200 ms"
+            );
+        }
+
+        /// A lane whose source is a socket parks in the reaper's waiting set, on the descriptor its
+        /// read timed out on, and one peer byte wakes it. A lane on the timer never enters that set.
+        #[test]
+        fn a_socket_lane_waits_on_readiness() {
+            use std::io::{Read as _, Write as _};
+
+            let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let address = front.local_addr().expect("addr");
+            let mut peer = crate::conn::Connection::connect(address).expect("connects");
+            let (served, _) = front.accept().expect("accepts");
+            served
+                .set_read_timeout(Some(Duration::from_millis(1)))
+                .expect("arms the read clock");
+            let received = Arc::new(AtomicUsize::new(0));
+            let bytes = Arc::clone(&received);
+            let mut source = Some(served);
+            let mut window = [0u8; 64];
+            let pool = TestPool(spawn_pool());
+            submit_to(
+                &pool,
+                Box::new(move || {
+                    let source = source.as_mut().expect("the lane keeps its source");
+                    match source.read(&mut window) {
+                        Ok(0) => Next::Done,
+                        Ok(n) => {
+                            bytes.fetch_add(n, Ordering::Relaxed);
+                            Next::Done
+                        }
+                        Err(error) if crate::proxy::is_timeout(&error) => Next::Idle,
+                        Err(_) => Next::Done,
+                    }
+                }),
+                Box::new(|| {}),
+            );
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while pool.ready_parks.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert!(
+                pool.ready_parks.load(Ordering::Relaxed) > 0,
+                "the socket lane never parked on its descriptor"
+            );
+            assert_eq!(
+                pool.timer_parks.load(Ordering::Relaxed),
+                0,
+                "the socket lane fell back to the timer"
+            );
+            peer.write_all(b"x").expect("writes");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while received.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(
+                received.load(Ordering::Relaxed),
+                1,
+                "the peer's byte never woke the parked lane"
+            );
+        }
+
+        /// A poll that fails for the whole set must hand every parked lane back, not leave them
+        /// waiting on a set that can no longer poll.
+        #[cfg(windows)]
+        #[test]
+        fn a_failed_poll_wakes_every_parked_lane() {
+            let fd = usize::MAX as WaitFd;
+            let mut reactor = Reactor::new(fd).expect("a reactor");
+            let slot = std::sync::Arc::new(ReadySlot {
+                id: 1,
+                due: std::sync::OnceLock::new(),
+                fd,
+                write: false,
+                finish: None,
+                lane: Mutex::new(None),
+                pool: std::sync::Weak::new(),
+            });
+            let _ = slot.due.set(None);
+            slot.put_lane(Lane {
+                step: Box::new(|| Next::Done),
+                complete: None,
+                idle: 0,
+                relay: false,
+            });
+            assert!(reactor.park(slot).is_none(), "the lane parks");
+            let ready = reactor.wait(Duration::ZERO);
+            assert!(
+                ready.iter().any(|(at, _)| *at == fd),
+                "a failed poll must wake the parked set"
+            );
+        }
+
+        /// A parked lane's deadline follows the latest write, not the sibling's older end.
+        #[test]
+        fn a_parked_deadline_follows_the_last_write() {
+            let flow = std::sync::Arc::new(crate::proxy::RelayFinish::new(
+                true,
+                std::sync::Arc::new(|| {}),
+                None,
+            ));
+            flow.mark_ended();
+            let slot = std::sync::Arc::new(ReadySlot {
+                id: 1,
+                due: std::sync::OnceLock::new(),
+                fd: 0,
+                write: false,
+                finish: Some(std::sync::Arc::clone(&flow)),
+                lane: Mutex::new(None),
+                pool: std::sync::Weak::new(),
+            });
+            let at_end = flow.watch_park(&slot).expect("the sibling ended");
+            thread::sleep(Duration::from_millis(20));
+            flow.mark_progress();
+            let at_write = flow.watch_park(&slot).expect("the sibling ended");
+            assert!(
+                at_write > at_end,
+                "the parked deadline stayed at the sibling's end"
+            );
+            flow.unwatch_park(&slot);
+        }
+
+        /// A descriptor number the kernel dropped, then reused, is registered again: the stale id
+        /// left in the parked set cannot keep the new socket out of the interest set.
+        #[cfg(unix)]
+        #[test]
+        fn a_reused_descriptor_is_registered_again() {
+            use std::io::Write as _;
+            use std::os::fd::{AsRawFd, IntoRawFd as _};
+
+            let (_peer_a, watched_a) = std::os::unix::net::UnixStream::pair().expect("pair");
+            let fd = watched_a.as_raw_fd();
+            let (mut peer_b, watched_b) = std::os::unix::net::UnixStream::pair().expect("pair");
+            let wake = WakePipe::new().expect("wake pipe");
+            let mut reactor = Reactor::new(wake.read).expect("reactor");
+            let pool = TestPool(spawn_pool());
+            let slot = |id: u64, fd: libc::c_int| {
+                let slot = std::sync::Arc::new(ReadySlot {
+                    id,
+                    due: std::sync::OnceLock::new(),
+                    fd,
+                    write: false,
+                    finish: None,
+                    lane: Mutex::new(None),
+                    pool: std::sync::Arc::downgrade(&pool),
+                });
+                slot.put_lane(Lane {
+                    step: Box::new(|| Next::Done),
+                    complete: Some(Box::new(|| {})),
+                    idle: 0,
+                    relay: true,
+                });
+                slot
+            };
+            assert!(
+                reactor.park(slot(1, fd)).is_none(),
+                "the first park was refused"
+            );
+            let reused = unsafe { libc::dup2(watched_b.as_raw_fd(), fd) };
+            assert_eq!(reused, fd, "the new socket took the same number");
+            // `dup2` replaced the number under `watched_a`, so releasing it must not close the new socket.
+            let _ = watched_a.into_raw_fd();
+            drop(watched_b);
+            assert!(
+                reactor.park(slot(2, fd)).is_none(),
+                "the reused descriptor was refused"
+            );
+            peer_b.write_all(b"x").expect("writes");
+            let ready = reactor.wait(Duration::from_millis(200));
+            assert_eq!(
+                ready,
+                vec![(
+                    fd,
+                    Ready {
+                        read: true,
+                        write: false
+                    }
+                )],
+                "the reused descriptor stayed out of the interest set"
+            );
+            let mut lanes = Vec::new();
+            reactor.wake(
+                fd,
+                Ready {
+                    read: true,
+                    write: false,
+                },
+                &mut lanes,
+            );
+            assert_eq!(
+                lanes.len(),
+                2,
+                "the reused descriptor woke neither parked lane"
+            );
+            unsafe {
+                libc::close(fd);
+            }
+        }
+
+        /// A regular file cannot join epoll: the slot waits a poll quantum on the clock instead of
+        /// coming straight back to the worker, which would spin a read that always answers `WouldBlock`.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn an_unwatchable_descriptor_waits_a_poll_quantum() {
+            use std::os::fd::AsRawFd;
+
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos());
+            let path = std::env::temp_dir()
+                .join(format!("ferrox-unwatchable-{}-{stamp}", std::process::id()));
+            std::fs::write(&path, b"x").expect("writes the fixture");
+            let file = std::fs::File::open(&path).expect("opens the fixture");
+            let fd = file.as_raw_fd();
+            let wake = WakePipe::new().expect("wake pipe");
+            let mut reactor = Reactor::new(wake.read).expect("reactor");
+            let pool = TestPool(spawn_pool());
+            let slot = std::sync::Arc::new(ReadySlot {
+                id: 1,
+                due: std::sync::OnceLock::new(),
+                fd,
+                write: false,
+                finish: None,
+                lane: Mutex::new(None),
+                pool: std::sync::Arc::downgrade(&pool),
+            });
+            slot.put_lane(Lane {
+                step: Box::new(|| Next::Done),
+                complete: Some(Box::new(|| {})),
+                idle: 0,
+                relay: true,
+            });
+            let park = std::time::Instant::now();
+            assert!(
+                reactor.park(slot).is_none(),
+                "an unwatchable descriptor was handed back at once"
+            );
+            let mut lanes = Vec::new();
+            reactor.wake_due(park + crate::budgets::RELAY_POLL / 4, &mut lanes);
+            assert!(lanes.is_empty(), "the clock fired before its quantum");
+            reactor.wake_due(park + crate::budgets::RELAY_POLL * 4, &mut lanes);
+            assert_eq!(lanes.len(), 1, "the unwatchable descriptor never came back");
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// A lane parked on a full carrier is woken by the socket taking bytes again, not by the clock.
+        #[cfg(unix)]
+        #[test]
+        fn a_write_slot_waits_for_the_socket_to_drain() {
+            use std::io::{Read as _, Write as _};
+            use std::os::fd::AsRawFd;
+
+            let (mut side, mut peer) = std::os::unix::net::UnixStream::pair().expect("pair");
+            side.set_nonblocking(true).expect("non-blocking");
+            while side.write(&[0u8]).is_ok() {}
+            side.set_nonblocking(false).expect("blocking");
+            peer.set_nonblocking(true).expect("non-blocking");
+            let fd = side.as_raw_fd();
+            let wake = WakePipe::new().expect("wake pipe");
+            let mut reactor = Reactor::new(wake.read).expect("reactor");
+            let pool = TestPool(spawn_pool());
+            let slot = |id: u64, write: bool| {
+                let slot = std::sync::Arc::new(ReadySlot {
+                    id,
+                    due: std::sync::OnceLock::new(),
+                    fd,
+                    write,
+                    finish: None,
+                    lane: Mutex::new(None),
+                    pool: std::sync::Arc::downgrade(&pool),
+                });
+                slot.put_lane(Lane {
+                    step: Box::new(|| Next::Done),
+                    complete: Some(Box::new(|| {})),
+                    idle: 0,
+                    relay: true,
+                });
+                slot
+            };
+            assert!(
+                reactor.park(slot(1, false)).is_none(),
+                "the reader was refused"
+            );
+            assert!(
+                reactor.park(slot(2, true)).is_none(),
+                "the writer was refused on a socket the reader already holds"
+            );
+            assert!(
+                reactor.wait(Duration::from_millis(50)).is_empty(),
+                "a full socket reported itself writable"
+            );
+            // A byte the peer sends makes the same descriptor readable; only the reader comes back.
+            peer.write_all(b"y").expect("writes");
+            let ready = reactor.wait(Duration::from_secs(2));
+            assert_eq!(
+                ready,
+                vec![(
+                    fd,
+                    Ready {
+                        read: true,
+                        write: false
+                    }
+                )],
+                "a readable socket reported itself writable"
+            );
+            let mut lanes = Vec::new();
+            reactor.wake(fd, ready[0].1, &mut lanes);
+            assert_eq!(
+                lanes.len(),
+                1,
+                "the peer's readable byte woke the write-parked lane"
+            );
+            let mut sink = [0u8; 4096];
+            while peer.read(&mut sink).is_ok() {}
+            let ready = reactor.wait(Duration::from_secs(2));
+            assert_eq!(
+                ready,
+                vec![(
+                    fd,
+                    Ready {
+                        read: false,
+                        write: true
+                    }
+                )],
+                "the drained socket did not wake its writer"
+            );
+            let mut lanes = Vec::new();
+            reactor.wake(fd, ready[0].1, &mut lanes);
+            assert_eq!(lanes.len(), 1, "the drained socket never woke its writer");
+        }
+
+        /// A lane whose sibling still lives has no clock: ending the sibling wakes it, and only
+        /// then does the response-idle grace arm.
+        #[test]
+        fn a_parked_lane_waits_for_its_sibling_not_the_clock() {
+            use std::io::Read as _;
+
+            let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let address = front.local_addr().expect("addr");
+            let _peer = crate::conn::Connection::connect(address).expect("connects");
+            let (served, _) = front.accept().expect("accepts");
+            served
+                .set_read_timeout(Some(Duration::from_millis(1)))
+                .expect("arms the read clock");
+            let flow = crate::proxy::RelayFinish::new(false, Arc::new(|| {}), None);
+            let step_flow = Arc::clone(&flow);
+            let done_flow = Arc::clone(&flow);
+            let completed = Arc::new(AtomicUsize::new(0));
+            let done = Arc::clone(&completed);
+            let mut source = Some(served);
+            let mut window = [0u8; 64];
+            let pool = TestPool(spawn_pool());
+            submit_to(
+                &pool,
+                Box::new(move || {
+                    let source = source.as_mut().expect("the lane keeps its source");
+                    match source.read(&mut window) {
+                        Err(error) if crate::proxy::is_timeout(&error) => {
+                            if step_flow.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
+                                Next::Done
+                            } else {
+                                crate::proxy::note_wait_finish(&step_flow);
+                                Next::Idle
+                            }
+                        }
+                        _ => Next::Done,
+                    }
+                }),
+                Box::new(move || {
+                    done_flow.lane_done();
+                    done.fetch_add(1, Ordering::Relaxed);
+                }),
+            );
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while pool.last_ready_due.lock().unwrap().is_none() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(
+                *pool.last_ready_due.lock().unwrap(),
+                Some(ReadyClock::None),
+                "a lane whose sibling still lives armed a clock"
+            );
+            assert_eq!(pool.ended_wakes.load(Ordering::Relaxed), 0);
+            // A full response-idle window with no sibling end must cost the reaper no wake at all.
+            thread::sleep(Duration::from_millis(1200));
+            assert_eq!(
+                pool.ready_parks.load(Ordering::Relaxed),
+                1,
+                "the reaper woke a lane whose sibling still lives"
+            );
+            assert_eq!(completed.load(Ordering::Relaxed), 0);
+            submit_to(
+                &pool,
+                Box::new(|| Next::Done),
+                Box::new(crate::proxy::stream_lane_done(&flow)),
+            );
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while pool.ended_wakes.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(
+                pool.ended_wakes.load(Ordering::Relaxed),
+                1,
+                "the sibling's end never woke the parked lane"
+            );
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if let Some(ReadyClock::At(due)) = *pool.last_ready_due.lock().unwrap() {
+                    assert!(
+                        due > Instant::now(),
+                        "the woken lane kept a grace that had already run out"
+                    );
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the woken lane never re-armed the response-idle grace"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while completed.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(
+                completed.load(Ordering::Relaxed),
+                1,
+                "the parked lane outlived its grace"
+            );
+        }
+
+        /// The accept path's handshake is a setup lane: its waits are bounded by the handshake
+        /// budget, so it must not claim the relay clock a framed reader hands timeouts back to.
+        #[test]
+        fn a_setup_lane_keeps_the_relay_step_off() {
+            let pool = TestPool(spawn_pool());
+            let seen = Arc::new(AtomicUsize::new(2));
+            let seen_lane = Arc::clone(&seen);
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let _ = submit_to_with(
+                &pool,
+                Box::new(move || {
+                    seen_lane.store(
+                        usize::from(crate::proxy::relay_step_owns_poll()),
+                        Ordering::SeqCst,
+                    );
+                    done_tx.send(()).expect("reports");
+                    Next::Done
+                }),
+                Box::new(|| {}),
+                false,
+            );
+            done_rx.recv_timeout(Duration::from_secs(5)).expect("runs");
+            assert_eq!(
+                seen.load(Ordering::SeqCst),
+                0,
+                "a setup lane's waits are its own"
+            );
+        }
+
+        /// A setup pool reports a full queue instead of growing it, so the accept path can run the
+        /// work on its own thread rather than refusing the connection.
+        #[test]
+        fn a_setup_pool_bounds_its_pending_queue() {
+            let pool = TestPool(spawn_pool_with(1, Some(1)));
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            assert!(submit_to_with(
+                &pool,
+                Box::new(move || {
+                    started_tx.send(()).expect("starts");
+                    release_rx.recv().expect("releases");
+                    Next::Done
+                }),
+                Box::new(|| {}),
+                false,
+            )
+            .is_ok());
+            started_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("runs");
+            assert!(
+                submit_to_with(&pool, Box::new(|| Next::Done), Box::new(|| {}), false,).is_ok()
+            );
+            assert!(
+                submit_to_with(&pool, Box::new(|| Next::Done), Box::new(|| {}), false,).is_err()
+            );
+            release_tx.send(()).expect("releases");
+        }
+
+        /// A muxed stream's setup reads the request from the connection its caller demuxes, so a
+        /// setup lane the pool cannot take must be refused to the caller, never run on it.
+        #[test]
+        fn a_setup_lane_without_a_worker_stays_off_the_caller() {
+            let pool = TestPool(spawn_pool_with(0, None));
+            let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let ran_lane = Arc::clone(&ran);
+            let refused = submit_to_with(
+                &pool,
+                Box::new(move || {
+                    ran_lane.store(true, Ordering::SeqCst);
+                    Next::Done
+                }),
+                Box::new(|| {}),
+                false,
+            );
+            assert!(
+                refused.is_err(),
+                "a setup lane with no worker ran on its caller"
+            );
+            assert!(
+                !ran.load(Ordering::SeqCst),
+                "the setup body ran on the caller"
+            );
+        }
+
+        /// A relay lane is the other shape: the framed reader hands its timeout back to the step.
+        #[test]
+        fn a_relay_lane_claims_the_relay_step() {
+            let pool = TestPool(spawn_pool());
+            let seen = Arc::new(AtomicUsize::new(2));
+            let seen_lane = Arc::clone(&seen);
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            submit_to(
+                &pool,
+                Box::new(move || {
+                    seen_lane.store(
+                        usize::from(crate::proxy::relay_step_owns_poll()),
+                        Ordering::SeqCst,
+                    );
+                    done_tx.send(()).expect("reports");
+                    Next::Done
+                }),
+                Box::new(|| {}),
+            );
+            done_rx.recv_timeout(Duration::from_secs(5)).expect("runs");
+            assert_eq!(seen.load(Ordering::SeqCst), 1, "a relay lane owns the poll");
+        }
+
+        fn marker(ran: Arc<Mutex<Option<Instant>>>) -> Lane {
+            Lane {
+                step: Box::new(move || {
+                    *ran.lock().unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
+                    Next::Done
+                }),
+                complete: Some(Box::new(|| {})),
+                idle: 0,
+                relay: true,
+            }
+        }
+
+        /// A lane inserted with an earlier deadline must not wait for the deadline already parked.
+        #[test]
+        fn an_earlier_deadline_wakes_the_parker() {
+            let pool = TestPool(spawn_pool());
+            assert!(grow(&pool));
+            let ran = Arc::new(Mutex::new(None));
+            let mut later = marker(Arc::clone(&ran));
+            later.idle = 5;
+            let parker = Arc::clone(&*pool);
+            let handle = thread::spawn(move || {
+                park_with(&parker, later, Duration::from_millis(50));
+            });
+            thread::sleep(Duration::from_millis(20));
+            let at = Instant::now();
+            park_with(&pool, marker(Arc::clone(&ran)), Duration::from_millis(50));
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while ran.lock().unwrap_or_else(PoisonError::into_inner).is_none()
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                ran.lock().unwrap_or_else(PoisonError::into_inner).is_some(),
+                "the earlier lane never ran"
+            );
+            assert!(
+                at.elapsed() < Duration::from_millis(400),
+                "the earlier lane waited {:?}",
+                at.elapsed()
+            );
+            handle.join().unwrap();
+        }
+
+        /// A batch belongs to the pool that parked it, not to every pool in the process.
+        #[test]
+        fn a_pool_counts_its_own_batches() {
+            let a = TestPool(spawn_pool());
+            let b = TestPool(spawn_pool());
+            let before = parker_batches(&b);
+            let parker = Arc::clone(&*a);
+            thread::spawn(move || {
+                park_with(
+                    &parker,
+                    marker(Arc::new(Mutex::new(None))),
+                    Duration::from_millis(1),
+                );
+            })
+            .join()
+            .unwrap();
+            assert!(parker_batches(&a) >= 1);
+            assert_eq!(
+                parker_batches(&b) - before,
+                0,
+                "another pool's batch was counted here"
+            );
+        }
+
+        /// The first idle round waits one poll quantum, and the cap is still 16.
+        #[test]
+        fn the_first_idle_wait_is_one_quantum() {
+            let quantum = Duration::from_millis(1);
+            assert_eq!(wait_for(1, quantum), quantum);
+            assert_eq!(wait_for(2, quantum), quantum * 2);
+            assert_eq!(wait_for(5, quantum), quantum * 16);
+            assert_eq!(wait_for(9, quantum), quantum * 16);
+        }
+
+        /// A cell queues two lanes per stream against fewer threads, and a lane that never parks
+        /// must still hand its worker on: the lanes behind it are the other direction of a stream
+        /// that cannot free its window until they run.
+        #[test]
+        fn a_saturated_cell_still_steps_the_lanes_behind_a_busy_one() {
+            let pool = TestPool(spawn_pool());
+            let lanes = RELAY_LANES * 2;
+            let started = Arc::new(AtomicUsize::new(0));
+            let finished = Arc::new(AtomicUsize::new(0));
+            for _ in 0..lanes {
+                let started = Arc::clone(&started);
+                let finished = Arc::clone(&finished);
+                let mut began = false;
+                submit_to(
+                    &pool,
+                    Box::new(move || {
+                        if !began {
+                            began = true;
+                            started.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if started.load(Ordering::Relaxed) < lanes {
+                            Next::More
+                        } else {
+                            Next::Done
+                        }
+                    }),
+                    Box::new(move || {
+                        finished.fetch_add(1, Ordering::Relaxed);
+                    }),
+                );
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while finished.load(Ordering::Relaxed) < lanes && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(
+                started.load(Ordering::Relaxed),
+                lanes,
+                "a lane that never parked kept its worker: {} of {lanes} lanes never ran",
+                started.load(Ordering::Relaxed)
+            );
+            assert_eq!(finished.load(Ordering::Relaxed), lanes);
+        }
+
+        /// A cell is as wide as the lanes it queues: two blocked reads start two workers, so a
+        /// one-flow server does not hold a full cell's threads for a session that never needs them.
+        #[test]
+        fn a_narrow_cell_starts_only_the_lanes_it_queues() {
+            let pool = TestPool(spawn_pool());
+            let gate = Arc::new(Gate {
+                state: Mutex::new((0, false)),
+                wake: Condvar::new(),
+            });
+            let finished = Arc::new(AtomicUsize::new(0));
+            for _ in 0..2 {
+                let gate = Arc::clone(&gate);
+                let finished = Arc::clone(&finished);
+                submit_to(
+                    &pool,
+                    Box::new(move || {
+                        gate.arrive_and_wait();
+                        Next::Done
+                    }),
+                    Box::new(move || {
+                        finished.fetch_add(1, Ordering::Relaxed);
+                    }),
+                );
+            }
+            let waiting = gate.wait_for(2, Duration::from_secs(5));
+            gate.release();
+            assert_eq!(
+                waiting, 2,
+                "both lanes of the narrow cell reached their read"
+            );
+            assert_eq!(
+                pool.workers.load(Ordering::Relaxed),
+                2,
+                "the pool started {} workers for the two lanes a one-flow cell queues",
+                pool.workers.load(Ordering::Relaxed)
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while finished.load(Ordering::Relaxed) < 2 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(finished.load(Ordering::Relaxed), 2);
+        }
+    }
+}
+
+/// What both directions of one wrapped flow share: the close that ends the pair when either
+/// side does, the optional hand-back once both have, and the flag a parked read checks.
+pub(crate) struct RelayFinish {
+    left: AtomicU32,
+    ended: AtomicBool,
+    ended_at: Mutex<Option<std::time::Instant>>,
+    /// The latest write either direction finished, so a lane that still moves bytes keeps its grace.
+    progress_at: Mutex<Option<std::time::Instant>>,
+    /// Lanes parked on the peer's read, so ending this flow hands its sibling back at once.
+    parked: Mutex<Vec<std::sync::Weak<lane_pool::ReadySlot>>>,
+    closed: AtomicBool,
+    close_first: bool,
+    close: Arc<dyn Fn() + Send + Sync>,
+    finish: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    done: Mutex<bool>,
+    #[cfg(test)]
+    wake: std::sync::Condvar,
+}
+
+impl RelayFinish {
+    pub(crate) fn new(
+        close_first: bool,
+        close: Arc<dyn Fn() + Send + Sync>,
+        finish: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            left: AtomicU32::new(2),
+            ended: AtomicBool::new(false),
+            ended_at: Mutex::new(None),
+            progress_at: Mutex::new(None),
+            parked: Mutex::new(Vec::new()),
+            closed: AtomicBool::new(false),
+            close_first,
+            close,
+            finish: Mutex::new(finish),
+            #[cfg(test)]
+            done: Mutex::new(false),
+            #[cfg(test)]
+            wake: std::sync::Condvar::new(),
+        })
+    }
+
+    pub(crate) fn ended(&self) -> bool {
+        self.ended.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn mark_ended(&self) {
+        *self
+            .ended_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::time::Instant::now());
+        self.ended.store(true, Ordering::Relaxed);
+        {
+            let parked = std::mem::take(
+                &mut *self
+                    .parked
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            for slot in parked.into_iter().filter_map(|slot| slot.upgrade()) {
+                slot.wake_ended();
+            }
+        }
+    }
+
+    /// Registers a parked sibling and returns the end it must outlive, under the same hand as
+    /// `mark_ended` so a race lands either on the wake or on the armed grace.
+    pub(crate) fn watch_park(
+        &self,
+        slot: &std::sync::Arc<lane_pool::ReadySlot>,
+    ) -> Option<std::time::Instant> {
+        let mut parked = self
+            .parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        parked.push(std::sync::Arc::downgrade(slot));
+        let ended = *self
+            .ended_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ended = ended?;
+        let progress = *self
+            .progress_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Some(ended.max(progress.unwrap_or(ended)))
+    }
+
+    pub(crate) fn unwatch_park(&self, slot: &std::sync::Arc<lane_pool::ReadySlot>) {
+        let weak = std::sync::Arc::downgrade(slot);
+        self.parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|parked| !parked.ptr_eq(&weak));
+    }
+
+    /// A successful write: bytes still moving restart the reply grace after the sibling's end.
+    pub(crate) fn mark_progress(&self) {
+        *self
+            .progress_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::time::Instant::now());
+    }
+
+    /// True once the sibling ended and `idle` has run since: a lane waits for the last reply that follows its sibling's end, then hands its thread back.
+    pub(crate) fn ended_and_idle(&self, idle: Duration) -> bool {
+        let ended = *self
+            .ended_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(ended) = ended else {
+            return false;
+        };
+        let progress = *self
+            .progress_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ended.max(progress.unwrap_or(ended)).elapsed() >= idle
+    }
+
+    fn close_once(&self) {
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            (self.close)();
+        }
+    }
+
+    pub(crate) fn lane_done(&self) {
+        if self.close_first {
+            self.close_once();
+        }
+        if self.left.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        if !self.close_first {
+            self.close_once();
+        }
+        let finish = self
+            .finish
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(finish) = finish {
+            finish();
+        }
+        #[cfg(test)]
+        {
+            if let Ok(mut done) = self.done.lock() {
+                *done = true;
+            }
+            self.wake.notify_all();
+        }
+    }
+
+    /// Run `after` once both lanes have ended; runs it now if they already have, so a caller
+    /// that finishes its handoff late never loses the work that belongs to the flow's end.
+    pub(crate) fn then(self: &Arc<Self>, after: impl FnOnce() + Send + 'static) {
+        let mut slot = self
+            .finish
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.left.load(Ordering::Acquire) == 0 {
+            drop(slot);
+            after();
+        } else {
+            *slot = Some(Box::new(after));
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait(&self) {
+        let mut done = self
+            .done
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*done {
+            done = self
+                .wake
+                .wait(done)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+/// The one step of a plain half-to-half direction: read on the source's own clock, write the
+/// prefix the read reported, and end on EOF, a read the sibling ended, or a write error.
+fn stream_lane_step<R, W>(
+    from: &Half<R>,
+    to: &Half<W>,
+    buffer: &mut RelayBuf,
+    ended: &Arc<RelayFinish>,
+) -> Next
+where
+    R: Read,
+    W: Write,
+{
+    match from.read_once(buffer.as_mut()) {
+        Ok(0) => Next::Done,
+        Ok(n) if to.write_once(buffer.filled(n)).is_ok() => Next::More,
+        // A record still arriving has progress behind it, so the step already spent its turn: the lane requeues rather than reading the yield as an idle peer.
+        Err(error) if is_driven_yield(&error) => Next::Retry,
+        Err(error) if is_timeout(&error) => {
+            if ended.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
+                Next::Done
+            } else {
+                note_wait_finish(ended);
+                buffer.release();
+                Next::Idle
+            }
+        }
+        Ok(_) | Err(_) => Next::Done,
+    }
+}
+
+/// A finished lane's bookkeeping: the sibling sees the end, and the pair closes when both have.
+pub(crate) fn stream_lane_done(finish: &Arc<RelayFinish>) -> impl FnOnce() + Send + 'static {
+    let finish = Arc::clone(finish);
+    move || {
+        finish.mark_ended();
+        finish.lane_done();
+    }
+}
+
+fn relay_stream_handoff<A: Read + Write + Send + 'static, B: Read + Write + Send + 'static>(
+    a: Half<A>,
+    b: Half<B>,
+    close: &Arc<dyn Fn() + Send + Sync>,
+    finish: Option<Box<dyn FnOnce() + Send>>,
+    close_first: bool,
+) -> Arc<RelayFinish> {
+    let a = Arc::new(a);
+    let b = Arc::new(b);
+    let flow = RelayFinish::new(close_first, Arc::clone(close), finish);
+    let (up_a, up_b, up_flow) = (Arc::clone(&a), Arc::clone(&b), Arc::clone(&flow));
+    let mut forward = RelayBuf::new();
+    lane_pool::submit(
+        Box::new(move || stream_lane_step(&up_a, &up_b, &mut forward, &up_flow)),
+        Box::new(stream_lane_done(&flow)),
+    );
+    let mut backward = RelayBuf::new();
+    let parked = Arc::clone(&flow);
+    lane_pool::submit(
+        Box::new(move || stream_lane_step(&b, &a, &mut backward, &parked)),
+        Box::new(stream_lane_done(&flow)),
+    );
+    flow
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[inline]
+fn copy_all_memcpy(from: &mut Connection, to: &mut Connection) {
+    // Once per leg, outside the byte loop: a budget read per buffer would price the copy.
+    let policy = from.policy().or_else(|| to.policy());
+    let stall = policy
+        .and_then(|flow| flow.conn_idle())
+        .unwrap_or_else(crate::budgets::relay_stall);
+    let _ = to.set_write_timeout(Some(stall));
+    // A read a caller already armed is that caller's to end: a poll quantum it set is how the leg stops, so this shape arms only a read nobody bounded.
+    let armed = from.read_timeout().ok().flatten();
+    let patient = armed.is_none();
+    let read_arm = armed.or(Some(stall));
+    let _ = from.set_read_timeout(read_arm);
+    let window = policy
+        .and_then(|flow| flow.buffer())
+        .filter(|window| *window > 0)
+        .map_or(RELAY_SMALL_BUFFER, |window| window.min(RELAY_BUFFER));
+    let mut buffer = RelayBuf::with_len(window);
+    loop {
+        let read = {
+            census!("relay-leg-read", crate::census::handle(from), read_arm);
+            from.read(buffer.as_mut())
+        };
+        let n = match read {
+            Ok(0) => return,
+            Ok(n) => n,
+            // An un-armed peer that has simply not spoken is idle, not ended: its read arm exists so this leg can still notice its partner gave up, which on Windows nothing else does.
+            Err(error) if patient && is_timeout(&error) => continue,
+            Err(_) => return,
+        };
+        let written = {
+            census!("relay-leg-write", crate::census::handle(to), Some(stall));
+            to.write_all(buffer.filled(n))
+        };
+        if written.is_err() {
+            // Closing both halves is what ends the partner leg on a POSIX read parked inside its own socket; on Windows that park ends only at the read arm above, and a give-up that leaves a thread parked is not a give-up.
+            let _ = to.shutdown(Shutdown::Both);
+            return;
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct SplicePipe {
+    fds: [libc::c_int; 2],
+    capacity: libc::size_t,
+}
+
+/// Pipes allocated on this host, counted under `cfg(test)` so a test can tell the descriptor
+/// pump from the buffered copy without reading the flow.
+#[cfg(all(target_os = "linux", test))]
+static SPLICE_PIPES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(all(target_os = "linux", test))]
+pub(crate) fn splice_pipes_allocated() -> usize {
+    SPLICE_PIPES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(target_os = "linux")]
+impl SplicePipe {
+    fn new() -> Option<Self> {
+        let asked = match splice_pipe_override() {
+            Some(bytes) => {
+                SPLICE_PIPE_ACTIVE.fetch_add(1, Ordering::Relaxed);
+                bytes
+            }
+            None => libc::c_int::try_from(reserve_splice_pipe()).unwrap_or(libc::c_int::MAX),
+        };
+        let mut fds = [-1; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            release_splice_pipe();
+            return None;
+        }
+        #[cfg(test)]
+        SPLICE_PIPES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let asked = unsafe { libc::fcntl(fds[0], libc::F_SETPIPE_SZ, asked) };
+        let granted = unsafe { libc::fcntl(fds[0], libc::F_GETPIPE_SZ) };
+        let capacity = libc::size_t::try_from(if asked > 0 { asked } else { granted }).ok();
+        let capacity = match capacity {
+            Some(bytes) if bytes > 0 => bytes,
+            _ => DEFAULT_SPLICE_PIPE_BYTES,
+        };
+        if capacity != DEFAULT_SPLICE_PIPE_BYTES {
+            static NOTED: OnceLock<()> = OnceLock::new();
+            NOTED.get_or_init(|| eprintln!("ferrox-app: splice pipe {capacity} B"));
+        }
+        Some(Self { fds, capacity })
+    }
+}
+
+#[cfg(target_os = "linux")]
+const DEFAULT_SPLICE_PIPE_BYTES: usize = 1024 * 1024;
+
+#[cfg(target_os = "linux")]
+static SPLICE_PIPE_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// A 1 MiB ring per pipe is 128 MiB at sixty-four flows, twice the default
+/// `pipe-user-pages-soft`; the ring halves as the pump's own pipes pass the counts that fit.
+#[cfg(target_os = "linux")]
+fn splice_pipe_bytes_for(active: usize) -> usize {
+    match active {
+        0..=15 => DEFAULT_SPLICE_PIPE_BYTES,
+        16..=127 => 256 * 1024,
+        128..=255 => 64 * 1024,
+        _ => 8 * 1024,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn reserve_splice_pipe() -> usize {
+    let active = SPLICE_PIPE_ACTIVE.fetch_add(1, Ordering::Relaxed);
+    splice_pipe_bytes_for(active)
+}
+
+#[cfg(target_os = "linux")]
+fn release_splice_pipe() {
+    SPLICE_PIPE_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// The environment's one explicit size, asked once: a controlled run may pin it, and a relay that
+/// read it per pipe paid an environment lookup and a `String` for every connection it carried.
+#[cfg(target_os = "linux")]
+fn splice_pipe_override() -> Option<libc::c_int> {
+    static ASKED: OnceLock<Option<libc::c_int>> = OnceLock::new();
+    *ASKED.get_or_init(|| {
+        std::env::var("FERROX_SPLICE_PIPE_BYTES")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|bytes| *bytes > 0)
+            .map(|bytes| libc::c_int::try_from(bytes).unwrap_or(libc::c_int::MAX))
+    })
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for SplicePipe {
+    fn drop(&mut self) {
+        release_splice_pipe();
+        unsafe {
+            libc::close(self.fds[0]);
+            libc::close(self.fds[1]);
+        }
+    }
+}
+
+pub(crate) fn find_across(head: &[u8], probe: &[u8], pattern: &[u8]) -> Option<usize> {
+    debug_assert!(!pattern.is_empty(), "a pattern of no bytes is everywhere");
+    // Optimized for \r\n\r\n pattern
+    if pattern == b"\r\n\r\n" {
+        let joined = head.len() + probe.len();
+        if joined < 4 {
+            return None;
+        }
+        let target = u32::from_le_bytes(*b"\r\n\r\n");
+        let start = head.len().saturating_sub(3);
+        // Only up to three windows can touch the head/probe seam, so assemble those byte by byte.
+        let straddle_end = head.len().min(joined.saturating_sub(3));
+        let mut pos = start;
+        while pos < straddle_end {
+            let bytes = [
+                head[pos],
+                if pos + 1 < head.len() {
+                    head[pos + 1]
+                } else {
+                    probe[pos + 1 - head.len()]
+                },
+                if pos + 2 < head.len() {
+                    head[pos + 2]
+                } else {
+                    probe[pos + 2 - head.len()]
+                },
+                if pos + 3 < head.len() {
+                    head[pos + 3]
+                } else {
+                    probe[pos + 3 - head.len()]
+                },
+            ];
+            if u32::from_le_bytes(bytes) == target {
+                return Some(pos);
+            }
+            pos += 1;
+        }
+        // Every window past the seam lies wholly inside probe, so read it as one SWAR scan.
+        if let Some(at) = ferrox_core::foxy::head_end(probe) {
+            return Some(head.len() + at);
+        }
+        return None;
+    }
+    let span = pattern.len() - 1;
+    let joined = head.len() + probe.len();
+    let start = head.len().saturating_sub(span);
+    let limit = joined.saturating_sub(span);
+    (start..limit).find(|&at| {
+        let mut k = 0;
+        while k < pattern.len() {
+            let i = at + k;
+            let b = unsafe {
+                if i < head.len() {
+                    *head.get_unchecked(i)
+                } else {
+                    *probe.get_unchecked(i - head.len())
+                }
+            };
+            if b != pattern[k] {
+                break;
+            }
+            k += 1;
+        }
+        k == pattern.len()
+    })
+}
+
+/// Arm the poll quantum a head read needs: a budget cannot bound a blocking socket call, so the timeout is never longer than the caller's and the previous value goes back.
+pub(crate) fn with_head_poll<T>(
+    stream: &mut Connection,
+    run: impl FnOnce(&mut Connection) -> T,
+) -> Option<T> {
+    let previous = stream.read_timeout().ok().flatten();
+    let poll = previous.map_or(RELAY_POLL, |armed| armed.min(RELAY_POLL));
+    if stream.set_read_timeout(Some(poll)).is_err() {
+        return None;
+    }
+    let got = run(stream);
+    let _ = stream.set_read_timeout(previous);
+    Some(got)
+}
+
+pub(crate) fn read_http_head(
+    stream: &mut Connection,
+    limit: usize,
+    budget: Duration,
+) -> Option<Vec<u8>> {
+    with_head_poll(stream, |stream| peek_head_rounds(stream, limit, budget)).flatten()
+}
+
+/// The head and the octets that arrived with it, in the one buffer the caller's reader keeps; the
+/// returned length is where the head ends. The peek reader paid a `peek` and a re-read of the same
+/// bytes to leave that tail in the socket, so a head of `H` octets crossed user space twice and a
+/// round cost two calls; here `H` crosses once and a round costs one. Nothing that has nowhere to
+/// put the tail — the `http` front and the Shadowsocks rung's wait for a request packet — may take it.
+pub(crate) fn read_http_head_kept(
+    stream: &mut Connection,
+    limit: usize,
+    budget: Duration,
+) -> Option<(Vec<u8>, usize)> {
+    with_head_poll(stream, |stream| kept_head_rounds(stream, limit, budget)).flatten()
+}
+
+/// The kept reader's first round and growth quantum: a common camouflage head fits one allocation, while the 8 KiB limit stays a limit rather than a per-handshake buffer.
+const HEAD_ROUND: usize = 2048;
+
+fn kept_head_rounds(
+    stream: &mut dyn Read,
+    limit: usize,
+    budget: Duration,
+) -> Option<(Vec<u8>, usize)> {
+    kept_head_into(stream, limit, budget, Vec::with_capacity(HEAD_ROUND), None)
+}
+
+fn kept_head_rounds_deferred(
+    stream: &mut dyn Read,
+    limit: usize,
+    budget: Duration,
+    progress: &AtomicU64,
+) -> Option<(Vec<u8>, usize)> {
+    kept_head_into(
+        stream,
+        limit,
+        budget,
+        Vec::with_capacity(HEAD_ROUND),
+        Some(progress),
+    )
+}
+
+fn kept_head_into(
+    stream: &mut dyn Read,
+    limit: usize,
+    budget: Duration,
+    mut head: Vec<u8>,
+    progress: Option<&AtomicU64>,
+) -> Option<(Vec<u8>, usize)> {
+    head.clear();
+    let mut init = 0;
+    let mut until = Instant::now() + budget;
+    let mut seen = progress.map(|progress| progress.load(Ordering::Relaxed));
+    loop {
+        if Instant::now() >= until {
+            match (progress, seen.as_mut()) {
+                (Some(progress), Some(seen)) => {
+                    let advanced = progress.load(Ordering::Relaxed);
+                    if advanced == *seen {
+                        return None;
+                    }
+                    *seen = advanced;
+                    until = Instant::now() + budget;
+                }
+                _ => return None,
+            }
+        }
+        if head.len() >= limit {
+            return None;
+        }
+        let base = head.len();
+        let mut want = HEAD_ROUND.min(limit - base);
+        let room = head.capacity() - base;
+        if room > 0 {
+            want = want.min(room);
+        }
+        // SAFETY: `init` is the first byte no earlier round initialised, and every byte below it is zeroed or was written by a read that kept its length.
+        unsafe { ferrox_core::read::init_room(&mut head, &mut init, base + want) };
+        let n = match stream.read(&mut head[base..]) {
+            Ok(n) => n,
+            Err(error) if is_timeout(&error) => {
+                head.truncate(base);
+                if let (Some(progress), Some(seen)) = (progress, seen.as_mut()) {
+                    let advanced = progress.load(Ordering::Relaxed);
+                    if advanced != *seen {
+                        *seen = advanced;
+                        until = Instant::now() + budget;
+                    }
+                }
+                if Instant::now() >= until {
+                    return None;
+                }
+                continue;
+            }
+            Err(_) => {
+                head.truncate(base);
+                return None;
+            }
+        };
+        head.truncate(base + n);
+        if n == 0 || (progress.is_none() && Instant::now() >= until) {
+            return None;
+        }
+        // A fresh delimiter can straddle the round's bytes, so the scan starts three octets before them.
+        let from = base.saturating_sub(3);
+        if let Some(at) = ferrox_core::foxy::head_end(&head[from..]).map(|hit| hit + from) {
+            return Some((head, at + 4));
+        }
+    }
+}
+
+fn peek_head_rounds(stream: &mut Connection, limit: usize, budget: Duration) -> Option<Vec<u8>> {
+    let mut head = Vec::with_capacity(512);
+    let mut init = 0;
+    let mut probe = [0u8; 512];
+    let until = Instant::now() + budget;
+    loop {
+        if head.len() >= limit {
+            return None;
+        }
+        let n = match stream.peek(&mut probe) {
+            Ok(n) => n,
+            Err(error) if is_timeout(&error) => {
+                if Instant::now() >= until {
+                    return None;
+                }
+                continue;
+            }
+            Err(_) => return None,
+        };
+        if n == 0 {
+            return None;
+        }
+        // `peek` cannot consume: prove the head, then re-read it, leaving pipelined bytes for the caller.
+        let want = match find_across(&head, &probe[..n], b"\r\n\r\n") {
+            Some(at) => at + 4 - head.len(),
+            None => n.min(limit - head.len()),
+        };
+        let base = head.len();
+        // SAFETY: `init` is the first byte no earlier round initialised, and every byte below it is zeroed or was written by a read that kept its length.
+        unsafe { ferrox_core::read::init_room(&mut head, &mut init, base + want) };
+        if stream.read_exact(&mut head[base..]).is_err() {
+            head.truncate(base);
+            return None;
+        }
+        if head.ends_with(b"\r\n\r\n") {
+            return Some(head);
+        }
+    }
+}
+
+/// Head reader for a stream with no `peek`: the kept loop's own buffer and the offset where the head ends, so a head of `H` crosses user space once and its tail is not copied into an allocation of its own.
+pub(crate) fn read_exact_head(
+    stream: &mut dyn Read,
+    limit: usize,
+    budget: Duration,
+) -> Option<(Vec<u8>, usize)> {
+    kept_head_rounds(stream, limit, budget)
+}
+
+/// The same reader, whose clock moves with the upload pump: a server may hold its answer behind the
+/// payload, so progress buys another head budget and silence after the last step still ends the read.
+pub(crate) fn read_exact_head_deferred(
+    stream: &mut dyn Read,
+    limit: usize,
+    budget: Duration,
+    progress: &AtomicU64,
+) -> Option<(Vec<u8>, usize)> {
+    kept_head_rounds_deferred(stream, limit, budget, progress)
+}
+
+/// The same reader over a buffer the caller keeps: a lane that reads an answer per frame hands its own window back instead of paying a fresh allocation for every read.
+pub(crate) fn read_exact_head_into(
+    stream: &mut dyn Read,
+    limit: usize,
+    budget: Duration,
+    head: Vec<u8>,
+) -> Option<(Vec<u8>, usize)> {
+    kept_head_into(stream, limit, budget, head, None)
+}
+
+/// What a carrier did with a relay window: took a prefix, had no room and asked for the same bytes again, or ended the flow.
+pub(crate) enum Push {
+    Took(usize),
+    Parked,
+    Lost,
+}
+
+pub(crate) trait CarrierSink: Clone + Send + 'static {
+    fn send(&self, bytes: &[u8]) -> bool;
+    /// A lane step must not wait for room a paced carrier frees later: a full queue parks the window instead of holding the worker the other flows need.
+    fn push(&self, bytes: &[u8]) -> Push {
+        if self.send(bytes) {
+            Push::Took(bytes.len())
+        } else {
+            Push::Lost
+        }
+    }
+    /// One window offered without waiting on a full socket: a carrier that can report a partial take
+    /// parks the lane on its writability, and the default keeps the blocking send.
+    fn push_ready(&self, bytes: &[u8]) -> Push {
+        self.push(bytes)
+    }
+    /// Bytes a parked push accepted but the socket did not take yet: a lane that owes none still
+    /// drains them, so a stalled record is not stranded behind an idle read.
+    fn settle(&self) -> Settle {
+        Settle::Clear
+    }
+    /// The most bytes one relay read should hand this carrier, so a write stays one framed message
+    /// the peer's window can pay for; `None` keeps the relay's own window.
+    fn read_window(&self) -> Option<usize> {
+        None
+    }
+    /// Sleeps out a parked turn; a carrier whose room arrives on a peer wake returns early instead.
+    fn wait_for_room(&self, turn: std::time::Duration) {
+        std::thread::sleep(turn);
+    }
+    fn close(&self);
+    /// Ends the request body when the app half-closes, before the carrier's own download ends; only a carrier whose response is gated on that body (xhttp, gRPC) answers here.
+    fn upload_done(&self) {}
+    /// The forward leg's read from the target failed: a carrier that reports its own status records
+    /// it here instead of letting the end read as success.
+    fn target_failed(&self, _error: &std::io::Error) {}
+}
+
+/// What one offer of framed bytes did: the transport took all of them (possibly into its own paced
+/// tail), took none and asks for the same bytes again, or the carrier is gone.
+pub(crate) enum Accepted {
+    All,
+    Full,
+    Lost,
+}
+
+/// What a settle found: the paced tail is empty, it still owes the socket bytes, or the carrier died.
+pub(crate) enum Settle {
+    Clear,
+    Parked,
+    Lost,
+}
+
+// Vectored write with and without a file descriptor: the socket packs into one `writev` or one `WSASend`, the session feeds its record batcher.
+pub(crate) trait FrameWrite: Write + Send {
+    fn write_slices(&mut self, parts: &[&[u8]]) -> bool;
+
+    /// One framed offer that never waits on a full socket: `Some` is the payload prefix the
+    /// transport took, `None` a transport that cannot report a partial take (a sealed record, a
+    /// masked frame), whose caller keeps the blocking `write_slices`.
+    fn write_ready(&mut self, _parts: &[&[u8]]) -> Option<std::io::Result<usize>> {
+        None
+    }
+
+    /// Every byte is taken, but a transport with a paced tail may not have put it on the wire yet:
+    /// it owns the rest, so a lane never waits on a socket the peer has not drained.
+    fn offer_slices(&mut self, parts: &[&[u8]]) -> Accepted {
+        if self.write_slices(parts) {
+            Accepted::All
+        } else {
+            Accepted::Lost
+        }
+    }
+
+    /// Bytes the transport's own flow control will take without waiting; a writer that gates on a
+    /// peer window reports it so a batch is sized to what fits and a full window parks the lane.
+    fn room(&self) -> u64 {
+        u64::MAX
+    }
+
+    /// Blocks a caller that may wait until a window opens; a lane never reaches this, it parks.
+    fn wait_room(&self, _turn: Duration) {}
+
+    /// Drains a paced tail without waiting; `Clear` when there is nothing left to write.
+    fn settle(&mut self) -> Settle {
+        Settle::Clear
+    }
+
+    /// Arms the writer's clock so a peer that drains nothing parks the lane instead of the thread.
+    fn arm_write(&mut self, _timeout: Duration) {}
+
+    /// Clears the clock so an established relay waits on the peer rather than a task budget.
+    fn clear_write_timeout(&mut self) {}
+
+    /// Closes both directions of the transport, so a reader blocked beside this writer ends.
+    fn shutdown_both(&mut self) {}
+}
+
+impl FrameWrite for Connection {
+    fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+        write_all_parts::<VECTOR_PARTS>(self, parts).is_ok()
+    }
+
+    #[cfg(unix)]
+    fn write_ready(&mut self, parts: &[&[u8]]) -> Option<std::io::Result<usize>> {
+        // A masked frame's encoded length is not the caller's, so there is no plaintext count: the caller keeps the blocking write.
+        if self.has_mask() {
+            return None;
+        }
+        Some(Connection::write_ready(self, parts))
+    }
+
+    fn arm_write(&mut self, timeout: Duration) {
+        let _ = self.set_write_timeout(Some(timeout));
+    }
+
+    fn clear_write_timeout(&mut self) {
+        let _ = self.set_write_timeout(None);
+    }
+
+    fn shutdown_both(&mut self) {
+        let _ = Connection::shutdown(self, std::net::Shutdown::Both);
+    }
+}
+
+/// The plaintext one TLS record carries. A carrier frames what a relay handed it, and a window larger than this goes to the session as record-sized pieces rather than as one payload no session buffer holds.
+const SESSION_WINDOW: usize = 16 * 1024;
+
+/// The records one send carries: the relay window a carrier paces, plus the record its framing opens when the head pushes the payload past a record boundary. A frame of one window leaves as one send, and a frame larger than the batch — a peer that advertises a wide HTTP/2 frame size — is cut rather than staged whole.
+const SESSION_BATCH: usize = RELAY_BUFFER + SESSION_WINDOW;
+
+/// Offer `parts` to `write` in windows of at most [`SESSION_WINDOW`], in order and without a copy: a window is a run of subslices of the caller's parts, so a frame of any size leaves the session as the records it would have taken had each window been a frame of its own.
+fn write_windows<F>(parts: &[&[u8]], mut write: F) -> bool
+where
+    F: FnMut(&[&[u8]]) -> bool,
+{
+    const PARTS: usize = 8;
+    let mut window: [&[u8]; PARTS] = [&[]; PARTS];
+    let mut kept = 0usize;
+    let mut room = SESSION_WINDOW;
+    for part in parts.iter().copied().filter(|part| !part.is_empty()) {
+        let mut left = part;
+        while !left.is_empty() {
+            let take = left.len().min(room);
+            window[kept] = &left[..take];
+            kept += 1;
+            room -= take;
+            left = &left[take..];
+            if room == 0 || kept == PARTS {
+                if !write(&window[..kept]) {
+                    return false;
+                }
+                kept = 0;
+                room = SESSION_WINDOW;
+            }
+        }
+    }
+    kept == 0 || write(&window[..kept])
+}
+
+impl<S: ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send, R: Send>
+    FrameWrite for TlsHalf<S, R>
+{
+    // One seal per window, and the batch sent after the session's lock drops: every part of a window reaches the session as segments of one payload, so it seals one record where a write per part sealed one each, and a frame larger than a record is cut rather than handed over as a payload the session cannot hold. The records of a batch then leave in one send, so a 64 KiB relay window costs one write where a send per record cost it four.
+    fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+        let Ok(mut out) = self.out.lock() else {
+            return false;
+        };
+        let session = Arc::clone(&self.session);
+        let sealed = write_windows(parts, |window| {
+            let sealed = match session.lock() {
+                Ok(mut session) => session.seal_slices_into(window, &mut out.bytes).is_ok(),
+                Err(_) => false,
+            };
+            sealed && (out.bytes.len() < SESSION_BATCH || out.send().is_ok())
+        });
+        if !sealed {
+            out.bytes.clear();
+            return false;
+        }
+        out.send().is_ok()
+    }
+
+    fn offer_slices(&mut self, parts: &[&[u8]]) -> Accepted {
+        let Ok(mut out) = self.out.lock() else {
+            return Accepted::Lost;
+        };
+        if !out.paced {
+            drop(out);
+            return if <Self as FrameWrite>::write_slices(self, parts) {
+                Accepted::All
+            } else {
+                Accepted::Lost
+            };
+        }
+        // An over-full tail parks the caller before more plaintext is sealed, so a peer that reads nothing costs the bound and not the process's memory.
+        if out.bytes.len() >= PACED_TAIL {
+            match out.settle() {
+                Settle::Clear => {}
+                Settle::Parked => return Accepted::Full,
+                Settle::Lost => return Accepted::Lost,
+            }
+        }
+        let start = out.bytes.len();
+        let session = Arc::clone(&self.session);
+        let sealed = write_windows(parts, |window| match session.lock() {
+            Ok(mut session) => session.seal_slices_into(window, &mut out.bytes).is_ok(),
+            Err(_) => false,
+        });
+        if !sealed {
+            // A refused seal is a partial record; the bytes accepted before this call stay paced.
+            out.bytes.truncate(start);
+            return Accepted::Lost;
+        }
+        match out.send() {
+            Ok(()) => Accepted::All,
+            Err(_) => Accepted::Lost,
+        }
+    }
+
+    fn settle(&mut self) -> Settle {
+        match self.out.lock() {
+            Ok(mut out) => out.settle(),
+            Err(_) => Settle::Lost,
+        }
+    }
+
+    fn arm_write(&mut self, timeout: Duration) {
+        if let Ok(mut out) = self.out.lock() {
+            if out.wire.is_none() {
+                return;
+            }
+            #[cfg(not(windows))]
+            if let Some(wire) = out.wire.as_ref() {
+                let _ = wire.set_write_timeout(Some(timeout));
+            }
+            #[cfg(windows)]
+            let _ = timeout;
+            out.paced = true;
+        }
+    }
+}
+
+/// The spans one read hands the relay: offsets into `bytes`, never a copy of them.
+pub(crate) const WINDOW_PARTS: usize = 16;
+
+pub(crate) struct Window<'a> {
+    bytes: &'a [u8],
+    spans: [(usize, usize); WINDOW_PARTS],
+    len: usize,
+}
+
+impl<'a> Window<'a> {
+    pub(crate) fn empty() -> Self {
+        Self {
+            bytes: &[],
+            spans: [(0, 0); WINDOW_PARTS],
+            len: 0,
+        }
+    }
+
+    pub(crate) fn one(bytes: &'a [u8]) -> Self {
+        let mut spans = [(0, 0); WINDOW_PARTS];
+        spans[0] = (0, bytes.len());
+        Self {
+            bytes,
+            spans,
+            len: 1,
+        }
+    }
+
+    pub(crate) fn new(bytes: &'a [u8], spans: [(usize, usize); WINDOW_PARTS], len: usize) -> Self {
+        Self { bytes, spans, len }
+    }
+
+    pub(crate) fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    pub(crate) fn parts(&self) -> &[(usize, usize)] {
+        &self.spans[..self.len]
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.spans[..self.len].iter().all(|&(_, part)| part == 0)
+    }
+}
+
+pub(crate) trait WindowRead: Read {
+    fn read_window(&mut self) -> std::io::Result<Window<'_>>;
+
+    /// Whether a poll timeout is a lane the pool must park, rather than one that has to keep reading
+    /// because the sibling's window credit arrives on it.
+    fn parks_on_timeout(&self) -> bool {
+        false
+    }
+
+    /// A carrier whose first answer head may wait on the upload ties that read to the pump's progress.
+    fn set_head_progress(&mut self, _progress: Arc<AtomicU64>) {}
+
+    fn awaits_head(&self) -> bool {
+        false
+    }
+}
+
+impl<T: WindowRead + ?Sized> WindowRead for Box<T> {
+    fn read_window(&mut self) -> std::io::Result<Window<'_>> {
+        (**self).read_window()
+    }
+
+    fn parks_on_timeout(&self) -> bool {
+        (**self).parks_on_timeout()
+    }
+
+    fn set_head_progress(&mut self, progress: Arc<AtomicU64>) {
+        (**self).set_head_progress(progress);
+    }
+
+    fn awaits_head(&self) -> bool {
+        (**self).awaits_head()
+    }
+}
+
+/// A `Read` reader behind the window trait: its window is the buffer it just filled.
+pub(crate) struct Copied<R> {
+    inner: R,
+    buffer: RelayBuf,
+    parks: bool,
+}
+
+impl<R> Copied<R> {
+    pub(crate) fn new(inner: R) -> Self {
+        Self::with_park(inner, false)
+    }
+
+    fn with_park(inner: R, parks: bool) -> Self {
+        Self {
+            inner,
+            buffer: RelayBuf::new(),
+            parks,
+        }
+    }
+
+    /// A queued carrier's timeout is the queue's, not the socket its inner read was last woken by.
+    fn drop_fd_hint(&self) {
+        if self.parks {
+            crate::proxy::forget_wait_fd();
+        }
+    }
+}
+
+impl<R: Read> Read for Copied<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let got = self.inner.read(buf);
+        if got.is_err() {
+            self.drop_fd_hint();
+        }
+        got
+    }
+}
+
+impl<R: Read> WindowRead for Copied<R> {
+    fn read_window(&mut self) -> std::io::Result<Window<'_>> {
+        let n = match self.inner.read(self.buffer.as_mut()) {
+            Ok(n) => n,
+            Err(err) => {
+                self.drop_fd_hint();
+                return Err(err);
+            }
+        };
+        Ok(Window::one(self.buffer.filled(n)))
+    }
+
+    fn parks_on_timeout(&self) -> bool {
+        self.parks
+    }
+}
+
+pub(crate) fn relay_sink<R, W, F>(
+    reader: R,
+    writer: &W,
+    peer: &Connection,
+    on_reader_done: F,
+) -> Option<Arc<RelayFinish>>
+where
+    R: Read + Send + 'static,
+    W: CarrierSink,
+    F: FnOnce(&mut R) + Send + 'static,
+{
+    relay_ordered::<Copied<R>, W, _, _, CLOSE_BEFORE_JOIN, false>(
+        Copied::new(reader),
+        writer,
+        peer,
+        move |reader: &mut Copied<R>| on_reader_done(&mut reader.inner),
+        |_| false,
+    )
+}
+
+pub(crate) fn relay_sink_ws<R, W>(
+    reader: crate::ws::WsReader<R>,
+    writer: &W,
+    peer: &Connection,
+) -> Option<Arc<RelayFinish>>
+where
+    R: Read + Send + 'static,
+    W: CarrierSink,
+{
+    relay_ordered::<crate::ws::WsReader<R>, W, _, _, CLOSE_BEFORE_JOIN, false>(
+        reader,
+        writer,
+        peer,
+        |_| {},
+        |_| false,
+    )
+}
+
+/// The plain-xhttp downlink as windows: a chunk's body stays in the reader's own buffer, so the relay writes it out without the `Copied` memcpy.
+pub(crate) fn relay_sink_xhttp_drained<R, W>(
+    reader: R,
+    writer: &W,
+    peer: &Connection,
+) -> Option<Arc<RelayFinish>>
+where
+    R: WindowRead + Send + 'static,
+    W: CarrierSink,
+{
+    relay_ordered::<R, W, _, _, CLOSE_AFTER_JOIN, false>(reader, writer, peer, |_| {}, |_| false)
+}
+
+const CLOSE_BEFORE_JOIN: bool = true;
+
+/// A window the peer has not granted yet is another lane's frame away at most a queue turn; only a peer that grants nothing for this many turns is waited out.
+const RELAY_SPINS: u32 = 8;
+
+const CLOSE_AFTER_JOIN: bool = false;
+
+/// Where one forward leg stands: the bytes the peer has not taken, and the turns it has spent waiting on its window.
+struct Forward {
+    first: bool,
+    pending: usize,
+    sent: usize,
+    spins: u32,
+    parked: Option<std::time::Instant>,
+    stopped: Option<std::time::Instant>,
+}
+
+impl Forward {
+    fn new() -> Self {
+        Self {
+            first: true,
+            pending: 0,
+            sent: 0,
+            spins: 0,
+            parked: None,
+            stopped: None,
+        }
+    }
+}
+
+/// Where one upload leg stands: whether the first window has moved, and whether a normal request end already closed its write half.
+struct Upload {
+    first: bool,
+    half_closed: bool,
+}
+
+impl Upload {
+    fn new() -> Self {
+        Self {
+            first: true,
+            half_closed: false,
+        }
+    }
+}
+
+/// A paced carrier may still owe bytes no caller offered again: drain them before a read that would
+/// otherwise park the only lane able to hand the peer the grant the parked write waits for.
+fn settle_lane(uplink: &impl CarrierSink, at: &mut Forward) -> Option<Next> {
+    match uplink.settle() {
+        Settle::Clear => {
+            at.parked = None;
+            None
+        }
+        Settle::Parked => {
+            let now = std::time::Instant::now();
+            let since = *at.parked.get_or_insert(now);
+            if now.duration_since(since) >= crate::budgets::relay_stall() {
+                return Some(Next::Done);
+            }
+            at.spins += 1;
+            if at.spins >= RELAY_SPINS {
+                at.spins = 0;
+                uplink.wait_for_room(crate::budgets::RELAY_POLL);
+            }
+            Some(Next::Retry)
+        }
+        Settle::Lost => Some(Next::Done),
+    }
+}
+
+/// Stamps the first offer that made no progress and reports whether the stall budget has run out.
+fn write_parked(at: &mut Forward) -> bool {
+    let now = std::time::Instant::now();
+    let since = *at.stopped.get_or_insert(now);
+    now.duration_since(since) >= crate::budgets::relay_stall()
+}
+
+/// Offers the bytes a parked window still owes; `Some` ends or parks the lane, `None` means the window is clear and the leg may read again.
+fn forward_flush(buffer: &RelayBuf, uplink: &impl CarrierSink, at: &mut Forward) -> Option<Next> {
+    while at.sent < at.pending {
+        match uplink.push_ready(&buffer.prefix(at.pending)[at.sent..]) {
+            Push::Took(n) if n > 0 => {
+                at.sent += n;
+                at.spins = 0;
+                at.stopped = None;
+            }
+            // A carrier that takes nothing for the stall budget ends the leg, wherever the lane parks.
+            Push::Took(_) | Push::Parked if write_parked(at) => return Some(Next::Done),
+            // A full socket hands the lane to the reactor, while a full window rejoins the queue at once.
+            Push::Took(_) | Push::Parked if crate::proxy::write_wait_pending() => {
+                return Some(Next::Idle);
+            }
+            Push::Took(_) | Push::Parked => {
+                at.spins += 1;
+                if at.spins < RELAY_SPINS {
+                    return Some(Next::Retry);
+                }
+                at.spins = 0;
+                uplink.wait_for_room(crate::budgets::RELAY_POLL);
+                return Some(Next::Retry);
+            }
+            Push::Lost => {
+                echo_trace("relay fwd send failed");
+                return Some(Next::Done);
+            }
+        }
+    }
+    if at.pending > 0 {
+        if at.first {
+            echo_trace("relay fwd sent");
+            echo_trace("relay fwd first send ok");
+            at.first = false;
+        }
+        at.pending = 0;
+        at.sent = 0;
+    }
+    None
+}
+
+/// Classifies one forward wait: a send the carrier refused ends the leg, a full queue keeps the
+/// window for the next lane turn, and a timeout only ends it when the sibling already did.
+fn forward_finished(
+    read: std::io::Result<usize>,
+    buffer: &mut RelayBuf,
+    uplink: &impl CarrierSink,
+    at: &mut Forward,
+    give_up: impl FnOnce() -> bool,
+) -> Next {
+    match read {
+        Ok(n) if n > 0 => {
+            if at.first {
+                echo_trace("relay fwd first read");
+                echo_trace("relay fwd sending");
+            }
+            at.pending = n;
+            at.sent = 0;
+            let _ = buffer.filled(n);
+            forward_flush(buffer, uplink, at).unwrap_or(Next::More)
+        }
+        Err(error) if is_timeout(&error) => {
+            if give_up() {
+                Next::Done
+            } else {
+                debug_assert_eq!(at.pending, 0, "an idle forward still owed bytes");
+                buffer.release();
+                Next::Idle
+            }
+        }
+        Err(error) => {
+            echo_trace(&format!("relay fwd read err {error:?}"));
+            uplink.target_failed(&error);
+            Next::Done
+        }
+        Ok(_) => {
+            echo_trace("relay fwd eof");
+            Next::Done
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn relay_ordered<R, W, F, E, const CLOSE_FIRST: bool, const DRAIN_REQUEST: bool>(
+    reader: R,
+    writer: &W,
+    peer: &Connection,
+    on_reader_done: F,
+    mut request_ended: E,
+) -> Option<Arc<RelayFinish>>
+where
+    R: WindowRead + Send + 'static,
+    W: CarrierSink,
+    F: FnOnce(&mut R) + Send + 'static,
+    E: FnMut(&mut R) -> bool + Send + 'static,
+{
+    echo_trace("relay start");
+    let Ok(peer_read) = peer.try_clone() else {
+        echo_trace("relay no peer");
+        return None;
+    };
+    let Ok(peer_write) = peer.try_clone() else {
+        return None;
+    };
+    // The header handshake is the blocking path's, finished before a readiness lane can ask for bytes.
+    if peer.masked() {
+        let saved = peer.read_timeout().unwrap_or(None);
+        let _ = peer.set_read_timeout(Some(crate::budgets::handshake()));
+        let completed = peer.complete_header();
+        let _ = peer.set_read_timeout(saved);
+        if let Err(error) = completed {
+            echo_trace(&format!("relay header handshake failed: {error:?}"));
+            return None;
+        }
+        if let Err(error) = peer.complete_xmc() {
+            echo_trace(&format!("relay xmc handshake failed: {error:?}"));
+            return None;
+        }
+    }
+    // The stall the buffered copy already arms, once per leg outside the byte loop: a peer that reads none of the download would otherwise pin this leg's read, and the join behind it, for the life of the process.
+    let stall = budgets::relay_stall();
+    // A parked lane read polls instead of waiting, and asks whether its sibling ended.
+    let read_arm = Some(crate::budgets::RELAY_POLL);
+    let _ = peer_read.set_read_timeout(read_arm);
+    let final_writer = writer.clone();
+    let final_peer = peer_write.try_clone().ok();
+    let then: Option<Box<dyn FnOnce() + Send>> = if CLOSE_FIRST {
+        None
+    } else {
+        Some(Box::new(move || {
+            final_writer.close();
+            if let Some(peer) = final_peer {
+                let _ = peer.shutdown(Shutdown::Both);
+            }
+        }))
+    };
+    let flow = RelayFinish::new(false, Arc::new(|| {}), then);
+
+    let uplink = writer.clone();
+    let forward_flow = Arc::clone(&flow);
+    let mut peer_read = peer_read;
+    let mut buffer = uplink
+        .read_window()
+        .map_or_else(RelayBuf::new, RelayBuf::with_limit);
+    let mut at = Forward::new();
+    lane_pool::submit(
+        Box::new(move || {
+            if let Some(next) = settle_lane(&uplink, &mut at) {
+                return next;
+            }
+            if let Some(next) = forward_flush(&buffer, &uplink, &mut at) {
+                return next;
+            }
+            if let Some(limit) = uplink.read_window() {
+                buffer.set_limit(limit);
+            }
+            let read = {
+                census!("carrier-read", crate::census::handle(&peer_read), read_arm);
+                peer_read.read_ready(buffer.as_mut())
+            };
+            let next = forward_finished(read, &mut buffer, &uplink, &mut at, || {
+                forward_flow.ended_and_idle(budgets::RELAY_RESPONSE_IDLE)
+            });
+            if next == Next::Idle {
+                note_wait_finish(&forward_flow);
+            }
+            if next != Next::Done {
+                return next;
+            }
+            // The app's upload ended: a carrier whose answer is gated on that body ends it now, before the download leg does.
+            uplink.upload_done();
+            if CLOSE_FIRST {
+                uplink.close();
+                // The peer ended its upload: keep the write half for the download leg's retained bytes.
+                let _ = peer_read.shutdown(Shutdown::Read);
+            }
+            Next::Done
+        }),
+        Box::new(stream_lane_done(&flow)),
+    );
+
+    let mut reader = reader;
+    let mut on_reader_done = Some(on_reader_done);
+    let mut peer_write = peer_write;
+    let upload_flow = Arc::clone(&flow);
+    let upload_writer = writer.clone();
+    let mut upload = Upload::new();
+    // Every wait of this shape carries the named stall, armed once outside the byte loop.
+    let _ = peer_write.set_write_timeout(Some(stall));
+    lane_pool::submit(
+        Box::new(move || {
+            let read = reader.read_window();
+            let (next, timed_out) = match read {
+                Ok(window) if !window.is_empty() => {
+                    if upload.first {
+                        echo_trace("relay bwd first read");
+                        echo_trace("relay bwd forwarding");
+                    }
+                    census!(
+                        "carrier-write",
+                        crate::census::handle(&peer_write),
+                        Some(stall)
+                    );
+                    if write_all_runs::<WINDOW_PARTS>(
+                        &mut peer_write,
+                        window.bytes(),
+                        window.parts(),
+                    )
+                    .is_err()
+                    {
+                        echo_trace("relay bwd peer write failed");
+                        (Next::Done, false)
+                    } else {
+                        if upload.first {
+                            echo_trace("relay bwd forwarded");
+                            upload.first = false;
+                        }
+                        (Next::More, false)
+                    }
+                }
+                Ok(_) => {
+                    echo_trace("relay bwd eof");
+                    (Next::Done, false)
+                }
+                // A record still arriving is not an idle peer: the reader stays open and the lane requeues.
+                Err(error) if is_driven_yield(&error) => (Next::Retry, false),
+                // A carrier that waits on its own source parks there; one whose window credit arrives on another read keeps the turn.
+                Err(error) if is_timeout(&error) => (
+                    if reader.parks_on_timeout() {
+                        Next::Idle
+                    } else {
+                        Next::More
+                    },
+                    true,
+                ),
+                Err(error) => {
+                    echo_trace(&format!("relay bwd read err {error:?}"));
+                    (Next::Done, false)
+                }
+            };
+            let ended_request = DRAIN_REQUEST && request_ended(&mut reader);
+            let next = if timed_out {
+                if (!DRAIN_REQUEST || ended_request)
+                    && upload_flow.ended_and_idle(budgets::RELAY_RESPONSE_IDLE)
+                {
+                    Next::Done
+                } else if reader.parks_on_timeout() {
+                    Next::Idle
+                } else {
+                    Next::More
+                }
+            } else {
+                next
+            };
+            // A normal request end still needs the target write half closed, even while this lane pumps control frames.
+            if ended_request && !upload.half_closed {
+                let _ = peer_write.shutdown(Shutdown::Write);
+                upload.half_closed = true;
+            }
+            if next == Next::Idle {
+                note_wait_finish(&upload_flow);
+            }
+            if next != Next::Done {
+                return next;
+            }
+            if CLOSE_FIRST {
+                upload_writer.close();
+            }
+            if let Some(done) = on_reader_done.take() {
+                done(&mut reader);
+            }
+            if CLOSE_FIRST {
+                let _ = peer_write.shutdown(Shutdown::Both);
+            } else {
+                let _ = peer_write.shutdown(Shutdown::Write);
+            }
+            Next::Done
+        }),
+        Box::new(stream_lane_done(&flow)),
+    );
+    Some(flow)
+}
+
+pub(crate) fn relay_sink_drained<R: Read + Send + 'static, W: CarrierSink>(
+    reader: R,
+    writer: &W,
+    peer: &Connection,
+) -> Option<Arc<RelayFinish>> {
+    relay_ordered::<Copied<R>, W, _, _, CLOSE_AFTER_JOIN, false>(
+        Copied::new(reader),
+        writer,
+        peer,
+        |_| {},
+        |_| false,
+    )
+}
+
+pub(crate) fn relay_sink_drained_with<R, W, F, E>(
+    reader: R,
+    writer: &W,
+    peer: &Connection,
+    on_reader_done: F,
+    request_ended: E,
+) -> Option<Arc<RelayFinish>>
+where
+    R: Read + Send + 'static,
+    W: CarrierSink,
+    F: FnOnce(&mut R) + Send + 'static,
+    E: FnMut(&mut R) -> bool + Send + 'static,
+{
+    relay_sink_poll(reader, writer, peer, on_reader_done, request_ended, false)
+}
+
+/// The same relay over a carrier that hands its payload out as a window: the download lane writes the
+/// reader's own slices to the peer, so no relay buffer copies the body a second time.
+pub(crate) fn relay_sink_window_with<R, W, F, E>(
+    reader: R,
+    writer: &W,
+    peer: &Connection,
+    on_reader_done: F,
+    request_ended: E,
+) -> Option<Arc<RelayFinish>>
+where
+    R: WindowRead + Send + 'static,
+    W: CarrierSink,
+    F: FnOnce(&mut R) + Send + 'static,
+    E: FnMut(&mut R) -> bool + Send + 'static,
+{
+    relay_ordered::<R, W, _, _, CLOSE_AFTER_JOIN, true>(
+        reader,
+        writer,
+        peer,
+        on_reader_done,
+        request_ended,
+    )
+}
+
+/// The same relay over a reader whose bytes wait in a queue another thread fills: a poll timeout
+/// parks the lane instead of keeping a worker reading a socket that carries no credit for it.
+pub(crate) fn relay_sink_drained_queued<R, W, F, E>(
+    reader: R,
+    writer: &W,
+    peer: &Connection,
+    on_reader_done: F,
+    request_ended: E,
+) -> Option<Arc<RelayFinish>>
+where
+    R: Read + Send + 'static,
+    W: CarrierSink,
+    F: FnOnce(&mut R) + Send + 'static,
+    E: FnMut(&mut R) -> bool + Send + 'static,
+{
+    relay_sink_poll(reader, writer, peer, on_reader_done, request_ended, true)
+}
+
+fn relay_sink_poll<R, W, F, E>(
+    reader: R,
+    writer: &W,
+    peer: &Connection,
+    on_reader_done: F,
+    mut request_ended: E,
+    parks: bool,
+) -> Option<Arc<RelayFinish>>
+where
+    R: Read + Send + 'static,
+    W: CarrierSink,
+    F: FnOnce(&mut R) + Send + 'static,
+    E: FnMut(&mut R) -> bool + Send + 'static,
+{
+    relay_ordered::<Copied<R>, W, _, _, CLOSE_AFTER_JOIN, true>(
+        Copied::with_park(reader, parks),
+        writer,
+        peer,
+        move |reader: &mut Copied<R>| on_reader_done(&mut reader.inner),
+        move |reader: &mut Copied<R>| request_ended(&mut reader.inner),
+    )
+}
+
+pub(crate) fn relay_carried<R: Read + Send + 'static>(
+    mut reader: R,
+    write: &Connection,
+    peer: &Connection,
+) -> Option<Arc<RelayFinish>> {
+    let peer_read = peer.try_clone().ok()?;
+    let mut peer_write = peer.try_clone().ok()?;
+    let mut uplink = write.try_clone().ok()?;
+    // Every wait of this shape carries the named stall, armed once outside the byte loop: the half-close below is a write half, which wakes a parked read on no platform.
+    let stall = budgets::relay_stall();
+    let _ = peer_write.set_write_timeout(Some(stall));
+    let _ = uplink.set_write_timeout(Some(stall));
+    // A parked lane read polls instead of waiting, and asks its flow whether the sibling ended.
+    let read_arm = Some(crate::budgets::RELAY_POLL);
+    let _ = peer_read.set_read_timeout(read_arm);
+    let flow = RelayFinish::new(false, Arc::new(|| {}), None);
+    let mut peer_read = peer_read;
+    let forward_flow = Arc::clone(&flow);
+    let mut buffer = RelayBuf::new();
+    lane_pool::submit(
+        Box::new(move || {
+            let read = {
+                census!("carrier-read", crate::census::handle(&peer_read), read_arm);
+                peer_read.read(buffer.as_mut())
+            };
+            let next = match read {
+                Ok(n) if n > 0 => {
+                    if uplink.write_all(buffer.filled(n)).is_ok() {
+                        Next::More
+                    } else {
+                        Next::Done
+                    }
+                }
+                Err(error) if is_timeout(&error) => {
+                    if forward_flow.ended_and_idle(budgets::RELAY_RESPONSE_IDLE) {
+                        Next::Done
+                    } else {
+                        buffer.release();
+                        Next::Idle
+                    }
+                }
+                _ => Next::Done,
+            };
+            if next == Next::Idle {
+                note_wait_finish(&forward_flow);
+            }
+            if next == Next::Done {
+                let _ = uplink.shutdown(Shutdown::Write);
+            }
+            next
+        }),
+        Box::new(stream_lane_done(&flow)),
+    );
+    let upload_flow = Arc::clone(&flow);
+    let mut buffer = RelayBuf::new();
+    lane_pool::submit(
+        Box::new(move || {
+            let read = reader.read(buffer.as_mut());
+            let next = match read {
+                Ok(n) if n > 0 => {
+                    census!(
+                        "carrier-write",
+                        crate::census::handle(&peer_write),
+                        Some(stall)
+                    );
+                    if peer_write.write_all(buffer.filled(n)).is_ok() {
+                        Next::More
+                    } else {
+                        Next::Done
+                    }
+                }
+                Err(error) if is_timeout(&error) => {
+                    if upload_flow.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
+                        Next::Done
+                    } else {
+                        buffer.release();
+                        Next::Idle
+                    }
+                }
+                _ => Next::Done,
+            };
+            if next == Next::Idle {
+                note_wait_finish(&upload_flow);
+            }
+            if next == Next::Done {
+                // Half-close this direction's write only: `Both` would abort the sibling clone's still-open read and drop a pending download.
+                let _ = peer_write.shutdown(Shutdown::Write);
+            }
+            next
+        }),
+        Box::new(stream_lane_done(&flow)),
+    );
+    Some(flow)
+}
+
+// A quiet socket is not a dead one: retry the relay's poll grain, fail only a closed stream.
+pub(crate) fn read_exact(stream: &mut dyn Read, buf: &mut [u8]) -> std::io::Result<()> {
+    ferrox_core::tls::read_exact(stream, buf)
+}
+
+pub(crate) fn header_value<'a>(head: &'a [u8], name: &str) -> Option<&'a str> {
+    header_value_in(std::str::from_utf8(head).ok()?, name)
+}
+
+/// The lookup over a head somebody already paid one `from_utf8` for.
+pub(crate) fn header_value_in<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    header_values_in(text, [name])[0]
+}
+
+/// Every named field in one walk of the head: a caller that needs two of them pays one line split, not one per name.
+pub(crate) fn header_values_in<'a, const N: usize>(
+    text: &'a str,
+    names: [&str; N],
+) -> [Option<&'a str>; N] {
+    let mut found = [None; N];
+    let mut left = N;
+    let mut lines = text.split("\r\n");
+    lines.next();
+    for line in lines {
+        let Some((key, value)) = line.split_once(':') else {
+            break;
+        };
+        let key = key.trim();
+        for (slot, name) in found.iter_mut().zip(names) {
+            if slot.is_none() && key.eq_ignore_ascii_case(name) {
+                *slot = Some(value.trim());
+                left -= 1;
+                if left == 0 {
+                    return found;
+                }
+            }
+        }
+    }
+    found
+}
+
+pub(crate) fn request_path(head: &[u8]) -> Option<&str> {
+    request_path_in(std::str::from_utf8(head).ok()?)
+}
+
+pub(crate) fn request_path_in(text: &str) -> Option<&str> {
+    let line = text.split("\r\n").next()?;
+    let mut parts = line.split_whitespace();
+    if parts.next()? != "GET" {
+        return None;
+    }
+    let target = parts.next()?;
+    Some(target.split_once('?').map_or(target, |(base, _)| base))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AddrKind {
+    V4,
+    V6,
+    Domain,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum AddrBody<'a> {
+    V4([u8; 4]),
+    V6([u8; 16]),
+    Domain(&'a str),
+}
+
+pub(crate) fn parse_addr_body(buf: &[u8], kind: AddrKind) -> Option<(AddrBody<'_>, usize)> {
+    match kind {
+        AddrKind::V4 => {
+            let ip: [u8; 4] = buf.get(1..5)?.try_into().ok()?;
+            Some((AddrBody::V4(ip), 5))
+        }
+        AddrKind::V6 => {
+            let ip: [u8; 16] = buf.get(1..17)?.try_into().ok()?;
+            Some((AddrBody::V6(ip), 17))
+        }
+        AddrKind::Domain => {
+            let len = usize::from(*buf.get(1)?);
+            if len == 0 {
+                return None;
+            }
+            let host = std::str::from_utf8(buf.get(2..2 + len)?).ok()?;
+            Some((AddrBody::Domain(host), 2 + len))
+        }
+    }
+}
+
+/// The keys of this span and the previous one: a key is refused as a replay for at least `span` seconds, and the rotation after that is what forgets it.
+pub(crate) struct Replay {
+    current: HashSet<[u8; 32]>,
+    prev: HashSet<[u8; 32]>,
+    rotated_at: u64,
+    span: u64,
+}
+
+/// Keys one half of a window holds before it rotates early, so a flood bounds the window instead of growing it.
+pub(crate) const REPLAY_KEYS: usize = 64 * 1024;
+
+impl Replay {
+    pub(crate) fn new(span: u64) -> Self {
+        Self {
+            current: HashSet::new(),
+            prev: HashSet::new(),
+            rotated_at: 0,
+            span,
+        }
+    }
+
+    /// Whether this key was already seen inside the window; the clock is the caller's, so the bounds are testable without waiting on it.
+    pub(crate) fn seen(&mut self, key: &[u8; 32], now: u64) -> bool {
+        if now.wrapping_sub(self.rotated_at) >= self.span || self.current.len() >= REPLAY_KEYS {
+            self.prev = std::mem::take(&mut self.current);
+            self.rotated_at = now;
+        }
+        if self.current.contains(key) || self.prev.contains(key) {
+            return true;
+        }
+        self.current.insert(*key);
+        false
+    }
+
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> usize {
+        self.current.len() + self.prev.len()
+    }
+}
+
+/// The two `writev` parts: header plus payload handed over by pointer — why the mux uplink copies zero.
+#[cfg(unix)]
+pub(crate) fn two_iovecs(first: &[u8], second: &[u8]) -> [libc::iovec; 2] {
+    [
+        libc::iovec {
+            iov_base: first.as_ptr() as *mut libc::c_void,
+            iov_len: first.len(),
+        },
+        libc::iovec {
+            iov_base: second.as_ptr() as *mut libc::c_void,
+            iov_len: second.len(),
+        },
+    ]
+}
+
+/// One datagram as its two parts on a connected socket: `sendmsg` on unix and `WSASend` on
+/// windows hand the head and the caller's payload to the kernel by pointer, so the payload is
+/// never gathered into a second buffer. A platform without either joins the parts. The pointer
+/// gate `a_udp_reply_hands_the_payload_over_by_pointer` is what can see the difference.
+pub(crate) fn send_two(socket: &UdpSocket, first: &[u8], second: &[u8]) -> std::io::Result<usize> {
+    send_parts(socket, first, second, None)
+}
+
+/// One datagram as its two parts to `dest`. The server's answer socket is not connected, so the
+/// address rides the same call.
+pub(crate) fn send_to_two(
+    socket: &UdpSocket,
+    first: &[u8],
+    second: &[u8],
+    dest: SocketAddr,
+) -> std::io::Result<usize> {
+    send_parts(socket, first, second, Some(dest))
+}
+
+/// The platform call behind `send_two` and `send_to_two`.
+fn send_parts(
+    socket: &UdpSocket,
+    first: &[u8],
+    second: &[u8],
+    dest: Option<SocketAddr>,
+) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+        let mut parts = two_iovecs(first, second);
+        let mut storage = std::mem::MaybeUninit::<libc::sockaddr_storage>::uninit();
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        if let Some(dest) = dest {
+            let (addr, len) = sockaddr_of(dest);
+            storage.write(addr);
+            msg.msg_name = storage.as_mut_ptr().cast();
+            msg.msg_namelen = len;
+        }
+        msg.msg_iov = parts.as_mut_ptr();
+        // glibc sizes `msg_iovlen` as a `usize`, every other unix in scope as a 32-bit count.
+        #[cfg(target_os = "linux")]
+        let count = parts.len();
+        #[cfg(not(target_os = "linux"))]
+        let count: libc::c_int = parts.len().try_into().expect("two iovecs fit the field");
+        msg.msg_iovlen = count;
+        loop {
+            // SAFETY: `msg` names `parts` and the `sockaddr` storage, both live and sized as the call reads them.
+            let sent = unsafe { libc::sendmsg(socket.as_raw_fd(), &raw const msg, 0) };
+            if sent >= 0 {
+                return Ok(sent as usize);
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket as _;
+        use windows_sys::Win32::Networking::WinSock::{
+            WSAGetLastError, WSASend, WSASendTo, SOCKADDR, SOCKET, SOCKET_ERROR, WSABUF,
+        };
+        let parts = [
+            WSABUF {
+                len: first.len() as u32,
+                buf: first.as_ptr().cast_mut(),
+            },
+            WSABUF {
+                len: second.len() as u32,
+                buf: second.as_ptr().cast_mut(),
+            },
+        ];
+        loop {
+            let mut sent = 0u32;
+            // SAFETY: `parts` describes the caller's buffers, live and read-only for the call; a blocking socket takes no overlapped or completion routine.
+            let code = if let Some(dest) = dest {
+                let (storage, len) = windows_sockaddr_of(dest);
+                // SAFETY: the storage holds the address the length describes, live for the call.
+                unsafe {
+                    WSASendTo(
+                        socket.as_raw_socket() as SOCKET,
+                        parts.as_ptr(),
+                        parts.len() as u32,
+                        &raw mut sent,
+                        0,
+                        (&raw const storage).cast::<SOCKADDR>(),
+                        len,
+                        std::ptr::null_mut(),
+                        None,
+                    )
+                }
+            } else {
+                unsafe {
+                    WSASend(
+                        socket.as_raw_socket() as SOCKET,
+                        parts.as_ptr(),
+                        parts.len() as u32,
+                        &raw mut sent,
+                        0,
+                        std::ptr::null_mut(),
+                        None,
+                    )
+                }
+            };
+            if code == SOCKET_ERROR {
+                let error = std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() });
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+                continue;
+            }
+            return Ok(sent as usize);
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let mut one = Vec::with_capacity(first.len() + second.len());
+        one.extend_from_slice(first);
+        one.extend_from_slice(second);
+        match dest {
+            Some(dest) => socket.send_to(&one, dest),
+            None => socket.send(&one),
+        }
+    }
+}
+
+/// The `sockaddr` a datagram goes to, and its length, in the storage `WSASendTo` reads it from.
+#[cfg(windows)]
+fn windows_sockaddr_of(
+    addr: SocketAddr,
+) -> (
+    windows_sys::Win32::Networking::WinSock::SOCKADDR_STORAGE,
+    i32,
+) {
+    use windows_sys::Win32::Networking::WinSock::{
+        AF_INET, AF_INET6, IN6_ADDR, IN6_ADDR_0, IN_ADDR, IN_ADDR_0, SOCKADDR_IN, SOCKADDR_IN6,
+        SOCKADDR_STORAGE,
+    };
+    let mut storage = SOCKADDR_STORAGE::default();
+    match addr {
+        SocketAddr::V4(v4) => {
+            // SAFETY: a `sockaddr_in` is shorter and no more aligned than the storage it is built in.
+            let sin = unsafe { &mut *(&raw mut storage).cast::<SOCKADDR_IN>() };
+            sin.sin_family = AF_INET;
+            sin.sin_port = v4.port().to_be();
+            sin.sin_addr = IN_ADDR {
+                S_un: IN_ADDR_0 {
+                    S_addr: u32::from_ne_bytes(v4.ip().octets()),
+                },
+            };
+            (
+                storage,
+                i32::try_from(std::mem::size_of::<SOCKADDR_IN>()).expect("sockaddr fits"),
+            )
+        }
+        SocketAddr::V6(v6) => {
+            // SAFETY: a `sockaddr_in6` is shorter and no more aligned than the storage it is built in.
+            let sin6 = unsafe { &mut *(&raw mut storage).cast::<SOCKADDR_IN6>() };
+            sin6.sin6_family = AF_INET6;
+            sin6.sin6_port = v6.port().to_be();
+            sin6.sin6_flowinfo = v6.flowinfo();
+            sin6.sin6_addr = IN6_ADDR {
+                u: IN6_ADDR_0 {
+                    Byte: v6.ip().octets(),
+                },
+            };
+            sin6.Anonymous.sin6_scope_id = v6.scope_id();
+            (
+                storage,
+                i32::try_from(std::mem::size_of::<SOCKADDR_IN6>()).expect("sockaddr fits"),
+            )
+        }
+    }
+}
+
+/// The `sockaddr` a datagram goes to, and its length, in the storage the kernel reads it from.
+#[cfg(unix)]
+pub(crate) fn sockaddr_of(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    match addr {
+        SocketAddr::V4(v4) => {
+            let len = std::mem::size_of::<libc::sockaddr_in>();
+            // SAFETY: a `sockaddr_in` is shorter and no more aligned than the storage it is built in.
+            let sin = unsafe { &mut *(&raw mut storage).cast::<libc::sockaddr_in>() };
+            sin.sin_family = libc::AF_INET as libc::sa_family_t;
+            sin.sin_port = v4.port().to_be();
+            sin.sin_addr = libc::in_addr {
+                s_addr: u32::from_ne_bytes(v4.ip().octets()),
+            };
+            // A BSD sockaddr carries its own length as the first byte; Linux's family starts there.
+            #[cfg(any(
+                target_vendor = "apple",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "dragonfly"
+            ))]
+            {
+                sin.sin_len = len as u8;
+            }
+            (storage, len as libc::socklen_t)
+        }
+        SocketAddr::V6(v6) => {
+            let len = std::mem::size_of::<libc::sockaddr_in6>();
+            // SAFETY: `sockaddr_in6` is shorter and no more aligned than the storage it is built in.
+            let sin6 = unsafe { &mut *(&raw mut storage).cast::<libc::sockaddr_in6>() };
+            sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sin6.sin6_port = v6.port().to_be();
+            sin6.sin6_addr = libc::in6_addr {
+                s6_addr: v6.ip().octets(),
+            };
+            sin6.sin6_scope_id = v6.scope_id();
+            #[cfg(any(
+                target_vendor = "apple",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "dragonfly"
+            ))]
+            {
+                sin6.sin6_len = len as u8;
+            }
+            (storage, len as libc::socklen_t)
+        }
+    }
+}
+
+/// The address a `sockaddr` the kernel wrote carries, read out of it in place: a batched receive names the peer in the storage the kernel filled, and the address is read rather than joined, so a batch of datagrams costs no name per datagram.
+#[cfg(target_os = "linux")]
+pub(crate) fn socket_addr_of(
+    storage: &libc::sockaddr_storage,
+    len: libc::socklen_t,
+) -> Option<SocketAddr> {
+    match storage.ss_family as libc::c_int {
+        libc::AF_INET if len as usize >= std::mem::size_of::<libc::sockaddr_in>() => {
+            // SAFETY: the family says the storage holds a `sockaddr_in`, and the length says it is whole.
+            let sin = unsafe { &*(&raw const *storage).cast::<libc::sockaddr_in>() };
+            Some(SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes())),
+                u16::from_be(sin.sin_port),
+            ))
+        }
+        libc::AF_INET6 if len as usize >= std::mem::size_of::<libc::sockaddr_in6>() => {
+            // SAFETY: the family says the storage holds a `sockaddr_in6`, and the length says it is whole.
+            let sin6 = unsafe { &*(&raw const *storage).cast::<libc::sockaddr_in6>() };
+            Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+                std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr),
+                u16::from_be(sin6.sin6_port),
+                sin6.sin6_flowinfo,
+                sin6.sin6_scope_id,
+            )))
+        }
+        _ => None,
+    }
+}
+
+/// Segments one vectored write carries: a gathered batch of h2 frames is sixty-four of them, and the
+/// list stays on the stack at that width on every platform in scope.
+const VECTOR_PARTS: usize = 64;
+
+/// The segment that fills a stack list before the live parts overwrite it.
+const NO_PARTS: &[u8] = &[];
+
+/// Hand `parts` to `out` in as few vectored calls as the socket takes: one `writev` per `N` segments
+/// on unix, one `WSASend` on Windows, where a write per part cost one socket call each. A short call
+/// advances the list rather than restaging any byte, so the parts stay where the caller put them
+/// however the kernel splits the write. `N` is the caller's own batch width, so a list is never wider
+/// than the call it serves and never touches the heap.
+pub(crate) fn write_all_parts<const N: usize>(
+    out: &mut dyn Write,
+    mut parts: &[&[u8]],
+) -> std::io::Result<()> {
+    while !parts.is_empty() {
+        let (chunk, rest) = parts.split_at(parts.len().min(N));
+        let mut made: [IoSlice; N] = std::array::from_fn(|_| IoSlice::new(NO_PARTS));
+        let mut pieces = 0usize;
+        for part in chunk.iter().copied().filter(|part| !part.is_empty()) {
+            made[pieces] = IoSlice::new(part);
+            pieces += 1;
+        }
+        let mut slices = &mut made[..pieces];
+        while !slices.is_empty() {
+            let wrote = match out.write_vectored(slices) {
+                Ok(wrote) => wrote,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
+            if wrote == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+            }
+            IoSlice::advance_slices(&mut slices, wrote);
+        }
+        parts = rest;
+    }
+    Ok(())
+}
+
+/// Hand `parts` runs of `buf` to `out` in one vectored write: one syscall where the socket has
+/// `writev`, one where it has `WSASend`, one per run where the sink has neither, and none at all for
+/// an empty batch — so a caller that opened several records into one buffer leaves them where they
+/// lie instead of gathering them. `N` is the caller's batch width, so the segment list never touches
+/// the heap.
+pub(crate) fn write_all_runs<const N: usize>(
+    out: &mut dyn Write,
+    buf: &[u8],
+    parts: &[(usize, usize)],
+) -> std::io::Result<()> {
+    let mut made: [&[u8]; N] = [NO_PARTS; N];
+    let mut pieces = 0usize;
+    for (start, len) in parts.iter().copied() {
+        if len > 0 {
+            made[pieces] = &buf[start..start + len];
+            pieces += 1;
+        }
+    }
+    write_all_parts::<N>(out, &made[..pieces])
+}
+
+/// The app's payload pumped while the carrier still owes its answer, because a server may hold that answer until it sees payload — xray flushes its buffered response on the first downstream write and zeronet's `HeaderFirst::hold` waits for the first payload outright — so a client that stops sending to wait hangs both ways.
+pub(crate) struct Pump {
+    stop: std::sync::mpsc::Sender<()>,
+    running: Option<RelayEnd>,
+    sent: Arc<AtomicBool>,
+    progress: Arc<AtomicU64>,
+}
+
+impl Pump {
+    /// Pumps the app's bytes through `to_carrier` once the answer is overdue; the leg is the only reader of the app's socket until `end` joins it.
+    fn over(peer: &Connection, to_carrier: impl FnMut(&[u8]) -> bool + Send + 'static) -> Self {
+        Self::start(peer, to_carrier, true)
+    }
+
+    /// Pumps from the first byte, without waiting out the grace: a server that holds its answer until it sees payload would otherwise idle the opening write for the whole grace. The caller must stop climbing once [`Pump::end`] reports bytes sent, because those bytes are spent and cannot be replayed to another rung.
+    fn over_now(peer: &Connection, to_carrier: impl FnMut(&[u8]) -> bool + Send + 'static) -> Self {
+        Self::start(peer, to_carrier, false)
+    }
+
+    fn start(
+        peer: &Connection,
+        mut to_carrier: impl FnMut(&[u8]) -> bool + Send + 'static,
+        wait: bool,
+    ) -> Self {
+        let (stop, stop_rx) = std::sync::mpsc::channel();
+        let sent = Arc::new(AtomicBool::new(false));
+        let pumped = Arc::clone(&sent);
+        let progress = Arc::new(AtomicU64::new(0));
+        let advanced = Arc::clone(&progress);
+        let running = match peer.try_clone() {
+            Ok(reading) => Some(RelayPool::run_once(move || {
+                use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+                let mut reading = reading;
+                if wait
+                    && !matches!(
+                        stop_rx.recv_timeout(budgets::payload_grace()),
+                        Err(RecvTimeoutError::Timeout)
+                    )
+                {
+                    return;
+                }
+                let _ = reading.set_read_timeout(Some(RELAY_POLL));
+                // The same reused window the relay uses: the small pool already paid the 16 KiB memset, so a fresh flow does not.
+                let mut buffer = RelayBuf::new();
+                loop {
+                    if !matches!(stop_rx.try_recv(), Err(TryRecvError::Empty)) {
+                        break;
+                    }
+                    match reading.read(buffer.as_mut()) {
+                        Ok(size) if size > 0 => {
+                            pumped.store(true, Ordering::Relaxed);
+                            advanced.fetch_add(1, Ordering::Relaxed);
+                            if !to_carrier(buffer.filled(size)) {
+                                break;
+                            }
+                        }
+                        Err(error) if is_timeout(&error) => {}
+                        _ => break,
+                    }
+                }
+                // A poll quantum left armed on the shared descriptor would make every later reader spin.
+                let _ = reading.set_read_timeout(None);
+            })),
+            Err(_) => None,
+        };
+        Self {
+            stop,
+            running,
+            sent,
+            progress,
+        }
+    }
+
+    fn to_sink<W: CarrierSink>(peer: &Connection, writer: &W) -> Self {
+        let sink = writer.clone();
+        Self::over(peer, move |bytes| sink.send(bytes))
+    }
+
+    fn to_stream(peer: &Connection, write: &Connection) -> Self {
+        let Ok(mut uplink) = write.try_clone() else {
+            return Self::idle();
+        };
+        Self::over(peer, move |bytes| uplink.write_all(bytes).is_ok())
+    }
+
+    fn to_stream_now(peer: &Connection, write: &Connection) -> Self {
+        let Ok(mut uplink) = write.try_clone() else {
+            return Self::idle();
+        };
+        Self::over_now(peer, move |bytes| uplink.write_all(bytes).is_ok())
+    }
+
+    /// A pump with nothing to pump: a socket whose descriptor cannot be duplicated again.
+    fn idle() -> Self {
+        let (stop, _) = std::sync::mpsc::channel();
+        Self {
+            stop,
+            running: None,
+            sent: Arc::new(AtomicBool::new(false)),
+            progress: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// The leg's pumped steps, read while an answer wait decides how long silence may hold it.
+    fn progress_flag(&self) -> &AtomicU64 {
+        &self.progress
+    }
+
+    fn progress_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.progress)
+    }
+
+    /// Stops the leg and waits for it, so the session's own upload leg is the only reader afterwards, and reports whether it spent any of the app's bytes.
+    fn end(self) -> bool {
+        let _ = self.stop.send(());
+        if let Some(running) = self.running {
+            join(&running);
+        }
+        self.sent.load(Ordering::Relaxed)
+    }
+}
+
+/// The VLESS answer is stripped on the first read, not before the relay starts: a server may hold `[0, 0]` until it sees payload, and the upload then moves through the relay itself instead of a pump thread.
+struct ReplyReader<R> {
+    inner: R,
+    head: [u8; 2 + 255],
+    filled: usize,
+    answered: bool,
+}
+
+impl<R> ReplyReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            head: [0u8; 2 + 255],
+            filled: 0,
+            answered: false,
+        }
+    }
+
+    fn inner_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+}
+
+impl<R: Read> ReplyReader<R> {
+    /// Reads the version and add-on length, then the add-ons the header declares, without taking a byte of the stream behind them.
+    fn ensure_answered(&mut self) -> std::io::Result<()> {
+        while self.filled < 2 {
+            match self.inner.read(&mut self.head[self.filled..2]) {
+                Ok(0) => {
+                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                }
+                Ok(n) => self.filled += n,
+                Err(error) => return Err(error),
+            }
+        }
+        let want = 2 + usize::from(self.head[1]);
+        while self.filled < want {
+            match self.inner.read(&mut self.head[self.filled..want]) {
+                Ok(0) => {
+                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                }
+                Ok(n) => self.filled += n,
+                Err(error) => return Err(error),
+            }
+        }
+        if ferrox_core::vless::VlessLink::decode_response_header(&self.head[..want]).is_err() {
+            return Err(std::io::Error::other("vless answer refused"));
+        }
+        if echo_trace_on() {
+            echo_trace("response ok");
+        }
+        self.answered = true;
+        Ok(())
+    }
+}
+
+impl<R: Read> Read for ReplyReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if !self.answered {
+            self.ensure_answered()?;
+        }
+        self.inner.read(buf)
+    }
+}
+
+impl<R: WindowRead> WindowRead for ReplyReader<R> {
+    fn read_window(&mut self) -> std::io::Result<Window<'_>> {
+        if !self.answered {
+            self.ensure_answered()?;
+        }
+        self.inner.read_window()
+    }
+
+    fn parks_on_timeout(&self) -> bool {
+        self.inner.parks_on_timeout()
+    }
+}
+
+fn read_vless_response_body(stream: &mut dyn Read) -> Option<()> {
+    let mut header = [0u8; 2 + 255];
+    read_exact(stream, &mut header[..2]).ok()?;
+    let addons = usize::from(header[1]);
+    if addons > 0 {
+        read_exact(stream, &mut header[2..2 + addons]).ok()?;
+    }
+    ferrox_core::vless::VlessLink::decode_response_header(&header[..2 + addons]).ok()?;
+    if echo_trace_on() {
+        echo_trace("response ok");
+    }
+    Some(())
+}
+
+pub(crate) fn read_vless_response(stream: &mut dyn Read) -> Option<()> {
+    let mut bounded = HandshakeDeadline {
+        inner: stream,
+        until: Instant::now() + crate::budgets::handshake(),
+    };
+    read_vless_response_body(&mut bounded)
+}
+
+fn read_vless_response_deferred(stream: &mut dyn Read, progress: &AtomicU64) -> Option<()> {
+    let mut bounded = UploadDeadline {
+        inner: stream,
+        progress,
+        seen: progress.load(Ordering::Relaxed),
+        until: Instant::now() + crate::budgets::handshake(),
+    };
+    read_vless_response_body(&mut bounded)
+}
+
+const MUX_TARGET: SocketAddr =
+    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 666);
+
+/// The request a front reads, with `accept` asked before the resolver, so a name no served user names is never looked up.
+fn singmux_sentinel() -> SocketAddr {
+    SocketAddr::new(
+        IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        crate::singmux::PORT,
+    )
+}
+
+pub(crate) fn decode_request_gated<A, F>(
+    stream: &mut dyn Read,
+    accept: A,
+    resolve: F,
+) -> Option<([u8; 16], Flow, u8, SocketAddr)>
+where
+    A: FnOnce([u8; 16], Flow, u8, &Target<'_>, u16) -> bool,
+    F: FnOnce(&str, u16) -> Option<SocketAddr>,
+{
+    // One buffer holds the whole header: the parse borrows the name out of it.
+    let mut scratch = [0u8; ferrox_core::vless::REQUEST_MAX];
+    let request = ferrox_core::vless::decode_request(stream, &mut scratch)?;
+    let target = match request.target {
+        Some(target) => {
+            if !accept(
+                request.id,
+                request.flow,
+                request.command,
+                &target,
+                request.port,
+            ) {
+                return None;
+            }
+            match target {
+                Target::Ip(ip) => SocketAddr::new(ip, request.port),
+                Target::Name(host) => {
+                    if crate::singmux::is_rendezvous(host, request.port) {
+                        singmux_sentinel()
+                    } else {
+                        resolve(host, request.port)?
+                    }
+                }
+            }
+        }
+        None => MUX_TARGET,
+    };
+    Some((request.id, request.flow, request.command, target))
+}
+
+/// The same read where the caller has already accepted the header — a probe's own id check — so nothing is withheld from the resolver.
+pub(crate) fn decode_request(stream: &mut dyn Read) -> Option<([u8; 16], Flow, u8, SocketAddr)> {
+    decode_request_gated(stream, |_, _, _, _, _| true, resolve_endpoint)
+}
+
+/// The longest trojan header: key, CRLF, command, a 255-byte domain with its port, and CRLF.
+const TROJAN_HEAD_MAX: usize = 56 + 2 + 1 + 1 + 1 + 255 + 2 + 2;
+
+/// Compares every byte, so timing hides how much of the key was right and a short read never agrees.
+fn key_agrees(got: &[u8], key: &[u8; 56]) -> bool {
+    let Ok(got) = <&[u8; 56]>::try_from(got) else {
+        return false;
+    };
+    let mut diff = 0u64;
+    for at in (0..56).step_by(8) {
+        let a = u64::from_ne_bytes(got[at..at + 8].try_into().expect("a full key word"));
+        let b = u64::from_ne_bytes(key[at..at + 8].try_into().expect("a full key word"));
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+/// Fills `head[..want]`: a `dyn Read` may answer short, so this loops; the count is what the header costs.
+fn trojan_take(
+    stream: &mut dyn Read,
+    head: &mut [u8; TROJAN_HEAD_MAX],
+    filled: &mut usize,
+    want: usize,
+) -> bool {
+    while *filled < want {
+        match stream.read(&mut head[*filled..want]) {
+            Ok(0) => return false,
+            Ok(n) => *filled += n,
+            Err(error) if is_timeout(&error) => {}
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+/// Reads a decimal IPv4 literal exactly as `Ipv4Addr::from_str` does, without validating UTF-8 first.
+fn trojan_ipv4(bytes: &[u8]) -> Option<std::net::Ipv4Addr> {
+    let digit = |byte: u8| match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        _ => None,
+    };
+    let mut octets = [0u8; 4];
+    let mut at = 0usize;
+    for (index, octet) in octets.iter_mut().enumerate() {
+        if index > 0 {
+            if bytes.get(at) != Some(&b'.') {
+                return None;
+            }
+            at += 1;
+        }
+        let first = digit(*bytes.get(at)?)?;
+        at += 1;
+        if first == 0 && bytes.get(at).and_then(|byte| digit(*byte)).is_some() {
+            return None;
+        }
+        let mut value = u16::from(first);
+        let mut digits = 1;
+        while digits < 3 {
+            let Some(next) = bytes.get(at).and_then(|byte| digit(*byte)) else {
+                break;
+            };
+            value = value * 10 + u16::from(next);
+            at += 1;
+            digits += 1;
+        }
+        if value > 255 {
+            return None;
+        }
+        *octet = value as u8;
+    }
+    (at == bytes.len()).then_some(octets.into())
+}
+
+/// The reference's mux rendezvous: a trojan request naming it opens a session whose frames carry every flow.
+const TROJAN_MUX_HOST: &[u8] = b"v1.mux.cool";
+const TROJAN_MUX_PORT: u16 = 9527;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrojanTarget {
+    Mux,
+    Rendezvous,
+    Address(SocketAddr),
+}
+
+impl TrojanTarget {
+    fn is_mux(&self) -> bool {
+        matches!(self, Self::Mux)
+    }
+
+    fn is_rendezvous(&self) -> bool {
+        matches!(self, Self::Rendezvous)
+    }
+
+    fn socket(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Mux | Self::Rendezvous => None,
+            Self::Address(address) => Some(*address),
+        }
+    }
+}
+
+impl std::fmt::Display for TrojanTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Mux => write!(f, "v1.mux.cool:{TROJAN_MUX_PORT}"),
+            Self::Rendezvous => {
+                write!(f, "{}:{}", crate::singmux::HOST, crate::singmux::PORT)
+            }
+            Self::Address(address) => address.fmt(f),
+        }
+    }
+}
+
+/// The whole header in one read, parsed in place: 2-3 reads where the field-at-a-time parse spent 7-8.
+fn decode_trojan_request(stream: &mut dyn Read, key: &[[u8; 56]]) -> Option<(u8, TrojanTarget)> {
+    decode_trojan_request_index(stream, key).map(|(cmd, target, _)| (cmd, target))
+}
+
+fn decode_trojan_request_index(
+    stream: &mut dyn Read,
+    key: &[[u8; 56]],
+) -> Option<(u8, TrojanTarget, usize)> {
+    let mut head = [0u8; TROJAN_HEAD_MAX];
+    let mut filled = 0usize;
+    if !trojan_take(stream, &mut head, &mut filled, 60) || head[56..58] != *b"\r\n" {
+        return None;
+    }
+    let index = key.iter().position(|key| key_agrees(&head[..56], key))?;
+    let cmd = head[58];
+    // The port ends the address in every form, so the header's closing CRLF is the two bytes after it.
+    let (target, port_end) = match head[59] {
+        1 => {
+            if !trojan_take(stream, &mut head, &mut filled, 68) {
+                return None;
+            }
+            let mut ip = [0u8; 4];
+            ip.copy_from_slice(&head[60..64]);
+            let port = u16::from_be_bytes([head[64], head[65]]);
+            (
+                TrojanTarget::Address(SocketAddr::new(std::net::IpAddr::V4(ip.into()), port)),
+                66,
+            )
+        }
+        4 => {
+            if !trojan_take(stream, &mut head, &mut filled, 80) {
+                return None;
+            }
+            let mut ip = [0u8; 16];
+            ip.copy_from_slice(&head[60..76]);
+            let port = u16::from_be_bytes([head[76], head[77]]);
+            (
+                TrojanTarget::Address(SocketAddr::new(std::net::IpAddr::V6(ip.into()), port)),
+                78,
+            )
+        }
+        3 => {
+            if !trojan_take(stream, &mut head, &mut filled, 61) {
+                return None;
+            }
+            let name_end = 61 + usize::from(head[60]);
+            if !trojan_take(stream, &mut head, &mut filled, name_end + 4) {
+                return None;
+            }
+            let host = &head[61..name_end];
+            let port = u16::from_be_bytes([head[name_end], head[name_end + 1]]);
+            if host == TROJAN_MUX_HOST {
+                (TrojanTarget::Mux, name_end + 2)
+            } else if std::str::from_utf8(host)
+                .is_ok_and(|host| crate::singmux::is_rendezvous(host, port))
+            {
+                (TrojanTarget::Rendezvous, name_end + 2)
+            } else {
+                let target = match trojan_ipv4(host) {
+                    Some(ip) => SocketAddr::new(IpAddr::V4(ip), port),
+                    None => resolve_endpoint(std::str::from_utf8(host).ok()?, port)?,
+                };
+                (TrojanTarget::Address(target), name_end + 2)
+            }
+        }
+        _ => return None,
+    };
+    if head[port_end..port_end + 2] != *b"\r\n" {
+        return None;
+    }
+    Some((cmd, target, index))
+}
+
+pub(crate) fn push_addr(header: &mut Vec<u8>, target: &SocketAddr, v6: u8) {
+    match target.ip() {
+        std::net::IpAddr::V4(ip) => {
+            header.push(1);
+            header.extend_from_slice(&ip.octets());
+        }
+        std::net::IpAddr::V6(ip) => {
+            header.push(v6);
+            header.extend_from_slice(&ip.octets());
+        }
+    }
+}
+
+pub(crate) fn push_socks_addr(out: &mut Vec<u8>, addr: &SocketAddr) {
+    push_addr(out, addr, 4);
+    out.extend_from_slice(&addr.port().to_be_bytes());
+}
+
+/// The head of a SOCKS5 UDP frame: the reserved bytes, the fragment byte and the address.
+fn socks_udp_head(out: &mut Vec<u8>, dest: &SocketAddr) {
+    out.clear();
+    out.extend_from_slice(&[0, 0, 0]);
+    push_socks_addr(out, dest);
+}
+
+/// The SOCKS5 UDP frame to send for a datagram: the head and the payload.
+///
+/// `client` is the frame the datagram arrived in, where there is one. When the frame
+/// this tree would build is byte for byte that frame, the datagram is sent as it
+/// arrived and its payload is not copied at all: the frame is handed back by pointer.
+/// Otherwise the frame is rebuilt around the payload, which is the only copy there is.
+///
+/// The caller's buffer is the only buffer: the frame never allocates.
+fn socks_udp_head_len(frame: &[u8], dest: &SocketAddr) -> Option<usize> {
+    if frame.len() < 4 || frame[..3] != [0, 0, 0] {
+        return None;
+    }
+    match dest {
+        SocketAddr::V4(dest) => {
+            let head = 3 + 1 + 4 + 2;
+            (frame.len() >= head
+                && frame[3] == 1
+                && frame[4..8] == dest.ip().octets()
+                && frame[8..10] == dest.port().to_be_bytes())
+            .then_some(head)
+        }
+        SocketAddr::V6(dest) => {
+            let head = 3 + 1 + 16 + 2;
+            (frame.len() >= head
+                && frame[3] == 4
+                && frame[4..20] == dest.ip().octets()
+                && frame[20..22] == dest.port().to_be_bytes())
+            .then_some(head)
+        }
+    }
+}
+
+/// The SOCKS5 UDP frame to send for a datagram: the head and the payload in the caller's buffer.
+///
+/// A caller that already holds the frame it arrived in asks `socks_udp_forwarded` first: when
+/// that frame is byte for byte the one this tree would build, it is sent as it arrived and the
+/// payload is not copied at all. Otherwise the frame is rebuilt here around the payload, which
+/// is the only copy there is. The caller's buffer is the only buffer: the frame never allocates.
+pub(crate) fn socks_udp_frame<'a>(
+    out: &'a mut Vec<u8>,
+    dest: &SocketAddr,
+    payload: &'a [u8],
+) -> &'a [u8] {
+    socks_udp_head(out, dest);
+    out.extend_from_slice(payload);
+    out
+}
+
+/// The datagram as it arrived, when the client framed it with the literal address the tree
+/// would have written: the payload is the frame's own tail, so nothing is copied. A name, a
+/// short tail or a header the tree would not have written returns `None` and is rebuilt.
+fn socks_udp_forwarded<'a>(
+    client: &'a [u8],
+    dest: &SocketAddr,
+    payload: &[u8],
+) -> Option<&'a [u8]> {
+    let head = socks_udp_head_len(client, dest)?;
+    (client.len() == head + payload.len()).then_some(client)
+}
+
+/// Read a SOCKS address body straight off a slice: the same field order `read_socks_addr_rest` draws from a stream, read where the bytes already lie, so a relayed datagram pays no cursor, no `dyn Read` call per field and no copy into scratch.
+fn parse_socks_addr_rest(buf: &[u8], atyp: u8) -> Option<(SocketAddr, usize)> {
+    match atyp {
+        1 => {
+            let ip = buf.first_chunk::<4>()?;
+            let port: [u8; 2] = buf.get(4..6)?.try_into().ok()?;
+            Some((
+                SocketAddr::new(std::net::IpAddr::V4((*ip).into()), u16::from_be_bytes(port)),
+                6,
+            ))
+        }
+        3 => {
+            let len = usize::from(*buf.first()?);
+            let name = buf.get(1..1 + len)?;
+            let port: [u8; 2] = buf.get(1 + len..3 + len)?.try_into().ok()?;
+            let host = std::str::from_utf8(name).ok()?;
+            // The name and the port go to the resolver as they are: the authority the datagram named is never spelled out.
+            let addr = (host, u16::from_be_bytes(port))
+                .to_socket_addrs()
+                .ok()?
+                .next()?;
+            Some((addr, 3 + len))
+        }
+        4 => {
+            let ip = buf.first_chunk::<16>()?;
+            let port: [u8; 2] = buf.get(16..18)?.try_into().ok()?;
+            Some((
+                SocketAddr::new(std::net::IpAddr::V6((*ip).into()), u16::from_be_bytes(port)),
+                18,
+            ))
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn parse_socks_udp(packet: &[u8]) -> Option<(SocketAddr, &[u8])> {
+    if packet.len() < 4 || packet[2] != 0 {
+        return None;
+    }
+    let (addr, used) = parse_socks_addr_rest(&packet[4..], packet[3])?;
+    Some((addr, &packet[4 + used..]))
+}
+
+/// The same frame with the name kept: a routing rule may name a domain, and resolving here would
+/// hand the decision an address the client never asked for.
+pub(crate) fn parse_socks_udp_dest(packet: &[u8]) -> Option<(Destination, &[u8])> {
+    if packet.len() < 4 || packet[2] != 0 {
+        return None;
+    }
+    let body = &packet[4..];
+    let (dest, used) = match packet[3] {
+        1 => {
+            let ip: [u8; 4] = body.get(..4)?.try_into().ok()?;
+            let port: [u8; 2] = body.get(4..6)?.try_into().ok()?;
+            (
+                Destination::Address(SocketAddr::new(
+                    std::net::IpAddr::V4(ip.into()),
+                    u16::from_be_bytes(port),
+                )),
+                6,
+            )
+        }
+        3 => {
+            let len = usize::from(*body.first()?);
+            let name = body.get(1..1 + len)?;
+            let port: [u8; 2] = body.get(1 + len..3 + len)?.try_into().ok()?;
+            (
+                Destination::Name(
+                    std::str::from_utf8(name).ok()?.to_owned(),
+                    u16::from_be_bytes(port),
+                ),
+                3 + len,
+            )
+        }
+        4 => {
+            let ip: [u8; 16] = body.get(..16)?.try_into().ok()?;
+            let port: [u8; 2] = body.get(16..18)?.try_into().ok()?;
+            (
+                Destination::Address(SocketAddr::new(
+                    std::net::IpAddr::V6(ip.into()),
+                    u16::from_be_bytes(port),
+                )),
+                18,
+            )
+        }
+        _ => return None,
+    };
+    Some((dest, &body[used..]))
+}
+
+/// The handshake a front's client made: the command, the destination, and the version
+/// the reply is written in.
+struct Handshake<'a> {
+    /// 1 for CONNECT, 3 for UDP ASSOCIATE.
+    cmd: u8,
+    /// The destination the request named.
+    asked: Destination,
+    /// The version the client spoke.
+    version: crate::socks::Version,
+    /// The account the greeting authenticated, when the front asked for one. Borrowed
+    /// from the front's own list, which outlives the flow, so the handshake takes no
+    /// heap copy of a name and a password.
+    account: Option<&'a SocksAccount>,
+}
+
+/// The handshake that keeps the client's name: resolving here hands the edge an address it cannot route.
+#[cfg(test)]
+fn socks_target<'a>(
+    client: &mut Connection,
+    grant: bool,
+    accounts: &'a SocksAccounts,
+) -> Option<Handshake<'a>> {
+    // Bound only the greeting to a wall-clock budget, then restore the untimed relay reads behind it.
+    let budget = budgets::handshake();
+    let _ = client.set_read_timeout(Some(budget));
+    let asked = socks_request(client, grant, Instant::now() + budget, accounts);
+    let _ = client.set_read_timeout(None);
+    asked
+}
+
+/// Each greeting read under the deadline the caller armed: the relay's `read_exact` retries a quiet socket forever, so the socket's poll quantum wakes the read and the deadline ends it.
+fn socks_request<'a>(
+    client: &mut Connection,
+    grant: bool,
+    until: Instant,
+    accounts: &'a SocksAccounts,
+) -> Option<Handshake<'a>> {
+    let mut head = [0u8; 2];
+    read_exact(
+        &mut HandshakeDeadline {
+            inner: &mut *client,
+            until,
+        },
+        &mut head,
+    )
+    .ok()?;
+    if head[0] == ferrox_core::socks::VERSION4 {
+        // SOCKS4 has no greeting: the second byte is the command.
+        let (cmd, asked) = socks4_request(client, head[1], until, accounts)?;
+        return Some(Handshake {
+            cmd,
+            asked,
+            version: crate::socks::Version::V4,
+            account: None,
+        });
+    }
+    if head[0] != 5 {
+        return None;
+    }
+    // The offered-method count is an unauthenticated byte and the list is never inspected, so drain it on the stack (head[1] can never overrun the 255-byte array) to keep the heap off the pre-auth path.
+    let mut methods = [0u8; u8::MAX as usize];
+    read_exact(
+        &mut HandshakeDeadline {
+            inner: &mut *client,
+            until,
+        },
+        &mut methods[..usize::from(head[1])],
+    )
+    .ok()?;
+    // The one method this front wants: the credential exchange when the front has accounts, no authentication when it has none — a front that asks for the credential exchange refuses a client that does not offer it, the way the pinned Go server does (`authNoMatchingMethod`), and the no-authentication front answers whatever the client offered, as it always has.
+    let wants = accounts.wants_credential();
+    let wanted = if wants {
+        ferrox_core::socks::METHOD_USER
+    } else {
+        ferrox_core::socks::METHOD_NONE
+    };
+    if wants && !methods[..usize::from(head[1])].contains(&wanted) {
+        client.write_all(&[5, 0xff]).ok()?;
+        return None;
+    }
+    if client.write_all(&[5, wanted]).is_err() {
+        return None;
+    }
+    let account = if wanted == ferrox_core::socks::METHOD_USER {
+        Some(socks_authenticate(client, until, accounts)?)
+    } else {
+        None
+    };
+    let mut req = [0u8; 4];
+    read_exact(
+        &mut HandshakeDeadline {
+            inner: &mut *client,
+            until,
+        },
+        &mut req,
+    )
+    .ok()?;
+    if req[0] != 5 || (req[1] != 1 && req[1] != 3) {
+        return None;
+    }
+    let target = read_socks_named(
+        &mut HandshakeDeadline {
+            inner: &mut *client,
+            until,
+        },
+        req[3],
+    )?;
+    if grant && req[1] == 1 && client.write_all(&foxy_socks_reply(0)).is_err() {
+        return None;
+    }
+    Some(Handshake {
+        cmd: req[1],
+        asked: target,
+        version: crate::socks::Version::V5,
+        account,
+    })
+}
+
+/// The SOCKS4 request: the port, the address, the user id, and — for `SOCKS4a` — the
+/// name.
+///
+/// A front that asks for a credential refuses the request: SOCKS4 carries a user id
+/// and no password, so there is nothing to check a credential against. The pinned Go
+/// server refuses it the same way, and its reply is the one this writes.
+fn socks4_request(
+    client: &mut Connection,
+    cmd: u8,
+    until: Instant,
+    accounts: &SocksAccounts,
+) -> Option<(u8, Destination)> {
+    if accounts.wants_credential() || cmd != ferrox_core::socks::CMD4_CONNECT {
+        client.write_all(ferrox_core::socks::refuse4()).ok()?;
+        return None;
+    }
+    let mut head = [0u8; 6];
+    read_exact(
+        &mut HandshakeDeadline {
+            inner: &mut *client,
+            until,
+        },
+        &mut head,
+    )
+    .ok()?;
+    let port = u16::from_be_bytes([head[0], head[1]]);
+    let address = [head[2], head[3], head[4], head[5]];
+    let mut name = [0u8; ferrox_core::socks::NAME4_MAX];
+    // The user id: a NUL-terminated name no front here reads, so it is stepped over.
+    read_socks4_name(client, until, &mut name)?;
+    let asked = if address[0] == 0 {
+        // SOCKS4a: the name follows the user id.
+        let len = read_socks4_name(client, until, &mut name)?;
+        let text = std::str::from_utf8(&name[..len]).ok()?;
+        Destination::Name(text.to_owned(), port)
+    } else {
+        Destination::Address(SocketAddr::from((
+            std::net::IpAddr::V4(address.into()),
+            port,
+        )))
+    };
+    Some((cmd, asked))
+}
+
+/// Read a NUL-terminated name into `buf`, and return how many bytes it held.
+///
+/// The first byte is read on its own, because an empty name is one byte and a proxy
+/// client sends one; the rest is found with a peek and taken with one read, so the
+/// bytes after the name stay on the socket for the tunnel. The pinned Go reader takes
+/// a byte per call, so a name of n bytes costs it n reads.
+fn read_socks4_name(client: &mut Connection, until: Instant, buf: &mut [u8]) -> Option<usize> {
+    read_exact(
+        &mut HandshakeDeadline {
+            inner: &mut *client,
+            until,
+        },
+        &mut buf[..1],
+    )
+    .ok()?;
+    if buf[0] == 0 {
+        return Some(0);
+    }
+    let mut held = 1;
+    while held < buf.len() {
+        if Instant::now() >= until {
+            return None;
+        }
+        let peeked = client.peek(&mut buf[held..]).ok()?;
+        if peeked == 0 {
+            return None;
+        }
+        let chunk = &buf[held..held + peeked];
+        if let Some(at) = chunk.iter().position(|byte| *byte == 0) {
+            // The name ends inside the chunk: take the bytes from here to the NUL.
+            let end = held + at + 1;
+            read_exact(
+                &mut HandshakeDeadline {
+                    inner: &mut *client,
+                    until,
+                },
+                &mut buf[held..end],
+            )
+            .ok()?;
+            return Some(end - 1);
+        }
+        read_exact(
+            &mut HandshakeDeadline {
+                inner: &mut *client,
+                until,
+            },
+            &mut buf[held..held + peeked],
+        )
+        .ok()?;
+        held += peeked;
+    }
+    None
+}
+
+/// The RFC 1929 exchange: the version, the name's length, the name, the password's
+/// length, and the password. The answer is the version and a status byte — zero when
+/// the account is one the front knows.
+fn socks_authenticate<'a>(
+    client: &mut Connection,
+    until: Instant,
+    accounts: &'a SocksAccounts,
+) -> Option<&'a SocksAccount> {
+    let mut head = [0u8; 2];
+    if read_exact(
+        &mut HandshakeDeadline {
+            inner: &mut *client,
+            until,
+        },
+        &mut head,
+    )
+    .is_err()
+    {
+        return None;
+    }
+    if head[0] != ferrox_core::socks::AUTH_VERSION {
+        let _ = client.write_all(&[ferrox_core::socks::AUTH_VERSION, 1]);
+        return None;
+    }
+    let mut name = [0u8; u8::MAX as usize];
+    let user_len = usize::from(head[1]);
+    if read_exact(
+        &mut HandshakeDeadline {
+            inner: &mut *client,
+            until,
+        },
+        &mut name[..user_len],
+    )
+    .is_err()
+    {
+        return None;
+    }
+    let mut len = [0u8; 1];
+    if read_exact(
+        &mut HandshakeDeadline {
+            inner: &mut *client,
+            until,
+        },
+        &mut len,
+    )
+    .is_err()
+    {
+        return None;
+    }
+    let mut pass = [0u8; u8::MAX as usize];
+    let pass_len = usize::from(len[0]);
+    if read_exact(
+        &mut HandshakeDeadline {
+            inner: &mut *client,
+            until,
+        },
+        &mut pass[..pass_len],
+    )
+    .is_err()
+    {
+        return None;
+    }
+    let accepted = accounts.account(&name[..user_len], &pass[..pass_len]);
+    let _ = client.write_all(&[
+        ferrox_core::socks::AUTH_VERSION,
+        u8::from(accepted.is_none()),
+    ]);
+    accepted
+}
+
+fn read_socks_named(stream: &mut dyn Read, atyp: u8) -> Option<Destination> {
+    match atyp {
+        3 => {
+            let mut len = [0u8; 1];
+            read_exact(stream, &mut len).ok()?;
+            let mut name = vec![0u8; usize::from(len[0])];
+            read_exact(stream, &mut name).ok()?;
+            let mut port = [0u8; 2];
+            read_exact(stream, &mut port).ok()?;
+            Some(Destination::Name(
+                String::from_utf8(name).ok()?,
+                u16::from_be_bytes(port),
+            ))
+        }
+        _ => Some(Destination::Address(read_socks_addr_rest(stream, atyp)?)),
+    }
+}
+
+/// What the client asked for: a name the edge resolves itself, or an address. A name stays a name down to the request bytes, because a client that looks the name up itself sends the edge an address for a destination it never kept, and the lookup itself is visible to whoever watches its resolver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Destination {
+    Name(String, u16),
+    Address(SocketAddr),
+}
+
+impl Destination {
+    pub(crate) fn authority(&self) -> String {
+        match self {
+            Self::Name(host, port) => ferrox_core::foxy::authority(host, *port),
+            Self::Address(address) => address.to_string(),
+        }
+    }
+
+    /// The authority's octet count: exact for a name and a v4 literal, the uncompressed bound for a v6 one.
+    fn authority_len(&self) -> usize {
+        fn digits(value: u16) -> usize {
+            1 + usize::from(value >= 10)
+                + usize::from(value >= 100)
+                + usize::from(value >= 1000)
+                + usize::from(value >= 10000)
+        }
+        match self {
+            Self::Name(host, port) => {
+                host.len() + usize::from(host.contains(':')) * 2 + 1 + digits(*port)
+            }
+            Self::Address(address) => match address.ip() {
+                std::net::IpAddr::V4(ip) => {
+                    ip.octets()
+                        .iter()
+                        .map(|octet| 1 + usize::from(*octet >= 10) + usize::from(*octet >= 100))
+                        .sum::<usize>()
+                        + 4
+                        + digits(address.port())
+                }
+                std::net::IpAddr::V6(_) => 42 + digits(address.port()),
+            },
+        }
+    }
+
+    /// The authority in a buffer the caller owns, so a flow that dials several carriers spells the target once: the joined form this replaced cost a heap buffer per flow for a name and a port.
+    fn authority_into(&self, out: &mut String) {
+        use std::fmt::Write;
+        out.clear();
+        let _ = match self {
+            Self::Name(host, port) if host.contains(':') => write!(out, "[{host}]:{port}"),
+            Self::Name(host, port) => write!(out, "{host}:{port}"),
+            Self::Address(address) if address.ip().is_ipv6() => {
+                write!(out, "[{}]:{}", address.ip(), address.port())
+            }
+            Self::Address(address) => write!(out, "{address}"),
+        };
+    }
+
+    /// Appends the authority's octets: the same bytes `authority` returns, without the buffer they used to pass through.
+    fn push_authority(&self, out: &mut Vec<u8>) {
+        use std::io::Write;
+        let _ = match self {
+            Self::Name(host, port) if host.contains(':') => write!(out, "[{host}]:{port}"),
+            Self::Name(host, port) => write!(out, "{host}:{port}"),
+            Self::Address(address) if address.ip().is_ipv6() => {
+                write!(out, "[{}]:{}", address.ip(), address.port())
+            }
+            Self::Address(address) => write!(out, "{address}"),
+        };
+    }
+
+    /// The address to connect to directly: only a lane that carries no destination answers the name itself.
+    pub(crate) fn socket(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Address(address) => Some(*address),
+            Self::Name(host, port) => resolve_endpoint(host, *port),
+        }
+    }
+
+    /// The address to connect to directly: only a lane that carries no destination answers the name itself.
+    pub(crate) fn port(&self) -> u16 {
+        match self {
+            Self::Name(_, port) => *port,
+            Self::Address(address) => address.port(),
+        }
+    }
+
+    /// The family byte and its body: `v6` is what this protocol numbers IPv6 and `domain` what it numbers a name, and the two conventions in the tree differ.
+    pub(crate) fn push_addr(&self, out: &mut Vec<u8>, v6: u8, domain: u8) {
+        match self {
+            Self::Address(address) => push_addr(out, address, v6),
+            Self::Name(host, _) => {
+                out.push(domain);
+                out.push(host.len() as u8);
+                out.extend_from_slice(host.as_bytes());
+            }
+        }
+    }
+
+    /// The bytes `push_addr` writes, so a header reserves for the destination it holds.
+    pub(crate) fn addr_len(&self) -> usize {
+        match self {
+            Self::Address(address) => {
+                if address.is_ipv6() {
+                    17
+                } else {
+                    5
+                }
+            }
+            Self::Name(host, _) => host.len() + 2,
+        }
+    }
+
+    /// `push_addr`'s bytes into a caller's buffer, so a dial header never needs a heap copy.
+    /// A name the wire's one-byte length cannot carry is refused rather than truncated.
+    fn write_addr(&self, out: &mut [u8]) -> Option<usize> {
+        match self {
+            Self::Address(address) => match address.ip() {
+                IpAddr::V4(ip) => {
+                    out[0] = 1;
+                    out[1..5].copy_from_slice(&ip.octets());
+                    Some(5)
+                }
+                IpAddr::V6(ip) => {
+                    out[0] = 3;
+                    out[1..17].copy_from_slice(&ip.octets());
+                    Some(17)
+                }
+            },
+            Self::Name(host, _) => {
+                if host.len() > u8::MAX as usize {
+                    return None;
+                }
+                out[0] = 2;
+                out[1] = host.len() as u8;
+                out[2..2 + host.len()].copy_from_slice(host.as_bytes());
+                Some(host.len() + 2)
+            }
+        }
+    }
+}
+
+impl From<SocketAddr> for Destination {
+    fn from(address: SocketAddr) -> Self {
+        Self::Address(address)
+    }
+}
+
+impl std::str::FromStr for Destination {
+    type Err = &'static str;
+
+    fn from_str(authority: &str) -> Result<Self, Self::Err> {
+        authority_target(authority.as_bytes()).ok_or("no destination in this authority")
+    }
+}
+
+fn read_socks_addr(stream: &mut dyn Read) -> Option<SocketAddr> {
+    let mut atyp = [0u8; 1];
+    read_exact(stream, &mut atyp).ok()?;
+    read_socks_addr_rest(stream, atyp[0])
+}
+
+fn read_socks_addr_rest(stream: &mut dyn Read, atyp: u8) -> Option<SocketAddr> {
+    match atyp {
+        1 => {
+            let mut ip = [0u8; 4];
+            read_exact(stream, &mut ip).ok()?;
+            let mut port = [0u8; 2];
+            read_exact(stream, &mut port).ok()?;
+            Some(SocketAddr::new(
+                std::net::IpAddr::V4(ip.into()),
+                u16::from_be_bytes(port),
+            ))
+        }
+        3 => {
+            let mut len = [0u8; 1];
+            read_exact(stream, &mut len).ok()?;
+            let mut name = vec![0u8; usize::from(len[0])];
+            read_exact(stream, &mut name).ok()?;
+            let mut port = [0u8; 2];
+            read_exact(stream, &mut port).ok()?;
+            let host = String::from_utf8(name).ok()?;
+            format!("{host}:{}", u16::from_be_bytes(port))
+                .to_socket_addrs()
+                .ok()?
+                .next()
+        }
+        4 => {
+            let mut ip = [0u8; 16];
+            read_exact(stream, &mut ip).ok()?;
+            let mut port = [0u8; 2];
+            read_exact(stream, &mut port).ok()?;
+            Some(SocketAddr::new(
+                std::net::IpAddr::V6(ip.into()),
+                u16::from_be_bytes(port),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// The account a single-client inbound names: its counters and the access line key on these.
+#[derive(Clone, Debug, Default)]
+struct InboundAccount {
+    email: String,
+    level: u32,
+}
+
+fn inbound_account(inbound: &Json) -> InboundAccount {
+    let client = inbound_first_client(inbound);
+    let settings = inbound.get("settings");
+    let field = |name: &str| {
+        client
+            .and_then(|client| client.get(name))
+            .or_else(|| settings.and_then(|settings| settings.get(name)))
+    };
+    InboundAccount {
+        email: field("email")
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        level: field("level").and_then(Json::as_u32).unwrap_or(0),
+    }
+}
+
+fn inbound_first_client(inbound: &Json) -> Option<&Json> {
+    inbound
+        .get("settings")
+        .and_then(|s| s.get("clients").or_else(|| s.get("users")))
+        .and_then(Json::as_arr)
+        .and_then(|clients| clients.first())
+}
+
+/// The reference's per-account experiment string: the protobuf field is `tests_enabled`, its
+/// JSON name `testsEnabled`, and a share link spells the same list `experiments`.
+fn account_experiments(client: &Json) -> Option<&str> {
+    ["testsEnabled", "tests_enabled", "experiments"]
+        .into_iter()
+        .find_map(|name| client.get(name).and_then(Json::as_str))
+}
+
+/// Whether an account asks for the reference's authenticated-length experiment.
+fn authenticated_length(client: &Json) -> bool {
+    account_experiments(client).is_some_and(|text| text.contains("AuthenticatedLength"))
+}
+
+/// Whether an account asks for the reference's suppressed termination signal.
+fn no_termination(client: &Json) -> bool {
+    account_experiments(client).is_some_and(|text| text.contains("NoTerminationSignal"))
+}
+
+/// The reference parses `security: "none"` as `auto` (`infra/conf/vmess.go`, `VMessAccount.Build`), so the
+/// outbound sends the negotiated cipher's code rather than the plain code 5 its inbound refuses.
+fn vmess_cipher(account: &Json) -> crate::vmess::Cipher {
+    let cipher = crate::vmess::Cipher::parse(
+        account
+            .get("security")
+            .and_then(Json::as_str)
+            .unwrap_or("auto"),
+    );
+    if cipher == crate::vmess::Cipher::None {
+        crate::vmess::Cipher::Auto
+    } else {
+        cipher
+    }
+}
+
+fn inbound_id(inbound: &Json) -> [u8; 16] {
+    inbound_first_client(inbound)
+        .and_then(|client| client.get("id"))
+        .and_then(Json::as_str)
+        .and_then(uuid_bytes)
+        .unwrap_or([0u8; 16])
+}
+
+/// Every vmess account the inbound names, with the email `RemoveUser` selects; `clients` is the
+/// reference's alias for `users` and names the whole table when it is present.
+fn inbound_vmess_users(inbound: &Json) -> crate::vmess::UsersRef {
+    let entries = inbound
+        .get("settings")
+        .and_then(|settings| {
+            settings
+                .get("clients")
+                .and_then(Json::as_arr)
+                .or_else(|| settings.get("users").and_then(Json::as_arr))
+        })
+        .map(|clients| {
+            clients
+                .iter()
+                .filter_map(|client| {
+                    let id = client
+                        .get("id")
+                        .and_then(Json::as_str)
+                        .and_then(uuid_bytes)?;
+                    let email = client
+                        .get("email")
+                        .and_then(Json::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    let level = client.get("level").and_then(Json::as_u32).unwrap_or(0);
+                    Some(crate::vmess::User {
+                        level,
+                        email,
+                        id,
+                        no_termination: no_termination(client),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    crate::vmess::Users::with(entries)
+}
+
+/// One client a vless inbound serves: the id the wire names and the flow its account is bound to.
+#[derive(Clone, Debug)]
+pub(crate) struct VlessUser {
+    pub(crate) id: [u8; 16],
+    pub(crate) flow: Flow,
+    /// The reference's account name and policy level; an account without an email counts nothing.
+    pub(crate) email: String,
+    pub(crate) level: u32,
+    /// The portal a user's reverse tag names: a reverse account forwards nothing itself, it only
+    /// lends the portal's sessions to the flows routed to that tag.
+    pub(crate) reverse: Option<Arc<crate::reverse::Portal>>,
+}
+
+/// The clients one vless inbound serves; lookup keys the id the way the reference's validator
+/// does, where bytes 6 and 7 are the mux route rather than identity.
+pub(crate) type VlessUsers = Arc<[VlessUser]>;
+
+/// A single-user set, the shape a test front hands a handler.
+#[cfg(test)]
+pub(crate) fn one_user(id: [u8; 16]) -> VlessUsers {
+    Arc::from([VlessUser {
+        id,
+        flow: Flow::None,
+        email: String::new(),
+        level: 0,
+        reverse: None,
+    }])
+}
+
+#[cfg(test)]
+fn one_vless_user(id: &[u8; 16]) -> [VlessUser; 1] {
+    [VlessUser {
+        id: *id,
+        flow: Flow::None,
+        email: String::new(),
+        level: 0,
+        reverse: None,
+    }]
+}
+
+#[cfg(test)]
+fn enable_user_stats() {
+    let root = crate::json::parse(
+        r#"{"stats":{},"policy":{"system":{"statsInboundUplink":true,"statsInboundDownlink":true},"levels":{"1":{"statsUserUplink":true,"statsUserDownlink":true,"statsUserOnline":true}}}}"#,
+    )
+    .expect("stats config");
+    crate::policy::install(&root).expect("policy installs");
+    crate::stats::install(&root).expect("stats installs");
+}
+
+fn same_vless_user(a: &[u8; 16], b: &[u8; 16]) -> bool {
+    a[..6] == b[..6] && a[8..] == b[8..]
+}
+
+fn inbound_users(inbound: &Json, portals: &crate::reverse::Portals) -> VlessUsers {
+    let mut users: Vec<VlessUser> = Vec::new();
+    let clients = inbound
+        .get("settings")
+        .and_then(|settings| settings.get("clients"))
+        .and_then(Json::as_arr);
+    for client in clients.into_iter().flatten() {
+        let Some(id) = client.get("id").and_then(Json::as_str).and_then(uuid_bytes) else {
+            continue;
+        };
+        let flow = match client.get("flow").and_then(Json::as_str).unwrap_or("") {
+            ferrox_core::vless::VISION_FLOW => Flow::Vision,
+            "" => Flow::None,
+            _ => Flow::Other,
+        };
+        let reverse = client
+            .get("reverse")
+            .and_then(|reverse| reverse.get("tag"))
+            .and_then(Json::as_str)
+            .filter(|tag| !tag.is_empty())
+            .and_then(|tag| portals.get(tag));
+        let email = client
+            .get("email")
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let level = client.get("level").and_then(Json::as_u32).unwrap_or(0);
+        let user = VlessUser {
+            id,
+            flow,
+            email,
+            level,
+            reverse,
+        };
+        match users.iter_mut().find(|seen| same_vless_user(&seen.id, &id)) {
+            Some(seen) => *seen = user,
+            None => users.push(user),
+        }
+    }
+    Arc::from(users)
+}
+
+/// The reference's account-flow gate: the wire's flow must be the account's own, and only a
+/// front that runs Vision framing speaks it.
+fn vless_flow_ok(user: &VlessUser, wire: Flow, cmd: u8, vision: bool) -> bool {
+    match wire {
+        Flow::Vision => vision && cmd == 1 && user.flow == Flow::Vision,
+        Flow::None => matches!(cmd, 1..=4) && !(user.flow == Flow::Vision && cmd == 1),
+        Flow::Other => false,
+    }
+}
+
+/// The reality/tls front also serves xray's XUDP shape: a Vision UDP association rides a mux request.
+fn vless_reply_ok(user: &VlessUser, wire: Flow, cmd: u8, vision: bool) -> bool {
+    vless_flow_ok(user, wire, cmd, vision)
+        || (vision && wire == Flow::Vision && cmd == 3 && user.flow == Flow::Vision)
+}
+
+/// A front that does not frame Vision still speaks the account's flow: the id must be served and the wire flow the account's own.
+fn vless_user_allows(
+    users: &[VlessUser],
+    got: &[u8; 16],
+    flow: Flow,
+    cmd: u8,
+    freedom: bool,
+    udp: bool,
+) -> bool {
+    if cmd == 4
+        && users
+            .iter()
+            .any(|user| same_vless_user(&user.id, got) && user.reverse.is_some())
+    {
+        static SAID: OnceLock<()> = OnceLock::new();
+        if SAID.set(()).is_ok() {
+            eprintln!(
+                "vless: a reverse session rides raw, tls, reality, ws, grpc, httpupgrade and httpheader only; this carrier's request is refused"
+            );
+        }
+    }
+    freedom
+        && (matches!(cmd, 1 | 3) || (udp && cmd == 2))
+        && users.iter().any(|user| {
+            same_vless_user(&user.id, got)
+                && user.reverse.is_none()
+                && vless_flow_ok(user, flow, cmd, false)
+        })
+}
+
+/// What a request means for the user it names: a reverse account forwards nothing and a forward
+/// account opens no reverse session, so the two commands never share a user.
+#[derive(Clone, Copy)]
+enum ReverseAsk<'a> {
+    NotReverse,
+    Allowed(&'a Arc<crate::reverse::Portal>),
+    Refused,
+}
+
+fn reverse_ask<'a>(users: &'a [VlessUser], got: &[u8; 16], flow: Flow, cmd: u8) -> ReverseAsk<'a> {
+    let Some(user) = users.iter().find(|user| same_vless_user(&user.id, got)) else {
+        return ReverseAsk::NotReverse;
+    };
+    match &user.reverse {
+        None if cmd == 4 => {
+            eprintln!("vless: a reverse request named a user with no reverse tag; refused");
+            ReverseAsk::Refused
+        }
+        None => ReverseAsk::NotReverse,
+        Some(portal) => {
+            if cmd != 4 {
+                eprintln!(
+                    "vless: reverse user `{}` may not forward; refused",
+                    portal.tag()
+                );
+                return ReverseAsk::Refused;
+            }
+            if flow != user.flow || user.flow != Flow::None {
+                eprintln!(
+                    "vless: reverse user `{}` opens the unframed stream only; refused",
+                    portal.tag()
+                );
+                return ReverseAsk::Refused;
+            }
+            ReverseAsk::Allowed(portal)
+        }
+    }
+}
+
+/// The reverse session a stream front hands the portal: the response header goes out on the same
+/// writer the mux will use, then both directions become the tunnel's.
+fn attach_reverse<R, W>(
+    portal: &Arc<crate::reverse::Portal>,
+    reader: R,
+    mut writer: W,
+    closer: Arc<dyn Fn() + Send + Sync>,
+) -> bool
+where
+    R: std::io::Read + Send + 'static,
+    W: std::io::Write + Send + 'static,
+{
+    if writer.write_all(&[0, 0]).is_err() {
+        return false;
+    }
+    portal
+        .attach(crate::reverse::Tunnel::new(
+            Box::new(reader),
+            Box::new(writer),
+            closer,
+        ))
+        .is_some()
+}
+
+/// The close that wakes a session parked in a read: the socket behind the carrier, shut down.
+fn connection_closer(connection: &Connection) -> Arc<dyn Fn() + Send + Sync> {
+    let close = connection.try_clone().ok();
+    Arc::new(move || {
+        if let Some(close) = close.as_ref() {
+            let _ = close.shutdown(Shutdown::Both);
+        }
+    })
+}
+
+/// The two halves of a TLS session as a reverse tunnel: the reader owns one handle and the writers
+/// share the other, exactly the split the forward relay makes.
+fn attach_reverse_session<S>(
+    portal: &Arc<crate::reverse::Portal>,
+    mut session: S,
+    raw: Option<Connection>,
+    meter: crate::stats::Meter,
+) -> bool
+where
+    S: std::io::Read
+        + std::io::Write
+        + Send
+        + ferrox_core::tls::RecordAlignment
+        + Drivable
+        + CipherOpen
+        + 'static,
+{
+    if session.write_all(&[0, 0]).is_err() {
+        return false;
+    }
+    let close = raw.and_then(|raw| raw.try_clone().ok());
+    let closer: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        if let Some(close) = close.as_ref() {
+            let _ = close.shutdown(Shutdown::Both);
+        }
+    });
+    let tunnel = match driven_halves(session, RELAY_POLL) {
+        Ok(half) => half.into_tunnel(closer, meter),
+        Err(session) => {
+            let session = MeteredIo {
+                inner: session,
+                meter,
+            };
+            let shared = Arc::new(Mutex::new(session));
+            crate::reverse::Tunnel::new(
+                Box::new(SharedRead(Arc::clone(&shared))),
+                Box::new(SharedWrite(shared)),
+                closer,
+            )
+        }
+    };
+    portal.attach(tunnel).is_some()
+}
+
+/// A session's two directions behind the one lock its transport needs: the fallback for a session
+/// whose transport cannot be cloned.
+struct SharedRead<S>(Arc<Mutex<S>>);
+
+impl<S: std::io::Read> std::io::Read for SharedRead<S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut inner = self
+            .0
+            .lock()
+            .map_err(|_| std::io::Error::other("session"))?;
+        inner.read(buf)
+    }
+}
+
+struct SharedWrite<S>(Arc<Mutex<S>>);
+
+impl<S: std::io::Write> std::io::Write for SharedWrite<S> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut inner = self
+            .0
+            .lock()
+            .map_err(|_| std::io::Error::other("session"))?;
+        inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut inner = self
+            .0
+            .lock()
+            .map_err(|_| std::io::Error::other("session"))?;
+        inner.flush()
+    }
+}
+
+/// xray registers each handler under more than one name; the alias resolves to the one protocol this tree builds.
+fn canonical_protocol(protocol: &str) -> &str {
+    match protocol {
+        "direct" => "freedom",
+        "block" => "blackhole",
+        "tunnel" => "dokodemo-door",
+        other => other,
+    }
+}
+
+fn has_protocol(root: &Json, array: &str, protocol: &str) -> bool {
+    root.get(array).and_then(Json::as_arr).is_some_and(|items| {
+        items.iter().any(|item| {
+            item.get("protocol")
+                .and_then(Json::as_str)
+                .is_some_and(|named| canonical_protocol(named) == protocol)
+        })
+    })
+}
+
+/// An outbound that dials a peer makes this process a client for its flows: the lane ceiling is
+/// wider than a server's. `freedom`, `blackhole`, `dns` and `loopback` reach no proxy peer.
+fn dials_a_proxy(root: &Json) -> bool {
+    const LOCAL: [&str; 4] = ["freedom", "blackhole", "dns", "loopback"];
+    root.get("outbounds")
+        .and_then(Json::as_arr)
+        .is_some_and(|outbounds| {
+            outbounds.iter().any(|outbound| {
+                outbound
+                    .get("protocol")
+                    .and_then(Json::as_str)
+                    .is_some_and(|named| !LOCAL.contains(&canonical_protocol(named)))
+            })
+        })
+}
+
+fn inbound_method(inbound: &Json) -> String {
+    inbound
+        .get("settings")
+        .and_then(|s| s.get("method"))
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .to_owned()
+}
+
+pub(crate) fn inbound_ss_password(inbound: &Json) -> String {
+    inbound
+        .get("settings")
+        .and_then(|s| s.get("password"))
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .to_owned()
+}
+
+/// Every client a shadowsocks inbound names: `clients` replaces `users` whenever the key is there, an empty list serves nobody, and with neither the inbound's own password is its one account. A client this tree cannot serve is named once and skipped, so the rest of the list still serves.
+fn inbound_ss_users(
+    inbound: &Json,
+    password: &str,
+    method: &str,
+    address: &str,
+) -> crate::shadowsocks::SsUsers {
+    let listed = inbound
+        .get("settings")
+        .and_then(|settings| settings.get("clients").or_else(|| settings.get("users")))
+        .and_then(Json::as_arr);
+    let Some(listed) = listed else {
+        if password.is_empty() {
+            return crate::shadowsocks::SsUsers::default();
+        }
+        return crate::shadowsocks::account(password, method);
+    };
+    let mut users = Vec::with_capacity(listed.len());
+    for client in listed {
+        let named = client
+            .get("method")
+            .and_then(Json::as_str)
+            .unwrap_or(method);
+        let client_password = client.get("password").and_then(Json::as_str);
+        let Some(client_password) = client_password.filter(|password| !password.is_empty()) else {
+            eprintln!("shadowsocks client `{named}` on {address}: no password, skipped");
+            continue;
+        };
+        let Some(client_method) = ferrox_core::shadowsocks::Method::parse(named) else {
+            eprintln!("shadowsocks client `{named}` on {address}: unsupported cipher, skipped");
+            continue;
+        };
+        users.push(crate::shadowsocks::SsUser {
+            method: client_method,
+            master: ferrox_core::shadowsocks::MasterKey::new(
+                client_password,
+                client_method.key_len(),
+            ),
+            email: client
+                .get("email")
+                .and_then(Json::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            level: client.get("level").and_then(Json::as_u32).unwrap_or(0),
+        });
+    }
+    std::sync::Arc::from(users)
+}
+
+/// The (email, level) pair each client PSK a 2022 multi-user config carries, one entry per user and in the same order as the colon-joined password's tail; the master is not named here.
+fn ss2022_identities(inbound: &Json) -> Vec<(String, u32)> {
+    inbound
+        .get("settings")
+        .and_then(|s| s.get("users"))
+        .and_then(Json::as_arr)
+        .map(|listed| {
+            listed
+                .iter()
+                .map(|user| {
+                    (
+                        user.get("email")
+                            .and_then(Json::as_str)
+                            .unwrap_or("")
+                            .to_owned(),
+                        user.get("level").and_then(Json::as_u32).unwrap_or(0),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Every email a configured user carries, across the whole config: a generated fallback name must
+/// not share a statistics key with any of them, not just with its own inbound's.
+pub(crate) fn configured_emails(root: &Json) -> HashSet<String> {
+    let mut emails = HashSet::new();
+    for inbound in root.get("inbounds").and_then(Json::as_arr).unwrap_or(&[]) {
+        let settings = inbound.get("settings");
+        if let Some(email) = settings
+            .and_then(|settings| settings.get("email"))
+            .and_then(Json::as_str)
+            .filter(|email| !email.is_empty())
+        {
+            emails.insert(email.to_owned());
+        }
+        for list in ["clients", "accounts", "users"] {
+            for row in settings
+                .and_then(|settings| settings.get(list))
+                .and_then(Json::as_arr)
+                .unwrap_or(&[])
+            {
+                if let Some(email) = row
+                    .get("email")
+                    .and_then(Json::as_str)
+                    .filter(|email| !email.is_empty())
+                {
+                    emails.insert(email.to_owned());
+                }
+            }
+        }
+    }
+    emails
+}
+
+/// An inbound's parsed accounts: 2022 reads its PSK list from the single password, everything else from the client list.
+pub(crate) fn ss_accounts(
+    inbound: &Json,
+    address: &str,
+    password: String,
+    method: String,
+    configured: &HashSet<String>,
+) -> Arc<crate::shadowsocks::SsAccounts> {
+    let parsed = ferrox_core::shadowsocks2022::Method::parse(&method);
+    let is_2022 = parsed.is_some();
+    let (users, mut identities) = if is_2022 {
+        (
+            crate::shadowsocks::SsUsers::default(),
+            ss2022_identities(inbound),
+        )
+    } else {
+        (
+            inbound_ss_users(inbound, &password, &method, address),
+            Vec::new(),
+        )
+    };
+    // A 2022 inbound whose users[] array does not line up with its password's PSK tail leaves one side unmatched; warn once, then give every PSK an identity so a flow is never left unattributed. A password that does not parse is the handshake's failure to surface, not this check's.
+    if let Some(parsed) = parsed {
+        if let Some(list) =
+            ferrox_core::shadowsocks2022::parse_psk_list(&password, parsed.key_len())
+        {
+            let psks = list.len().saturating_sub(1);
+            let users = identities.len();
+            if users > psks {
+                eprintln!(
+                    "shadowsocks 2022 inbound on {address}: {users} users for {psks} client psks, dropping {} users",
+                    users - psks
+                );
+                identities.truncate(psks);
+            } else if users < psks {
+                eprintln!(
+                    "shadowsocks 2022 inbound on {address}: {users} users for {psks} client psks, naming the rest after the inbound"
+                );
+                let base = inbound_tag(inbound).unwrap_or_else(|| address.to_owned());
+                while identities.len() < psks {
+                    let mut name = format!("{base}#{}", identities.len());
+                    while identities.iter().any(|(email, _)| *email == name)
+                        || configured.contains(&name)
+                    {
+                        name.push('#');
+                    }
+                    identities.push((name, 0));
+                }
+            }
+        }
+    }
+    Arc::new(crate::shadowsocks::SsAccounts {
+        users,
+        password,
+        method,
+        is_2022,
+        identities,
+    })
+}
+
+fn inbound_password(inbound: &Json) -> String {
+    inbound_first_client(inbound)
+        .and_then(|client| client.get("password"))
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .to_owned()
+}
+
+/// Every password a trojan inbound lists: any of them opens it, as xray builds one account per client.
+fn inbound_trojan_keys(inbound: &Json) -> std::sync::Arc<[[u8; 56]]> {
+    let keys: Vec<[u8; 56]> = inbound
+        .get("settings")
+        .and_then(|s| s.get("clients"))
+        .and_then(Json::as_arr)
+        .map(|clients| {
+            clients
+                .iter()
+                .filter_map(|client| client.get("password").and_then(Json::as_str))
+                .filter(|password| !password.is_empty())
+                .map(trojan_key)
+                .collect()
+        })
+        .unwrap_or_default();
+    if keys.is_empty() {
+        let password = inbound_password(inbound);
+        if password.is_empty() {
+            return std::sync::Arc::from([]);
+        }
+        return std::sync::Arc::from([trojan_key(&password)]);
+    }
+    std::sync::Arc::from(keys)
+}
+
+fn inbound_trojan_accounts(inbound: &Json) -> std::sync::Arc<[InboundAccount]> {
+    let settings = inbound.get("settings");
+    let mut accounts = Vec::new();
+    if let Some(clients) = settings
+        .and_then(|settings| settings.get("clients"))
+        .and_then(Json::as_arr)
+    {
+        for client in clients {
+            let Some(password) = client.get("password").and_then(Json::as_str) else {
+                continue;
+            };
+            if password.is_empty() {
+                continue;
+            }
+            accounts.push(InboundAccount {
+                email: client
+                    .get("email")
+                    .or_else(|| settings.and_then(|settings| settings.get("email")))
+                    .and_then(Json::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                level: client
+                    .get("level")
+                    .or_else(|| settings.and_then(|settings| settings.get("level")))
+                    .and_then(Json::as_u32)
+                    .unwrap_or(0),
+            });
+        }
+    }
+    if accounts.is_empty() {
+        accounts.push(inbound_account(inbound));
+    }
+    std::sync::Arc::from(accounts)
+}
+
+fn hysteria_transport(outbound: &Json) -> bool {
+    outbound
+        .get("streamSettings")
+        .and_then(|s| s.get("network"))
+        .and_then(Json::as_str)
+        == Some("hysteria")
+}
+
+// A shadowsocks row's own fields, and the one security this lane dials: tls and reality ride the carried lanes, never a carrier they would speak plaintext.
+fn ss_outbound_refusal(outbound: &Json, server: &Json) -> Option<String> {
+    if server.get("method").and_then(Json::as_str).is_none() {
+        return Some("no cipher method in the server entry".to_owned());
+    }
+    if server.get("password").and_then(Json::as_str).is_none() {
+        return Some("no password in the server entry".to_owned());
+    }
+    let security = stream_security(outbound);
+    if matches!(security, "" | "none") {
+        return None;
+    }
+    let network = outbound
+        .get("streamSettings")
+        .and_then(|s| s.get("network"))
+        .and_then(Json::as_str)
+        .unwrap_or("tcp");
+    let tls_carried = matches!(
+        network,
+        "tcp"
+            | "raw"
+            | "ws"
+            | "websocket"
+            | "httpupgrade"
+            | "grpc"
+            | "xhttp"
+            | "splithttp"
+            | "httpheader"
+            | "kcp"
+            | "mkcp"
+    );
+    let reality_carried = matches!(
+        network,
+        "tcp"
+            | "raw"
+            | "ws"
+            | "websocket"
+            | "httpupgrade"
+            | "grpc"
+            | "xhttp"
+            | "splithttp"
+            | "httpheader"
+            | "kcp"
+            | "mkcp"
+    );
+    match (security, network) {
+        ("tls", "xdrive" | "hysteria") => None,
+        ("tls", _) if tls_carried => outbound_tls(
+            outbound,
+            server
+                .get("address")
+                .and_then(Json::as_str)
+                .unwrap_or_default(),
+        )
+        .err(),
+        ("reality", _) if reality_carried => {
+            let address = server
+                .get("address")
+                .and_then(Json::as_str)
+                .unwrap_or_default();
+            if outbound_reality(outbound, address).is_none() {
+                let _ = crate::config::reality_mldsa(outbound, false);
+                return Some("no reality config in the outbound".to_owned());
+            }
+            if let Err(error) = crate::config::reality_mldsa(outbound, false) {
+                return Some(error);
+            }
+            None
+        }
+        (security, network) => Some(format!("security `{security}` does not ride `{network}`")),
+    }
+}
+
+fn hysteria_outbound_refusal(outbound: &Json) -> Option<String> {
+    let settings = outbound.get("settings");
+    let version = crate::config::hysteria_version(settings.and_then(|s| s.get("version")))
+        .or_else(|| {
+            outbound
+                .get("streamSettings")
+                .and_then(|s| s.get("hysteriaSettings"))
+                .and_then(|h| h.get("version"))
+                .and_then(|version| crate::config::hysteria_version(Some(version)))
+        })
+        .unwrap_or(2);
+    if version != 1 && version != 2 {
+        return Some(format!("hysteria version {version} is not carried"));
+    }
+    if lane_server(settings, "servers").is_none()
+        && settings.and_then(|s| s.get("address")).is_none()
+    {
+        return Some("no server entry in the hysteria settings".to_owned());
+    }
+    None
+}
+
+/// The TLS block a lane's own dial builds, when that dial is `tls_parts` or `tls_carried_parts`:
+/// an error here is the config's own, so the reference refuses it before any dial rather than
+/// carrying the row plaintext.
+fn outbound_tls_refusal(outbound: &Json, protocol: &str) -> Option<String> {
+    if stream_security(outbound) != "tls" {
+        return None;
+    }
+    let settings = outbound.get("settings");
+    let server = match protocol {
+        "vless" | "vmess" => vnext_lane(settings?)?.0,
+        "trojan" | "http" | "socks" | "shadowsocks" => lane_server(settings, "servers")?,
+        _ => return None,
+    };
+    // A dial the lane cannot make is the refusal's own line, not this one.
+    if dial_fields(server).is_some() {
+        return None;
+    }
+    let address = server
+        .get("address")
+        .and_then(Json::as_str)
+        .unwrap_or_default();
+    let (carrier, _) = outbound_carrier(outbound, address);
+    match carrier {
+        Carrier::Raw(_)
+        | Carrier::Ws { .. }
+        | Carrier::HttpUpgrade { .. }
+        | Carrier::Grpc(_)
+        | Carrier::Xhttp { .. }
+        | Carrier::HttpHeader { .. }
+        | Carrier::Kcp(_) => outbound_tls(outbound, address).err(),
+        _ => None,
+    }
+}
+
+// A lane the tree can carry when its fields are honest: the field it lacks is the refusal's word.
+fn outbound_refusal(outbound: &Json, protocol: &str) -> Option<String> {
+    let settings = outbound.get("settings");
+    let tls_reason = |outbound: &Json, protocol: &str| {
+        let network = outbound
+            .get("streamSettings")
+            .and_then(|s| s.get("network"))
+            .and_then(Json::as_str)
+            .unwrap_or("tcp");
+        outbound_tls_refusal(outbound, protocol)
+            .unwrap_or_else(|| format!("security `tls` does not ride `{network}`"))
+    };
+    match protocol {
+        "vless" | "vmess" => {
+            let (server, account) = vnext_lane(settings?)?;
+            if let Some(field) = dial_fields(server) {
+                return Some(field);
+            }
+            if account
+                .get("id")
+                .and_then(Json::as_str)
+                .and_then(uuid_bytes)
+                .is_none()
+            {
+                return Some("no user id that is a uuid in the account".to_owned());
+            }
+            if stream_security(outbound) == "tls" && !hysteria_transport(outbound) {
+                return Some(tls_reason(outbound, protocol));
+            }
+            None
+        }
+        "trojan" => {
+            let server = lane_server(settings, "servers")?;
+            if let Some(field) = dial_fields(server) {
+                return Some(field);
+            }
+            if server.get("password").and_then(Json::as_str).is_none() {
+                return Some("no password in the server entry".to_owned());
+            }
+            if stream_security(outbound) == "tls" && !hysteria_transport(outbound) {
+                return Some(tls_reason(outbound, protocol));
+            }
+            None
+        }
+        "http" | "socks" | "shadowsocks" => {
+            let server = lane_server(settings, "servers")?;
+            if let Some(field) = dial_fields(server) {
+                return Some(field);
+            }
+            if protocol == "shadowsocks" {
+                if let Some(reason) = ss_outbound_refusal(outbound, server) {
+                    return Some(reason);
+                }
+            }
+            if protocol == "socks" {
+                match settings
+                    .and_then(|s| s.get("version"))
+                    .and_then(Json::as_str)
+                {
+                    None | Some("5" | "4" | "4a") => {}
+                    Some(other) => return Some(format!("version `{other}` is not carried")),
+                }
+            }
+            // The store's own lanes carry the handshake `security: tls` names, so no second one is added.
+            let xdrive = outbound
+                .get("streamSettings")
+                .and_then(|s| s.get("network"))
+                .and_then(Json::as_str)
+                == Some("xdrive");
+            if stream_security(outbound) == "tls" && !hysteria_transport(outbound) && !xdrive {
+                return Some(tls_reason(outbound, protocol));
+            }
+            None
+        }
+        "loopback" => {
+            let absent = settings
+                .and_then(|s| s.get("inboundTag"))
+                .and_then(Json::as_str)
+                .is_none_or(str::is_empty);
+            if absent {
+                return Some("no inboundTag in the loopback settings".to_owned());
+            }
+            None
+        }
+        // The chain's own refusals carry their one line already.
+        "foxy" | "veepn" | "psiphon" | "masque" => None,
+        // A lane without an outbound this binary builds: the name is xray's, not a typo to diagnose.
+        "hysteria" => hysteria_outbound_refusal(outbound),
+        "dokodemo-door" => Some("the `dokodemo-door` outbound is not carried".to_owned()),
+        _ => Some(format!("unknown outbound protocol: {protocol}")),
+    }
+}
+
+/// The one server entry a client lane reads: `vnext[0]` for vless and vmess, `servers[0]` for the trojan and front lanes, or nothing to diagnose.
+fn lane_server<'a>(settings: Option<&'a Json>, key: &str) -> Option<&'a Json> {
+    settings
+        .and_then(|s| s.get(key))
+        .and_then(Json::as_arr)
+        .and_then(|servers| servers.first())
+}
+
+/// The dial entry and the account a vless or vmess outbound is read from, in both spellings the
+/// reference builds: `vnext[0]` with its `users[0]`, or the simplified form where the settings
+/// themselves carry address, port and id. `infra/conf/vless.go` and `infra/conf/vmess.go` take
+/// that form whenever `address` is set, so it wins even beside a `vnext`.
+fn vnext_lane(settings: &Json) -> Option<(&Json, &Json)> {
+    if settings
+        .get("address")
+        .and_then(Json::as_str)
+        .is_some_and(|address| !address.is_empty())
+    {
+        return Some((settings, settings));
+    }
+    let server = lane_server(Some(settings), "vnext")?;
+    Some((
+        server,
+        server
+            .get("users")
+            .and_then(Json::as_arr)
+            .and_then(|users| users.first())
+            .unwrap_or(server),
+    ))
+}
+
+/// The dial pair a server entry must carry; the missing one is the refusal's word.
+fn dial_fields(server: &Json) -> Option<String> {
+    if server
+        .get("address")
+        .and_then(Json::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return Some("no address in the server entry".to_owned());
+    }
+    if server.get("port").and_then(Json::as_port).is_none() {
+        return Some("no port in the server entry".to_owned());
+    }
+    None
+}
+
+/// One line per outbound a lane could carry that names neither a dial nor the field it lacks.
+fn diagnose_outbounds(root: &Json) -> Vec<String> {
+    let empty = Vec::new();
+    let mut refused = Vec::new();
+    for outbound in root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .unwrap_or(&empty)
+    {
+        if is_chain_config(outbound) {
+            continue;
+        }
+        let named = outbound
+            .get("protocol")
+            .and_then(Json::as_str)
+            .unwrap_or("");
+        let protocol = canonical_protocol(named);
+        let tag = outbound
+            .get("tag")
+            .and_then(Json::as_str)
+            .unwrap_or("<untagged>");
+        let Some(reason) = outbound_refusal(outbound, protocol) else {
+            continue;
+        };
+        let line = format!("outbound `{tag}` ({named}) cannot be built: {reason}");
+        eprintln!("{line}");
+        refused.push(line);
+    }
+    refused
+}
+
+fn find_outbound(root: &Json) -> Result<Option<Outbound>, String> {
+    find_outbound_with(root, false)
+}
+
+fn find_outbound_with(root: &Json, test: bool) -> Result<Option<Outbound>, String> {
+    let Some(first) = root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .and_then(|list| list.first())
+    else {
+        return Ok(None);
+    };
+    // The default is the first configured outbound, so the finders below are shown only that entry.
+    let only = Json::Obj(vec![(
+        "outbounds".to_owned(),
+        Json::Arr(vec![first.clone()]),
+    )]);
+    let root = &only;
+    if let Some(lane) = crate::psiphon::psiphon_outbound(root, test)? {
+        return Ok(Some(Outbound::Psiphon(lane)));
+    }
+    if let Some(foxy) = find_foxy_outbound(root) {
+        return Ok(Some(Outbound::Foxy(Box::new(foxy))));
+    }
+    if let Some(lane) = find_veepn_outbound(root) {
+        return Ok(Some(Outbound::Veepn(lane)));
+    }
+    if let Some(vless) = find_vless_outbound(root) {
+        return Ok(Some(Outbound::Vless(vless)));
+    }
+    if let Some(vmess) = find_vmess_outbound(root) {
+        return Ok(Some(Outbound::Vmess(vmess)));
+    }
+    if let Some(trojan) = find_trojan_outbound(root) {
+        return Ok(Some(Outbound::Trojan(trojan)));
+    }
+    if let Some(http) = find_http_outbound(root) {
+        return Ok(Some(Outbound::Http(http)));
+    }
+    if let Some(socks) = find_socks_outbound(root) {
+        return Ok(Some(Outbound::Socks(socks)));
+    }
+    if let Some(shadowsocks) = find_shadowsocks_outbound(root) {
+        return Ok(Some(Outbound::Shadowsocks(shadowsocks)));
+    }
+    if let Some(hysteria) = find_hysteria_outbound(root) {
+        return Ok(Some(Outbound::Hysteria(Box::new(hysteria))));
+    }
+    if let Some(tuic) = crate::tuic::outbound(root)? {
+        return Ok(Some(Outbound::Tuic(Arc::new(tuic))));
+    }
+    if let Some(anytls) = crate::anytls::outbound(root)? {
+        return Ok(Some(Outbound::AnyTls(Arc::new(anytls))));
+    }
+    if let Some(wireguard) = find_wireguard_outbound(root)? {
+        return Ok(Some(Outbound::WireGuard(Arc::new(wireguard))));
+    }
+    if let Some(masque) = find_masque_outbound(root)? {
+        return Ok(Some(Outbound::Masque(Arc::new(masque))));
+    }
+    if let Some(warp) = find_warp_outbound(root, test)? {
+        return Ok(Some(Outbound::Warp(Arc::new(warp))));
+    }
+    if let Some(freedom) = find_freedom_outbound(root)? {
+        return Ok(Some(Outbound::Freedom(Arc::new(freedom))));
+    }
+    // The sink is the last resort: a config that names a dial takes the dial.
+    if let Some(answer) = find_blackhole_outbound(root)? {
+        return Ok(Some(Outbound::Block(answer)));
+    }
+    if let Some(dns) = find_dns_outbound(root)? {
+        return Ok(Some(Outbound::Dns(dns)));
+    }
+    // A tls block the row cannot build is the config's own, so the reference refuses it before any dial.
+    let named = first.get("protocol").and_then(Json::as_str).unwrap_or("");
+    if let Some(reason) = outbound_tls_refusal(first, canonical_protocol(named)) {
+        return Err(reason);
+    }
+    Ok(None)
+}
+
+/// The `WireGuard` outbound's device config, built once at startup so a bad key or
+/// endpoint refuses the config instead of a flow.
+fn find_wireguard_outbound(root: &Json) -> Result<Option<crate::wg::WireGuardOut>, String> {
+    let Some(outbound) = root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .and_then(|outbounds| outbounds.first())
+    else {
+        return Ok(None);
+    };
+    if canonical_protocol(
+        outbound
+            .get("protocol")
+            .and_then(Json::as_str)
+            .unwrap_or(""),
+    ) != "wireguard"
+    {
+        return Ok(None);
+    }
+    let settings = outbound
+        .get("settings")
+        .ok_or("wireguard outbound has no settings")?;
+    let config = crate::wireguard::DeviceConfig::from_json(settings)
+        .map_err(|reason| format!("wireguard outbound: {reason}"))?;
+    crate::wg::WireGuardOut::new(config)
+        .map(Some)
+        .map_err(|reason| format!("wireguard outbound: {reason}"))
+}
+
+/// The WARP outbound's identity, registration and both halves, built once at
+/// startup so a bad identity or an unusable API refuses the config.
+fn find_warp_outbound(root: &Json, test: bool) -> Result<Option<crate::warp::WarpOut>, String> {
+    let Some(outbound) = root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .and_then(|outbounds| outbounds.first())
+    else {
+        return Ok(None);
+    };
+    if canonical_protocol(
+        outbound
+            .get("protocol")
+            .and_then(Json::as_str)
+            .unwrap_or(""),
+    ) != "warp"
+    {
+        return Ok(None);
+    }
+    if dialer_proxy_tag(outbound).is_some() {
+        eprintln!("warp: sockopt.dialerProxy is ignored; the tunnel dials its edge directly");
+    }
+    crate::warp::WarpOut::new(outbound, test)
+        .map(Some)
+        .map_err(|reason| format!("warp outbound: {reason}"))
+}
+
+/// The MASQUE outbound's transport and account, built once at startup so a bad
+/// server or a missing TLS identity refuses the config instead of a flow.
+fn find_masque_outbound(root: &Json) -> Result<Option<crate::masque::MasqueOut>, String> {
+    let empty = Vec::new();
+    for outbound in root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .unwrap_or(&empty)
+    {
+        if canonical_protocol(
+            outbound
+                .get("protocol")
+                .and_then(Json::as_str)
+                .unwrap_or(""),
+        ) != "masque"
+        {
+            continue;
+        }
+        return crate::masque::MasqueOut::new(outbound)
+            .map(Some)
+            .map_err(|reason| format!("masque outbound: {reason}"));
+    }
+    Ok(None)
+}
+
+/// The freedom outbound's settings, read the way the reference reads them. A value the
+/// reference refuses is a startup refusal here too; a field this tree has no lane for is
+/// named once and left out rather than silently changing the dial.
+pub(crate) fn find_freedom_outbound(root: &Json) -> Result<Option<FreedomOut>, String> {
+    let empty = Vec::new();
+    let outbounds = root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .unwrap_or(&empty);
+    for outbound in outbounds {
+        if canonical_protocol(
+            outbound
+                .get("protocol")
+                .and_then(Json::as_str)
+                .unwrap_or(""),
+        ) != "freedom"
+        {
+            continue;
+        }
+        let settings = outbound.get("settings");
+        let mut freedom = FreedomOut::default();
+        if let Some(redirect) = settings
+            .and_then(|s| s.get("redirect"))
+            .and_then(Json::as_str)
+        {
+            if !redirect.is_empty() {
+                freedom.redirect = Some(parse_freedom_redirect(redirect)?);
+            }
+        }
+        let strategy = settings
+            .and_then(|s| s.get("targetStrategy").or_else(|| s.get("domainStrategy")))
+            .and_then(Json::as_str)
+            .unwrap_or("");
+        freedom.domain = FreedomDomain::parse(strategy)
+            .ok_or_else(|| format!("unsupported domain strategy: {strategy}"))?;
+        // The reference migrates an outbound-level `targetStrategy` into the freedom lane's own, and it wins over the settings' name.
+        if let Some(strategy) = parse_target_strategy(outbound)? {
+            if freedom.domain != FreedomDomain::AsIs && freedom.domain != strategy {
+                eprintln!(
+                    "freedom: outbound targetStrategy overrides the lane's {}",
+                    strategy_name(freedom.domain)
+                );
+            }
+            freedom.domain = strategy;
+        }
+        if let Some(version) = settings
+            .and_then(|s| s.get("proxyProtocol"))
+            .and_then(Json::as_u32)
+        {
+            if version <= 2 {
+                freedom.proxy_protocol = version as u8;
+            } else {
+                eprintln!(
+                    "freedom: proxyProtocol {version} is outside 1..=2, so it is not written"
+                );
+            }
+        }
+        if let Some(conf) = settings
+            .and_then(|s| s.get("fragment"))
+            .filter(|conf| !matches!(conf, Json::Null))
+        {
+            let stage = crate::config::fragment(Some(conf)).ok_or_else(|| {
+                "freedom fragment cannot be driven: check packets, length, interval and maxSplit"
+                    .to_owned()
+            })?;
+            let mut chain = ferrox_core::finalmask::Chain::default();
+            chain.push(stage);
+            freedom.fragment = Some(Arc::new(chain));
+        }
+        let settings = settings.unwrap_or(&Json::Null);
+        if settings
+            .get("noise")
+            .is_some_and(|value| !matches!(value, Json::Null))
+        {
+            return Err("freedom: `noise` is removed; use `noises`".to_owned());
+        }
+        freedom.noises = freedom_noise_list(outbound, settings)?;
+        freedom.final_rules = parse_freedom_final_rules(settings)?;
+        if !freedom.final_rules.is_empty() && dialer_proxy_tag(outbound).is_some() {
+            eprintln!(
+                "The \"finalRules\" setting is ignored when \"sockopt.dialerProxy\" is set, since freedom is not the final outbound."
+            );
+        }
+        if settings
+            .get("ipsBlocked")
+            .is_some_and(|value| !matches!(value, Json::Null))
+        {
+            eprintln!(
+                "freedom: `ipsBlocked` is removed and migrated to finalRules; it is not read"
+            );
+        }
+        if settings
+            .get("userLevel")
+            .is_some_and(|value| !matches!(value, Json::Null))
+        {
+            eprintln!("freedom: userLevel is not carried; the flow keeps its own policy");
+        }
+        return Ok(Some(freedom));
+    }
+    Ok(None)
+}
+
+/// The reference's `noises`: each entry writes its count of datagrams before a UDP flow's first
+/// payload, and each kind the current schema names is read here.
+fn parse_freedom_noises(settings: &Json) -> Result<Vec<FreedomNoise>, String> {
+    parse_noise_list(settings.get("noises"), "freedom")
+}
+
+/// The decoys a `finalmask.udp` list names: one `noise` entry's `settings.noise` is a list of
+/// the same entries `settings.noises` holds.
+fn parse_finalmask_noises(settings: Option<&Json>) -> Result<Vec<FreedomNoise>, String> {
+    let Some(udp) = settings
+        .and_then(|settings| settings.get("finalmask"))
+        .and_then(|finalmask| finalmask.get("udp"))
+        .and_then(Json::as_arr)
+    else {
+        return Ok(Vec::new());
+    };
+    let mut noises = Vec::new();
+    for entry in udp {
+        if entry.get("type").and_then(Json::as_str) != Some("noise") {
+            continue;
+        }
+        noises.extend(parse_noise_list(
+            entry
+                .get("settings")
+                .and_then(|settings| settings.get("noise")),
+            "finalmask.udp noise",
+        )?);
+    }
+    Ok(noises)
+}
+
+/// The decoy list a freedom outbound dials: the outbound's `evasion.noises` overlay wins, then
+/// the `finalmask.udp` list, then the legacy `settings.noises`, with one warning where the legacy
+/// list and the finalmask list both name decoys.
+fn freedom_noise_list(outbound: &Json, settings: &Json) -> Result<Vec<FreedomNoise>, String> {
+    let legacy = parse_freedom_noises(settings)?;
+    let masked = parse_finalmask_noises(outbound.get("streamSettings"))?;
+    let overlay = parse_noise_list(
+        outbound
+            .get("evasion")
+            .and_then(|evasion| evasion.get("noises")),
+        "evasion",
+    )?;
+    if !legacy.is_empty() && !masked.is_empty() {
+        eprintln!(
+            "freedom: settings.noises and finalmask.udp noise both name decoys; the finalmask list wins"
+        );
+    }
+    Ok(if !overlay.is_empty() {
+        overlay
+    } else if !masked.is_empty() {
+        masked
+    } else {
+        legacy
+    })
+}
+
+fn parse_noise_list(value: Option<&Json>, label: &str) -> Result<Vec<FreedomNoise>, String> {
+    let Some(value) = value.filter(|value| !matches!(value, Json::Null)) else {
+        return Ok(Vec::new());
+    };
+    let items = value
+        .as_arr()
+        .ok_or_else(|| format!("{label}: noises is not a list"))?;
+    let mut noises = Vec::with_capacity(items.len());
+    for item in items {
+        noises.push(parse_freedom_noise(item)?);
+    }
+    Ok(noises)
+}
+
+/// The kind a noise entry names, its drawn length range, and the spelling a ceiling refusal
+/// quotes back.
+fn freedom_noise_kind(
+    item: &Json,
+) -> Result<(ferrox_core::evasion::NoiseKind, u64, u64, String), String> {
+    use ferrox_core::evasion::NoiseKind;
+    let rand_spec = item.get("rand").and_then(Json::as_str);
+    let kind_name = item
+        .get("type")
+        .and_then(Json::as_str)
+        .or(rand_spec.map(|_| "rand"))
+        .unwrap_or("rand");
+    let raw = item.get("packet").and_then(Json::as_str).unwrap_or("");
+    let text = raw.trim();
+    let (kind, length_min, length_max, shown) = match kind_name {
+        "rand" => {
+            let spec = rand_spec.unwrap_or(text);
+            let (min, max) = freedom_range_text(spec)
+                .ok_or_else(|| format!("freedom: rand noise length `{spec}` is not a range"))?;
+            if min <= 0 || max <= 0 {
+                return Err("freedom: rand noise length must be positive".to_owned());
+            }
+            let bytes = match item.get("randRange").and_then(Json::as_str) {
+                Some(range) => freedom_byte_range(range)?,
+                None => (0, u8::MAX),
+            };
+            (
+                NoiseKind::Rand { bytes },
+                min as u64,
+                max as u64,
+                spec.to_owned(),
+            )
+        }
+        "quic" => {
+            let spec = if text.is_empty() { "5-10" } else { text };
+            let (min, max) = freedom_range_text(spec)
+                .ok_or_else(|| format!("freedom: quic noise length `{spec}` is not a range"))?;
+            if min <= 0 || max <= 0 {
+                return Err("freedom: quic noise length must be positive".to_owned());
+            }
+            (NoiseKind::Quic, min as u64, max as u64, spec.to_owned())
+        }
+        "str" => (
+            NoiseKind::Fixed(raw.as_bytes().to_vec()),
+            0,
+            0,
+            String::new(),
+        ),
+        "hex" => (NoiseKind::Fixed(freedom_hex(text)?), 0, 0, String::new()),
+        "base64" => (NoiseKind::Fixed(freedom_base64(text)?), 0, 0, String::new()),
+        "array" => (
+            NoiseKind::Fixed(freedom_array(item.get("packet"))?),
+            0,
+            0,
+            String::new(),
+        ),
+        other => {
+            return Err(format!(
+                "freedom: noise type `{other}` is not rand/str/hex/base64/array/quic"
+            ));
+        }
+    };
+    Ok((kind, length_min, length_max, shown))
+}
+
+fn parse_freedom_noise(item: &Json) -> Result<FreedomNoise, String> {
+    use ferrox_core::evasion::{Noise, NoiseKind};
+    let (kind, length_min, length_max, shown) = freedom_noise_kind(item)?;
+    let delay = match item.get("delay") {
+        None | Some(Json::Null) => (0, 0),
+        Some(value) => freedom_u64_range(value, "noise delay")?.unwrap_or((0, 0)),
+    };
+    let count = match item.get("count") {
+        None | Some(Json::Null) => 1,
+        Some(value) => match value.as_i64() {
+            Some(count) => u32::try_from(count).map_err(|_| {
+                "freedom: noise count is not a number between 0 and 4294967295".to_owned()
+            })?,
+            None => {
+                return Err(
+                    "freedom: noise count is not a number between 0 and 4294967295".to_owned(),
+                );
+            }
+        },
+    };
+    let apply_to = match item
+        .get("applyTo")
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "ip" | "all" => FreedomNoiseApply::Ip,
+        "ipv4" => FreedomNoiseApply::Ipv4,
+        "ipv6" => FreedomNoiseApply::Ipv6,
+        other => {
+            return Err(format!(
+                "freedom: noise applyTo `{other}` is not ip/ipv4/ipv6"
+            ));
+        }
+    };
+    let ceiling = if apply_to == FreedomNoiseApply::Ipv6 {
+        UDP_NOISE_MAX_V6
+    } else {
+        UDP_NOISE_MAX_V4
+    };
+    match &kind {
+        NoiseKind::Rand { .. } | NoiseKind::Quic => {
+            let (low, high) = if length_min <= length_max {
+                (length_min, length_max)
+            } else {
+                (length_max, length_min)
+            };
+            let largest = if low == high { high } else { high - 1 };
+            if largest > ceiling {
+                return Err(format!(
+                    "freedom: noise length `{shown}` can exceed the UDP payload limit"
+                ));
+            }
+        }
+        NoiseKind::Fixed(bytes) if bytes.len() as u64 > ceiling => {
+            return Err(format!(
+                "freedom: a noise packet of {} bytes exceeds the UDP payload limit",
+                bytes.len()
+            ));
+        }
+        NoiseKind::Fixed(_) => {}
+    }
+    Ok(FreedomNoise {
+        noise: Noise {
+            kind,
+            length_min,
+            length_max,
+            delay_min: delay.0,
+            delay_max: delay.1,
+            count,
+        },
+        apply_to,
+    })
+}
+
+fn freedom_base64(text: &str) -> Result<Vec<u8>, String> {
+    let text = text.replace('+', "-").replace('/', "_").replace('=', "");
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    ferrox_core::b64::decode(text.as_bytes())
+        .ok_or_else(|| "freedom: base64 noise is not decodable".to_owned())
+}
+
+fn freedom_byte_range(text: &str) -> Result<(u8, u8), String> {
+    let parse = |part: &str| {
+        part.trim()
+            .parse::<u8>()
+            .map_err(|_| format!("freedom: randRange `{text}` is not a byte range"))
+    };
+    if let Some((low, high)) = text.split_once('-') {
+        return Ok((parse(low)?, parse(high)?));
+    }
+    let value = parse(text)?;
+    Ok((value, value))
+}
+
+fn freedom_array(packet: Option<&Json>) -> Result<Vec<u8>, String> {
+    match packet {
+        None | Some(Json::Null) => Ok(Vec::new()),
+        Some(Json::Arr(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_u32()
+                    .and_then(|value| u8::try_from(value).ok())
+                    .ok_or_else(|| "freedom: an array noise byte is not 0..=255".to_owned())
+            })
+            .collect(),
+        Some(Json::Str(text)) => text
+            .split(',')
+            .filter(|part| !part.trim().is_empty())
+            .map(|part| {
+                part.trim()
+                    .parse::<u8>()
+                    .map_err(|_| "freedom: an array noise byte is not 0..=255".to_owned())
+            })
+            .collect(),
+        Some(_) => Err("freedom: array noise packet is not a list or a string".to_owned()),
+    }
+}
+
+fn freedom_hex(text: &str) -> Result<Vec<u8>, String> {
+    if !text.len().is_multiple_of(2) {
+        return Err("freedom: hex noise has an odd number of digits".to_owned());
+    }
+    let mut out = Vec::with_capacity(text.len() / 2);
+    for pair in text.as_bytes().as_chunks::<2>().0 {
+        let high = freedom_hex_digit(pair[0])?;
+        let low = freedom_hex_digit(pair[1])?;
+        out.push((high << 4) | low);
+    }
+    Ok(out)
+}
+
+fn freedom_hex_digit(byte: u8) -> Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err("freedom: hex noise is not hexadecimal".to_owned()),
+    }
+}
+
+/// The reference's `finalRules`, read in order: the first rule a destination matches decides.
+fn parse_freedom_final_rules(settings: &Json) -> Result<Vec<FreedomFinalRule>, String> {
+    let Some(value) = settings.get("finalRules") else {
+        return Ok(Vec::new());
+    };
+    if matches!(value, Json::Null) {
+        return Ok(Vec::new());
+    }
+    let items = value
+        .as_arr()
+        .ok_or_else(|| "freedom: finalRules is not a list".to_owned())?;
+    let mut rules = Vec::with_capacity(items.len());
+    for item in items {
+        let action = match item
+            .get("action")
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "allow" => FreedomRuleAction::Allow,
+            "block" => FreedomRuleAction::Block,
+            other => {
+                return Err(format!("freedom: unknown final rule action `{other}`"));
+            }
+        };
+        let networks = match item.get("network") {
+            None | Some(Json::Null) => None,
+            Some(value) => freedom_networks(value)?,
+        };
+        let ports = item
+            .get("port")
+            .filter(|value| !matches!(value, Json::Null))
+            .map(freedom_ports)
+            .transpose()?
+            .flatten();
+        let ips = item
+            .get("ip")
+            .filter(|value| !matches!(value, Json::Null))
+            .map(freedom_ips)
+            .transpose()?
+            .flatten();
+        let block_delay = item
+            .get("blockDelay")
+            .filter(|value| !matches!(value, Json::Null))
+            .map(|value| freedom_u64_range(value, "blockDelay"))
+            .transpose()?
+            .flatten();
+        rules.push(FreedomFinalRule {
+            action,
+            networks,
+            ports,
+            ips,
+            block_delay,
+        });
+    }
+    Ok(rules)
+}
+
+fn freedom_networks(value: &Json) -> Result<Option<[bool; 2]>, String> {
+    let mut networks = [false, false];
+    let mut add = |name: &str| {
+        if name.eq_ignore_ascii_case("tcp") {
+            networks[0] = true;
+        } else if name.eq_ignore_ascii_case("udp") {
+            networks[1] = true;
+        }
+    };
+    match value {
+        Json::Str(text) => {
+            for name in text.split(',') {
+                add(name);
+            }
+        }
+        Json::Arr(items) => {
+            // An empty list builds no network entries, which the reference treats as absent.
+            if items.is_empty() {
+                return Ok(None);
+            }
+            for item in items {
+                let name = item.as_str().ok_or_else(|| {
+                    "freedom: network has a value that is not a string".to_owned()
+                })?;
+                add(name);
+            }
+        }
+        _ => return Err("freedom: network is not a string or array".to_owned()),
+    }
+    Ok(Some(networks))
+}
+
+fn freedom_ports(value: &Json) -> Result<Option<Vec<(u16, u16)>>, String> {
+    let pieces: Vec<String> = match value {
+        Json::Str(text) => text.split(',').map(str::to_owned).collect(),
+        Json::Arr(items) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| "freedom: port has a value that is not a string".to_owned())
+            })
+            .collect::<Result<_, _>>()?,
+        Json::Num(_) => {
+            let port = value
+                .as_port()
+                .ok_or_else(|| "freedom: port is not between 0 and 65535".to_owned())?;
+            return Ok((port != 0).then(|| vec![(port, port)]));
+        }
+        _ => return Err("freedom: port is not a string, number or array".to_owned()),
+    };
+    let mut ranges = Vec::new();
+    for piece in pieces {
+        let piece = piece.trim();
+        if piece.is_empty() {
+            continue;
+        }
+        let piece = match piece.strip_prefix("env:") {
+            Some(name) => std::env::var(name)
+                .map_err(|_| format!("freedom: env `{name}` in a port is unset"))?,
+            None => piece.to_owned(),
+        };
+        let (from, to) = match piece.split_once('-') {
+            Some((from, to)) => (from, to),
+            None => (piece.as_str(), piece.as_str()),
+        };
+        let from = freedom_port(from)?;
+        let to = freedom_port(to)?;
+        if from > to {
+            return Err(format!("freedom: port range `{piece}` is reversed"));
+        }
+        ranges.push((from, to));
+    }
+    // An empty port list is the reference's "all ports", the same as an absent one.
+    Ok((!ranges.is_empty()).then_some(ranges))
+}
+
+fn freedom_port(text: &str) -> Result<u16, String> {
+    text.parse::<u16>()
+        .map_err(|_| format!("freedom: port `{text}` is not between 0 and 65535"))
+}
+
+fn freedom_ips(value: &Json) -> Result<Option<Arc<crate::router::IpMatcher>>, String> {
+    if matches!(value, Json::Arr(items) if items.is_empty()) {
+        return Ok(None);
+    }
+    let mut assets = crate::router::Assets::new(crate::router::asset_dirs());
+    crate::router::ip_matcher(value, &mut assets, "freedom finalRules ip")
+        .map(|matcher| Some(Arc::new(matcher)))
+}
+
+fn freedom_u64_range(value: &Json, field: &str) -> Result<Option<(u64, u64)>, String> {
+    let (min, max) = match value {
+        Json::Num(_) => {
+            let number = value.as_u32().ok_or_else(|| {
+                format!("freedom: {field} is not a number between 0 and 4294967295")
+            })?;
+            (i64::from(number), i64::from(number))
+        }
+        Json::Str(text) => freedom_range_text(text)
+            .ok_or_else(|| format!("freedom: {field} `{text}` is not a range"))?,
+        _ => return Err(format!("freedom: {field} is not a number or string")),
+    };
+    if min < 0 || max < 0 {
+        return Err(format!("freedom: {field} cannot be negative"));
+    }
+    Ok(Some((min as u64, max as u64)))
+}
+
+/// `ParseRangeString`: a number, an empty string as zero, or `a-b`; the leading dash of a
+/// negative lower end belongs to it, so `-114-514` splits after its second number.
+fn freedom_range_text(text: &str) -> Option<(i64, i64)> {
+    if let Ok(single) = text.parse::<i64>() {
+        return Some((single, single));
+    }
+    if text.is_empty() {
+        return Some((0, 0));
+    }
+    let leading = text.starts_with('-');
+    let (left, right) = text.strip_prefix('-').unwrap_or(text).split_once('-')?;
+    let left = if leading {
+        format!("-{left}")
+    } else {
+        left.to_owned()
+    };
+    Some((left.parse().ok()?, right.parse().ok()?))
+}
+
+fn parse_freedom_redirect(text: &str) -> Result<FreedomRedirect, String> {
+    let (host, port) = text
+        .rsplit_once(':')
+        .ok_or_else(|| format!("invalid redirect address: {text}: missing port"))?;
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| format!("invalid redirect port: {text}"))?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.is_empty() {
+        Ok(FreedomRedirect::Port(port))
+    } else {
+        Ok(FreedomRedirect::Address(host.to_owned(), port))
+    }
+}
+
+/// The blackhole outbound's answer, read the way the reference's own config
+/// builder reads it. An answer the reference does not know is a startup
+/// refusal, not an outbound this tree skips.
+fn find_blackhole_outbound(
+    root: &Json,
+) -> Result<Option<ferrox_core::blackhole::Response>, String> {
+    let empty = Vec::new();
+    let outbounds = root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .unwrap_or(&empty);
+    for outbound in outbounds {
+        let protocol = canonical_protocol(
+            outbound
+                .get("protocol")
+                .and_then(Json::as_str)
+                .unwrap_or(""),
+        );
+        if protocol != "blackhole" {
+            continue;
+        }
+        return Ok(Some(crate::blackhole::answer(outbound.get("settings"))?));
+    }
+    Ok(None)
+}
+
+/// The tag a `loopback` outbound re-injects through, or nothing when no such
+/// outbound is configured to carry. An empty tag skips it; its sniffing, when
+/// enabled, runs on the re-inject before the named inbound is dialled.
+fn find_loopback_outbound(root: &Json) -> Option<String> {
+    let outbounds = root.get("outbounds").and_then(Json::as_arr)?;
+    for outbound in outbounds {
+        if canonical_protocol(
+            outbound
+                .get("protocol")
+                .and_then(Json::as_str)
+                .unwrap_or(""),
+        ) != "loopback"
+        {
+            continue;
+        }
+        let settings = outbound.get("settings")?;
+        return settings
+            .get("inboundTag")
+            .and_then(Json::as_str)
+            .filter(|tag| !tag.is_empty())
+            .map(str::to_owned);
+    }
+    None
+}
+
+/// Whether the redial speaks the named carrier over plain TCP. Datagram
+/// handshakes need a session and roots the inbound JSON does not carry, so
+/// they refuse here rather than dialling half a handshake.
+fn loopback_carrier(carrier: &Carrier) -> bool {
+    matches!(
+        carrier,
+        Carrier::Raw(_)
+            | Carrier::Ws { .. }
+            | Carrier::HttpUpgrade { .. }
+            | Carrier::Grpc(_)
+            | Carrier::Xhttp { .. }
+            | Carrier::HttpHeader { .. }
+    )
+}
+
+/// How many loopback hops a single flow may take before the chain is refused. The reference has
+/// no cap and can spin on a tag cycle; `ZeroNet`'s bound is the shape kept here.
+const MAX_LOOPBACK_DEPTH: u8 = 8;
+
+/// A loopback's named-inbound tag, its own sniffer, and the dial an unrouted config still uses.
+/// A routed table binds the live rules here, so the named inbound's second pass runs per flow.
+#[derive(Debug, Clone)]
+pub(crate) struct LoopbackOut {
+    inbound_tag: String,
+    inbound_name: Option<String>,
+    source_known: bool,
+    /// Present for a server-shaped named inbound, and for the unrouted convenience path.
+    dial: Option<Outbound>,
+    sniffing: Option<Arc<crate::sniff::Sniffing>>,
+    /// The table this outbound was built in, bound once after the table is complete.
+    route: Arc<OnceLock<Weak<RouteShared>>>,
+}
+
+impl LoopbackOut {
+    fn bind(&self, shared: &Arc<RouteShared>) {
+        let _ = self.route.set(Arc::downgrade(shared));
+    }
+
+    fn shared(&self) -> Option<Arc<RouteShared>> {
+        self.route.get()?.upgrade()
+    }
+}
+
+/// Whether the second pass selected this same loopback by tag: the reference would re-enter it,
+/// and this tree stops at the named inbound's dial when there is one.
+fn same_loopback(lane: &Picked<'_>, loopback: &LoopbackOut) -> bool {
+    matches!(&**lane, Outbound::Loopback(next) if next.inbound_tag == loopback.inbound_tag)
+}
+
+/// The sniffing block the loopback outbound naming this inbound carries, if it enables one.
+fn loopback_sniffing(
+    root: &Json,
+    inbound_tag: &str,
+) -> Result<Option<Arc<crate::sniff::Sniffing>>, String> {
+    let empty = Vec::new();
+    for outbound in root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .unwrap_or(&empty)
+    {
+        if canonical_protocol(
+            outbound
+                .get("protocol")
+                .and_then(Json::as_str)
+                .unwrap_or(""),
+        ) != "loopback"
+        {
+            continue;
+        }
+        let settings = outbound.get("settings");
+        if settings
+            .and_then(|settings| settings.get("inboundTag"))
+            .and_then(Json::as_str)
+            != Some(inbound_tag)
+        {
+            continue;
+        }
+        let sniffing = crate::sniff::parse(settings.and_then(|settings| settings.get("sniffing")))
+            .map_err(|error| format!("loopback `{inbound_tag}` sniffing {error}"))?;
+        return Ok(sniffing.filter(|sniffing| sniffing.enabled()));
+    }
+    Ok(None)
+}
+
+/// The unrouted convenience: a loopback with no rules to consult desugars to the
+/// named inbound's own credentials pointed at where it listens, so the re-injected
+/// flow carries a real handshake on the loopback wire. A routed table instead builds
+/// [`resolve_routed_loopback`], where the named tag's rules run per flow.
+fn resolve_loopback(root: &Json, tag: &str, freedom: bool) -> Result<Outbound, String> {
+    let empty = Vec::new();
+    let inbounds = root
+        .get("inbounds")
+        .and_then(Json::as_arr)
+        .unwrap_or(&empty);
+    let inbound = inbounds
+        .iter()
+        .find(|inbound| inbound.get("tag").and_then(Json::as_str) == Some(tag))
+        .ok_or_else(|| format!("names an unknown inbound `{tag}`"))?;
+    let protocol = canonical_protocol(inbound.get("protocol").and_then(Json::as_str).unwrap_or(""));
+    // A front would re-enter this same resolution through the single outbound.
+    if matches!(protocol, "socks" | "http" | "mixed" | "dokodemo-door") {
+        return Err(format!(
+            "names front `{tag}`, which would re-enter the loopback"
+        ));
+    }
+    if !freedom {
+        return Err(format!(
+            "names `{tag}`, which has no freedom outbound to leave by"
+        ));
+    }
+    let dial = loopback_dial_for_inbound(inbound, protocol, tag)?;
+    Ok(match loopback_sniffing(root, tag)? {
+        Some(sniffing) => {
+            loopback_out(tag, inbound_name(inbound), true, Some(dial), Some(sniffing))
+        }
+        None => dial,
+    })
+}
+
+/// A routed loopback: the tag is all the second pass needs, so a tag no inbound answers to is
+/// still valid here (the reference's dispatcher does not look it up either). A named server
+/// inbound also gets the redial its datagram lane still uses; a front gets none, because its
+/// only TCP path is the second pass.
+fn resolve_routed_loopback(root: &Json, config: &Json) -> Result<Outbound, String> {
+    let settings = config.get("settings");
+    let inbound_tag = settings
+        .and_then(|settings| settings.get("inboundTag"))
+        .and_then(Json::as_str)
+        .unwrap_or("");
+    let sniffing = crate::sniff::parse(settings.and_then(|settings| settings.get("sniffing")))
+        .map_err(|error| format!("loopback `{inbound_tag}` sniffing {error}"))?
+        .filter(|sniffing| sniffing.enabled());
+    let inbound = root
+        .get("inbounds")
+        .and_then(Json::as_arr)
+        .unwrap_or(&[])
+        .iter()
+        .find(|inbound| inbound.get("tag").and_then(Json::as_str) == Some(inbound_tag));
+    let (name, source_known, dial) = match inbound {
+        Some(inbound) => {
+            let protocol =
+                canonical_protocol(inbound.get("protocol").and_then(Json::as_str).unwrap_or(""));
+            let front = matches!(protocol, "socks" | "http" | "mixed" | "dokodemo-door");
+            let source_known = !matches!(protocol, "tun" | "wireguard" | "masque");
+            let dial = if front {
+                None
+            } else {
+                match loopback_dial_for_inbound(inbound, protocol, inbound_tag) {
+                    Ok(dial) => Some(dial),
+                    Err(reason) => {
+                        eprintln!(
+                            "loopback `{inbound_tag}`: {reason}; its TCP second pass still runs, its datagram lane does not"
+                        );
+                        None
+                    }
+                }
+            };
+            (inbound_name(inbound), source_known, dial)
+        }
+        None => (None, true, None),
+    };
+    Ok(loopback_out(
+        inbound_tag,
+        name,
+        source_known,
+        dial,
+        sniffing,
+    ))
+}
+
+/// One loopback value, with the table handle empty until `RouteShared` binds it.
+fn loopback_out(
+    inbound_tag: &str,
+    inbound_name: Option<String>,
+    source_known: bool,
+    dial: Option<Outbound>,
+    sniffing: Option<Arc<crate::sniff::Sniffing>>,
+) -> Outbound {
+    Outbound::Loopback(Box::new(LoopbackOut {
+        inbound_tag: inbound_tag.to_owned(),
+        inbound_name,
+        source_known,
+        dial,
+        sniffing,
+        route: Arc::new(OnceLock::new()),
+    }))
+}
+
+/// The named inbound's own credentials pointed at where it listens.
+fn loopback_dial_for_inbound(
+    inbound: &Json,
+    protocol: &str,
+    tag: &str,
+) -> Result<Outbound, String> {
+    let listen = inbound
+        .get("listen")
+        .and_then(Json::as_str)
+        .unwrap_or("127.0.0.1");
+    // An every-interface bind is redialled where it also answers.
+    let listen = match listen {
+        "0.0.0.0" | "::" | "" => "127.0.0.1",
+        named => named,
+    };
+    let Some(field) = inbound.get("port") else {
+        return Err(format!("names `{tag}`, which binds no port"));
+    };
+    let Some(port) = inbound_ports(field).into_iter().next() else {
+        return Err(format!("names `{tag}`, which binds no port"));
+    };
+    loopback_dial(inbound, protocol, listen, port, tag)
+}
+
+/// The named inbound's own credentials pointed at where it listens, so the
+/// re-injected flow carries a real handshake on the loopback wire.
+fn loopback_dial(
+    inbound: &Json,
+    protocol: &str,
+    address: &str,
+    port: u16,
+    tag: &str,
+) -> Result<Outbound, String> {
+    if crate::config::accept_proxy_protocol(inbound.get("streamSettings")) {
+        return Err(format!(
+            "names `{tag}`, whose listener expects a PROXY header no loopback redial sends"
+        ));
+    }
+    let (headers, heartbeat) = crate::config::carrier_headers(inbound.get("streamSettings"));
+    match protocol {
+        "vless" if vless_security_supported(stream_security(inbound)) => {
+            let (carrier, host) = loopback_carrier_of(inbound, address, tag)?;
+            let flow = inbound_first_client(inbound)
+                .and_then(|client| client.get("flow"))
+                .and_then(Json::as_str)
+                .unwrap_or("");
+            if !flow.is_empty() && flow != "none" && !ferrox_core::vless::is_vision_name(flow) {
+                return Err(format!(
+                    "names `{tag}`, whose first user asks for unknown flow `{flow}`"
+                ));
+            }
+            if ferrox_core::vless::is_vision_name(flow) {
+                return Err(format!(
+                    "names `{tag}`, whose first user asks for the vision flow a plain loopback dial does not carry"
+                ));
+            }
+            let encryption =
+                vless_loopback_encryption(crate::config::server_decryption_string(inbound))?;
+            Ok(Outbound::Vless(VlessOut {
+                address: address.to_owned(),
+                port,
+                id: inbound_id(inbound),
+                carrier,
+                host,
+                mux: Mux::default(),
+                pool: Pools::default(),
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
+                tls: None,
+                flow: String::new(),
+                reality: None,
+                headers,
+                heartbeat,
+                encryption,
+            }))
+        }
+        "trojan" if matches!(stream_security(inbound), "" | "none") => {
+            let (carrier, host) = loopback_carrier_of(inbound, address, tag)?;
+            Ok(Outbound::Trojan(TrojanOut {
+                address: address.to_owned(),
+                port,
+                key: trojan_key(&inbound_password(inbound)),
+                carrier,
+                host,
+                tls: None,
+                headers,
+                heartbeat,
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
+                mux: Mux::default(),
+                pool: Pools::default(),
+                reality: None,
+            }))
+        }
+        "vmess" if matches!(stream_security(inbound), "" | "none") => {
+            let (carrier, host) = loopback_carrier_of(inbound, address, tag)?;
+            let client = inbound_first_client(inbound);
+            let cipher = client.map_or(crate::vmess::Cipher::Auto, vmess_cipher);
+            Ok(Outbound::Vmess(VmessOut {
+                address: address.to_owned(),
+                port,
+                id: inbound_id(inbound),
+                cipher,
+                auth_len: client.is_some_and(authenticated_length),
+                no_termination: client.is_some_and(no_termination),
+                carrier,
+                host,
+                tls: None,
+                reality: None,
+                headers,
+                heartbeat,
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
+                mux: Mux::default(),
+                pool: Pools::default(),
+            }))
+        }
+        "shadowsocks" if matches!(stream_security(inbound), "" | "none") => {
+            loopback_shadowsocks(inbound, address, port, tag, headers, heartbeat)
+        }
+        _ => Err(format!(
+            "names `{tag}` speaking `{protocol}`, which no client dial here replays"
+        )),
+    }
+}
+
+fn loopback_shadowsocks(
+    inbound: &Json,
+    address: &str,
+    port: u16,
+    tag: &str,
+    headers: Vec<(String, String)>,
+    heartbeat: u32,
+) -> Result<Outbound, String> {
+    let method = inbound_method(inbound);
+    if !inbound_ss_destinations(inbound, &method).is_empty() {
+        return Err(format!(
+            "names `{tag}`, which relays to fixed destinations rather than freedom"
+        ));
+    }
+    let (carrier, host) = loopback_carrier_of(inbound, address, tag)?;
+    Ok(Outbound::Shadowsocks(ShadowsocksOut {
+        address: address.to_owned(),
+        port,
+        method,
+        password: inbound_ss_password(inbound),
+        carrier,
+        host,
+        mux: Mux::default(),
+        pool: Pools::default(),
+        tls: None,
+        reality: None,
+        hysteria_roots: None,
+        headers,
+        heartbeat,
+    }))
+}
+
+/// The carrier the redial speaks, or the refusal when it speaks none.
+fn loopback_carrier_of(
+    inbound: &Json,
+    address: &str,
+    tag: &str,
+) -> Result<(Carrier, String), String> {
+    let (carrier, host) = outbound_carrier(inbound, address);
+    if loopback_carrier(&carrier) {
+        Ok((carrier, host))
+    } else {
+        Err(format!(
+            "names `{tag}`, whose carrier no plain-TCP redial speaks"
+        ))
+    }
+}
+
+/// Carrier defaults to `auto`: QUIC, HTTP/2, HTTP/1.1. A named edge is dialed whatever the catalogue publishes.
+fn foxy_candidates(
+    outbound: &Json,
+    link: &ferrox_core::foxy::link::FoxyLink,
+    country: &str,
+    city: &str,
+    roots: ferrox_core::tls::Anchors,
+    upstream: Option<&crate::foxy::UpstreamProxy>,
+) -> Vec<ferrox_core::foxy::Candidate> {
+    let named = link.host();
+    let named_edge = (!named.is_empty()).then(|| ferrox_core::foxy::Candidate {
+        host: std::sync::Arc::from(named),
+        port: link.port(),
+        country: country.to_owned(),
+        city: city.to_owned(),
+    });
+    let configured_edges = foxy_edges(outbound, country, city);
+    if let Some(edge) = named_edge {
+        return vec![edge];
+    }
+    if !configured_edges.is_empty() {
+        return configured_edges;
+    }
+    crate::foxy_catalog::edges_via(roots, upstream)
+}
+
+/// A configured edge address, resolved once for every dial; otherwise catalogue names resolve per dial.
+fn foxy_edge_address(settings: Option<&Json>) -> Option<SocketAddr> {
+    let named = foxy_text(settings, "edgeAddress");
+    if named.is_empty() {
+        return None;
+    }
+    resolve_endpoint(&named, 443)
+}
+
+/// Upstream: config first, link second. A value that does not parse is refused, since going direct would leak.
+fn foxy_upstream(
+    settings: Option<&Json>,
+    link: &ferrox_core::foxy::link::FoxyLink,
+) -> Result<Option<crate::foxy::UpstreamProxy>, String> {
+    let named = foxy_text(settings, "upstreamProxy");
+    let named = if named.is_empty() {
+        link.upstream_proxy().to_owned()
+    } else {
+        named
+    };
+    if named.is_empty() {
+        return Ok(None);
+    }
+    crate::foxy::upstream_proxy(&named).map(Some).ok_or(named)
+}
+
+fn foxy_carrier(
+    settings: Option<&Json>,
+    link: &ferrox_core::foxy::link::FoxyLink,
+) -> crate::foxy::Carrier {
+    let named = foxy_text(settings, "carrier");
+    let named = if named.is_empty() {
+        link.carrier().to_owned()
+    } else {
+        named
+    };
+    crate::foxy::carrier(&named)
+}
+
+/// One field, two spellings: a config array or a comma-separated link, since a link has no arrays.
+fn foxy_list_or(
+    link: &ferrox_core::foxy::link::FoxyLink,
+    settings: Option<&Json>,
+    key: &str,
+) -> Vec<String> {
+    let listed = foxy_strings(settings.and_then(|s| s.get(key)));
+    if !listed.is_empty() {
+        return listed;
+    }
+    link.param(key)
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Configured edges in the pinned country, city first, so failover matches the catalogue's own order.
+fn foxy_edges(outbound: &Json, country: &str, city: &str) -> Vec<ferrox_core::foxy::Candidate> {
+    let edges = outbound
+        .get("settings")
+        .and_then(|s| s.get("servers"))
+        .and_then(Json::as_arr)
+        .unwrap_or(&[]);
+    edges
+        .iter()
+        .filter_map(|edge| {
+            let host = std::sync::Arc::from(edge.get("host").and_then(Json::as_str)?);
+            let port = edge.get("port").and_then(Json::as_port)?;
+            let code = edge
+                .get("country")
+                .and_then(Json::as_str)
+                .unwrap_or(country);
+            let name = edge.get("city").and_then(Json::as_str).unwrap_or(city);
+            Some(ferrox_core::foxy::Candidate {
+                host,
+                port,
+                country: code.to_owned(),
+                city: name.to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn foxy_strings(value: Option<&Json>) -> Vec<String> {
+    value
+        .and_then(Json::as_arr)
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(Json::as_str)
+        .map(str::to_owned)
+        .collect()
+}
+
+fn foxy_ports(value: Option<&Json>) -> Vec<u16> {
+    value
+        .and_then(Json::as_arr)
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(Json::as_port)
+        .collect()
+}
+
+fn foxy_exit_probe(
+    link: &ferrox_core::foxy::link::FoxyLink,
+    settings: Option<&Json>,
+) -> Option<String> {
+    let probe = foxy_text_or(link, settings, "exitProbe");
+    (!probe.is_empty()).then_some(probe)
+}
+
+fn foxy_pasted_pass(token: &str) -> ferrox_core::foxy::Pass {
+    ferrox_core::foxy::Pass {
+        token: std::sync::Arc::from(token),
+        expires_at: ferrox_core::foxy::account::jwt_expiry(token),
+        quota_remaining: None,
+        quota_reset: None,
+        quota_limit: None,
+    }
+}
+
+/// One plane refusal's pace: a retryable one is asked again after the gap it named, a final one is handed back at once.
+fn retry_plane(
+    what: &str,
+    mut ask: impl FnMut() -> Result<(), crate::foxy_account::Denied>,
+) -> Result<(), crate::foxy_account::Denied> {
+    let mut attempt = 0usize;
+    loop {
+        match ask() {
+            Ok(()) => return Ok(()),
+            Err(denied) if attempt + 1 < ACCOUNT_ATTEMPTS && denied.is_retryable() => {
+                let pause = crate::foxy_account::renewal_gap(&denied, attempt as u32, None);
+                attempt += 1;
+                eprintln!(
+                    "foxy: the account plane refused the {what} ({denied}), again in {}s",
+                    pause.as_secs()
+                );
+                std::thread::sleep(pause);
+            }
+            Err(denied) => return Err(denied),
+        }
+    }
+}
+
+/// A `foxy` outbound's account, sign-in or pasted pass, as one `Account` whose pass the renewal thread owns.
+#[allow(clippy::too_many_arguments)]
+fn foxy_account(
+    email: &str,
+    password: &str,
+    session_token: &str,
+    code: &str,
+    pasted: &ferrox_core::foxy::Pass,
+    guardian: &str,
+    token_file: &str,
+    roots: &ferrox_core::tls::Anchors,
+    upstream: Option<&crate::foxy::UpstreamProxy>,
+) -> Option<std::sync::Arc<crate::foxy_account::Account>> {
+    let pass = pasted.clone();
+    if email.is_empty() && pass.token.is_empty() {
+        return None;
+    }
+    let tokens = crate::foxy_account::TokenFile::new(token_file, email);
+    let session = tokens
+        .as_ref()
+        .and_then(crate::foxy_account::TokenFile::load);
+    let mut fxa = crate::foxy_account::Endpoint::parse(
+        ferrox_core::foxy::account::FXA_SERVER,
+        std::sync::Arc::clone(roots),
+    )?;
+    let mut guardian =
+        crate::foxy_account::Endpoint::parse(guardian, std::sync::Arc::clone(roots))?;
+    fxa.upstream = upstream.cloned();
+    guardian.upstream = upstream.cloned();
+    let account = std::sync::Arc::new(crate::foxy_account::Account {
+        fxa,
+        guardian,
+        jar: std::sync::Arc::new(std::sync::Mutex::new(crate::foxy_challenge::Jar::default())),
+        pending: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        pending_method: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        auth: std::sync::Arc::new(std::sync::Mutex::new(crate::foxy_account::Auth {
+            access_token: String::new(),
+            refresh_token: String::new(),
+            expires_at: 0,
+        })),
+        pass: std::sync::Arc::new(std::sync::Mutex::new(pass.clone())),
+        tokens,
+    });
+    if pass.token.is_empty() {
+        // A stored grant answers the launch: no sign-in, so no new-sign-in mail, and a password only when the grant is dead.
+        let mut resumed = false;
+        if let Some(session) = session {
+            match retry_plane("stored session", || account.resume(session.clone())) {
+                Ok(()) => resumed = true,
+                Err(denied) if denied.is_final() => {
+                    eprintln!("foxy: the stored session was refused ({denied}), signing in again");
+                    if !account.forget() {
+                        eprintln!("foxy: the refused session could not be cleared from disk");
+                    }
+                }
+                Err(denied) => {
+                    eprintln!("foxy: the stored session did not resume: {denied}");
+                    return None;
+                }
+            }
+        }
+        if !resumed {
+            let mut session_signed_in = false;
+            if !session_token.is_empty() {
+                match retry_plane("session token", || account.sign_in_session(session_token)) {
+                    Ok(()) => session_signed_in = true,
+                    Err(denied) if password.is_empty() => {
+                        eprintln!("foxy: the session token did not sign in: {denied}");
+                        return None;
+                    }
+                    Err(denied) => {
+                        eprintln!(
+                            "foxy: the session token did not sign in: {denied}, trying settings.password"
+                        );
+                    }
+                }
+            }
+            if !session_signed_in {
+                if password.is_empty() {
+                    eprintln!(
+                        "foxy: no stored session and no settings.password: the sign-in needs one"
+                    );
+                    return None;
+                }
+                let mut signed_in = false;
+                let sign_in = || {
+                    // A retry resumes the grant the first attempt stored before minting: one sign-in, however many attempts the plane's mood costs.
+                    if signed_in {
+                        if let Some(session) = account
+                            .tokens
+                            .as_ref()
+                            .and_then(crate::foxy_account::TokenFile::load)
+                        {
+                            return account.resume(session);
+                        }
+                    }
+                    signed_in = true;
+                    account.sign_in(email, password)
+                };
+                if let Err(denied) = retry_plane("sign-in", sign_in) {
+                    eprintln!("foxy: the account did not sign in: {denied}");
+                    return None;
+                }
+            }
+        }
+        if account.needs_code() {
+            let Err(denied) = account.verify_code(code) else {
+                return Some(account);
+            };
+            eprintln!("foxy: the account wants a two-factor code in settings.code: {denied}");
+            return None;
+        }
+    }
+    Some(account)
+}
+
+/// Whether this lane can keep a pass: refuse one it cannot dial or cannot replace, and put the renewal clock on the account that can.
+fn foxy_pass_guard(
+    account: Option<&std::sync::Arc<crate::foxy_account::Account>>,
+    pass: &ferrox_core::foxy::Pass,
+) -> Option<String> {
+    let renews = account.filter(|account| account.can_renew());
+    // A lane that opens fronts over an empty pass answers every flow with a refusal.
+    if pass.token.is_empty() {
+        return Some("the outbound has no pass to dial with".to_owned());
+    }
+    // The pass the edge accepts lives minutes, not hours: a pasted one at the end of its window has nobody to replace it.
+    if renews.is_none()
+        && pass
+            .expires_at
+            .is_some_and(|at| at <= now_secs().saturating_add(30))
+    {
+        return Some(format!(
+            "settings.pass expires at {:?} and nothing can replace it: serve with email and password, or paste a fresh pass",
+            pass.expires_at
+        ));
+    }
+    if let Some(line) = pass.allowance_line() {
+        eprintln!("foxy: allowance {line}");
+    }
+    if let Some(account) = renews {
+        start_renewal(std::sync::Arc::clone(account));
+    }
+    None
+}
+
+fn foxy_text(settings: Option<&Json>, key: &str) -> String {
+    settings
+        .and_then(|s| s.get(key))
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .to_owned()
+}
+
+/// Inline field first, link parameter second: when both exist, the written-out one was edited last.
+fn foxy_text_or(
+    link: &ferrox_core::foxy::link::FoxyLink,
+    settings: Option<&Json>,
+    key: &str,
+) -> String {
+    let inline = foxy_text(settings, key);
+    if inline.is_empty() {
+        link.param(key).to_owned()
+    } else {
+        inline
+    }
+}
+
+/// A sign-in token already minted by the browser: inline wins, else the file it names, read once at boot.
+fn foxy_session_token(link: &ferrox_core::foxy::link::FoxyLink, settings: Option<&Json>) -> String {
+    let inline = foxy_text_or(link, settings, "sessionToken");
+    if !inline.is_empty() {
+        return inline;
+    }
+    let path = foxy_text_or(link, settings, "sessionTokenFile");
+    if path.is_empty() {
+        return String::new();
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(token) => token.trim().to_owned(),
+        Err(error) => {
+            eprintln!("foxy: cannot read sessionTokenFile {path:?}: {error}");
+            String::new()
+        }
+    }
+}
+
+/// The pinned country, upper-cased so a hand-typed link matches the catalogue; defaults to every account's exit.
+fn foxy_country(link: &ferrox_core::foxy::link::FoxyLink, settings: Option<&Json>) -> String {
+    let named = foxy_text(settings, "country");
+    let named = if named.is_empty() {
+        link.country().to_owned()
+    } else {
+        named
+    };
+    let named = if named.is_empty() {
+        "US".to_owned()
+    } else {
+        named
+    };
+    named.to_ascii_uppercase()
+}
+
+/// No CA file trusts the machine's anchors; an empty store is trust-nothing.
+fn ca_roots(settings: Option<&Json>) -> ferrox_core::tls::Anchors {
+    settings
+        .and_then(|s| s.get("caCertFile"))
+        .and_then(Json::as_str)
+        .and_then(crate::config::read_cert_file)
+        .map(|pem| ferrox_core::tls::Anchors::from(crate::quic::parse_ca_pem(&pem)))
+        .filter(|roots: &ferrox_core::tls::Anchors| !roots.is_empty())
+        .unwrap_or_else(crate::quic::system_roots)
+}
+
+/// The `VeePN` lane: an anonymous launch over a rotation of origins, one region's list, and the upstream that answers `Basic` for the pair it names.
+fn find_veepn_outbound(root: &Json) -> Option<crate::veepn::VeepnOut> {
+    let empty = Vec::new();
+    for outbound in root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .unwrap_or(&empty)
+    {
+        if outbound.get("protocol").and_then(Json::as_str) != Some("veepn") {
+            continue;
+        }
+        let settings = outbound.get("settings");
+        let mut domains = foxy_strings(settings.and_then(|s| s.get("domains")));
+        if domains.is_empty() {
+            domains = ferrox_core::veepn::DEFAULT_DOMAINS
+                .iter()
+                .map(|url| (*url).to_owned())
+                .collect();
+        }
+        let udid = crate::veepn::udid(&foxy_text(settings, "udid"));
+        let region = foxy_text(settings, "region");
+        match crate::veepn::VeepnOut::new(region, &domains, udid, ca_roots(settings)) {
+            Ok(lane) => return Some(lane),
+            Err(why) => eprintln!("{why}: serves nothing"),
+        }
+    }
+    None
+}
+
+/// An HTTP hop carries streams, not datagrams, so h3 over one is a refusal rather than a silent carrier switch.
+fn foxy_h3_over_http(
+    upstream: Option<&crate::foxy::UpstreamProxy>,
+    carrier: crate::foxy::Carrier,
+) -> bool {
+    upstream.is_some_and(crate::foxy::UpstreamProxy::http) && carrier == crate::foxy::Carrier::H3
+}
+
+/// A config's explicit `FxA` identity is process-wide; empty restores the pin and an invalid one warns.
+fn apply_fxa_user_agent(settings: Option<&Json>) {
+    let value = foxy_text(settings, "fxaUserAgent");
+    if let Err(why) = crate::foxy_challenge::set_fxa_user_agent(&value) {
+        eprintln!("foxy: fxaUserAgent {why}: keeping the current identity");
+    }
+}
+
+fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
+    let empty = Vec::new();
+    for outbound in root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .unwrap_or(&empty)
+    {
+        if outbound.get("protocol").and_then(Json::as_str) != Some("foxy") {
+            continue;
+        }
+        let settings = outbound.get("settings");
+        let link = ferrox_core::foxy::link::FoxyLink::parse(&foxy_text(settings, "link"))
+            .unwrap_or_default();
+        let configured = foxy_text_or(&link, settings, "pass");
+        let email = foxy_text_or(&link, settings, "email");
+        let password = foxy_text_or(&link, settings, "password");
+        let session_token = foxy_session_token(&link, settings);
+        let code = foxy_text_or(&link, settings, "code");
+        let token_file = foxy_text_or(&link, settings, "tokenFile");
+        if configured.is_empty() && email.is_empty() {
+            continue;
+        }
+        let country = foxy_country(&link, settings);
+        let city = foxy_text_or(&link, settings, "city").to_ascii_uppercase();
+        let upstream = match foxy_upstream(settings, &link) {
+            Ok(upstream) => upstream,
+            Err(named) => {
+                eprintln!("foxy: upstreamProxy {named:?} is not http:// or socks5(h)://host:port: serves nothing");
+                continue;
+            }
+        };
+        let roots = ca_roots(settings);
+        let pins = ferrox_core::foxy::pin::Pins::parse(foxy_list_or(&link, settings, "spkiPins"));
+        let edge_address = foxy_edge_address(settings);
+        let candidates = foxy_candidates(
+            outbound,
+            &link,
+            &country,
+            &city,
+            roots.clone(),
+            upstream.as_ref(),
+        );
+        let carrier = foxy_carrier(settings, &link);
+        // An HTTP hop carries streams not datagrams, so this is a refusal, not a silent carrier switch.
+        if foxy_h3_over_http(upstream.as_ref(), carrier) {
+            eprintln!("foxy: carrier h3 cannot ride an http upstreamProxy: use socks5(h)://, h1, h2 or auto");
+            continue;
+        }
+        apply_fxa_user_agent(settings);
+        let pasted = foxy_pasted_pass(&configured);
+        let account = foxy_account(
+            &email,
+            &password,
+            &session_token,
+            &code,
+            &pasted,
+            link.guardian(),
+            &token_file,
+            &roots,
+            upstream.as_ref(),
+        );
+        let pass = account
+            .as_ref()
+            .map_or_else(|| pasted.clone(), |account| account.current());
+        if let Some(reason) = foxy_pass_guard(account.as_ref(), &pass) {
+            eprintln!("foxy: {reason}: serves nothing");
+            continue;
+        }
+        eprintln!("foxy: carrier {}", carrier.name());
+        // The ladder is tiered once: the country's edges in tier order never change, and a flow that rebuilt them copied four strings per edge to walk a list it had already.
+        let ladder =
+            ferrox_core::foxy::catalog::tier(&candidates, &country, &city, MAX_FOXY_ALTERNATES);
+        return Some(FoxyOut {
+            account,
+            ladder,
+            stored: None,
+            unauthenticated: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            limited_strikes: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            limited_until: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            carrier_dead: std::sync::Arc::new(std::sync::Mutex::new(
+                ferrox_core::foxy::Refusals::new(32),
+            )),
+            edge_strikes: std::sync::Arc::new(std::sync::Mutex::new(
+                ferrox_core::foxy::EdgeStrikes::new(32),
+            )),
+            country,
+            carrier,
+            upstream,
+            roots,
+            pins,
+            pass,
+            edge_address,
+            direct_ports: foxy_ports(settings.and_then(|s| s.get("directPorts"))),
+            direct_suffixes: foxy_list_or(&link, settings, "directDomains"),
+            exit_probe: foxy_exit_probe(&link, settings),
+            verified: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            probe_unavailable: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            exit_probe_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            exit_refuted_until: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            selected: carrier_slots(),
+        });
+    }
+    None
+}
+
+/// Mints one pass and stores it so legs never sign in again: the rate limit counts logins, one job wants one.
+pub(crate) fn mint_foxy_pass(config: &str, out: &str) -> ! {
+    let text = std::fs::read_to_string(config)
+        .unwrap_or_else(|error| exit(&format!("cannot read {config}: {error}")));
+    let root = crate::json::parse(&text)
+        .unwrap_or_else(|error| exit(&format!("bad config {config}: {error}")));
+    let Some(foxy) = find_foxy_outbound(&root) else {
+        exit("no foxy outbound with an email or a pass in {config}");
+    };
+    let token = foxy.account.as_ref().map(|account| account.current());
+    let Some(pass) = token else {
+        exit("the account did not sign in, so there is no pass to store");
+    };
+    if pass.token.is_empty() {
+        exit("the account did not sign in, so there is no pass to store");
+    }
+    let mut stored = String::with_capacity(pass.token.len() + 12);
+    stored.push_str("{\"pass\":\"");
+    for byte in pass.token.bytes() {
+        if byte == b'"' || byte == b'\\' {
+            stored.push('\\');
+        }
+        stored.push(byte as char);
+    }
+    stored.push_str("\"}");
+    std::fs::write(out, stored)
+        .unwrap_or_else(|error| exit(&format!("cannot write {out}: {error}")));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(out, std::fs::Permissions::from_mode(0o600));
+    }
+    // The allowance on the pass's own line, so an account knows how much is left before a flow is refused for having none.
+    let allowance = pass
+        .allowance_line()
+        .map(|line| format!(" quota=\"{line}\""))
+        .unwrap_or_default();
+    println!("minted=1 expires_at={:?}{allowance}", pass.expires_at);
+    std::process::exit(0);
+}
+
+/// The mux session an outbound's `mux` object enables: xray's `enabled`, its `concurrency` and
+/// `xudpConcurrency` folds, and the `xudpProxyUDP443` passthrough with its one refusal.
+fn outbound_mux(outbound: &Json) -> Result<Mux, String> {
+    let Some(mux) = outbound.get("mux") else {
+        return Ok(Mux::default());
+    };
+    let udp443 = match mux.get("xudpProxyUDP443") {
+        None => Udp443::Reject,
+        Some(Json::Str(policy)) => match policy.as_str() {
+            "" | "reject" => Udp443::Reject,
+            "allow" => Udp443::Allow,
+            "skip" => Udp443::Skip,
+            _ => return Err(format!("unknown \"xudpProxyUDP443\": {policy}")),
+        },
+        Some(_) => return Err("unknown \"xudpProxyUDP443\": not a string".to_owned()),
+    };
+    if mux.get("enabled").and_then(Json::as_bool) != Some(true) {
+        return Ok(Mux::default());
+    }
+    let concurrency = mux.get("concurrency").and_then(Json::as_i64).unwrap_or(0);
+    let xudp = mux
+        .get("xudpConcurrency")
+        .and_then(Json::as_i64)
+        .unwrap_or(0);
+    let protocol = match mux.get("protocol") {
+        None => None,
+        Some(Json::Str(name)) => Some(
+            crate::singmux::Protocol::parse(name)
+                .ok_or_else(|| format!("unknown \"protocol\": {name}"))?,
+        ),
+        Some(_) => return Err("unknown \"protocol\": not a string".to_owned()),
+    };
+    let padding = match mux.get("padding") {
+        None => false,
+        Some(Json::Bool(value)) => *value,
+        Some(_) => return Err("unknown \"padding\": not a bool".to_owned()),
+    };
+    Ok(Mux {
+        enabled: true,
+        tcp: (concurrency >= 0).then(|| {
+            if concurrency <= 128 {
+                128
+            } else {
+                usize::try_from(concurrency).unwrap_or(usize::MAX)
+            }
+        }),
+        xudp: match xudp.cmp(&0) {
+            std::cmp::Ordering::Less => Xudp::Off,
+            std::cmp::Ordering::Equal => Xudp::Shared,
+            std::cmp::Ordering::Greater => Xudp::Own(usize::try_from(xudp).unwrap_or(usize::MAX)),
+        },
+        udp443,
+        protocol,
+        padding,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn find_trojan_outbound(root: &Json) -> Option<TrojanOut> {
+    let empty = Vec::new();
+    let outbounds = root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .unwrap_or(&empty);
+    for outbound in outbounds {
+        if outbound.get("protocol").and_then(Json::as_str) != Some("trojan") {
+            continue;
+        }
+        let server = outbound
+            .get("settings")
+            .and_then(|s| s.get("servers"))
+            .and_then(Json::as_arr)
+            .and_then(|servers| servers.first());
+        let Some(server) = server else { continue };
+        let address = server.get("address").and_then(Json::as_str)?.to_owned();
+        let port = server.get("port").and_then(Json::as_port)?;
+        let password = server.get("password").and_then(Json::as_str)?;
+        let key = trojan_key(password);
+        let security = stream_security(outbound);
+        let mux = match outbound_mux(outbound) {
+            Ok(mux) => mux,
+            Err(why) => {
+                eprintln!("trojan: {why}; outbound refused");
+                return None;
+            }
+        };
+        let quic_tls = outbound
+            .get("streamSettings")
+            .and_then(|s| s.get("network"))
+            .and_then(Json::as_str)
+            == Some("quic")
+            && security == "tls";
+        let hysteria_tls = hysteria_transport(outbound) && security == "tls";
+        if security == "reality" {
+            let (carrier, host) = outbound_carrier(outbound, &address);
+            if !matches!(
+                carrier,
+                Carrier::Raw(_)
+                    | Carrier::Ws { .. }
+                    | Carrier::HttpUpgrade { .. }
+                    | Carrier::Grpc(_)
+                    | Carrier::Xhttp { .. }
+                    | Carrier::HttpHeader { .. }
+                    | Carrier::Kcp(_)
+            ) {
+                return None;
+            }
+            let reality = outbound_reality(outbound, &address)?;
+            if let Err(error) = crate::config::reality_mldsa(outbound, false) {
+                eprintln!("trojan: {error}; outbound refused");
+                return None;
+            }
+            return Some(TrojanOut {
+                address,
+                port,
+                key,
+                carrier,
+                host,
+                tls: None,
+                headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
+                heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
+                mux,
+                pool: Pools::default(),
+                reality: Some(reality),
+            });
+        }
+        if security == "tls" && !quic_tls && !hysteria_tls {
+            if let Some((carrier, host, tls)) = tls_carried_parts(outbound, &address) {
+                return Some(TrojanOut {
+                    address,
+                    port,
+                    key,
+                    carrier,
+                    host,
+                    tls: Some(tls),
+                    headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
+                    heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
+                    quic_roots: None,
+                    quic_ech: None,
+                    hysteria_roots: None,
+                    mux,
+                    pool: Pools::default(),
+                    reality: None,
+                });
+            }
+        }
+        let stored = xdrive_carried(outbound, &address);
+        if !matches!(security, "" | "none") && !quic_tls && !hysteria_tls && stored.is_none() {
+            continue;
+        }
+        let (carrier, host) = stored.unwrap_or_else(|| outbound_carrier(outbound, &address));
+        let (quic_roots, quic_ech, hysteria_roots) = match &carrier {
+            Carrier::Quic => {
+                let ech = if quic_tls {
+                    match crate::config::quic_ech_config(outbound, &address) {
+                        Ok(ech) => ech,
+                        Err(why) => {
+                            eprintln!("trojan: {why}; the quic dial will fail");
+                            return None;
+                        }
+                    }
+                } else {
+                    None
+                };
+                (tls_ca_roots(outbound), ech, None)
+            }
+            Carrier::Hysteria(_) => (None, None, tls_ca_roots(outbound)),
+            _ => (None, None, None),
+        };
+        return Some(TrojanOut {
+            address,
+            port,
+            key,
+            carrier,
+            host,
+            tls: None,
+            headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
+            heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
+            quic_roots,
+            quic_ech,
+            hysteria_roots,
+            mux,
+            pool: Pools::default(),
+            reality: None,
+        });
+    }
+    None
+}
+
+/// The SOCKS5 client lane's server: the address the outbound dials, and the credential
+/// it offers.
+///
+/// The shape is xray's own outbound form — a `servers` list whose one entry names an
+/// address, a port and the user that signs the dial — so a config that served xray's
+/// SOCKS client serves this one.
+fn find_socks_outbound(root: &Json) -> Option<SocksOut> {
+    let empty = Vec::new();
+    let outbounds = root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .unwrap_or(&empty);
+    for outbound in outbounds {
+        if outbound.get("protocol").and_then(Json::as_str) != Some("socks") {
+            continue;
+        }
+        let server = outbound
+            .get("settings")
+            .and_then(|s| s.get("servers"))
+            .and_then(Json::as_arr)
+            .and_then(|servers| servers.first());
+        let Some(server) = server else { continue };
+        let address = server.get("address").and_then(Json::as_str)?.to_owned();
+        let port = server.get("port").and_then(Json::as_port)?;
+        // The version the lane speaks: `4` and `4a` are SOCKS4, `5` is SOCKS5. An unknown one is refused by name rather than spoken as the wrong protocol.
+        let version = match outbound
+            .get("settings")
+            .and_then(|settings| settings.get("version"))
+            .and_then(Json::as_str)
+        {
+            None | Some("5") => crate::socks::Version::V5,
+            Some("4" | "4a") => crate::socks::Version::V4,
+            Some(other) => {
+                eprintln!("socks outbound: version `{other}` is not carried, refused");
+                return None;
+            }
+        };
+        let user = server
+            .get("users")
+            .and_then(Json::as_arr)
+            .and_then(|users| users.first())
+            .and_then(|user| {
+                user.get("user")
+                    .and_then(Json::as_str)
+                    .or_else(|| user.get("username").and_then(Json::as_str))
+            })
+            .unwrap_or_default();
+        let pass = server
+            .get("users")
+            .and_then(Json::as_arr)
+            .and_then(|users| users.first())
+            .and_then(|user| {
+                user.get("pass")
+                    .and_then(Json::as_str)
+                    .or_else(|| user.get("password").and_then(Json::as_str))
+            })
+            .unwrap_or_default();
+        let (carrier, host, tls) = if stream_security(outbound) == "tls" {
+            let Some((c, h, t)) = tls_carried_parts(outbound, &address) else {
+                continue;
+            };
+            (c, h, Some(t))
+        } else {
+            let (carrier, host) = outbound_carrier(outbound, &address);
+            if !matches!(carrier, Carrier::Raw(_)) {
+                continue;
+            }
+            (carrier, host, None)
+        };
+        let (carrier_headers, heartbeat) =
+            crate::config::carrier_headers(outbound.get("streamSettings"));
+        let mut socks = SocksOut::new(&address, port, user, pass, version);
+        socks.tls = tls;
+        socks.carrier = carrier;
+        socks.host = host;
+        socks.carrier_headers = carrier_headers;
+        socks.heartbeat = heartbeat;
+        return Some(socks);
+    }
+    None
+}
+
+/// The direct Hysteria v1 outbound a config names: `settings.version: 1` and a server entry, with the stream's own `hysteriaSettings` supplying auth, congestion, obfs and hop.
+fn find_hysteria_outbound(root: &Json) -> Option<HysteriaOut> {
+    let empty = Vec::new();
+    let outbounds = root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .unwrap_or(&empty);
+    for outbound in outbounds {
+        if canonical_protocol(
+            outbound
+                .get("protocol")
+                .and_then(Json::as_str)
+                .unwrap_or(""),
+        ) != "hysteria"
+        {
+            continue;
+        }
+        let Some(settings) = outbound.get("settings") else {
+            continue;
+        };
+        let version = crate::config::hysteria_version(settings.get("version"))
+            .or_else(|| {
+                outbound
+                    .get("streamSettings")
+                    .and_then(|s| s.get("hysteriaSettings"))
+                    .and_then(|h| h.get("version"))
+                    .and_then(|version| crate::config::hysteria_version(Some(version)))
+            })
+            .unwrap_or(2);
+        if version != 1 && version != 2 {
+            continue;
+        }
+        let server = settings
+            .get("servers")
+            .and_then(Json::as_arr)
+            .and_then(|servers| servers.first());
+        let field = |name: &str| {
+            server
+                .and_then(|s| s.get(name))
+                .or_else(|| settings.get(name))
+        };
+        let Some(address) = field("address").and_then(Json::as_str).map(str::to_owned) else {
+            continue;
+        };
+        let Some(port) = field("port").and_then(Json::as_port) else {
+            continue;
+        };
+        let stream = outbound.get("streamSettings");
+        let mut config = match crate::config::hysteria_outbound_config(stream, version) {
+            Ok(config) => config,
+            Err(why) => {
+                eprintln!("hysteria outbound: {why}; it is not used");
+                continue;
+            }
+        };
+        if let Some(auth) = field("auth").and_then(Json::as_str) {
+            auth.clone_into(&mut config.auth);
+        }
+        let host = stream
+            .and_then(|s| s.get("tlsSettings"))
+            .and_then(|t| t.get("serverName"))
+            .and_then(Json::as_str)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&address)
+            .to_owned();
+        let roots = crate::config::tls_ca_roots(outbound)
+            .or_else(|| Some(crate::quic::system_roots()))
+            .filter(|roots| !roots.is_empty());
+        return Some(HysteriaOut {
+            address,
+            port,
+            host,
+            config,
+            roots,
+        });
+    }
+    None
+}
+
+#[allow(clippy::too_many_lines)]
+fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
+    let empty = Vec::new();
+    let outbounds = root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .unwrap_or(&empty);
+    for outbound in outbounds {
+        if outbound.get("protocol").and_then(Json::as_str) != Some("shadowsocks") {
+            continue;
+        }
+        let server = outbound
+            .get("settings")
+            .and_then(|s| s.get("servers"))
+            .and_then(Json::as_arr)
+            .and_then(|servers| servers.first());
+        let Some(server) = server else { continue };
+        let address = server.get("address").and_then(Json::as_str)?.to_owned();
+        let port = server.get("port").and_then(Json::as_port)?;
+        let method = server.get("method").and_then(Json::as_str)?.to_owned();
+        let password = server.get("password").and_then(Json::as_str)?.to_owned();
+        let mux = match outbound_mux(outbound) {
+            Ok(mux) => mux,
+            Err(why) => {
+                eprintln!("shadowsocks: {why}; outbound refused");
+                continue;
+            }
+        };
+        // Hysteria carries its own QUIC TLS, so xray's `security: tls` names that handshake rather than a second layer above it.
+        let hysteria_tls = hysteria_transport(outbound) && stream_security(outbound) == "tls";
+        // The store's own lanes speak the handshake, so a tls xdrive row adds no second one and keeps the row.
+        if let Some((carrier, host)) = xdrive_carried(outbound, &address) {
+            return Some(ShadowsocksOut {
+                address,
+                port,
+                method,
+                password,
+                carrier,
+                host,
+                mux: Mux::default(),
+                pool: Pools::default(),
+                tls: None,
+                reality: None,
+                hysteria_roots: None,
+                headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
+                heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
+            });
+        }
+        if stream_security(outbound) == "reality" {
+            let (carrier, host) = outbound_carrier(outbound, &address);
+            if !matches!(
+                carrier,
+                Carrier::Raw(_)
+                    | Carrier::Ws { .. }
+                    | Carrier::HttpUpgrade { .. }
+                    | Carrier::Grpc(_)
+                    | Carrier::Xhttp { .. }
+                    | Carrier::HttpHeader { .. }
+                    | Carrier::Kcp(_)
+            ) {
+                return None;
+            }
+            let reality = outbound_reality(outbound, &address)?;
+            if let Err(error) = crate::config::reality_mldsa(outbound, false) {
+                eprintln!("shadowsocks: {error}; outbound refused");
+                return None;
+            }
+            return Some(ShadowsocksOut {
+                address,
+                port,
+                method,
+                password,
+                carrier,
+                host,
+                mux,
+                pool: Pools::default(),
+                tls: None,
+                reality: Some(reality),
+                hysteria_roots: None,
+                headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
+                heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
+            });
+        }
+        let (carrier, host) = outbound_carrier(outbound, &address);
+        let tls = match stream_security(outbound) {
+            "" | "none" => None,
+            "tls" if hysteria_tls => None,
+            "tls" => {
+                let Ok(tls) = outbound_tls(outbound, &address) else {
+                    continue;
+                };
+                Some(tls)
+            }
+            _ => continue,
+        };
+        let hysteria_roots = match &carrier {
+            Carrier::Hysteria(_) => tls_ca_roots(outbound),
+            _ => None,
+        };
+        return Some(ShadowsocksOut {
+            address,
+            port,
+            method,
+            password,
+            carrier,
+            host,
+            mux,
+            pool: Pools::default(),
+            tls,
+            reality: None,
+            hysteria_roots,
+            headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
+            heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
+        });
+    }
+    None
+}
+
+/// The DNS outbound's decoded lane: the reference's `proxy/dns` at this pin. The
+/// rewrite overlays the destination the flow named, field by field, and the rules
+/// decide per query in order.
+#[derive(Debug, Clone)]
+pub(crate) struct DnsOut {
+    /// The upstream lane the direct half rides; none keeps the asked network.
+    tcp: Option<bool>,
+    /// The upstream address the rewrite names; none keeps the asked one.
+    address: Option<String>,
+    /// The upstream port the rewrite names; zero keeps the asked one.
+    port: u16,
+    rules: Vec<ferrox_core::dns::Rule>,
+}
+
+/// The DNS outbound's config, the way the reference's own builder reads it: the
+/// legacy `network`/`address`/`port` forms fill the rewrite they alias, a rule
+/// refusing by name, and the budget the lane runs on.
+fn find_dns_outbound(root: &Json) -> Result<Option<DnsOut>, String> {
+    let empty = Vec::new();
+    let outbounds = root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .unwrap_or(&empty);
+    for outbound in outbounds {
+        if outbound.get("protocol").and_then(Json::as_str) != Some("dns") {
+            continue;
+        }
+        return build_dns_outbound(outbound);
+    }
+    Ok(None)
+}
+
+fn build_dns_outbound(outbound: &Json) -> Result<Option<DnsOut>, String> {
+    let settings = outbound.get("settings");
+    // The rewrite form wins; the legacy alias fills the field the rewrite skips.
+    let tcp = match settings
+        .and_then(|s| s.get("rewriteNetwork"))
+        .and_then(Json::as_str)
+    {
+        Some(name) => decode_dns_network(name),
+        None => settings
+            .and_then(|s| s.get("network"))
+            .and_then(Json::as_str)
+            .filter(|name| !name.is_empty())
+            .and_then(decode_dns_network),
+    };
+    let address = match settings
+        .and_then(|s| s.get("rewriteAddress"))
+        .and_then(Json::as_str)
+    {
+        Some(name) => Some(name.to_owned()),
+        None => settings
+            .and_then(|s| s.get("address"))
+            .and_then(Json::as_str)
+            .map(str::to_owned),
+    };
+    let port = match settings
+        .and_then(|s| s.get("rewritePort"))
+        .and_then(Json::as_port)
+    {
+        Some(port) if port != 0 => port,
+        _ => settings
+            .and_then(|s| s.get("port"))
+            .and_then(Json::as_port)
+            .unwrap_or(0),
+    };
+    let rules = decode_dns_rules(settings)?;
+    Ok(Some(DnsOut {
+        tcp,
+        address,
+        port,
+        rules,
+    }))
+}
+
+/// A lane the rewrite names: `tcp` or `udp` rides it, and anything else leaves
+/// the asked network where it is, the way the reference's unknown builds.
+fn decode_dns_network(name: &str) -> Option<bool> {
+    match name.to_ascii_lowercase().as_str() {
+        "tcp" => Some(true),
+        "udp" => Some(false),
+        _ => None,
+    }
+}
+
+/// The rules the DNS outbound carries, in order; the legacy `nonIPQuery` and
+/// `blockTypes` forms build as the reference's own three rules.
+fn decode_dns_rules(settings: Option<&Json>) -> Result<Vec<ferrox_core::dns::Rule>, String> {
+    let Some(settings) = settings.filter(|settings| !matches!(settings, Json::Null)) else {
+        return Ok(Vec::new());
+    };
+    let non_ip = settings.get("nonIPQuery");
+    let block_types = settings.get("blockTypes");
+    if non_ip.is_some() || block_types.is_some() {
+        if settings.get("rules").is_some() {
+            return Err("legacy nonIPQuery and blockTypes cannot be mixed with rules".into());
+        }
+        eprintln!("nonIPQuery and blockTypes are deprecated; rules is the form");
+        return decode_dns_legacy(
+            non_ip.and_then(Json::as_str),
+            block_types.and_then(Json::as_arr),
+        );
+    }
+    let mut rules = Vec::new();
+    for rule in settings.get("rules").and_then(Json::as_arr).unwrap_or(&[]) {
+        rules.push(decode_dns_rule(rule)?);
+    }
+    Ok(rules)
+}
+
+/// One rule: the action refused by name, the qType expanded the way a port list
+/// is, the domains through the same tree the router builds its matches with, and
+/// an rCode the reference parses at its own 16-bit bound.
+fn decode_dns_rule(rule: &Json) -> Result<ferrox_core::dns::Rule, String> {
+    let name = rule.get("action").and_then(Json::as_str);
+    let Some(action) = name.and_then(ferrox_core::dns::Action::from_name) else {
+        return Err(format!("unknown action: {}", name.unwrap_or_default()));
+    };
+    let qtypes = match rule.get("qType") {
+        None | Some(Json::Null) => Vec::new(),
+        Some(qtype @ (Json::Num(_) | Json::Str(_))) => inbound_ports(qtype),
+        Some(_) => return Err("qType is a port list: a number or a string names it".into()),
+    };
+    let mut domains = crate::router::DomainMatcher::new();
+    if let Some(list) = rule
+        .get("domain")
+        .filter(|list| !matches!(list, Json::Null))
+    {
+        let items = if let Some(text) = list.as_str() {
+            text.split(',').map(str::to_owned).collect::<Vec<_>>()
+        } else if let Some(items) = list.as_arr() {
+            items
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .ok_or_else(|| "domain has a value that is not a string".to_owned())
+                        .map(str::to_owned)
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            return Err("domain is not a string or array".into());
+        };
+        let mut assets = crate::router::Assets::new(crate::router::asset_dirs());
+        for item in items {
+            crate::router::add_domain(&mut domains, &item, &mut assets)?;
+        }
+        domains.finish()?;
+    }
+    let rcode = match rule.get("rCode").and_then(Json::as_u32) {
+        Some(rcode) if rcode > 65535 => {
+            return Err(format!("rCode out of range: {rcode}"));
+        }
+        Some(rcode) => rcode as u16,
+        None => 0,
+    };
+    Ok(ferrox_core::dns::Rule {
+        qtypes,
+        domains: Some(ferrox_core::dns::Matcher::new(move |name| {
+            domains.matches(name, name)
+        })),
+        action,
+        rcode,
+    })
+}
+
+/// The three rules the legacy forms build: the blocked types, the A/AAAA
+/// hijack, and the catch-all that the non-`reject` modes widen.
+fn decode_dns_legacy(
+    non_ip: Option<&str>,
+    block_types: Option<&[Json]>,
+) -> Result<Vec<ferrox_core::dns::Rule>, String> {
+    let mode = non_ip.filter(|mode| !mode.is_empty()).unwrap_or("reject");
+    if !matches!(mode, "reject" | "drop" | "skip") {
+        return Err(format!("unknown nonIPQuery: {mode}"));
+    }
+    let mut rules = Vec::new();
+    if let Some(types) = block_types {
+        let mut qtypes = Vec::new();
+        for qtype in types {
+            let named = qtype
+                .as_u32()
+                .ok_or_else(|| "legacy blockTypes qType is not a number".to_owned())?;
+            u16::try_from(named)
+                .map_err(|_| format!("legacy blockTypes qType out of range: {named}"))?;
+            qtypes.push(named as u16);
+        }
+        if !qtypes.is_empty() {
+            rules.push(ferrox_core::dns::Rule {
+                qtypes,
+                domains: None,
+                action: match mode {
+                    "reject" => ferrox_core::dns::Action::Return,
+                    _ => ferrox_core::dns::Action::Drop,
+                },
+                rcode: u16::from(mode == "reject") * 5,
+            });
+        }
+    }
+    rules.push(ferrox_core::dns::Rule {
+        qtypes: vec![1, 28],
+        domains: None,
+        action: ferrox_core::dns::Action::Hijack,
+        rcode: 0,
+    });
+    let (action, rcode) = match mode {
+        "reject" => (ferrox_core::dns::Action::Return, 5),
+        "drop" => (ferrox_core::dns::Action::Drop, 0),
+        "skip" => (ferrox_core::dns::Action::Direct, 0),
+        _ => unreachable!(),
+    };
+    rules.push(ferrox_core::dns::Rule {
+        qtypes: Vec::new(),
+        domains: None,
+        action,
+        rcode,
+    });
+    Ok(rules)
+}
+
+#[cfg(test)]
+mod dns_config_tests {
+    use super::*;
+
+    fn dns_probe(settings: &str) -> Result<Option<DnsOut>, String> {
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds":[{{"protocol":"dns","settings":{settings}}}]}}"#
+        ))
+        .expect("parses");
+        find_dns_outbound(&root)
+    }
+
+    fn dns_outbound(settings: &str) -> DnsOut {
+        dns_probe(settings)
+            .expect("the outbound's own settings read")
+            .expect("a DNS outbound in the config")
+    }
+
+    #[test]
+    fn an_empty_settings_dns_outbound_carries_no_rule() {
+        let dns = dns_outbound("{}");
+        assert_eq!(dns.tcp, None);
+        assert_eq!(dns.address, None);
+        assert_eq!(dns.port, 0);
+        assert!(dns.rules.is_empty());
+    }
+
+    #[test]
+    fn the_rewrite_fields_are_the_lane_the_outbound_rides() {
+        let dns = dns_outbound(
+            r#"{"rewriteNetwork":"tcp","rewriteAddress":"192.0.2.9","rewritePort":5353,"rules":[{"action":"return","rCode":5}]}"#,
+        );
+        assert_eq!(dns.tcp, Some(true));
+        assert_eq!(dns.address.as_deref(), Some("192.0.2.9"));
+        assert_eq!(dns.port, 5353);
+        assert_eq!(dns.rules[0].rcode, 5);
+        assert_eq!(dns.rules[0].action, ferrox_core::dns::Action::Return);
+    }
+
+    #[test]
+    fn the_legacy_aliases_fill_the_fields_the_rewrite_skips() {
+        let dns = dns_outbound(r#"{"network":"udp","address":"ns.test","port":53}"#);
+        assert_eq!(dns.tcp, Some(false));
+        assert_eq!(dns.address.as_deref(), Some("ns.test"));
+        assert_eq!(dns.port, 53);
+        // A network name the reference does not build keeps the asked lane.
+        let dns = dns_outbound(r#"{"network":"unix"}"#);
+        assert_eq!(dns.tcp, None);
+    }
+
+    #[test]
+    fn a_rule_refused_by_name_and_a_qtype_out_of_form_are_build_errors() {
+        assert!(dns_probe(r#"{"rules":[{"action":"quux"}]}"#).is_err());
+        assert!(
+            dns_probe(r#"{"rules":[]}"#).is_ok(),
+            "no rules is a rule set of none"
+        );
+        assert!(dns_probe(r#"{"rules":[{"action":"return","qType":[1,28]}]}"#).is_err());
+        assert!(dns_probe(r#"{"rules":[{"action":"return","rCode":70000}]}"#).is_err());
+    }
+
+    #[test]
+    fn a_qtype_port_list_expands() {
+        let dns = dns_outbound(r#"{"rules":[{"action":"return","qType":"1,28"}]}"#);
+        assert_eq!(dns.rules[0].qtypes, vec![1, 28]);
+    }
+
+    #[test]
+    fn the_legacy_form_builds_the_three_rules_the_reference_main() {
+        let dns = dns_outbound(r#"{"nonIPQuery":"skip","blockTypes":[]}"#);
+        assert_eq!(dns.rules.len(), 2);
+        assert_eq!(
+            dns.rules[0].action,
+            ferrox_core::dns::Action::Hijack,
+            "A and AAAA are hijacked before the catch-all"
+        );
+        assert_eq!(dns.rules[1].action, ferrox_core::dns::Action::Direct);
+        let dns = dns_outbound(r#"{"nonIPQuery":"drop","blockTypes":[16]}"#);
+        assert_eq!(dns.rules[0].qtypes, vec![16]);
+        assert_eq!(dns.rules[0].action, ferrox_core::dns::Action::Drop);
+        assert!(dns_probe(r#"{"nonIPQuery":"skip","rules":[]}"#).is_err());
+    }
+}
+
+fn find_http_outbound(root: &Json) -> Option<HttpOut> {
+    let empty = Vec::new();
+    let outbounds = root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .unwrap_or(&empty);
+    for outbound in outbounds {
+        if outbound.get("protocol").and_then(Json::as_str) != Some("http") {
+            continue;
+        }
+        let settings = outbound.get("settings")?;
+        let servers = settings
+            .get("servers")
+            .and_then(Json::as_arr)
+            .unwrap_or(&empty);
+        for server in servers {
+            let address = server.get("address").and_then(Json::as_str)?.to_owned();
+            let port = server.get("port").and_then(Json::as_port)?;
+            let security = stream_security(outbound);
+            let (carrier, host, tls) = if security == "tls" {
+                let Some((c, h, t)) = tls_carried_parts(outbound, &address) else {
+                    continue;
+                };
+                (c, h, Some(t))
+            } else {
+                let (carrier, host) = outbound_carrier(outbound, &address);
+                if !matches!(carrier, Carrier::Raw(_)) {
+                    continue;
+                }
+                (carrier, host, None)
+            };
+            let (carrier_headers, heartbeat) =
+                crate::config::carrier_headers(outbound.get("streamSettings"));
+            let mut headers: Vec<(String, String)> = Vec::new();
+            if let Some(hdrs) = server.get("headers").and_then(Json::as_arr) {
+                for h in hdrs {
+                    if let Some(k) = h.get("key").and_then(Json::as_str) {
+                        if let Some(v) = h.get("value").and_then(Json::as_str) {
+                            headers.push((k.to_owned(), v.to_owned()));
+                        }
+                    }
+                }
+            }
+            let (user, pass) = if let Some(users) = server.get("users").and_then(Json::as_arr) {
+                if let Some(u) = users.first() {
+                    let user = u
+                        .get("user")
+                        .and_then(Json::as_str)
+                        .or_else(|| u.get("username").and_then(Json::as_str));
+                    let pass = u
+                        .get("pass")
+                        .and_then(Json::as_str)
+                        .or_else(|| u.get("password").and_then(Json::as_str));
+                    (
+                        user.map(std::borrow::ToOwned::to_owned),
+                        pass.map(std::borrow::ToOwned::to_owned),
+                    )
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+            return Some(HttpOut {
+                address,
+                port,
+                tls,
+                carrier,
+                host,
+                carrier_headers,
+                heartbeat,
+                headers,
+                user,
+                pass,
+            });
+        }
+    }
+    None
+}
+
+/// The outbound, dial entry and account of each vmess entry the tree shows.
+fn vmess_outbounds(root: &Json) -> impl Iterator<Item = (&Json, &Json, &Json)> {
+    let outbounds: &[Json] = root.get("outbounds").and_then(Json::as_arr).unwrap_or(&[]);
+    outbounds
+        .iter()
+        .filter(|outbound| outbound.get("protocol").and_then(Json::as_str) == Some("vmess"))
+        .filter_map(|outbound| {
+            let (server, account) = vnext_lane(outbound.get("settings")?)?;
+            Some((outbound, server, account))
+        })
+}
+
+/// One vless outbound's dial fields, from either the simplified style the reference's own reverse
+/// configs use (`settings.address/port/id/flow`) or the `vnext[0].users[0]` shape.
+struct VlessServer<'a> {
+    address: &'a str,
+    port: u16,
+    id: [u8; 16],
+    flow: String,
+    encryption: Option<&'a str>,
+    /// The reverse tag a bridge names; the monitor dials command 4 and carries the portal's flows.
+    reverse: Option<&'a str>,
+}
+
+fn vless_server(settings: &Json) -> Option<VlessServer<'_>> {
+    let reverse = settings
+        .get("reverse")
+        .and_then(|reverse| reverse.get("tag"))
+        .and_then(Json::as_str);
+    let (server, account) = vnext_lane(settings)?;
+    Some(VlessServer {
+        address: server.get("address").and_then(Json::as_str)?,
+        port: server.get("port").and_then(Json::as_port)?,
+        id: account
+            .get("id")
+            .and_then(Json::as_str)
+            .and_then(uuid_bytes)?,
+        flow: account
+            .get("flow")
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        encryption: account.get("encryption").and_then(Json::as_str),
+        reverse,
+    })
+}
+
+fn vless_outbounds(root: &Json) -> impl Iterator<Item = (&Json, VlessServer<'_>)> {
+    let outbounds: &[Json] = root.get("outbounds").and_then(Json::as_arr).unwrap_or(&[]);
+    outbounds
+        .iter()
+        .filter(|outbound| outbound.get("protocol").and_then(Json::as_str) == Some("vless"))
+        .filter_map(|outbound| {
+            let server = vless_server(outbound.get("settings")?)?;
+            Some((outbound, server))
+        })
+}
+
+fn find_vless_outbound(root: &Json) -> Option<VlessOut> {
+    vless_outbounds(root).find_map(|(outbound, server)| vless_outbound(outbound, server))
+}
+
+/// The networks whose stream the mux codec rides; a transport outside this set dials one flow per request.
+fn vless_mux_pairs(carrier: &Carrier) -> bool {
+    matches!(
+        carrier,
+        Carrier::Raw(_)
+            | Carrier::Ws { .. }
+            | Carrier::HttpUpgrade { .. }
+            | Carrier::Grpc(_)
+            | Carrier::Xhttp { .. }
+            | Carrier::HttpHeader { .. }
+            | Carrier::Quic
+            | Carrier::Kcp(_)
+            | Carrier::Hysteria(_)
+            | Carrier::Xdrive { .. }
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn vless_outbound(outbound: &Json, server: VlessServer<'_>) -> Option<VlessOut> {
+    let encryption = match vless_client_encryption(server.encryption) {
+        Ok(encryption) => encryption,
+        Err(error) => {
+            eprintln!("vless: {error}; outbound refused");
+            return None;
+        }
+    };
+    let flow = server.flow;
+    if !flow.is_empty() && flow != "none" && !ferrox_core::vless::is_vision_name(&flow) {
+        eprintln!("vless: unknown flow `{flow}`; outbound refused");
+        return None;
+    }
+    let security = stream_security(outbound);
+    let quic_tls = outbound
+        .get("streamSettings")
+        .and_then(|s| s.get("network"))
+        .and_then(Json::as_str)
+        == Some("quic")
+        && security == "tls";
+    // Hysteria carries its own QUIC TLS, so xray's `security: tls` names that handshake rather than a second layer above it.
+    let hysteria_tls = hysteria_transport(outbound) && security == "tls";
+    let transport_tls = quic_tls || hysteria_tls;
+    let address = server.address.to_owned();
+    let (port, id) = (server.port, server.id);
+    let mut mux = match outbound_mux(outbound) {
+        Ok(mux) => mux,
+        Err(why) => {
+            eprintln!("vless: {why}; outbound refused");
+            return None;
+        }
+    };
+    if mux.tcp.is_some() && !vless_mux_pairs(&outbound_carrier(outbound, &address).0) {
+        eprintln!("vless: mux is not carried over this network; every flow dials directly");
+        mux.tcp = None;
+    }
+    if mux.protocol.is_some() && ferrox_core::vless::is_vision_name(&flow) {
+        eprintln!("vless: sing-mux is not carried with the vision flow; using mux.cool");
+        mux.protocol = None;
+    }
+    let stored = xdrive_carried(outbound, &address);
+    if security == "tls" && !transport_tls && stored.is_none() {
+        let out = tls_carried_vless(outbound, address, port, id, &flow, mux, encryption)?;
+        return Some(out);
+    }
+    // REALITY dials raw TCP and every carried carrier the client reaches, both UDP dialers included.
+    if security == "reality" {
+        let (carrier, host) = outbound_carrier(outbound, &address);
+        if !matches!(
+            carrier,
+            Carrier::Raw(_)
+                | Carrier::Ws { .. }
+                | Carrier::HttpUpgrade { .. }
+                | Carrier::Grpc(_)
+                | Carrier::Xhttp { .. }
+                | Carrier::HttpHeader { .. }
+                | Carrier::Kcp(_)
+                | Carrier::Quic
+                | Carrier::Hysteria(_)
+        ) {
+            return None;
+        }
+        let reality = outbound_reality(outbound, &address)?;
+        if let Err(error) = crate::config::reality_mldsa(outbound, false) {
+            eprintln!("vless: {error}; outbound refused");
+            return None;
+        }
+        let (quic_roots, quic_ech, hysteria_roots) = match &carrier {
+            Carrier::Quic => {
+                let ech = if security == "tls" {
+                    match crate::config::quic_ech_config(outbound, &address) {
+                        Ok(ech) => ech,
+                        Err(why) => {
+                            eprintln!("vless: {why}; the quic dial will fail");
+                            return None;
+                        }
+                    }
+                } else {
+                    None
+                };
+                (tls_ca_roots(outbound), ech, None)
+            }
+            Carrier::Hysteria(_) => (None, None, tls_ca_roots(outbound)),
+            _ => (None, None, None),
+        };
+        return Some(VlessOut {
+            address,
+            port,
+            id,
+            carrier,
+            host,
+            mux,
+            pool: Pools::default(),
+            quic_roots,
+            quic_ech,
+            hysteria_roots,
+            tls: None,
+            flow,
+            reality: Some(reality),
+            headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
+            heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
+            encryption,
+        });
+    }
+    if !vless_security_supported(security) && !transport_tls && stored.is_none() {
+        return None;
+    }
+    let (carrier, host) = stored.unwrap_or_else(|| outbound_carrier(outbound, &address));
+    let (quic_roots, quic_ech, hysteria_roots) = match &carrier {
+        Carrier::Quic => {
+            let ech = if security == "tls" {
+                match crate::config::quic_ech_config(outbound, &address) {
+                    Ok(ech) => ech,
+                    Err(why) => {
+                        eprintln!("vless: {why}; the quic dial will fail");
+                        return None;
+                    }
+                }
+            } else {
+                None
+            };
+            (tls_ca_roots(outbound), ech, None)
+        }
+        Carrier::Hysteria(_) => (None, None, tls_ca_roots(outbound)),
+        _ => (None, None, None),
+    };
+    Some(VlessOut {
+        address,
+        port,
+        id,
+        carrier,
+        host,
+        mux,
+        pool: Pools::default(),
+        quic_roots,
+        quic_ech,
+        hysteria_roots,
+        tls: None,
+        flow,
+        reality: None,
+        headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
+        heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
+        encryption,
+    })
+}
+
+/// The bridges the config names: a vless outbound with a reverse tag opens its own session to the
+/// portal and serves whatever the portal routes back under that tag.
+fn find_bridges(root: &Json) -> Vec<(String, VlessOut)> {
+    vless_outbounds(root)
+        .filter_map(|(outbound, server)| {
+            let tag = server.reverse.filter(|tag| !tag.is_empty())?;
+            let vision = ferrox_core::vless::is_vision_name(&server.flow);
+            if !vision && !server.flow.is_empty() && server.flow != "none" {
+                eprintln!(
+                    "vless: reverse bridge `{tag}` names an unknown flow `{}`; not started",
+                    server.flow
+                );
+                return None;
+            }
+            if vision {
+                eprintln!(
+                    "vless: reverse bridge `{tag}` names the vision flow; a reverse session carries the unframed stream only"
+                );
+            }
+            let vless = vless_outbound(outbound, server)?;
+            if !matches!(
+                vless.carrier,
+                Carrier::Raw(_)
+                    | Carrier::Ws { .. }
+                    | Carrier::HttpUpgrade { .. }
+                    | Carrier::Grpc(_)
+                    | Carrier::HttpHeader { .. }
+                    | Carrier::Xhttp { .. }
+            ) {
+                eprintln!(
+                    "vless: reverse bridge `{tag}` names a carrier that cannot carry a reverse session"
+                );
+                return None;
+            }
+            Some((tag.to_owned(), vless))
+        })
+        .collect()
+}
+
+/// The outbound a carried TLS session names: the carriers whose stream the mux codec rides keep it, and a transport that wraps its own session still dials one flow per request.
+fn tls_carried_vless(
+    outbound: &Json,
+    address: String,
+    port: u16,
+    id: [u8; 16],
+    flow: &str,
+    mux: Mux,
+    encryption: Option<Arc<ferrox_core::vless_encryption::Client>>,
+) -> Option<VlessOut> {
+    let (carrier, host, tls) = tls_carried_parts(outbound, &address)?;
+    Some(VlessOut {
+        address,
+        port,
+        id,
+        carrier,
+        host,
+        mux,
+        pool: Pools::default(),
+        quic_roots: None,
+        quic_ech: None,
+        hysteria_roots: None,
+        tls: Some(tls),
+        flow: flow.to_owned(),
+        reality: None,
+        headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
+        heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
+        encryption,
+    })
+}
+
+fn vless_client_encryption(
+    value: Option<&str>,
+) -> Result<Option<Arc<ferrox_core::vless_encryption::Client>>, String> {
+    let Some(value) = value.filter(|value| !value.is_empty() && *value != "none") else {
+        return Ok(None);
+    };
+    let config = ferrox_core::vless_encryption::ClientConfig::parse(value)?;
+    Ok(Some(ferrox_core::vless_encryption::Client::with_clock(
+        config,
+        Arc::new(crate::config::unix_seconds),
+    )))
+}
+
+fn vless_loopback_encryption(
+    value: Option<&str>,
+) -> Result<Option<Arc<ferrox_core::vless_encryption::Client>>, String> {
+    let Some(value) = value.filter(|value| !value.is_empty() && *value != "none") else {
+        return Ok(None);
+    };
+    let config = ferrox_core::vless_encryption::ClientConfig::from_server(value)?;
+    Ok(Some(ferrox_core::vless_encryption::Client::with_clock(
+        config,
+        Arc::new(crate::config::unix_seconds),
+    )))
+}
+
+#[allow(clippy::too_many_lines)]
+fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
+    if let Some((outbound, server, user)) = vmess_outbounds(root).next() {
+        let address = server.get("address").and_then(Json::as_str)?.to_owned();
+        let port = server.get("port").and_then(Json::as_port)?;
+        let id = user.get("id").and_then(Json::as_str).and_then(uuid_bytes)?;
+        let cipher = vmess_cipher(user);
+        let auth_len = authenticated_length(user);
+        let no_termination = no_termination(user);
+        let mux = match outbound_mux(outbound) {
+            Ok(mux) => mux,
+            Err(why) => {
+                eprintln!("vmess: {why}; outbound refused");
+                return None;
+            }
+        };
+        if stream_security(outbound) == "reality" {
+            let (carrier, host) = outbound_carrier(outbound, &address);
+            if !matches!(
+                carrier,
+                Carrier::Raw(_)
+                    | Carrier::Ws { .. }
+                    | Carrier::HttpUpgrade { .. }
+                    | Carrier::Grpc(_)
+                    | Carrier::Xhttp { .. }
+                    | Carrier::HttpHeader { .. }
+            ) {
+                let network = match &carrier {
+                    Carrier::Quic => "quic",
+                    Carrier::Kcp(_) => "kcp",
+                    Carrier::Hysteria(_) => "hysteria",
+                    Carrier::Masque => "masque",
+                    Carrier::Xdrive { .. } => "xdrive",
+                    Carrier::Http => "http",
+                    Carrier::Unknown { network } => network.as_str(),
+                    _ => "that transport",
+                };
+                eprintln!("vmess reality on {address}: not carried on {network}; outbound refused");
+                return None;
+            }
+            let reality = outbound_reality(outbound, &address)?;
+            if let Err(error) = crate::config::reality_mldsa(outbound, false) {
+                eprintln!("vmess: {error}; outbound refused");
+                return None;
+            }
+            return Some(VmessOut {
+                address,
+                port,
+                id,
+                cipher,
+                auth_len,
+                no_termination,
+                carrier,
+                host,
+                tls: None,
+                reality: Some(reality),
+                headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
+                heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
+                mux,
+                pool: Pools::default(),
+            });
+        }
+        let security = stream_security(outbound);
+        let quic_tls = outbound
+            .get("streamSettings")
+            .and_then(|s| s.get("network"))
+            .and_then(Json::as_str)
+            == Some("quic")
+            && security == "tls";
+        let hysteria_tls = hysteria_transport(outbound) && security == "tls";
+        if security == "tls" && !quic_tls && !hysteria_tls {
+            if let Some((carrier, host, tls)) = tls_carried_parts(outbound, &address) {
+                return Some(VmessOut {
+                    address,
+                    port,
+                    id,
+                    cipher,
+                    auth_len,
+                    no_termination,
+                    carrier,
+                    host,
+                    tls: Some(tls),
+                    reality: None,
+                    headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
+                    heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
+                    quic_roots: None,
+                    quic_ech: None,
+                    hysteria_roots: None,
+                    mux,
+                    pool: Pools::default(),
+                });
+            }
+        }
+        // A security the tree cannot dial is refused, never silently sent plain.
+        let stored = xdrive_carried(outbound, &address);
+        if !matches!(security, "" | "none") && !quic_tls && !hysteria_tls && stored.is_none() {
+            return None;
+        }
+        let (carrier, host) = stored.unwrap_or_else(|| outbound_carrier(outbound, &address));
+        if let Carrier::Unknown { network } = &carrier {
+            eprintln!("vmess: network `{network}` is not dialled; outbound refused");
+            return None;
+        }
+        if matches!(&carrier, Carrier::Masque | Carrier::Http) {
+            eprintln!("vmess: the masque and http carriers are not dialled; outbound refused");
+            return None;
