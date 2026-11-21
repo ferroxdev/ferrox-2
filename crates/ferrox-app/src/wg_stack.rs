@@ -181,7 +181,36 @@ impl Drop for FlowLease {
 /// The route table of live client datagram lanes, keyed by the loopback relay
 /// port each lane bound: an inner reply names that port, so the reader hands it
 /// to the lane that asked.
-pub(crate) type UdpRoutes = Arc<Mutex<HashMap<u16, Sender<Vec<u8>>>>>;
+pub(crate) type UdpRoutes = Arc<Mutex<HashMap<u16, Sender<LanePacket>>>>;
+
+/// An inner packet bound for a client lane: the buffer the tunnel read it into, the offset its IP
+/// packet starts at, and the pool that owns the buffer, so the lane reads the packet where it lies
+/// and hands the buffer back instead of a copy outliving a dropped original.
+pub(crate) struct LanePacket {
+    pub bytes: Vec<u8>,
+    pub at: usize,
+    pub recycle: Option<Sender<Vec<u8>>>,
+}
+
+impl LanePacket {
+    pub(crate) fn packet(&self) -> &[u8] {
+        &self.bytes[self.at..]
+    }
+
+    /// The packet's buffer, without returning it to the pool: the caller keeps it.
+    pub(crate) fn into_bytes(mut self) -> Vec<u8> {
+        self.recycle = None;
+        std::mem::take(&mut self.bytes)
+    }
+}
+
+impl Drop for LanePacket {
+    fn drop(&mut self) {
+        if let Some(recycle) = self.recycle.take() {
+            let _ = recycle.send(std::mem::take(&mut self.bytes));
+        }
+    }
+}
 
 /// An in-memory IP device: the reader pushes inner packets into `rx`, and every
 /// packet `smoltcp` emits is left in `tx` for the tunnel writer.
@@ -1296,10 +1325,9 @@ fn receive_client(stack: &mut ClientStack, packet: Packet) {
         stack.device.push(bytes, at);
         return;
     }
-    if stack.deliver_udp(&bytes[at..]) {
-        stack.device.recycle(bytes, at);
+    let Some(bytes) = stack.deliver_udp(bytes, at) else {
         return;
-    }
+    };
     if !stack.answer_echo(&bytes[at..]) {
         stack.absorb(packet.peer, &bytes[at..]);
     }
@@ -1610,21 +1638,31 @@ impl ClientStack {
         }
     }
 
-    /// Hand a complete UDP packet to the lane waiting on its destination port.
-    fn deliver_udp(&self, packet: &[u8]) -> bool {
-        let Some(datagram) = udp_from_packet(packet) else {
-            return false;
+    /// Hand a complete UDP packet to the lane waiting on its destination port, in the buffer the
+    /// tunnel read it into: the lane returns that buffer to the pool. `Some` is the packet back
+    /// when no lane takes it.
+    fn deliver_udp(&self, packet: Vec<u8>, at: usize) -> Option<Vec<u8>> {
+        let Some(datagram) = udp_from_packet(&packet[at..]) else {
+            return Some(packet);
         };
         if !datagram.verified {
-            return false;
+            return Some(packet);
         }
         let Ok(table) = self.routes.lock() else {
-            return false;
+            return Some(packet);
         };
         let Some(lane) = table.get(&datagram.destination_port) else {
-            return false;
+            return Some(packet);
         };
-        lane.send(packet.to_vec()).is_ok()
+        let handed = LanePacket {
+            bytes: packet,
+            at,
+            recycle: self.device.recycle.clone().filter(|_| at != 0),
+        };
+        match lane.send(handed) {
+            Ok(()) => None,
+            Err(back) => Some(back.0.into_bytes()),
+        }
     }
 
     /// Answer an echo aimed at one of the client's own tunnel addresses.
@@ -2649,7 +2687,7 @@ fn query_tunnel(
             let Ok(reply) = reply_rx.recv_timeout(left) else {
                 break None;
             };
-            let Some(datagram) = udp_from_packet(&reply) else {
+            let Some(datagram) = udp_from_packet(reply.packet()) else {
                 continue;
             };
             let Some(answer) = ferrox_core::dns::parse_answer(datagram.payload) else {
@@ -2687,7 +2725,7 @@ fn query_tunnel(
 
 /// Reserve the port the answer will be addressed to; a lane that already owns it
 /// is skipped so the query never steals a reply from a live call.
-fn reserve_dns_port(routes: &UdpRoutes, sender: &Sender<Vec<u8>>) -> Option<u16> {
+fn reserve_dns_port(routes: &UdpRoutes, sender: &Sender<LanePacket>) -> Option<u16> {
     let mut table = routes.lock().ok()?;
     for _ in 0..DNS_PORT_SPAN {
         let port = DNS_PORT_BASE + (NEXT_DNS_PORT.fetch_add(1, Ordering::Relaxed) % DNS_PORT_SPAN);
@@ -2716,7 +2754,7 @@ fn lane_reply(
 }
 
 /// Reserve a tunnel source port for one name on this lane.
-fn lane_port(routes: &UdpRoutes, sender: &Sender<Vec<u8>>, lane: u16) -> Option<u16> {
+fn lane_port(routes: &UdpRoutes, sender: &Sender<LanePacket>, lane: u16) -> Option<u16> {
     let mut table = routes.lock().ok()?;
     for _ in 0..LANE_PORTS {
         let port = 20000 + (NEXT_LANE_PORT.fetch_add(1, Ordering::Relaxed) % 40000);
@@ -2751,7 +2789,7 @@ fn lane_source_port(
     replies: &mut HashMap<u16, (String, u16)>,
     owned: &mut Vec<u16>,
     routes: &UdpRoutes,
-    sender: &Sender<Vec<u8>>,
+    sender: &Sender<LanePacket>,
     lane: u16,
 ) -> Option<u16> {
     let Some(key) = key else {
@@ -2775,13 +2813,13 @@ fn lane_over(associate: Option<&Connection>, quiet: StdInstant) -> bool {
     associate.is_some_and(crate::proxy::peer_left) || quiet.elapsed() >= crate::budgets::udp_idle()
 }
 
-pub(crate) type UdpRouteClaim = (Sender<Vec<u8>>, Receiver<Vec<u8>>);
+pub(crate) type UdpRouteClaim = (Sender<LanePacket>, Receiver<LanePacket>);
 
 /// The lifecycle controls of a fixed-target datagram lane.
 pub(crate) struct ForwardControl {
     pub(crate) stop: Arc<AtomicBool>,
     pub(crate) ready: Option<Sender<Result<(), String>>>,
-    pub(crate) preclaimed: Option<Receiver<Vec<u8>>>,
+    pub(crate) preclaimed: Option<Receiver<LanePacket>>,
 }
 
 /// Claims one relay port for a datagram lane, so a second owner reports the collision before it reads.
@@ -2833,26 +2871,29 @@ pub(crate) fn client_udp<T: Clone + Into<ToTunnel>>(
     let mut owned = vec![port];
     let mut quiet = StdInstant::now();
     'lane: loop {
-        while let Ok(inner) = reply_rx.try_recv() {
-            let Some(datagram) = udp_from_packet(&inner) else {
-                continue;
-            };
-            let Some(app) = app else {
-                continue;
-            };
-            let Some(remote) = socket_addr(datagram.source, datagram.source_port) else {
-                continue;
-            };
-            if let Some(key) = replies.get(&datagram.destination_port) {
-                if !lane_reply(&mut winners, key, remote) {
-                    continue;
+        while let Ok(packet) = reply_rx.try_recv() {
+            'packet: {
+                let Some(datagram) = udp_from_packet(packet.packet()) else {
+                    break 'packet;
+                };
+                let Some(app) = app else {
+                    break 'packet;
+                };
+                let Some(remote) = socket_addr(datagram.source, datagram.source_port) else {
+                    break 'packet;
+                };
+                if let Some(key) = replies.get(&datagram.destination_port) {
+                    if !lane_reply(&mut winners, key, remote) {
+                        break 'packet;
+                    }
+                } else if datagram.destination_port != port {
+                    break 'packet;
                 }
-            } else if datagram.destination_port != port {
-                continue;
+                let out = crate::proxy::socks_udp_frame(&mut frame, &remote, datagram.payload);
+                let _ = relay.send_to(out, app);
+                quiet = StdInstant::now();
+                drop(packet);
             }
-            let out = crate::proxy::socks_udp_frame(&mut frame, &remote, datagram.payload);
-            let _ = relay.send_to(out, app);
-            quiet = StdInstant::now();
         }
         match relay.recv_from(&mut buf) {
             Ok((n, sender)) => {
@@ -2966,17 +3007,20 @@ pub(crate) fn client_udp_forward<T: Clone + Into<ToTunnel>>(
     let mut buf = crate::proxy::udp_buffer();
     let mut app: Option<SocketAddr> = None;
     while !stop.load(Ordering::Relaxed) {
-        while let Ok(inner) = reply_rx.try_recv() {
-            let Some(datagram) = udp_from_packet(&inner) else {
-                continue;
-            };
-            if datagram.destination_port != port {
-                continue;
+        while let Ok(packet) = reply_rx.try_recv() {
+            'packet: {
+                let Some(datagram) = udp_from_packet(packet.packet()) else {
+                    break 'packet;
+                };
+                if datagram.destination_port != port {
+                    break 'packet;
+                }
+                let Some(app) = app else {
+                    break 'packet;
+                };
+                let _ = relay.send_to(datagram.payload, app);
+                drop(packet);
             }
-            let Some(app) = app else {
-                continue;
-            };
-            let _ = relay.send_to(datagram.payload, app);
         }
         match relay.recv_from(&mut buf) {
             Ok((n, sender)) => {
@@ -3333,7 +3377,11 @@ mod tests {
                 .get(&datagram.source_port)
                 .cloned()
                 .expect("the query's route")
-                .send(packet)
+                .send(LanePacket {
+                    bytes: packet,
+                    at: 0,
+                    recycle: None,
+                })
                 .expect("the answer reaches the waiter");
         });
         let answer = resolve_over_tunnel(
@@ -4690,7 +4738,7 @@ mod tests {
             let reply = replies
                 .recv_timeout(Duration::from_secs(5))
                 .expect("the completed datagram reaches its lane");
-            assert_eq!(reply, packet);
+            assert_eq!(reply.packet(), &packet[..]);
         }
     }
 
@@ -5166,6 +5214,59 @@ mod tests {
             "a client narrowed the MTU every tunnel shares"
         );
     }
+
+    /// A reply datagram reaches its lane in the buffer the tunnel read, and the lane's return puts
+    /// that same allocation back in the pool; a packet no lane claims comes back untouched.
+    #[test]
+    fn a_reply_datagram_reaches_its_lane_in_the_readers_buffer() {
+        let (to_tunnel, _packets) = std::sync::mpsc::channel();
+        let mut stack = ClientStack::new(&device(&["10.0.0.1"], true), to_tunnel, 0);
+        let (pool, recycled) = std::sync::mpsc::channel();
+        stack.device.recycle = Some(pool);
+        let (lane, replies) = std::sync::mpsc::channel();
+        stack.routes.lock().expect("routes").insert(4321, lane);
+        let mut bytes = vec![0u8; 16];
+        assert!(udp_datagram(
+            &UdpDatagram {
+                source: &[10, 0, 0, 2],
+                destination: &[10, 0, 0, 1],
+                source_port: 1234,
+                destination_port: 4321,
+                payload: b"hi",
+            },
+            &mut bytes,
+        ));
+        let base = bytes.as_ptr();
+        let (want, copy_counts) = ferrox_core::alloc_count::measure(|| bytes[16..].to_vec());
+        assert_eq!(copy_counts.allocs, 1, "the old shape copied the datagram");
+        assert_eq!(stack.deliver_udp(bytes, 16), None, "the lane takes it");
+        let packet = replies.recv().expect("the lane's packet");
+        assert_eq!(packet.bytes.as_ptr(), base, "the reader's own buffer");
+        assert_eq!(packet.at, 16, "at the packet's offset");
+        assert_eq!(packet.packet(), &want[..], "the datagram's own bytes");
+        drop(packet);
+        let returned = recycled.recv().expect("the pool's buffer");
+        assert_eq!(returned.as_ptr(), base, "the same allocation comes back");
+
+        let mut bytes = vec![7u8; 16];
+        assert!(udp_datagram(
+            &UdpDatagram {
+                source: &[10, 0, 0, 2],
+                destination: &[10, 0, 0, 1],
+                source_port: 1234,
+                destination_port: 4322,
+                payload: b"hi",
+            },
+            &mut bytes,
+        ));
+        let base = bytes.as_ptr();
+        let back = stack.deliver_udp(bytes, 16).expect("no lane claims it");
+        assert_eq!(
+            back.as_ptr(),
+            base,
+            "and the packet comes back as it went in"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -5323,7 +5424,11 @@ mod client_tests {
             .expect("routes")
             .get(&port)
             .expect("lane")
-            .send(reply)
+            .send(LanePacket {
+                bytes: reply,
+                at: 0,
+                recycle: None,
+            })
             .expect("reply");
         let mut received = [0u8; 2048];
         let (n, _) = app.recv_from(&mut received).expect("framed reply");
@@ -5395,7 +5500,11 @@ mod client_tests {
             .expect("routes")
             .get(&port)
             .expect("lane")
-            .send(reply)
+            .send(LanePacket {
+                bytes: reply,
+                at: 0,
+                recycle: None,
+            })
             .expect("reply");
         let mut received = [0u8; 2048];
         let (n, _) = app.recv_from(&mut received).expect("reply");
@@ -5575,7 +5684,11 @@ mod client_tests {
             .expect("routes")
             .get(&source_port)
             .expect("lane")
-            .send(reply)
+            .send(LanePacket {
+                bytes: reply,
+                at: 0,
+                recycle: None,
+            })
             .expect("reply");
 
         let mut received = [0u8; 2048];
@@ -5603,7 +5716,11 @@ mod client_tests {
             .expect("routes")
             .get(&port)
             .expect("lane")
-            .send(reply)
+            .send(LanePacket {
+                bytes: reply,
+                at: 0,
+                recycle: None,
+            })
             .expect("reply");
 
         app.send_to(&frame, relay_address).expect("send again");
