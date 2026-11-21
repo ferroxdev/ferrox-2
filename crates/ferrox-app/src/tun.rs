@@ -3434,7 +3434,7 @@ mod tests {
         covered.extend_from_slice(&(request.len() as u32).to_be_bytes());
         covered.extend_from_slice(&[0, 0, 0, ICMPV6_PROTO]);
         covered.extend_from_slice(&request);
-        let sum = checksum(&covered);
+        let sum = ferrox_core::foxy::connectip::checksum(&covered);
         request[2..4].copy_from_slice(&sum.to_be_bytes());
         let mut out = Vec::new();
         render_icmp_reply_ip(
@@ -3527,7 +3527,7 @@ mod tests {
             );
         }
         let mut request = [8u8, 0, 0, 0, 0, 1, 0, 1, b'p', b'i', b'n', b'g'];
-        let sum = checksum(&request);
+        let sum = ferrox_core::foxy::connectip::checksum(&request);
         request[2..4].copy_from_slice(&sum.to_be_bytes());
         render_icmp_reply([10, 0, 0, 1], [10, 0, 0, 2], &request, &mut out);
         assert_eq!(
