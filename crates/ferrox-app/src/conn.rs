@@ -3435,29 +3435,16 @@ fn windows_delete_stale(path: &std::path::Path, before: Option<&(u32, u64)>) -> 
     use std::os::windows::io::AsRawHandle as _;
     const DELETE: u32 = 0x0001_0000;
     const FILE_READ_ATTRIBUTES: u32 = 0x80;
-    const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     #[repr(C)]
-    struct FileDispositionInfo {
-        delete_file: u8,
+    struct FileDispositionInfoEx {
+        flags: u32,
     }
-    #[repr(C)]
-    struct FileBasicInfo {
-        creation_time: i64,
-        last_access_time: i64,
-        last_write_time: i64,
-        change_time: i64,
-        file_attributes: u32,
-    }
+    const FILE_DISPOSITION_FLAG_DELETE: u32 = 0x1;
+    const FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE: u32 = 0x10;
     #[link(name = "kernel32")]
     extern "system" {
-        fn GetFileInformationByHandleEx(
-            handle: *mut core::ffi::c_void,
-            class: i32,
-            info: *mut core::ffi::c_void,
-            size: u32,
-        ) -> i32;
         fn SetFileInformationByHandle(
             handle: *mut core::ffi::c_void,
             class: i32,
@@ -3466,7 +3453,7 @@ fn windows_delete_stale(path: &std::path::Path, before: Option<&(u32, u64)>) -> 
         ) -> i32;
     }
     let file = match std::fs::OpenOptions::new()
-        .access_mode(DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+        .access_mode(DELETE | FILE_READ_ATTRIBUTES)
         .share_mode(0)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
@@ -3503,46 +3490,16 @@ fn windows_delete_stale(path: &std::path::Path, before: Option<&(u32, u64)>) -> 
             ))
         }
     }
-    let mut basic = FileBasicInfo {
-        creation_time: 0,
-        last_access_time: 0,
-        last_write_time: 0,
-        change_time: 0,
-        file_attributes: 0,
+    let disposition = FileDispositionInfoEx {
+        flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
     };
-    // SAFETY: the handle is live and `basic` is the class's structure.
-    let read = unsafe {
-        GetFileInformationByHandleEx(
-            file.as_raw_handle(),
-            0,
-            (&raw mut basic).cast(),
-            std::mem::size_of::<FileBasicInfo>() as u32,
-        )
-    };
-    if read == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    basic.file_attributes &= !0x1;
-    // SAFETY: the handle is live and `basic` is the class's structure.
-    let cleared = unsafe {
-        SetFileInformationByHandle(
-            file.as_raw_handle(),
-            0,
-            (&raw const basic).cast(),
-            std::mem::size_of::<FileBasicInfo>() as u32,
-        )
-    };
-    if cleared == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let disposition = FileDispositionInfo { delete_file: 1 };
     // SAFETY: the handle is live and `disposition` is the class's structure.
     let ok = unsafe {
         SetFileInformationByHandle(
             file.as_raw_handle(),
-            4,
+            21,
             (&raw const disposition).cast(),
-            std::mem::size_of::<FileDispositionInfo>() as u32,
+            std::mem::size_of::<FileDispositionInfoEx>() as u32,
         )
     };
     if ok == 0 {

@@ -1057,6 +1057,7 @@ fn serve_inbounds_counted(
             }
             let handler_users = vmess_users;
             if let Some(stop) = &handler_stop {
+                stop.untrack_sessions();
                 stop.expect_listeners(handler_stops.len() + extra_threads);
             }
             if let Some(api) = api {
@@ -1382,6 +1383,7 @@ pub(crate) struct Stop {
     next_session: std::sync::atomic::AtomicU64,
     track_sessions: AtomicBool,
     wake: std::sync::Condvar,
+    drained: std::sync::Condvar,
 }
 
 /// One accepted session's registration: the stop holds a socket clone it can shut down, and the guard removes it when the work ends.
@@ -1395,7 +1397,30 @@ impl Drop for TrackedSession {
         if let Ok(mut sessions) = self.stop.sessions.lock() {
             sessions.remove(&self.id);
         }
-        self.stop.wake.notify_all();
+        self.stop.drained.notify_all();
+    }
+}
+
+thread_local! {
+    static ACCEPTED_SESSION: std::cell::RefCell<Option<TrackedSession>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Holds one accepted session for the setup work's thread and clears it when that work returns, unless the relay took it for its own lifetime.
+struct SessionScope;
+
+impl SessionScope {
+    fn install(session: Option<TrackedSession>) -> Self {
+        ACCEPTED_SESSION.with(|slot| *slot.borrow_mut() = session);
+        Self
+    }
+}
+
+impl Drop for SessionScope {
+    fn drop(&mut self) {
+        ACCEPTED_SESSION.with(|slot| {
+            slot.borrow_mut().take();
+        });
     }
 }
 
@@ -1443,6 +1468,10 @@ impl Stop {
         self.track_sessions.store(true, Ordering::Relaxed);
     }
 
+    fn untrack_sessions(&self) {
+        self.track_sessions.store(false, Ordering::Relaxed);
+    }
+
     /// Registers an accepted stream so rollback can shut it down and wait for its work to leave.
     fn track_session(self: &Arc<Self>, stream: &Connection) -> Option<TrackedSession> {
         if !self.track_sessions.load(Ordering::Relaxed) {
@@ -1475,7 +1504,7 @@ impl Stop {
             if left.is_zero() {
                 return false;
             }
-            let Ok(next) = self.wake.wait_timeout(sessions, left) else {
+            let Ok(next) = self.drained.wait_timeout(sessions, left) else {
                 return false;
             };
             sessions = next.0;
@@ -6401,7 +6430,7 @@ fn accept_listener(
             lane_pool::submit_setup(
                 Box::new(move || {
                     if let Some((role, stream, sniffing, session)) = work.take() {
-                        let _session = session;
+                        let _session = SessionScope::install(session);
                         // The header handshake reads the peer's first bytes; the lane spends what is left of the handshake budget, queue time included.
                         let budget = budgets::handshake();
                         let waited = accepted_at.elapsed();
@@ -6427,7 +6456,7 @@ fn accept_listener(
             lane_pool::submit_setup(
                 Box::new(move || {
                     if let Some((stream, role, tag, sniffing, session)) = work.take() {
-                        let _session = session;
+                        let _session = SessionScope::install(session);
                         serve_accepted(stream, role, tag.as_deref(), sniffing, accepted_at);
                     }
                     lane_pool::Next::Done
@@ -6437,7 +6466,7 @@ fn accept_listener(
         } else {
             let session = stop.as_ref().and_then(|stop| stop.track_session(&stream));
             thread::spawn(move || {
-                let _session = session;
+                let _session = SessionScope::install(session);
                 serve_accepted(stream, role, tag.as_deref(), sniffing, accepted_at);
             });
         }
@@ -31293,8 +31322,6 @@ fn serve_socks_udp_freedom(
             }
             Err(_) => break,
         };
-        seen = replies.load(Ordering::Relaxed);
-        last = Instant::now();
         // Only the control peer, then its first UDP source, may name a destination.
         if !source_admitted(peer, pinned, src) {
             continue;
@@ -31305,6 +31332,9 @@ fn serve_socks_udp_freedom(
         if payload.is_empty() {
             continue;
         }
+        // A datagram that passes admission and framing is the only one that keeps the lane alive.
+        seen = replies.load(Ordering::Relaxed);
+        last = Instant::now();
         let Some(dest) = freedom_socket(freedom, &Destination::Address(dest)) else {
             continue;
         };
@@ -33512,7 +33542,15 @@ fn relay_handoff_with(client: &Connection, target: &Connection, answer: Option<A
         return;
     }
     // A masked or metered leg needs the buffered copy, and a host without a descriptor pump keeps the lane pool.
-    relay_lanes(client_read, target_write, target_read, client_write, answer);
+    let session = ACCEPTED_SESSION.with(|slot| slot.borrow_mut().take());
+    relay_lanes(
+        client_read,
+        target_write,
+        target_read,
+        client_write,
+        answer,
+        session,
+    );
 }
 
 /// One direction of a TCP relay as a lane step: the descriptor pump's buffer and nonblocking
@@ -33523,6 +33561,7 @@ fn relay_lanes(
     target_read: Connection,
     client_write: Connection,
     answer: Option<AnswerHooks>,
+    session: Option<TrackedSession>,
 ) {
     // A pool with no worker would run forward inline before reply was queued, so use the owned copy.
     if !lane_pool::start() {
@@ -33545,6 +33584,9 @@ fn relay_lanes(
         .unwrap_or_else(crate::budgets::relay_stall);
     let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
     let flow = RelayFinish::new(false, close, None);
+    if let Some(session) = session {
+        flow.then(move || drop(session));
+    }
     let first = Arc::clone(&flow);
     let mut forward = TcpCopy::new(client_read, target_write);
     forward.stall = forward_stall;
