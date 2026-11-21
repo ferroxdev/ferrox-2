@@ -43640,3 +43640,8679 @@ fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
                         Err(why) => {
                             eprintln!("vmess: {why}; the quic dial will fail");
                             return None;
+                        }
+                    }
+                } else {
+                    None
+                };
+                (tls_ca_roots(outbound), ech, None)
+            }
+            Carrier::Hysteria(_) => (None, None, tls_ca_roots(outbound)),
+            _ => (None, None, None),
+        };
+        return Some(VmessOut {
+            address,
+            port,
+            id,
+            cipher,
+            auth_len,
+            no_termination,
+            carrier,
+            host,
+            tls: None,
+            reality: None,
+            headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
+            heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
+            quic_roots,
+            quic_ech,
+            hysteria_roots,
+            mux,
+            pool: Pools::default(),
+        });
+    }
+    None
+}
+
+// TLS runs outside the carrier, the order both references use, so every diallable carrier is accepted here.
+fn tls_parts(
+    outbound: &Json,
+    address: &str,
+) -> Option<(Carrier, String, Arc<ferrox_core::tls::TlsConfig>)> {
+    if stream_security(outbound) != "tls" {
+        return None;
+    }
+    let (carrier, host) = outbound_carrier(outbound, address);
+    match carrier {
+        Carrier::Raw(_)
+        | Carrier::Ws { .. }
+        | Carrier::HttpUpgrade { .. }
+        | Carrier::Grpc(_)
+        | Carrier::Xhttp { .. }
+        | Carrier::HttpHeader { .. } => {}
+        Carrier::Quic
+        | Carrier::Kcp(_)
+        | Carrier::Hysteria(_)
+        | Carrier::Masque
+        | Carrier::Xdrive { .. }
+        | Carrier::Http
+        | Carrier::Unknown { .. } => return None,
+    }
+    outbound_tls(outbound, address)
+        .ok()
+        .map(|tls| (carrier, host, tls))
+}
+
+/// KCP's session wraps the transport, as it does upstream, so the carrier and the TLS are one dial.
+fn tls_carried_parts(
+    outbound: &Json,
+    address: &str,
+) -> Option<(Carrier, String, Arc<ferrox_core::tls::TlsConfig>)> {
+    let (carrier, host) = outbound_carrier(outbound, address);
+    match carrier {
+        Carrier::Kcp(_) => outbound_tls(outbound, address)
+            .ok()
+            .map(|tls| (carrier, host, tls)),
+        _ => tls_parts(outbound, address),
+    }
+}
+
+/// An xdrive row's `security: tls` names the handshake its own lanes speak, as upstream reads it, so the session above the store adds no second one; reality stays refused, as the store refuses it.
+fn xdrive_carried(outbound: &Json, address: &str) -> Option<(Carrier, String)> {
+    if stream_security(outbound) != "tls" {
+        return None;
+    }
+    let (carrier, host) = outbound_carrier(outbound, address);
+    matches!(carrier, Carrier::Xdrive { .. }).then_some((carrier, host))
+}
+
+fn x25519_pair() -> (String, String) {
+    let mut private = [0u8; 32];
+    getrandom::fill(&mut private).unwrap_or_else(|error| exit(&format!("no entropy: {error}")));
+    private[0] &= 0xF8;
+    private[31] &= 0x7F;
+    private[31] |= 0x40;
+    let public = x25519_dalek::x25519(private, x25519_dalek::X25519_BASEPOINT_BYTES);
+    (b64url(&private), b64url(&public))
+}
+
+fn b64url(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    ferrox_core::transport::early_encode_into(&mut out, bytes);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    impl Mux {
+        /// The mux a config with only `enabled: true` folds to: the 128 concurrency floor and the shared datagram carrier.
+        fn on() -> Mux {
+            Mux {
+                enabled: true,
+                tcp: Some(128),
+                xudp: Xudp::Shared,
+                udp443: Udp443::Reject,
+                ..Mux::default()
+            }
+        }
+    }
+
+    fn fast_open_cfg() -> ferrox_core::tls::TlsConfig {
+        ferrox_core::tls::TlsConfig {
+            sni: Some(ferrox_core::evasion::SniSpoof {
+                fake_sni: "www.speedtest.net".to_owned(),
+                sequence: 0,
+                method: ferrox_core::evasion::SniMethod::FastOpen,
+                fooling: ferrox_core::evasion::DecoyFooling::Auto,
+                ttl: 8,
+                mixed_case: false,
+            }),
+            ..ferrox_core::tls::TlsConfig::default()
+        }
+    }
+
+    fn tcp_pair() -> Connection {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let client =
+            std::net::TcpStream::connect(listener.local_addr().expect("bound")).expect("connects");
+        let (_peer, _) = listener.accept().expect("accepts");
+        Connection::Tcp(client)
+    }
+
+    #[test]
+    fn a_deferred_fast_open_dial_keeps_the_hello_as_it_is() {
+        let cfg = fast_open_cfg();
+        assert!(
+            matches!(
+                arm_sni(&cfg, tcp_pair(), Fast::Deferred),
+                Connection::Tcp(_)
+            ),
+            "a SYN the kernel deferred needs no rewrite"
+        );
+        assert!(
+            matches!(
+                arm_sni(&cfg, tcp_pair(), Fast::Refused),
+                Connection::Masked(_)
+            ),
+            "a refused Fast Open rewrites the first record"
+        );
+    }
+
+    #[test]
+    fn a_windows_receive_timeout_counts_as_a_timeout() {
+        let timeout = std::io::Error::from(std::io::ErrorKind::TimedOut);
+        assert!(
+            is_timeout(&timeout),
+            "Windows reports SO_RCVTIMEO as TimedOut, not WouldBlock"
+        );
+        assert!(!is_timeout(&std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset
+        )));
+    }
+
+    #[test]
+    fn an_absent_mux_protocol_keeps_mux_cool_and_an_explicit_one_selects_singmux() {
+        let xray = crate::json::parse(r#"{"mux":{"enabled":true}}"#).expect("json");
+        let mux = outbound_mux(&xray).expect("mux");
+        assert!(mux.enabled);
+        assert_eq!(mux.protocol, None);
+        assert!(!mux.padding);
+        assert_eq!(mux.udp_manager(), Some(128));
+        assert_eq!(
+            mux.udp_443("192.0.2.1:443".parse().expect("addr")),
+            Udp443::Reject
+        );
+
+        let sing =
+            crate::json::parse(r#"{"mux":{"enabled":true,"protocol":"h2mux","padding":true}}"#)
+                .expect("json");
+        let mux = outbound_mux(&sing).expect("mux");
+        assert_eq!(mux.protocol, Some(crate::singmux::Protocol::H2Mux));
+        assert!(mux.padding);
+        assert_eq!(mux.udp_manager(), Some(128));
+        assert_eq!(
+            mux.udp_443("192.0.2.1:443".parse().expect("addr")),
+            Udp443::Allow,
+            "sing-mux carries udp/443 without xray's policy"
+        );
+
+        let yamux =
+            crate::json::parse(r#"{"mux":{"enabled":true,"protocol":"yamux"}}"#).expect("json");
+        assert_eq!(
+            outbound_mux(&yamux).expect("mux").protocol,
+            Some(crate::singmux::Protocol::Yamux)
+        );
+        let unknown =
+            crate::json::parse(r#"{"mux":{"enabled":true,"protocol":"other"}}"#).expect("json");
+        assert!(outbound_mux(&unknown).is_err());
+    }
+
+    /// Vision framing cannot carry a sing-mux rendezvous header, so the outbound falls back to
+    /// xray's command-3 carrier instead of dialing a pool the server will refuse.
+    #[test]
+    fn a_vision_flow_falls_back_from_singmux_to_mux_cool() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"127.0.0.1",
+                "port":443,"users":[{"id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "flow":"xtls-rprx-vision"}]}]},
+                "mux":{"enabled":true,"protocol":"yamux"}}]}"#,
+        )
+        .expect("json");
+        let out = find_vless_outbound(&root).expect("outbound");
+        assert!(out.is_vision());
+        assert_eq!(out.mux.protocol, None);
+    }
+
+    /// The whole-pool cells — eight-flow and mux-carrier — need the suite to themselves; running
+    /// two at once measures the harness's parallelism, not the lane scheduler.
+    static EIGHT_FLOW: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn an_address_port_strategy_moves_the_outbound_edges_dial() {
+        let echo = std::net::TcpListener::bind("127.0.0.1:0").expect("echo binds");
+        let echo_port = echo.local_addr().expect("echo address").port();
+        thread::spawn(move || {
+            if let Ok((mut stream, _)) = echo.accept() {
+                let mut said = [0u8; 4];
+                if stream.read_exact(&mut said).is_ok() {
+                    let _ = stream.write_all(&said);
+                }
+            }
+        });
+        let dns = UdpSocket::bind("127.0.0.1:0").expect("dns binds");
+        let dns_addr = dns.local_addr().expect("dns address");
+        thread::spawn(move || {
+            let mut query = vec![0u8; 512];
+            let Ok((read, from)) = dns.recv_from(&mut query) else {
+                return;
+            };
+            let mut target = Vec::new();
+            for label in ["127", "0", "0", "1"] {
+                target.push(label.len() as u8);
+                target.extend_from_slice(label.as_bytes());
+            }
+            target.push(0);
+            let mut rdata = Vec::new();
+            rdata.extend_from_slice(&0u16.to_be_bytes());
+            rdata.extend_from_slice(&0u16.to_be_bytes());
+            rdata.extend_from_slice(&echo_port.to_be_bytes());
+            rdata.extend_from_slice(&target);
+            let mut answer = query[..read].to_vec();
+            answer[2] = 0x81;
+            answer[3] = 0x80;
+            answer[6..8].copy_from_slice(&1u16.to_be_bytes());
+            answer.extend_from_slice(&[0xC0, 0x0C, 0, 33, 0, 1]);
+            answer.extend_from_slice(&60u32.to_be_bytes());
+            answer.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+            answer.extend_from_slice(&rdata);
+            let _ = dns.send_to(&answer, from);
+        });
+        let _servers = crate::address_port::test_servers(vec![dns_addr]);
+
+        let json =
+            crate::json::parse(r#"{"addressPortStrategy":"SrvPortAndAddress"}"#).expect("json");
+        let options = crate::sockopt::parse_outbound(Some(&json))
+            .expect("parses")
+            .expect("present");
+        let _options = DialSockoptsGuard::enter(Some(Arc::new(options)));
+
+        let edge = resolve_outbound("_svc._tcp.example.test", 1).expect("the SRV answer resolves");
+        assert_eq!(edge, SocketAddr::new([127, 0, 0, 1].into(), echo_port));
+
+        let mut stream = std::net::TcpStream::connect(edge).expect("dials the replacement");
+        stream.write_all(b"ping").expect("writes");
+        let mut said = [0u8; 4];
+        stream.read_exact(&mut said).expect("reads");
+        assert_eq!(&said, b"ping", "the wire reached the strategy's edge");
+    }
+
+    #[test]
+    fn freedom_refuses_an_address_port_strategy() {
+        let freedom = crate::json::parse(
+            r#"{"protocol":"freedom","streamSettings":{"sockopt":{"addressPortStrategy":"SrvPortOnly"}}}"#,
+        )
+        .expect("json");
+        assert!(super::parse_outbound_sockopt(&freedom)
+            .expect_err("freedom refuses")
+            .contains("freedom outbound does not support"));
+
+        let chained = crate::json::parse(
+            r#"{"protocol":"vless","streamSettings":{"sockopt":{"addressPortStrategy":"TxtPortOnly","dialerProxy":"hop"}}}"#,
+        )
+        .expect("json");
+        let options = super::parse_outbound_sockopt(&chained)
+            .expect("a chain keeps it")
+            .expect("present");
+        assert_eq!(
+            options.address_port_strategy(),
+            crate::sockopt::AddressPortStrategy::TxtPortOnly
+        );
+    }
+
+    #[test]
+    fn a_tun_field_with_the_wrong_type_is_refused() {
+        for config in [
+            r#"{"address":"198.18.0.1","prefix":"24"}"#,
+            r#"{"address":"198.18.0.1","queues":"four"}"#,
+            r#"{"address":"198.18.0.1","mtu":"1500"}"#,
+            r#"{"address":42}"#,
+            r#"{"address":"198.18.0.1","name":42}"#,
+            r#"{"address":"198.18.0.1","stack":42}"#,
+            r#"{"inet4_address":42}"#,
+            r#"{"interface_name":42}"#,
+            r#"{"udp_timeout":"soon"}"#,
+            r#"{"udp_timeout":0}"#,
+            r#"{"multi_queue":1}"#,
+            r#"{"endpoint_independent_nat":"yes"}"#,
+            r#"{"gso":"off"}"#,
+            r#"{"address":["10.0.0.1/30","nonsense"]}"#,
+            r#"{"address":["10.0.0.1/30","fd00::1/129"]}"#,
+            r#"{"udp_timeout":"5x"}"#,
+            r#"{"udp_timeout":"1m30x"}"#,
+        ] {
+            let parsed = crate::json::parse(config).expect("config");
+            assert!(tun_spec(&parsed).is_err(), "{config}");
+        }
+        let parsed = crate::json::parse(r#"{"address":"198.18.0.1","prefix":24}"#).expect("config");
+        assert!(tun_spec(&parsed).is_ok());
+    }
+
+    #[test]
+    fn the_tun_spec_accepts_the_reference_spellings() {
+        let spec = |config: &str| {
+            let parsed = crate::json::parse(config).expect("config");
+            tun_spec(&parsed)
+        };
+        let wanted =
+            spec(r#"{"interface_name":"tun9","inet4_address":"10.0.0.1/30","stack":"gvisor"}"#)
+                .expect("interface_name and inet4_address");
+        assert_eq!(wanted.name(), "tun9");
+        assert_eq!(
+            wanted.address(),
+            "10.0.0.1".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(wanted.prefix(), 30);
+        let listed = spec(r#"{"address":["10.1.0.1/30","fd00::1/126"]}"#).expect("an address list");
+        assert_eq!(
+            listed.address(),
+            "10.1.0.1".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(listed.addresses().len(), 2);
+        assert_eq!(
+            listed.addresses()[1],
+            ("fd00::1".parse::<std::net::IpAddr>().unwrap(), 126),
+            "the device is opened with every address the config names"
+        );
+        assert_eq!(
+            spec(r#"{"udp_timeout":"5m"}"#)
+                .expect("a duration string")
+                .udp_idle(),
+            std::time::Duration::from_secs(300)
+        );
+        assert_eq!(
+            spec(r#"{"udp_timeout":90}"#).expect("seconds").udp_idle(),
+            std::time::Duration::from_secs(90)
+        );
+        assert_eq!(
+            spec(r#"{"udp_timeout":"500ms"}"#)
+                .expect("milliseconds")
+                .udp_idle(),
+            std::time::Duration::from_millis(500)
+        );
+        assert_eq!(
+            spec(r#"{"udp_timeout":"1m30s"}"#)
+                .expect("a compound duration")
+                .udp_idle(),
+            std::time::Duration::from_secs(90)
+        );
+        assert_eq!(
+            spec(r#"{"multi_queue":false}"#)
+                .expect("one queue")
+                .queues(),
+            1
+        );
+        assert!(
+            spec(r#"{"multi_queue":true}"#)
+                .expect("the platform's queues")
+                .queues()
+                > 0
+        );
+        let nat =
+            spec(r#"{"endpoint_independent_nat":true,"gso":false}"#).expect("the NAT switches");
+        assert!(nat.endpoint_independent_nat());
+        assert!(!nat.gso());
+        assert!(
+            spec(
+                r#"{"interface_name":"tun0","mtu":1400,"address":["172.19.0.1/30","fdfe:dcba:9876::1/126"],"dns_mode":"hijack","dns_address":["192.0.2.53"],"auto_route":true,"iproute2_table_index":2022,"iproute2_rule_index":9000,"auto_redirect":true,"strict_route":true,"route_address":["192.0.2.0/25","192.0.2.128/25"],"route_exclude_address":["198.51.100.0/24"],"include_interface":["eth0"],"exclude_interface":["eth1"],"include_uid":[1000],"exclude_uid_range":["1000:2000"],"include_package":["com.example"],"include_mac_address":["00:11:22:33:44:55"],"udp_timeout":"5m","udp_mapping":"endpoint_independent","udp_filtering":"endpoint_independent","udp_nat_max":1024,"multi_queue":true,"platform":{"http_proxy":{"enabled":true}},"stack":"mixed","gso":true,"inet4_address":["172.19.0.1/30"],"inet4_route_address":["198.51.100.0/24"],"endpoint_independent_nat":true}"#
+            )
+            .is_ok(),
+            "a config every key of the reference tun block carries still loads"
+        );
+    }
+
+    #[test]
+    fn the_reference_stack_names_map_to_the_engines() {
+        use crate::tun_stack::Mode;
+        assert_eq!(super::tun_mode("gvisor"), Mode::Userspace);
+        assert_eq!(super::tun_mode("smoltcp"), Mode::Userspace);
+        assert_eq!(super::tun_mode("mixed"), Mode::Hybrid);
+        assert_eq!(super::tun_mode("system"), Mode::System);
+        assert_eq!(super::tun_mode("nonsense"), Mode::Userspace);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_ipv6_socket_address_keeps_its_scope() {
+        // SAFETY: `storage` is a zeroed `sockaddr_storage`, large enough for the `sockaddr_in6` written through it.
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        // SAFETY: the family and length below say the storage holds this `sockaddr_in6`.
+        let sin6 = unsafe { &mut *(&raw mut storage).cast::<libc::sockaddr_in6>() };
+        sin6.sin6_family = libc::AF_INET6 as _;
+        sin6.sin6_port = 1234u16.to_be();
+        sin6.sin6_addr.s6_addr = std::net::Ipv6Addr::LOCALHOST.octets();
+        sin6.sin6_flowinfo = 0x1234;
+        sin6.sin6_scope_id = 7;
+        let Some(SocketAddr::V6(address)) = socket_addr_of(
+            &storage,
+            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+        ) else {
+            panic!("the address is IPv6");
+        };
+        assert_eq!(address.port(), 1234);
+        assert_eq!(address.flowinfo(), 0x1234);
+        assert_eq!(address.scope_id(), 7);
+    }
+    use crate::budgets::{HEAD_DEADLINE, RELAY_JOIN, SINK_GRACE};
+    use crate::config::{grpc_path, stream_carrier};
+    use ferrox_core::finalmask::Chain;
+
+    #[test]
+    fn a_poisoned_relay_write_stops_instead_of_looping() {
+        let sink = RelayWrite::new(Box::new(std::io::sink()));
+        let lock = std::sync::Arc::clone(&sink.0);
+        let poisoned = std::thread::spawn(move || {
+            let _held = lock.lock().expect("lock");
+            panic!("poison the relay write");
+        })
+        .join();
+        assert!(poisoned.is_err(), "the helper thread poisons the lock");
+        let mut sink = sink;
+        assert_eq!(
+            std::io::Write::write(&mut sink, b"x")
+                .expect_err("a poisoned write stops")
+                .kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            std::io::Write::flush(&mut sink)
+                .expect_err("a poisoned flush stops")
+                .kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+    }
+
+    fn freedom() -> Outbound {
+        Outbound::Freedom(Arc::default())
+    }
+
+    #[test]
+    fn the_first_configured_outbound_is_the_default() {
+        let private = [0x11u8; 32];
+        let peer = ferrox_core::wireguard::device::public_key(&[0x22; 32]);
+        let json = format!(
+            r#"{{"outbounds":[{{"protocol":"freedom","settings":{{}}}},{{"protocol":"wireguard","settings":{{"secretKey":"{}","address":["10.0.0.2"],"peers":[{{"publicKey":"{}","endpoint":"127.0.0.1:1"}}]}}}}]}}"#,
+            ferrox_core::foxy::account::hex_encode(&private),
+            ferrox_core::foxy::account::hex_encode(&peer)
+        );
+        let root = crate::json::parse(&json).expect("config");
+        let outbound = find_outbound(&root).expect("outbound").expect("some");
+        assert!(
+            matches!(outbound, Outbound::Freedom(_)),
+            "freedom before wireguard stays the default"
+        );
+    }
+
+    /// The lane ceiling follows the role: an outbound that dials a peer is a client, and the four
+    /// that reach no peer are not, including a config with no outbounds at all.
+    #[test]
+    fn a_config_that_dials_a_peer_reads_as_a_client() {
+        let client = crate::json::parse(r#"{"outbounds":[{"protocol":"vless"}]}"#).expect("config");
+        assert!(dials_a_proxy(&client));
+        let server = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"freedom"},{"protocol":"blackhole"},{"protocol":"dns"}]}"#,
+        )
+        .expect("config");
+        assert!(!dials_a_proxy(&server));
+        let none = crate::json::parse(r"{}").expect("config");
+        assert!(!dials_a_proxy(&none));
+    }
+
+    /// A relay half that is read by one thread and written by another: the reader parks
+    /// where the kernel would park, and the writer must not wait for it.
+    struct Parked {
+        entered: std::sync::mpsc::Sender<()>,
+        written: std::sync::mpsc::Sender<()>,
+        released: std::sync::mpsc::Sender<()>,
+        open: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl Read for Parked {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            let _ = self.entered.send(());
+            // A parked read ends when it is released, or when its own wait is over.
+            let (lock, cvar) = &*self.open;
+            let mut open = lock.lock().expect("locks");
+            while !*open {
+                let (guard, timeout) = cvar
+                    .wait_timeout(open, std::time::Duration::from_secs(5))
+                    .expect("waits");
+                open = guard;
+                if timeout.timed_out() {
+                    break;
+                }
+            }
+            let _ = self.released.send(());
+            Ok(0)
+        }
+    }
+
+    impl Write for Parked {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let _ = self.written.send(());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A relay's writer carries the bytes the reader is not going to bring, so it must not
+    /// wait for the reader's parked read: a read that holds the lock across its wait makes
+    /// the write wait for that whole wait, and the flow's throughput falls to one buffer
+    /// per wait.
+    /// A SOCKS front zeroes the name's room once: the read fills it, but the buffer handed to
+    /// the read has to be initialised first. The counting allocator's `zeroed` counter is the
+    /// witness.
+    #[test]
+    fn a_socks_front_zeroes_the_name_once() {
+        let mut request = vec![12u8];
+        request.extend_from_slice(b"example.test");
+        request.extend_from_slice(&443u16.to_be_bytes());
+        let mut reader = std::io::Cursor::new(request);
+        let (target, counts) =
+            ferrox_core::alloc_count::measure(|| read_socks_named(&mut reader, 3));
+        assert_eq!(
+            (counts.zeroed, counts.zeroed_bytes),
+            (1, 12),
+            "the name's room is zeroed once"
+        );
+        assert_eq!(
+            target,
+            Some(Destination::Name("example.test".to_owned(), 443))
+        );
+    }
+
+    #[test]
+    fn a_script_pick_sees_an_outbound_added_after_startup() {
+        let root = crate::json::parse(r#"{"routing":{}}"#).expect("parses");
+        let routing = RwLock::new(
+            crate::router::Routing::parse_in(&root, Vec::new())
+                .expect("parses")
+                .expect("routing"),
+        );
+        let dynamic = RwLock::new(Dynamic::default());
+        dynamic
+            .write()
+            .expect("lock")
+            .added
+            .insert("api".to_owned(), Arc::new(freedom()));
+        assert_eq!(
+            pick_script_outbound(
+                &routing,
+                &HashMap::new(),
+                &HashSet::new(),
+                &dynamic,
+                None,
+                "api"
+            ),
+            Ok("api".to_owned())
+        );
+        dynamic
+            .write()
+            .expect("lock")
+            .removed
+            .insert("gone".to_owned());
+        assert!(pick_script_outbound(
+            &routing,
+            &HashMap::new(),
+            &HashSet::new(),
+            &dynamic,
+            None,
+            "gone"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_geodata_outbound_is_built_without_a_routing_table() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"geo","protocol":"freedom"}]}"#,
+        )
+        .expect("parses");
+        let shared = route_shared_with_api(
+            &root,
+            crate::router::Routing::empty(),
+            &crate::reverse::Portals::default(),
+            None,
+            None,
+            None,
+            Some("geo"),
+        )
+        .expect("shared");
+        assert!(shared.outbound_for("geo").is_some());
+        assert!(shared.outbound_for("").is_some());
+    }
+
+    #[test]
+    fn a_live_portal_rule_reaches_and_leaves_the_vmess_restriction() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"direct","protocol":"freedom"}],"routing":{"rules":[{"type":"field","ruleTag":"seed","inboundTag":["other"],"domain":["full:edge.test"],"outboundTag":"edge"}]}}"#,
+        )
+        .expect("parses");
+        let mut portals = crate::reverse::Portals::default();
+        portals.insert("edge");
+        portals
+            .insert_domain("edge", "edge.test")
+            .expect("the portal domain is unique");
+        let portals = Arc::new(portals);
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let shared = route_shared(&root, routing, &portals, None).expect("shared");
+        let users = shared.vmess_users("vmess", || crate::vmess::Users::single([7; 16]));
+        shared.restrict_user_portals(Some("vmess"), &users);
+        assert!(
+            !users.portal_allowed("edge"),
+            "the seed rule names another inbound"
+        );
+        let runtime = Runtime::new(None, Some(Arc::clone(&shared)), true, Arc::clone(&portals));
+        let added = crate::json::parse(
+            r#"[{"type":"field","ruleTag":"live","domain":["full:edge.test"],"outboundTag":"edge"}]"#,
+        )
+        .expect("rule");
+        runtime
+            .add_rules(added.as_arr().expect("rules"), true)
+            .expect("the portal rule lands");
+        assert!(
+            users.portal_allowed("edge"),
+            "a portal rule added after startup restricts the running users"
+        );
+        runtime.remove_rules("live").expect("the rule leaves");
+        assert!(
+            !users.portal_allowed("edge"),
+            "removing the rule revokes the portal again"
+        );
+        runtime.forget_server_inbound("vmess");
+        let replacement = shared.vmess_users("vmess", || crate::vmess::Users::single([9; 16]));
+        assert!(
+            !std::sync::Arc::ptr_eq(&users, &replacement),
+            "a re-added inbound builds a fresh account table"
+        );
+    }
+
+    #[test]
+    fn a_dynamic_inbound_naming_a_source_selector_is_not_served() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"direct","protocol":"freedom"}],"routing":{"rules":[{"type":"field","outboundTag":"direct","inboundTag":["dyn"],"source":["192.0.2.0/24"]}]}}"#,
+        )
+        .expect("parses");
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let portals = Arc::new(crate::reverse::Portals::default());
+        let shared = route_shared(&root, routing, &portals, None).expect("shared");
+        let (cert, key, _) = tls_cert_json();
+        let dynamic = crate::json::parse(&format!(
+            r#"{{"inbounds":[{{"tag":"dyn","protocol":"masque","listen":"127.0.0.1","port":443,"settings":{{"users":[{{"email":"u@example.com","pass":"p"}}],"address":["10.14.0.1/24"]}},"streamSettings":{{"network":"masque","security":"tls","tlsSettings":{{"certificates":[{{"certificate":{cert},"key":{key}}}]}}}}}}]}}"#
+        ))
+        .expect("parses");
+        let inbound = dynamic
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .and_then(|list| list.first())
+            .expect("an inbound");
+        assert!(
+            refuse_source(Some(&shared), inbound, "commander", "MASQUE", false),
+            "the source rule is refused"
+        );
+        let runtime = Runtime::new(None, Some(Arc::clone(&shared)), false, Arc::clone(&portals));
+        let api = crate::commander::Api::new(crate::commander::ApiConfig::default());
+        let seed = crate::xray_pb::Seed::default();
+        let served = serve_dynamic_inbounds(&runtime, &dynamic, &seed, &api);
+        assert_eq!(served, 0, "the dynamic inbound is refused, not served");
+    }
+
+    #[test]
+    fn a_dynamic_server_inbound_is_proved_before_a_later_rule_is_published() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"remote","protocol":"vmess","settings":{"vnext":[{"address":"127.0.0.1","port":1,"users":[{"id":"8b2f3c1e-6a3e-4a56-9b8c-7f0b2a1d4c5e"}]}]}}],"routing":{"rules":[{"type":"field","ruleTag":"seed","inboundTag":["other"],"outboundTag":"remote"}]}}"#,
+        )
+        .expect("parses");
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let portals = Arc::new(crate::reverse::Portals::default());
+        let shared = route_shared(&root, routing, &portals, None).expect("shared");
+        shared.record_server_inbound(
+            Some("dyn".to_owned()),
+            &[crate::router::Network::Tcp, crate::router::Network::Udp],
+            false,
+        );
+        let runtime = Runtime::new(None, Some(Arc::clone(&shared)), true, Arc::clone(&portals));
+        let rules =
+            crate::json::parse(r#"[{"type":"field","inboundTag":["dyn"],"outboundTag":"remote"}]"#)
+                .expect("parses");
+        assert_eq!(
+            runtime.add_rules(rules.as_arr().expect("rules"), true),
+            Err(
+                "a rule for inbound dyn targets `remote`, which the server inbound serves direct"
+                    .to_owned()
+            ),
+            "the rule that sends the dynamic inbound to a proxied outbound is refused"
+        );
+    }
+
+    /// A `process` rule follows the socket the client really holds: the peer a PROXY header named
+    /// belongs to no local process and must not borrow this one, while routing still reads it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_proxy_reported_peer_names_no_process_for_the_socket_it_rode() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"default","protocol":"freedom"}],"routing":{"rules":[{"type":"field","process":["self/"],"outboundTag":"default"}]}}"#,
+        )
+        .expect("parses");
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let portals = Arc::new(crate::reverse::Portals::default());
+        let shared = route_shared(&root, routing, &portals, None).expect("shared");
+        let plan = RoutePlan::new(Arc::clone(&shared), None, None, true);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let client =
+            std::net::TcpStream::connect(listener.local_addr().expect("local")).expect("connects");
+        let (server, _) = listener.accept().expect("accepts");
+        let reported: std::net::SocketAddr = "192.0.2.9:4444".parse().expect("address");
+        let proxied = Connection::Tcp(server).with_peer(reported);
+        assert_eq!(proxied.peer_addr().expect("reported"), reported);
+        let owner = plan
+            .process_owner(crate::router::Network::Tcp, Some(&proxied))
+            .expect("the real socket belongs to this process");
+        assert_eq!(owner.pid, std::process::id());
+        drop(client);
+    }
+
+    #[test]
+    fn a_dynamic_outbound_is_routable_and_removable() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"default","protocol":"freedom"},{"tag":"alt","protocol":"freedom"}],"routing":{"rules":[{"type":"field","outboundTag":"alt","domain":["example.test"]}]}}"#,
+        )
+        .expect("parses");
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let portals = crate::reverse::Portals::default();
+        let shared = route_shared(&root, routing, &portals, None).expect("shared");
+        let plan = RoutePlan::new(Arc::clone(&shared), None, None, true);
+        let asked = Destination::Name("example.test".to_owned(), 443);
+        let lane = |plan: &RoutePlan| {
+            matches!(
+                &*plan.pick(&asked, crate::router::Network::Tcp, None, None),
+                Outbound::Freedom(_)
+            )
+        };
+        assert!(lane(&plan));
+        assert!(shared.add_outbound("alt", freedom()).is_err());
+        shared.remove_outbound("alt");
+        assert!(matches!(
+            &*plan.pick(&asked, crate::router::Network::Tcp, None, None),
+            Outbound::Block(_)
+        ));
+        assert!(shared.add_outbound("alt", freedom()).is_ok());
+        assert!(lane(&plan));
+        shared.remove_outbound("alt");
+        assert!(matches!(
+            &*plan.pick(&asked, crate::router::Network::Tcp, None, None),
+            Outbound::Block(_)
+        ));
+        assert!(shared.add_outbound("alt", freedom()).is_ok());
+        assert!(lane(&plan));
+        assert!(shared.add_outbound("new", freedom()).is_ok());
+        assert!(matches!(&*plan.target("new"), Outbound::Freedom(_)));
+        shared.remove_outbound("new");
+        assert!(matches!(&*plan.target("new"), Outbound::Block(_)));
+        shared.remove_outbound("nobody");
+        shared.remove_outbound("default");
+        assert!(matches!(&*plan.default_lane().0, Outbound::Block(_)));
+    }
+
+    /// A masque outbound the management API adds binds its retained options to the same table its
+    /// `dialerProxy` hop resolves in, just as a configured one does.
+    #[test]
+    fn a_dynamic_masque_outbound_binds_the_route_it_dials_through() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"default","protocol":"freedom"}],"routing":{}}"#,
+        )
+        .expect("parses");
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let portals = crate::reverse::Portals::default();
+        let shared = route_shared(&root, routing, &portals, None).expect("shared");
+        let outbound = crate::json::parse(
+            r#"{"protocol":"masque","settings":{"address":"127.0.0.1","port":443},
+                "streamSettings":{"network":"masque","security":"tls",
+                "tlsSettings":{"serverName":"edge.example","allowInsecure":true},
+                "sockopt":{"dialerProxy":"default"}}}"#,
+        )
+        .expect("parses");
+        let masque = Arc::new(crate::masque::MasqueOut::new(&outbound).expect("masque"));
+        assert!(!masque.route_bound());
+        shared
+            .add_outbound("dynamic", Outbound::Masque(Arc::clone(&masque)))
+            .expect("adds");
+        assert!(masque.route_bound());
+    }
+
+    #[test]
+    fn a_dynamic_outbound_config_builds_and_removes_through_the_runtime() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"default","protocol":"freedom"}],"routing":{}}"#,
+        )
+        .expect("parses");
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let portals = Arc::new(crate::reverse::Portals::default());
+        let shared = route_shared(&root, routing, &portals, None).expect("shared");
+        let runtime = Runtime::new(
+            Some(freedom()),
+            Some(Arc::clone(&shared)),
+            false,
+            Arc::clone(&portals),
+        );
+        let plan = RoutePlan::new(Arc::clone(&shared), None, None, true);
+        let name = b"xray.proxy.freedom.Config";
+        let mut raw = vec![0x0a, 3, b'n', b'e', b'w'];
+        raw.push(0x1a);
+        raw.push((name.len() + 2) as u8);
+        raw.extend_from_slice(&[0x0a, name.len() as u8]);
+        raw.extend_from_slice(name);
+        runtime.add_outbound("new", &raw).expect("adds");
+        assert!(matches!(&*plan.target("new"), Outbound::Freedom(_)));
+        assert!(runtime.add_outbound("new", &raw).is_err());
+        runtime.remove_outbound("new");
+        assert!(matches!(&*plan.target("new"), Outbound::Block(_)));
+        let mut unknown = vec![0x0a, 1, b'x'];
+        unknown.push(0x1a);
+        unknown.extend_from_slice(&[0x04, 0x0a, 0x02, b'n', b'o']);
+        assert!(runtime.add_outbound("x", &unknown).is_err());
+    }
+
+    #[test]
+    fn an_inbound_expands_the_port_forms_the_reference_accepts() {
+        let addresses = |text: &str| inbound_addresses(&crate::json::parse(text).expect("parses"));
+        assert_eq!(addresses(r#"{"port": 18084}"#), ["0.0.0.0:18084"]);
+        assert_eq!(addresses(r#"{"port": "18085"}"#), ["0.0.0.0:18085"]);
+        assert_eq!(
+            addresses(r#"{"port": "18086-18087"}"#),
+            ["0.0.0.0:18086", "0.0.0.0:18087"]
+        );
+        assert_eq!(
+            addresses(r#"{"port": "not-a-port, toronto, 400-401"}"#),
+            ["0.0.0.0:400", "0.0.0.0:401"]
+        );
+        assert_eq!(addresses(r#"{"port": "402-401"}"#), [] as [String; 0]);
+        assert_eq!(
+            addresses(r#"{"listen": "192.0.2.7", "port": "400,401"}"#),
+            ["192.0.2.7:400", "192.0.2.7:401"]
+        );
+        assert_eq!(
+            addresses(r#"{"listen": "", "port": "402"}"#),
+            ["0.0.0.0:402"]
+        );
+        assert_eq!(
+            addresses(r#"{"port": "env:FERROX_UNSET_PORT_PIECE"}"#),
+            [] as [String; 0]
+        );
+    }
+
+    #[test]
+    fn an_env_name_supplies_an_address_and_port() {
+        let _env = crate::router::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("FERROX_ENV_ADDRESS", "198.51.100.7");
+        std::env::set_var("FERROX_ENV_PORT", "8443");
+        let outbound = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "vless", "settings": {"vnext": [{
+                "address": "env:FERROX_ENV_ADDRESS", "port": "env:FERROX_ENV_PORT",
+                "users": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]}]}}]}"#,
+        )
+        .expect("parses");
+        let Some(vless) = find_vless_outbound(&outbound) else {
+            panic!("the outbound reads its env-named address");
+        };
+        assert_eq!(vless.address, "198.51.100.7");
+        assert_eq!(vless.port, 8443);
+        let inbound = crate::json::parse(
+            r#"{"listen": "env:FERROX_ENV_ADDRESS", "port": "100, env:FERROX_ENV_PORT"}"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            inbound_addresses(&inbound),
+            ["198.51.100.7:100", "198.51.100.7:8443"]
+        );
+        std::env::remove_var("FERROX_ENV_ADDRESS");
+        std::env::remove_var("FERROX_ENV_PORT");
+    }
+
+    /// A naming refusal is not a silent drop: the lane that cannot build says the outbound,
+    /// and the field the build stopped at is the refusal's own word.
+    #[test]
+    fn an_unbuildable_outbound_names_its_field() {
+        let diagnose = |text: &str| diagnose_outbounds(&crate::json::parse(text).expect("parses"));
+        assert_eq!(
+            diagnose(
+                r#"{"outbounds":[{"tag":"t","protocol":"trojan","settings":{"servers":[{"address":"192.0.2.6","port":443}]}}]}"#,
+            ),
+            ["outbound `t` (trojan) cannot be built: no password in the server entry"]
+        );
+        assert_eq!(
+            diagnose(r#"{"outbounds":[{"protocol":"quux"}]}"#),
+            ["outbound `<untagged>` (quux) cannot be built: unknown outbound protocol: quux"]
+        );
+        assert_eq!(diagnose(r#"{"outbounds":[]}"#), [] as [String; 0]);
+    }
+
+    /// A front lane's `tlsSettings` is the config's own, so the fingerprint no table knows is the
+    /// reference's load-time refusal (`transport_security.go`), never a row silently left unbuilt.
+    #[test]
+    fn a_front_lanes_unknown_fingerprint_refuses_the_config() {
+        let lane = |protocol: &str, extra: &str, fingerprint: &str| {
+            crate::json::parse(&format!(
+                r#"{{"outbounds":[{{"protocol":"{protocol}","settings":{{"servers":[{{"address":"192.0.2.6","port":1080{extra}}}]}},"streamSettings":{{"security":"tls","tlsSettings":{{"allowInsecure":true,"fingerprint":"{fingerprint}"}}}}}}]}}"#
+            ))
+            .expect("parses")
+        };
+        for protocol in ["socks", "http", "shadowsocks"] {
+            let extra = if protocol == "shadowsocks" {
+                r#","method":"aes-128-gcm","password":"p""#
+            } else {
+                ""
+            };
+            assert_eq!(
+                find_outbound(&lane(protocol, extra, "Bogus")).err(),
+                Some(r#"unknown "fingerprint": bogus"#.to_owned()),
+                "{protocol} refused to name the field"
+            );
+            assert!(
+                matches!(
+                    find_outbound(&lane(protocol, extra, "chrome")),
+                    Ok(Some(
+                        Outbound::Socks(_) | Outbound::Http(_) | Outbound::Shadowsocks(_)
+                    ))
+                ),
+                "{protocol} did not build before the refusal"
+            );
+        }
+        // The same line reaches the operator when the row is diagnosed rather than built.
+        assert_eq!(
+            diagnose_outbounds(&lane("socks", "", "Bogus")),
+            [r#"outbound `<untagged>` (socks) cannot be built: unknown "fingerprint": bogus"#]
+        );
+        // A lane whose dial builds no tls block keeps its own fields, not this refusal.
+        let freedom = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"freedom","streamSettings":{"security":"tls","tlsSettings":{"fingerprint":"Bogus"}}}]}"#,
+        )
+        .expect("parses");
+        assert!(matches!(
+            find_outbound(&freedom),
+            Ok(Some(Outbound::Freedom(_)))
+        ));
+    }
+
+    /// The census is a stall hunt's instrument: a release build's relay registers no wait
+    /// with it, so the hot path pays neither the map, the lock, the clock nor the scan.
+    /// The ops job builds its binary in release, so this row is the release shape's.
+    #[test]
+    fn a_release_build_registers_no_census_wait() {
+        let before = crate::census::registrations();
+        let half = Half::split(
+            std::io::Cursor::new(b"hello".to_vec()),
+            std::io::Cursor::new(Vec::new()),
+        );
+        let mut buf = [0u8; 8];
+        let read = half.read_once(&mut buf).expect("reads");
+        assert_eq!(read, 5, "the reader saw the bytes");
+        let after = crate::census::registrations();
+        if cfg!(debug_assertions) {
+            assert!(after > before, "a debug build registers the wait");
+        } else {
+            assert_eq!(after, before, "a release build registers no wait");
+        }
+    }
+
+    #[test]
+    fn a_relay_write_goes_out_while_the_reader_is_parked() {
+        use std::sync::mpsc;
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (written_tx, written_rx) = mpsc::channel();
+        let (released_tx, released_rx) = mpsc::channel();
+        let open = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let side = || Parked {
+            entered: entered_tx.clone(),
+            written: written_tx.clone(),
+            released: released_tx.clone(),
+            open: Arc::clone(&open),
+        };
+        // The two directions of a socket are two handles, so the write goes out while the read is parked.
+        let half = Arc::new(Half::split(side(), side()));
+        let parked = Arc::clone(&half);
+        let leg = std::thread::spawn(move || {
+            let mut buf = [0u8; 16];
+            parked.read_once(&mut buf)
+        });
+        entered_rx.recv().expect("the reader is parked in its read");
+        half.write_once(b"ping").expect("writes");
+        assert!(
+            written_rx.try_recv().is_ok(),
+            "the write went out while the reader was parked"
+        );
+        assert!(
+            released_rx.try_recv().is_err(),
+            "the reader's read ended before the write went out: the write waited for it"
+        );
+        {
+            let (lock, cvar) = &*open;
+            *lock.lock().expect("locks") = true;
+            cvar.notify_all();
+        }
+        let _ = leg.join().expect("joins");
+    }
+
+    /// A transport that parks in its read until it is released: the wait an idle relay leg
+    /// spends in the kernel, with no session lock held around it.
+    struct ParkedTransport {
+        entered: std::sync::mpsc::Sender<()>,
+        released: std::sync::mpsc::Sender<()>,
+        open: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl Read for ParkedTransport {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            self.entered.send(()).expect("signals");
+            let (lock, cvar) = &*self.open;
+            let mut open = lock.lock().expect("locks");
+            while !*open {
+                open = cvar.wait(open).expect("waits");
+            }
+            self.released.send(()).expect("signals");
+            Ok(0)
+        }
+    }
+
+    /// A session that records the bytes written into it and hands back nothing to read.
+    struct RecordingSession {
+        written: std::sync::mpsc::Sender<Vec<u8>>,
+    }
+
+    impl ferrox_core::tls::TlsProvider for RecordingSession {
+        fn name() -> &'static str {
+            "recording"
+        }
+
+        fn suites(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn handshake(&mut self) -> Result<(), ferrox_core::tls::TlsError> {
+            Ok(())
+        }
+
+        fn alpn(&self) -> Option<&[u8]> {
+            None
+        }
+
+        fn open(&mut self, _ciphertext: &[u8], _buf: &mut [u8]) -> std::io::Result<(usize, usize)> {
+            Ok((0, 0))
+        }
+    }
+
+    impl Read for RecordingSession {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for RecordingSession {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.send(buf.to_vec()).expect("signals");
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The session's own half: the relay reads the transport with no session lock held, so the
+    /// idle leg's wait costs the busy leg's write nothing.
+    #[test]
+    fn a_session_write_goes_out_while_its_read_is_parked() {
+        use std::sync::mpsc;
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (written_tx, written_rx) = mpsc::channel();
+        let (released_tx, released_rx) = mpsc::channel();
+        let open = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let transport = Arc::new(Mutex::new(ParkedTransport {
+            entered: entered_tx,
+            released: released_tx,
+            open: Arc::clone(&open),
+        }));
+        let session = Arc::new(Mutex::new(RecordingSession {
+            written: written_tx,
+        }));
+        let out = Arc::new(Mutex::new(Sealed::new(std::io::sink())));
+        let mut reader = DrivenHalf::new(
+            Arc::clone(&session),
+            Arc::clone(&transport),
+            Arc::clone(&out),
+        );
+        let mut writer = DrivenHalf::new(session, transport, out);
+        let leg = std::thread::spawn(move || {
+            let mut buf = [0u8; 16];
+            reader.read(&mut buf)
+        });
+        entered_rx
+            .recv()
+            .expect("the reader is parked in its transport");
+        writer.write_all(b"ping").expect("writes");
+        assert!(
+            written_rx.try_recv().is_ok(),
+            "the write went out while the reader was parked"
+        );
+        assert!(
+            released_rx.try_recv().is_err(),
+            "the reader's read ended before the write went out: the write waited for it"
+        );
+        {
+            let (lock, cvar) = &*open;
+            *lock.lock().expect("locks") = true;
+            cvar.notify_all();
+        }
+        let _ = leg.join().expect("joins");
+    }
+
+    /// A steady read opens the session once. With nothing pending and nothing queued the
+    /// transport is the only source, so the read asks it first and opens the session only for
+    /// the bytes it brought; an empty open would queue the duplex writer's seal behind it.
+    #[test]
+    fn a_steady_read_opens_the_session_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counting {
+            opens: Arc<AtomicUsize>,
+        }
+
+        impl CipherOpen for Counting {
+            fn open(
+                &mut self,
+                ciphertext: &[u8],
+                buf: &mut [u8],
+            ) -> std::io::Result<(usize, usize)> {
+                self.opens.fetch_add(1, Ordering::Relaxed);
+                let n = ciphertext.len().min(buf.len());
+                buf[..n].copy_from_slice(&ciphertext[..n]);
+                Ok((n, n))
+            }
+
+            fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize> {
+                out.extend_from_slice(plaintext);
+                Ok(plaintext.len())
+            }
+        }
+
+        /// Sixteen ciphertext bytes a read, short of the caller's window, so a read that
+        /// delivered them took everything the session held.
+        struct Wire {
+            left: usize,
+        }
+
+        impl Read for Wire {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.left.min(buf.len()).min(16);
+                for (at, slot) in buf[..n].iter_mut().enumerate() {
+                    *slot = at as u8;
+                }
+                self.left -= n;
+                Ok(n)
+            }
+        }
+
+        let opens = Arc::new(AtomicUsize::new(0));
+        let session = Arc::new(Mutex::new(Counting {
+            opens: Arc::clone(&opens),
+        }));
+        let reader = Arc::new(Mutex::new(Wire { left: 8 * 16 }));
+        let out = Arc::new(Mutex::new(Sealed::new(std::io::sink())));
+        let mut half = DrivenHalf::new(session, reader, out);
+        let mut buf = [0u8; 64];
+        // The first read asks the session for anything the answer left before it reads the transport.
+        assert_eq!(half.read(&mut buf).expect("warms"), 16);
+        for _ in 0..4 {
+            let before = opens.load(Ordering::Relaxed);
+            let read = half.read(&mut buf).expect("reads");
+            assert_eq!(read, 16, "one transport read per steady read");
+            assert_eq!(buf[..16], (0u8..16).collect::<Vec<_>>()[..], "the bytes");
+            assert_eq!(
+                opens.load(Ordering::Relaxed) - before,
+                1,
+                "each steady read opened the session once, not once empty and once for its bytes"
+            );
+        }
+    }
+
+    /// A peer that drips ciphertext without completing a record must not hold the lane turn: the
+    /// read gives the worker back after a bounded number of opens that produced no plaintext, and
+    /// the bytes it did not turn into plaintext stay where the next read resumes them.
+    #[test]
+    fn a_dripping_record_yields_the_lane_and_resumes() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct Partial {
+            held: Vec<u8>,
+            emit: Arc<AtomicBool>,
+        }
+
+        impl CipherOpen for Partial {
+            fn open(
+                &mut self,
+                ciphertext: &[u8],
+                buf: &mut [u8],
+            ) -> std::io::Result<(usize, usize)> {
+                self.held.extend_from_slice(ciphertext);
+                if !self.emit.load(Ordering::Relaxed) {
+                    return Ok((0, ciphertext.len()));
+                }
+                let n = self.held.len().min(buf.len());
+                buf[..n].copy_from_slice(&self.held[..n]);
+                self.held.drain(..n);
+                Ok((n, ciphertext.len()))
+            }
+
+            fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize> {
+                out.extend_from_slice(plaintext);
+                Ok(plaintext.len())
+            }
+        }
+
+        /// One ciphertext byte a read, a fixed count of them, then the wire ends.
+        struct Drip {
+            left: usize,
+            reads: Arc<AtomicUsize>,
+        }
+
+        impl Read for Drip {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                if self.left == 0 || buf.is_empty() {
+                    return Ok(0);
+                }
+                buf[0] = b'c';
+                self.left -= 1;
+                Ok(1)
+            }
+        }
+
+        let emit = Arc::new(AtomicBool::new(false));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let session = Arc::new(Mutex::new(Partial {
+            held: Vec::new(),
+            emit: Arc::clone(&emit),
+        }));
+        let reader = Arc::new(Mutex::new(Drip {
+            left: 100_000,
+            reads: Arc::clone(&reads),
+        }));
+        let out = Arc::new(Mutex::new(Sealed::new(std::io::sink())));
+        let mut half = DrivenHalf::new(session, reader, out);
+        let mut buf = [0u8; 64];
+        let result = half.read(&mut buf);
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            32,
+            "a read that opened 32 records without plaintext handed the lane back"
+        );
+        assert!(
+            matches!(&result, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "the read yielded instead of swallowing the wire, got {result:?}"
+        );
+
+        emit.store(true, Ordering::Relaxed);
+        let resumed = half.read(&mut buf).expect("resumes the record");
+        assert_eq!(resumed, 33, "the yielded bytes resume on the next read");
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            33,
+            "the resume reads the wire once"
+        );
+    }
+
+    /// A record that hands the lane back mid-read is progress, not an idle transport: even with
+    /// the sibling ended and its reply grace spent, the step retries instead of ending the flow.
+    #[test]
+    fn a_driven_yield_does_not_end_a_lane_after_its_sibling() {
+        struct Yielding;
+
+        impl Read for Yielding {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(driven_yield())
+            }
+        }
+
+        let finish = RelayFinish::new(true, Arc::new(|| {}), None);
+        let past = std::time::Instant::now()
+            .checked_sub(crate::budgets::RELAY_RESPONSE_IDLE)
+            .and_then(|at| at.checked_sub(std::time::Duration::from_millis(1)))
+            .expect("a clock past the grace");
+        *finish.ended_at.lock().expect("ended") = Some(past);
+        assert!(
+            finish.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE),
+            "the sibling ended past its reply grace"
+        );
+        let from = Half::split(Yielding, Yielding);
+        let to = Half::split(std::io::sink(), std::io::sink());
+        let mut buffer = RelayBuf::new();
+        assert_eq!(
+            stream_lane_step(&from, &to, &mut buffer, &finish),
+            lane_pool::Next::Retry,
+            "a yield is progress, not the end of the flow"
+        );
+    }
+
+    /// A write after the sibling's end restarts the reply grace: a lane with bytes still moving stays.
+    #[test]
+    fn a_write_after_the_sibling_ends_restarts_the_reply_grace() {
+        let finish = RelayFinish::new(true, Arc::new(|| {}), None);
+        let idle = Duration::from_millis(50);
+        let past = std::time::Instant::now()
+            .checked_sub(idle + Duration::from_millis(1))
+            .expect("a clock past the grace");
+        *finish.ended_at.lock().expect("ended") = Some(past);
+        assert!(
+            finish.ended_and_idle(idle),
+            "the grace ran from the sibling's end"
+        );
+        finish.mark_progress();
+        assert!(!finish.ended_and_idle(idle), "the write restarts the grace");
+        std::thread::sleep(idle + Duration::from_millis(1));
+        assert!(finish.ended_and_idle(idle), "the grace runs from the write");
+    }
+
+    /// A closed session that still holds plaintext delivers it: a read that filled the caller's
+    /// window exactly must not turn the peer's close into an early end that drops what is queued.
+    #[test]
+    fn a_closed_session_hands_over_its_queued_plaintext() {
+        struct Draining {
+            plain: Vec<u8>,
+        }
+
+        impl CipherOpen for Draining {
+            fn open(
+                &mut self,
+                _ciphertext: &[u8],
+                buf: &mut [u8],
+            ) -> std::io::Result<(usize, usize)> {
+                let n = self.plain.len().min(buf.len());
+                buf[..n].copy_from_slice(&self.plain[..n]);
+                self.plain.drain(..n);
+                Ok((n, 0))
+            }
+
+            fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize> {
+                out.extend_from_slice(plaintext);
+                Ok(plaintext.len())
+            }
+
+            fn closed(&self) -> bool {
+                true
+            }
+        }
+
+        struct Silent;
+
+        impl Read for Silent {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                panic!("a closed session with queued plaintext must not read the transport");
+            }
+        }
+
+        let session = Arc::new(Mutex::new(Draining {
+            plain: (0u8..8).collect(),
+        }));
+        let reader = Arc::new(Mutex::new(Silent));
+        let out = Arc::new(Mutex::new(Sealed::new(std::io::sink())));
+        let mut half = DrivenHalf::new(session, reader, out);
+        let mut buf = [0u8; 4];
+        assert_eq!(half.read(&mut buf).expect("first"), 4);
+        assert_eq!(buf, [0, 1, 2, 3]);
+        assert_eq!(
+            half.read(&mut buf).expect("second"),
+            4,
+            "the queued plaintext is handed over, not dropped at the close"
+        );
+        assert_eq!(buf, [4, 5, 6, 7]);
+        assert_eq!(half.read(&mut buf).expect("end"), 0);
+    }
+
+    /// A Vision link over a driven session: the reader parks in the transport read with no
+    /// session lock held, and the writer seals through the same session while it waits.
+    #[test]
+    fn a_vision_read_waits_outside_the_lock() {
+        use std::sync::mpsc;
+
+        struct FakeSession {
+            written: mpsc::Sender<()>,
+        }
+
+        impl CipherOpen for FakeSession {
+            fn open(
+                &mut self,
+                _ciphertext: &[u8],
+                _buf: &mut [u8],
+            ) -> std::io::Result<(usize, usize)> {
+                Ok((0, 0))
+            }
+
+            fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize> {
+                if !plaintext.is_empty() {
+                    let _ = self.written.send(());
+                }
+                out.extend_from_slice(plaintext);
+                Ok(plaintext.len())
+            }
+
+            fn seal_slices_into(
+                &mut self,
+                parts: &[&[u8]],
+                out: &mut Vec<u8>,
+            ) -> std::io::Result<()> {
+                if parts.iter().any(|part| !part.is_empty()) {
+                    let _ = self.written.send(());
+                }
+                for part in parts {
+                    out.extend_from_slice(part);
+                }
+                Ok(())
+            }
+
+            fn closed(&self) -> bool {
+                false
+            }
+        }
+
+        impl ferrox_core::tls::RecordAlignment for FakeSession {}
+
+        struct ParkedReader {
+            entered: mpsc::Sender<()>,
+            released: mpsc::Receiver<()>,
+        }
+
+        impl Read for ParkedReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                let _ = self.entered.send(());
+                let _ = self.released.recv();
+                Ok(0)
+            }
+        }
+
+        impl ferrox_core::tls::RecordAlignment for ParkedReader {}
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (written_tx, written_rx) = mpsc::channel();
+        let (released_tx, released_rx) = mpsc::channel();
+        let session = Arc::new(Mutex::new(FakeSession {
+            written: written_tx,
+        }));
+        let reader = Arc::new(Mutex::new(ParkedReader {
+            entered: entered_tx,
+            released: released_rx,
+        }));
+        let out = Arc::new(Mutex::new(Sealed::new(std::io::sink())));
+        let read = DrivenHalf::new(Arc::clone(&session), Arc::clone(&reader), Arc::clone(&out));
+        let write = DrivenHalf::new(session, reader, out);
+        let (read, write) = crate::vision::Link::split(read, write, None, None, &[0u8; 16]);
+        let half = Arc::new(Half::split(read, write));
+
+        let parked = Arc::clone(&half);
+        let leg = std::thread::spawn(move || {
+            let mut buf = [0u8; 16];
+            parked.read_once(&mut buf)
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the reader is parked in its transport, outside the session lock");
+        half.write_once(b"ping").expect("writes");
+        assert!(
+            written_rx.try_recv().is_ok(),
+            "the write sealed while the read was parked outside the lock"
+        );
+        let _ = released_tx.send(());
+        let _ = leg.join().expect("joins");
+    }
+
+    /// The switch's disarm has to reach the ciphertext reader, not only the session: a flow that
+    /// ends framing without going direct would otherwise stay capped at one record per read.
+    #[test]
+    fn a_vision_switch_disarms_the_cipher_reader() {
+        struct CopySession;
+
+        impl ferrox_core::tls::TlsProvider for CopySession {
+            fn name() -> &'static str {
+                "copy"
+            }
+
+            fn suites(&self) -> Vec<String> {
+                Vec::new()
+            }
+
+            fn handshake(&mut self) -> Result<(), ferrox_core::tls::TlsError> {
+                Ok(())
+            }
+
+            fn alpn(&self) -> Option<&[u8]> {
+                None
+            }
+
+            fn open(
+                &mut self,
+                ciphertext: &[u8],
+                buf: &mut [u8],
+            ) -> std::io::Result<(usize, usize)> {
+                let n = ciphertext.len().min(buf.len());
+                buf[..n].copy_from_slice(&ciphertext[..n]);
+                Ok((n, n))
+            }
+        }
+
+        impl Read for CopySession {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Ok(0)
+            }
+        }
+
+        impl Write for CopySession {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl ferrox_core::tls::RecordAlignment for CopySession {}
+
+        struct Wire<'a>(&'a [u8]);
+
+        impl Read for Wire<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.0.len().min(buf.len());
+                buf[..n].copy_from_slice(&self.0[..n]);
+                self.0 = &self.0[n..];
+                Ok(n)
+            }
+        }
+
+        impl ferrox_core::tls::RecordAlignment for Wire<'_> {}
+
+        let mut wire = vec![0x17, 0x03, 0x03, 0, 100];
+        wire.extend_from_slice(&[1u8; 100]);
+        wire.extend_from_slice(&[0x17, 0x03, 0x03, 0, 200]);
+        wire.extend_from_slice(&[2u8; 200]);
+
+        let session = Arc::new(Mutex::new(CopySession));
+        let out = Arc::new(Mutex::new(Sealed::new(std::io::sink())));
+        let mut reader = TlsHalf {
+            session: Arc::clone(&session),
+            out: Arc::clone(&out),
+            driven: Some(DrivenHalf::new(
+                session,
+                Arc::new(Mutex::new(CipherReader::Record(
+                    ferrox_core::tls::reality::RecordLimiter::new(Wire(wire.as_slice())),
+                ))),
+                out,
+            )),
+            sleep_on_timeout: false,
+        };
+
+        reader.disarm_record_alignment();
+        let mut buf = [0u8; 4096];
+        let n = reader.read(&mut buf).expect("reads");
+        assert_eq!(
+            n,
+            wire.len(),
+            "the disarmed cipher reader takes both records in one read"
+        );
+    }
+
+    /// The framing exit itself, not a direct call to the hook, has to disarm the ciphertext
+    /// reader: an `end` command leaves no inner TLS to hand over, and the next read must cross
+    /// record boundaries rather than stop at the first one.
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn a_framing_exit_disarms_the_cipher_reader() {
+        struct RecordSession {
+            header: [u8; 5],
+            header_len: usize,
+            payload_left: usize,
+        }
+
+        impl ferrox_core::tls::TlsProvider for RecordSession {
+            fn name() -> &'static str {
+                "record"
+            }
+
+            fn suites(&self) -> Vec<String> {
+                Vec::new()
+            }
+
+            fn handshake(&mut self) -> Result<(), ferrox_core::tls::TlsError> {
+                Ok(())
+            }
+
+            fn alpn(&self) -> Option<&[u8]> {
+                None
+            }
+
+            fn open(
+                &mut self,
+                ciphertext: &[u8],
+                buf: &mut [u8],
+            ) -> std::io::Result<(usize, usize)> {
+                let mut taken = 0;
+                let mut plain = 0;
+                while taken < ciphertext.len() {
+                    if self.header_len < self.header.len() {
+                        self.header[self.header_len] = ciphertext[taken];
+                        self.header_len += 1;
+                        taken += 1;
+                        if self.header_len == self.header.len() {
+                            self.payload_left =
+                                usize::from(u16::from_be_bytes([self.header[3], self.header[4]]));
+                            if self.payload_left == 0 {
+                                self.header_len = 0;
+                            }
+                        }
+                        continue;
+                    }
+                    let room = buf.len() - plain;
+                    if room == 0 {
+                        break;
+                    }
+                    let n = (ciphertext.len() - taken).min(self.payload_left).min(room);
+                    buf[plain..plain + n].copy_from_slice(&ciphertext[taken..taken + n]);
+                    plain += n;
+                    taken += n;
+                    self.payload_left -= n;
+                    if self.payload_left == 0 {
+                        self.header_len = 0;
+                    }
+                }
+                Ok((plain, taken))
+            }
+        }
+
+        impl Read for RecordSession {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Ok(0)
+            }
+        }
+
+        impl Write for RecordSession {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl ferrox_core::tls::RecordAlignment for RecordSession {}
+
+        struct Wire {
+            bytes: Vec<u8>,
+            at: usize,
+        }
+
+        impl Read for Wire {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = (self.bytes.len() - self.at).min(buf.len());
+                buf[..n].copy_from_slice(&self.bytes[self.at..self.at + n]);
+                self.at += n;
+                Ok(n)
+            }
+        }
+
+        impl ferrox_core::tls::RecordAlignment for Wire {}
+
+        fn record(payload: &[u8]) -> Vec<u8> {
+            let len = u16::try_from(payload.len()).expect("record fits");
+            let mut out = vec![0x17, 0x03, 0x03];
+            out.extend_from_slice(&len.to_be_bytes());
+            out.extend_from_slice(payload);
+            out
+        }
+
+        let uuid = [0xAA; 16];
+        let mut framed = uuid.to_vec();
+        framed.extend_from_slice(&[1, 0, 3, 0, 0]);
+        framed.extend_from_slice(b"end");
+        let mut bytes = record(&framed);
+        bytes.extend_from_slice(&record(&[0x11; 100]));
+        bytes.extend_from_slice(&record(&[0x22; 200]));
+
+        let session = Arc::new(Mutex::new(RecordSession {
+            header: [0; 5],
+            header_len: 0,
+            payload_left: 0,
+        }));
+        let reader = Arc::new(Mutex::new(CipherReader::Record(
+            ferrox_core::tls::reality::RecordLimiter::new(Wire { bytes, at: 0 }),
+        )));
+        let out = Arc::new(Mutex::new(Sealed::new(std::io::sink())));
+        let half = DrivenHalf::new(Arc::clone(&session), reader, out);
+        let mut link = crate::vision::Link::new(half, None, &uuid);
+
+        let mut buf = [0u8; 4096];
+        let n = link.read(&mut buf).expect("reads the frame");
+        assert_eq!(&buf[..n], b"end", "the end command's content came out");
+        let n = link.read(&mut buf).expect("reads past the frame");
+        assert_eq!(
+            n, 300,
+            "the framing exit disarmed the cipher reader, so both records come out in one read"
+        );
+    }
+
+    /// A session that seals into the caller's buffer and never touches a transport, as the real
+    /// one does, and whose `open` answers four bytes without a transport read.
+    struct WritingSession;
+
+    impl ferrox_core::tls::TlsProvider for WritingSession {
+        fn name() -> &'static str {
+            "writing"
+        }
+
+        fn suites(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn handshake(&mut self) -> Result<(), ferrox_core::tls::TlsError> {
+            Ok(())
+        }
+
+        fn alpn(&self) -> Option<&[u8]> {
+            None
+        }
+
+        fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize> {
+            out.extend_from_slice(plaintext);
+            Ok(plaintext.len())
+        }
+
+        fn open(&mut self, _ciphertext: &[u8], buf: &mut [u8]) -> std::io::Result<(usize, usize)> {
+            buf[..4].copy_from_slice(b"pong");
+            Ok((4, 0))
+        }
+    }
+
+    impl Read for WritingSession {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for WritingSession {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A transport whose write parks until released: the kernel wait a full peer receive window
+    /// costs, now outside the session's lock.
+    struct ParkedWrite {
+        entered: std::sync::mpsc::Sender<()>,
+        released: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl Write for ParkedWrite {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.entered.send(()).expect("signals");
+            let _ = self.released.recv();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The write's own half: a session seals under its lock and sends outside it, so a peer that
+    /// is not draining this direction parks the write alone.
+    #[test]
+    fn a_session_read_runs_while_its_write_is_parked() {
+        use std::sync::mpsc;
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (released_tx, released_rx) = mpsc::channel();
+        let session = Arc::new(Mutex::new(WritingSession));
+        let out = Arc::new(Mutex::new(Sealed::new(ParkedWrite {
+            entered: entered_tx,
+            released: released_rx,
+        })));
+        let mut reader = DrivenHalf::new(
+            Arc::clone(&session),
+            Arc::new(Mutex::new(std::io::empty())),
+            Arc::clone(&out),
+        );
+        let mut writer = DrivenHalf::new(session, Arc::new(Mutex::new(std::io::empty())), out);
+        let writing = thread::spawn(move || writer.write_all(b"ping"));
+        entered_rx.recv().expect("the write reached its transport");
+        let (done_tx, done_rx) = mpsc::channel();
+        let reading = thread::spawn(move || {
+            let mut buf = [0u8; 4];
+            let read = reader.read(&mut buf);
+            let _ = done_tx.send(read.map(|read| (read, buf)));
+        });
+        let read = done_rx.recv_timeout(Duration::from_secs(2));
+        let _ = released_tx.send(());
+        reading.join().expect("joins");
+        writing.join().expect("joins").expect("writes");
+        let (read, buf) = read
+            .expect("the read ran while the write was parked, not after it was released")
+            .expect("reads");
+        assert_eq!(read, 4);
+        assert_eq!(&buf, b"pong");
+    }
+
+    /// A record already opened is handed to the caller without asking the transport for more:
+    /// the peer's next bytes are the next read's wait, not this one's.
+    #[test]
+    fn a_driven_read_hands_over_ready_plaintext_without_another_transport_read() {
+        struct OnceOpen;
+        impl CipherOpen for OnceOpen {
+            fn open(
+                &mut self,
+                ciphertext: &[u8],
+                buf: &mut [u8],
+            ) -> std::io::Result<(usize, usize)> {
+                let plain = ciphertext.len().min(buf.len());
+                buf[..plain].copy_from_slice(&ciphertext[..plain]);
+                Ok((plain, ciphertext.len()))
+            }
+
+            fn seal_into(
+                &mut self,
+                _plaintext: &[u8],
+                _out: &mut Vec<u8>,
+            ) -> std::io::Result<usize> {
+                Ok(0)
+            }
+        }
+        struct OnceRead {
+            reads: usize,
+        }
+        impl Read for OnceRead {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                if self.reads > 1 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+                }
+                buf[..4].copy_from_slice(b"pong");
+                Ok(4)
+            }
+        }
+        let transport = Arc::new(Mutex::new(OnceRead { reads: 0 }));
+        let mut half = DrivenHalf::new(
+            Arc::new(Mutex::new(OnceOpen)),
+            Arc::clone(&transport),
+            Arc::new(Mutex::new(Sealed::new(std::io::sink()))),
+        );
+        let mut buf = [0u8; 64];
+        let read = half.read(&mut buf).expect("reads");
+        assert_eq!(&buf[..read], b"pong");
+        assert_eq!(
+            transport.lock().expect("locks").reads,
+            1,
+            "the read waited on the transport again with plaintext already in hand"
+        );
+    }
+
+    /// One transport read carries a whole relay window: a 64 KiB window costs one read, and the
+    /// opens it costs are the ones its records cost, one each.
+    #[test]
+    fn a_whole_relay_window_arrives_in_one_transport_read() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct RecordOpen {
+            opens: Arc<AtomicUsize>,
+            records: Arc<AtomicUsize>,
+        }
+        // A TLS 1.3 record: five header bytes, the content, an inner type byte and a 16-byte tag.
+        const OVERHEAD: usize = 5 + 1 + 16;
+        impl CipherOpen for RecordOpen {
+            fn open(
+                &mut self,
+                ciphertext: &[u8],
+                buf: &mut [u8],
+            ) -> std::io::Result<(usize, usize)> {
+                self.opens.fetch_add(1, Ordering::Relaxed);
+                if ciphertext.is_empty() {
+                    return Ok((0, 0));
+                }
+                let record = ciphertext.len().min(SESSION_WINDOW + OVERHEAD);
+                let plain = (record - OVERHEAD).min(buf.len());
+                buf[..plain].copy_from_slice(&ciphertext[OVERHEAD..OVERHEAD + plain]);
+                if plain > 0 {
+                    self.records.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok((plain, record))
+            }
+
+            fn seal_into(
+                &mut self,
+                _plaintext: &[u8],
+                _out: &mut Vec<u8>,
+            ) -> std::io::Result<usize> {
+                Ok(0)
+            }
+        }
+        struct Window {
+            left: usize,
+            reads: Arc<AtomicUsize>,
+        }
+        impl Read for Window {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                let take = self.left.min(buf.len());
+                buf[..take].fill(b'x');
+                self.left -= take;
+                Ok(take)
+            }
+        }
+
+        let opens = Arc::new(AtomicUsize::new(0));
+        let records = Arc::new(AtomicUsize::new(0));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut half = DrivenHalf::new(
+            Arc::new(Mutex::new(RecordOpen {
+                opens: Arc::clone(&opens),
+                records: Arc::clone(&records),
+            })),
+            Arc::new(Mutex::new(Window {
+                left: DRIVEN_CIPHERTEXT,
+                reads: Arc::clone(&reads),
+            })),
+            Arc::new(Mutex::new(Sealed::new(std::io::sink()))),
+        );
+        let mut buf = vec![0u8; RELAY_BUFFER];
+        let mut filled = 0;
+        while filled < buf.len() {
+            let read = half.read(&mut buf[filled..]).expect("reads");
+            assert!(read > 0, "the window ended early at {filled} bytes");
+            filled += read;
+        }
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            1,
+            "a 64 KiB window cost more than one transport read"
+        );
+        assert_eq!(
+            records.load(Ordering::Relaxed),
+            RELAY_BUFFER / SESSION_WINDOW,
+            "the window's records were not opened one each"
+        );
+        assert!(
+            opens.load(Ordering::Relaxed) <= RELAY_BUFFER / SESSION_WINDOW + 1,
+            "a 64 KiB window cost more opens than its records and the queued probe"
+        );
+    }
+
+    /// The app's own client and server speak the sealed raw session end to end: the hello,
+    /// the VLESS header and the echoed payload all cross the encryption engine.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn an_encrypted_vless_raw_session_echoes_over_loopback() {
+        use std::os::unix::net::UnixStream;
+
+        let _stats = crate::stats::test_lock();
+        crate::stats::clear();
+        enable_user_stats();
+
+        let (client_string, server_string) =
+            ferrox_core::vless_encryption::generate_pair(true, "native", "1rtt", "600");
+        let client = vless_client_encryption(Some(&client_string))
+            .expect("client")
+            .expect("engine");
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol":"vless","settings":{{"decryption":"{server_string}"}}}}"#
+        ))
+        .expect("parses");
+        let decryption = crate::config::server_decryption(&inbound)
+            .expect("decryption")
+            .expect("engine");
+
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds the echo");
+        let echo_addr = echo.local_addr().expect("addr");
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 1024];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => stream.write_all(&buf[..n]).expect("echoes"),
+                }
+            }
+        });
+
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds the server");
+        let server_addr = listener.local_addr().expect("addr");
+        let id = [0x42u8; 16];
+        let user = VlessUser {
+            id,
+            flow: Flow::None,
+            email: "sealed@example".to_owned(),
+            level: 1,
+            reverse: None,
+        };
+        let serving = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let source: SocketAddr = "192.0.2.10:1234".parse().expect("address");
+            let _flow = crate::accesslog::flow(Some(source), "sealed@example", 1);
+            serve_vless(
+                stream,
+                &[user],
+                &Carrier::Raw(Chain::default()),
+                true,
+                None,
+                Some(&decryption),
+            );
+        });
+
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: server_addr.port(),
+            id,
+            carrier: Carrier::Raw(Chain::default()),
+            host: String::new(),
+            mux: Mux::default(),
+            pool: Pools::default(),
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            headers: crate::config::carrier_headers(None).0,
+            heartbeat: crate::config::carrier_headers(None).1,
+            encryption: Some(Arc::clone(&client)),
+        };
+        let header = vless_request_header(&vless, Some(&Destination::from(echo_addr)))
+            .expect("the header fits");
+
+        let (app, mut peer) = UnixStream::pair().expect("pair");
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        thread::spawn(move || {
+            dial_vless_encrypted_raw(
+                &Connection::from(app),
+                &server_addr,
+                &vless,
+                &client,
+                &header,
+            );
+        });
+        let payload = b"hello through the sealed raw session";
+        peer.write_all(payload).expect("writes");
+        let mut lease = None;
+        for _ in 0..500 {
+            lease = crate::stats::snapshot()
+                .online
+                .get("sealed@example")
+                .copied();
+            if lease == Some(1) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            lease,
+            Some(1),
+            "the authenticated sealed session holds the user's online lease"
+        );
+        let mut got = vec![0u8; payload.len()];
+        peer.read_exact(&mut got).expect("reads the echo");
+        assert_eq!(&got, payload);
+        // The counters are metered on the relay threads, so join the session before reading them.
+        drop(peer);
+        serving.join().expect("serves");
+        let traffic = crate::stats::snapshot();
+        let traffic = traffic
+            .user
+            .get("sealed@example")
+            .expect("the sealed session counts the user's traffic");
+        assert!(traffic.uplink > 0 && traffic.downlink > 0);
+        crate::stats::clear();
+    }
+
+    /// The sealed session rides a carrier: the upgrade, the hello, the VLESS header and the
+    /// echo all cross the carrier's framing, with the encryption between carrier and header.
+    #[cfg(unix)]
+    fn encrypted_vless_carried_echo(carrier: Carrier, host: &str) {
+        use std::os::unix::net::UnixStream;
+
+        let (client_string, server_string) =
+            ferrox_core::vless_encryption::generate_pair(true, "native", "1rtt", "600");
+        let client = vless_client_encryption(Some(&client_string))
+            .expect("client")
+            .expect("engine");
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol":"vless","settings":{{"decryption":"{server_string}"}}}}"#
+        ))
+        .expect("parses");
+        let decryption = crate::config::server_decryption(&inbound)
+            .expect("decryption")
+            .expect("engine");
+
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds the echo");
+        let echo_addr = echo.local_addr().expect("addr");
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 1024];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => stream.write_all(&buf[..n]).expect("echoes"),
+                }
+            }
+        });
+
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds the server");
+        let server_addr = listener.local_addr().expect("addr");
+        let id = [0x45u8; 16];
+        let server_carrier = carrier.clone();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless(
+                stream,
+                &one_vless_user(&id),
+                &server_carrier,
+                true,
+                None,
+                Some(&decryption),
+            );
+        });
+
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: server_addr.port(),
+            id,
+            carrier,
+            host: host.to_owned(),
+            mux: Mux::default(),
+            pool: Pools::default(),
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            headers: crate::config::carrier_headers(None).0,
+            heartbeat: crate::config::carrier_headers(None).1,
+            encryption: Some(Arc::clone(&client)),
+        };
+
+        let (app, mut peer) = UnixStream::pair().expect("pair");
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        thread::spawn(move || {
+            dial_vless(
+                &Connection::from(app),
+                &server_addr,
+                &vless,
+                Some(&Destination::from(echo_addr)),
+                Ladder::global(),
+            );
+        });
+        let payload = vec![0x5Au8; 32 * 1024];
+        peer.write_all(&payload).expect("writes");
+        let mut got = vec![0u8; payload.len()];
+        peer.read_exact(&mut got).expect("reads the echo");
+        assert_eq!(got, payload);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_encrypted_vless_ws_session_echoes_over_loopback() {
+        encrypted_vless_carried_echo(
+            Carrier::Ws {
+                path: "/sealed".to_owned(),
+                ed: 0,
+            },
+            "ws.test",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_encrypted_vless_grpc_session_echoes_over_loopback() {
+        encrypted_vless_carried_echo(
+            Carrier::Grpc(crate::config::GrpcSettings::path("/sealed")),
+            "127.0.0.1",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_encrypted_vless_httpupgrade_session_echoes_over_loopback() {
+        encrypted_vless_carried_echo(
+            Carrier::HttpUpgrade {
+                path: "/sealed".to_owned(),
+                host: "upgrade.test".to_owned(),
+            },
+            "upgrade.test",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_encrypted_vless_xhttp_session_echoes_over_loopback() {
+        let mut settings = crate::xhttp::XhttpSettings::stream_one();
+        settings.path = "/sealed".to_owned();
+        encrypted_vless_carried_echo(
+            Carrier::Xhttp {
+                settings: Box::new(settings),
+            },
+            "xhttp.test",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_encrypted_vless_httpheader_session_echoes_over_loopback() {
+        encrypted_vless_carried_echo(
+            Carrier::HttpHeader {
+                paths: vec!["/sealed".to_owned()],
+                path: "/sealed".to_owned(),
+                response: None,
+            },
+            "header.test",
+        );
+    }
+
+    /// Vision rides the sealed session above a carrier: the framing command, the padding and the
+    /// echo all cross the engine's records, which are themselves framed by the carrier.
+    #[cfg(unix)]
+    fn encrypted_vless_carried_vision_echo(carrier: Carrier, host: &str, flow: &str) {
+        use std::os::unix::net::UnixStream;
+
+        let (client_string, server_string) =
+            ferrox_core::vless_encryption::generate_pair(true, "native", "1rtt", "600");
+        let client = vless_client_encryption(Some(&client_string))
+            .expect("client")
+            .expect("engine");
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol":"vless","settings":{{"decryption":"{server_string}"}}}}"#
+        ))
+        .expect("parses");
+        let decryption = crate::config::server_decryption(&inbound)
+            .expect("decryption")
+            .expect("engine");
+
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds the echo");
+        let echo_addr = echo.local_addr().expect("addr");
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 1024];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => stream.write_all(&buf[..n]).expect("echoes"),
+                }
+            }
+        });
+
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds the server");
+        let server_addr = listener.local_addr().expect("addr");
+        let id = [0x46u8; 16];
+        let server_carrier = carrier.clone();
+        thread::spawn(move || {
+            let user = VlessUser {
+                id,
+                flow: Flow::Vision,
+                email: String::new(),
+                level: 0,
+                reverse: None,
+            };
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless(
+                stream,
+                std::slice::from_ref(&user),
+                &server_carrier,
+                true,
+                None,
+                Some(&decryption),
+            );
+        });
+
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: server_addr.port(),
+            id,
+            carrier,
+            host: host.to_owned(),
+            mux: Mux::default(),
+            pool: Pools::default(),
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: flow.to_owned(),
+            reality: None,
+            headers: crate::config::carrier_headers(None).0,
+            heartbeat: crate::config::carrier_headers(None).1,
+            encryption: Some(Arc::clone(&client)),
+        };
+
+        let (app, mut peer) = UnixStream::pair().expect("pair");
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        thread::spawn(move || {
+            dial_vless(
+                &Connection::from(app),
+                &server_addr,
+                &vless,
+                Some(&Destination::from(echo_addr)),
+                Ladder::global(),
+            );
+        });
+        let payload = vec![0x5Au8; 48 * 1024];
+        peer.write_all(&payload).expect("writes");
+        let mut got = vec![0u8; payload.len()];
+        peer.read_exact(&mut got).expect("reads the echo");
+        assert_eq!(got, payload);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_encrypted_vless_ws_vision_session_echoes_over_loopback() {
+        encrypted_vless_carried_vision_echo(
+            Carrier::Ws {
+                path: "/sealed".to_owned(),
+                ed: 0,
+            },
+            "ws.test",
+            ferrox_core::vless::VISION_FLOW,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_encrypted_vless_grpc_vision_session_echoes_over_loopback() {
+        encrypted_vless_carried_vision_echo(
+            Carrier::Grpc(crate::config::GrpcSettings::path("/sealed")),
+            "127.0.0.1",
+            ferrox_core::vless::VISION_FLOW,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_encrypted_vless_httpupgrade_vision_session_echoes_over_loopback() {
+        encrypted_vless_carried_vision_echo(
+            Carrier::HttpUpgrade {
+                path: "/sealed".to_owned(),
+                host: "upgrade.test".to_owned(),
+            },
+            "upgrade.test",
+            ferrox_core::vless::VISION_FLOW,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_encrypted_vless_xhttp_vision_session_echoes_over_loopback() {
+        let mut settings = crate::xhttp::XhttpSettings::stream_one();
+        settings.path = "/sealed".to_owned();
+        encrypted_vless_carried_vision_echo(
+            Carrier::Xhttp {
+                settings: Box::new(settings),
+            },
+            "xhttp.test",
+            ferrox_core::vless::VISION_FLOW,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_encrypted_vless_xhttp_h2_vision_session_echoes_over_loopback() {
+        let mut settings = crate::xhttp::XhttpSettings::stream_one();
+        settings.path = "/sealed".to_owned();
+        settings.h2c = true;
+        encrypted_vless_carried_vision_echo(
+            Carrier::Xhttp {
+                settings: Box::new(settings),
+            },
+            "xhttp.test",
+            ferrox_core::vless::VISION_FLOW,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_encrypted_vless_httpheader_vision_session_echoes_over_loopback() {
+        encrypted_vless_carried_vision_echo(
+            Carrier::HttpHeader {
+                paths: vec!["/sealed".to_owned()],
+                path: "/sealed".to_owned(),
+                response: None,
+            },
+            "header.test",
+            ferrox_core::vless::VISION_FLOW,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_encrypted_vless_ws_vision_udp443_session_echoes_over_loopback() {
+        encrypted_vless_carried_vision_echo(
+            Carrier::Ws {
+                path: "/sealed".to_owned(),
+                ed: 0,
+            },
+            "ws.test",
+            ferrox_core::vless::VISION_UDP443_FLOW,
+        );
+    }
+
+    /// The sealed session sits above TLS exactly as it sits above the socket: the hello and
+    /// the VLESS header cross the encryption engine, and the payload crosses both layers.
+    #[cfg(unix)]
+    #[test]
+    fn an_encrypted_vless_tls_session_echoes_over_loopback() {
+        use std::os::unix::net::UnixStream;
+
+        let (client_string, server_string) =
+            ferrox_core::vless_encryption::generate_pair(true, "native", "1rtt", "600");
+        let client = vless_client_encryption(Some(&client_string))
+            .expect("client")
+            .expect("engine");
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol":"vless","settings":{{"decryption":"{server_string}"}}}}"#
+        ))
+        .expect("parses");
+        let decryption = crate::config::server_decryption(&inbound)
+            .expect("decryption")
+            .expect("engine");
+        let (server_config, client_config) = carried_tls_configs();
+
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds the echo");
+        let echo_addr = echo.local_addr().expect("addr");
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 1024];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => stream.write_all(&buf[..n]).expect("echoes"),
+                }
+            }
+        });
+
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds the server");
+        let server_addr = listener.local_addr().expect("addr");
+        let id = [0x43u8; 16];
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless_tls(
+                stream,
+                &one_vless_user(&id),
+                true,
+                &Carrier::Raw(Chain::default()),
+                &server_config,
+                None,
+                Some(&decryption),
+            );
+        });
+
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: server_addr.port(),
+            id,
+            carrier: Carrier::Raw(Chain::default()),
+            host: String::new(),
+            mux: Mux::default(),
+            pool: Pools::default(),
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: Some(Arc::new(client_config)),
+            flow: String::new(),
+            reality: None,
+            headers: crate::config::carrier_headers(None).0,
+            heartbeat: crate::config::carrier_headers(None).1,
+            encryption: Some(Arc::clone(&client)),
+        };
+
+        let (app, mut peer) = UnixStream::pair().expect("pair");
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        thread::spawn(move || {
+            dial_vless_tls(
+                &Connection::from(app),
+                &server_addr,
+                &vless,
+                Some(&Destination::from(echo_addr)),
+            );
+        });
+        let payload = b"hello through the sealed tls session";
+        peer.write_all(payload).expect("writes");
+        let mut got = vec![0u8; payload.len()];
+        peer.read_exact(&mut got).expect("reads the echo");
+        assert_eq!(&got, payload);
+    }
+
+    /// Vision's direct command peels the sealed record layer but keeps the XOR header mask:
+    /// a bulk echo crosses the switch on both legs and comes back byte for byte.
+    #[cfg(unix)]
+    #[test]
+    fn an_encrypted_vless_vision_session_echoes_over_loopback() {
+        use std::os::unix::net::UnixStream;
+
+        let (client_string, server_string) =
+            ferrox_core::vless_encryption::generate_pair(true, "random", "1rtt", "600");
+        let client = vless_client_encryption(Some(&client_string))
+            .expect("client")
+            .expect("engine");
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol":"vless","settings":{{"decryption":"{server_string}"}}}}"#
+        ))
+        .expect("parses");
+        let decryption = crate::config::server_decryption(&inbound)
+            .expect("decryption")
+            .expect("engine");
+        let (server_config, client_config) = carried_tls_configs();
+
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds the echo");
+        let echo_addr = echo.local_addr().expect("addr");
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 16 * 1024];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => stream.write_all(&buf[..n]).expect("echoes"),
+                }
+            }
+        });
+
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds the server");
+        let server_addr = listener.local_addr().expect("addr");
+        let id = [0x44u8; 16];
+        let users = [VlessUser {
+            id,
+            flow: Flow::Vision,
+            email: String::new(),
+            level: 0,
+            reverse: None,
+        }];
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless_tls(
+                stream,
+                &users,
+                true,
+                &Carrier::Raw(Chain::default()),
+                &server_config,
+                None,
+                Some(&decryption),
+            );
+        });
+
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: server_addr.port(),
+            id,
+            carrier: Carrier::Raw(Chain::default()),
+            host: String::new(),
+            mux: Mux::default(),
+            pool: Pools::default(),
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: Some(Arc::new(client_config)),
+            flow: ferrox_core::vless::VISION_FLOW.to_owned(),
+            reality: None,
+            headers: crate::config::carrier_headers(None).0,
+            heartbeat: crate::config::carrier_headers(None).1,
+            encryption: Some(Arc::clone(&client)),
+        };
+
+        let (app, mut peer) = UnixStream::pair().expect("pair");
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        thread::spawn(move || {
+            dial_vless_tls(
+                &Connection::from(app),
+                &server_addr,
+                &vless,
+                Some(&Destination::from(echo_addr)),
+            );
+        });
+        let payload: Vec<u8> = (0..64 * 1024u32)
+            .map(|index| (index as u8).wrapping_mul(31).wrapping_add(7))
+            .collect();
+        peer.write_all(&payload).expect("writes");
+        let mut got = vec![0u8; payload.len()];
+        peer.read_exact(&mut got).expect("reads the echo");
+        assert_eq!(got, payload);
+    }
+
+    /// The driven half carries the bytes: a payload that crosses several records comes back
+    /// byte for byte through the relay's own read of the transport.
+    #[test]
+    fn a_driven_session_carries_a_bulk_echo() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut buf = [0u8; 16 * 1024];
+            loop {
+                match tls.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        tls.write_all(&buf[..n]).expect("echoes");
+                        tls.flush().expect("flushes");
+                    }
+                }
+            }
+        });
+
+        let mut session = ferrox_core::tls::RustlsProvider::connect(
+            &client_config,
+            Connection::connect(("127.0.0.1", port)).expect("connects"),
+        )
+        .expect("opens");
+        session.handshake().expect("handshakes");
+        let cipher = session.get_ref().try_clone().expect("dups the transport");
+        let out = session.get_ref().try_clone().expect("dups the transport");
+        cipher.set_read_timeout(Some(SESSION_POLL)).expect("arms");
+        let session = Arc::new(Mutex::new(session));
+        let cipher = Arc::new(Mutex::new(cipher));
+        let out = Arc::new(Mutex::new(Sealed::new(out)));
+        let mut reader =
+            DrivenHalf::new(Arc::clone(&session), Arc::clone(&cipher), Arc::clone(&out));
+        let mut writer = DrivenHalf::new(session, cipher, out);
+
+        let payload: Vec<u8> = (0..64 * 1024u32)
+            .map(|index| (index as u8).wrapping_mul(31).wrapping_add(7))
+            .collect();
+        let expected = payload.clone();
+        let sending = thread::spawn(move || {
+            writer.write_all(&payload).expect("writes");
+            writer.flush().expect("flushes");
+        });
+        let mut back = Vec::with_capacity(expected.len());
+        let mut buf = vec![0u8; 64 * 1024];
+        while back.len() < expected.len() {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => back.extend_from_slice(&buf[..n]),
+                Err(error) if is_timeout(&error) => {}
+                Err(error) => panic!("reads the echo: {error:?}"),
+            }
+        }
+        sending.join().expect("joins");
+        assert_eq!(
+            back, expected,
+            "the echo came back altered through the driven session"
+        );
+    }
+
+    /// One handle of a relay half that records which handle served a call: `armed` is the
+    /// handle its caller sets a read timeout on, `duplicate` the one `Half::socket` clones.
+    struct Marked {
+        calls: Arc<Mutex<Vec<String>>>,
+        handle: &'static str,
+    }
+
+    impl Read for Marked {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            self.calls
+                .lock()
+                .expect("calls")
+                .push(format!("read {}", self.handle));
+            Ok(0)
+        }
+    }
+
+    impl Write for Marked {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.calls
+                .lock()
+                .expect("calls")
+                .push(format!("write {}", self.handle));
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Duplicate for Marked {
+        fn duplicate(&self) -> Option<Self> {
+            Some(Self {
+                calls: Arc::clone(&self.calls),
+                handle: "duplicate",
+            })
+        }
+    }
+
+    /// The wait a caller arms belongs on the handle that waits: a duplicated socket is an
+    /// independent handle on Windows, so a read served there has no bound and can never
+    /// notice that its sibling ended.
+    #[test]
+    fn the_socket_half_reads_on_the_armed_handle() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let half = Half::socket(Marked {
+            calls: Arc::clone(&calls),
+            handle: "armed",
+        });
+        let mut buf = [0u8; 4];
+        half.read_once(&mut buf).expect("reads");
+        half.write_once(b"ping").expect("writes");
+        assert_eq!(
+            *calls.lock().expect("calls"),
+            ["read armed", "write duplicate"],
+            "the read was served by the unarmed duplicate"
+        );
+    }
+
+    #[test]
+    fn dokodemo_reads_user_level_as_the_account_level() {
+        let inbound = crate::json::parse(r#"{"settings": {"userLevel": 7}}"#).expect("parses");
+        assert_eq!(dokodemo_user_level(&inbound), 7);
+        let absent = crate::json::parse(r#"{"settings": {}}"#).expect("parses");
+        assert_eq!(dokodemo_user_level(&absent), 0);
+    }
+
+    #[test]
+    fn dokodemo_rewrites_to_the_named_address_and_port() {
+        let inbound = crate::json::parse(
+            r#"{"settings": {"address": "127.0.0.1", "port": 8080, "network": "tcp,udp"}}"#,
+        )
+        .expect("parses");
+        let rewrite = DokodemoRewrite::from_config(&inbound);
+        let dest = rewrite.configured().expect("a rewrite target");
+        assert_eq!(dest.port(), 8080);
+        assert_eq!(dest.authority(), "127.0.0.1:8080");
+        assert_eq!(dokodemo_networks(&inbound), ["tcp", "udp"]);
+    }
+
+    #[test]
+    fn dokodemo_without_a_rewrite_target_completes_it_from_the_flow() {
+        let inbound = crate::json::parse(r#"{"settings": {"network": "tcp"}}"#).expect("parses");
+        let rewrite = DokodemoRewrite::from_config(&inbound);
+        assert!(rewrite.configured().is_none());
+        let local: SocketAddr = "192.0.2.1:443".parse().expect("local");
+        let dest = rewrite.resolved(Some(local), &HashMap::new());
+        assert_eq!(dest.authority(), "127.0.0.1:443");
+        assert!(dokodemo_has(&dokodemo_networks(&inbound), "tcp"));
+    }
+
+    #[test]
+    fn dokodemo_reads_the_legacy_names_and_defaults_to_tcp() {
+        let inbound = crate::json::parse(
+            r#"{"settings": {"rewriteAddress": "example.test", "rewritePort": 8443, "allowedNetwork": ["udp", "tcp"]}}"#,
+        )
+        .expect("parses");
+        let rewrite = DokodemoRewrite::from_config(&inbound);
+        assert_eq!(
+            rewrite.configured().expect("target").authority(),
+            "example.test:8443"
+        );
+        assert_eq!(dokodemo_networks(&inbound), ["udp", "tcp"]);
+        let absent = crate::json::parse(r#"{"settings": {}}"#).expect("parses");
+        assert_eq!(dokodemo_networks(&absent), ["tcp"]);
+    }
+
+    #[test]
+    fn a_dokodemo_port_map_overrides_one_half_of_the_target() {
+        let inbound = crate::json::parse(
+            r#"{"settings": {"address": "192.0.2.1", "port": 80, "network": "tcp", "portMap": {"443": ":8443", "8443": "example.test:"}}}"#,
+        )
+        .expect("parses");
+        let map = dokodemo_port_map(&inbound).expect("map");
+        let rewrite = DokodemoRewrite::from_config(&inbound);
+        let local: SocketAddr = "198.51.100.1:443".parse().expect("local");
+        assert_eq!(
+            rewrite.resolved(Some(local), &map).authority(),
+            "192.0.2.1:8443"
+        );
+        let local: SocketAddr = "198.51.100.1:8443".parse().expect("local");
+        assert_eq!(
+            rewrite.resolved(Some(local), &map).authority(),
+            "example.test:80"
+        );
+    }
+
+    #[test]
+    fn shadowsocks_networks_read_as_a_string_or_an_array() {
+        let string = crate::json::parse(r#"{"settings": {"network": "tcp"}}"#).expect("parses");
+        assert_eq!(inbound_ss_networks(&string), (true, false));
+        let array = crate::json::parse(r#"{"settings": {"network": ["udp"]}}"#).expect("parses");
+        assert_eq!(inbound_ss_networks(&array), (false, true));
+        let joined = crate::json::parse(r#"{"settings": {"network": "tcp,udp"}}"#).expect("parses");
+        assert_eq!(inbound_ss_networks(&joined), (true, true));
+        let unsupported =
+            crate::json::parse(r#"{"settings": {"network": "unix"}}"#).expect("parses");
+        assert_eq!(inbound_ss_networks(&unsupported), (false, false));
+        let absent = crate::json::parse(r#"{"settings": {"password": "p"}}"#).expect("parses");
+        assert_eq!(inbound_ss_networks(&absent), (true, true));
+    }
+
+    #[test]
+    fn a_websocket_shadowsocks_inbound_proves_the_udp_its_mux_carries() {
+        let inbound = crate::json::parse(
+            r#"{"protocol":"shadowsocks","settings":{"password":"p"},"streamSettings":{"network":"ws","wsSettings":{"path":"/x"}}}"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            server_networks(&inbound),
+            Some(vec![
+                crate::router::Network::Tcp,
+                crate::router::Network::Udp,
+            ]),
+            "a ws mux tunnel serves both networks"
+        );
+    }
+
+    #[test]
+    fn a_kcp_or_xdrive_shadowsocks_inbound_proves_the_udp_its_mux_carries() {
+        for (network, extra) in [
+            ("kcp", ""),
+            (
+                "xdrive",
+                r#","xdriveSettings":{"remoteFolder":"/tmp/xdrive","service":"local"}"#,
+            ),
+        ] {
+            let inbound = crate::json::parse(&format!(
+                r#"{{"protocol":"shadowsocks","settings":{{"network":"tcp","password":"p"}},"streamSettings":{{"network":"{network}"{extra}}}}}"#
+            ))
+            .expect("parses");
+            assert_eq!(
+                server_networks(&inbound),
+                Some(vec![
+                    crate::router::Network::Tcp,
+                    crate::router::Network::Udp,
+                ]),
+                "a {network} mux tunnel serves both networks"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tcp_only_shadowsocks_inbound_proves_the_udp_its_mux_carries() {
+        let inbound = crate::json::parse(
+            r#"{"protocol":"shadowsocks","settings":{"network":"tcp","password":"p"}}"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            server_networks(&inbound),
+            Some(vec![
+                crate::router::Network::Tcp,
+                crate::router::Network::Udp,
+            ]),
+            "the raw tcp listener still accepts a udp-bearing v1.mux.cool session"
+        );
+    }
+
+    #[test]
+    fn the_seam_split_find_across_agrees_with_the_per_byte_branch_scan() {
+        // The contiguous probe scan must yield the identical first position on every seam, interior and absent placement.
+        fn before(head: &[u8], probe: &[u8]) -> Option<usize> {
+            let joined = head.len() + probe.len();
+            if joined < 4 {
+                return None;
+            }
+            let mut pos = if head.len() >= 3 { head.len() - 3 } else { 0 };
+            let target = u32::from_le_bytes(*b"\r\n\r\n");
+            while pos + 3 < joined {
+                let b0 = if pos < head.len() {
+                    head[pos]
+                } else {
+                    probe[pos - head.len()]
+                };
+                let b1 = if pos + 1 < head.len() {
+                    head[pos + 1]
+                } else {
+                    probe[pos + 1 - head.len()]
+                };
+                let b2 = if pos + 2 < head.len() {
+                    head[pos + 2]
+                } else {
+                    probe[pos + 2 - head.len()]
+                };
+                let b3 = if pos + 3 < head.len() {
+                    head[pos + 3]
+                } else {
+                    probe[pos + 3 - head.len()]
+                };
+                if u32::from_le_bytes([b0, b1, b2, b3]) == target {
+                    return Some(pos);
+                }
+                pos += 1;
+            }
+            None
+        }
+        const ALPHABET: [u8; 3] = *b"\r\nZ";
+        let mut buf = [0u8; 6];
+        for head_len in 0..=6usize {
+            for probe_len in 0..=6usize {
+                let total = head_len + probe_len;
+                if total > 6 {
+                    continue;
+                }
+                for code in 0..ALPHABET.len().pow(total as u32) {
+                    let mut rest = code;
+                    for slot in &mut buf[..total] {
+                        *slot = ALPHABET[rest % ALPHABET.len()];
+                        rest /= ALPHABET.len();
+                    }
+                    let (head, probe) = buf.split_at(head_len);
+                    assert_eq!(
+                        find_across(head, probe, b"\r\n\r\n"),
+                        before(head, probe),
+                        "head {head:?} probe {probe:?}"
+                    );
+                }
+            }
+        }
+        // At scale the scan returns the earliest of several matches, including one filling the whole tail.
+        let mut tail = vec![b'x'; 255];
+        tail.extend_from_slice(b"\r\n\r\n\r\n\r\n");
+        assert_eq!(find_across(&[], &tail, b"\r\n\r\n"), Some(255));
+        assert_eq!(find_across(b"\r\n", b"\r\nZZ", b"\r\n\r\n"), Some(0));
+    }
+
+    struct Gated {
+        sent: Vec<u8>,
+        held: Vec<u8>,
+    }
+    impl Write for Gated {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.held.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.sent.extend_from_slice(&self.held);
+            self.held.clear();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_relay_write_is_sent_without_waiting_for_close() {
+        let half = Half::shared(Gated {
+            sent: Vec::new(),
+            held: Vec::new(),
+        });
+        half.write_once(b"ping").expect("writes");
+        let Half::Shared { inner, .. } = &half else {
+            panic!("a gated writer is one object behind one lock");
+        };
+        let gated = inner.lock().expect("reads back");
+        assert_eq!(gated.sent, b"ping", "flush-gated bytes are sent, not held");
+    }
+
+    /// A leg that times out at once: the grain a shared read arms is counted without a socket's wait.
+    struct Silent;
+
+    impl Read for Silent {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
+        }
+    }
+
+    impl Write for Silent {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_quiet_shared_read_arms_the_long_grain_and_a_write_brings_it_back() {
+        let arms = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&arms);
+        let half = Half::shared_armed(Silent, move |_: &Silent, grain| {
+            recorded.lock().expect("records").push(grain);
+            Ok(())
+        });
+        let mut buf = [0u8; 8];
+        for _ in 0..RELAY_MOVING_READS {
+            assert!(half.read_once(&mut buf).is_err());
+        }
+        assert!(
+            !arms.lock().expect("arms").contains(&RELAY_POLL),
+            "a moving flow keeps the short grain"
+        );
+        assert!(half.read_once(&mut buf).is_err());
+        assert_eq!(
+            arms.lock().expect("arms").last(),
+            Some(&RELAY_POLL),
+            "an idle flow arms the long grain"
+        );
+        half.write_once(b"ping").expect("writes");
+        assert!(half.read_once(&mut buf).is_err());
+        assert_eq!(
+            arms.lock().expect("arms").last(),
+            Some(&SESSION_POLL),
+            "a write returns the flow to the short grain"
+        );
+    }
+
+    /// A parked read that cannot be polled: the shared read arms no grain past the cap, so no park outlives a writer's seal.
+    #[test]
+    fn a_capped_shared_read_arms_no_grain_past_the_cap() {
+        let arms = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&arms);
+        let half = Half::shared_armed_capped(
+            Silent,
+            move |_: &Silent, grain| {
+                recorded.lock().expect("records").push(grain);
+                Ok(())
+            },
+            SESSION_POLL,
+        );
+        let mut buf = [0u8; 8];
+        for _ in 0..=RELAY_MOVING_READS {
+            assert!(half.read_once(&mut buf).is_err());
+        }
+        assert_eq!(
+            arms.lock().expect("arms").last(),
+            Some(&SESSION_POLL),
+            "the quiet grain stops at the cap"
+        );
+    }
+
+    #[test]
+    fn a_finished_relay_closes_the_other_side() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fired = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&fired);
+        let close: Arc<dyn Fn() + Send + Sync> =
+            Arc::new(move || flag.store(true, Ordering::SeqCst));
+        let from = Arc::new(Half::shared(std::io::Cursor::new(b"ping".to_vec())));
+        let to = Arc::new(Half::shared(Gated {
+            sent: Vec::new(),
+            held: Vec::new(),
+        }));
+        copy_stream(&from, &to, &close, &AtomicBool::new(false));
+        assert!(fired.load(Ordering::SeqCst), "EOF fires the close");
+        let Half::Shared { inner, .. } = to.as_ref() else {
+            panic!("a gated writer is one object behind one lock");
+        };
+        let gated = inner.lock().expect("reads back");
+        assert_eq!(gated.sent, b"ping");
+    }
+
+    /// A leg that only ever times out: a live socket whose peer fell silent, where no byte or error ends the read on its own.
+    struct Poller;
+
+    impl Read for Poller {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            std::thread::sleep(Duration::from_millis(2));
+            Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
+        }
+    }
+
+    impl Write for Poller {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A leg whose source reaches its end at once: the sibling that must retire the other.
+    struct EofReader;
+
+    impl Read for EofReader {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for EofReader {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_polling_leg_ends_when_its_sibling_finishes() {
+        // The stall the Windows CI caught: a busy `continue` at the timeout outlives the relay that ended, and the join on it never returns.
+        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let joined = thread::spawn(move || {
+            relay_stream(Half::shared(Poller), Half::shared(EofReader), &close);
+        });
+        joined
+            .join()
+            .expect("the polling leg ends on its sibling's finish");
+    }
+
+    /// A wrapped flow is a direction pair, not a pair of threads: the peak the matrix reads is
+    /// the fixed lanes plus the accept loop, so a regression that buys a thread per flow shows up
+    /// here as growth proportional to the connection count.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wrapped_flows_share_a_fixed_set_of_lanes() {
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::wrapped_flows_share_a_fixed_set_of_lanes",
+        ) {
+            return;
+        }
+        let before = crate::conn::live_threads();
+        let flows = 24usize;
+        let mut stops = Vec::new();
+        for _ in 0..flows {
+            let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let address = front.local_addr().expect("addr");
+            let client = Connection::connect(address).expect("connects");
+            let peer = front.accept().expect("accepts").0;
+            stops.push((
+                client.try_clone().expect("clones"),
+                peer.try_clone().expect("clones"),
+            ));
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+            relay_shared(Half::socket(client), Half::socket(peer), &close);
+        }
+        thread::sleep(Duration::from_millis(50));
+        let grown = crate::conn::live_threads().saturating_sub(before);
+        for (client, peer) in stops {
+            let _ = client.shutdown(Shutdown::Both);
+            let _ = peer.shutdown(Shutdown::Both);
+        }
+        let lanes = lane_pool::workers();
+        assert!(lanes >= 6, "the lane count is the bound: {lanes}");
+        assert!(
+            grown <= lanes + 8,
+            "{flows} wrapped flows grew the process by {grown} threads, past {lanes} lanes plus slack"
+        );
+        assert!(
+            grown < flows,
+            "{flows} wrapped flows grew the process by {grown} threads: a thread per flow"
+        );
+    }
+
+    /// A plaintext muxed gRPC connection is demuxed by a lane parked on its socket, so an
+    /// eight-connection cell grows the process by the demux pool's lanes and one reaper, not by a
+    /// thread per connection and its reaper.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn muxed_grpc_connections_share_the_lane_pool() {
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::muxed_grpc_connections_share_the_lane_pool",
+        ) {
+            return;
+        }
+        // Hold every lane and setup worker once so the pools' growth lands in the baseline, not in the measured window.
+        let hold = Arc::new(AtomicBool::new(true));
+        for _ in 0..lane_pool::RELAY_LANES * 2 {
+            let hold = Arc::clone(&hold);
+            lane_pool::submit(
+                Box::new(move || {
+                    while hold.load(Ordering::Relaxed) {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    lane_pool::Next::Done
+                }),
+                Box::new(|| {}),
+            );
+        }
+        for _ in 0..=lane_pool::SETUP_LANES {
+            let hold = Arc::clone(&hold);
+            lane_pool::submit_setup(
+                Box::new(move || {
+                    while hold.load(Ordering::Relaxed) {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    lane_pool::Next::Done
+                }),
+                Box::new(|| {}),
+            );
+        }
+        let until = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < until
+            && (lane_pool::workers() < lane_pool::RELAY_LANES
+                || lane_pool::setup_workers() < lane_pool::SETUP_LANES)
+        {
+            thread::sleep(Duration::from_millis(1));
+        }
+        hold.store(false, Ordering::Relaxed);
+        thread::sleep(Duration::from_millis(100));
+
+        let id = [0x2Bu8; 16];
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let carrier = Carrier::Grpc(crate::config::GrpcSettings::path("/p"));
+        let serving = thread::spawn(move || {
+            for _ in 0..8 {
+                let (stream, _) = front.accept().expect("accepts");
+                let carrier = carrier.clone();
+                let mut stream = Some(stream);
+                lane_pool::submit_setup(
+                    Box::new(move || {
+                        if let Some(stream) = stream.take() {
+                            serve_vless(stream, &one_vless_user(&id), &carrier, true, None, None);
+                        }
+                        lane_pool::Next::Done
+                    }),
+                    Box::new(|| {}),
+                );
+            }
+        });
+        let before = crate::conn::live_threads();
+        let peers: Vec<_> = (0..8)
+            .map(|_| Connection::connect(addr).expect("connects"))
+            .collect();
+        thread::sleep(Duration::from_millis(300));
+        let grown = crate::conn::live_threads().saturating_sub(before);
+        drop(peers);
+        serving.join().expect("joins");
+        assert!(
+            grown <= lane_pool::demux_lanes() + 1,
+            "eight muxed connections grew the process by {grown} threads past the demux pool's {} lanes and its one reaper: a thread per connection and more",
+            lane_pool::demux_lanes()
+        );
+    }
+
+    /// A plaintext xHTTP connection that sends the H2 preface and no stream hands its demux to a
+    /// lane: the setup workers that took the first eight still reach the ninth handshake.
+    #[test]
+    fn a_plaintext_h2_preface_releases_its_setup_worker() {
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::a_plaintext_h2_preface_releases_its_setup_worker",
+        ) {
+            return;
+        }
+        let id = [0x2Bu8; 16];
+        let users: Arc<[VlessUser]> = Arc::from(one_vless_user(&id));
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let settings = xhttp_settings("/p");
+        let queued = Arc::new(AtomicUsize::new(0));
+        let accepting = {
+            let users = Arc::clone(&users);
+            let queued = Arc::clone(&queued);
+            thread::spawn(move || {
+                for _ in 0..8 {
+                    let (stream, _) = front.accept().expect("accepts");
+                    let carrier = Carrier::Xhttp {
+                        settings: settings.clone(),
+                    };
+                    let users = Arc::clone(&users);
+                    let mut stream = Some(stream);
+                    lane_pool::submit_setup(
+                        Box::new(move || {
+                            if let Some(stream) = stream.take() {
+                                serve_vless(stream, &users, &carrier, true, None, None);
+                            }
+                            lane_pool::Next::Done
+                        }),
+                        Box::new(|| {}),
+                    );
+                    queued.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+        let mut peers: Vec<_> = (0..8)
+            .map(|_| Connection::connect(addr).expect("connects"))
+            .collect();
+        for peer in &mut peers {
+            peer.write_all(crate::h2::MAGIC)
+                .expect("writes the preface");
+            peer.flush().expect("flushes");
+        }
+        let until = Instant::now() + Duration::from_secs(10);
+        while queued.load(Ordering::SeqCst) < 8 && Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            queued.load(Ordering::SeqCst),
+            8,
+            "the accept loop did not hand every connection to a setup lane"
+        );
+        let ran = Arc::new(AtomicBool::new(false));
+        let witness = Arc::clone(&ran);
+        lane_pool::submit_setup(
+            Box::new(move || {
+                witness.store(true, Ordering::SeqCst);
+                lane_pool::Next::Done
+            }),
+            Box::new(|| {}),
+        );
+        let until = Instant::now() + crate::budgets::handshake() + Duration::from_secs(5);
+        while !ran.load(Ordering::SeqCst) && Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let released = ran.load(Ordering::SeqCst);
+        drop(peers);
+        accepting.join().expect("joins");
+        assert!(
+            released,
+            "eight idle H2 connections held every setup worker: the ninth lane never ran"
+        );
+    }
+
+    /// A carriered accept hands its handshake to the lane pool, so an eight-flow cell grows the
+    /// process by the setup lanes and their borrow ceiling, not by connections.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn carried_handshakes_share_the_lane_pool() {
+        if !crate::conn::in_a_quiet_process("proxy::tests::carried_handshakes_share_the_lane_pool")
+        {
+            return;
+        }
+        let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let address = format!("127.0.0.1:{port}");
+        let role = Role::Vless {
+            users: one_user([9u8; 16]),
+            carrier: Carrier::Raw(Chain::default()),
+            freedom: true,
+            fallbacks: None,
+            decryption: None,
+        };
+        let stop = std::sync::Arc::new(Stop::new());
+        let before = crate::conn::live_threads();
+        let serving = {
+            let address = address.clone();
+            let stop = std::sync::Arc::clone(&stop);
+            let role = role.clone();
+            thread::spawn(move || {
+                let listener = bind_listener(&address, &role).expect("binds the carried listener");
+                accept_listener(listener, &address, &role, None, Some(stop));
+            })
+        };
+        let clients: Vec<_> = (0..8)
+            .map(|_| {
+                let until = Instant::now() + Duration::from_secs(10);
+                loop {
+                    match Connection::connect(("127.0.0.1", port)) {
+                        Ok(client) => return client,
+                        Err(_) if Instant::now() < until => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("the listener never came up: {error}"),
+                    }
+                }
+            })
+            .collect();
+        let until = Instant::now() + Duration::from_secs(3);
+        let lanes = loop {
+            let lanes = lane_pool::setup_workers();
+            if lanes >= 1 || Instant::now() >= until {
+                break lanes;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let grown = crate::conn::live_threads().saturating_sub(before);
+        assert!(lanes >= 1, "the setup lane count is the bound: {lanes}");
+        assert!(
+            lanes <= lane_pool::SETUP_LANES,
+            "the setup pool grew past its {0} lanes: {lanes}",
+            lane_pool::SETUP_LANES
+        );
+        assert!(
+            grown <= lanes + 4,
+            "{} carried handshakes grew the process by {grown} threads, past {lanes} setup lanes, their borrow ceiling and the accept thread",
+            clients.len()
+        );
+        assert!(
+            grown < clients.len(),
+            "{} carried handshakes grew the process by {grown} threads: a thread per handshake",
+            clients.len()
+        );
+        stop.stop();
+        wake_listener(&stop, &address);
+        serving.join().expect("the accept loop stops");
+        drop(clients);
+    }
+
+    #[test]
+    fn the_cover_origin_splice_carries_the_reply_back_to_the_peer() {
+        let peer_side = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let origin_side = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let origin_port = origin_side.local_addr().expect("addr").port();
+        let mut peer =
+            Connection::connect(peer_side.local_addr().expect("addr")).expect("connects");
+        let client = peer_side.accept().expect("accepts").0;
+        client
+            .set_read_timeout(Some(RELAY_POLL))
+            .expect("polls like the server path");
+        let target = std::net::TcpStream::connect(("127.0.0.1", origin_port)).expect("dials");
+        let cover = thread::spawn(move || {
+            let (mut origin, _) = origin_side.accept().expect("accepts");
+            let mut head = [0u8; 4];
+            origin.read_exact(&mut head).expect("reads");
+            origin.write_all(b"pong").expect("replies");
+            origin.shutdown(Shutdown::Write).expect("half-closes");
+            let mut rest = Vec::new();
+            let _ = origin.read_to_end(&mut rest);
+            head
+        });
+        let fallback = thread::spawn(move || {
+            relay_fallback(ferrox_core::tls::Proxied {
+                client,
+                target,
+                upload: None,
+                download: None,
+            });
+        });
+        peer.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("times out");
+        peer.write_all(b"ping").expect("sends");
+        let mut reply = [0u8; 4];
+        let arrived = match peer.read_exact(&mut reply) {
+            Ok(()) => Some(reply),
+            Err(why) if is_timeout(&why) => None,
+            Err(why) => panic!("reads: {why}"),
+        };
+        drop(peer);
+        let head = cover.join().expect("the cover origin ends");
+        fallback.join().expect("the splice ends");
+        assert_eq!(
+            arrived,
+            Some(*b"pong"),
+            "the origin's reply reaches the peer"
+        );
+        assert_eq!(
+            &head, b"ping",
+            "the peer's hello reaches the origin in order"
+        );
+    }
+
+    #[test]
+    fn the_cover_origin_splice_ends_when_the_peer_finishes() {
+        let peer_side = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let origin_side = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let origin_port = origin_side.local_addr().expect("addr").port();
+        let mut peer =
+            Connection::connect(peer_side.local_addr().expect("addr")).expect("connects");
+        let client = peer_side.accept().expect("accepts").0;
+        client
+            .set_read_timeout(Some(RELAY_POLL))
+            .expect("polls like the server path");
+        let target = std::net::TcpStream::connect(("127.0.0.1", origin_port)).expect("dials");
+        let (gone_tx, gone_rx) = std::sync::mpsc::channel();
+        let cover = thread::spawn(move || {
+            let (mut origin, _) = origin_side.accept().expect("accepts");
+            let mut head = [0u8; 4];
+            origin.read_exact(&mut head).expect("reads");
+            let _ = gone_rx.recv_timeout(Duration::from_secs(5));
+            head
+        });
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let fallback = thread::spawn(move || {
+            relay_fallback(ferrox_core::tls::Proxied {
+                client,
+                target,
+                upload: None,
+                download: None,
+            });
+            let _ = finished_tx.send(());
+        });
+        peer.write_all(b"ping").expect("sends");
+        drop(peer);
+        let ended = finished_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        let _ = gone_tx.send(());
+        let head = cover.join().expect("the cover origin ends");
+        fallback.join().expect("the splice ends");
+        assert!(
+            ended,
+            "a finished peer ends the splice against a silent origin"
+        );
+        assert_eq!(&head, b"ping", "the hello reaches the origin");
+    }
+
+    /// Two pumps share one session lock: an idle read must leave it after the relay grain, and a write must bring back the one-tick grain that keeps the opposite pump waiting.
+    #[test]
+    fn a_server_relay_moves_an_idle_shared_session_to_the_relay_grain() {
+        let site = crate::conn::test_bind("127.0.0.1:0").expect("binds the site");
+        let site_addr: SocketAddr = site.local_addr().expect("addr");
+        let dialed = thread::spawn(move || {
+            let (peer, _) = site.accept().expect("accepts");
+            peer
+        });
+
+        let lane = crate::conn::test_bind("127.0.0.1:0").expect("binds the lane");
+        let lane_addr: SocketAddr = lane.local_addr().expect("addr");
+        let mut edge = Connection::connect(lane_addr).expect("connects");
+        let (session, _) = lane.accept().expect("accepts");
+        session
+            .set_read_timeout(Some(RELAY_POLL))
+            .expect("arms the server idle grain");
+        let raw = session.try_clone().expect("shares the fd");
+        #[cfg(unix)]
+        let probe = session.try_clone().expect("probes the fd");
+        #[cfg(unix)]
+        let (relay_poll, session_poll) = {
+            let Connection::Tcp(tcp) = &edge else {
+                unreachable!("the loopback edge is TCP")
+            };
+            tcp.set_read_timeout(Some(RELAY_POLL))
+                .expect("native idle grain");
+            let idle = tcp
+                .read_timeout()
+                .expect("reads the idle grain")
+                .expect("armed idle");
+            tcp.set_read_timeout(Some(SESSION_POLL))
+                .expect("native moving grain");
+            let moving = tcp
+                .read_timeout()
+                .expect("reads the moving grain")
+                .expect("armed moving");
+            (idle, moving)
+        };
+        drop(lane);
+
+        let id = [0x5Au8; 16];
+        edge.write_all(&vless_header(&id, 1, &Destination::from(site_addr)))
+            .expect("greets");
+        let relay = thread::spawn(move || {
+            relay_vless(
+                session,
+                Some(raw),
+                &one_vless_user(&id),
+                true,
+                true,
+                None,
+                &FrontNames::default(),
+                None,
+            );
+        });
+
+        edge.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("arms the reply read");
+        let mut answer = [0u8; 2];
+        edge.read_exact(&mut answer).expect("answers");
+        assert_eq!(answer, [0, 0], "the relay grants the tunnel");
+        // Only a duplicated file description reflects a setsockopt made on the raw clone, so the value witness is unix-only (WSADuplicateSocket gives Windows an independent handle).
+        #[cfg(unix)]
+        {
+            let idle = Instant::now() + Duration::from_secs(5);
+            while probe.read_timeout().ok().flatten() != Some(relay_poll) {
+                assert!(
+                    Instant::now() < idle,
+                    "an idle shared read must arm the relay grain"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            edge.write_all(b"x").expect("moves the flow");
+            let moving = Instant::now() + Duration::from_secs(5);
+            while probe.read_timeout().ok().flatten() != Some(session_poll) {
+                assert!(
+                    Instant::now() < moving,
+                    "a write must return the shared read to one tick"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        drop(edge);
+        relay.join().expect("the relay ends");
+        drop(dialed.join().expect("the site holds its connection"));
+    }
+
+    /// Every other TLS rung re-shakes a slow hello to its deadline; the raw arm shook once and refused at the grain.
+    #[test]
+    fn a_plain_tls_lane_retries_a_hello_that_arrives_past_the_grain() {
+        use ferrox_core::tls::TlsProvider;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let server: SocketAddr = listener.local_addr().expect("addr");
+        let lane = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless_tls(
+                stream,
+                &one_vless_user(&[0x9Du8; 16]),
+                true,
+                &Carrier::Raw(Chain::default()),
+                &server_config,
+                None,
+                None,
+            );
+        });
+
+        // The hello arrives twelve grains later than the lane's first read; only its deadline may refuse it.
+        let edge = Connection::connect(server).expect("connects");
+        thread::sleep(Duration::from_millis(240));
+        let mut client = ferrox_core::tls::connect(&client_config, edge).expect("opens");
+        let shook = client.handshake();
+        drop(client);
+        lane.join().expect("the lane ends");
+        shook.expect("a hello past the grain completes the handshake, not a refusal");
+    }
+
+    #[test]
+    fn scratch_reuses_capacity_and_reports_its_length() {
+        let mut buf = Vec::new();
+        for len in [0usize, 1, 16, 4096, 65_536, 3] {
+            resize_scratch(&mut buf, len);
+            assert!(buf.capacity() >= len, "len {len}");
+            assert_eq!(buf.len(), len, "len {len}");
+            buf.fill(0x5A);
+            assert!(buf.iter().all(|&byte| byte == 0x5A), "len {len}");
+        }
+        let mut fresh = Vec::new();
+        resize_scratch(&mut fresh, 32);
+        assert_eq!(fresh, [0u8; 32]);
+    }
+
+    struct Broken;
+
+    impl Read for Broken {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("no bytes today"))
+        }
+    }
+
+    #[test]
+    fn a_connect_lane_grants_only_after_its_tunnel_opens() {
+        fn handshake(grant: bool) -> Vec<u8> {
+            let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let port = listener.local_addr().expect("addr").port();
+            let accepted = std::thread::spawn(move || listener.accept().expect("accepts").0);
+            let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("times out");
+            client
+                .write_all(&[5, 1, 0, 5, 1, 0, 3, 11])
+                .expect("greets");
+            client.write_all(b"example.com").expect("names");
+            client.write_all(&[0, 80]).expect("ports");
+            let mut server = accepted.join().expect("accepts");
+            let accounts = no_accounts();
+            let handshake = socks_target(&mut server, grant, &accounts).expect("handshakes");
+            assert_eq!(handshake.cmd, 1);
+            assert_eq!(handshake.asked.authority(), "example.com:80");
+            let mut reply = [0u8; 2];
+            client.read_exact(&mut reply).expect("selects a method");
+            assert_eq!(reply, [5, 0]);
+            let mut rest = Vec::new();
+            let _ = client.read_to_end(&mut rest);
+            drop(server);
+            rest
+        }
+        let granted = handshake(true);
+        assert_eq!(granted.len(), 10, "one grant, ten bytes");
+        assert_eq!(&granted[..3], &[5, 0, 0]);
+        let ungranted = handshake(false);
+        assert!(ungranted.is_empty(), "no grant before the tunnel opens");
+    }
+
+    #[test]
+    fn a_maximal_method_offer_drains_on_the_stack_and_still_grants() {
+        // head[1] = 255 is the largest count a peer can send, and with no method 0x00 offered the reply is still no-auth, so the offer is provably never inspected.
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let accepted = std::thread::spawn(move || listener.accept().expect("accepts").0);
+        let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("times out");
+        let mut greeting = vec![5u8, u8::MAX];
+        greeting.extend_from_slice(&[2u8; u8::MAX as usize]);
+        greeting.extend([5, 1, 0, 3, 11]);
+        greeting.extend_from_slice(b"example.com");
+        greeting.extend([0, 80]);
+        client.write_all(&greeting).expect("greets");
+        let mut server = accepted.join().expect("accepts");
+        let accounts = no_accounts();
+        let handshake = socks_target(&mut server, true, &accounts).expect("handshakes");
+        assert_eq!(handshake.cmd, 1);
+        assert_eq!(handshake.asked.authority(), "example.com:80");
+        let mut reply = [0u8; 2];
+        client.read_exact(&mut reply).expect("selects a method");
+        assert_eq!(reply, [5, 0]);
+    }
+
+    struct Dribble {
+        inner: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl Read for Dribble {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let take = buf.len().min(5);
+            self.inner.read(&mut buf[..take])
+        }
+    }
+
+    #[test]
+    fn a_read_into_the_tail_appends_exactly_what_the_stream_held() {
+        let stream: Vec<u8> = (0..(READ_SLICE * 2 + 137))
+            .map(|i| (i as u8).wrapping_mul(17).wrapping_add(3))
+            .collect();
+        let mut source = Dribble {
+            inner: std::io::Cursor::new(stream.clone()),
+        };
+        let mut buf = Vec::with_capacity(READ_SLICE);
+        let mut init = 0usize;
+        let mut reads = 0usize;
+        loop {
+            // SAFETY: `init` describes `buf`, whose tail this loop owns.
+            match unsafe { read_into_tail(&mut source, &mut buf, &mut init) } {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    assert!(n <= READ_SLICE, "read {n} exceeds the slice");
+                    reads += 1;
+                }
+            }
+            assert_eq!(buf, stream[..buf.len()], "read {reads}");
+            assert!(
+                buf.capacity() >= READ_SLICE,
+                "read {reads}: the framing buffer grew past the read slice"
+            );
+        }
+        assert_eq!(buf, stream, "every byte arrived, in order");
+        assert!(
+            reads > 3_000,
+            "a five-byte reader needs many reads: {reads}"
+        );
+    }
+
+    #[test]
+    fn a_read_into_the_tail_never_leaves_a_short_buffer() {
+        let mut buf = Vec::from(&b"keep"[..]);
+        let mut init = 0usize;
+        // SAFETY: `init` describes `buf`, whose tail this test owns.
+        assert!(unsafe { read_into_tail(&mut Broken, &mut buf, &mut init) }.is_err());
+        assert_eq!(buf, b"keep", "a failed read leaves the bytes already there");
+        let mut buf = Vec::from(&b"keep"[..]);
+        let mut init = 0usize;
+        assert_eq!(
+            // SAFETY: `init` describes `buf`, whose tail this test owns.
+            unsafe { read_into_tail(&mut std::io::empty(), &mut buf, &mut init) }.expect("eof"),
+            0
+        );
+        assert_eq!(
+            buf, b"keep",
+            "an empty stream leaves the bytes already there"
+        );
+    }
+
+    #[test]
+    fn b64url_matches_the_shared_encoder() {
+        for (bytes, want) in [
+            (&b""[..], ""),
+            (&b"foobar"[..], "Zm9vYmFy"),
+            (&[0xff, 0xff, 0x00][..], "__8A"),
+        ] {
+            assert_eq!(b64url(bytes), want);
+            let mut shared = String::new();
+            ferrox_core::transport::early_encode_into(&mut shared, bytes);
+            assert_eq!(b64url(bytes), shared);
+        }
+    }
+
+    #[test]
+    fn a_head_split_across_segments_is_read_whole() {
+        use std::time::Duration;
+
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let peer = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            for piece in [
+                &b"GET /tunnel HTTP/1.1\r\nHost: h\r\n"[..],
+                &b"Upgrade: websocket\r\n"[..],
+                &b"\r"[..],
+                &b"\n"[..],
+            ] {
+                stream.write_all(piece).expect("writes");
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+
+        let mut stream = Connection::connect(("127.0.0.1", port)).expect("connects");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let head =
+            read_http_head(&mut stream, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("reads a head");
+        assert_eq!(
+            head,
+            b"GET /tunnel HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\n\r\n".to_vec()
+        );
+        peer.join().expect("joins");
+    }
+
+    #[test]
+    fn a_head_dribbled_across_reads_returns_whole_with_its_pipelined_tail() {
+        // A delimiter straddling a read boundary: the head comes back whole, the overflow becomes the prefix.
+        let head_bytes =
+            b"HTTP/1.1 200 Connection established\r\nProxy-Connection: keep-alive\r\n\r\n";
+        let tail_bytes = b"the pipelined first frame";
+        let mut wire = Vec::new();
+        wire.extend_from_slice(head_bytes);
+        wire.extend_from_slice(tail_bytes);
+        let mut source = Dribble {
+            inner: std::io::Cursor::new(wire),
+        };
+        let (head, at) =
+            read_exact_head(&mut source, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("reads the head");
+        assert_eq!(
+            &head[..at],
+            head_bytes.to_vec(),
+            "the head comes back whole"
+        );
+        // The tail is overflow plus reader bytes: nothing lost at the boundary, nothing handed twice.
+        let mut rest = Vec::new();
+        source.read_to_end(&mut rest).expect("drains the reader");
+        let joined = [head[at..].to_vec(), rest].concat();
+        assert_eq!(joined, tail_bytes.to_vec(), "the tail splits cleanly");
+    }
+
+    /// The kept head reader's whole claim, witnessed where a count is exact: one call proves the head *and* takes the bytes behind it. The `peek` reader spent one call proving the head and another taking it, and left the tail in the stream for a third.
+    #[test]
+    fn a_kept_head_costs_one_read_per_window_and_takes_its_tail() {
+        let head = b"GET /tunnel HTTP/1.1\r\nHost: h\r\n\r\n";
+        let tail = b"the first frame's bytes";
+        let mut wire = head.to_vec();
+        wire.extend_from_slice(tail);
+        let whole = wire.len();
+        let mut source = Counted {
+            inner: std::io::Cursor::new(wire),
+            reads: 0,
+        };
+        let (got, at) =
+            kept_head_rounds(&mut source, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("reads a head");
+        assert_eq!(got[..at], head.to_vec(), "the head ends at its delimiter");
+        assert_eq!(
+            got[at..],
+            tail.to_vec(),
+            "the bytes behind it came in the same buffer"
+        );
+        assert_eq!(
+            source.reads, 1,
+            "one read proved the head and took the tail"
+        );
+        assert_eq!(
+            source.inner.position() as usize,
+            whole,
+            "octets were left in the stream for another read"
+        );
+    }
+
+    /// The delimiter split across a round's seam: the scan starts three octets before the new bytes, so a head whose `\r\n\r\n` straddles is still proved, and it costs the two windows it arrived in and no third.
+    #[test]
+    fn a_kept_head_straddling_a_round_is_proved_by_two_reads() {
+        let mut wire: Vec<u8> = b"GET /tunnel HTTP/1.1\r\nX-Pad: ".to_vec();
+        while wire.len() < HEAD_ROUND - 2 {
+            wire.push(b'p');
+        }
+        // The delimiter occupies HEAD_ROUND-2..HEAD_ROUND+2, so the first round ends inside it.
+        wire.extend_from_slice(b"\r\n\r\npayload");
+        assert_eq!(wire[HEAD_ROUND - 2..], b"\r\n\r\npayload".to_vec());
+        let mut source = Counted {
+            inner: std::io::Cursor::new(wire),
+            reads: 0,
+        };
+        let (got, at) =
+            kept_head_rounds(&mut source, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("straddles");
+        assert_eq!(
+            at,
+            HEAD_ROUND + 2,
+            "the head is proved past the seam, not re-windowed"
+        );
+        assert_eq!(&got[at..], b"payload");
+        assert_eq!(source.reads, 2, "a round per window: {}", source.reads);
+    }
+
+    /// A common camouflage head is one allocation and a full window is three: the first round covers the head, and the growth rounds stay at the limit's fractions rather than pre-sizing the whole 8 KiB window.
+    #[test]
+    fn a_common_head_is_one_allocation_and_a_full_window_is_three() {
+        for (len, allocs) in [(512usize, 1usize), (700, 1), (8 * 1024, 3)] {
+            let mut head = vec![b'p'; len - 4];
+            head.extend_from_slice(b"\r\n\r\n");
+            for _ in 0..12 {
+                let mut source = std::io::Cursor::new(head.clone());
+                let (read, counts) = ferrox_core::alloc_count::measure(|| {
+                    kept_head_rounds(&mut source, 8 * 1024, HEAD_DEADLINE)
+                });
+                let (got, at) = read.expect("reads a head");
+                assert_eq!(at, len, "the head ends at its delimiter");
+                assert_eq!(&got[..at], &head[..], "the head comes back whole");
+                assert_eq!(
+                    counts.allocs, allocs,
+                    "a {len}-byte head costs {allocs} allocation(s): {counts:?}"
+                );
+            }
+        }
+    }
+
+    /// A head that arrives in fragments still fits the first round: a short read must spend the room it already has, not grow the buffer.
+    #[test]
+    fn a_fragmented_head_inside_the_first_round_does_not_grow() {
+        let mut wire = vec![b'p'; 696];
+        wire.extend_from_slice(b"\r\n\r\n");
+        for take in [1usize, 7, 64, 333, 400] {
+            let mut source = Chunked {
+                inner: std::io::Cursor::new(wire.clone()),
+                take,
+            };
+            let (read, counts) = ferrox_core::alloc_count::measure(|| {
+                kept_head_rounds(&mut source, 8 * 1024, HEAD_DEADLINE)
+            });
+            let (got, at) = read.expect("reads a fragmented head");
+            assert_eq!(at, wire.len(), "the head ends at its delimiter");
+            assert_eq!(&got[..at], &wire[..], "the head comes back whole");
+            assert_eq!(
+                counts.allocs, 1,
+                "{take}-byte fragments grow the first round: {counts:?}"
+            );
+        }
+    }
+
+    /// The worst input the round loop meets: no delimiter at all. It is refused, and so is a stream that holds nothing.
+    #[test]
+    fn a_kept_head_without_a_delimiter_is_refused() {
+        let mut endless = Counted {
+            inner: std::io::Cursor::new(vec![b'x'; 4096]),
+            reads: 0,
+        };
+        assert!(
+            kept_head_rounds(&mut endless, 8 * 1024, HEAD_DEADLINE).is_none(),
+            "a head with no terminator must be refused"
+        );
+        assert!(
+            endless.inner.position() as usize <= 8 * 1024,
+            "the reader went past its limit"
+        );
+        let mut empty = Counted {
+            inner: std::io::Cursor::new(Vec::new()),
+            reads: 0,
+        };
+        assert!(
+            kept_head_rounds(&mut empty, HEAD_LIMIT_TEST, HEAD_DEADLINE).is_none(),
+            "an idle stream is not a head"
+        );
+    }
+
+    #[test]
+    fn bytes_pipelined_behind_a_head_stay_in_the_kernel() {
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let peer = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let mut request = Vec::from(&b"GET /tunnel HTTP/1.1\r\nHost: h\r\n\r\n"[..]);
+            request.extend_from_slice(b"the first frame's bytes");
+            stream.write_all(&request).expect("writes");
+            thread::sleep(std::time::Duration::from_millis(50));
+        });
+
+        let mut stream = Connection::connect(("127.0.0.1", port)).expect("connects");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let head =
+            read_http_head(&mut stream, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("reads a head");
+        assert_eq!(head, b"GET /tunnel HTTP/1.1\r\nHost: h\r\n\r\n".to_vec());
+        let tail = b"the first frame's bytes";
+        let mut rest = vec![0u8; tail.len()];
+        stream
+            .read_exact(&mut rest)
+            .expect("the tail is still there");
+        assert_eq!(rest, tail);
+        peer.join().expect("joins");
+    }
+
+    #[test]
+    fn an_unterminated_head_is_refused_at_the_limit() {
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let peer = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let filler = vec![b'x'; 4096];
+            while stream.write_all(&filler).is_ok() {}
+        });
+
+        let mut stream = Connection::connect(("127.0.0.1", port)).expect("connects");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        assert!(
+            read_http_head(&mut stream, 8 * 1024, HEAD_DEADLINE).is_none(),
+            "a head with no terminator must be refused"
+        );
+        drop(stream);
+        peer.join().expect("joins");
+    }
+
+    /// Poll-armed socket, silent peer: the elapsed assert is the witness, since a spinning test never fails.
+    #[test]
+    fn a_quiet_peer_ends_both_head_readers_at_their_budget() {
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let budget = Duration::from_millis(60);
+        let at = Instant::now();
+
+        let mut peeked = Connection::connect(addr).expect("connects");
+        peeked
+            .set_read_timeout(Some(Duration::from_millis(2)))
+            .expect("timeout");
+        assert!(
+            read_http_head(&mut peeked, HEAD_LIMIT_TEST, budget).is_none(),
+            "the peeking reader must give up on a silent peer"
+        );
+
+        let mut record = Connection::connect(addr).expect("connects");
+        record
+            .set_read_timeout(Some(Duration::from_millis(2)))
+            .expect("timeout");
+        assert!(
+            read_exact_head(&mut record, HEAD_LIMIT_TEST, budget).is_none(),
+            "the record reader must give up on a silent peer"
+        );
+
+        // A budget cannot bound a blocking `peek`: arm one, and hand the socket back as it came.
+        let unarmed = Connection::connect(addr).expect("connects");
+        let mut unarmed = unarmed;
+        assert!(
+            read_http_head(&mut unarmed, HEAD_LIMIT_TEST, budget).is_none(),
+            "an un-armed socket must not park the thread in `peek`"
+        );
+        assert_eq!(
+            unarmed.read_timeout().ok().flatten(),
+            None,
+            "the reader left the socket's own timeout as it found it"
+        );
+
+        assert!(
+            at.elapsed() < Duration::from_secs(5),
+            "a head read outlived its budget: {}ms",
+            at.elapsed().as_millis()
+        );
+    }
+
+    const HEAD_LIMIT_TEST: usize = 16 * 1024;
+
+    #[test]
+    fn base64url_matches_the_oracle_shape() {
+        assert_eq!(b64url(&[0u8; 32]), "A".repeat(43));
+        assert_eq!(b64url(b"fo"), "Zm8");
+        assert_eq!(b64url(b"foo"), "Zm9v");
+    }
+
+    #[test]
+    fn uuid_parses_and_rejects() {
+        assert_eq!(
+            uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("parses")[0..2],
+            [0xaa, 0xaa]
+        );
+        assert!(uuid_bytes("not-a-uuid").is_none());
+        assert!(uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeee").is_none());
+    }
+
+    #[test]
+    fn decodes_what_the_core_encodes() {
+        let link = ferrox_core::vless::VlessLink::parse(
+            "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@192.0.2.1:443?security=none&encryption=none&type=tcp#x",
+        )
+        .expect("parses");
+        let header = link.encode_request_header("192.0.2.53", 80);
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let writer = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            decode_request(&mut stream).expect("decodes")
+        });
+        let mut reader = Connection::connect(("127.0.0.1", port)).expect("connects");
+        reader.write_all(&header).expect("writes");
+        let (id, _flow, cmd, target) = writer.join().expect("joins");
+        assert_eq!(
+            id,
+            uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id")
+        );
+        assert_eq!(cmd, 1);
+        assert_eq!(target.to_string(), "192.0.2.53:80");
+        drop(reader);
+    }
+
+    #[test]
+    fn trojan_key_is_sha224_hex() {
+        assert_eq!(
+            trojan_key("an-example-shared-password"),
+            *b"73317e3bf920a459723610d27b71cadc07061d8f0d8587e041944896"
+        );
+    }
+
+    #[test]
+    fn both_sockets_of_a_connection_have_nagle_off() {
+        let listener = crate::conn::test_bind(("127.0.0.1", 0)).expect("binds");
+        let port = listener.local_addr().expect("has an address").port();
+        let server = thread::spawn(move || {
+            let (accepted, _) = listener.accept().expect("accepts");
+            accepted
+        });
+        let dialled = dial(&SocketAddr::from(([127, 0, 0, 1], port))).expect("connects");
+        assert!(
+            dialled.nodelay().expect("reads back"),
+            "the socket this binary dials must have TCP_NODELAY set"
+        );
+        let accepted = server.join().expect("the listener thread");
+        no_delay(&accepted);
+        assert!(
+            accepted.nodelay().expect("reads back"),
+            "and so must an accepted one"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_splice_pipe_reads_back_the_capacity_it_was_granted() {
+        let pipe = SplicePipe::new().expect("a pipe is available on this host");
+        assert!(
+            pipe.capacity > 0,
+            "a granted capacity of zero would make every splice ask for nothing"
+        );
+        let asked = unsafe { libc::fcntl(pipe.fds[0], libc::F_GETPIPE_SZ) };
+        assert_eq!(
+            asked as usize, pipe.capacity,
+            "the recorded capacity must be the kernel's answer, not the request"
+        );
+        assert!(
+            pipe.capacity <= DEFAULT_SPLICE_PIPE_BYTES.max(1) || pipe.capacity > 0,
+            "a granted capacity is always positive and never invented"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sixty_four_flows_fit_the_splice_pipe_budget() {
+        let rings: Vec<usize> = (0..128).map(splice_pipe_bytes_for).collect();
+        assert_eq!(rings[0], DEFAULT_SPLICE_PIPE_BYTES);
+        assert_eq!(rings[16], 256 * 1024);
+        assert_eq!(rings[128 - 1], 256 * 1024);
+        let total: usize = rings.iter().sum();
+        assert!(
+            total <= 48 * 1024 * 1024,
+            "128 rings claimed {total} B, over the 48 MiB the 64-flow cells may hold"
+        );
+    }
+
+    /// A write that advances but cannot finish must hand its worker back: a trickling peer would
+    /// otherwise keep the direction on a shared lane until every byte it accepts arrives.
+    #[test]
+    #[cfg(unix)]
+    fn a_partial_write_hands_the_lane_back() {
+        use std::os::unix::io::AsRawFd;
+
+        let front = crate::conn::test_bind(("127.0.0.1", 0)).expect("binds the front");
+        let edge = crate::conn::test_bind(("127.0.0.1", 0)).expect("binds the edge");
+        let dst = Connection::connect(front.local_addr().expect("front address"))
+            .expect("connects the writer");
+        let (_peer, _) = front.accept().expect("accepts the writer");
+        let src = Connection::connect(edge.local_addr().expect("edge address"))
+            .expect("connects the reader");
+        let (_source, _) = edge.accept().expect("accepts the reader");
+        let want: libc::c_int = 4096;
+        // SAFETY: `want` outlives the call, and the size is its own.
+        let set = unsafe {
+            libc::setsockopt(
+                dst.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                std::ptr::addr_of!(want).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(set, 0, "SO_SNDBUF refused");
+        dst.set_nonblocking(true).expect("nonblocking writer");
+        src.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("source timeout");
+        let mut copy = TcpCopy::new(src, dst);
+        copy.filled = copy.bytes.len();
+        let flow = Arc::new(RelayFinish::new(false, Arc::new(|| {}), None));
+        assert_eq!(
+            copy.step(&flow),
+            Next::Retry,
+            "a partial write must hand the lane back instead of finishing the buffer inline"
+        );
+        assert!(
+            copy.off > 0 && copy.off < copy.filled,
+            "the witness needs a write that moved part of the buffer, not all of it"
+        );
+    }
+
+    /// The fallback used when no lane worker can start must not hold a caller after the
+    /// forward half is gone and the peer has nothing left to say.
+    #[test]
+    fn an_owned_fallback_ends_an_idle_sibling() {
+        let front = crate::conn::test_bind(("127.0.0.1", 0)).expect("binds the front");
+        let edge = crate::conn::test_bind(("127.0.0.1", 0)).expect("binds the edge");
+        let mut client = Connection::connect(front.local_addr().expect("front address"))
+            .expect("connects the client");
+        let (client_local, _) = front.accept().expect("accepts the client");
+        let mut peer = Connection::connect(edge.local_addr().expect("edge address"))
+            .expect("connects the peer");
+        let (target_local, _) = edge.accept().expect("accepts the peer");
+        let (ended, waited) = std::sync::mpsc::channel();
+        let relay = thread::spawn(move || {
+            relay_owned(
+                client_local.try_clone().expect("client read"),
+                target_local.try_clone().expect("target write"),
+                target_local.try_clone().expect("target read"),
+                client_local.try_clone().expect("client write"),
+                None,
+            );
+            let _ = ended.send(());
+        });
+        client.write_all(b"x").expect("writes forward");
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("peer timeout");
+        let mut byte = [0u8; 1];
+        peer.read_exact(&mut byte).expect("reads forward");
+        client
+            .shutdown(Shutdown::Write)
+            .expect("finishes the client");
+        waited
+            .recv_timeout(crate::budgets::RELAY_RESPONSE_IDLE + Duration::from_secs(5))
+            .expect("the owned relay ended its idle sibling");
+        relay.join().expect("the relay thread returns");
+    }
+
+    #[test]
+    fn a_metered_tcp_flow_relays_over_the_lane_pool() {
+        let front = crate::conn::test_bind(("127.0.0.1", 0)).expect("binds the front");
+        let edge = crate::conn::test_bind(("127.0.0.1", 0)).expect("binds the edge");
+        let mut client = Connection::connect(front.local_addr().expect("front address"))
+            .expect("connects the client");
+        let (accepted, _) = front.accept().expect("accepts the client");
+        let (meter, read, write) = crate::stats::counting();
+        let client_local = accepted.with_meter(meter);
+        let mut peer = Connection::connect(edge.local_addr().expect("edge address"))
+            .expect("connects the peer");
+        let (accepted, _) = edge.accept().expect("accepts the peer");
+        let target_local = accepted;
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("client timeout");
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("peer timeout");
+        let relay = thread::spawn(move || relay_handoff(&client_local, &target_local));
+        client.write_all(b"hello").expect("writes forward");
+        let mut got = [0u8; 5];
+        peer.read_exact(&mut got).expect("reads forward");
+        assert_eq!(&got, b"hello");
+        peer.write_all(b"world").expect("writes back");
+        client.read_exact(&mut got).expect("reads back");
+        assert_eq!(&got, b"world");
+        client
+            .shutdown(Shutdown::Write)
+            .expect("finishes the client");
+        peer.shutdown(Shutdown::Write).expect("finishes the peer");
+        drop(client);
+        drop(peer);
+        relay.join().expect("the relay call returns");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while (read.value(), write.value()) != (5, 5) {
+            assert!(
+                Instant::now() < deadline,
+                "the relay counters saw {} read and {} written bytes",
+                read.value(),
+                write.value()
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn the_relay_pool_never_shrinks_below_the_directions_in_flight() {
+        const DIRECTIONS: usize = 64;
+        let pool = RelayPool::global();
+        let arrived = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut waits = Vec::new();
+        for _ in 0..DIRECTIONS {
+            let arrived = Arc::clone(&arrived);
+            waits.push(pool.run(move || {
+                arrived.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while arrived.load(std::sync::atomic::Ordering::SeqCst) < DIRECTIONS {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "only {} of {DIRECTIONS} directions were ever in flight at \
+                         once, so the pool serialised them",
+                        arrived.load(std::sync::atomic::Ordering::SeqCst)
+                    );
+                    std::thread::yield_now();
+                }
+            }));
+        }
+        for wait in &waits {
+            wait.recv_timeout(RELAY_JOIN)
+                .expect(
+                    "every direction must report that it ended, and a direction that never \
+                         started means the pool serialised them instead of running them",
+                )
+                .expect("and none of them ended by panicking on an assert of its own");
+        }
+        assert_eq!(
+            arrived.load(std::sync::atomic::Ordering::SeqCst),
+            DIRECTIONS,
+            "every direction must run exactly once"
+        );
+    }
+
+    /// Threads the pool borrows answer live flows, not history: a burst of directions that all finish has to hand its workers back inside the worker life, or every burst of concurrent flows raises the process's thread count for good.
+    #[test]
+    fn a_finished_burst_hands_its_workers_back_to_the_process() {
+        const BURST: usize = 8;
+        let pool = RelayPool::with_life(Duration::from_millis(200));
+        let gate = Arc::new(std::sync::Barrier::new(BURST + 1));
+        let waits: Vec<_> = (0..BURST)
+            .map(|_| {
+                let gate = Arc::clone(&gate);
+                pool.run(move || {
+                    gate.wait();
+                })
+            })
+            .collect();
+        // All eight are in flight at once, so no direction was served by a worker another had already released.
+        gate.wait();
+        let settled = Instant::now() + Duration::from_secs(1);
+        while pool.parked() < BURST && Instant::now() < settled {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            pool.parked(),
+            BURST,
+            "each worker a burst borrowed parks where the next claim looks"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pool.parked() > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for wait in waits {
+            wait.recv_timeout(RELAY_JOIN)
+                .expect("every direction of the burst reported that it ended")
+                .expect("and none of them ended by panicking on an assert of its own");
+        }
+        assert_eq!(
+            pool.parked(),
+            0,
+            "the threads a finished burst borrowed came back to the process"
+        );
+    }
+
+    /// A claim can reach a worker that handed back in the moment between the pop and the send; the direction it holds has to reach the thread that replaces the gone worker, not die with the rejected send.
+    #[test]
+    fn a_claim_that_reaches_a_gone_worker_keeps_its_direction() {
+        let pool = RelayPool::with_life(Duration::from_millis(50));
+        let (gone_tx, gone_rx) = std::sync::mpsc::channel::<RelayTask>();
+        drop(gone_rx);
+        pool.idle.lock().expect("locks").push((7, gone_tx));
+        let ran = Arc::new(AtomicBool::new(false));
+        let named = Arc::clone(&ran);
+        let did = pool.run(move || {
+            named.store(true, Ordering::SeqCst);
+        });
+        did.recv_timeout(RELAY_JOIN)
+            .expect("the direction of a claim that missed its worker still hands back")
+            .expect("and the direction it carried ran to its end");
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "and it ran on the thread spawned for it"
+        );
+    }
+
+    #[test]
+    fn a_direction_that_panics_does_not_take_the_worker_with_it() {
+        let pool = RelayPool::global();
+        pool.run(|| panic!("this direction is broken on purpose"))
+            .recv_timeout(RELAY_JOIN)
+            .expect(
+                "a panicking direction still has to report that it ended, or the relay \
+             waits on it forever",
+            )
+            .expect_err(
+                "and the report says it panicked, so a joiner is not told the leg finished",
+            );
+        let (tx, rx) = std::sync::mpsc::channel();
+        pool.run(move || {
+            let _ = tx.send(());
+        })
+        .recv_timeout(RELAY_JOIN)
+        .expect("the pool still works, so a hand-back arrived")
+        .expect("and a direction that ran is reported as clean");
+        assert!(rx.try_recv().is_ok(), "and the work after it actually ran");
+    }
+
+    /// A leg whose partner never reports has to be given up on inside the budget, not waited out: the parked arm is the one that used to hold a thread forever.
+    #[test]
+    fn a_leg_that_never_hands_back_is_given_up_on_instead_of_waited_out() {
+        let (_never, held) = std::sync::mpsc::channel::<Result<(), ()>>();
+        let started = std::time::Instant::now();
+        assert!(
+            !join_within(&held, Duration::from_millis(50)),
+            "a partner that never reports is a give-up, not a park"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "and it gives up promptly"
+        );
+
+        let (ended_tx, ended_rx) = std::sync::mpsc::channel();
+        ended_tx.send(Ok(())).expect("the hand-back is sent");
+        assert!(
+            join_within(&ended_rx, RELAY_JOIN),
+            "a hand-back is a hand-back"
+        );
+        let (gone_tx, gone_rx) = std::sync::mpsc::channel::<Result<(), ()>>();
+        drop(gone_tx);
+        assert!(
+            join_within(&gone_rx, RELAY_JOIN),
+            "a partner that died counts as finished, exactly as the unbounded wait read it"
+        );
+    }
+
+    /// The budget a leg waits on is the one the config named: the hand-back arrives past a named millisecond and inside the two-minute constant, so the verdict says which value the site read.
+    #[test]
+    fn a_named_join_budget_is_the_bound_a_parked_leg_gives_up_on() {
+        let root = crate::json::parse(r#"{"budgets": {"relayJoin": "1ms"}}"#).expect("parses");
+        budgets::apply(&crate::config::budgets(&root).expect("a budget the engine acts on"));
+        let handed_back_later = || {
+            let (tx, rx) = std::sync::mpsc::channel::<Result<(), ()>>();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(40));
+                let _ = tx.send(Ok(()));
+            });
+            rx
+        };
+        let gave_up = !join(&handed_back_later());
+        // Restored before the assertion, so a leg another test is joining never reads this table.
+        budgets::clear();
+        assert!(
+            gave_up,
+            "the named 1ms gives the leg up instead of waiting the 40ms out"
+        );
+        assert!(
+            join(&handed_back_later()),
+            "with the constant armed again the same hand-back is joined"
+        );
+    }
+
+    /// A head that never arrives is given up on at its own budget, so a quiet peer costs one give-up and not a task waking once per poll forever.
+    #[test]
+    fn a_head_that_never_arrives_is_given_up_on_at_its_named_budget() {
+        struct Quiet;
+
+        impl Read for Quiet {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            }
+        }
+
+        let root = crate::json::parse(r#"{"budgets": {"headArrival": "150ms"}}"#).expect("parses");
+        let named = crate::config::budgets(&root)
+            .expect("a budget the engine acts on")
+            .head_arrival
+            .expect("named");
+        let started = Instant::now();
+        // The site's own shape: the value the config named is the value the read is armed with.
+        assert!(
+            read_exact_head(&mut Quiet, HEAD_LIMIT_TEST, named).is_none(),
+            "a head that never arrives is refused at its budget"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(100) && elapsed < Duration::from_secs(5),
+            "the read ran on the named 150ms, not the 20s constant, and took {elapsed:?}"
+        );
+    }
+
+    /// A server holding its answer behind the upload must not lose the head to the fixed arrival clock:
+    /// the pump's progress buys another budget, and silence after the last step still ends the read.
+    #[test]
+    fn an_upload_extends_the_head_wait() {
+        struct UploadingHead {
+            head: &'static [u8],
+            at: usize,
+            reads: usize,
+            progress: Arc<AtomicU64>,
+        }
+
+        impl Read for UploadingHead {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                if self.reads < 4 {
+                    self.progress.fetch_add(1, Ordering::Relaxed);
+                    thread::sleep(Duration::from_millis(60));
+                    return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+                }
+                let n = (self.head.len() - self.at).min(buf.len());
+                buf[..n].copy_from_slice(&self.head[self.at..self.at + n]);
+                self.at += n;
+                Ok(n)
+            }
+        }
+
+        let head = b"HTTP/1.1 200 OK\r\n\r\n";
+        let progress = Arc::new(AtomicU64::new(0));
+        let mut source = UploadingHead {
+            head,
+            at: 0,
+            reads: 0,
+            progress: Arc::clone(&progress),
+        };
+        let started = Instant::now();
+        let (got, at) = read_exact_head_deferred(
+            &mut source,
+            HEAD_LIMIT_TEST,
+            Duration::from_millis(150),
+            &progress,
+        )
+        .expect("upload progress extends the head budget");
+        assert_eq!(&got[..at], head);
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "the head outlived its first budget: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct ClosingSink {
+        state: Arc<Mutex<(bool, Vec<u8>)>>,
+    }
+
+    impl ClosingSink {
+        fn closed_empty(&self) -> bool {
+            let state = self.state.lock().expect("locks");
+            state.0 && state.1.is_empty()
+        }
+        fn accepted(&self) -> Vec<u8> {
+            self.state.lock().expect("locks").1.clone()
+        }
+    }
+
+    impl CarrierSink for ClosingSink {
+        fn send(&self, bytes: &[u8]) -> bool {
+            let mut state = self.state.lock().expect("locks");
+            if state.0 {
+                return false;
+            }
+            state.1.extend_from_slice(bytes);
+            true
+        }
+        fn close(&self) {
+            self.state.lock().expect("locks").0 = true;
+        }
+    }
+
+    /// A peer that ends its upload must still take every window the download lane has already parsed.
+    #[test]
+    fn a_half_closed_peer_still_takes_the_retained_window() {
+        struct TwoWindows {
+            stage: u8,
+            flow: Arc<Mutex<Option<Arc<RelayFinish>>>>,
+        }
+
+        impl Read for TwoWindows {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Ok(0)
+            }
+        }
+
+        impl WindowRead for TwoWindows {
+            fn read_window(&mut self) -> std::io::Result<Window<'_>> {
+                match self.stage {
+                    0 => {
+                        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                        while self.flow.lock().expect("flow").is_none() {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "the relay flow was registered"
+                            );
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        self.stage = 1;
+                        Ok(Window::one(b"first"))
+                    }
+                    1 => {
+                        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                        let flow = {
+                            let slot = self.flow.lock().expect("flow");
+                            Arc::clone(slot.as_ref().expect("flow registered"))
+                        };
+                        while flow.left.load(Ordering::Acquire) == 2 {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "the upload lane ended before the download lane read again"
+                            );
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        self.stage = 2;
+                        Ok(Window::one(b"second"))
+                    }
+                    _ => Ok(Window::one(b"")),
+                }
+            }
+        }
+
+        let peer = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let peer_port = peer.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = peer.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            stream.shutdown(Shutdown::Write).expect("half closes");
+            let mut got = [0u8; 11];
+            stream.read_exact(&mut got).expect("reads both windows");
+            got.to_vec()
+        });
+        let connection = Connection::connect(("127.0.0.1", peer_port)).expect("dials");
+        let sink = ClosingSink::default();
+        let registered = Arc::new(Mutex::new(None));
+        let flow = relay_ordered::<TwoWindows, ClosingSink, _, _, CLOSE_BEFORE_JOIN, false>(
+            TwoWindows {
+                stage: 0,
+                flow: Arc::clone(&registered),
+            },
+            &sink,
+            &connection,
+            |_| {},
+            |_| false,
+        )
+        .expect("relay");
+        *registered.lock().expect("flow") = Some(Arc::clone(&flow));
+        flow.wait();
+        assert_eq!(
+            server.join().expect("joins"),
+            b"firstsecond",
+            "the retained window reached the half-closed peer"
+        );
+    }
+
+    fn relay_against_a_late_peer(drain: bool) -> (bool, Vec<u8>) {
+        let peer = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let peer_port = peer.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = peer.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .expect("timeout");
+            let mut request = Vec::new();
+            let _ = stream.read_to_end(&mut request);
+            assert_eq!(&request, b"request", "the peer saw the whole request");
+            stream.write_all(b"reply").expect("writes");
+            std::thread::sleep(Duration::from_millis(300));
+        });
+
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let sink = ClosingSink::default();
+        let carrier = thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            let uplink = Connection::connect(("127.0.0.1", peer_port)).expect("dials");
+            let sink = sink.clone();
+            let flow = if drain {
+                relay_sink_drained(stream, &sink, &uplink)
+            } else {
+                relay_sink(stream, &sink, &uplink, |_| {})
+            };
+            if let Some(flow) = flow {
+                flow.wait();
+            }
+            sink
+        });
+        let client = thread::spawn(move || {
+            let stream = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+            let mut writer = stream.try_clone().expect("clones");
+            writer.write_all(b"request").expect("writes");
+            writer.shutdown(Shutdown::Write).expect("half closes");
+            drop(stream);
+        });
+        let sink = carrier.join().expect("joins");
+        client.join().expect("joins");
+        server.join().expect("joins");
+        (sink.closed_empty(), sink.accepted())
+    }
+
+    #[test]
+    fn the_drained_order_lets_the_last_reply_reach_the_sink() {
+        let (closed_empty, accepted) = relay_against_a_late_peer(true);
+        assert_eq!(
+            accepted, b"reply",
+            "the reply the peer sent after its FIN must reach the sink before the close"
+        );
+        assert!(
+            !closed_empty,
+            "the sink must close after the reply, not before it"
+        );
+    }
+
+    #[test]
+    fn the_default_order_refuses_a_reply_that_follows_the_fin() {
+        let (closed_empty, accepted) = relay_against_a_late_peer(false);
+        assert!(
+            closed_empty || accepted.is_empty(),
+            "a sink that closed before the reply must not accept it"
+        );
+    }
+
+    /// A gRPC request that ends normally still needs its target write half closed: a target that
+    /// answers only after EOF must not wait out the response lane.
+    #[test]
+    fn a_grpc_request_half_close_reaches_a_target_that_waits_for_eof() {
+        let target = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let target_port = target.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = target.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("timeout");
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).expect("reads the request");
+            assert_eq!(request, b"request");
+            stream.write_all(b"reply").expect("writes");
+            let _ = stream.shutdown(Shutdown::Write);
+        });
+
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let carrier = thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            let (mut reader, writer) =
+                crate::grpc::accept(stream, "/TunnelService/Tun").expect("serves");
+            reader.set_poll(Some(RELAY_POLL));
+            let uplink = Connection::connect(("127.0.0.1", target_port)).expect("dials");
+            let flow = relay_sink_window_with(
+                reader,
+                &writer,
+                &uplink,
+                crate::grpc::mark_reader_dead,
+                |reader| crate::grpc::request_ended(reader),
+            );
+            if let Some(flow) = flow {
+                flow.wait();
+            }
+            let _ = done_tx.send(());
+        });
+        let client = thread::spawn(move || {
+            let stream = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+            let (mut reader, writer) =
+                crate::grpc::connect(stream, "127.0.0.1", "/TunnelService/Tun").expect("dials");
+            assert!(writer.send(b"request"));
+            writer.close();
+            let mut reply = [0u8; 5];
+            reader.read_exact(&mut reply).expect("reads the reply");
+            assert_eq!(&reply, b"reply");
+            // Keep the client socket open past the request end, so the relay's reader polls for control frames rather than seeing EOF.
+            thread::sleep(Duration::from_millis(300));
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the relay finished: the target saw the request half-close");
+        client.join().expect("joins");
+        server.join().expect("joins");
+        carrier.join().expect("joins");
+    }
+
+    /// A target response half-close must not end the request lane: a client that keeps uploading
+    /// after the reply reaches the target instead of being marked dead.
+    #[test]
+    fn a_target_response_half_close_keeps_the_request_lane_open() {
+        let target = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let target_port = target.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = target.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("timeout");
+            let mut first = [0u8; 7];
+            stream.read_exact(&mut first).expect("reads the request");
+            assert_eq!(&first, b"request");
+            stream.write_all(b"reply").expect("writes");
+            let _ = stream.shutdown(Shutdown::Write);
+            let mut rest = Vec::new();
+            stream.read_to_end(&mut rest).expect("reads the rest");
+            assert_eq!(rest, b"more", "the request lane stopped after the reply");
+        });
+
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let carrier = thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            let (mut reader, writer) =
+                crate::grpc::accept(stream, "/TunnelService/Tun").expect("serves");
+            reader.set_poll(Some(RELAY_POLL));
+            let uplink = Connection::connect(("127.0.0.1", target_port)).expect("dials");
+            let flow = relay_sink_window_with(
+                reader,
+                &writer,
+                &uplink,
+                crate::grpc::mark_reader_dead,
+                |reader| crate::grpc::request_ended(reader),
+            );
+            if let Some(flow) = flow {
+                flow.wait();
+            }
+            let _ = done_tx.send(());
+        });
+        let client = thread::spawn(move || {
+            let stream = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+            let (mut reader, writer) =
+                crate::grpc::connect(stream, "127.0.0.1", "/TunnelService/Tun").expect("dials");
+            assert!(writer.send(b"request"));
+            let mut reply = [0u8; 5];
+            reader.read_exact(&mut reply).expect("reads the reply");
+            assert_eq!(&reply, b"reply");
+            // Past the response lane's idle interval, the request lane must still take bytes.
+            thread::sleep(Duration::from_millis(1_500));
+            // The relay writes the response end the moment the target half-closes, so that frame is owed here: a socket closed with received bytes unread answers with a reset, and the reset eats the request window still behind it. Draining is what a client does, and the grace is the wait's own bound.
+            reader.set_poll(Some(RELAY_POLL));
+            reader.set_handshake_budget(Some(Instant::now() + SINK_GRACE));
+            let _ = reader.read_to_end(&mut Vec::new());
+            assert!(
+                crate::grpc::request_ended(&reader),
+                "the response end was not drained before the close"
+            );
+            assert!(writer.send(b"more"), "the request lane was closed early");
+            writer.close();
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the relay finished: the request lane stayed open after the reply");
+        client.join().expect("joins");
+        server.join().expect("joins");
+        carrier.join().expect("joins");
+    }
+
+    /// A carrier that answers `Parked` keeps the window for the next lane turn: the relay must retry those bytes, not end the flow or move on to the next read.
+    #[test]
+    fn a_parked_window_is_retried_instead_of_ending_the_flow() {
+        #[derive(Clone, Default)]
+        struct ParkingSink {
+            state: Arc<Mutex<(usize, Vec<u8>)>>,
+            parks: Arc<std::sync::atomic::AtomicUsize>,
+            parked_at: Arc<Mutex<Vec<std::time::Instant>>>,
+        }
+
+        impl CarrierSink for ParkingSink {
+            fn send(&self, _: &[u8]) -> bool {
+                false
+            }
+            fn push(&self, bytes: &[u8]) -> Push {
+                let mut state = self.state.lock().expect("state");
+                if state.0 > 0 {
+                    state.0 -= 1;
+                    self.parks.fetch_add(1, Ordering::SeqCst);
+                    self.parked_at
+                        .lock()
+                        .expect("parked at")
+                        .push(std::time::Instant::now());
+                    return Push::Parked;
+                }
+                state.1.extend_from_slice(bytes);
+                Push::Took(bytes.len())
+            }
+            fn close(&self) {}
+        }
+
+        let peer = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let peer_port = peer.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = peer.accept().expect("accepts");
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).expect("reads the request");
+            assert_eq!(request, b"request");
+            stream.write_all(b"reply").expect("writes the reply");
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let sink = ParkingSink {
+            state: Arc::new(Mutex::new((2, Vec::new()))),
+            parks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            parked_at: Arc::new(Mutex::new(Vec::new())),
+        };
+        let carrier = {
+            let sink = sink.clone();
+            thread::spawn(move || {
+                let (stream, _) = front.accept().expect("accepts");
+                let uplink = Connection::connect(("127.0.0.1", peer_port)).expect("dials");
+                if let Some(flow) = relay_sink_drained(stream, &sink, &uplink) {
+                    flow.wait();
+                }
+                sink
+            })
+        };
+        let client = thread::spawn(move || {
+            let stream = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+            let mut writer = stream.try_clone().expect("clones");
+            writer.write_all(b"request").expect("writes");
+            writer.shutdown(Shutdown::Write).expect("half closes");
+            drop(stream);
+        });
+        let sink = carrier.join().expect("joins");
+        client.join().expect("joins");
+        server.join().expect("joins");
+        assert_eq!(
+            sink.state.lock().expect("state").1,
+            b"reply",
+            "the parked window reached the sink whole"
+        );
+        assert_eq!(
+            sink.parks.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "both refusals parked and the third attempt took the window"
+        );
+    }
+
+    /// A full window takes the leg's next turn at once, since the frame that grants it is another lane's; only a peer that grants nothing across a whole burst of turns is waited out.
+    #[test]
+    fn a_parked_window_takes_the_next_turn_and_backs_off_after_a_burst() {
+        #[derive(Clone)]
+        struct Sink {
+            refusals: std::cell::Cell<usize>,
+        }
+
+        impl CarrierSink for Sink {
+            fn send(&self, _: &[u8]) -> bool {
+                false
+            }
+            fn push(&self, bytes: &[u8]) -> Push {
+                if self.refusals.get() > 0 {
+                    self.refusals.set(self.refusals.get() - 1);
+                    return Push::Parked;
+                }
+                Push::Took(bytes.len())
+            }
+            fn close(&self) {}
+        }
+
+        let mut buffer = RelayBuf::new();
+        buffer.as_mut()[..8].copy_from_slice(b"abcdefgh");
+        let _ = buffer.filled(8);
+        let mut at = Forward::new();
+        at.pending = 8;
+
+        let once = Sink {
+            refusals: std::cell::Cell::new(1),
+        };
+        assert_eq!(forward_flush(&buffer, &once, &mut at), Some(Next::Retry));
+        assert_eq!(at.spins, 1, "the refusal took the next turn");
+        assert_eq!(at.sent, 0);
+        assert_eq!(forward_flush(&buffer, &once, &mut at), None);
+        assert_eq!(at.spins, 0, "the granted window cleared the streak");
+        assert_eq!(at.sent, 0);
+        assert_eq!(at.pending, 0);
+
+        let mut at = Forward::new();
+        at.pending = 8;
+        let never = Sink {
+            refusals: std::cell::Cell::new(usize::MAX),
+        };
+        for turn in 1..RELAY_SPINS {
+            assert_eq!(forward_flush(&buffer, &never, &mut at), Some(Next::Retry));
+            assert_eq!(at.spins, turn);
+        }
+        let began = std::time::Instant::now();
+        assert_eq!(forward_flush(&buffer, &never, &mut at), Some(Next::Retry));
+        assert_eq!(at.spins, 0, "the burst's end waits out a quantum");
+        assert!(
+            began.elapsed() >= crate::budgets::RELAY_POLL,
+            "the backoff turn slept its quantum"
+        );
+    }
+
+    /// A carrier whose body waits in a queue parks its relay lane on a poll timeout, because the demux
+    /// that owes it the bytes wakes the slot; a socket carrier keeps taking turns for the sibling's grant.
+    #[test]
+    fn a_queued_carrier_timeout_parks_its_lane() {
+        #[derive(Clone)]
+        struct Queue {
+            reads: Arc<std::sync::atomic::AtomicUsize>,
+            ended: Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        impl Read for Queue {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                if self.ended.load(Ordering::Relaxed) {
+                    return Ok(0);
+                }
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            }
+        }
+
+        #[derive(Clone)]
+        struct Take;
+
+        impl CarrierSink for Take {
+            fn send(&self, _: &[u8]) -> bool {
+                true
+            }
+            fn close(&self) {}
+        }
+
+        fn turns(queued: bool) -> usize {
+            let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let address = listener.local_addr().expect("addr");
+            let client = Connection::connect(address).expect("connects");
+            let (peer, _) = listener.accept().expect("accepts");
+            let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let queue = Queue {
+                reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                ended: Arc::clone(&ended),
+            };
+            let reads = Arc::clone(&queue.reads);
+            let sink = Take;
+            let flow = if queued {
+                relay_sink_drained_queued(queue, &sink, &peer, |_| {}, |_| false)
+            } else {
+                relay_sink_drained_with(queue, &sink, &peer, |_| {}, |_| false)
+            }
+            .expect("the relay starts");
+            let progress = if queued { 1 } else { 1000 };
+            let until = std::time::Instant::now() + Duration::from_secs(5);
+            while reads.load(Ordering::Relaxed) < progress && std::time::Instant::now() < until {
+                thread::sleep(Duration::from_millis(1));
+            }
+            thread::sleep(Duration::from_millis(300));
+            let turns = reads.load(Ordering::Relaxed);
+            ended.store(true, Ordering::Relaxed);
+            let _ = client.shutdown(Shutdown::Both);
+            wait_for_flow(&flow, Duration::from_secs(5), "the carrier relay");
+            turns
+        }
+
+        let queued = turns(true);
+        let socket = turns(false);
+        assert!(queued >= 1, "the queued reader never started");
+        assert!(
+            queued <= 64,
+            "a queued timeout parked, yet its reader took {queued} turns"
+        );
+        assert!(
+            socket >= 1000,
+            "a socket carrier kept its turns, yet its reader took {socket}"
+        );
+    }
+
+    /// The queue's timeout belongs to the queue, not to the socket its inner read left a hint for: a
+    /// lane that parked on that hint woke on every readable event the demux already owns.
+    #[test]
+    fn a_parked_queue_read_drops_the_socket_hint() {
+        struct Noted;
+
+        impl Read for Noted {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                let fd: WaitFd = 7;
+                note_wait_fd(fd);
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            }
+        }
+
+        let _step = RelayStep::enter();
+        let mut queued = Copied::with_park(Noted, true);
+        assert!(
+            queued.read_window().is_err(),
+            "the queue answers WouldBlock"
+        );
+        assert_eq!(take_wait_fd(), None, "a queued park owns no socket");
+
+        let mut socket = Copied::with_park(Noted, false);
+        assert!(socket.read_window().is_err());
+        let fd: WaitFd = 7;
+        assert_eq!(
+            take_wait_fd(),
+            Some(fd),
+            "a socket carrier parks on its descriptor"
+        );
+    }
+
+    /// A full carrier parks the lane on the socket's writability instead of spending a worker in the
+    /// send clock: the offer returns at once and names the descriptor the reactor must watch.
+    #[cfg(unix)]
+    #[test]
+    fn a_full_carrier_parks_the_lane_instead_of_the_worker() {
+        use std::os::unix::io::AsRawFd;
+        use std::time::{Duration, Instant};
+
+        let (server_stream, client_stream) = std::os::unix::net::UnixStream::pair().expect("pairs");
+        small_buffer(server_stream.as_raw_fd(), libc::SO_SNDBUF);
+        small_buffer(client_stream.as_raw_fd(), libc::SO_RCVBUF);
+        let server = std::thread::spawn(move || {
+            crate::ws::accept(
+                crate::conn::Connection::Unix(server_stream.into()),
+                "/frame",
+            )
+            .expect("upgrades")
+        });
+        let (client, _client_writer) = crate::ws::connect(
+            crate::conn::Connection::Unix(client_stream.into()),
+            "127.0.0.1",
+            "/frame",
+            0,
+            b"",
+            &[],
+            0,
+        )
+        .expect("upgrades");
+        let (_reader, writer) = server.join().expect("joins");
+
+        let chunk = vec![7u8; 1024];
+        let mut filled = 0usize;
+        loop {
+            match writer.push_ready(&chunk) {
+                Push::Took(n) if n > 0 => filled += n,
+                Push::Parked => break,
+                _ => panic!("the carrier ended while filling"),
+            }
+            assert!(filled < 256 * 1024 * 1024, "the socket never filled");
+        }
+
+        let mut buffer = RelayBuf::with_len(1024);
+        buffer.as_mut().fill(1);
+        let mut at = Forward::new();
+        at.pending = 1024;
+        let step = crate::proxy::RelayStep::enter();
+        let began = Instant::now();
+        let next = forward_flush(&buffer, &writer, &mut at);
+        let waited = began.elapsed();
+        assert_eq!(next, Some(Next::Idle), "a full socket held the lane");
+        assert!(
+            waited < Duration::from_millis(100),
+            "the lane waited {waited:?} for a socket the reactor will wake it on"
+        );
+        assert!(
+            crate::proxy::write_wait_pending(),
+            "the lane parked without naming the descriptor it waits on"
+        );
+        drop(step);
+        // The peer drains only after the flush, so a slow fill cannot free the socket the assertion above needs full.
+        let drain = std::thread::spawn(move || {
+            use std::io::Read as _;
+            std::thread::sleep(Duration::from_millis(250));
+            let mut sink = [0u8; 8192];
+            let mut client = client;
+            client.set_poll(Some(Duration::from_secs(1)));
+            let _ = client.read(&mut sink);
+        });
+        let _ = drain.join();
+    }
+
+    /// A carrier that takes nothing for the stall budget ends the leg where it stands: the parked
+    /// lane must not outlive the write the blocking send used to time out.
+    #[cfg(unix)]
+    #[test]
+    fn a_stalled_write_ends_the_leg_at_the_stall_budget() {
+        #[derive(Clone)]
+        struct Stalled;
+        impl CarrierSink for Stalled {
+            fn send(&self, _: &[u8]) -> bool {
+                false
+            }
+            fn push_ready(&self, _: &[u8]) -> Push {
+                Push::Parked
+            }
+            fn close(&self) {}
+        }
+
+        crate::budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(Duration::from_millis(50)),
+            ..Default::default()
+        });
+        let mut buffer = RelayBuf::with_len(64 * 1024);
+        buffer.as_mut()[..64].fill(1);
+        let mut at = Forward::new();
+        at.pending = 64;
+        let step = crate::proxy::RelayStep::enter();
+        crate::proxy::note_wait_fd_write(1);
+        assert_eq!(
+            forward_flush(&buffer, &Stalled, &mut at),
+            Some(Next::Idle),
+            "a full socket held the lane"
+        );
+        assert!(
+            at.stopped.is_some(),
+            "a parked lane did not stamp the write it waits on"
+        );
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(
+            forward_flush(&buffer, &Stalled, &mut at),
+            Some(Next::Done),
+            "a write the peer never drained outlived the stall budget"
+        );
+        drop(step);
+        crate::budgets::clear();
+    }
+
+    #[test]
+    fn a_dial_that_cannot_connect_is_classified_not_dropped() {
+        let failure =
+            dial(&SocketAddr::from(([127, 0, 0, 1], 1))).expect_err("nothing listens on port 1");
+        assert_eq!(failure.stage, Stage::SocketConnected);
+        assert_eq!(
+            failure.kind,
+            Kind::Refused,
+            "a refused connect is observed, not inferred"
+        );
+        assert!(!failure.worth_retrying());
+    }
+
+    /// A refused chain is a refusal, not a dropped connection: while the backend folded the kind into `Other` this arm was unreachable, so an untrusted server reported as a peer that hung up and counted as a dial worth retrying.
+    #[test]
+    fn a_refused_chain_is_a_refusal_not_a_drop() {
+        let refused = ferrox_core::tls::TlsError::BadCertificate("UnknownIssuer".to_owned());
+        let failure = tls_failure(&refused);
+        assert_eq!(failure.stage, Stage::SocketConnected);
+        assert_eq!(failure.kind, Kind::Rejected, "{failure}");
+        assert!(
+            !failure.worth_retrying(),
+            "a chain this device does not trust is not a moment worth another dial"
+        );
+    }
+
+    #[test]
+    fn the_reporting_wrapper_counts_a_fatal_dial_and_returns_none() {
+        let target = SocketAddr::from(([127, 0, 0, 1], 1));
+        let refused = dial(&target).expect_err("nothing listens on port 1");
+        assert!(
+            !refused.worth_retrying(),
+            "a refused connect is not worth another dial"
+        );
+        let before = dial_failures();
+        assert!(dial_or_report(&target).is_none());
+        let after = dial_failures();
+        assert_eq!(after.fatal, before.fatal + 1, "a refused connect is fatal");
+    }
+
+    /// A `recv` returns what is queued, not what was asked, so a busy leg's reads can stay short for the life of a flow: it must promote once it has moved a whole window, or every read of a bulk transfer stays at 16 KiB.
+    #[test]
+    fn a_relay_buffer_promotes_once_a_whole_window_has_moved() {
+        let mut buffer = RelayBuf::new();
+        let short = RELAY_SMALL_BUFFER - 1;
+        let window = (RELAY_BUFFER - 1) / short;
+        for _ in 0..window {
+            assert_eq!(buffer.filled(short).len(), short);
+        }
+        assert_eq!(
+            buffer.size(),
+            RELAY_SMALL_BUFFER,
+            "{window} short reads moved {} bytes, one short of a relay window",
+            window * short
+        );
+
+        assert_eq!(buffer.filled(short).len(), short);
+        assert_eq!(
+            buffer.size(),
+            RELAY_BUFFER,
+            "the read that moved a whole window did not promote"
+        );
+
+        let mut small = RelayBuf::new();
+        assert_eq!(small.filled(1).len(), 1);
+        assert_eq!(
+            small.size(),
+            RELAY_SMALL_BUFFER,
+            "a one-byte flow paid for a relay window"
+        );
+    }
+
+    /// The carrier legs read the window `filled` promotes: while they sliced `as_mut()[..n]` a ws, xhttp or grpc flow relayed in 16 KiB pieces for its whole life, and a read that filled the window never paid off. A leg that moves a window of short reads is handed `RELAY_BUFFER` from then on, and its sends grow with it.
+    #[test]
+    fn a_carrier_leg_reads_the_window_it_promoted() {
+        struct Windowed {
+            left: usize,
+            asked: Arc<Mutex<Vec<usize>>>,
+        }
+        impl std::io::Read for Windowed {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.asked.lock().expect("locks").push(buf.len());
+                let n = buf.len().min(self.left).min(RELAY_SMALL_BUFFER / 4);
+                buf[..n].fill(0x5a);
+                self.left -= n;
+                Ok(n)
+            }
+        }
+        #[derive(Clone, Default)]
+        struct SizedSink {
+            sizes: Arc<Mutex<Vec<usize>>>,
+        }
+        impl CarrierSink for SizedSink {
+            fn send(&self, bytes: &[u8]) -> bool {
+                self.sizes.lock().expect("locks").push(bytes.len());
+                true
+            }
+            fn close(&self) {}
+        }
+
+        let peer = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let peer_port = peer.local_addr().expect("addr").port();
+        let source = thread::spawn(move || {
+            let (mut stream, _) = peer.accept().expect("accepts");
+            let payload = vec![0x5au8; RELAY_BUFFER * 8];
+            stream.write_all(&payload).expect("writes");
+            let _ = stream.shutdown(Shutdown::Write);
+            // Bounded: a relay that forgets its own close must fail this leg, not hang it.
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut back = Vec::new();
+            let _ = stream.read_to_end(&mut back);
+        });
+
+        let sink = SizedSink::default();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let reader = Windowed {
+            left: RELAY_BUFFER * 2,
+            asked: Arc::clone(&asked),
+        };
+        let uplink = Connection::connect(("127.0.0.1", peer_port)).expect("dials");
+        // Drained, not close-first: the upload leg finishing must not abort the peer's write before the forward leg has drained it.
+        let flow = relay_sink_drained(reader, &sink, &uplink);
+        drop(uplink);
+        source.join().expect("joins");
+        if let Some(flow) = flow {
+            flow.wait();
+        }
+
+        let asked = asked.lock().expect("locks").clone();
+        assert_eq!(
+            asked.first(),
+            Some(&RELAY_SMALL_BUFFER),
+            "a fresh leg starts at the small window: {asked:?}"
+        );
+        assert!(
+            asked.contains(&RELAY_BUFFER),
+            "the leg that moved a window was handed the promoted one: {asked:?}"
+        );
+        let sent = sink.sizes.lock().expect("locks").clone();
+        assert!(
+            sent.iter().any(|&len| len > RELAY_SMALL_BUFFER),
+            "a send carried more than the small window, so the carrier frames the promoted one: {sent:?}"
+        );
+    }
+
+    /// A session seals one record per window of plaintext, so a frame the promoted relay window produced is cut at the record rather than offered as a payload no session buffer holds — the shape a REALITY ws flow takes when its relay leg promotes.
+    #[test]
+    fn a_carrier_frame_is_offered_in_record_windows() {
+        let data = vec![0x5au8; RELAY_BUFFER];
+        let parts: [&[u8]; 3] = [b"\x00\x01", &data, b"\r\n"];
+        let mut windows: Vec<usize> = Vec::new();
+        let mut total = 0usize;
+        assert!(write_windows(&parts, |window| {
+            let bytes = window.iter().map(|part| part.len()).sum::<usize>();
+            windows.push(bytes);
+            total += bytes;
+            true
+        }));
+        assert_eq!(total, data.len() + 4, "every byte is offered once: {total}");
+        assert!(
+            windows.iter().all(|&bytes| bytes <= SESSION_WINDOW),
+            "no window is larger than a record: {windows:?}"
+        );
+        assert_eq!(
+            windows.len(),
+            total.div_ceil(SESSION_WINDOW),
+            "a frame larger than a record is cut at the record: {windows:?}"
+        );
+    }
+
+    #[test]
+    fn a_read_that_fills_the_window_promotes_it_at_once() {
+        let mut buffer = RelayBuf::new();
+        buffer.as_mut().fill(0xff);
+        assert_eq!(buffer.filled(RELAY_SMALL_BUFFER).len(), RELAY_SMALL_BUFFER);
+        assert_eq!(buffer.size(), RELAY_BUFFER, "a full read did not promote");
+
+        assert_eq!(buffer.filled(1).len(), 1);
+        assert_eq!(buffer.size(), RELAY_BUFFER);
+    }
+
+    /// A carrier that frames one message per read asks the relay for a window it can pay for; the
+    /// limit survives promotion, so a full read never offers past it.
+    #[test]
+    fn a_limited_relay_buffer_never_asks_past_its_limit() {
+        let limit = 65_471;
+        let mut buffer = RelayBuf::with_limit(limit);
+        assert_eq!(buffer.as_mut().len(), RELAY_SMALL_BUFFER);
+        buffer.as_mut().fill(0);
+        assert_eq!(buffer.filled(RELAY_SMALL_BUFFER).len(), RELAY_SMALL_BUFFER);
+        assert_eq!(buffer.size(), RELAY_BUFFER, "the pool still backs it");
+        assert_eq!(buffer.as_mut().len(), limit, "a full read is capped");
+        assert_eq!(
+            buffer.into_vec().len(),
+            limit,
+            "the handed-off buffer is capped"
+        );
+    }
+
+    /// A promoted limited buffer reads a full `64 KiB` source in two reads, `65_471` then `65`,
+    /// where the unlimited window reads it in one: the extra read is what keeps one message whole.
+    #[test]
+    fn a_limited_relay_buffer_reads_a_64kib_source_in_two() {
+        let mut buffer = RelayBuf::with_limit(65_471);
+        buffer.as_mut().fill(0);
+        let _ = buffer.filled(RELAY_SMALL_BUFFER);
+        let source = vec![7u8; RELAY_BUFFER];
+        let mut at = 0usize;
+        let mut reads = 0usize;
+        while at < source.len() {
+            let n = (&source[at..]).read(buffer.as_mut()).expect("reads");
+            assert!(n > 0, "the source ended before the window");
+            at += n;
+            reads += 1;
+            let _ = buffer.filled(n);
+        }
+        assert_eq!(at, RELAY_BUFFER);
+        assert_eq!(reads, 2);
+    }
+
+    #[test]
+    fn a_promoted_buffer_returns_the_bytes_that_were_read() {
+        let mut buffer = RelayBuf::new();
+        buffer.as_mut().fill(0);
+        buffer.as_mut()[..4].copy_from_slice(&[192, 0, 2, 1]);
+        let read = buffer.filled(RELAY_SMALL_BUFFER);
+        assert_eq!(&read[..4], &[192, 0, 2, 1], "promotion lost the bytes read");
+        assert_eq!(read.len(), RELAY_SMALL_BUFFER);
+    }
+
+    /// A clip past the reported prefix would ship bytes the read did not write; the buffer hands back only what it was told.
+    #[test]
+    fn the_relay_buffer_hands_back_only_what_its_read_reported() {
+        let source: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let mut buffer = RelayBuf::new();
+        let n = std::io::Cursor::new(source.clone())
+            .read(buffer.as_mut())
+            .expect("the cursor fills what it holds");
+        assert!(
+            n < RELAY_SMALL_BUFFER,
+            "a full buffer would promote, not clip"
+        );
+        let handed = buffer.filled(n).to_vec();
+        assert_eq!(handed, source[..n], "every byte handed back was read");
+    }
+
+    /// The handshake pump hands the carrier the buffer's own bytes, and a sub-buffer read holds that buffer steady — the allocation claim behind routing the pump through `RelayBuf` rather than a fresh zero-filled `Vec` per connection.
+    #[test]
+    fn the_pump_forwards_its_buffer_by_pointer_and_holds_capacity_steady() {
+        struct Quantum;
+        impl std::io::Read for Quantum {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = 1024usize.min(buf.len());
+                buf[..n].fill(0xa5);
+                Ok(n)
+            }
+        }
+        let mut reader = Quantum;
+        let mut buffer = RelayBuf::new();
+        let base = buffer.as_mut().as_ptr();
+        // One read under the promotion edge: the quantum that crosses `RELAY_BUFFER` moved promotes, and that is the cap's test, not this one.
+        let rounds = RELAY_BUFFER / 1024 - 1;
+        for round in 0..rounds as u32 {
+            let n = reader
+                .read(buffer.as_mut())
+                .expect("the quantum always answers");
+            let (handed, len) = {
+                let slice = buffer.filled(n);
+                (slice.as_ptr(), slice.len())
+            };
+            assert_eq!(
+                handed, base,
+                "round {round}: the pump forwards the buffer's own bytes, not a copy"
+            );
+            assert_eq!(len, n, "round {round}: only the bytes read escape");
+            assert_eq!(
+                buffer.as_mut().as_ptr(),
+                base,
+                "round {round}: a short read did not move the buffer"
+            );
+            assert_eq!(
+                buffer.size(),
+                RELAY_SMALL_BUFFER,
+                "round {round}: and did not grow it"
+            );
+        }
+    }
+
+    /// The promotion stops at the cap: one full read puts the buffer at `RELAY_BUFFER` and the cycles after it neither grow the allocation nor move the bytes — the RSS a duplex flow carries is the promotion times the legs that promote (`rss_mib`, `benchmark-matrix.yml`), so the bound is the resident claim, and the handoff's base pointer proves the slice handed on is the buffer's own allocation.
+    #[test]
+    fn the_window_promotes_to_the_cap_and_holds_it_over_push_and_drain() {
+        struct Whole;
+        impl std::io::Read for Whole {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                buf.fill(0x5a);
+                Ok(buf.len())
+            }
+        }
+        let mut reader = Whole;
+        let mut buffer = RelayBuf::new();
+        let first = reader.read(buffer.as_mut()).expect("answers");
+        let base = buffer.filled(first).as_ptr();
+        assert_eq!(
+            buffer.size(),
+            RELAY_BUFFER,
+            "a full window promoted past the cap"
+        );
+        assert_eq!(
+            buffer.capacity(),
+            RELAY_BUFFER,
+            "the promotion paid more than the cap"
+        );
+        // 16 promoted windows of an 8-flow duplex cell: 64 KiB × 16 = 1 MiB where 256 KiB × 16 was 4 MiB — the delta the issue's `rss_mib` table reads.
+        assert_eq!(
+            RELAY_BUFFER,
+            64 * 1024,
+            "the promoted windows are the RSS a duplex flow pays, times the legs that promote"
+        );
+        for round in 0..32u32 {
+            let n = reader
+                .read(buffer.as_mut())
+                .expect("the whole window always answers");
+            let handed = buffer.filled(n).as_ptr();
+            let cap = buffer.capacity();
+            assert_eq!(
+                handed, base,
+                "round {round}: the drain handed bytes from another allocation"
+            );
+            assert!(
+                base >= buffer.as_mut().as_ptr()
+                    && base < buffer.as_mut().as_ptr().wrapping_add(buffer.capacity()),
+                "round {round}: the handed slice left the buffer's allocation"
+            );
+            assert_eq!(
+                cap, RELAY_BUFFER,
+                "round {round}: a push/drain cycle grew the window"
+            );
+            assert_eq!(buffer.size(), RELAY_BUFFER, "round {round}: size moved");
+        }
+    }
+
+    /// The relay legs hand `read` a window that has left the type (`RelayBuf::with_len(n).into_vec()`): the claim this witnesses is that leaving did not shrink the quantum — the same `len` and headroom the zero-filled `vec![0u8; n]` carried — so the read still covers the whole window and never reallocs, and only the prefix a read reports escapes.
+    #[test]
+    fn a_relay_leg_window_keeps_its_quantum_after_leaving_the_buffer() {
+        for window in [RELAY_SMALL_BUFFER, 32 * 1024] {
+            let mut buf = RelayBuf::with_len(window).into_vec();
+            assert_eq!(buf.len(), window, "the read window keeps its full quantum");
+            let base = buf.as_ptr();
+            let headroom = buf.capacity();
+            assert!(
+                headroom >= window,
+                "the window was shrunk below its quantum"
+            );
+            // A sub-window read overwrites from index 0; nothing past the reported prefix is ever read back.
+            let source: Vec<u8> = (0..1024u32).map(|i| (i % 251) as u8).collect();
+            let n = std::io::Cursor::new(source.clone())
+                .read(&mut buf)
+                .expect("the cursor fills what it holds");
+            assert_eq!(n, source.len(), "a short read reports its own length");
+            assert_eq!(
+                &buf[..n],
+                &source[..],
+                "every byte below the prefix was read"
+            );
+            assert_eq!(buf.as_ptr(), base, "a read did not move the window");
+            assert_eq!(
+                buf.capacity(),
+                headroom,
+                "a read did not realloc the window"
+            );
+        }
+    }
+
+    /// The reference's ARM policy default is a 4 KiB buffer, but a sealed relay must not emit a
+    /// 4 KiB record: the peer then wakes twice per 8 KiB of payload. The floor is one small window.
+    #[test]
+    fn a_sealed_relay_reads_at_least_one_record() {
+        for buffer in [None, Some(0), Some(4096), Some(8192)] {
+            assert_eq!(
+                sealed_window(buffer),
+                RELAY_SMALL_BUFFER,
+                "a {buffer:?}-byte policy buffer must not cut the seal below a record"
+            );
+        }
+        assert_eq!(sealed_window(Some(32 * 1024)), 32 * 1024);
+        assert_eq!(sealed_window(Some(usize::MAX)), RELAY_BUFFER);
+    }
+
+    /// A finished flow hands its window back: the next flow takes the same zeroed allocation from the local pool, and the promotion draws from the large pool rather than paying a fresh zeroing pass. The gate is the allocator's own zeroed-allocation count rather than a timing.
+    #[test]
+    fn a_reused_relay_window_is_not_zeroed() {
+        drop(RelayBuf::with_len(RELAY_SMALL_BUFFER));
+        drop(RelayBuf::with_len(RELAY_SMALL_BUFFER));
+        let (_, counts) =
+            ferrox_core::alloc_count::measure(|| RelayBuf::with_len(RELAY_SMALL_BUFFER));
+        assert_eq!(
+            counts.zeroed, 0,
+            "the reused small window is zeroed: {counts:?}"
+        );
+
+        drop(RelayBuf::with_len(RELAY_BUFFER));
+        let mut buffer = RelayBuf::new();
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            let _ = buffer.filled(RELAY_SMALL_BUFFER);
+        });
+        assert_eq!(counts.zeroed, 0, "the promotion is zeroed: {counts:?}");
+        assert_eq!(buffer.size(), RELAY_BUFFER, "the promotion kept its window");
+    }
+
+    /// A park hands the window back and the next step takes one again: the parked direction holds no
+    /// bytes, and the reacquired window is the same allocation at the same capacity.
+    #[test]
+    fn a_parked_relay_window_holds_no_bytes() {
+        let mut buffer = RelayBuf::with_len(RELAY_BUFFER);
+        let base = buffer.as_mut().as_ptr();
+        let capacity = buffer.capacity();
+        buffer.release();
+        assert_eq!(buffer.held(), 0, "a parked lane kept its window");
+        let again = buffer.as_mut().as_ptr();
+        assert_eq!(buffer.held(), RELAY_BUFFER, "the next step got no window");
+        assert_eq!(
+            buffer.capacity(),
+            capacity,
+            "the reacquired window reallocated"
+        );
+        assert_eq!(again, base, "the reacquired window is a new allocation");
+    }
+
+    /// A window between the quanta is exactly what its flow asked for: the pool keeps a 16 KiB flow at 16 KiB rather than handing it a 64 KiB allocation it may never fill.
+    #[test]
+    fn an_unpooled_window_stays_the_size_it_asked_for() {
+        let buffer = RelayBuf::with_len(32 * 1024).into_vec();
+        assert_eq!(buffer.capacity(), 32 * 1024, "the flow paid for 64 KiB");
+    }
+
+    #[test]
+    fn the_relay_moves_a_payload_larger_than_its_copy_buffer() {
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = vec![0u8; RELAY_BUFFER];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        if stream.write_all(&buf[..n]).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            let Ok(uplink) = Connection::connect(("127.0.0.1", echo_port)) else {
+                return;
+            };
+            relay(&stream, &uplink);
+        });
+
+        let payload: Vec<u8> = (0..(3 * RELAY_BUFFER + 7))
+            .map(|i| (i % 253) as u8)
+            .collect();
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let sent = client.try_clone().expect("clones");
+        let outbound = payload.clone();
+        let reader = thread::spawn(move || {
+            let mut sent = sent;
+            sent.write_all(&outbound).expect("writes");
+            sent.shutdown(Shutdown::Write).expect("half closes");
+        });
+        let mut back = vec![0u8; payload.len()];
+        client.read_exact(&mut back).expect("reads");
+        reader.join().expect("sender finishes");
+        assert_eq!(back, payload, "the relay must move every byte, in order");
+    }
+
+    #[test]
+    fn trojan_relay_round_trips_and_refuses_strangers() {
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = echo.accept().expect("accepts");
+            relay(&stream, &stream);
+        });
+        let server = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = server.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            for stream in server.incoming().take(2) {
+                let Ok(stream) = stream else { continue };
+                thread::spawn(move || {
+                    serve_trojan_raw(stream, &[trojan_key("an-example-shared-password")], true);
+                });
+            }
+        });
+        let mut good = Connection::connect(("127.0.0.1", port)).expect("connects");
+        let mut header = Vec::new();
+        header.extend_from_slice(&trojan_key("an-example-shared-password"));
+        header.extend_from_slice(b"\r\n\x01\x01\x7f\x00\x00\x01");
+        header.extend_from_slice(&echo_port.to_be_bytes());
+        header.extend_from_slice(b"\r\n");
+        good.write_all(&header).expect("writes");
+        good.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        good.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        let mut bad = Connection::connect(("127.0.0.1", port)).expect("connects");
+        bad.write_all(&[0u8; 64]).expect("writes");
+        let mut closed = [0u8; 1];
+        assert!(bad.read(&mut closed).is_err() || closed == [0]);
+        drop(good);
+        drop(bad);
+    }
+
+    #[test]
+    fn the_trojan_header_costs_two_reads_not_seven() {
+        struct Counting<'a> {
+            at: usize,
+            wire: &'a [u8],
+            reads: usize,
+        }
+        impl Read for Counting<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                let left = self.wire.len() - self.at;
+                if left == 0 {
+                    return Ok(0);
+                }
+                let n = left.min(buf.len());
+                buf[..n].copy_from_slice(&self.wire[self.at..self.at + n]);
+                self.at += n;
+                Ok(n)
+            }
+        }
+
+        let key = trojan_key("an-example-shared-password");
+        for (addr, reads) in [
+            (b"\x01\x7f\x00\x00\x01\x1f\x90".to_vec(), 2usize),
+            (
+                [4u8]
+                    .into_iter()
+                    .chain([0u8; 15])
+                    .chain([1u8, 0x1f, 0x90])
+                    .collect::<Vec<u8>>(),
+                2,
+            ),
+            (b"\x03\x09127.0.0.1\x1f\x90".to_vec(), 3),
+        ] {
+            let mut wire = key.to_vec();
+            wire.extend_from_slice(b"\r\n\x01");
+            wire.extend_from_slice(&addr);
+            wire.extend_from_slice(b"\r\n");
+            let mut reader = Counting {
+                at: 0,
+                wire: &wire,
+                reads: 0,
+            };
+            let (cmd, _) = decode_trojan_request(&mut reader, &[key])
+                .unwrap_or_else(|| panic!("decodes {addr:?}"));
+            assert_eq!(cmd, 1, "{addr:?}");
+            assert_eq!(reader.reads, reads, "{addr:?}");
+        }
+    }
+
+    #[test]
+    fn the_trojan_ipv4_reader_matches_the_standard_parser() {
+        for text in [
+            "0.0.0.0",
+            "127.0.0.1",
+            "255.255.255.255",
+            "192.0.2.1",
+            "10.20.30.40",
+            "192.0.2.256",
+            "192.0.2.1000",
+            "192.0.2.04",
+            "0.0.0.01",
+            "192.0.2",
+            "192.0.2.1.5",
+            "192..0.2",
+            "192.0.2.",
+            ".192.0.2",
+            "",
+            " 192.0.2.1",
+            "192.0.2.1 ",
+            "192.0.2.1\n",
+            "192.0.2.a",
+            "192.0.2.-1",
+            "192.0.2.1a",
+        ] {
+            assert_eq!(
+                trojan_ipv4(text.as_bytes()),
+                text.parse::<std::net::Ipv4Addr>().ok(),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_trojan_numeric_domain_header_allocates_nothing() {
+        let key = trojan_key("an-example-shared-password");
+        let numeric = b"\x03\x09127.0.0.1\x1f\x90";
+        let mut wire = key.to_vec();
+        wire.extend_from_slice(b"\r\n\x01");
+        wire.extend_from_slice(numeric);
+        wire.extend_from_slice(b"\r\n");
+        let (decoded, counts) = ferrox_core::alloc_count::measure(|| {
+            decode_trojan_request(&mut std::io::Cursor::new(wire), &[key])
+        });
+        assert!(decoded.is_some(), "the numeric domain header decodes");
+        assert_eq!(
+            counts.allocs, 0,
+            "a numeric domain is parsed, not walked through an allocating resolver iterator"
+        );
+    }
+
+    /// The server read is four for every address family and two for mux, down from five for an IP and six for a domain: the add-ons ride in with the command byte, and the port, family and the body's first byte share one read.
+    #[test]
+    fn the_vless_request_header_costs_four_reads_not_six() {
+        struct Counting<'a> {
+            at: usize,
+            wire: &'a [u8],
+            reads: usize,
+        }
+        impl Read for Counting<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                let n = (self.wire.len() - self.at).min(buf.len());
+                buf[..n].copy_from_slice(&self.wire[self.at..self.at + n]);
+                self.at += n;
+                Ok(n)
+            }
+        }
+        let id = [0x11u8; 16];
+        let header = |addons: &[u8], cmd: u8, tail: &[u8]| -> Vec<u8> {
+            let mut w = vec![0u8];
+            w.extend_from_slice(&id);
+            w.push(addons.len() as u8);
+            w.extend_from_slice(addons);
+            w.push(cmd);
+            w.extend_from_slice(tail);
+            w
+        };
+        let port = 80u16.to_be_bytes();
+        let cases = [
+            (
+                "ipv4",
+                header(&[], 1, &[port.as_slice(), &[1, 192, 0, 2, 53]].concat()),
+                4usize,
+            ),
+            (
+                "ipv6",
+                header(
+                    &[],
+                    1,
+                    &[
+                        port.as_slice(),
+                        &[3, 0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01],
+                    ]
+                    .concat(),
+                ),
+                4,
+            ),
+            (
+                "domain",
+                header(&[], 1, &[port.as_slice(), b"\x02\x09localhost"].concat()),
+                4,
+            ),
+            (
+                "addons",
+                header(
+                    b"\x0a\x00",
+                    1,
+                    &[port.as_slice(), &[1, 192, 0, 2, 53]].concat(),
+                ),
+                4,
+            ),
+        ];
+        for (label, wire, want) in cases {
+            let mut reader = Counting {
+                at: 0,
+                wire: &wire,
+                reads: 0,
+            };
+            let (got, _flow, cmd, _target) =
+                decode_request(&mut reader).unwrap_or_else(|| panic!("decodes {label}"));
+            assert_eq!((got, cmd), (id, 1), "{label}");
+            assert_eq!(reader.reads, want, "{label}");
+        }
+
+        let mux = header(&[], 3, &[]);
+        let mut reader = Counting {
+            at: 0,
+            wire: &mux,
+            reads: 0,
+        };
+        let (_, _, cmd, _) = decode_request(&mut reader).expect("decodes mux");
+        assert_eq!(cmd, 3, "a mux request stops at the command byte");
+        assert_eq!(reader.reads, 2, "mux");
+    }
+
+    #[test]
+    fn the_key_compare_reads_every_byte() {
+        let key = trojan_key("an-example-shared-password");
+        assert!(key_agrees(&key, &key), "the key agrees with itself");
+        for at in [0usize, 1, 27, 55] {
+            let mut other = key;
+            other[at] ^= 0x01;
+            assert!(!key_agrees(&other, &key), "byte {at} differs");
+        }
+        assert!(!key_agrees(&key[..55], &key), "a short read never agrees");
+    }
+
+    /// xray makes one account per `clients` entry, so a header carrying any of them opens the inbound.
+    #[test]
+    fn a_trojan_inbound_accepts_every_clients_password() {
+        let inbound = crate::json::parse(
+            r#"{"protocol": "trojan", "settings": {"clients": [
+                {"password": "first-password"}, {"password": "second-password"}]}}"#,
+        )
+        .expect("parses");
+        let keys = inbound_trojan_keys(&inbound);
+        let ask = |password: &str| {
+            let mut header = trojan_key(password).to_vec();
+            header.extend_from_slice(b"\r\n\x01\x01\x7f\x00\x00\x01\x1f\x90\r\n");
+            header
+        };
+        let mut second = std::io::Cursor::new(ask("second-password"));
+        let (cmd, target) =
+            decode_trojan_request(&mut second, &keys).expect("the second client authenticates");
+        assert_eq!(cmd, 1);
+        assert_eq!(target.socket().expect("address").port(), 8080);
+        assert_eq!(keys.len(), 2, "one key per client");
+        let mut stranger = std::io::Cursor::new(ask("nobody-lists-this"));
+        assert!(
+            decode_trojan_request(&mut stranger, &keys).is_none(),
+            "a password no client lists is refused"
+        );
+    }
+
+    #[test]
+    fn rejects_a_wrong_version_and_user() {
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let writer = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            decode_request(&mut stream)
+        });
+        let mut reader = Connection::connect(("127.0.0.1", port)).expect("connects");
+        reader.write_all(&[1u8; 18]).expect("writes");
+        assert!(writer.join().expect("joins").is_none());
+        drop(reader);
+    }
+
+    #[test]
+    fn a_grpc_service_name_is_escaped_the_way_xray_escapes_it() {
+        let spaced = crate::json::parse(r#"{"grpcSettings": {"serviceName": "interop grpc"}}"#)
+            .expect("parses");
+        assert_eq!(grpc_path(Some(&spaced)), "/interop%20grpc/Tun");
+        let plain =
+            crate::json::parse(r#"{"grpcSettings": {"serviceName": "svc"}}"#).expect("parses");
+        assert_eq!(grpc_path(Some(&plain)), "/svc/Tun");
+        let custom =
+            crate::json::parse(r#"{"grpcSettings": {"serviceName": "/svc/tun"}}"#).expect("parses");
+        assert_eq!(grpc_path(Some(&custom)), "/svc/tun");
+        let multi = crate::json::parse(r#"{"grpcSettings": {"serviceName": "/svc/tun|tunmulti"}}"#)
+            .expect("parses");
+        assert_eq!(
+            grpc_path(Some(&multi)),
+            "/svc/tun",
+            "a custom service name names the call, not the multi stream"
+        );
+        assert_eq!(grpc_path(None), "//Tun");
+        let one =
+            crate::json::parse(r#"{"grpcSettings": {"serviceName": "/tun"}}"#).expect("parses");
+        assert_eq!(grpc_path(Some(&one)), "//tun");
+
+        let full = crate::json::parse(
+            r#"{"network":"grpc","grpcSettings":{"serviceName":"/svc/tun|tunmulti","authority":"edge.example","userAgent":"agent/1","multiMode":true,"idleTimeout":30,"healthCheckTimeout":5,"permitWithoutStream":true,"initialWindowsSize":1000000}}"#,
+        )
+        .expect("parses");
+        let Carrier::Grpc(settings) = crate::config::stream_carrier(Some(&full)) else {
+            panic!("the config names grpc");
+        };
+        assert_eq!(settings.path, "/svc/tun");
+        assert_eq!(settings.multi_path, "/svc/tunmulti");
+        assert_eq!(settings.authority, "edge.example");
+        assert_eq!(settings.user_agent, "agent/1");
+        assert!(settings.multi_mode);
+        assert_eq!(settings.idle_timeout, 30);
+        assert_eq!(settings.health_check_timeout, 5);
+        assert!(settings.permit_without_stream);
+        assert_eq!(settings.initial_window_size, 1_000_000);
+    }
+
+    #[test]
+    fn vision_links_relay_plaintext_over_outer_tls() {
+        use ferrox_core::tls::TlsProvider as _;
+        use std::io::Read as _;
+        use std::io::Write as _;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let id = [9u8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("timeout");
+            let raw = stream.try_clone().expect("clones");
+            let mut outer =
+                ferrox_core::tls::accept(&server_config, stream).expect("outer accepts");
+            outer.handshake().expect("outer handshakes");
+            let mut link = crate::vision::Link::new(outer, Some(raw), &id);
+            let mut buf = [0u8; 512];
+            let n = link.read(&mut buf).expect("reads");
+            link.write_all(&buf[..n]).expect("echoes");
+            link.flush().expect("flushes");
+        });
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .expect("timeout");
+        let raw = stream.try_clone().expect("clones");
+        let limited = ferrox_core::tls::reality::RecordLimiter::new(stream);
+        let mut outer = ferrox_core::tls::connect(&client_config, limited).expect("outer connects");
+        outer.handshake().expect("outer handshakes");
+        let mut link = crate::vision::Link::new(outer, Some(raw), &id);
+        link.write_all(b"ping").expect("writes");
+        link.flush().expect("flushes");
+        let mut back = [0u8; 4];
+        link.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        drop(link);
+        server.join().expect("joins");
+    }
+
+    #[test]
+    fn vision_direct_switch_carries_inner_tls_over_loopback() {
+        use ferrox_core::tls::TlsProvider as _;
+        use std::io::Read as _;
+        use std::io::Write as _;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let id = [9u8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("timeout");
+            let raw = stream.try_clone().expect("clones");
+            let mut outer =
+                ferrox_core::tls::accept(&server_config, stream).expect("outer accepts");
+            outer.handshake().expect("outer handshakes");
+            let link = crate::vision::Link::new(outer, Some(raw), &id);
+            let mut inner = ferrox_core::tls::accept(&server_config, link).expect("inner accepts");
+            inner.handshake().expect("inner handshakes");
+            let mut buf = [0u8; 512];
+            loop {
+                match inner.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        inner.write_all(&buf[..n]).expect("echoes");
+                        inner.flush().expect("flushes");
+                    }
+                }
+            }
+        });
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .expect("timeout");
+        let raw = stream.try_clone().expect("clones");
+        let limited = ferrox_core::tls::reality::RecordLimiter::new(stream);
+        let mut outer = ferrox_core::tls::connect(&client_config, limited).expect("outer connects");
+        outer.handshake().expect("outer handshakes");
+        let link = crate::vision::Link::new(outer, Some(raw), &id);
+        let mut inner = ferrox_core::tls::connect(&client_config, link).expect("inner connects");
+        inner.handshake().expect("inner handshakes");
+        for round in 0..8 {
+            let payload = format!("inner tls round {round}");
+            inner.write_all(payload.as_bytes()).expect("writes");
+            inner.flush().expect("flushes");
+            let mut echoed = vec![0; payload.len()];
+            inner.read_exact(&mut echoed).expect("reads the echo");
+            assert_eq!(echoed, payload.as_bytes());
+        }
+        drop(inner);
+        server.join().expect("joins");
+    }
+
+    #[test]
+    fn reality_edges_skip_lookups_without_xver() {
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
+        let (mut site, _) = listener.accept().expect("accepts");
+        let _ = &mut site;
+        let plain = ferrox_core::tls::RealityServerConfig {
+            xver: 0,
+            ..ferrox_core::tls::RealityServerConfig::default()
+        };
+        assert_eq!(
+            reality_edges(&plain, &stream),
+            Edges::default(),
+            "no PROXY header means no lookup"
+        );
+        let proxied = ferrox_core::tls::RealityServerConfig {
+            xver: 1,
+            ..ferrox_core::tls::RealityServerConfig::default()
+        };
+        let edges = reality_edges(&proxied, &stream);
+        assert!(edges.peer.is_some() && edges.local.is_some());
+        assert_ne!(edges.peer, edges.local);
+    }
+
+    #[test]
+    fn vless_security_gate_keeps_plain_and_refuses_reality() {
+        let plain =
+            crate::json::parse(r#"{"streamSettings": {"network": "tcp"}}"#).expect("parses");
+        let none =
+            crate::json::parse(r#"{"streamSettings": {"network": "tcp", "security": "none"}}"#)
+                .expect("parses");
+        let reality =
+            crate::json::parse(r#"{"streamSettings": {"network": "tcp", "security": "reality"}}"#)
+                .expect("parses");
+        let tls =
+            crate::json::parse(r#"{"streamSettings": {"network": "tcp", "security": "tls"}}"#)
+                .expect("parses");
+        assert!(vless_security_supported(stream_security(&plain)));
+        assert!(vless_security_supported(stream_security(&none)));
+        assert!(!vless_security_supported(stream_security(&reality)));
+        assert!(!vless_security_supported(stream_security(&tls)));
+    }
+
+    #[test]
+    fn vless_with_hysteria_takes_tls_as_the_carriers_own_handshake() {
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "vless", "settings": {{"vnext": [{{"address": "127.0.0.1",
+            "port": 443, "users": [{{"id": "{REALITY_TEST_ID}"}}]}}]}},
+            "streamSettings": {{"network": "hysteria", "security": "tls",
+            "hysteriaSettings": {{"version": 2, "auth": "matrix-auth"}},
+            "tlsSettings": {{"serverName": "carrier.test"}}}}}}]}}"#
+        ))
+        .expect("parses");
+        let outbound = &root
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .expect("outbounds")[0];
+        assert!(outbound_refusal(outbound, "vless").is_none());
+        let out = find_vless_outbound(&root).expect("hysteria over tls dials");
+        assert!(matches!(out.carrier, Carrier::Hysteria(_)));
+        assert_eq!(
+            out.host, "carrier.test",
+            "the carrier's SNI is tlsSettings.serverName"
+        );
+        assert!(out.tls.is_none(), "the carrier's TLS is not a second layer");
+    }
+
+    #[test]
+    fn vless_outbound_with_reality_dials_raw_and_every_carrier() {
+        let public =
+            x25519_dalek::x25519(REALITY_TEST_PRIVATE, x25519_dalek::X25519_BASEPOINT_BYTES);
+        let key = b64url(&public);
+        let dials = |stream: &str| {
+            let json = format!(
+                r#"{{"outbounds": [{{"protocol": "vless", "settings": {{"vnext": [{{"address": "127.0.0.1",
+                "port": 443, "users": [{{"id": "{REALITY_TEST_ID}"}}]}}]}},
+                "streamSettings": {{{stream}, "security": "reality",
+                "realitySettings": {{"serverName": "{REALITY_TEST_SNI}",
+                "publicKey": "{key}", "shortId": "{REALITY_TEST_SHORT}"}}}}}}]}}"#
+            );
+            find_vless_outbound(&crate::json::parse(&json).expect("parses")).is_some()
+        };
+        assert!(dials(r#""network": "tcp""#), "raw REALITY dials");
+        assert!(dials(r#""network": "ws""#), "ws REALITY dials");
+        assert!(
+            dials(r#""network": "httpupgrade""#),
+            "httpupgrade REALITY dials"
+        );
+        assert!(dials(r#""network": "grpc""#), "grpc REALITY dials");
+        assert!(dials(r#""network": "xhttp""#), "xhttp REALITY dials");
+        assert!(
+            dials(
+                r#""network": "tcp", "tcpSettings": {"header": {"type": "http", "request": {"path": "/"}}}"#
+            ),
+            "http-header REALITY dials"
+        );
+        assert!(
+            dials(r#""network": "quic""#),
+            "quic REALITY dials the carried tunnel"
+        );
+        assert!(
+            dials(r#""network": "kcp""#),
+            "kcp REALITY dials the carried tunnel"
+        );
+        assert!(
+            dials(r#""network": "hysteria""#),
+            "hysteria REALITY dials the carried tunnel"
+        );
+        let bare = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "vless", "settings": {"vnext": [{"address": "127.0.0.1",
+            "port": 443, "users": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]}]},
+            "streamSettings": {"network": "tcp", "security": "reality"}}]}"#,
+        )
+        .expect("parses");
+        assert!(
+            find_vless_outbound(&bare).is_none(),
+            "no identity means no dial, never a plain one"
+        );
+    }
+
+    const REALITY_TEST_PRIVATE: [u8; 32] = [
+        0x69, 0x20, 0xca, 0xab, 0x2b, 0x4d, 0xe3, 0x7d, 0xfc, 0xfe, 0xbf, 0x60, 0x8b, 0x2a, 0x43,
+        0x1c, 0x0e, 0xbb, 0xae, 0x26, 0x93, 0x9a, 0x9c, 0x01, 0x9e, 0x06, 0x1e, 0x8a, 0x0b, 0x4e,
+        0x6b, 0x91,
+    ];
+    const REALITY_TEST_SHORT: &str = "0123456789abcdef";
+    const REALITY_TEST_SNI: &str = "www.google.com";
+    const REALITY_TEST_ID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+    fn reality_server_config() -> ferrox_core::tls::RealityServerConfig {
+        ferrox_core::tls::RealityServerConfig {
+            private_key: REALITY_TEST_PRIVATE,
+            short_ids: vec![[1, 35, 69, 103, 137, 171, 205, 239]],
+            server_names: vec![REALITY_TEST_SNI.to_owned()],
+            ..ferrox_core::tls::RealityServerConfig::default()
+        }
+    }
+
+    fn reality_client_json(server_port: u16, public_b64: &str, flow: &str) -> String {
+        reality_network_json(server_port, public_b64, flow, "tcp")
+    }
+
+    fn reality_network_json(
+        server_port: u16,
+        public_b64: &str,
+        flow: &str,
+        network: &str,
+    ) -> String {
+        reality_network_json_with_log(server_port, public_b64, flow, network, None, None)
+    }
+
+    fn reality_network_json_with_log(
+        server_port: u16,
+        public_b64: &str,
+        flow: &str,
+        network: &str,
+        log: Option<&str>,
+        xhttp_path: Option<&str>,
+    ) -> String {
+        let log = log
+            .map(|path| format!(r#", "masterKeyLog": "{}""#, path.replace('\\', "\\\\")))
+            .unwrap_or_default();
+        let xhttp = xhttp_path
+            .map(|path| format!(r#", "xhttpSettings": {{"path": "{path}"}}"#))
+            .unwrap_or_default();
+        format!(
+            r#"{{"outbounds": [{{"protocol": "vless", "settings": {{"vnext": [{{"address": "127.0.0.1",
+            "port": {server_port}, "users": [{{"id": "{REALITY_TEST_ID}", "flow": "{flow}"}}]}}]}},
+            "streamSettings": {{"network": "{network}", "security": "reality",
+            "realitySettings": {{"serverName": "{REALITY_TEST_SNI}",
+            "publicKey": "{public_b64}", "shortId": "{REALITY_TEST_SHORT}",
+            "fingerprint": "chrome"{log}}}{xhttp}}}}}]}}"#,
+        )
+    }
+
+    /// The sealed session sits above REALITY as it sits above TLS: the hello, the VLESS
+    /// header and the payload all cross the engine, and the cover handshake still runs.
+    #[cfg(unix)]
+    #[test]
+    fn an_encrypted_vless_reality_session_echoes_over_loopback() {
+        use std::os::unix::net::UnixStream;
+
+        let (client_string, server_string) =
+            ferrox_core::vless_encryption::generate_pair(true, "native", "1rtt", "600");
+        let client = vless_client_encryption(Some(&client_string))
+            .expect("client")
+            .expect("engine");
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol":"vless","settings":{{"decryption":"{server_string}"}}}}"#
+        ))
+        .expect("parses");
+        let decryption = crate::config::server_decryption(&inbound)
+            .expect("decryption")
+            .expect("engine");
+
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds the echo");
+        let echo_addr = echo.local_addr().expect("addr");
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 1024];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => stream.write_all(&buf[..n]).expect("echoes"),
+                }
+            }
+        });
+
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds the server");
+        let server_addr = listener.local_addr().expect("addr");
+        let server_config = reality_server_config();
+        let id = uuid_bytes(REALITY_TEST_ID).expect("id");
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless_reality(
+                stream,
+                &[VlessUser {
+                    id,
+                    flow: Flow::None,
+                    email: String::new(),
+                    level: 0,
+                    reverse: None,
+                }],
+                true,
+                &Carrier::Raw(Chain::default()),
+                &server_config,
+                None,
+                Some(&decryption),
+            );
+        });
+
+        let public =
+            x25519_dalek::x25519(REALITY_TEST_PRIVATE, x25519_dalek::X25519_BASEPOINT_BYTES);
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds":[{{"protocol":"vless","settings":{{"vnext":[{{"address":"127.0.0.1","port":{},"users":[{{"id":"{REALITY_TEST_ID}","encryption":"{client_string}"}}]}}]}},"streamSettings":{{"network":"tcp","security":"reality","realitySettings":{{"serverName":"{REALITY_TEST_SNI}","publicKey":"{}","shortId":"{REALITY_TEST_SHORT}","fingerprint":"chrome"}}}}}}]}}"#,
+            server_addr.port(),
+            b64url(&public),
+        ))
+        .expect("parses");
+        let vless = find_vless_outbound(&root).expect("a REALITY outbound");
+        assert!(vless.encryption.is_some(), "the account names the engine");
+
+        let (app, mut peer) = UnixStream::pair().expect("pair");
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        thread::spawn(move || {
+            dial_vless_reality(
+                &Connection::from(app),
+                &server_addr,
+                &vless,
+                Some(&Destination::from(echo_addr)),
+            );
+        });
+        let payload = b"hello through the sealed reality session";
+        peer.write_all(payload).expect("writes");
+        let mut got = vec![0u8; payload.len()];
+        peer.read_exact(&mut got).expect("reads the echo");
+        assert_eq!(&got, payload);
+        let _ = client;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_encrypted_vless_reality_xhttp_session_dials_h2() {
+        use std::os::unix::net::UnixStream;
+
+        const WITNESS: &str = "/sealed-h2-dial";
+        let (client_string, server_string) =
+            ferrox_core::vless_encryption::generate_pair(true, "native", "1rtt", "600");
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol":"vless","settings":{{"decryption":"{server_string}"}}}}"#
+        ))
+        .expect("parses");
+        let decryption = crate::config::server_decryption(&inbound)
+            .expect("decryption")
+            .expect("engine");
+
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds the echo");
+        let echo_addr = echo.local_addr().expect("addr");
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 1024];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => stream.write_all(&buf[..n]).expect("echoes"),
+                }
+            }
+        });
+
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds the server");
+        let server_addr = listener.local_addr().expect("addr");
+        let server_config = reality_server_config();
+        let id = uuid_bytes(REALITY_TEST_ID).expect("id");
+        let settings = xhttp_settings(WITNESS);
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless_reality(
+                stream,
+                &[VlessUser {
+                    id,
+                    flow: Flow::None,
+                    email: String::new(),
+                    level: 0,
+                    reverse: None,
+                }],
+                true,
+                &Carrier::Xhttp { settings },
+                &server_config,
+                None,
+                Some(&decryption),
+            );
+        });
+
+        let public =
+            x25519_dalek::x25519(REALITY_TEST_PRIVATE, x25519_dalek::X25519_BASEPOINT_BYTES);
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds":[{{"protocol":"vless","settings":{{"vnext":[{{"address":"127.0.0.1","port":{},"users":[{{"id":"{REALITY_TEST_ID}","encryption":"{client_string}"}}]}}]}},"streamSettings":{{"network":"xhttp","security":"reality","realitySettings":{{"serverName":"{REALITY_TEST_SNI}","publicKey":"{}","shortId":"{REALITY_TEST_SHORT}","fingerprint":"chrome"}},"xhttpSettings":{{"path":"{WITNESS}"}}}}}}]}}"#,
+            server_addr.port(),
+            b64url(&public),
+        ))
+        .expect("parses");
+        let vless = find_vless_outbound(&root).expect("a REALITY outbound");
+        assert!(vless.encryption.is_some(), "the account names the engine");
+
+        let (app, mut peer) = UnixStream::pair().expect("pair");
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        thread::spawn(move || {
+            dial_vless_reality(
+                &Connection::from(app),
+                &server_addr,
+                &vless,
+                Some(&Destination::from(echo_addr)),
+            );
+        });
+        let payload = b"sealed reality over h2";
+        peer.write_all(payload).expect("writes");
+        let mut got = vec![0u8; payload.len()];
+        peer.read_exact(&mut got).expect("reads the echo");
+        assert_eq!(&got, payload);
+        assert!(
+            H2_DIAL_WITNESS
+                .lock()
+                .expect("witness lock")
+                .iter()
+                .any(|path| path == WITNESS),
+            "the sealed REALITY xHTTP dial did not open with the H2 preface"
+        );
+    }
+
+    #[test]
+    fn reality_outbound_parses_its_identity() {
+        let public =
+            x25519_dalek::x25519(REALITY_TEST_PRIVATE, x25519_dalek::X25519_BASEPOINT_BYTES);
+        let root = crate::json::parse(&reality_client_json(
+            443,
+            &b64url(&public),
+            "xtls-rprx-vision",
+        ))
+        .expect("parses");
+        let out = find_vless_outbound(&root).expect("dials raw REALITY");
+        assert_eq!(out.flow, "xtls-rprx-vision");
+        assert!(out.is_vision());
+        assert!(!out.allows_udp443());
+        let target = SocketAddr::from(([192, 0, 2, 1], 443));
+        assert!(
+            !vless_udp_target_allowed(&out, &target),
+            "the bare vision flow refuses UDP/443"
+        );
+        assert!(vless_udp_target_allowed(
+            &out,
+            &SocketAddr::from(([192, 0, 2, 1], 8443))
+        ));
+        let alias_flow = crate::json::parse(&reality_client_json(
+            443,
+            &b64url(&public),
+            ferrox_core::vless::VISION_UDP443_FLOW,
+        ))
+        .expect("parses");
+        let alias = find_vless_outbound(&alias_flow).expect("dials the alias");
+        assert_eq!(alias.flow, ferrox_core::vless::VISION_UDP443_FLOW);
+        assert!(alias.is_vision());
+        assert!(alias.allows_udp443());
+        assert!(vless_udp_target_allowed(&alias, &target));
+        let core = ferrox_core::vless::VlessLink::parse(&format!(
+            "vless://{REALITY_TEST_ID}@192.0.2.1:443?security=reality&encryption=none&type=tcp&flow={}#x",
+            ferrox_core::vless::VISION_UDP443_FLOW
+        ))
+        .expect("parses");
+        let core_header = core.encode_request_header("192.0.2.1", 443);
+        let alias_header = vless_request_header(&alias, Some(&Destination::from(target)))
+            .expect("the alias header fits");
+        assert_eq!(
+            &*alias_header,
+            core_header.as_slice(),
+            "the alias writes the same bytes as the core link"
+        );
+        let reality = out.reality.expect("carries its identity");
+        assert_eq!(reality.server_name, REALITY_TEST_SNI);
+        assert_eq!(reality.public_key, public);
+        assert_eq!(reality.short_id, [1, 35, 69, 103, 137, 171, 205, 239]);
+        let bare_flow =
+            crate::json::parse(&reality_client_json(443, &b64url(&public), "")).expect("parses");
+        let bare = find_vless_outbound(&bare_flow).expect("dials without a flow too");
+        assert_eq!(bare.flow, "");
+        let bad_flow = crate::json::parse(&reality_client_json(
+            443,
+            &b64url(&public),
+            "xtls-rprx-vision-udp4430",
+        ))
+        .expect("parses");
+        assert!(
+            find_vless_outbound(&bad_flow).is_none(),
+            "an unknown flow is refused, never sent plain"
+        );
+    }
+
+    fn header_test_outbound() -> VlessOut {
+        VlessOut {
+            address: "192.0.2.1".to_owned(),
+            port: 443,
+            id: [0x11; 16],
+            carrier: Carrier::Raw(Chain::default()),
+            host: String::new(),
+            mux: Mux::default(),
+            pool: Pools::default(),
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: ferrox_core::vless::VISION_UDP443_FLOW.to_owned(),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            encryption: None,
+        }
+    }
+
+    #[test]
+    fn an_overlong_destination_refuses_the_dial_header() {
+        let vless = header_test_outbound();
+        let name = Destination::Name("a".repeat(256), 443);
+        assert!(
+            vless_request_header(&vless, Some(&name)).is_none(),
+            "a name the wire's one-byte length cannot carry is refused"
+        );
+    }
+
+    #[test]
+    fn the_vless_dial_header_allocates_nothing() {
+        let vless = header_test_outbound();
+        let target = Destination::from(SocketAddr::from(([192, 0, 2, 53], 443)));
+        let (header, counts) =
+            ferrox_core::alloc_count::measure(|| vless_request_header(&vless, Some(&target)));
+        let header = header.expect("the alias header fits");
+        assert_eq!(
+            counts.allocs, 0,
+            "the alias header is written into the stack"
+        );
+        assert_eq!(counts.bytes, 0);
+        assert_eq!(counts.zeroed, 0);
+        let expected = vless_vision_header(&vless.id, 1, &target);
+        assert_eq!(&*header, expected.as_slice());
+    }
+
+    #[test]
+    fn vision_header_matches_the_core_encoder() {
+        let link = ferrox_core::vless::VlessLink::parse(
+            "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@192.0.2.1:443?security=reality&encryption=none&type=tcp&flow=xtls-rprx-vision#x",
+        )
+        .expect("parses");
+        let id = uuid_bytes(REALITY_TEST_ID).expect("id");
+        for target in [
+            SocketAddr::from(([192, 0, 2, 53], 80)),
+            SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1], 443)),
+        ] {
+            let host = match target.ip() {
+                std::net::IpAddr::V4(ip) => ip.to_string(),
+                std::net::IpAddr::V6(ip) => ip.to_string(),
+            };
+            let core = link.encode_request_header(&host, target.port());
+            let proxy = vless_vision_header(&id, 1, &Destination::from(target));
+            assert_eq!(proxy, core, "the dial writes the core bytes for {target}");
+            let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let port = listener.local_addr().expect("addr").port();
+            let writer = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accepts");
+                decode_request(&mut stream).expect("decodes")
+            });
+            let mut reader = Connection::connect(("127.0.0.1", port)).expect("connects");
+            reader.write_all(&proxy).expect("writes");
+            let (got, flow, cmd, decoded) = writer.join().expect("joins");
+            assert_eq!(got, id);
+            assert_eq!(flow, Flow::Vision);
+            assert_eq!(cmd, 1);
+            assert_eq!(decoded, target);
+        }
+    }
+
+    /// The dial headers are reserved to the exact bytes they hold, so an IPv6 destination —
+    /// 38 and 56 bytes against the old `with_capacity(30)`/`(48)` — no longer reallocates.
+    #[test]
+    fn dial_headers_are_sized_to_the_bytes_they_hold() {
+        let id = [0x5au8; 16];
+        for target in [
+            SocketAddr::from(([192, 0, 2, 53], 80)),
+            SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1], 443)),
+        ] {
+            let plain = vless_header(&id, 1, &Destination::from(target));
+            assert_eq!(plain.capacity(), plain.len(), "no realloc for {target}");
+            let vision = vless_vision_header(&id, 1, &Destination::from(target));
+            assert_eq!(vision.capacity(), vision.len(), "no realloc for {target}");
+        }
+    }
+
+    /// The dial reads a response's addons before deciding, and a bare `[0, 0]` leaves the payload on the wire; a wrong version or a short addon is no answer.
+    #[test]
+    fn a_flow_echo_reads_its_addons_and_a_bare_answer_never_spends_the_payload() {
+        let mut wire = vec![0u8, 18];
+        wire.extend_from_slice(b"xtls-rprx-vision\0\0");
+        wire.extend_from_slice(b"payload");
+        let mut stream = std::io::Cursor::new(wire.clone());
+        assert!(
+            read_vless_response(&mut stream).is_some(),
+            "a response with addons is an answer"
+        );
+        assert_eq!(
+            stream.position(),
+            20,
+            "the prefix and the addons are consumed"
+        );
+        assert_eq!(&wire[20..], b"payload", "the payload waits on the wire");
+        let mut short = std::io::Cursor::new(vec![0u8, 3, b'a']);
+        assert!(
+            read_vless_response(&mut short).is_none(),
+            "a truncated addon is no answer"
+        );
+        let bare = std::io::Cursor::new(vec![0u8, 0, b'p', b'a', b'y']);
+        let mut bare = std::io::Read::take(bare, 5);
+        {
+            let inner = &mut bare as &mut dyn Read;
+            assert!(
+                read_vless_response(inner).is_some(),
+                "a bare answer is an answer"
+            );
+        }
+        assert_eq!(bare.limit(), 3, "the payload is not consumed");
+        let mut wrong = std::io::Cursor::new(vec![1u8, 0]);
+        assert!(
+            read_vless_response(&mut wrong).is_none(),
+            "a wrong version is no answer"
+        );
+    }
+
+    /// One REALITY pair on loopback: an echo target, an inbound, the dial. The flow is the caller's.
+    struct RealityPair {
+        outbound: Outbound,
+        server: SocketAddr,
+        target: SocketAddr,
+        echo: thread::JoinHandle<()>,
+        front: thread::JoinHandle<()>,
+    }
+
+    fn reality_pair(flow: &str) -> RealityPair {
+        reality_pair_with(flow, "tcp", Carrier::Raw(Chain::default()))
+    }
+
+    fn reality_pair_with(flow: &str, network: &str, carrier: Carrier) -> RealityPair {
+        reality_pair_logged(flow, network, carrier, None, None)
+    }
+
+    fn reality_xhttp_pair(mode: crate::xhttp::XhttpMode, path: &str) -> RealityPair {
+        let mut pair = reality_pair_at_path(
+            "",
+            "xhttp",
+            Carrier::Xhttp {
+                settings: xhttp_settings_mode(path, mode),
+            },
+            path,
+        );
+        if let Outbound::Vless(vless) = &mut pair.outbound {
+            if let Carrier::Xhttp { settings } = &mut vless.carrier {
+                settings.mode = mode;
+            }
+        }
+        pair
+    }
+
+    fn reality_pair_at_path(
+        flow: &str,
+        network: &str,
+        carrier: Carrier,
+        path: &str,
+    ) -> RealityPair {
+        reality_pair_logged(flow, network, carrier, None, Some(path))
+    }
+
+    fn reality_pair_logged(
+        flow: &str,
+        network: &str,
+        carrier: Carrier,
+        log: Option<&str>,
+        xhttp_path: Option<&str>,
+    ) -> RealityPair {
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_addr = echo.local_addr().expect("addr");
+        let echo = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 8192];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        if stream.write_all(&buf[..n]).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        let id = uuid_bytes(REALITY_TEST_ID).expect("id");
+        let account = if flow == ferrox_core::vless::VISION_FLOW {
+            Flow::Vision
+        } else {
+            Flow::None
+        };
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let server_addr = front.local_addr().expect("addr");
+        let server_config = reality_server_config();
+        let front_handle = thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_vless_reality(
+                stream,
+                &[VlessUser {
+                    id,
+                    flow: account,
+                    email: String::new(),
+                    level: 0,
+                    reverse: None,
+                }],
+                true,
+                &carrier,
+                &server_config,
+                None,
+                None,
+            );
+        });
+        let public =
+            x25519_dalek::x25519(REALITY_TEST_PRIVATE, x25519_dalek::X25519_BASEPOINT_BYTES);
+        let root = crate::json::parse(&reality_network_json_with_log(
+            server_addr.port(),
+            &b64url(&public),
+            flow,
+            network,
+            log,
+            xhttp_path,
+        ))
+        .expect("parses");
+        let outbound = find_outbound(&root)
+            .expect("a REALITY outbound")
+            .expect("the config names one");
+        RealityPair {
+            outbound,
+            server: server_addr,
+            target: echo_addr,
+            echo,
+            front: front_handle,
+        }
+    }
+
+    fn dial_pair(pair: &RealityPair) -> (Connection, thread::JoinHandle<()>) {
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let outbound = match &pair.outbound {
+            Outbound::Vless(vless) => vless.clone(),
+            _ => panic!("the pair dials VLESS"),
+        };
+        let server = pair.server;
+        let target = pair.target;
+        let dialled = thread::spawn(move || {
+            let (client, _) = front.accept().expect("accepts");
+            tx.send(()).expect("signals");
+            dial_socks_outbound(
+                &client,
+                &Outbound::Vless(outbound),
+                &server,
+                &Destination::from(target),
+            );
+        });
+        let user = Connection::connect(addr).expect("connects");
+        user.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        rx.recv_timeout(Duration::from_secs(30)).expect("dials");
+        (user, dialled)
+    }
+
+    // Writing before reading only completes while the whole payload fits the chain's buffering, so read while writing, and give both arms the same deadline so a blocked one reports instead of parking.
+    fn echo_within(user: &mut Connection, payload: &[u8], budget: Duration) -> Vec<u8> {
+        user.set_write_timeout(Some(budget)).expect("write timeout");
+        let mut reader = user.try_clone().expect("clones");
+        // A duplicated socket need not inherit the parent's poll timeout, so the reading arm carries its own.
+        reader.set_read_timeout(Some(budget)).expect("read timeout");
+        let length = payload.len();
+        let back = thread::spawn(move || {
+            let mut got = vec![0u8; length];
+            reader.read_exact(&mut got).map(|()| got)
+        });
+        user.write_all(payload).expect("writes");
+        back.join().expect("joins").expect("echoes")
+    }
+
+    fn echo_bulk(user: &mut Connection, payload: &[u8]) -> Vec<u8> {
+        echo_within(user, payload, Duration::from_secs(30))
+    }
+
+    /// A peer that swallows the payload and answers nothing must cost the witness its budget, not the job's whole stall window; a silent read here is a red that names the arm.
+    #[test]
+    #[should_panic(expected = "echoes")]
+    fn a_silent_echo_peer_ends_the_bulk_read_at_its_budget() {
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let sink = thread::spawn(move || {
+            let (mut peer, _) = front.accept().expect("accepts");
+            let mut drained = [0u8; 4096];
+            while let Ok(read) = peer.read(&mut drained) {
+                if read == 0 {
+                    break;
+                }
+            }
+        });
+        let mut user = Connection::connect(addr).expect("connects");
+        let payload: Vec<u8> = (0..4096u32).map(|index| index as u8).collect();
+        echo_within(&mut user, &payload, Duration::from_millis(250));
+        sink.join().expect("drains");
+    }
+
+    #[test]
+    fn reality_vision_dial_reaches_echo_through_the_relay() {
+        let pair = reality_pair(ferrox_core::vless::VISION_FLOW);
+        let (mut user, dialled) = dial_pair(&pair);
+        let payload: Vec<u8> = (0..65536u32).map(|i| (i % 251) as u8).collect();
+        assert_eq!(echo_bulk(&mut user, &payload), payload);
+        drop(user);
+        dialled.join().expect("joins");
+        pair.echo.join().expect("joins");
+        pair.front.join().expect("joins");
+    }
+
+    /// The reference opens `realitySettings.masterKeyLog` separately from `tlsSettings`, so a REALITY
+    /// dial's secrets reach the file its own block names.
+    #[test]
+    fn a_reality_master_key_log_records_the_sealed_handshake() {
+        let path =
+            std::env::temp_dir().join(format!("ferrox-reality-keylog-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let named = path.to_string_lossy().into_owned();
+        let pair = reality_pair_logged(
+            "",
+            "tcp",
+            Carrier::Raw(Chain::default()),
+            Some(&named),
+            None,
+        );
+        let (mut user, dialled) = dial_pair(&pair);
+        assert_eq!(echo_bulk(&mut user, b"sealed"), b"sealed");
+        drop(user);
+        dialled.join().expect("joins");
+        pair.echo.join().expect("joins");
+        pair.front.join().expect("joins");
+        let log = std::fs::read_to_string(&path).expect("the log the config named");
+        let _ = std::fs::remove_file(&path);
+        for label in [
+            "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+            "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+            "CLIENT_TRAFFIC_SECRET_0",
+            "SERVER_TRAFFIC_SECRET_0",
+        ] {
+            assert!(
+                log.lines().any(|line| line.starts_with(label)),
+                "{label} in {log:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reality_raw_dial_reaches_echo_through_the_relay() {
+        let pair = reality_pair("");
+        let (mut user, dialled) = dial_pair(&pair);
+        for seed in [11u8, 12] {
+            let length = if seed == 11 { 64 } else { 96 * 1024 };
+            let payload: Vec<u8> = (0..length)
+                .map(|index| (index as u8).wrapping_mul(29).wrapping_add(seed))
+                .collect();
+            let back = echo_bulk(&mut user, &payload);
+            assert_eq!(back, payload, "{seed}: payload came back altered");
+        }
+        drop(user);
+        dialled.join().expect("joins");
+        pair.echo.join().expect("joins");
+        pair.front.join().expect("joins");
+    }
+
+    /// A bulk round trip must not assume the socket holds the payload: 4 KiB per direction is under what a fresh loopback socket gets anywhere, and 256 KiB crosses 64 of those windows, so a hop that parked after one still stalls; 4 MiB crossed 1024 of them for no extra witness and cost the linux job 107s of delayed-ACK-throttled transfer.
+    #[test]
+    #[cfg(unix)]
+    fn a_small_socket_buffer_does_not_park_a_bulk_round_trip() {
+        use std::os::unix::io::AsRawFd;
+        let pair = reality_pair("");
+        let (mut user, dialled) = dial_pair(&pair);
+        for (name, opt) in [
+            ("SO_SNDBUF", libc::SO_SNDBUF),
+            ("SO_RCVBUF", libc::SO_RCVBUF),
+        ] {
+            let want: libc::c_int = 4096;
+            // SAFETY: `want` outlives the call, and the size is its own.
+            let set = unsafe {
+                libc::setsockopt(
+                    user.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    opt,
+                    std::ptr::addr_of!(want).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(0, set, "{name} refused");
+        }
+        let payload: Vec<u8> = (0..256 * 1024usize)
+            .map(|index| (index as u8).wrapping_mul(29))
+            .collect();
+        assert_eq!(echo_bulk(&mut user, &payload), payload);
+        drop(user);
+        dialled.join().expect("joins");
+        pair.echo.join().expect("joins");
+        pair.front.join().expect("joins");
+    }
+
+    #[test]
+    fn reality_ws_dial_reaches_echo_through_the_relay() {
+        let pair = reality_pair_with(
+            "",
+            "ws",
+            Carrier::Ws {
+                path: "/".to_owned(),
+                ed: 0,
+            },
+        );
+        let (mut user, dialled) = dial_pair(&pair);
+        let payload: Vec<u8> = (0..200_000u32)
+            .map(|index| (index as u8).wrapping_mul(31).wrapping_add(7))
+            .collect();
+        let back = echo_bulk(&mut user, &payload);
+        assert_eq!(
+            back, payload,
+            "payload came back altered through the carried REALITY session"
+        );
+        drop(user);
+        dialled.join().expect("joins");
+        pair.echo.join().expect("joins");
+        pair.front.join().expect("joins");
+    }
+
+    #[test]
+    fn reality_xhttp_dial_reaches_echo_through_the_relay() {
+        let pair = reality_pair_with(
+            "",
+            "xhttp",
+            Carrier::Xhttp {
+                settings: xhttp_settings("/"),
+            },
+        );
+        let (mut user, dialled) = dial_pair(&pair);
+        let payload: Vec<u8> = (0..4_000_000u32)
+            .map(|index| (index as u8).wrapping_mul(37).wrapping_add(11))
+            .collect();
+        let back = echo_bulk(&mut user, &payload);
+        assert_eq!(
+            back, payload,
+            "payload came back altered through the carried REALITY xhttp session"
+        );
+        drop(user);
+        dialled.join().expect("joins");
+        pair.echo.join().expect("joins");
+        // The pooled H2 transport outlives the session by design, so the hub's accept loop stays parked.
+        drop(pair.front);
+    }
+
+    /// The reference chooses HTTP/2 for every REALITY xHTTP session (`decideHTTPVersion`, dialer.go:82), so the preface is the contract: an H1 head never carries this path.
+    #[test]
+    fn reality_xhttp_dial_opens_with_the_h2_preface() {
+        const WITNESS: &str = "/h2-dial-witness";
+        let pair = reality_pair_at_path(
+            "",
+            "xhttp",
+            Carrier::Xhttp {
+                settings: xhttp_settings(WITNESS),
+            },
+            WITNESS,
+        );
+        let (mut user, dialled) = dial_pair(&pair);
+        let payload: Vec<u8> = (0..4096u32)
+            .map(|index| (index as u8).wrapping_mul(19).wrapping_add(3))
+            .collect();
+        assert_eq!(echo_bulk(&mut user, &payload), payload);
+        drop(user);
+        dialled.join().expect("joins");
+        pair.echo.join().expect("joins");
+        // The pooled H2 transport outlives the session by design, so the hub's accept loop stays parked.
+        drop(pair.front);
+        assert!(
+            H2_DIAL_WITNESS
+                .lock()
+                .expect("witness lock")
+                .iter()
+                .any(|path| path == WITNESS),
+            "the REALITY xHTTP dial did not open with the H2 preface"
+        );
+    }
+
+    /// The reference dials HTTP/2 for a REALITY carrier in every mode, so the dual modes must open
+    /// their GET and POST as streams on that connection rather than taking the stream-one pool.
+    #[test]
+    fn reality_xhttp_dual_modes_reach_echo_over_h2() {
+        for (mode, path) in [
+            (crate::xhttp::XhttpMode::StreamUp, "/reality-stream-up-h2"),
+            (crate::xhttp::XhttpMode::PacketUp, "/reality-packet-up-h2"),
+        ] {
+            let pair = reality_xhttp_pair(mode, path);
+            let (mut user, dialled) = dial_pair(&pair);
+            let length = if mode == crate::xhttp::XhttpMode::PacketUp {
+                8192
+            } else {
+                64 * 1024
+            };
+            let payload: Vec<u8> = (0..length)
+                .map(|index| (index as u8).wrapping_mul(23).wrapping_add(9))
+                .collect();
+            assert_eq!(
+                echo_bulk(&mut user, &payload),
+                payload,
+                "{mode:?} payload came back altered through REALITY xHTTP"
+            );
+            drop(user);
+            dialled.join().expect("joins");
+            pair.echo.join().expect("joins");
+            pair.front.join().expect("joins");
+            assert!(
+                H2_DIAL_WITNESS
+                    .lock()
+                    .expect("witness lock")
+                    .iter()
+                    .any(|seen| seen == path),
+                "{mode:?} did not open with the H2 preface"
+            );
+        }
+    }
+
+    /// Two sequential REALITY stream-one flows through `serve_vless_reality`, returning the transports
+    /// the front counted. `settings_xmux` is the parsed block and `json_xmux` the fragment the
+    /// outbound is written with, so an absent block and a written one can be told apart.
+    fn reality_xhttp_pool_accepts(
+        settings_xmux: Option<crate::xhttp::Xmux>,
+        json_xmux: Option<&str>,
+    ) -> usize {
+        const WITNESS: &str = "/h2-pool-witness";
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_addr = echo.local_addr().expect("addr");
+        let _echo = thread::spawn(move || loop {
+            let Ok((mut stream, _)) = echo.accept() else {
+                return;
+            };
+            thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => {
+                            if stream.write_all(&buf[..n]).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        });
+        let id = uuid_bytes(REALITY_TEST_ID).expect("id");
+        let users = [VlessUser {
+            id,
+            flow: Flow::None,
+            email: String::new(),
+            level: 0,
+            reverse: None,
+        }];
+        let mut settings = xhttp_settings(WITNESS);
+        settings.xmux = settings_xmux;
+        let carrier = Carrier::Xhttp { settings };
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let server_addr = front.local_addr().expect("addr");
+        let server_config = reality_server_config();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&accepted);
+        thread::spawn(move || loop {
+            let Ok((stream, _)) = front.accept() else {
+                return;
+            };
+            seen.fetch_add(1, Ordering::SeqCst);
+            let carrier = carrier.clone();
+            let server_config = server_config.clone();
+            let users = users.clone();
+            thread::spawn(move || {
+                serve_vless_reality(stream, &users, true, &carrier, &server_config, None, None);
+            });
+        });
+        let public =
+            x25519_dalek::x25519(REALITY_TEST_PRIVATE, x25519_dalek::X25519_BASEPOINT_BYTES);
+        let mut json = reality_network_json_with_log(
+            server_addr.port(),
+            &b64url(&public),
+            "",
+            "xhttp",
+            None,
+            Some(WITNESS),
+        );
+        if let Some(fragment) = json_xmux {
+            json = json.replace(
+                &format!(r#""xhttpSettings": {{"path": "{WITNESS}"}}"#),
+                &format!(r#""xhttpSettings": {{"path": "{WITNESS}", {fragment}}}"#),
+            );
+        }
+        let root = crate::json::parse(&json).expect("parses");
+        let outbound = find_outbound(&root)
+            .expect("a REALITY outbound")
+            .expect("the config names one");
+        let pair = RealityPair {
+            outbound,
+            server: server_addr,
+            target: echo_addr,
+            echo: thread::spawn(|| ()),
+            front: thread::spawn(|| ()),
+        };
+        for _ in 0..2 {
+            let (mut user, dialled) = dial_pair(&pair);
+            let payload: Vec<u8> = (0..4096u32)
+                .map(|index| (index as u8).wrapping_mul(7).wrapping_add(5))
+                .collect();
+            assert_eq!(echo_bulk(&mut user, &payload), payload);
+            drop(user);
+            dialled.join().expect("joins");
+        }
+        accepted.load(Ordering::SeqCst)
+    }
+
+    /// `maxConnections: 1` is the reference's multiplexing shape: the second session opens a stream on
+    /// the connection the first one dialled (`getHTTPClient` → `GetXmuxClient`, mux.go:73), so the
+    /// server counts one transport for two flows.
+    #[test]
+    fn two_reality_xhttp_sessions_share_one_pooled_connection() {
+        assert_eq!(
+            reality_xhttp_pool_accepts(
+                Some(crate::xhttp::Xmux {
+                    max_connections: (1, 1),
+                    ..crate::xhttp::Xmux::default()
+                }),
+                Some(r#""xmux": {"maxConnections": "1"}"#),
+            ),
+            1,
+            "the second REALITY xHTTP session dialled its own transport instead of reusing the pool"
+        );
+    }
+
+    /// An absent block normalizes to zeros, which the reference's pool reads as one connection with
+    /// no caps, so the second flow must ride the transport the first one dialled.
+    #[test]
+    fn an_absent_xmux_block_dials_one_pooled_connection() {
+        assert_eq!(
+            reality_xhttp_pool_accepts(None, None),
+            1,
+            "an absent xmux block dialled a second transport instead of reusing the first"
+        );
+    }
+
+    /// A written `{}` is not an absent block: the reference fills its own three-connection target, so
+    /// two sequential flows are two dials until the target is reached.
+    #[test]
+    fn a_written_empty_xmux_block_keeps_the_three_connection_target() {
+        assert_eq!(
+            reality_xhttp_pool_accepts(
+                Some(crate::xhttp::Xmux {
+                    max_connections: (3, 3),
+                    h_max_request_times: (600, 900),
+                    h_max_reusable_secs: (1800, 3000),
+                    ..crate::xhttp::Xmux::default()
+                }),
+                Some(r#""xmux": {}"#),
+            ),
+            2,
+            "a written `{{}}` dialled its own transport where the reference would grow the target"
+        );
+    }
+
+    /// A TLS stream-one session negotiates h2, so the second flow opens a stream on the first
+    /// connection; the handshake happened once even though the pool learned the protocol late.
+    #[test]
+    fn two_tls_xhttp_sessions_share_one_pooled_connection() {
+        const WITNESS: &str = "/tls-h2-pool-witness";
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_addr = echo.local_addr().expect("addr");
+        let _echo = thread::spawn(move || loop {
+            let Ok((mut stream, _)) = echo.accept() else {
+                return;
+            };
+            thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => {
+                            if stream.write_all(&buf[..n]).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        });
+        let id = [0x51u8; 16];
+        let users = one_vless_user(&id);
+        let (server_config, mut client_config) = carried_tls_configs();
+        let server_config = Arc::new(ferrox_core::tls::TlsServerConfig {
+            alpn: vec![b"h2".to_vec()],
+            ..(*server_config).clone()
+        });
+        client_config.alpn = vec![b"h2".to_vec()].into();
+        let mut settings = xhttp_settings(WITNESS);
+        settings.xmux = Some(crate::xhttp::Xmux {
+            max_connections: (1, 1),
+            ..crate::xhttp::Xmux::default()
+        });
+        let carrier = Carrier::Xhttp {
+            settings: settings.clone(),
+        };
+        let server_carrier = carrier.clone();
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let server_addr = front.local_addr().expect("addr");
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&accepted);
+        thread::spawn(move || loop {
+            let Ok((stream, _)) = front.accept() else {
+                return;
+            };
+            seen.fetch_add(1, Ordering::SeqCst);
+            let carrier = server_carrier.clone();
+            let server_config = Arc::clone(&server_config);
+            let users = users.clone();
+            thread::spawn(move || {
+                serve_vless_tls(stream, &users, true, &carrier, &server_config, None, None);
+            });
+        });
+        let pair = RealityPair {
+            outbound: tls_vless_out(server_addr.port(), id, carrier, client_config),
+            server: server_addr,
+            target: echo_addr,
+            echo: thread::spawn(|| ()),
+            front: thread::spawn(|| ()),
+        };
+        for _ in 0..2 {
+            let (mut user, dialled) = dial_pair(&pair);
+            let payload: Vec<u8> = (0..4096u32)
+                .map(|index| (index as u8).wrapping_mul(11).wrapping_add(3))
+                .collect();
+            assert_eq!(echo_bulk(&mut user, &payload), payload);
+            drop(user);
+            dialled.join().expect("joins");
+        }
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "the second TLS xHTTP session dialled its own transport instead of reusing the pool"
+        );
+    }
+
+    #[test]
+    fn reality_grpc_dial_reaches_echo_through_the_relay() {
+        let pair = reality_pair_with(
+            "",
+            "grpc",
+            Carrier::Grpc(crate::config::GrpcSettings::path("//Tun")),
+        );
+        let (mut user, dialled) = dial_pair(&pair);
+        let payload: Vec<u8> = (0..200_000u32)
+            .map(|index| (index as u8).wrapping_mul(41).wrapping_add(13))
+            .collect();
+        let back = echo_bulk(&mut user, &payload);
+        assert_eq!(
+            back, payload,
+            "payload came back altered through the carried REALITY gRPC session"
+        );
+        drop(user);
+        dialled.join().expect("joins");
+        pair.echo.join().expect("joins");
+        pair.front.join().expect("joins");
+    }
+
+    fn run_grpc_client(
+        outbound: Outbound,
+        server: SocketAddr,
+        target: SocketAddr,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dial = thread::spawn(move || {
+            let (client, _) = front.accept().expect("accepts");
+            tx.send(()).expect("signals");
+            dial_socks_outbound(&client, &outbound, &server, &Destination::from(target));
+        });
+        let mut user = Connection::connect(addr).expect("connects");
+        user.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        rx.recv_timeout(Duration::from_secs(30)).expect("dials");
+        let mut back = vec![0u8; payload.len()];
+        user.read_exact(&mut back).expect("reads the download");
+        drop(user);
+        dial.join().expect("joins");
+        back
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum GrpcCarry {
+        Plain,
+        Tls,
+        Reality,
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn grpc_multi_leg(carry: GrpcCarry, payload: &[u8], clients: usize) -> Duration {
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_addr = echo.local_addr().expect("addr");
+        let download = payload.to_vec();
+        let echo_handle = thread::spawn(move || {
+            let mut handles = Vec::new();
+            for _ in 0..clients {
+                let (mut stream, _) = echo.accept().expect("accepts");
+                let payload = download.clone();
+                handles.push(thread::spawn(move || {
+                    let _ = stream.write_all(&payload);
+                }));
+            }
+            for handle in handles {
+                handle.join().expect("joins");
+            }
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let server_addr = front.local_addr().expect("addr");
+        let carrier = Carrier::Grpc(crate::config::GrpcSettings::path("//Tun"));
+        let reality = carry == GrpcCarry::Reality;
+        let id = if reality {
+            uuid_bytes(REALITY_TEST_ID).expect("id")
+        } else {
+            [0x45u8; 16]
+        };
+        let reality_config = reality_server_config();
+        let (tls_server, tls_client) = carried_tls_configs();
+        let server_carrier = carrier.clone();
+        let server_handle = thread::spawn(move || {
+            let mut handles = Vec::new();
+            for _ in 0..clients {
+                let (stream, _) = front.accept().expect("accepts");
+                let carrier = server_carrier.clone();
+                handles.push(match carry {
+                    GrpcCarry::Plain => thread::spawn(move || {
+                        serve_vless(stream, &one_vless_user(&id), &carrier, true, None, None);
+                    }),
+                    GrpcCarry::Tls => {
+                        let config = std::sync::Arc::clone(&tls_server);
+                        thread::spawn(move || {
+                            serve_vless_tls(
+                                stream,
+                                &one_vless_user(&id),
+                                true,
+                                &carrier,
+                                &config,
+                                None,
+                                None,
+                            );
+                        })
+                    }
+                    GrpcCarry::Reality => {
+                        let config = reality_config.clone();
+                        thread::spawn(move || {
+                            serve_vless_reality(
+                                stream,
+                                &one_vless_user(&id),
+                                true,
+                                &carrier,
+                                &config,
+                                None,
+                                None,
+                            );
+                        })
+                    }
+                });
+            }
+            for handle in handles {
+                handle.join().expect("joins");
+            }
+        });
+        let outbound = if reality {
+            let public =
+                x25519_dalek::x25519(REALITY_TEST_PRIVATE, x25519_dalek::X25519_BASEPOINT_BYTES);
+            let root = crate::json::parse(&reality_network_json(
+                server_addr.port(),
+                &b64url(&public),
+                "",
+                "grpc",
+            ))
+            .expect("parses");
+            find_outbound(&root)
+                .expect("a REALITY outbound")
+                .expect("the config names one")
+        } else {
+            let tls = if carry == GrpcCarry::Tls {
+                Some(std::sync::Arc::new(tls_client))
+            } else {
+                None
+            };
+            Outbound::Vless(VlessOut {
+                address: "127.0.0.1".to_owned(),
+                port: server_addr.port(),
+                id,
+                carrier: carrier.clone(),
+                host: String::new(),
+                mux: Mux::default(),
+                pool: Pools::default(),
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
+                tls,
+                flow: String::new(),
+                reality: None,
+                headers: crate::config::carrier_headers(None).0,
+                heartbeat: crate::config::carrier_headers(None).1,
+                encryption: None,
+            })
+        };
+        let mut workers = Vec::new();
+        let start = std::time::Instant::now();
+        for _ in 0..clients {
+            let outbound = outbound.clone();
+            let payload = payload.to_vec();
+            workers.push(thread::spawn(move || {
+                run_grpc_client(outbound, server_addr, echo_addr, &payload)
+            }));
+        }
+        for worker in workers {
+            let back = worker.join().expect("joins");
+            assert_eq!(back, payload, "payload came back altered");
+        }
+        let elapsed = start.elapsed();
+        server_handle.join().expect("joins");
+        echo_handle.join().expect("joins");
+        elapsed
+    }
+
+    /// Eight downloads share one carrier each way: with one lane per direction and eight workers, a
+    /// worker parked in a full socket used to be the worker the sibling's credit needed, so every
+    /// flow stopped at the same frame. The payload is large enough to fill both send buffers.
+    #[test]
+    fn eight_downloads_finish_over_each_grpc_carrier() {
+        let _eight = EIGHT_FLOW
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let payload = vec![0x5au8; 4 * 1024 * 1024];
+        for carry in [GrpcCarry::Plain, GrpcCarry::Tls, GrpcCarry::Reality] {
+            grpc_multi_leg(carry, &payload, 8);
+        }
+    }
+
+    #[test]
+    fn reality_vision_direct_switch_carries_inner_tls() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let pair = reality_pair(ferrox_core::vless::VISION_FLOW);
+        let (server_config, client_config) = carried_tls_configs();
+        let inner = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let inner_addr = inner.local_addr().expect("addr");
+        let echo = thread::spawn(move || {
+            let (stream, _) = inner.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut buf = [0u8; 4096];
+            loop {
+                match tls.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        tls.write_all(&buf[..n]).expect("echoes");
+                        tls.flush().expect("flushes");
+                    }
+                }
+            }
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let outbound = match &pair.outbound {
+            Outbound::Vless(vless) => vless.clone(),
+            _ => panic!("the pair dials VLESS"),
+        };
+        let server = pair.server;
+        let dialled = thread::spawn(move || {
+            let (client, _) = front.accept().expect("accepts");
+            tx.send(()).expect("signals");
+            dial_socks_outbound(
+                &client,
+                &Outbound::Vless(outbound),
+                &server,
+                &Destination::from(inner_addr),
+            );
+        });
+        let user = Connection::connect(addr).expect("connects");
+        user.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        rx.recv_timeout(Duration::from_secs(30)).expect("dials");
+        let mut inner = ferrox_core::tls::connect(&client_config, user).expect("inner configures");
+        inner.handshake().expect("inner handshakes");
+        for round in 0..4 {
+            let payload = format!("inner tls round {round}");
+            inner.write_all(payload.as_bytes()).expect("writes");
+            inner.flush().expect("flushes");
+            let mut echoed = vec![0; payload.len()];
+            inner.read_exact(&mut echoed).expect("echoes");
+            assert_eq!(echoed, payload.as_bytes());
+        }
+        drop(inner);
+        dialled.join().expect("joins");
+        echo.join().expect("joins");
+        pair.front.join().expect("joins");
+    }
+
+    /// A read timeout is the socket's poll, not the flow's end: the echo retries it and still answers every round.
+    struct IdleOnce {
+        io: Connection,
+        idle: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Read for IdleOnce {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.idle.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+            }
+            self.io.read(buf)
+        }
+    }
+
+    impl Write for IdleOnce {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.io.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.io.flush()
+        }
+    }
+
+    #[test]
+    fn reality_vision_inner_tls_survives_rounds_through_the_window() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let pair = reality_pair(ferrox_core::vless::VISION_FLOW);
+        let (server_config, client_config) = carried_tls_configs();
+        let inner = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let inner_addr = inner.local_addr().expect("addr");
+        let idle = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let echo_idle = Arc::clone(&idle);
+        let echo = thread::spawn(move || {
+            let (stream, _) = inner.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::accept(
+                &server_config,
+                IdleOnce {
+                    io: stream,
+                    idle: echo_idle,
+                },
+            )
+            .expect("accepts");
+            tls.handshake().expect("handshakes");
+            idle.store(true, std::sync::atomic::Ordering::SeqCst);
+            let mut buf = [0u8; 4096];
+            loop {
+                match tls.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tls.write_all(&buf[..n]).is_err() || tls.flush().is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) if is_timeout(&error) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let outbound = match &pair.outbound {
+            Outbound::Vless(vless) => vless.clone(),
+            _ => panic!("the pair dials VLESS"),
+        };
+        let server = pair.server;
+        let dialled = thread::spawn(move || {
+            let (client, _) = front.accept().expect("accepts");
+            tx.send(()).expect("signals");
+            dial_socks_outbound(
+                &client,
+                &Outbound::Vless(outbound),
+                &server,
+                &Destination::from(inner_addr),
+            );
+        });
+        let user = Connection::connect(addr).expect("connects");
+        user.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        rx.recv_timeout(Duration::from_secs(30)).expect("dials");
+        let mut inner = ferrox_core::tls::connect(&client_config, user).expect("inner configures");
+        inner.handshake().expect("inner handshakes");
+        let widths = [18usize, 511, 20_021];
+        // A stalled echo must name its round: a read that retries its own timeout forever once left this test silent past the detector's 240 s.
+        let began = Instant::now();
+        for round in 0..180u32 {
+            let width = widths[round as usize % widths.len()];
+            let payload: Vec<u8> = (0..width)
+                .map(|index| (index as u8).wrapping_mul(37).wrapping_add(round as u8))
+                .collect();
+            inner.write_all(&payload).expect("writes");
+            inner.flush().expect("flushes");
+            let mut echoed = vec![0u8; width];
+            let mut filled = 0usize;
+            while filled < width {
+                match inner.read(&mut echoed[filled..]) {
+                    Ok(0) => panic!("round {round}, {width} B: the echo closed after {filled} B"),
+                    Ok(read) => filled += read,
+                    Err(error) if is_timeout(&error) => assert!(
+                        began.elapsed() < Duration::from_secs(120),
+                        "round {round}, {width} B: {} of 180 rounds done and {filled} of {width} B back in {:?}",
+                        round,
+                        began.elapsed()
+                    ),
+                    Err(error) => panic!("round {round}, {width} B: {error}"),
+                }
+            }
+            assert_eq!(echoed, payload);
+        }
+        drop(inner);
+        join_thread_within(dialled, Duration::from_secs(30), "the dialling front");
+        join_thread_within(echo, Duration::from_secs(30), "the inner TLS echo");
+        join_thread_within(pair.front, Duration::from_secs(30), "the REALITY front");
+    }
+
+    #[test]
+    fn the_gauge_paces_only_past_the_burst_it_was_given() {
+        let mut flat = Gauge::start(ferrox_core::tls::RateLimit {
+            after_bytes: 4,
+            bytes_per_sec: 0,
+            burst_bytes_per_sec: 0,
+        });
+        let start = Instant::now();
+        for _ in 0..8 {
+            flat.admit(1);
+        }
+        assert!(
+            start.elapsed() < Duration::from_millis(20),
+            "no rate, no wait"
+        );
+
+        let mut capped = Gauge::start(ferrox_core::tls::RateLimit {
+            after_bytes: 0,
+            bytes_per_sec: 500,
+            burst_bytes_per_sec: 4_096,
+        });
+        let start = Instant::now();
+        capped.admit(4_096);
+        assert!(
+            start.elapsed() < Duration::from_millis(5),
+            "the burst is free"
+        );
+        capped.admit(1);
+        assert!(
+            start.elapsed() >= Duration::from_millis(1),
+            "the byte past the burst waits out its token"
+        );
+    }
+
+    #[test]
+    fn carriers_read_their_paths_out_of_stream_settings() {
+        let xhttp = crate::json::parse(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/share", "mode": "stream-one"}}}"#,
+        )
+        .expect("parses");
+        assert!(matches!(
+            stream_carrier(xhttp.get("streamSettings")),
+            Carrier::Xhttp { settings, .. } if settings.path == "/share"
+        ));
+        let legacy = crate::json::parse(
+            r#"{"streamSettings": {"network": "xhttp", "splithttpSettings": {"path": "/legacy"}}}"#,
+        )
+        .expect("parses");
+        assert!(matches!(
+            stream_carrier(legacy.get("streamSettings")),
+            Carrier::Xhttp { settings, .. } if settings.path == "/legacy"
+        ));
+        let packet = crate::json::parse(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"mode": "packet-up"}}}"#,
+        )
+        .expect("parses");
+        assert!(matches!(
+            stream_carrier(packet.get("streamSettings")),
+            Carrier::Xhttp { settings, .. }
+                if settings.mode == crate::xhttp::XhttpMode::PacketUp
+        ));
+        let reality = crate::json::parse(
+            r#"{"streamSettings": {"network": "xhttp", "security": "reality", "xhttpSettings": {}}}"#,
+        )
+        .expect("parses");
+        assert!(matches!(
+            stream_carrier(reality.get("streamSettings")),
+            Carrier::Xhttp { settings, .. }
+                if settings.mode == crate::xhttp::XhttpMode::StreamOne
+        ));
+        let camouflage = crate::json::parse(
+            r#"{"streamSettings": {"network": "tcp", "tcpSettings": {"header": {"type": "http", "request": {"path": ["/camouflage"]}}}}}"#,
+        )
+        .expect("parses");
+        assert!(matches!(
+            stream_carrier(camouflage.get("streamSettings")),
+            Carrier::HttpHeader { path, .. } if path == "/camouflage"
+        ));
+        let plain =
+            crate::json::parse(r#"{"streamSettings": {"network": "tcp"}}"#).expect("parses");
+        assert!(matches!(
+            stream_carrier(plain.get("streamSettings")),
+            Carrier::Raw(_)
+        ));
+    }
+
+    fn xhttp_settings(path: &str) -> Box<crate::xhttp::XhttpSettings> {
+        Box::new(crate::xhttp::XhttpSettings {
+            path: path.to_owned(),
+            // These rows are about what a hub that was *told* a mode refuses; an unstated mode serves every shape its dialer can write.
+            mode_source: crate::xhttp::ModeSource::Stated,
+            ..crate::xhttp::XhttpSettings::stream_one()
+        })
+    }
+
+    fn xhttp_settings_mode(
+        path: &str,
+        mode: crate::xhttp::XhttpMode,
+    ) -> Box<crate::xhttp::XhttpSettings> {
+        Box::new(crate::xhttp::XhttpSettings {
+            path: path.to_owned(),
+            mode,
+            mode_source: crate::xhttp::ModeSource::Stated,
+            ..crate::xhttp::XhttpSettings::stream_one()
+        })
+    }
+
+    /// One padded request head: the padding every default-configured server accepts.
+    fn xhttp_pad() -> String {
+        format!(
+            "Referer: http://127.0.0.1/x?x_padding={}\r\n",
+            "X".repeat(128)
+        )
+    }
+
+    fn vless_over_carrier_reaches_echo(carrier: &Carrier, host: &str, path: &str) {
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 1024];
+            loop {
+                let Ok(read) = stream.read(&mut buf) else {
+                    return;
+                };
+                if read == 0 {
+                    return;
+                }
+                if stream.write_all(&buf[..read]).is_err() {
+                    return;
+                }
+            }
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let serving: Carrier = carrier.clone();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_vless(stream, &one_vless_user(&id), &serving, true, None, None);
+        });
+        let link = ferrox_core::vless::VlessLink::parse(
+            "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@192.0.2.1:443?security=none&encryption=none&type=tcp#x",
+        )
+        .expect("parses");
+        let header = link.encode_request_header("127.0.0.1", echo_port);
+        let uplink = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        uplink
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        match &carrier {
+            Carrier::Xhttp { .. } => {
+                let (mut reader, writer) =
+                    crate::xhttp::connect(uplink, host, path, &[], &"X".repeat(500))
+                        .expect("upgrades");
+                writer.send(&header);
+                let mut reply = [0u8; 2];
+                reader.read_exact(&mut reply).expect("replies");
+                assert_eq!(reply, [0, 0]);
+                writer.send(b"ping");
+                writer.finish();
+                let mut back = Vec::new();
+                reader.read_to_end(&mut back).expect("echoes");
+                assert_eq!(back, b"ping");
+            }
+            Carrier::HttpHeader { .. } => {
+                let (mut reader, mut write) =
+                    crate::httpheader::connect(uplink, host, path, &[]).expect("headers");
+                write.write_all(&header).expect("writes");
+                let mut reply = [0u8; 2];
+                reader.read_exact(&mut reply).expect("replies");
+                assert_eq!(reply, [0, 0]);
+                write.write_all(b"ping").expect("writes");
+                let mut back = [0u8; 4];
+                reader.read_exact(&mut back).expect("echoes");
+                assert_eq!(&back, b"ping");
+            }
+            _ => unreachable!("this helper only serves the two new carriers"),
+        }
+    }
+
+    #[test]
+    fn vless_over_xhttp_reaches_echo() {
+        vless_over_carrier_reaches_echo(
+            &Carrier::Xhttp {
+                settings: xhttp_settings("/share"),
+            },
+            "oracle.example",
+            "/share",
+        );
+    }
+
+    /// An H1 stream-one session arms the relay poll on its socket before it relays, so an upload leg
+    /// waiting for payload parks instead of pinning one of the few relay workers the download legs need.
+    #[cfg(unix)]
+    fn assert_h1_arms(settings: Box<crate::xhttp::XhttpSettings>) {
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let users = one_vless_user(&[0xaau8; 16]);
+        let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+        let serving = thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            probe_tx
+                .send(stream.try_clone().expect("probe"))
+                .expect("probe");
+            serve_vless_xhttp(stream, &settings, &users, None, true, None);
+        });
+        let mut peer = Connection::connect(addr).expect("connects");
+        peer.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        xhttp_post_head(&mut peer, "/share", true);
+        let probe = probe_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("probe");
+        let until = Instant::now() + Duration::from_secs(5);
+        while probe.read_timeout().ok().flatten() != Some(budgets::RELAY_POLL) {
+            assert!(
+                Instant::now() < until,
+                "the H1 session never armed the relay poll"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        drop(peer);
+        serving.join().expect("joins");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_h1_xhttp_session_arms_the_relay_poll_before_it_relays() {
+        assert_h1_arms(xhttp_settings("/share"));
+    }
+
+    /// Automatic mode resolves to packet-up, yet the same hub serves a stream-one POST; its upload must not pin a worker either.
+    #[cfg(unix)]
+    #[test]
+    fn an_automatic_h1_stream_one_post_arms_the_relay_poll() {
+        assert_h1_arms(Box::new(crate::xhttp::XhttpSettings {
+            mode: crate::xhttp::XhttpMode::PacketUp,
+            mode_source: crate::xhttp::ModeSource::Auto,
+            ..*xhttp_settings("/share")
+        }));
+    }
+
+    /// Raw HTTP/1.1 clients for the three xhttp modes, padded, with session and seq in the path.
+    fn xhttp_get(stream: &mut Connection, target: &str) {
+        stream
+            .write_all(
+                format!(
+                    "GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n{}Connection: keep-alive\r\n\r\n",
+                    xhttp_pad(),
+                )
+                .as_bytes(),
+            )
+            .expect("writes");
+    }
+
+    fn xhttp_post_head(stream: &mut Connection, target: &str, chunked: bool) {
+        let framing = if chunked {
+            "Transfer-Encoding: chunked"
+        } else {
+            "Content-Length: 0"
+        };
+        stream
+            .write_all(
+                format!(
+                    "POST {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n{}Content-Type: application/grpc\r\n{framing}\r\nConnection: keep-alive\r\n\r\n",
+                    xhttp_pad(),
+                )
+                .as_bytes(),
+            )
+            .expect("writes");
+    }
+
+    fn xhttp_chunk(stream: &mut Connection, data: &[u8]) {
+        stream
+            .write_all(format!("{:X}\r\n", data.len()).as_bytes())
+            .expect("writes");
+        stream.write_all(data).expect("writes");
+        stream.write_all(b"\r\n").expect("writes");
+        stream.flush().expect("flushes");
+    }
+
+    fn xhttp_read_head(stream: &mut Connection) -> Vec<u8> {
+        let mut head = Vec::new();
+        let mut one = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            match stream.read(&mut one) {
+                Ok(0) => panic!("head ended early"),
+                Ok(_) => head.extend_from_slice(&one),
+                Err(error) => panic!("head failed: {error:?}"),
+            }
+            assert!(head.len() < 65536, "head too long");
+        }
+        head
+    }
+
+    fn xhttp_status(head: &[u8]) -> u16 {
+        let line = head.split(|b| *b == b'\r').next().unwrap_or_default();
+        let code = line.split(|b| *b == b' ').nth(1).unwrap_or_default();
+        std::str::from_utf8(code)
+            .unwrap_or_default()
+            .parse()
+            .unwrap_or(0)
+    }
+
+    /// Reads exactly `n` de-chunked bytes, the way any HTTP layer does before handing over the logical stream.
+    fn xhttp_read_chunked(stream: &mut Connection, n: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n);
+        let mut line = Vec::new();
+        let mut one = [0u8; 1];
+        while out.len() < n {
+            line.clear();
+            while !line.ends_with(b"\r\n") {
+                match stream.read(&mut one) {
+                    Ok(0) => panic!("chunk ended early"),
+                    Ok(_) => line.extend_from_slice(&one),
+                    Err(error) => panic!("chunk failed: {error:?}"),
+                }
+            }
+            let size = usize::from_str_radix(
+                std::str::from_utf8(&line[..line.len() - 2])
+                    .unwrap_or_default()
+                    .trim(),
+                16,
+            )
+            .unwrap_or_default();
+            assert!(
+                size != 0,
+                "downlink ended with {} of {n} bytes left",
+                n - out.len()
+            );
+            let mut chunk = vec![0u8; size];
+            stream.read_exact(&mut chunk).expect("reads the chunk");
+            let mut crlf = [0u8; 2];
+            stream.read_exact(&mut crlf).expect("reads the close");
+            assert_eq!(&crlf, b"\r\n");
+            let take = (n - out.len()).min(size);
+            out.extend_from_slice(&chunk[..take]);
+        }
+        out
+    }
+
+    /// Serve exactly `takes` xhttp connections the way the accept loop does.
+    fn xhttp_serve_n(listener: &Listener, takes: usize, carrier: &Carrier, id: [u8; 16]) {
+        for stream in listener.incoming().take(takes) {
+            let Ok(stream) = stream else { continue };
+            let carrier = carrier.clone();
+            crate::budgets::spawn(move || {
+                serve_vless(stream, &one_vless_user(&id), &carrier, true, None, None);
+            });
+        }
+    }
+
+    /// A peer that opens the carrier and sends nothing must release its thread at the handshake budget; the magic read cannot sit on a socket that will never answer.
+    #[test]
+    fn a_silent_xhttp_peer_releases_its_thread() {
+        crate::budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(200)),
+            ..Default::default()
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let carrier = Carrier::Xhttp {
+            settings: xhttp_settings("/up/"),
+        };
+        let (done, waited) = std::sync::mpsc::channel();
+        let serving = crate::budgets::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_vless(
+                stream,
+                &one_vless_user(&[0xaau8; 16]),
+                &carrier,
+                true,
+                None,
+                None,
+            );
+            let _ = done.send(());
+        });
+        let peer = Connection::connect(addr).expect("connects");
+        let verdict = waited.recv_timeout(Duration::from_secs(2));
+        drop(peer);
+        crate::budgets::clear();
+        assert!(
+            verdict.is_ok(),
+            "a silent xhttp peer pinned its thread past the handshake budget"
+        );
+        serving.join().expect("joins");
+    }
+
+    /// An encrypted xHTTP peer that opens the session and never sends the hello must release its thread at the handshake budget; the chunk body reader retries timeouts forever.
+    #[test]
+    fn an_encrypted_silent_xhttp_peer_releases_its_thread() {
+        crate::budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
+        let (_, server_string) =
+            ferrox_core::vless_encryption::generate_pair(true, "native", "1rtt", "600");
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol":"vless","settings":{{"decryption":"{server_string}"}}}}"#
+        ))
+        .expect("parses");
+        let decryption = crate::config::server_decryption(&inbound)
+            .expect("decryption")
+            .expect("engine");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let carrier = Carrier::Xhttp {
+            settings: xhttp_settings("/up/"),
+        };
+        let (done, waited) = std::sync::mpsc::channel();
+        let serving = crate::budgets::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_vless(
+                stream,
+                &one_vless_user(&[0xaau8; 16]),
+                &carrier,
+                true,
+                None,
+                Some(&decryption),
+            );
+            let _ = done.send(());
+        });
+        let mut peer = Connection::connect(addr).expect("connects");
+        xhttp_post_head(&mut peer, "/up/", true);
+        let verdict = waited.recv_timeout(budgets::handshake() + Duration::from_secs(5));
+        drop(peer);
+        crate::budgets::clear();
+        assert!(
+            verdict.is_ok(),
+            "an encrypted silent xhttp peer pinned its thread past the handshake budget"
+        );
+        serving.join().expect("joins");
+    }
+
+    /// An HTTP/2 xhttp client sends its preface once; the carrier's probe must hand those bytes to the h2 loop rather than consume them and read the next frame as a second preface.
+    #[test]
+    fn an_h2_xhttp_client_is_served_after_the_preface() {
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let carrier = Carrier::Xhttp {
+            settings: xhttp_settings("/up/"),
+        };
+        let serving = thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_vless(
+                stream,
+                &one_vless_user(&[0xaau8; 16]),
+                &carrier,
+                true,
+                None,
+                None,
+            );
+        });
+        let mut peer = Connection::connect(addr).expect("connects");
+        peer.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        peer.write_all(crate::h2::MAGIC).expect("preface");
+        let mut settings = Vec::new();
+        settings.extend_from_slice(&crate::h2::S_WINDOW.to_be_bytes());
+        settings.extend_from_slice(&crate::h2::WINDOW.to_be_bytes());
+        crate::h2::write_frame(&mut peer, crate::h2::T_SETTINGS, 0, 0, &settings);
+        peer.flush().expect("flushes");
+        let (_, kind, _, _) = crate::h2::read_head(&mut peer).expect("the server preface");
+        assert_eq!(
+            kind,
+            crate::h2::T_SETTINGS,
+            "an h2 carrier answered its settings, not the next frame's bytes"
+        );
+        drop(peer);
+        serving.join().expect("joins");
+    }
+
+    #[test]
+    fn a_plaintext_h2c_dial_reaches_the_hub() {
+        assert_plaintext_h2c_dial(crate::xhttp::XhttpMode::StreamOne);
+    }
+
+    #[test]
+    fn a_plaintext_h2c_stream_up_reaches_the_hub() {
+        assert_plaintext_h2c_dial(crate::xhttp::XhttpMode::StreamUp);
+    }
+
+    #[test]
+    fn a_plaintext_h2c_packet_up_reaches_the_hub() {
+        assert_plaintext_h2c_dial(crate::xhttp::XhttpMode::PacketUp);
+    }
+
+    fn assert_plaintext_h2c_dial(mode: crate::xhttp::XhttpMode) {
+        let witness = format!("/plain-h2c-{mode:?}");
+        let id = [0x56u8; 16];
+        let settings = Box::new(crate::xhttp::XhttpSettings {
+            h2c: true,
+            ..*xhttp_settings_mode(&witness, mode)
+        });
+        let server_settings = settings.clone();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless(
+                stream,
+                &one_vless_user(&id),
+                &Carrier::Xhttp {
+                    settings: server_settings,
+                },
+                true,
+                None,
+                None,
+            );
+        });
+        let out = Outbound::Vless(VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            carrier: Carrier::Xhttp { settings },
+            host: "127.0.0.1".to_owned(),
+            mux: Mux::default(),
+            pool: Pools::default(),
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            encryption: None,
+        });
+        carrier_echo(out, port);
+        server.join().expect("joins");
+        assert!(
+            H2_DIAL_WITNESS
+                .lock()
+                .expect("witness lock")
+                .iter()
+                .any(|path| path == &witness),
+            "an h2c dial must open with the H2 preface"
+        );
+    }
+
+    /// An h2c downlink read parks on the transport's clock: a peer that sends no frame hands the
+    /// relay lane back instead of pinning it in a blocking socket read.
+    #[test]
+    fn an_h2c_downlink_read_yields_the_relay_lane() {
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let peer = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            thread::sleep(Duration::from_secs(2));
+            drop(stream);
+        });
+        let settings = Box::new(crate::xhttp::XhttpSettings {
+            h2c: true,
+            ..crate::xhttp::XhttpSettings::stream_one()
+        });
+        let uplink = Connection::connect(("127.0.0.1", port)).expect("connects");
+        let (mut reader, _writer) = xhttp_pair(uplink, "127.0.0.1", &settings).expect("pair");
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _step = RelayStep::enter();
+            let _ = tx.send(reader.read_window().is_err());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("an idle h2c downlink must yield its lane"),
+            "an idle h2c downlink must time out, not block"
+        );
+        peer.join().ok();
+    }
+
+    fn xhttp_vless_header(echo_port: u16) -> Vec<u8> {
+        let link = ferrox_core::vless::VlessLink::parse(
+            "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@192.0.2.1:443?security=none&encryption=none&type=tcp#x",
+        )
+        .expect("parses");
+        link.encode_request_header("127.0.0.1", echo_port)
+    }
+
+    fn xhttp_echo_server() -> (SocketAddr, thread::JoinHandle<()>) {
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = echo.local_addr().expect("addr");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = vec![0u8; 65536];
+            loop {
+                let Ok(read) = stream.read(&mut buf) else {
+                    return;
+                };
+                if read == 0 {
+                    return;
+                }
+                if stream.write_all(&buf[..read]).is_err() {
+                    return;
+                }
+            }
+        });
+        (addr, handle)
+    }
+
+    fn xhttp_front(
+        carrier: Carrier,
+        id: [u8; 16],
+        takes: usize,
+    ) -> (SocketAddr, thread::JoinHandle<()>) {
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let handle = thread::spawn(move || xhttp_serve_n(&front, takes, &carrier, id));
+        (addr, handle)
+    }
+
+    #[test]
+    fn xhttp_stream_up_carries_bulk_both_ways() {
+        let (echo_addr, echo) = xhttp_echo_server();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let carrier = Carrier::Xhttp {
+            settings: xhttp_settings_mode("/up", crate::xhttp::XhttpMode::StreamUp),
+        };
+        let (addr, server) = xhttp_front(carrier, id, 2);
+        let header = xhttp_vless_header(echo_addr.port());
+
+        let mut down = Connection::connect(addr).expect("connects");
+        down.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        xhttp_get(&mut down, "/up/sess-up-01");
+        let head = xhttp_read_head(&mut down);
+        assert_eq!(xhttp_status(&head), 200);
+
+        let mut up = Connection::connect(addr).expect("connects");
+        up.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        xhttp_post_head(&mut up, "/up/sess-up-01", true);
+        let payload: Vec<u8> = (0..65536u32).map(|i| (i % 251) as u8).collect();
+        let writer = thread::spawn(move || {
+            xhttp_chunk(&mut up, &header);
+            let mut at = 0;
+            while at < payload.len() {
+                let end = (at + 4096).min(payload.len());
+                xhttp_chunk(&mut up, &payload[at..end]);
+                at = end;
+            }
+            up.write_all(b"0\r\n\r\n").expect("terminates");
+            up
+        });
+
+        let reply = xhttp_read_chunked(&mut down, 2);
+        assert_eq!(reply, [0, 0]);
+        let echoed = xhttp_read_chunked(&mut down, 65536);
+        assert_eq!(
+            echoed,
+            (0..65536u32).map(|i| (i % 251) as u8).collect::<Vec<u8>>()
+        );
+        writer.join().expect("joins");
+        drop(down);
+        echo.join().expect("joins");
+        server.join().expect("joins");
+    }
+
+    #[test]
+    fn xhttp_packet_up_reassembles_out_of_order_posts() {
+        let (echo_addr, _echo) = xhttp_echo_server();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let carrier = Carrier::Xhttp {
+            settings: xhttp_settings_mode("/up", crate::xhttp::XhttpMode::PacketUp),
+        };
+        let (addr, server) = xhttp_front(carrier, id, 3);
+        let header = xhttp_vless_header(echo_addr.port());
+        let payload: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+
+        let mut down = Connection::connect(addr).expect("connects");
+        down.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        xhttp_get(&mut down, "/up/sess-pkt-01");
+        let head = xhttp_read_head(&mut down);
+        assert_eq!(xhttp_status(&head), 200);
+
+        // Sequence 1 posts before sequence 0: the heap must still deliver in order.
+        let mut one = Connection::connect(addr).expect("connects");
+        one.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let body1 = &payload[4096..];
+        one.write_all(
+            format!(
+                "POST /up/sess-pkt-01/1 HTTP/1.1\r\nHost: 127.0.0.1\r\n{}Content-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                xhttp_pad(),
+                body1.len()
+            )
+            .as_bytes(),
+        )
+        .expect("writes");
+        one.write_all(body1).expect("writes");
+        one.flush().expect("flushes");
+        let head = xhttp_read_head(&mut one);
+        assert_eq!(xhttp_status(&head), 200);
+
+        let mut zero = Connection::connect(addr).expect("connects");
+        zero.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let mut body0 = header.clone();
+        body0.extend_from_slice(&payload[..4096]);
+        zero
+            .write_all(
+                format!(
+                    "POST /up/sess-pkt-01/0 HTTP/1.1\r\nHost: 127.0.0.1\r\n{}Content-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                    xhttp_pad(),
+                    body0.len()
+                )
+                .as_bytes(),
+            )
+            .expect("writes");
+        zero.write_all(&body0).expect("writes");
+        zero.flush().expect("flushes");
+        let head = xhttp_read_head(&mut zero);
+        assert_eq!(xhttp_status(&head), 200);
+
+        let reply = xhttp_read_chunked(&mut down, 2);
+        assert_eq!(reply, [0, 0]);
+        let echoed = xhttp_read_chunked(&mut down, payload.len());
+        assert_eq!(echoed, payload);
+        drop(down);
+        drop(one);
+        drop(zero);
+        server.join().expect("joins");
+        // No echo join: packet-up has no terminal marker, so the session outlives the last asserted byte.
+    }
+
+    #[test]
+    fn xhttp_greeting_first_arrives_before_uplink_payload() {
+        let greet = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let greet_addr = greet.local_addr().expect("addr");
+        let greeter = thread::spawn(move || {
+            let (mut stream, _) = greet.accept().expect("accepts");
+            stream.write_all(b"220 greetings\r\n").expect("greets");
+            stream.flush().expect("flushes");
+            let mut buf = [0u8; 1024];
+            loop {
+                let Ok(read) = stream.read(&mut buf) else {
+                    return;
+                };
+                if read == 0 {
+                    return;
+                }
+                if stream.write_all(&buf[..read]).is_err() {
+                    return;
+                }
+            }
+        });
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let carrier = Carrier::Xhttp {
+            settings: xhttp_settings_mode("/up", crate::xhttp::XhttpMode::StreamUp),
+        };
+        let (addr, server) = xhttp_front(carrier, id, 2);
+        let link = ferrox_core::vless::VlessLink::parse(
+            "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@192.0.2.1:443?security=none&encryption=none&type=tcp#x",
+        )
+        .expect("parses");
+        let header = link.encode_request_header("127.0.0.1", greet_addr.port());
+
+        let mut down = Connection::connect(addr).expect("connects");
+        down.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        xhttp_get(&mut down, "/up/sess-greet-01");
+        let head = xhttp_read_head(&mut down);
+        assert_eq!(xhttp_status(&head), 200);
+
+        // Only the VLESS header goes up; the greeting must arrive unprompted.
+        let mut up = Connection::connect(addr).expect("connects");
+        up.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        xhttp_post_head(&mut up, "/up/sess-greet-01", true);
+        xhttp_chunk(&mut up, &header);
+        let response = xhttp_read_chunked(&mut down, 2);
+        assert_eq!(response, [0, 0]);
+        let greeting = xhttp_read_chunked(&mut down, 15);
+        assert_eq!(greeting, b"220 greetings\r\n");
+        xhttp_chunk(&mut up, b"ping");
+        up.write_all(b"0\r\n\r\n").expect("terminates");
+        let echoed = xhttp_read_chunked(&mut down, 4);
+        assert_eq!(echoed, b"ping");
+        drop(down);
+        drop(up);
+        greeter.join().expect("joins");
+        server.join().expect("joins");
+    }
+
+    #[test]
+    fn xhttp_refusals_carry_their_statuses() {
+        fn status_of(settings: &crate::xhttp::XhttpSettings, request: &[u8]) -> u16 {
+            let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let port = listener.local_addr().expect("addr").port();
+            let settings = settings.clone();
+            thread::spawn(move || {
+                let (stream, _) = listener.accept().expect("accepts");
+                let Ok(read) = stream.try_clone() else {
+                    return;
+                };
+                let _ = crate::xhttp::accept_split_with_settings(read, stream, &settings, None);
+            });
+            let mut stream = Connection::connect(("127.0.0.1", port)).expect("connects");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("timeout");
+            stream.write_all(request).expect("writes");
+            let head = xhttp_read_head(&mut stream);
+            xhttp_status(&head)
+        }
+        let one = xhttp_settings("/up");
+        let pad = xhttp_pad();
+        let req = |method: &str, target: &str, extra: &str| {
+            format!("{method} {target} HTTP/1.1\r\nHost: h\r\n{pad}{extra}\r\n")
+        };
+        assert_eq!(status_of(&one, req("POST", "/other", "").as_bytes()), 404);
+        assert_eq!(
+            status_of(
+                &one,
+                b"POST /up HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice()
+            ),
+            400
+        );
+        assert_eq!(status_of(&one, req("DELETE", "/up", "").as_bytes()), 405);
+        let up = xhttp_settings_mode("/up", crate::xhttp::XhttpMode::StreamUp);
+        assert_eq!(
+            status_of(&up, req("POST", "/up", "").as_bytes()),
+            400,
+            "an uplink POST with no chunked framing"
+        );
+        assert_eq!(
+            status_of(
+                &up,
+                req("POST", "/up", "Transfer-Encoding: chunked\r\n").as_bytes()
+            ),
+            200,
+            "a stated stream-up hub serves a session-less POST, as the reference does"
+        );
+        assert_eq!(
+            status_of(&up, req("GET", "/up/abc", "").as_bytes()),
+            200,
+            "stream-up downlink"
+        );
+        let packet = xhttp_settings_mode("/up", crate::xhttp::XhttpMode::PacketUp);
+        assert_eq!(
+            status_of(&packet, req("POST", "/up/abc", "").as_bytes()),
+            400,
+            "packet-up without a seq"
+        );
+        assert_eq!(
+            status_of(&packet, req("POST", "/up/abc/notanumber", "").as_bytes()),
+            500,
+            "packet-up with a bad seq"
+        );
+        assert_eq!(
+            status_of(&one, req("POST", "/up/abc", "").as_bytes()),
+            400,
+            "stream-one with a session id"
+        );
+        assert_eq!(
+            status_of(
+                &packet,
+                format!(
+                    "POST /up/abc/0 HTTP/1.1\r\nHost: h\r\n{pad}Content-Length: 2000000\r\n\r\n"
+                )
+                .as_bytes()
+            ),
+            413
+        );
+
+        let obfs = crate::json::parse(
+            r#"{"xhttpSettings": {"path": "/up", "mode": "stream-one", "extra": {
+                "xPaddingBytes": "1-1", "xPaddingObfsMode": true, "xPaddingKey": "ctx",
+                "xPaddingHeader": "x-grpc-context", "xPaddingMethod": "tokenish"}}}"#,
+        )
+        .expect("parses");
+        let obfs = crate::xhttp::XhttpSettings::from_json(Some(&obfs)).expect("extra parses");
+        assert_eq!(
+            status_of(
+                &obfs,
+                b"POST /up HTTP/1.1\r\nHost: h\r\nx-grpc-context: http://h/up?ctx=kq\r\nTransfer-Encoding: chunked\r\n\r\n"
+            ),
+            200,
+            "the padding the reference puts in the configured header"
+        );
+        assert_eq!(
+            status_of(&obfs, req("POST", "/up", "").as_bytes()),
+            400,
+            "the default Referer padding is refused once obfs mode is on"
+        );
+    }
+
+    #[test]
+    fn vless_over_http_camouflage_reaches_echo() {
+        vless_over_carrier_reaches_echo(
+            &Carrier::HttpHeader {
+                paths: vec!["/camouflage".to_owned()],
+                path: "/camouflage".to_owned(),
+                response: None,
+            },
+            "oracle.example",
+            "/camouflage",
+        );
+    }
+
+    /// A failed encryption handshake on an HTTP-header carrier must not climb to the raw rung: that rung would put the user id and destination on the wire in clear.
+    #[test]
+    fn a_failed_encrypted_httpheader_handshake_never_writes_the_plain_header() {
+        let (client_string, _server_string) =
+            ferrox_core::vless_encryption::generate_pair(true, "native", "1rtt", "600");
+        let client = vless_client_encryption(Some(&client_string))
+            .expect("client")
+            .expect("engine");
+        let id = [0x7au8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let server_addr = listener.local_addr().expect("addr");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let seen = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_seen = Arc::clone(&seen);
+        let server_stop = Arc::clone(&stop);
+        let server = thread::spawn(move || {
+            while !server_stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n",
+                        );
+                        stream
+                            .set_read_timeout(Some(Duration::from_millis(100)))
+                            .expect("timeout");
+                        let mut got = Vec::new();
+                        let mut buf = [0u8; 256];
+                        while got.len() < buf.len() {
+                            match stream.read(&mut buf) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => got.extend_from_slice(&buf[..n]),
+                            }
+                        }
+                        server_seen.lock().expect("seen").push(got);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: server_addr.port(),
+            id,
+            carrier: Carrier::HttpHeader {
+                paths: vec!["/p".to_owned()],
+                path: "/p".to_owned(),
+                response: None,
+            },
+            host: "127.0.0.1".to_owned(),
+            mux: Mux::default(),
+            pool: Pools::default(),
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
