@@ -2558,7 +2558,6 @@ pub(crate) struct H3 {
     direct: usize,
     /// The source addresses the proxy currently lets this CONNECT-IP lane use, replaced whole by each assignment capsule.
     assigned: Assignment,
-    fin: bool,
     /// The peer sent its fin: nothing more will arrive on the request stream, so a reader that has the bytes it was given is at the end of the tunnel and a reader that has none is at the end of a stream that carried none.
     closed: bool,
     deadline: Instant,
@@ -2633,7 +2632,6 @@ impl H3 {
             handed: 0,
             direct: 0,
             assigned: ([0u8; 32], [0usize; 2]),
-            fin: false,
             closed: false,
             deadline: Instant::now(),
             head_wait,
@@ -2715,7 +2713,6 @@ impl H3 {
             handed: 0,
             direct: 0,
             assigned: ([0u8; 32], [0usize; 2]),
-            fin: false,
             closed: false,
             deadline: Instant::now(),
             head_wait: HEADER_TIMEOUT,
@@ -2744,7 +2741,6 @@ impl H3 {
             handed: 0,
             direct: 0,
             assigned: ([0u8; 32], [0usize; 2]),
-            fin: false,
             closed: false,
             deadline: Instant::now(),
             head_wait: HEADER_TIMEOUT,
@@ -2858,9 +2854,8 @@ impl H3 {
                 Ok(())
             }
             frames::H3_GOAWAY => {
-                self.fin = true;
-                self.carried = self.filled;
-                Ok(())
+                // RFC 9114 §7.2.6: a GOAWAY on a request stream is H3_FRAME_UNEXPECTED, so the tunnel ends as a protocol error rather than a clean end.
+                return Err(Failure::Stream);
             }
             _ => {
                 if length > H3_SKIP {
@@ -2910,9 +2905,6 @@ impl H3 {
                     continue;
                 }
                 return Ok(granted);
-            }
-            if self.fin {
-                return Err(Failure::Stream);
             }
             self.fill_capsules().map_err(io)?;
         }
@@ -2989,9 +2981,6 @@ impl H3 {
                 }
                 continue;
             }
-            if self.fin {
-                return Ok(false);
-            }
             if self.closed {
                 // The peer finished the stream: the packet that never came is a packet the peer never sent.
                 return Ok(false);
@@ -3047,9 +3036,6 @@ impl H3 {
 
     /// One UDP payload as one DATAGRAM capsule inside one DATA frame. The two headers ride the lane's own scratch and the payload keeps the caller's buffer: quiche copies every slice it is handed, so joining the datagram ahead of that copy crossed each of its bytes in userspace twice.
     pub(crate) fn write_datagram(&mut self, payload: &[u8]) -> std::io::Result<()> {
-        if self.fin {
-            return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
-        }
         let mut prefix = [0u8; 10];
         let plen = masque::datagram_prefix_into(&mut prefix, payload.len());
         let mut head = [0u8; 9];
@@ -3117,9 +3103,6 @@ impl H3 {
                     continue;
                 }
                 return Ok(take);
-            }
-            if self.fin {
-                return Ok(0);
             }
             if self.closed {
                 // The peer finished the stream: the datagram that never came is a datagram the peer never sent, and `Ok(0)` is the end of the stream.
@@ -3393,13 +3376,13 @@ impl H3 {
             .map(|frame| (frame, head))
     }
 
-    /// What one frame's header says the reader should do: a DATA frame's body becomes the caller's to read, a frame the tunnel does not read is consumed, and a goaway ends the tunnel without a block of its own.
+    /// What one frame's header says the reader should do: a DATA frame's body becomes the caller's to read, a frame the tunnel does not read is consumed, and a goaway on the request stream is a protocol error.
     fn dispatch(
         &mut self,
         frame: frames::H3Frame,
         head: usize,
         started: Instant,
-    ) -> Result<Dispatch, Failure> {
+    ) -> Result<(), Failure> {
         let Some(body_at) = self.carried.checked_add(head) else {
             return Err(Failure::Frame);
         };
@@ -3408,24 +3391,22 @@ impl H3 {
         };
         if frame.kind == frames::H3_DATA {
             self.carried = body_at;
-            // An empty DATA frame carries no bytes and is not the end of the stream: only a finished stream or a goaway ends the tunnel, and handing back zero here is what a caller reads as EOF.
+            // An empty DATA frame carries no bytes and is not the end of the stream: only a finished stream ends the tunnel, and handing back zero here is what a caller reads as EOF.
             if length == 0 {
-                return Ok(Dispatch::Again);
+                return Ok(());
             }
             self.body = length;
-            return Ok(Dispatch::Again);
+            return Ok(());
         }
         if frame.kind == frames::H3_GOAWAY {
-            // The kind is in the header, so an ending needs no block of its own: the frame that follows it is never read.
-            self.fin = true;
-            self.carried = self.filled;
-            return Ok(Dispatch::Ended);
+            // RFC 9114 §7.2.6: a GOAWAY on a request stream is H3_FRAME_UNEXPECTED, so the tunnel ends as a protocol error rather than a clean end.
+            return Err(Failure::Stream);
         }
         if length > H3_SKIP {
             return Err(Failure::Frame);
         }
         self.take_block(body_at, length, false, started)?;
-        Ok(Dispatch::Again)
+        Ok(())
     }
 
     /// The block a header names, consumed into the capsule buffer's tail: the bytes the peek already pulled arrive first, `keep` says whether the rest is the stream's own or a frame this lane has no use for, and the lane's cursor moves past what the window held either way. Returns where the block began, which is what its reader cuts back to.
@@ -3649,9 +3630,6 @@ impl H3 {
 
 impl Write for H3 {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.fin {
-            return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
-        }
         let frame = foxy::flow::frame_size(buf.len(), H3_FRAME);
         if frame == 0 {
             return Ok(0);
@@ -3694,10 +3672,6 @@ impl Read for H3 {
                 }
                 continue;
             }
-            if self.fin {
-                // The tunnel is over: the bytes already delivered are the caller's, and the next read is the end of the stream.
-                return Ok(delivered);
-            }
             if self.closed {
                 // The peer finished the stream. The bytes it sent are in the caller's hands, and what the stream still holds behind them is the caller's too: a fin says no more will arrive, not that none arrived.
                 if self.body > 0 {
@@ -3710,10 +3684,8 @@ impl Read for H3 {
                         // A remainder that is not a frame header: the peer sent bytes no frame names, and a tunnel that ends on them is a broken tunnel.
                         return Err(io(Failure::Stream));
                     };
-                    match self.dispatch(frame, head, started).map_err(io)? {
-                        Dispatch::Again => continue,
-                        Dispatch::Ended => return Ok(delivered),
-                    }
+                    self.dispatch(frame, head, started).map_err(io)?;
+                    continue;
                 }
                 if self.drained() {
                     return Ok(delivered);
@@ -3745,20 +3717,9 @@ impl Read for H3 {
                 }
                 continue;
             };
-            match self.dispatch(frame, head, started).map_err(io)? {
-                Dispatch::Again => {}
-                Dispatch::Ended => return Ok(delivered),
-            }
+            self.dispatch(frame, head, started).map_err(io)?;
         }
     }
-}
-
-/// What one frame's header says the reader should do next: the frame is a payload to deliver, or the tunnel is over.
-enum Dispatch {
-    /// The frame was taken in: a DATA frame's body is now the caller's to read, and a frame the tunnel does not read has been consumed.
-    Again,
-    /// The frame was a goaway: the tunnel is over and the frame that follows it is never read.
-    Ended,
 }
 
 /// Reads the two-letter country out of whatever the probe answered: a `loc=XX` line, a `"countryCode":"XX"` field, or nothing — a probe that cannot be read is not evidence.
