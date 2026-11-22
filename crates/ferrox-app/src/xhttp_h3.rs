@@ -121,7 +121,6 @@ pub(crate) struct H3Reader {
     content_length: Option<usize>,
     frame_left: usize,
     ended: bool,
-    reset: bool,
     head_seen: bool,
     expect_request: bool,
     idle_since: Option<Instant>,
@@ -146,7 +145,6 @@ impl H3Reader {
             content_length: None,
             frame_left: 0,
             ended: false,
-            reset: false,
             head_seen: false,
             expect_request,
             idle_since: None,
@@ -394,9 +392,14 @@ impl H3Reader {
                         self.status = status;
                     }
                 }
-                frames::H3_RESET => {
+                frames::H3_CANCEL_PUSH => {
+                    // RFC 9114 §7.2.3: CANCEL_PUSH belongs to the control stream, so on a request stream it is H3_FRAME_UNEXPECTED; a request reset is QUIC RESET_STREAM, not a frame.
+                    self.reset();
                     self.ended = true;
-                    self.reset = true;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "h3 cancel_push on a request stream",
+                    ));
                 }
                 _ => {}
             }
@@ -443,12 +446,6 @@ impl H3Reader {
         if self.ended {
             return self.finish();
         }
-        if self.reset {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionReset,
-                "h3 stream was reset",
-            ));
-        }
         Ok(self.data_available())
     }
 
@@ -458,12 +455,6 @@ impl H3Reader {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "h3 data frame ended early",
-            ));
-        }
-        if self.reset {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionReset,
-                "h3 stream was reset",
             ));
         }
         if self.buf_at < self.buf.len() {
@@ -517,12 +508,6 @@ impl H3Reader {
                 continue;
             }
             if self.ended {
-                if self.reset {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::ConnectionReset,
-                        "h3 stream was reset",
-                    ));
-                }
                 return Ok(0);
             }
             self.parse()?;
@@ -1823,22 +1808,22 @@ mod tests {
     }
 
     #[test]
-    fn a_reset_stream_is_an_error_not_a_clean_end() {
+    fn a_cancel_push_is_a_frame_error_not_a_reset() {
         let (identity, roots) = minted_identity("localhost");
         let settings = settings();
         let port = serve_inbound("127.0.0.1:0", &identity, &settings, Arc::new(Echo), None)
             .expect("the h3 listener binds");
         let client = client(port, roots);
         let wire = raw_stream(&client);
-        send_frame(&wire, frames::H3_RESET, &[]);
+        send_frame(&wire, frames::H3_CANCEL_PUSH, &[]);
         let mut reader = H3Reader::new(wire);
         let mut buf = [0u8; 8];
         assert_eq!(
             reader
                 .read(&mut buf)
-                .expect_err("a reset is not EOF")
+                .expect_err("cancel_push on a request stream is not EOF")
                 .kind(),
-            std::io::ErrorKind::ConnectionReset
+            std::io::ErrorKind::InvalidData
         );
     }
 

@@ -32016,6 +32016,10 @@ fn serve_socks_udp_foxy_ip(
         // The client's datagrams go out as a burst, and the destination address rides a stack buffer: one packet per pass and one `Vec` per packet are both a cost the association has no reason to pay.
         let mut ended = false;
         for _ in 0..UDP_BURST {
+            // A capsule already waiting on the tunnel may replace the source set, so it is drained before the next client datagram rather than after the burst.
+            if tunnel.as_ref().is_some_and(crate::foxy::Ip::readable) {
+                break;
+            }
             match relay.recv_from(&mut buf) {
                 Ok((n, src)) => {
                     if !source_admitted(peer, pinned, src) {
