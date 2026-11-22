@@ -1235,6 +1235,9 @@ fn dokodemo_transparent_mode(inbound: &Json) -> Option<crate::sockopt::Tproxy> {
 
 /// Bind every socket a dynamic inbound opens before serving any, so one taken port refuses the whole add.
 fn preflight_inbound(inbound: &Json, protocol: &str, addresses: &[String]) -> Result<(), String> {
+    if protocol == "naive" {
+        crate::naive::validate_inbound(inbound)?;
+    }
     let (tcp, udp) = inbound_sockets(inbound, protocol);
     // A transparent door binds its sockets with options plain `bind` cannot set.
     let transparent_door =
@@ -1414,7 +1417,7 @@ pub(crate) struct Stop {
 }
 
 /// One accepted session's registration: the stop holds a socket clone it can shut down, and the guard removes it when the work ends.
-struct TrackedSession {
+pub(crate) struct TrackedSession {
     stop: Arc<Stop>,
     id: u64,
 }
@@ -1500,7 +1503,7 @@ impl Stop {
     }
 
     /// Registers an accepted stream so rollback can shut it down and wait for its work to leave.
-    fn track_session(self: &Arc<Self>, stream: &Connection) -> Option<TrackedSession> {
+    pub(crate) fn track_session(self: &Arc<Self>, stream: &Connection) -> Option<TrackedSession> {
         if !self.track_sessions.load(Ordering::Relaxed) {
             return None;
         }

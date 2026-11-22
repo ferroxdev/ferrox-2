@@ -15,8 +15,8 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 const PADDING_COUNT: usize = 8;
 const MAX_PADDING_CHUNK: usize = 65_535;
@@ -1236,6 +1236,8 @@ fn h3_refuse(stream: &crate::quic::QuicStream, status: &str) {
     };
     if writer.write_all(head.as_bytes()).is_err() || !stream.fin() {
         stream.close();
+    } else {
+        stream.shutdown_read_h3();
     }
 }
 
@@ -1397,6 +1399,10 @@ pub(crate) struct NaiveOut {
     h3: Mutex<Vec<Arc<H3Client>>>,
     h2_next: AtomicUsize,
     h3_next: AtomicUsize,
+    h2_inflight: AtomicUsize,
+    h3_inflight: AtomicUsize,
+    h2_ready: Condvar,
+    h3_ready: Condvar,
 }
 
 impl std::fmt::Debug for NaiveOut {
@@ -1499,6 +1505,18 @@ impl NaiveOut {
                             done.store(true, Ordering::Relaxed);
                             stream.abort();
                         } else {
+                            if lanes.len() >= MAX_UOT_LANES {
+                                let oldest = lanes
+                                    .iter()
+                                    .min_by_key(|(_, lane)| lane.used)
+                                    .map(|(key, _)| key.clone());
+                                if let Some(oldest) = oldest {
+                                    if let Some(lane) = lanes.remove(&oldest) {
+                                        lane.done.store(true, Ordering::Relaxed);
+                                        lane.abort.abort();
+                                    }
+                                }
+                            }
                             lanes.insert(
                                 key,
                                 UotLane {
@@ -1559,18 +1577,6 @@ impl NaiveOut {
                 }
                 if pending.len() >= MAX_UOT_PENDING {
                     continue;
-                }
-                if lanes.len() >= MAX_UOT_LANES {
-                    let oldest = lanes
-                        .iter()
-                        .min_by_key(|(_, lane)| lane.used)
-                        .map(|(key, _)| key.clone());
-                    if let Some(oldest) = oldest {
-                        if let Some(lane) = lanes.remove(&oldest) {
-                            lane.done.store(true, Ordering::Relaxed);
-                            lane.abort.abort();
-                        }
-                    }
                 }
                 let Ok(reply_relay) = relay.try_clone() else {
                     continue;
@@ -1698,29 +1704,40 @@ impl NaiveOut {
     }
 
     fn h2_client(self: &Arc<Self>) -> Option<Arc<H2Client>> {
+        let deadline = Instant::now() + crate::budgets::handshake();
         let mut pool = self.h2.lock().ok()?;
-        pool.retain(|client| {
-            client.settle();
-            client.reusable()
-        });
-        if pool.len() < self.pool_limit {
-            drop(pool);
-            if let Some(client) = self.connect_h2() {
+        loop {
+            pool.retain(|client| {
+                client.settle();
+                client.reusable()
+            });
+            let inflight = self.h2_inflight.load(Ordering::Relaxed);
+            if pool.len() + inflight < self.pool_limit {
+                self.h2_inflight.fetch_add(1, Ordering::Relaxed);
+                drop(pool);
+                let client = self.connect_h2();
                 if let Ok(mut pool) = self.h2.lock() {
-                    if pool.len() < self.pool_limit {
-                        pool.push(Arc::clone(&client));
+                    if let Some(client) = &client {
+                        if pool.len() < self.pool_limit {
+                            pool.push(Arc::clone(client));
+                        }
                     }
                 }
-                return Some(client);
+                self.h2_inflight.fetch_sub(1, Ordering::Relaxed);
+                self.h2_ready.notify_all();
+                return client;
             }
-            pool = self.h2.lock().ok()?;
-            pool.retain(|client| client.reusable());
+            if !pool.is_empty() {
+                let at = self.h2_next.fetch_add(1, Ordering::Relaxed) % pool.len();
+                return Some(Arc::clone(&pool[at]));
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            let (next, _) = self.h2_ready.wait_timeout(pool, left).ok()?;
+            pool = next;
         }
-        if pool.is_empty() {
-            return None;
-        }
-        let at = self.h2_next.fetch_add(1, Ordering::Relaxed) % pool.len();
-        Some(Arc::clone(&pool[at]))
     }
 
     fn connect_h2(self: &Arc<Self>) -> Option<Arc<H2Client>> {
@@ -1772,26 +1789,37 @@ impl NaiveOut {
     }
 
     fn h3_client(self: &Arc<Self>) -> Option<Arc<H3Client>> {
+        let deadline = Instant::now() + crate::budgets::handshake();
         let mut pool = self.h3.lock().ok()?;
-        pool.retain(|client| client.reusable());
-        if pool.len() < self.pool_limit {
-            drop(pool);
-            if let Some(client) = self.connect_h3() {
+        loop {
+            pool.retain(|client| client.reusable());
+            let inflight = self.h3_inflight.load(Ordering::Relaxed);
+            if pool.len() + inflight < self.pool_limit {
+                self.h3_inflight.fetch_add(1, Ordering::Relaxed);
+                drop(pool);
+                let client = self.connect_h3();
                 if let Ok(mut pool) = self.h3.lock() {
-                    if pool.len() < self.pool_limit {
-                        pool.push(Arc::clone(&client));
+                    if let Some(client) = &client {
+                        if pool.len() < self.pool_limit {
+                            pool.push(Arc::clone(client));
+                        }
                     }
                 }
-                return Some(client);
+                self.h3_inflight.fetch_sub(1, Ordering::Relaxed);
+                self.h3_ready.notify_all();
+                return client;
             }
-            pool = self.h3.lock().ok()?;
-            pool.retain(|client| client.reusable());
+            if !pool.is_empty() {
+                let at = self.h3_next.fetch_add(1, Ordering::Relaxed) % pool.len();
+                return Some(Arc::clone(&pool[at]));
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            let (next, _) = self.h3_ready.wait_timeout(pool, left).ok()?;
+            pool = next;
         }
-        if pool.is_empty() {
-            return None;
-        }
-        let at = self.h3_next.fetch_add(1, Ordering::Relaxed) % pool.len();
-        Some(Arc::clone(&pool[at]))
     }
 
     fn connect_h3(self: &Arc<Self>) -> Option<Arc<H3Client>> {
@@ -1948,6 +1976,10 @@ pub(crate) fn outbound(root: &Json) -> Result<Option<NaiveOut>, String> {
         h3: Mutex::new(Vec::new()),
         h2_next: AtomicUsize::new(0),
         h3_next: AtomicUsize::new(0),
+        h2_inflight: AtomicUsize::new(0),
+        h3_inflight: AtomicUsize::new(0),
+        h2_ready: Condvar::new(),
+        h3_ready: Condvar::new(),
     }))
 }
 
@@ -2110,7 +2142,7 @@ fn identity_with_alpn(
     identity
 }
 
-fn inbound_users(inbound: &Json, settings: Option<&Json>) -> Users {
+fn inbound_users(inbound: &Json, settings: Option<&Json>) -> Result<Users, String> {
     let mut users = Vec::new();
     for node in [settings, Some(inbound)].into_iter().flatten() {
         let Some(list) = node.get("users").and_then(Json::as_arr) else {
@@ -2127,6 +2159,11 @@ fn inbound_users(inbound: &Json, settings: Option<&Json>) -> Users {
                 .and_then(Json::as_str)
                 .unwrap_or_default();
             if !password.is_empty() {
+                if username.contains(':') {
+                    return Err(format!(
+                        "naive inbound user `{username}` contains `:`, which Basic authentication cannot carry"
+                    ));
+                }
                 users.push((username.to_owned(), password.to_owned()));
             }
         }
@@ -2142,11 +2179,16 @@ fn inbound_users(inbound: &Json, settings: Option<&Json>) -> Users {
                 .and_then(Json::as_str)
                 .unwrap_or_default();
             if !password.is_empty() {
+                if username.contains(':') {
+                    return Err(format!(
+                        "naive inbound user `{username}` contains `:`, which Basic authentication cannot carry"
+                    ));
+                }
                 users.push((username.to_owned(), password.to_owned()));
             }
         }
     }
-    Arc::new(users)
+    Ok(Arc::new(users))
 }
 
 /// The listeners this inbound opens, for the dynamic path's all-or-nothing bind: QUIC is a UDP
@@ -2157,7 +2199,7 @@ pub(crate) fn inbound_sockets(inbound: &Json) -> (bool, bool) {
     if security != "tls" && !security.is_empty() && security != "none" {
         return (false, false);
     }
-    let (mut tcp, mut udp) = inbound_networks(inbound, settings);
+    let (mut tcp, mut udp) = inbound_networks(inbound, settings).unwrap_or((false, false));
     if security != "tls" {
         udp = false;
         tcp = true;
@@ -2165,30 +2207,53 @@ pub(crate) fn inbound_sockets(inbound: &Json) -> (bool, bool) {
     (tcp, udp)
 }
 
-fn inbound_networks(inbound: &Json, settings: Option<&Json>) -> (bool, bool) {
+fn inbound_networks(inbound: &Json, settings: Option<&Json>) -> Result<(bool, bool), String> {
     let node = settings
         .and_then(|settings| settings.get("network"))
         .or_else(|| inbound.get("network"));
+    let Some(node) = node else {
+        return Ok((true, true));
+    };
     let mut tcp = false;
     let mut udp = false;
     match node {
-        Some(Json::Str(name)) => match name.as_str() {
+        Json::Str(name) => match name.as_str() {
             "tcp" => tcp = true,
             "udp" | "quic" => udp = true,
-            _ => return (true, true),
+            _ => {
+                return Err(format!(
+                    "naive inbound network `{name}` is not tcp, udp, or quic"
+                ))
+            }
         },
-        Some(Json::Arr(items)) => {
+        Json::Arr(items) => {
             for item in items {
                 match item.as_str() {
                     Some("tcp") => tcp = true,
                     Some("udp" | "quic") => udp = true,
-                    _ => {}
+                    Some(name) => {
+                        return Err(format!(
+                            "naive inbound network `{name}` is not tcp, udp, or quic"
+                        ))
+                    }
+                    None => {
+                        return Err("naive inbound network list must contain strings".to_owned())
+                    }
                 }
             }
         }
-        _ => return (true, true),
+        _ => return Err("naive inbound network must be a string or list".to_owned()),
     }
-    (tcp, udp)
+    Ok((tcp, udp))
+}
+
+pub(crate) fn validate_inbound(inbound: &Json) -> Result<(), String> {
+    let settings = inbound.get("settings");
+    if inbound_users(inbound, settings)?.is_empty() {
+        return Err("naive inbound names no users".to_owned());
+    }
+    inbound_networks(inbound, settings)?;
+    Ok(())
 }
 
 struct ListenerExit {
@@ -2215,6 +2280,7 @@ fn tcp_start(
     identity: Option<Arc<ferrox_core::tls::TlsServerConfig>>,
     freedom: bool,
     halted: Arc<AtomicBool>,
+    stop: Option<Arc<proxy::Stop>>,
 ) -> Option<Start> {
     let target = match crate::conn::parse_target(address) {
         Ok(target) => target,
@@ -2240,7 +2306,9 @@ fn tcp_start(
             };
             let users = Arc::clone(&users);
             let identity = identity.clone();
+            let session = stop.as_ref().and_then(|stop| stop.track_session(&stream));
             std::thread::spawn(move || {
+                let _session = session;
                 serve_h2_connection(stream, identity, users, freedom);
             });
         }
@@ -2292,7 +2360,13 @@ pub(crate) fn serve_inbound(
     stop: Option<&Arc<proxy::Stop>>,
 ) -> bool {
     let settings = inbound.get("settings");
-    let users = inbound_users(inbound, settings);
+    let users = match inbound_users(inbound, settings) {
+        Ok(users) => users,
+        Err(error) => {
+            eprintln!("naive inbound in {path}: {error}");
+            return false;
+        }
+    };
     if users.is_empty() {
         eprintln!("naive inbound in {path} names no users: serves nothing");
         return false;
@@ -2327,7 +2401,13 @@ pub(crate) fn serve_inbound(
             return false;
         }
     };
-    let (mut tcp, mut udp) = inbound_networks(inbound, settings);
+    let (mut tcp, mut udp) = match inbound_networks(inbound, settings) {
+        Ok(networks) => networks,
+        Err(error) => {
+            eprintln!("naive inbound in {path}: {error}");
+            return false;
+        }
+    };
     if identity.is_none() {
         eprintln!("naive inbound in {path} has no TLS: serves plaintext HTTP/2");
         udp = false;
@@ -2349,6 +2429,7 @@ pub(crate) fn serve_inbound(
             tcp_identity.clone(),
             freedom,
             Arc::clone(&halted),
+            stop.cloned(),
         ) else {
             return false;
         };
@@ -2943,15 +3024,45 @@ mod tests {
         )
         .expect("parses");
         let settings = inbound.get("settings");
-        let users = inbound_users(&inbound, settings);
+        let users = inbound_users(&inbound, settings).expect("users");
         assert_eq!(users.len(), 1);
-        assert_eq!(inbound_networks(&inbound, settings), (true, false));
+        assert_eq!(
+            inbound_networks(&inbound, settings).expect("networks"),
+            (true, false)
+        );
 
         let top = crate::json::parse(
             r#"{"protocol": "naive", "users": [{"username": "u", "password": "p"}], "network": ["tcp", "udp"]}"#,
         )
         .expect("parses");
-        assert_eq!(inbound_users(&top, None).len(), 1);
-        assert_eq!(inbound_networks(&top, None), (true, true));
+        assert_eq!(inbound_users(&top, None).expect("users").len(), 1);
+        assert_eq!(
+            inbound_networks(&top, None).expect("networks"),
+            (true, true)
+        );
+    }
+
+    #[test]
+    fn invalid_networks_and_colon_usernames_are_refused() {
+        let bad = crate::json::parse(
+            r#"{"protocol": "naive", "settings": {"users": [{"username": "u", "password": "p"}], "network": "bogus"}}"#,
+        )
+        .expect("parses");
+        assert!(inbound_networks(&bad, bad.get("settings")).is_err());
+        assert!(validate_inbound(&bad).is_err());
+
+        let mixed = crate::json::parse(
+            r#"{"protocol": "naive", "settings": {"users": [{"username": "u", "password": "p"}], "network": ["tcp", "bogus"]}}"#,
+        )
+        .expect("parses");
+        assert!(inbound_networks(&mixed, mixed.get("settings")).is_err());
+        assert!(validate_inbound(&mixed).is_err());
+
+        let colon = crate::json::parse(
+            r#"{"protocol": "naive", "settings": {"users": [{"username": "u:p", "password": "p"}]}}"#,
+        )
+        .expect("parses");
+        assert!(inbound_users(&colon, colon.get("settings")).is_err());
+        assert!(validate_inbound(&colon).is_err());
     }
 }

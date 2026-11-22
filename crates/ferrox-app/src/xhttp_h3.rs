@@ -1612,8 +1612,28 @@ fn read_stream_varint(
         }
         let mut byte = [0u8; 1];
         match conn.stream_recv(id, &mut byte) {
-            Ok((1, _)) => types.entry(id).or_default().push(byte[0]),
-            _ => return None,
+            Ok((1, fin)) => {
+                types.entry(id).or_default().push(byte[0]);
+                if fin {
+                    let kind = types.get(&id).and_then(|bytes| {
+                        let mut at = 0;
+                        frames::quic_read(bytes, &mut at)
+                    });
+                    types.remove(&id);
+                    return kind;
+                }
+            }
+            Ok((_, fin)) => {
+                if fin {
+                    types.remove(&id);
+                }
+                return None;
+            }
+            Err(quiche::Error::Done) => return None,
+            Err(_) => {
+                types.remove(&id);
+                return None;
+            }
         }
     }
 }

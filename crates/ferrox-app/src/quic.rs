@@ -5133,6 +5133,14 @@ impl QuicStream {
         }
     }
 
+    /// Stop reading with H3's no-error code after a complete response.
+    pub(crate) fn shutdown_read_h3(&self) {
+        if let Ok(mut conn) = self.conn.lock() {
+            let _ = conn.stream_shutdown(self.id, quiche::Shutdown::Read, 0x0100);
+            flush_egress(&mut conn, &self.sock);
+        }
+    }
+
     /// The H3 server preface, once per connection: SETTINGS and the QPACK hellos ride the server's
     /// unidirectional ids, and a second control stream would be a connection error.
     pub(crate) fn preface_h3(&self) -> bool {
