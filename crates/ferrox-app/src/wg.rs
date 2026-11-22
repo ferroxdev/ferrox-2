@@ -1310,9 +1310,32 @@ impl Allowed for PeerConfig {
     }
 }
 
+#[allow(clippy::struct_field_names)]
 struct Peers {
     peers: Vec<Peer>,
     routes: Routes,
+    receivers: Receivers,
+    #[cfg(test)]
+    probes: usize,
+}
+
+/// A transport packet names the receiver index it answers to, and the peer that owns that index
+/// is the only one that can open it. Learning which peer answered the last time an index was seen
+/// turns the per-packet walk of [`Peers`] into one comparison, and an entry is trusted only while
+/// its peer still owns the index, so a rotating session falls back to the walk that answers it.
+struct Receivers([Option<(u32, usize)>; 64]);
+
+impl Receivers {
+    fn get(&self, receiver: u32) -> Option<usize> {
+        match self.0[(receiver as usize) & 63] {
+            Some((key, at)) if key == receiver => Some(at),
+            _ => None,
+        }
+    }
+
+    fn put(&mut self, receiver: u32, at: usize) {
+        self.0[(receiver as usize) & 63] = Some((receiver, at));
+    }
 }
 
 impl std::ops::Deref for Peers {
@@ -1332,11 +1355,59 @@ impl std::ops::DerefMut for Peers {
 impl Peers {
     fn new(peers: Vec<Peer>) -> Self {
         let routes = Routes::new(&peers);
-        Self { peers, routes }
+        Self {
+            peers,
+            routes,
+            receivers: Receivers([None; 64]),
+            #[cfg(test)]
+            probes: 0,
+        }
     }
 
     fn peer_for(&self, destination: IpAddr) -> Option<usize> {
         self.routes.peer_for(&self.peers, destination)
+    }
+
+    /// The peer whose handshake or session answers to `receiver`, through the learned mapping and,
+    /// on a miss, the walk that fills it.
+    fn peer_for_receiver(&mut self, receiver: u32) -> Option<usize> {
+        #[cfg(test)]
+        let mut probes = 0usize;
+        if let Some(at) = self.receivers.get(receiver) {
+            #[cfg(test)]
+            {
+                probes += 1;
+            }
+            if self
+                .peers
+                .get(at)
+                .is_some_and(|peer| peer.tunnel.owns(receiver))
+            {
+                #[cfg(test)]
+                {
+                    self.probes += probes;
+                }
+                return Some(at);
+            }
+        }
+        let mut found = None;
+        for (index, peer) in self.peers.iter().enumerate() {
+            #[cfg(test)]
+            {
+                probes += 1;
+            }
+            if peer.tunnel.owns(receiver) {
+                found = Some(index);
+                break;
+            }
+        }
+        #[cfg(test)]
+        {
+            self.probes += probes;
+        }
+        let at = found?;
+        self.receivers.put(receiver, at);
+        Some(at)
     }
 }
 
@@ -1678,7 +1749,7 @@ fn receive_datagram(
     else {
         return;
     };
-    let Some(index) = peers.iter().position(|peer| peer.tunnel.owns(receiver)) else {
+    let Some(index) = peers.peer_for_receiver(receiver) else {
         return;
     };
     peers[index].tunnel.receive(now, source, packet, incoming);
@@ -1737,7 +1808,7 @@ fn receive_datagram_owned(
     else {
         return Some(packet);
     };
-    let Some(index) = peers.iter().position(|peer| peer.tunnel.owns(receiver)) else {
+    let Some(index) = peers.peer_for_receiver(receiver) else {
         return Some(packet);
     };
     let packet = peers[index]
@@ -2994,6 +3065,100 @@ mod tests {
             got.push(buf[..n].to_vec());
         }
         assert_eq!(got, packets);
+    }
+
+    /// A receiver index is learned on the packet that walks to its owner, so the packets after it
+    /// cost one comparison, and a memory that outlived its session falls back to the walk.
+    #[test]
+    fn a_learned_receiver_reaches_its_peer_without_a_walk() {
+        let client_private = [0x11; 32];
+        let server_private = [0x22; 32];
+        let client_public = ferrox_core::wireguard::device::public_key(&client_private);
+        let server_public = ferrox_core::wireguard::device::public_key(&server_private);
+        let config = DeviceConfig {
+            secret: server_private,
+            addresses: vec!["10.0.0.1".parse().unwrap()],
+            peers: vec![
+                PeerConfig {
+                    public: [0x33; 32],
+                    preshared: [0; 32],
+                    endpoint: None,
+                    endpoints: Vec::new(),
+                    keepalive: 0,
+                    allowed: vec![("10.0.1.0".parse().unwrap(), 24)],
+                },
+                PeerConfig {
+                    public: client_public,
+                    preshared: [0; 32],
+                    endpoint: None,
+                    endpoints: Vec::new(),
+                    keepalive: 0,
+                    allowed: vec![("10.0.0.2".parse().unwrap(), 32)],
+                },
+            ],
+            mtu: 1420,
+            reserved: [0; 3],
+            is_client: Some(false),
+            no_kernel_tun: true,
+            large_segments: false,
+            dns: Vec::new(),
+        };
+        let mut peers = peers(&config, [0; 12], crate::noize::WireGuardNoize::off());
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("socket");
+        let server = socket.local_addr().expect("the server's address");
+        let client = UdpSocket::bind("127.0.0.1:0").expect("client");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let source = client.local_addr().expect("the client's address");
+        let (to_stack, _keep) = mpsc::channel();
+        let mut cookies = CookieGuard::default();
+        let mut initiator = Tunnel::new(
+            client_private,
+            server_public,
+            [0; 32],
+            server,
+            0,
+            [0; 3],
+            [0; 12],
+        );
+        let mut events = Vec::new();
+        assert!(initiator.initiate(0, &mut events));
+        handle_initiation(
+            &mut peers,
+            0,
+            source,
+            &sent(&events),
+            &socket,
+            &to_stack,
+            &mut cookies,
+            false,
+            &mut Vec::new(),
+        );
+        let mut response = [0u8; 128];
+        let (n, _) = client.recv_from(&mut response).expect("a response");
+        let receiver = u32::from_le_bytes(response[4..8].try_into().expect("an index"));
+        assert!(n >= 8, "a response carries its sender index");
+        assert_eq!(peers.peer_for_receiver(receiver), Some(1));
+        assert_eq!(peers.probes, 2, "the first packet walks to its owner");
+        peers.probes = 0;
+        for _ in 0..64 {
+            assert_eq!(peers.peer_for_receiver(receiver), Some(1));
+        }
+        assert_eq!(
+            peers.probes, 64,
+            "every packet after the first is one comparison"
+        );
+        for candidate in [receiver, receiver ^ 0x5555_5555, 0x7fff_ffff] {
+            let walked = peers.iter().position(|peer| peer.tunnel.owns(candidate));
+            assert_eq!(peers.peer_for_receiver(candidate), walked);
+        }
+        peers.receivers.put(receiver, 0);
+        assert_eq!(
+            peers.peer_for_receiver(receiver),
+            Some(1),
+            "a stale memory cannot name a peer that does not own the index"
+        );
     }
 
     #[test]

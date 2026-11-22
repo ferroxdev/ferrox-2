@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, ToSocketAddrs as _, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use ferrox_core::foxy::frames;
@@ -2262,14 +2262,14 @@ struct Association {
     destination: SocketAddr,
 }
 
-/// What the writer and the reader of one client association share: the flow now relayed, the reassembly its fragments feed, and the client address the relay last sent from. Only the writer rotates a flow, and only after the connection lock is held, so the reader never relays against a half-applied change and a retired flow's late datagrams land on the floor rather than on the new association.
+/// What the writer and the reader of one client association share: the flow now relayed, the reassembly its fragments feed, and the client address the lane is pinned to, stored once so neither path takes a lock to read it. Only the writer rotates a flow, and only after the connection lock is held, so the reader never relays against a half-applied change and a retired flow's late datagrams land on the floor rather than on the new association.
 struct Lane {
     flow: Mutex<Option<Association>>,
     defrag: Mutex<Defrag>,
-    source: Mutex<Option<SocketAddr>>,
+    source: OnceLock<SocketAddr>,
 }
 
-/// Rotate the lane under the writer's flow guard: the source moves with the association, so a reply cannot pair a retired flow with a new source, and the retired reassembly is dropped.
+/// Rotate the lane under the writer's flow guard: the pinned source is stored with the association, the retired reassembly is dropped, and a reply cannot pair a retired flow with a new source.
 fn rotate(
     lane: &Lane,
     flow: &mut Option<Association>,
@@ -2277,9 +2277,7 @@ fn rotate(
     source: SocketAddr,
 ) {
     *flow = Some(association);
-    if let Ok(mut slot) = lane.source.lock() {
-        *slot = Some(source);
-    }
+    let _ = lane.source.set(source);
     if let Ok(mut reassembly) = lane.defrag.lock() {
         *reassembly = Defrag::new();
     }
@@ -2300,7 +2298,7 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial, peer: Option<std::net::I
     let lane = Arc::new(Lane {
         flow: Mutex::new(None),
         defrag: Mutex::new(Defrag::new()),
-        source: Mutex::new(None),
+        source: OnceLock::new(),
     });
     let stop = Arc::new(AtomicBool::new(false));
     let reader = std::thread::spawn({
@@ -2321,7 +2319,7 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial, peer: Option<std::net::I
         if !crate::proxy::source_ip_ok(peer, src) {
             continue;
         }
-        let pinned = lane.source.lock().ok().and_then(|slot| *slot);
+        let pinned = lane.source.get().copied();
         if pinned.is_some_and(|held| held != src) {
             continue;
         }
@@ -2356,8 +2354,6 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial, peer: Option<std::net::I
             );
             drop(flow);
             relayed = Some((id, dest, address));
-        } else if let Ok(mut slot) = lane.source.lock() {
-            *slot = Some(src);
         }
         let Some((session_id, _, address)) = &relayed else {
             continue;
@@ -2414,7 +2410,7 @@ fn take_reply<'a>(
         .flatten()
         .map(|(_address, payload)| payload)?;
     before_source();
-    let src = lane.source.lock().ok().and_then(|slot| *slot)?;
+    let src = *lane.source.get()?;
     Some((destination, src, payload))
 }
 
@@ -4292,11 +4288,13 @@ mod tests {
     }
 
     fn lane_with(association: Association, source: SocketAddr) -> Lane {
-        Lane {
+        let lane = Lane {
             flow: Mutex::new(Some(association)),
             defrag: Mutex::new(Defrag::new()),
-            source: Mutex::new(Some(source)),
-        }
+            source: OnceLock::new(),
+        };
+        let _ = lane.source.set(source);
+        lane
     }
 
     fn message(session: u32, packet: u16, frag: u8, payload: &[u8]) -> UdpMessage<'_> {
@@ -4344,7 +4342,6 @@ mod tests {
                 session_id: 8,
                 destination: "127.0.0.1:7002".parse().expect("addr"),
             });
-            *lane.source.lock().expect("source") = Some("127.0.0.1:5002".parse().expect("addr"));
             *lane.defrag.lock().expect("defrag") = Defrag::new();
         }
         assert!(
@@ -4411,7 +4408,7 @@ mod tests {
                 session_id: 7,
                 destination: "127.0.0.1:7001".parse().expect("addr"),
             },
-            "127.0.0.1:5001".parse().expect("addr"),
+            source,
         ));
         let retired = UdpMessage {
             session: 7,

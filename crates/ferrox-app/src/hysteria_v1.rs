@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, ToSocketAddrs as _, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use ferrox_core::hysteria_v1 as wire;
@@ -358,10 +358,13 @@ pub(crate) fn dial(client: &Connection, dial: &Dial, target: &crate::proxy::Dest
 
 /// One UDP association's live session: the id its datagrams carry, the destination the last socks packet named, and the peer that asked.
 struct Lane {
-    session: Mutex<Option<u32>>,
+    /// The datagram session the uplink opened, as an atomic so the reply reader and the uplink
+    /// share it without a lock on every packet (zero means none yet).
+    session: AtomicU64,
     defrag: Mutex<Defrag>,
-    source: Mutex<Option<SocketAddr>>,
-    client: Mutex<Option<SocketAddr>>,
+    /// The relay peer that owns this lane, pinned by the first datagram and read by the reply
+    /// thread, so neither path takes a lock to find it.
+    client: OnceLock<SocketAddr>,
 }
 
 /// The client's UDP uplink over Hysteria v1: one connection and one datagram session per association, with a companion reader driving replies back into the socks frame.
@@ -374,10 +377,9 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial, peer: Option<std::net::I
         return;
     };
     let lane = Arc::new(Lane {
-        session: Mutex::new(None),
+        session: AtomicU64::new(0),
         defrag: Mutex::new(Defrag::new()),
-        source: Mutex::new(None),
-        client: Mutex::new(None),
+        client: OnceLock::new(),
     });
     let stop = Arc::new(AtomicBool::new(false));
     let reader = std::thread::spawn({
@@ -392,37 +394,31 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial, peer: Option<std::net::I
     let mut packet = 0u16;
     let mut host_room = [0u8; HOST_ROOM];
     let mut stream: Option<Flow> = None;
+    let mut session_id: Option<u32> = None;
     while let Ok((n, src)) = relay.recv_from(&mut buf) {
         if !crate::proxy::source_ip_ok(peer, src) {
             continue;
         }
-        let pinned = lane.client.lock().ok().and_then(|slot| *slot);
-        if pinned.is_some_and(|held| held != src) {
+        let pinned = lane.client.get();
+        if pinned.is_some_and(|held| *held != src) {
             continue;
         }
         let Some((dest, payload)) = crate::proxy::parse_socks_udp(&buf[..n]) else {
             continue;
         };
-        let Ok(mut client) = lane.client.lock() else {
-            break;
-        };
-        match *client {
-            None => *client = Some(src),
-            Some(peer) if peer != src => continue,
-            Some(_) => {}
+        if pinned.is_none() {
+            let _ = lane.client.set(src);
         }
-        drop(client);
         let Some(host) = host_of(dest.ip(), &mut host_room) else {
             continue;
         };
         if stream.is_none() {
-            let Some((flow, session_id)) = open_udp_flow(&session, host, dest.port()) else {
+            let Some((flow, opened)) = open_udp_flow(&session, host, dest.port()) else {
                 break;
             };
             stream = Some(flow);
-            if let Ok(mut slot) = lane.session.lock() {
-                *slot = Some(session_id);
-            }
+            session_id = Some(opened);
+            lane.session.store(u64::from(opened) + 1, Ordering::Relaxed);
             if let Ok(mut reassembly) = lane.defrag.lock() {
                 *reassembly = Defrag::new();
             }
@@ -436,16 +432,9 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial, peer: Option<std::net::I
         let Some(max) = conn.dgram_max_writable_len() else {
             break;
         };
-        if let Ok(mut slot) = lane.source.lock() {
-            *slot = Some(src);
-        }
-        let Ok(held) = lane.session.lock() else {
-            break;
-        };
-        let Some(session_id) = *held else {
+        let Some(session_id) = session_id else {
             continue;
         };
-        drop(held);
         packet = packet.wrapping_add(1);
         let message = UdpMessage {
             session: session_id,
@@ -524,14 +513,8 @@ fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpS
             let Ok(message) = wire::decode_udp(&data) else {
                 continue;
             };
-            let Ok(held) = lane.session.lock() else {
-                break;
-            };
-            let Some(session_id) = *held else {
-                continue;
-            };
-            drop(held);
-            if message.session != session_id {
+            let known = lane.session.load(Ordering::Relaxed);
+            if known == 0 || u64::from(message.session) + 1 != known {
                 continue;
             }
             let Ok(ip) = message.host.parse::<std::net::IpAddr>() else {
@@ -548,7 +531,7 @@ fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpS
             }) else {
                 continue;
             };
-            let Some(src) = lane.source.lock().ok().and_then(|slot| *slot) else {
+            let Some(src) = lane.client.get().copied() else {
                 continue;
             };
             reply.clear();
@@ -624,11 +607,45 @@ impl Assoc {
 struct Assocs {
     list: Vec<Assoc>,
     waiting: usize,
+    /// The index the last lookup answered: a run of datagrams for one destination probes one entry
+    /// instead of walking up to `MAX_UDP_ASSOCIATIONS` hosts, and a stale hint (an eviction moved
+    /// the tail) is rejected by the same host-and-port test the scan makes.
+    hit: Option<usize>,
+    #[cfg(test)]
+    probes: usize,
 }
 
 impl Assocs {
-    fn find(&self, host: &str, port: u16) -> Option<usize> {
-        self.list.iter().position(|assoc| assoc.is(host, port))
+    fn find(&mut self, host: &str, port: u16) -> Option<usize> {
+        let hint = self
+            .hit
+            .filter(|at| self.list.get(*at).is_some_and(|assoc| assoc.is(host, port)));
+        #[cfg(test)]
+        {
+            self.probes += usize::from(self.hit.is_some());
+        }
+        if hint.is_some() {
+            return hint;
+        }
+        #[cfg(test)]
+        let mut probes = 0usize;
+        let mut found = None;
+        for (at, assoc) in self.list.iter().enumerate() {
+            #[cfg(test)]
+            {
+                probes += 1;
+            }
+            if assoc.is(host, port) {
+                found = Some(at);
+                break;
+            }
+        }
+        #[cfg(test)]
+        {
+            self.probes += probes;
+        }
+        self.hit = found;
+        found
     }
 
     fn insert(&mut self, host: &str, port: u16, used: u64) -> Option<usize> {
@@ -636,6 +653,7 @@ impl Assocs {
             return None;
         }
         self.list.push(Assoc::new(host, port, used));
+        self.hit = Some(self.list.len() - 1);
         Some(self.list.len() - 1)
     }
 
@@ -1048,53 +1066,48 @@ fn relay_datagrams(
             return;
         };
         let session = message.session;
-        if !lane.sessions.contains(&session) {
-            let _ = conn.close(false, 0, b"");
-            return;
-        }
         let host = message.host;
         let port = message.port;
         let now = now_nanos();
-        if lane.flows.contains_key(&session) {
-            let literal = host
-                .parse::<IpAddr>()
-                .ok()
-                .map(|ip| SocketAddr::new(ip, port));
-            let room = MAX_PENDING_RESOLVERS.saturating_sub(lane.resolving);
-            let mut assembled = Vec::new();
-            let forged;
-            let mut spawn = Vec::new();
-            {
-                let Some(flow) = lane.flows.get_mut(&session) else {
-                    continue;
-                };
-                flow.last.store(now, Ordering::Relaxed);
-                let Some(at) = flow.slot(host, port, now) else {
-                    continue;
-                };
-                let whole = flow.assocs.list[at].defrag.feed(&message, &mut assembled);
-                forged = whole.is_err();
-                match whole {
-                    Ok(Some(message)) => {
-                        let assoc = &mut flow.assocs.list[at];
-                        let peer = assoc.dest.or(literal);
-                        if let Some(peer) = peer {
-                            assoc.dest = Some(peer);
-                            drop(flow.assocs.drain(at));
-                            let _ = flow
-                                .target
-                                .send_to(message.payload, target_addr(&flow.target, peer));
-                        } else if flow.assocs.waiting < MAX_PENDING_DATAGRAMS {
-                            flow.assocs.enqueue(at, message.payload.to_vec());
-                        }
+        let mut known = false;
+        let mut forged = false;
+        let mut assembled = Vec::new();
+        if let Some(flow) = lane.flows.get_mut(&session) {
+            known = true;
+            flow.last.store(now, Ordering::Relaxed);
+            let Some(at) = flow.slot(host, port, now) else {
+                continue;
+            };
+            let whole = flow.assocs.list[at].defrag.feed(&message, &mut assembled);
+            forged = whole.is_err();
+            match whole {
+                Ok(Some(message)) => {
+                    let assoc = &mut flow.assocs.list[at];
+                    let peer = assoc.dest.or_else(|| {
+                        host.parse::<IpAddr>()
+                            .ok()
+                            .map(|ip| SocketAddr::new(ip, port))
+                    });
+                    if let Some(peer) = peer {
+                        assoc.dest = Some(peer);
+                        drop(flow.assocs.drain(at));
+                        let _ = flow
+                            .target
+                            .send_to(message.payload, target_addr(&flow.target, peer));
+                    } else if flow.assocs.waiting < MAX_PENDING_DATAGRAMS {
+                        flow.assocs.enqueue(at, message.payload.to_vec());
                     }
-                    Ok(None) => {}
-                    Err(_) => flow.stop.store(true, Ordering::Relaxed),
                 }
+                Ok(None) => {}
+                Err(_) => flow.stop.store(true, Ordering::Relaxed),
             }
+        }
+        if known {
+            let mut spawn = Vec::new();
             if forged {
                 lane.flows.remove(&session);
             } else {
+                let room = MAX_PENDING_RESOLVERS.saturating_sub(lane.resolving);
                 spawn = lane.start_waiting(room);
             }
             lane.resolving += spawn.len();
@@ -1105,6 +1118,10 @@ fn relay_datagrams(
                 });
             }
             continue;
+        }
+        if !lane.sessions.contains(&session) {
+            let _ = conn.close(false, 0, b"");
+            return;
         }
         let UdpLane {
             flows,
@@ -2201,6 +2218,52 @@ mod tests {
             "a queued datagram costs its payload, not a key"
         );
         assert_eq!(assocs.waiting, 8);
+    }
+
+    /// A run of datagrams for one destination probes one association rather than walking the
+    /// list, and a hint left behind by an eviction is rejected by the walk's own test.
+    #[test]
+    fn a_known_destination_is_one_comparison_not_a_walk() {
+        let mut assocs = Assocs::default();
+        for index in 0..8 {
+            let host = format!("host{index}.test");
+            let at = assocs.insert(&host, 53, 0).expect("room");
+            assocs.list[at].dest = Some(SocketAddr::from(([127, 0, 0, 1], 53)));
+        }
+        assocs.probes = 0;
+        assert_eq!(assocs.find("host3.test", 53), Some(3));
+        assert_eq!(
+            assocs.probes, 5,
+            "the hint misses once, then the walk reaches the third association"
+        );
+        assocs.probes = 0;
+        for _ in 0..64 {
+            assert_eq!(assocs.find("host3.test", 53), Some(3));
+        }
+        assert_eq!(
+            assocs.probes, 64,
+            "each later lookup probes one association"
+        );
+        for index in 0..8 {
+            let host = format!("host{index}.test");
+            let walked = assocs.list.iter().position(|assoc| assoc.is(&host, 53));
+            assert_eq!(assocs.find(&host, 53), walked);
+        }
+        assocs.hit = Some(3);
+        assocs.evict(3);
+        assert!(
+            assocs.list[3].is("host7.test", 53),
+            "the tail moved into the hole"
+        );
+        assert!(
+            assocs.find("host3.test", 53).is_none(),
+            "an evicted association is not answered from a stale hint"
+        );
+        assert_eq!(
+            assocs.find("host7.test", 53),
+            Some(3),
+            "the moved association is found where it lives now"
+        );
     }
 
     /// The host a datagram's message carries is the address's own text, written into a stack

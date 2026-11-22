@@ -233,8 +233,11 @@ impl Lane {
 struct UdpSink {
     association: u16,
     reply: UdpSocket,
-    source: Mutex<Option<SocketAddr>>,
-    last: Mutex<Instant>,
+    /// The relay peer the association is pinned to, stored once so the uplink and the reply path read it without a lock.
+    source: OnceLock<SocketAddr>,
+    /// The instant the activity stamp counts from, with the last activity in milliseconds after it, so a reply refreshes the stamp with one atomic store.
+    born: Instant,
+    last: AtomicU64,
 }
 
 struct Pending {
@@ -568,8 +571,9 @@ impl TuicOut {
         let sink = Arc::new(UdpSink {
             association,
             reply,
-            source: Mutex::new(None),
-            last: Mutex::new(Instant::now()),
+            source: OnceLock::new(),
+            born: Instant::now(),
+            last: AtomicU64::new(0),
         });
         sinks.insert(association, Arc::clone(&sink));
         drop(sinks);
@@ -614,14 +618,12 @@ impl TuicOut {
                     else {
                         continue;
                     };
-                    if let Ok(mut slot) = sink.source.lock() {
-                        match *slot {
-                            None => *slot = Some(client),
-                            Some(pinned) if pinned != client => continue,
-                            Some(_) => {}
+                    match sink.source.get() {
+                        None => {
+                            let _ = sink.source.set(client);
                         }
-                    } else {
-                        break;
+                        Some(pinned) if *pinned != client => continue,
+                        Some(_) => {}
                     }
                     let Some((address, port)) = destination_wire(&destination) else {
                         continue;
@@ -651,10 +653,10 @@ impl TuicOut {
                         &mut frame,
                     );
                     flush_pending(&mut conn, &lane.sock, &mut pending, &lane.next_uni);
-                    touch(&sink.last);
+                    touch(&sink);
                 }
                 Err(error) if is_wait(&error) => {
-                    if idle(&sink.last) {
+                    if idle(&sink) {
                         break;
                     }
                 }
@@ -1243,28 +1245,19 @@ fn dispatch_client(
     let Some(sink) = sink else {
         return;
     };
-    client_reply(
-        &packet,
-        reassembly,
-        &sink.source,
-        &sink.last,
-        &sink.reply,
-        head,
-    );
+    client_reply(&packet, reassembly, &sink, head);
 }
 
 fn client_reply(
     packet: &wire::Packet<'_>,
     reassembly: &mut HashMap<(u16, u16), Parts>,
-    source: &Mutex<Option<SocketAddr>>,
-    last: &Mutex<Instant>,
-    reply: &UdpSocket,
+    sink: &UdpSink,
     head: &mut Vec<u8>,
 ) {
     let Some((destination, payload)) = take_packet(reassembly, packet) else {
         return;
     };
-    let Some(source) = source.lock().ok().and_then(|slot| *slot) else {
+    let Some(source) = sink.source.get().copied() else {
         return;
     };
     let target = match destination {
@@ -1277,19 +1270,23 @@ fn client_reply(
         }
     };
     let (head, payload) = proxy::socks_udp_parts(head, &target, &payload);
-    if proxy::send_to_two(reply, head, payload, source).is_ok() {
-        touch(last);
+    if proxy::send_to_two(&sink.reply, head, payload, source).is_ok() {
+        touch(sink);
     }
 }
 
-fn touch(last: &Mutex<Instant>) {
-    if let Ok(mut last) = last.lock() {
-        *last = Instant::now();
-    }
+fn touch(sink: &UdpSink) {
+    let stamp = millis(sink.born);
+    sink.last.store(stamp, Ordering::Relaxed);
 }
 
-fn idle(last: &Mutex<Instant>) -> bool {
-    last.lock().is_ok_and(|last| last.elapsed() >= UDP_IDLE)
+fn idle(sink: &UdpSink) -> bool {
+    let window = u64::try_from(UDP_IDLE.as_millis()).unwrap_or(u64::MAX);
+    millis(sink.born).saturating_sub(sink.last.load(Ordering::Relaxed)) >= window
+}
+
+fn millis(born: Instant) -> u64 {
+    u64::try_from(born.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn take_packet<'a>(
@@ -3562,29 +3559,32 @@ mod tests {
 
     #[test]
     fn a_delivered_reply_refreshes_the_sink_activity() {
-        let sink = UdpSocket::bind("127.0.0.1:0").expect("a sink");
         let client = UdpSocket::bind("127.0.0.1:0").expect("a client");
-        let source = Mutex::new(Some(client.local_addr().expect("an address")));
-        let last = Mutex::new(Instant::now().checked_sub(UDP_IDLE).expect("an instant"));
+        let sink = UdpSink {
+            association: 1,
+            reply: UdpSocket::bind("127.0.0.1:0").expect("a sink"),
+            source: OnceLock::new(),
+            born: Instant::now()
+                .checked_sub(UDP_IDLE + Duration::from_secs(1))
+                .expect("an instant"),
+            last: AtomicU64::new(0),
+        };
+        sink.source
+            .set(client.local_addr().expect("an address"))
+            .expect("the source is pinned once");
+        assert!(idle(&sink), "an idle stamp this old is stale");
         let address = wire::address_port("127.0.0.1", 9).expect("an address");
         let mut frame = Vec::new();
         wire::encode_fragment(1, 2, 1, 0, &address, b"hello", &mut frame);
         let packet = wire::parse_packet(&frame).expect("a packet");
         let mut head = Vec::new();
-        client_reply(
-            &packet,
-            &mut HashMap::new(),
-            &source,
-            &last,
-            &sink,
-            &mut head,
-        );
+        client_reply(&packet, &mut HashMap::new(), &sink, &mut head);
         let mut buf = [0u8; 64];
         client
             .set_read_timeout(Some(Duration::from_secs(1)))
             .expect("a timeout");
         let (n, _) = client.recv_from(&mut buf).expect("the reply arrives");
         assert!(n > 5);
-        assert!(last.lock().expect("the activity").elapsed() < UDP_IDLE);
+        assert!(!idle(&sink), "the reply refreshed the stamp");
     }
 }

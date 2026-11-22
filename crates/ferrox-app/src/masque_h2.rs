@@ -954,12 +954,12 @@ impl Client {
         }
         if at > 0 {
             pending.drain(..at);
+            self.last_frame = Instant::now();
         }
         self.wire.pending = pending;
     }
 
     fn on(&mut self, kind: u8, flags: u8, id: u32, body: &[u8]) {
-        self.last_frame = Instant::now();
         match kind {
             h2::T_SETTINGS if flags & h2::F_ACK == 0 => {
                 let mut at = 0;

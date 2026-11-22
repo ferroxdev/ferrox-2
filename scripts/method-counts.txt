@@ -1280,9 +1280,13 @@ tuic uni-read-copies-per-packet 0 ferrox-app-tuic::tests::a_uni_run_shares_one_b
 tuic uni-read-first-frame-tail-allocations 0 ferrox-app-tuic::tests::a_uni_run_keeps_only_the_partial_tail
 wireguard routed-lane-datagram-copies-per-datagram 0 ferrox-app-wg::tests::a_routed_datagram_reaches_its_lane_in_the_readers_buffer
 wireguard stack-reply-copies-per-datagram 0 ferrox-app-wg-stack::tests::a_reply_datagram_reaches_its_lane_in_the_readers_buffer
+wireguard receiver-lookups-per-transport-packet 1 ferrox-app-wg::tests::a_learned_receiver_reaches_its_peer_without_a_walk
+wireguard stale-receiver-hint-answers 0 ferrox-app-wg::tests::a_learned_receiver_reaches_its_peer_without_a_walk
 carrier-masque h3-lane-prefix-bytes-moved-per-datagram 0 ferrox-app-masque::tests::a_lane_datagram_keeps_its_prefix
 carrier-hysteria datagram-host-allocations-per-datagram 0 ferrox-app-hysteria-v1::tests::a_datagram_host_is_the_address_text_without_the_heap
 carrier-hysteria established-destination-allocations-per-datagram 0 ferrox-app-hysteria-v1::tests::an_established_destination_costs_no_key_and_no_insert
 carrier-hysteria queued-datagram-allocations-per-datagram 0 ferrox-app-hysteria_v1::tests::an_established_destination_costs_no_key_and_no_insert
+carrier-hysteria established-destination-comparisons-per-datagram 1 ferrox-app-hysteria_v1::tests::a_known_destination_is_one_comparison_not_a_walk
+carrier-hysteria evicted-association-hint-answers 0 ferrox-app-hysteria_v1::tests::a_known_destination_is_one_comparison_not_a_walk
 socks reply-head-allocations-per-reply-datagram 0 ferrox-app-proxy::tests::a_reply_head_is_written_without_a_buffer
 socks reply-ns-per-reply 2.3 .github/workflows/bench.yml
