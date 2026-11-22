@@ -355,8 +355,19 @@ fn members(config: &Json) -> Result<Vec<String>, String> {
     Ok(tags)
 }
 
+fn field<'a>(config: &'a Json, key: &str) -> Option<&'a Json> {
+    config
+        .get(key)
+        .filter(|value| !matches!(value, Json::Null))
+        .or_else(|| {
+            config
+                .get("settings")
+                .and_then(|settings| settings.get(key))
+        })
+}
+
 fn text<'a>(config: &'a Json, key: &str, tag: &str) -> Result<Option<&'a str>, String> {
-    match config.get(key) {
+    match field(config, key) {
         None | Some(Json::Null) => Ok(None),
         Some(Json::Str(value)) => Ok(Some(value)),
         Some(_) => Err(format!("group `{tag}` {key} is not a string")),
@@ -378,7 +389,7 @@ fn duration(value: Option<&Json>, default: Duration, what: &str) -> Result<Durat
 }
 
 fn flag(config: &Json, key: &str) -> bool {
-    config.get(key).and_then(Json::as_bool).unwrap_or(false)
+    field(config, key).and_then(Json::as_bool).unwrap_or(false)
 }
 
 impl Group {
@@ -417,14 +428,15 @@ impl Group {
                         named.clone_into(&mut url);
                     }
                 }
-                interval = duration(config.get("interval"), DEFAULT_INTERVAL, "interval")?;
-                idle = duration(config.get("idle_timeout"), DEFAULT_IDLE, "idle_timeout")?;
+                interval = duration(field(config, "interval"), DEFAULT_INTERVAL, "interval")?;
+                idle = duration(field(config, "idle_timeout"), DEFAULT_IDLE, "idle_timeout")?;
                 if interval > idle {
                     return Err(format!(
                         "urltest `{tag}` interval is longer than its idle_timeout"
                     ));
                 }
-                if let Some(value) = config.get("tolerance").filter(|v| !matches!(v, Json::Null)) {
+                if let Some(value) = field(config, "tolerance").filter(|v| !matches!(v, Json::Null))
+                {
                     let value = value
                         .as_u32()
                         .ok_or_else(|| format!("urltest `{tag}` tolerance is not a number"))?;

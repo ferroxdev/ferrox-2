@@ -2240,7 +2240,9 @@ fn udp_lane_supported(out: &Outbound) -> bool {
         | Outbound::Psiphon(_)
         | Outbound::Dns(_)
         | Outbound::ReversePortal(_) => true,
-        Outbound::Shadowsocks(ss) => matches!(ss.carrier, Carrier::Raw(_)),
+        Outbound::Shadowsocks(ss) => {
+            matches!(ss.carrier, Carrier::Raw(_)) || ss.mux.udp_manager().is_some()
+        }
         Outbound::Socks(socks) => socks.version != crate::socks::Version::V4,
         Outbound::Group(group) => group
             .resolve_bound(crate::router::Network::Udp)
@@ -28556,6 +28558,11 @@ fn serve_socks_connected(mut client: Connection, out: &Outbound, handshake: &Han
     // The rules decide the lane first; a blocked flow is granted before it closes, so the front's reply is read.
     let destination = handshake.asked.authority();
     crate::accesslog::record(client.peer_addr().ok(), true, &destination, None, "", email);
+    let group = front_group_lane(out);
+    let (out, group_tag) = match &group {
+        Some((member, leaf)) => (member, Some(leaf.as_str())),
+        None => (out, None),
+    };
     let first = match crate::sniff::current() {
         Some(sniffing) if sniffing.enabled() => None,
         _ => Some(out.resolved_lane_with_protocol(
@@ -28584,8 +28591,21 @@ fn serve_socks_connected(mut client: Connection, out: &Outbound, handshake: &Han
         }
     }
     let (dial, out, tag) = match first {
-        Some((lane, tag)) => (None, lane, tag),
-        None => sniff_lane(out, &handshake.asked, &client, user, level),
+        Some((lane, tag)) => (
+            None,
+            lane,
+            tag.map(|tag| tag.into_owned())
+                .or_else(|| group_tag.map(str::to_owned)),
+        ),
+        None => {
+            let (dial, out, tag) = sniff_lane(out, &handshake.asked, &client, user, level);
+            (
+                dial,
+                out,
+                tag.map(|tag| tag.into_owned())
+                    .or_else(|| group_tag.map(str::to_owned)),
+            )
+        }
     };
     let asked = dial.as_ref().unwrap_or(&handshake.asked);
     serve_connect(
@@ -29240,6 +29260,19 @@ fn loopback_sniffed(
         .should_dial_override(&found)
         .then(|| Destination::Name(found.domain, asked.port()));
     (dial, route, Some(found.protocol), pairs)
+}
+
+/// Resolve a group before a front decides whether its leaf grants for itself, so a Foxy or `VeePN`
+/// leaf is not granted twice and a leaf that grants itself is not granted early.
+fn front_group_lane(out: &Outbound) -> Option<(Outbound, String)> {
+    let Outbound::Group(group) = out else {
+        return None;
+    };
+    let (leaf, member) = group.resolve_bound(crate::router::Network::Tcp)?;
+    if let Some(route) = group.route_handle() {
+        route.carry_tag_settings(&leaf);
+    }
+    Some((member, leaf))
 }
 
 /// One tunnel request from either front, already resolved to its lane: the Foxy lane grants after its tunnel opens.
@@ -30779,6 +30812,11 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
         ProxyRequest::Connect(asked) => {
             let destination = asked.authority();
             crate::accesslog::record(client.peer_addr().ok(), true, &destination, None, "", email);
+            let group = front_group_lane(out);
+            let (out, group_tag) = match &group {
+                Some((member, leaf)) => (member, Some(leaf.as_str())),
+                None => (out, None),
+            };
             let first = match crate::sniff::current() {
                 Some(sniffing) if sniffing.enabled() => None,
                 _ => Some(out.resolved_lane_with_protocol(
@@ -30802,8 +30840,21 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
                 return;
             }
             let (dial, out, tag) = match first {
-                Some((lane, tag)) => (None, lane, tag),
-                None => sniff_lane(out, &asked, &client, user, level),
+                Some((lane, tag)) => (
+                    None,
+                    lane,
+                    tag.map(|tag| tag.into_owned())
+                        .or_else(|| group_tag.map(str::to_owned)),
+                ),
+                None => {
+                    let (dial, out, tag) = sniff_lane(out, &asked, &client, user, level);
+                    (
+                        dial,
+                        out,
+                        tag.map(|tag| tag.into_owned())
+                            .or_else(|| group_tag.map(str::to_owned)),
+                    )
+                }
             };
             let asked = dial.as_ref().unwrap_or(&asked);
             serve_connect(
@@ -61172,6 +61223,20 @@ mod tests {
         assert_eq!(off.mux, Mux::default(), "a disabled mux carries nothing");
     }
 
+    /// A WebSocket Shadowsocks lane whose mux has a UDP pool carries datagrams, so the group
+    /// filter must not reject it just because its carrier is not raw.
+    #[test]
+    fn a_mux_shadowsocks_websocket_lane_declares_udp() {
+        let root = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "shadowsocks", "settings": {"servers": [{"address": "192.0.2.1", "port": 443, "method": "aes-256-gcm", "password": "secret"}]}, "mux": {"enabled": true, "xudpConcurrency": 7}, "streamSettings": {"network": "ws", "wsSettings": {"path": "/t"}}}]}"#,
+        )
+        .expect("parses");
+        let out = find_shadowsocks_outbound(&root).expect("finds");
+        assert!(matches!(out.carrier, Carrier::Ws { .. }));
+        assert_eq!(out.mux.udp_manager(), Some(7));
+        assert!(udp_lane_supported(&Outbound::Shadowsocks(out)));
+    }
+
     /// A KCP bridge lane is admitted only when the mux carries a UDP pool, the same test the
     /// worker uses before it opens the datagram path.
     #[test]
@@ -84046,6 +84111,59 @@ end
             .expect("picks");
         assert_eq!(tag, "a");
         assert!(matches!(out, Outbound::Freedom(_)));
+    }
+
+    /// The nested member form carries its options in `settings`, and they are not silently lost.
+    #[test]
+    fn a_nested_group_reads_its_options_from_settings() {
+        let shared = group_route(
+            r#"{"outbounds":[
+                {"tag":"a","protocol":"freedom"},
+                {"tag":"b","protocol":"blackhole"},
+                {"tag":"pick","type":"selector","settings":{"outbounds":["a","b"],"default":"b"}}
+            ],"routing":{}}"#,
+        );
+        let group = group_of(&shared, "pick");
+        let (tag, _) = group
+            .resolve(&shared, crate::router::Network::Tcp)
+            .expect("picks");
+        assert_eq!(tag, "b", "the nested default is honored");
+
+        let shared = group_route(
+            r#"{"outbounds":[
+                {"tag":"a","protocol":"freedom"},
+                {"tag":"b","protocol":"freedom"},
+                {"tag":"pick","type":"urltest","settings":{
+                    "outbounds":["a","b"],
+                    "url":"http://127.0.0.1/204",
+                    "tolerance":10
+                }}
+            ],"routing":{}}"#,
+        );
+        let group = group_of(&shared, "pick");
+        group.record("a", 100);
+        group.record("b", 60);
+        let (tag, _) = group
+            .resolve(&shared, crate::router::Network::Tcp)
+            .expect("picks");
+        assert_eq!(tag, "b", "the nested tolerance is honored");
+    }
+
+    /// A front resolves a group before it decides whether the leaf grants the reply itself.
+    #[test]
+    fn a_front_group_lane_resolves_the_selected_leaf() {
+        let shared = group_route(
+            r#"{"outbounds":[
+                {"tag":"a","protocol":"freedom"},
+                {"tag":"b","protocol":"blackhole"},
+                {"tag":"pick","type":"selector","outbounds":["a","b"],"default":"b"}
+            ],"routing":{}}"#,
+        );
+        let group = group_of(&shared, "pick");
+        let out = Outbound::Group(group);
+        let (member, leaf) = front_group_lane(&out).expect("a group resolves");
+        assert_eq!(leaf, "b");
+        assert!(matches!(member, Outbound::Block(_)));
     }
 
     /// A urltest keeps the selected member until another is faster by more than the tolerance.
