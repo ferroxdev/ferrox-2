@@ -3500,6 +3500,30 @@ impl RouteShared {
             .or_else(|| (self.default_tag.as_deref() == Some(tag)).then(|| self.default.clone()))
     }
 
+    /// One tag's handler and the revision behind it from the same lookup, so a lane cannot pair a
+    /// handler with a revision that names a different entry.
+    pub(crate) fn member_revision(&self, tag: &str) -> Option<(Outbound, u64)> {
+        if self.changed.load(Ordering::Relaxed) {
+            let dynamic = self
+                .dynamic
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if dynamic.removed.contains(tag) {
+                return None;
+            }
+            if let Some(out) = dynamic.added.get(tag) {
+                return Some(((*out.out).clone(), out.id));
+            }
+        }
+        self.tagged
+            .get(tag)
+            .cloned()
+            .map(|out| (out, 0))
+            .or_else(|| {
+                (self.default_tag.as_deref() == Some(tag)).then(|| (self.default.clone(), 0))
+            })
+    }
+
     /// The source, socket options and target strategy one tag names, with the default's own when
     /// the tag is the default entry.
     fn tag_dial_settings(
@@ -31384,7 +31408,7 @@ fn serve_socks_udp_lane(mut client: Connection, out: &Outbound) {
             let _ = client.write_all(&foxy_socks_reply(0x07));
             return;
         };
-        if matches!(member, Outbound::Block(_)) {
+        if !udp_lane_supported(&member) {
             let _ = client.write_all(&foxy_socks_reply(0x07));
             return;
         }
@@ -31404,8 +31428,8 @@ fn serve_socks_udp_lane(mut client: Connection, out: &Outbound) {
         (None, None)
     };
     let out = resolved.as_ref().unwrap_or(out);
-    // A blackhole association is a refusal: a relay that drops every datagram reads as working.
-    if matches!(out, Outbound::Block(_)) {
+    // An outbound with no datagram lane is a refusal: a relay that drops every datagram reads as working.
+    if !udp_lane_supported(out) {
         let _ = client.write_all(&foxy_socks_reply(0x07));
         return;
     }
@@ -31747,6 +31771,7 @@ fn serve_socks_udp_split(
             if peer_left(&client) {
                 break;
             }
+            reap_finished_lanes(&mut lanes, &mut replies);
         }
         match relay.recv_from(&mut buf) {
             Ok((n, src)) => {
@@ -31816,11 +31841,14 @@ fn serve_socks_udp_split(
                 }
                 let (lane_out, lane_key, lane_start) = match &*out {
                     Outbound::Group(group) => {
-                        let Some((leaf, member)) = group.resolve_bound(crate::router::Network::Udp)
+                        let Some((leaf, _)) = group.resolve_bound(crate::router::Network::Udp)
                         else {
                             continue;
                         };
-                        if matches!(member, Outbound::Block(_)) {
+                        let Some((member, revision)) = plan.shared.member_revision(&leaf) else {
+                            continue;
+                        };
+                        if !udp_lane_supported(&member) {
                             continue;
                         }
                         let (source, sockopts, strategy) = group
@@ -31832,16 +31860,26 @@ fn serve_socks_udp_split(
                             sockopts,
                             strategy,
                         };
-                        (Some(member), Some(leaf), Some(start))
+                        (Some(member), Some((leaf, revision)), Some(start))
                     }
-                    _ => (None, key.as_deref().map(str::to_owned), None),
+                    _ => {
+                        if let Some(tag) = key.as_deref() {
+                            let Some((member, revision)) = plan.shared.member_revision(tag) else {
+                                continue;
+                            };
+                            if !udp_lane_supported(&member) {
+                                continue;
+                            }
+                            plan.carry_dial_settings(Some(tag));
+                            (Some(member), Some((tag.to_owned(), revision)), None)
+                        } else {
+                            (None, None, None)
+                        }
+                    }
                 };
                 let lane_ref = lane_out.as_ref().unwrap_or(&*out);
-                let lane_address = if let Some(tag) = lane_key.as_deref() {
-                    let Some(revision) = plan.shared.leaf_revision(tag) else {
-                        continue;
-                    };
-                    let key = (tag.to_owned(), revision);
+                let lane_address = if let Some((tag, revision)) = lane_key.as_ref() {
+                    let key = (tag.clone(), *revision);
                     if let Some(address) = retire_finished_lane(&mut lanes, &mut replies, &key) {
                         Some(address)
                     } else {
@@ -31854,6 +31892,9 @@ fn serve_socks_udp_split(
                                 None,
                                 Some(start),
                             ),
+                            (Some(member), None) => {
+                                spawn_udp_lane(member, local, client.try_clone().ok(), Some(local))
+                            }
                             _ => spawn_udp_lane(&out, local, client.try_clone().ok(), Some(local)),
                         };
                         spawned.map(|lane| {
@@ -31901,6 +31942,22 @@ fn udp_bind_for(relay: SocketAddr) -> SocketAddr {
             SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0)
         }
     }
+}
+
+/// Drop every finished worker, including one whose revision was superseded, so its waker socket and
+/// reply address do not wait for the association to close. Running workers stay for in-flight replies.
+fn reap_finished_lanes(
+    lanes: &mut HashMap<(String, u64), UdpLane>,
+    replies: &mut HashSet<SocketAddr>,
+) {
+    lanes.retain(|_, lane| {
+        if lane.handle.is_finished() {
+            replies.remove(&lane.address);
+            false
+        } else {
+            true
+        }
+    });
 }
 
 /// A lane's loop ends on its own idle or a refused upstream; the tag must not keep writing to the
@@ -32380,7 +32437,7 @@ fn serve_socks_udp_freedom(
         if !source_admitted(peer, pinned, src) {
             continue;
         }
-        let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
+        let Some((mut asked, payload)) = parse_socks_udp_dest(&buf[..n]) else {
             continue;
         };
         if payload.is_empty() {
@@ -32389,7 +32446,14 @@ fn serve_socks_udp_freedom(
         // A datagram that passes admission and framing is the only one that keeps the lane alive.
         seen = replies.load(Ordering::Relaxed);
         last = Instant::now();
-        let Some(dest) = freedom_socket(freedom, &Destination::Address(dest)) else {
+        if let Some(strategy) = TARGET_STRATEGY.with(std::cell::Cell::get) {
+            match resolve_target(&asked, strategy) {
+                TargetPick::Address(address) => asked = address,
+                TargetPick::Refuse => continue,
+                TargetPick::Keep => {}
+            }
+        }
+        let Some(dest) = freedom_socket(freedom, &asked) else {
             continue;
         };
         let blocked = freedom.blocks(crate::router::Network::Udp, dest.ip(), dest.port());
@@ -66098,6 +66162,75 @@ mod tests {
         assert_eq!(payload, b"ping");
     }
 
+    /// A freedom UDP name reaches the lane as a name, so its target strategy can refuse the wrong family.
+    #[test]
+    fn a_freedom_udp_name_takes_the_outbound_target_strategy() {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut buf = vec![0u8; UDP_BUF];
+            loop {
+                let Ok((n, src)) = echo.recv_from(&mut buf) else {
+                    return;
+                };
+                if echo.send_to(&buf[..n], src).is_err() {
+                    return;
+                }
+            }
+        });
+        let name_frame = |port: u16| {
+            let mut frame = vec![0, 0, 0, 3, 9];
+            frame.extend_from_slice(b"127.0.0.1");
+            frame.extend_from_slice(&port.to_be_bytes());
+            frame.extend_from_slice(b"ping");
+            frame
+        };
+        let associate = |out: Outbound| {
+            let front = socks_front_with(out);
+            let mut client = Connection::connect(("127.0.0.1", front)).expect("connects");
+            client
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .expect("timeout");
+            client.write_all(&[5, 1, 0]).expect("greets");
+            let mut method = [0u8; 2];
+            client.read_exact(&mut method).expect("selects");
+            client
+                .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+                .expect("associates");
+            let mut reply = [0u8; 10];
+            client.read_exact(&mut reply).expect("replies");
+            let relay = SocketAddr::new(
+                std::net::IpAddr::V4([127, 0, 0, 1].into()),
+                u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+            );
+            let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+            udp.set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("timeout");
+            (client, udp, relay)
+        };
+
+        let (force6, udp6, relay6) = associate(freedom_out(
+            r#"{"outbounds":[{"protocol":"freedom","targetStrategy":"forceIp6"}]}"#,
+        ));
+        udp6.send_to(&name_frame(echo_port), relay6).expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        assert!(
+            udp6.recv_from(&mut back).is_err(),
+            "ForceIP6 refuses an IPv4-only name"
+        );
+        drop(force6);
+
+        let (plain, udp, relay) =
+            associate(freedom_out(r#"{"outbounds":[{"protocol":"freedom"}]}"#));
+        udp.send_to(&name_frame(echo_port), relay).expect("sends");
+        let (n, _) = udp
+            .recv_from(&mut back)
+            .expect("the default strategy answers");
+        let (_, payload) = parse_socks_udp(&back[..n]).expect("splits");
+        assert_eq!(payload, b"ping");
+        drop(plain);
+    }
+
     /// A blocked UDP destination still receives the decoy before the final rule drops the payload,
     /// and the socket stays open, as the reference's noise writer runs ahead of its rule check.
     #[test]
@@ -84145,6 +84278,52 @@ end
         assert!(!replies.contains(&address));
     }
 
+    /// A finished worker from a superseded revision is reaped without touching a running one.
+    #[test]
+    fn a_superseded_finished_lane_is_reaped() {
+        let finished: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+        let running: SocketAddr = "127.0.0.1:10".parse().expect("addr");
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let running_handle = thread::spawn(move || {
+            let _ = wait.recv();
+        });
+        let finished_handle = thread::spawn(|| {});
+        while !finished_handle.is_finished() {
+            thread::yield_now();
+        }
+        let mut lanes = HashMap::from([
+            (
+                ("old".to_owned(), 0),
+                UdpLane {
+                    address: finished,
+                    handle: finished_handle,
+                    waker: UdpSocket::bind("127.0.0.1:0").expect("binds"),
+                },
+            ),
+            (
+                ("live".to_owned(), 1),
+                UdpLane {
+                    address: running,
+                    handle: running_handle,
+                    waker: UdpSocket::bind("127.0.0.1:0").expect("binds"),
+                },
+            ),
+        ]);
+        let mut replies = HashSet::from([finished, running]);
+        reap_finished_lanes(&mut lanes, &mut replies);
+        assert!(!lanes.contains_key(&("old".to_owned(), 0)));
+        assert!(!replies.contains(&finished));
+        assert!(lanes.contains_key(&("live".to_owned(), 1)));
+        assert!(replies.contains(&running));
+        let _ = release.send(());
+        lanes
+            .remove(&("live".to_owned(), 1))
+            .expect("the live lane")
+            .handle
+            .join()
+            .expect("joins");
+    }
+
     /// A balancer picks a lane per flow: the round robin walks the selected tags in config order,
     /// and a strategy with no observatory falls back where the reference does.
     #[test]
@@ -84391,6 +84570,34 @@ end
         assert_eq!(
             reply[1], 0x07,
             "the selected blackhole is a refusal, not an empty success: {reply:?}"
+        );
+    }
+
+    /// A group that selects a TCP-only leaf refuses the association instead of reporting an empty success.
+    #[test]
+    fn a_group_udp_association_to_a_tcp_only_leaf_is_refused() {
+        let config = r#"{"outbounds":[
+            {"tag":"pick","type":"selector","outbounds":["tcp","direct"],"default":"tcp"},
+            {"tag":"tcp","protocol":"http","settings":{"servers":[{"address":"127.0.0.1","port":1}]}},
+            {"tag":"direct","protocol":"freedom"}
+        ],"routing":{"rules":[{"type":"field","network":"tcp","port":1,"outboundTag":"direct"}]}}"#;
+        let out = route_outbound(config, Some("in"), true);
+        let port = socks_front_with(out);
+        let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(
+            reply[1], 0x07,
+            "the selected TCP-only leaf cannot carry datagrams: {reply:?}"
         );
     }
 
