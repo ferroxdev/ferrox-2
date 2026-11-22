@@ -1802,11 +1802,12 @@ impl NaiveOut {
         let mut tls = (*self.tls).clone();
         tls.alpn = Arc::from(vec![b"h2".to_vec()]);
         let session = proxy::dial_tls_session(&server, &tls, None)?;
+        let raw = Arc::new(session.get_ref().try_clone().ok()?);
         let (reader, writer) = proxy::tls_client_halves(session)?;
         H2Client::new_windowed(
             reader,
             BoxedWrite(writer),
-            None,
+            Some(raw),
             Some(self.stream_window.unwrap_or(H2_RECEIVE_WINDOW)),
         )
     }
