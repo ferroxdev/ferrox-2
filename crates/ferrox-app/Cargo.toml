@@ -14,6 +14,7 @@ workspace = true
 aes = "0.9"
 aes-gcm = "0.11"
 aho-corasick = "1"
+bytes = "1"
 ferrox-core = { workspace = true }
 getrandom = "0.4"
 hkdf = "0.13"

@@ -1,3 +1,4 @@
+use bytes::BufMut as _;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, ToSocketAddrs as _, UdpSocket};
@@ -10,7 +11,7 @@ use ferrox_core::hysteria::{self, Defrag, Masquerade, UdpMessage};
 
 use crate::conn::Connection;
 use crate::proxy::lane_pool::Next;
-use crate::quic::{Unfilled, RECV_ROOM};
+use crate::quic::{QuicheConnection, Unfilled, RECV_ROOM};
 
 const AUTH_STREAM: u64 = 0;
 
@@ -42,7 +43,7 @@ pub(crate) struct Dial {
 
 #[derive(Clone)]
 pub(crate) struct Session {
-    pub(crate) shared: Arc<Mutex<quiche::Connection>>,
+    pub(crate) shared: Arc<Mutex<QuicheConnection>>,
     pub(crate) sock: Arc<crate::quic::Datagram>,
     pub(crate) local: SocketAddr,
     /// The source the next packet must name, shared by every clone of the session:
@@ -492,7 +493,7 @@ pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
 }
 
 /// The datagrams already queued behind the one the turn took, never waiting for one that has not arrived: a lane whose read is the wire's own hands over a batch in one call, and a masked one reads what is there behind a tail short enough that a writer is not held behind it.
-fn take_queued(conn: &mut quiche::Connection, session: &Session) {
+fn take_queued(conn: &mut QuicheConnection, session: &Session) {
     let local = session
         .local_now
         .lock()
@@ -530,7 +531,6 @@ fn take_queued(conn: &mut quiche::Connection, session: &Session) {
 
 fn read_headers_block(session: &Session, stream: u64, deadline: Instant) -> Option<Vec<u8>> {
     let mut head = Vec::with_capacity(128);
-    let mut room = Unfilled::<4096>::new();
     loop {
         if head.len() >= HEAD_CAP || Instant::now() >= deadline {
             return None;
@@ -547,19 +547,18 @@ fn read_headers_block(session: &Session, stream: u64, deadline: Instant) -> Opti
                 return Some(head);
             }
         }
-        let read = {
+        let progressed = {
             let Ok(mut conn) = session.shared.lock() else {
                 return None;
             };
-            match conn.stream_recv(stream, room.as_mut()) {
-                Ok((n, _)) => Some(n),
-                Err(quiche::Error::Done) => None,
+            let room = HEAD_CAP - head.len();
+            match conn.stream_recv_buf(stream, (&mut head).limit(room)) {
+                Ok((0, _)) | Err(quiche::Error::Done) => false,
+                Ok((_, _)) => true,
                 Err(_) => return None,
             }
         };
-        if let Some(n) = read {
-            head.extend_from_slice(&room.as_mut()[..n]);
-        } else {
+        if !progressed {
             let _ = drive_once(session, STREAM_POLL);
         }
     }
@@ -646,6 +645,7 @@ fn client_config(dial: &Dial, roots: &[Vec<u8>]) -> Option<quiche::Config> {
 }
 
 /// Dial the configured lane, wrap its socket in the mask or hop it names, and finish the QUIC handshake and auth.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn connect(dial: &Dial) -> Option<Session> {
     #[cfg(test)]
     HANDSHAKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -669,7 +669,13 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
     config.set_initial_congestion_window_packets(400);
     // The client enables the datagram lane exactly as the served connection does: advertising it changes no stream byte of a TCP-only flow, and it is what lets `dgram_max_writable_len` answer for a UDP dial on this connection.
     config.enable_dgram(true, 1024, 1024);
-    let Ok(mut conn) = quiche::connect(Some(&dial.host), &cid, local, peer, &mut config) else {
+    let Ok(mut conn) = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
+        Some(&dial.host),
+        &cid,
+        local,
+        peer,
+        &mut config,
+    ) else {
         return None;
     };
     let obfs = hysteria::Salamander::new(&dial.config.obfs_password);
@@ -799,7 +805,7 @@ impl Flow {
     }
 
     pub(crate) fn from_parts(
-        shared: Arc<Mutex<quiche::Connection>>,
+        shared: Arc<Mutex<QuicheConnection>>,
         sock: Arc<crate::quic::Datagram>,
         local: SocketAddr,
         stream: u64,
@@ -1170,7 +1176,7 @@ fn server_of(dial: &Dial) -> Server {
 }
 
 /// Whether a pooled connection can still open a flow: quiche takes no new application data once a connection is closed, draining, or carrying a close in either direction.
-fn usable(conn: &quiche::Connection) -> bool {
+fn usable(conn: &QuicheConnection) -> bool {
     !conn.is_closed()
         && !conn.is_draining()
         && conn.local_error().is_none()
@@ -1447,7 +1453,7 @@ enum Standing {
 }
 
 struct Inbound {
-    conn: Arc<Mutex<quiche::Connection>>,
+    conn: Arc<Mutex<QuicheConnection>>,
     client_cid: Vec<u8>,
     initial_dcid: Vec<u8>,
     source_ids: Vec<Vec<u8>>,
@@ -1472,7 +1478,7 @@ struct UdpFlow {
 }
 
 fn answer_auth(
-    conn: &mut quiche::Connection,
+    conn: &mut QuicheConnection,
     sock: &crate::quic::Datagram,
     ok: bool,
     cc_rx: u64,
@@ -1493,7 +1499,7 @@ fn answer_auth(
 }
 
 /// Drains the client's HTTP/3 SETTINGS so the unread bytes never hold flow control, and reports the stream's FIN so the caller stops paying the call per packet.
-fn drain_settings(conn: &mut quiche::Connection) -> bool {
+fn drain_settings(conn: &mut QuicheConnection) -> bool {
     let mut room = Unfilled::<128>::new();
     loop {
         match conn.stream_recv(2, room.as_mut()) {
@@ -1506,7 +1512,7 @@ fn drain_settings(conn: &mut quiche::Connection) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 fn serve_stream(
-    shared: &Arc<Mutex<quiche::Connection>>,
+    shared: &Arc<Mutex<QuicheConnection>>,
     sock: &Arc<crate::quic::Datagram>,
     local: SocketAddr,
     stream: u64,
@@ -1597,7 +1603,7 @@ const MASQ_BODY_CAP: usize = hysteria::MAX_UDP_PAYLOAD;
 /// Answers a browser request that arrived on a flow slot: read the whole request off the stream, build the cover response, and finish the stream with it so the browser sees a complete reply while the connection stays up for its next request.
 #[allow(clippy::too_many_arguments)]
 fn serve_masquerade_stream(
-    shared: &Arc<Mutex<quiche::Connection>>,
+    shared: &Arc<Mutex<QuicheConnection>>,
     sock: &Arc<crate::quic::Datagram>,
     stream: u64,
     seed: Vec<u8>,
@@ -1629,7 +1635,7 @@ fn serve_masquerade_stream(
 
 /// Reads a browser's HTTP/3 request off a stream the router has already begun: the bytes in `buf` first, then whatever still arrives. A request whose headers are whole and which declares no body returns at once, so a keep-alive stream the browser leaves open never blocks the cover; a body is drained only until its declared length or the stream's finish.
 fn read_h3_request(
-    shared: &Arc<Mutex<quiche::Connection>>,
+    shared: &Arc<Mutex<QuicheConnection>>,
     stream: u64,
     mut buf: Vec<u8>,
     mut fin: bool,
@@ -2157,7 +2163,7 @@ fn read_origin<R: Read>(stream: &mut R, head: &[u8]) -> Option<hysteria::OriginR
 
 /// Bring one datagram association up: resolve the address the client named, connect a target socket of the matching family, and hand a reader thread the same socket so its replies return over the lane. `None` when the address is unresolvable or no socket can be raised, and the datagram is then dropped.
 fn open_udp(
-    shared: &Arc<Mutex<quiche::Connection>>,
+    shared: &Arc<Mutex<QuicheConnection>>,
     sock: &Arc<crate::quic::Datagram>,
     session: u32,
     address: &str,
@@ -2195,7 +2201,7 @@ fn open_udp(
 
 /// Read the target socket and put every reply back on the lane, fragmenting to the peer's writable datagram size so a large response still arrives: one packet id per reply, its fragments sharing it, exactly as the client sends to us. A read that only timed out checks whether the reap or the closed connection told it to stop, so the thread lives no longer than one poll past its association.
 fn udp_reader(
-    shared: &Arc<Mutex<quiche::Connection>>,
+    shared: &Arc<Mutex<QuicheConnection>>,
     sock: &Arc<crate::quic::Datagram>,
     target: &Arc<UdpSocket>,
     stop: &AtomicBool,
@@ -2443,8 +2449,8 @@ fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpS
 fn relay_datagrams(
     inbound: &mut Inbound,
     sock: &Arc<crate::quic::Datagram>,
-    shared: &Arc<Mutex<quiche::Connection>>,
-    conn: &mut quiche::Connection,
+    shared: &Arc<Mutex<QuicheConnection>>,
+    conn: &mut QuicheConnection,
     retired: &mut Vec<std::thread::JoinHandle<()>>,
 ) {
     if !matches!(inbound.standing, Standing::Authed) {
@@ -2561,8 +2567,8 @@ impl Drop for CoverSlot {
 #[allow(clippy::too_many_arguments)]
 fn auth_exchange(
     sock: &Arc<crate::quic::Datagram>,
-    conn: &mut quiche::Connection,
-    background: Option<&Arc<Mutex<quiche::Connection>>>,
+    conn: &mut QuicheConnection,
+    background: Option<&Arc<Mutex<QuicheConnection>>>,
     auths: &[String],
     inbound: &mut Inbound,
     peer: SocketAddr,
@@ -2671,7 +2677,9 @@ impl Router<'_> {
             return;
         }
         let cid = quiche::ConnectionId::from_ref(&scid);
-        let Ok(mut conn) = quiche::accept(&cid, None, self.local, from, template) else {
+        let Ok(mut conn) = quiche::accept_with_buf_factory::<crate::quic::BytesBufFactory>(
+            &cid, None, self.local, from, template,
+        ) else {
             return;
         };
         let info = quiche::RecvInfo {
@@ -3470,7 +3478,7 @@ mod tests {
             crate::quic::quiche_config(&roots, Some("reno")).expect("trusts the lane");
         let mut server_config =
             server_config(&identity, hysteria::Congestion::Reno, None).expect("serves");
-        let mut client = quiche::connect(
+        let mut client = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
             None,
             &quiche::ConnectionId::from_ref(&client_cid),
             client_addr,
@@ -3478,7 +3486,7 @@ mod tests {
             &mut client_config,
         )
         .expect("connects");
-        let mut server = quiche::accept(
+        let mut server = quiche::accept_with_buf_factory::<crate::quic::BytesBufFactory>(
             &quiche::ConnectionId::from_ref(&server_cid),
             None,
             server_addr,
@@ -3609,7 +3617,7 @@ mod tests {
         let server_addr = "127.0.0.1:443".parse().expect("addr");
         let client_cid = [1u8; SCID_LEN];
         let server_cid = [2u8; SCID_LEN];
-        let mut client = quiche::connect(
+        let mut client = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
             None,
             &quiche::ConnectionId::from_ref(&client_cid),
             client_addr,
@@ -3617,7 +3625,7 @@ mod tests {
             &mut client_config,
         )
         .expect("connects");
-        let mut server = quiche::accept(
+        let mut server = quiche::accept_with_buf_factory::<crate::quic::BytesBufFactory>(
             &quiche::ConnectionId::from_ref(&server_cid),
             None,
             server_addr,
@@ -3661,12 +3669,7 @@ mod tests {
     }
 
     /// A live QUIC handshake between a tuned client and the server template.
-    fn cover_pair() -> (
-        quiche::Connection,
-        quiche::Connection,
-        SocketAddr,
-        SocketAddr,
-    ) {
+    fn cover_pair() -> (QuicheConnection, QuicheConnection, SocketAddr, SocketAddr) {
         let mut server_config = server_template(&hysteria::Config::default());
         let mut client_config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("configures");
         crate::quic::tune_transport(&mut client_config);
@@ -3678,7 +3681,7 @@ mod tests {
         let server_addr = "127.0.0.1:443".parse().expect("addr");
         let client_cid = [1u8; SCID_LEN];
         let server_cid = [2u8; SCID_LEN];
-        let mut client = quiche::connect(
+        let mut client = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
             None,
             &quiche::ConnectionId::from_ref(&client_cid),
             client_addr,
@@ -3686,7 +3689,7 @@ mod tests {
             &mut client_config,
         )
         .expect("connects");
-        let mut server = quiche::accept(
+        let mut server = quiche::accept_with_buf_factory::<crate::quic::BytesBufFactory>(
             &quiche::ConnectionId::from_ref(&server_cid),
             None,
             server_addr,
@@ -3985,7 +3988,7 @@ mod tests {
             .set_application_protos(&[crate::quic::ALPN])
             .expect("negotiates");
         let client_cid = [0x42u8; SCID_LEN];
-        let mut client = quiche::connect(
+        let mut client = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
             None,
             &quiche::ConnectionId::from_ref(&client_cid),
             client_addr,
@@ -4163,7 +4166,14 @@ mod tests {
         let cid = quiche::ConnectionId::from_ref(&scid);
         let local = "127.0.0.1:0".parse().expect("addr");
         let peer = "127.0.0.1:1".parse().expect("addr");
-        let conn = quiche::connect(None, &cid, local, peer, &mut config).expect("connects");
+        let conn = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
+            None,
+            &cid,
+            local,
+            peer,
+            &mut config,
+        )
+        .expect("connects");
         let sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("binds");
         Session {
             shared: Arc::new(Mutex::new(conn)),
