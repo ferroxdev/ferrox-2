@@ -503,6 +503,8 @@ fn open_udp_flow(session: &Session, host: &str, port: u16) -> Option<(Flow, u32)
 
 fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpSocket) {
     let mut reply = Vec::with_capacity(3 + 25 + UDP_TARGET_BUF);
+    // One reassembly buffer for the whole association: it is the arena the defrag hands back, so a reply does not open a fresh `Vec` per datagram.
+    let mut assembled = Vec::new();
     loop {
         if stop.load(Ordering::Relaxed) || !crate::hysteria::drive_once(session, UDP_POLL) {
             break;
@@ -522,7 +524,6 @@ fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpS
                 continue;
             };
             let destination = SocketAddr::new(ip, message.port);
-            let mut assembled = Vec::new();
             let Some(payload) = lane.defrag.lock().ok().and_then(|mut reassembly| {
                 reassembly
                     .feed(&message, &mut assembled)

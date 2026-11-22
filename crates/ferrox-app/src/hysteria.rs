@@ -2274,23 +2274,22 @@ struct Association {
 
 /// What the writer and the reader of one client association share: the flow now relayed, the reassembly its fragments feed, and the client address the lane is pinned to, stored once so neither path takes a lock to read it. Only the writer rotates a flow, and only after the connection lock is held, so the reader never relays against a half-applied change and a retired flow's late datagrams land on the floor rather than on the new association.
 struct Lane {
-    flow: Mutex<Option<Association>>,
-    defrag: Mutex<Defrag>,
+    state: Mutex<LaneState>,
     source: OnceLock<SocketAddr>,
 }
 
-/// Rotate the lane under the writer's flow guard: the pinned source is stored with the association, the retired reassembly is dropped, and a reply cannot pair a retired flow with a new source.
-fn rotate(
-    lane: &Lane,
-    flow: &mut Option<Association>,
-    association: Association,
-    source: SocketAddr,
-) {
-    *flow = Some(association);
+/// The association and the reassembly retired and raised together: one lock, so a reader that gets the flow also gets the reassembly that flow's fragments feed.
+#[derive(Default)]
+struct LaneState {
+    flow: Option<Association>,
+    defrag: Defrag,
+}
+
+/// Rotate the lane under the writer's state guard: the pinned source is stored with the association, the retired reassembly is dropped, and a reply cannot pair a retired flow with a new source.
+fn rotate(lane: &Lane, state: &mut LaneState, association: Association, source: SocketAddr) {
+    state.flow = Some(association);
+    state.defrag = Defrag::new();
     let _ = lane.source.set(source);
-    if let Ok(mut reassembly) = lane.defrag.lock() {
-        *reassembly = Defrag::new();
-    }
 }
 
 /// The client's UDP uplink over the hysteria carrier: read the relay socket, put every datagram on the connection's datagram lane, and let a companion thread drive the connection and carry replies back. One destination at a time — a change rotates the association, stamping a fresh session id that the connection has never used, over a connection of its own: the pool is a TCP instrument, its staleness caught by a flow's reply deadline a datagram send has no answer to, so a lane dials fresh and is live from the first packet. The relay's read timeout, `budgets::udp_idle()`, is already armed where the front was raised, so silence ends the loop and retires the association with its reader; a server that refused the lane in auth is answered in silence, as the references do. Salamander obfuscation, when the outbound names it, is already wrapped at the `quic::Datagram` seam by `connect`, so no byte of this path changes when the password is set.
@@ -2306,8 +2305,7 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial, peer: Option<std::net::I
         return;
     };
     let lane = Arc::new(Lane {
-        flow: Mutex::new(None),
-        defrag: Mutex::new(Defrag::new()),
+        state: Mutex::new(LaneState::default()),
         source: OnceLock::new(),
     });
     let stop = Arc::new(AtomicBool::new(false));
@@ -2350,19 +2348,18 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial, peer: Option<std::net::I
             let id = next_id;
             next_id += 1;
             let address = dest.to_string();
-            let Ok(mut flow) = lane.flow.lock() else {
+            let Ok(mut state) = lane.state.lock() else {
                 break;
             };
             rotate(
                 &lane,
-                &mut flow,
+                &mut state,
                 Association {
                     session_id: id,
                     destination: dest,
                 },
                 src,
             );
-            drop(flow);
             relayed = Some((id, dest, address));
         }
         let Some((session_id, _, address)) = &relayed else {
@@ -2405,16 +2402,14 @@ fn take_reply<'a>(
     assembled: &'a mut Vec<u8>,
     before_source: impl FnOnce(),
 ) -> Option<(SocketAddr, SocketAddr, &'a [u8])> {
-    let held = lane.flow.lock().ok()?;
-    let association = held.as_ref()?;
+    let mut state = lane.state.lock().ok()?;
+    let association = state.flow.as_ref()?;
     if message.session != association.session_id {
         return None;
     }
     let destination = association.destination;
-    let payload = lane
+    let payload = state
         .defrag
-        .lock()
-        .ok()?
         .feed_allow_empty(message, assembled)
         .ok()
         .flatten()
@@ -4305,8 +4300,10 @@ mod tests {
 
     fn lane_with(association: Association, source: SocketAddr) -> Lane {
         let lane = Lane {
-            flow: Mutex::new(Some(association)),
-            defrag: Mutex::new(Defrag::new()),
+            state: Mutex::new(LaneState {
+                flow: Some(association),
+                defrag: Defrag::new(),
+            }),
             source: OnceLock::new(),
         };
         let _ = lane.source.set(source);
@@ -4322,6 +4319,36 @@ mod tests {
             address: "a",
             payload,
         }
+    }
+
+    /// The same single-fragment reply taken 512 times, so one ops job reports the reply frame
+    /// rather than the lane-and-assertions cost around it.
+    #[test]
+    fn a_reply_costs_one_lock_and_the_body() {
+        let lane = lane_with(
+            Association {
+                session_id: 7,
+                destination: "127.0.0.1:7001".parse().expect("addr"),
+            },
+            "127.0.0.1:5001".parse().expect("addr"),
+        );
+        let first = UdpMessage {
+            session: 7,
+            packet: 0,
+            frag: 0,
+            frags: 1,
+            address: "a",
+            payload: b"one",
+        };
+        let mut assembled = Vec::new();
+        let mut fold = 0usize;
+        for _ in 0..512 {
+            let (_, _, payload) =
+                take_reply(&lane, std::hint::black_box(&first), &mut assembled, || {})
+                    .expect("reply");
+            fold = fold.wrapping_add(payload.len());
+        }
+        assert_eq!(fold, 512 * 3);
     }
 
     #[test]
@@ -4353,12 +4380,12 @@ mod tests {
         assert_eq!(src, source);
         assert_eq!(payload, b"one".as_slice());
         {
-            let mut flow = lane.flow.lock().expect("flow");
-            *flow = Some(Association {
+            let mut state = lane.state.lock().expect("lane");
+            state.flow = Some(Association {
                 session_id: 8,
                 destination: "127.0.0.1:7002".parse().expect("addr"),
             });
-            *lane.defrag.lock().expect("defrag") = Defrag::new();
+            state.defrag = Defrag::new();
         }
         assert!(
             take_reply(&lane, &first, &mut assembled, || {}).is_none(),
@@ -4405,8 +4432,8 @@ mod tests {
             .recv()
             .expect("the reader reached the source read");
         assert!(
-            lane.flow.try_lock().is_err(),
-            "the reader holds the flow at the source read, so no rotation can start"
+            lane.state.try_lock().is_err(),
+            "the reader holds the lane at the source read, so no rotation can start"
         );
         release.send(()).expect("release");
         let (destination, src, payload) = reader.join().expect("reader").expect("reply");
@@ -4434,7 +4461,7 @@ mod tests {
             address: "a",
             payload: b"old",
         };
-        let mut flow = lane.flow.lock().expect("flow");
+        let mut state = lane.state.lock().expect("lane");
         let reader = {
             let lane = Arc::clone(&lane);
             std::thread::spawn(move || {
@@ -4445,14 +4472,14 @@ mod tests {
         };
         rotate(
             &lane,
-            &mut flow,
+            &mut state,
             Association {
                 session_id: 8,
                 destination,
             },
             source,
         );
-        drop(flow);
+        drop(state);
         assert!(
             reader.join().expect("reader").is_none(),
             "the retired session is dropped"
@@ -4489,10 +4516,10 @@ mod tests {
             "the old partial stays pending"
         );
         {
-            let mut flow = lane.flow.lock().expect("flow");
+            let mut state = lane.state.lock().expect("lane");
             rotate(
                 &lane,
-                &mut flow,
+                &mut state,
                 Association {
                     session_id: 8,
                     destination: "127.0.0.1:7002".parse().expect("addr"),

@@ -664,6 +664,13 @@ carrier-hysteria gecko-frame-decode-copies 0 ferrox-core-hysteria::tests::a_geck
 carrier-hysteria gecko-packet-reassembled-bytes 1234 ferrox-core-hysteria::tests::a_fragmented_long_header_packet_reassembles_bit_identical
 carrier-hysteria gecko-window-forms-parsed 3 ferrox-app-config::tests::a_hysteria_carrier_reads_a_gecko_window
 carrier-hysteria gecko-loopback-reassembled-bytes 900 ferrox-app-quic::tests::a_gecko_dial_reassembles_its_split_long_header
+carrier-hysteria udp-fragment-reassembly-allocations-per-datagram 0 ferrox-core-hysteria::tests::a_fragmented_datagram_assembles_in_one_buffer_without_a_fresh_allocation
+carrier-hysteria udp-fragment-reassembly-payload-passes 1 ferrox-core-hysteria::tests::a_fragmented_datagram_assembles_in_one_buffer_without_a_fresh_allocation
+carrier-hysteria udp-v1-fragment-reassembly-allocations-per-datagram 0 ferrox-core-hysteria_v1::tests::a_fragmented_v1_datagram_assembles_in_one_buffer_without_a_fresh_allocation
+carrier-hysteria udp-v1-fragment-reassembly-payload-passes 1 ferrox-core-hysteria_v1::tests::a_fragmented_v1_datagram_assembles_in_one_buffer_without_a_fresh_allocation
+carrier-hysteria gecko-message-reassembly-allocations-per-message 0 ferrox-app-quic::tests::a_gecko_message_reassembles_without_a_fresh_allocation
+carrier-hysteria gecko-message-copies-per-message 2 ferrox-app-quic::tests::a_gecko_message_reassembles_without_a_fresh_allocation
+carrier-hysteria gecko-table-walks-per-unexpired-datagram 0 ferrox-app-quic::tests::a_gecko_table_is_walked_only_when_a_message_can_expire
 carrier-hysteria masquerade-https-origin-served-bytes 6 ferrox-app-proxy::tests::hysteria_proxies_a_masquerade_request_to_an_https_origin
 carrier-hysteria masquerade-https-untrusted-refusals 1 ferrox-app-proxy::tests::hysteria_refuses_a_masquerade_https_origin_whose_chain_is_untrusted
 carrier-hysteria masquerade-unix-origin-served-bytes 6 ferrox-app-proxy::tests::hysteria_proxies_a_masquerade_request_to_a_unix_origin

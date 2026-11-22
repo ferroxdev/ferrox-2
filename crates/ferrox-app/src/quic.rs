@@ -2874,13 +2874,50 @@ const GECKO_MAX_PER_SOURCE: usize = 8;
 /// fragment is built in is big enough for any padded frame the plan can ask for.
 const GECKO_BUFFER: usize = ferrox_core::hysteria::Gecko::MAX_BUFFER as usize;
 
-/// One message mid-reassembly: its chunk count, the payloads landed so far indexed
-/// by chunk, and when it expires.
+/// One message mid-reassembly: its chunk count, the offsets of the payloads landed so
+/// far indexed by chunk into the one arena, and when it expires.
 struct GeckoMessage {
-    chunks: Vec<Option<Vec<u8>>>,
+    slots: Vec<Option<(usize, usize)>>,
+    arena: Vec<u8>,
     total: usize,
     received: usize,
     until: Instant,
+}
+
+/// The messages mid-reassembly under one lock, and the earliest instant any of them can
+/// expire: a reader compares that instant instead of walking every partial message on a
+/// datagram that lands on an unexpired table.
+#[derive(Default)]
+struct Reassembly {
+    messages: HashMap<(IpAddr, u8), GeckoMessage>,
+    spare: Vec<GeckoMessage>,
+    next_expiry: Option<Instant>,
+    #[cfg(test)]
+    walked: usize,
+    #[cfg(test)]
+    copies: usize,
+}
+
+impl Reassembly {
+    fn sweep(&mut self, now: Instant) {
+        if self.next_expiry.is_some_and(|at| at > now) {
+            return;
+        }
+        #[cfg(test)]
+        let mut walked = 0usize;
+        self.messages.retain(|_, message| {
+            #[cfg(test)]
+            {
+                walked += 1;
+            }
+            message.until > now
+        });
+        self.next_expiry = self.messages.values().map(|message| message.until).min();
+        #[cfg(test)]
+        {
+            self.walked += walked;
+        }
+    }
 }
 
 /// A `obfs: gecko` datagram socket: salamander-masks every datagram, and on a QUIC
@@ -2899,7 +2936,7 @@ pub(crate) struct Gecko {
     min: usize,
     max: usize,
     msg: AtomicU64,
-    reassembly: Mutex<HashMap<(IpAddr, u8), GeckoMessage>>,
+    reassembly: Mutex<Reassembly>,
 }
 
 impl Gecko {
@@ -2915,7 +2952,7 @@ impl Gecko {
             min: usize::from(window.min_pkt),
             max: usize::from(window.max_pkt),
             msg: AtomicU64::new(0),
-            reassembly: Mutex::new(HashMap::new()),
+            reassembly: Mutex::new(Reassembly::default()),
         }
     }
 
@@ -2932,7 +2969,7 @@ impl Gecko {
             min: usize::from(window.min_pkt),
             max: usize::from(window.max_pkt),
             msg: AtomicU64::new(0),
-            reassembly: Mutex::new(HashMap::new()),
+            reassembly: Mutex::new(Reassembly::default()),
         })
     }
 
@@ -3023,54 +3060,111 @@ impl Gecko {
         self.send_masked(buf, to)
     }
 
-    /// Land one frame's payload and return the whole message once every chunk has
-    /// arrived. A duplicate, an inconsistent count, an out-of-range index or a source
-    /// or global cap already reached all drop the chunk rather than growing state.
+    /// Land one frame's payload and, once every chunk has arrived, write the whole message
+    /// into the caller's buffer and return its length. A duplicate, an inconsistent count,
+    /// an out-of-range index or a source or global cap already reached all drop the chunk
+    /// rather than growing state.
     fn accept(
         &self,
         from: SocketAddr,
         frame: ferrox_core::hysteria::GeckoFrame,
         payload: &[u8],
-    ) -> Option<Vec<u8>> {
+        out: &mut [u8],
+    ) -> std::io::Result<Option<usize>> {
         let total = usize::from(frame.total_chunks);
         let index = usize::from(frame.chunk_idx);
         // Keyed by address, not address-and-port: a hop opens a fresh socket per stay, so one split message can arrive from several source ports.
         let key = (from.ip(), frame.msg_id);
         let now = Instant::now();
-        let mut table = self.reassembly.lock().ok()?;
-        table.retain(|_, message| message.until > now);
-        if !table.contains_key(&key) {
-            if table.len() >= GECKO_MAX_MESSAGES {
-                return None;
+        let Ok(mut table) = self.reassembly.lock() else {
+            return Ok(None);
+        };
+        table.sweep(now);
+        if !table.messages.contains_key(&key) {
+            if table.messages.len() >= GECKO_MAX_MESSAGES {
+                return Ok(None);
             }
-            if table.keys().filter(|(source, _)| *source == key.0).count() >= GECKO_MAX_PER_SOURCE {
-                return None;
+            if table
+                .messages
+                .keys()
+                .filter(|(source, _)| *source == key.0)
+                .count()
+                >= GECKO_MAX_PER_SOURCE
+            {
+                return Ok(None);
             }
-            table.insert(
-                key,
-                GeckoMessage {
-                    chunks: vec![None; total],
-                    total,
-                    received: 0,
-                    until: now + GECKO_TTL,
-                },
-            );
+            let until = now + GECKO_TTL;
+            table.next_expiry = Some(table.next_expiry.map_or(until, |at| at.min(until)));
+            // A message a reader just handed over comes back with its slots and arena intact, so a steady reassembly grows neither.
+            let mut message = table.spare.pop().unwrap_or(GeckoMessage {
+                slots: Vec::new(),
+                arena: Vec::new(),
+                total: 0,
+                received: 0,
+                until,
+            });
+            message.slots.clear();
+            message
+                .slots
+                .reserve(ferrox_core::hysteria::GECKO_MAX_CHUNKS);
+            message.slots.resize(total, None);
+            message.arena.clear();
+            message.total = total;
+            message.received = 0;
+            message.until = until;
+            table.messages.insert(key, message);
         }
-        let message = table.get_mut(&key)?;
-        if message.total != total || index >= total || message.chunks[index].is_some() {
-            return None;
+        let complete = {
+            let Some(message) = table.messages.get_mut(&key) else {
+                return Ok(None);
+            };
+            if message.total != total || index >= total || message.slots[index].is_some() {
+                return Ok(None);
+            }
+            let at = message.arena.len();
+            message.arena.extend_from_slice(payload);
+            message.slots[index] = Some((at, payload.len()));
+            message.received += 1;
+            message.received == total
+        };
+        if !complete {
+            return Ok(None);
         }
-        message.chunks[index] = Some(payload.to_vec());
-        message.received += 1;
-        if message.received < total {
-            return None;
+        let Some(mut message) = table.messages.remove(&key) else {
+            return Ok(None);
+        };
+        let len = message.arena.len();
+        let Some(out) = out.get_mut(..len) else {
+            return Err(invalid(std::io::ErrorKind::InvalidInput));
+        };
+        let mut next = 0usize;
+        // Chunks that arrived in index order already sit in that order, so the arena is the message and one copy hands it over; an out-of-order arrival walks the slots instead.
+        let ordered = message.slots.iter().all(|slot| match *slot {
+            Some((at, n)) if at == next => {
+                next += n;
+                true
+            }
+            _ => false,
+        });
+        if ordered {
+            out.copy_from_slice(&message.arena);
+        } else {
+            let mut written = 0usize;
+            for &(from, n) in message.slots.iter().flatten() {
+                out[written..written + n].copy_from_slice(&message.arena[from..from + n]);
+                written += n;
+            }
         }
-        let mut out = Vec::with_capacity(payload.len() * total);
-        for chunk in &mut message.chunks {
-            out.extend(chunk.take().unwrap_or_default());
+        #[cfg(test)]
+        {
+            table.copies += 2 * len;
         }
-        table.remove(&key);
-        Some(out)
+        message.slots.clear();
+        message.arena.clear();
+        if table.spare.len() < GECKO_MAX_MESSAGES {
+            table.spare.push(message);
+        }
+        Ok(Some(len))
     }
 
     /// Read frames until a whole message assembles or the socket runs dry, so one call
@@ -3113,14 +3207,11 @@ impl Gecko {
                 // A malformed frame is dropped, exactly as the reference reader does.
                 continue;
             };
-            let Some(message) = self.accept(from, frame, payload) else {
-                continue;
-            };
-            let Some(out) = buf.get_mut(..message.len()) else {
-                return Err(invalid(std::io::ErrorKind::InvalidInput));
-            };
-            out.copy_from_slice(&message);
-            return Ok((message.len(), from));
+            match self.accept(from, frame, payload, buf) {
+                Ok(Some(len)) => return Ok((len, from)),
+                Ok(None) => {}
+                Err(error) => return Err(error),
+            }
         }
     }
 }
@@ -7475,6 +7566,81 @@ mod tests {
             }
         };
         assert_eq!(&buf[..m], &short[..], "a short header is not fragmented");
+    }
+
+    /// A second message reuses the spare the first handed back and the table's own
+    /// bucket, and costs one copy into the arena plus one into the caller's buffer —
+    /// where the per-chunk `Vec` and the second assembly buffer used to be.
+    #[test]
+    fn a_gecko_message_reassembles_without_a_fresh_allocation() {
+        let a = UdpSocket::bind("0.0.0.0:0").expect("binds");
+        let b = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let b_addr = b.local_addr().expect("addr");
+        b.set_read_timeout(Some(Duration::from_millis(400)))
+            .expect("timeout");
+        let writer = Datagram::gecked(a, gecko_salamander(), gecko_window()).expect("geckos");
+        let reader = Datagram::gecked(b, gecko_salamander(), gecko_window()).expect("geckos");
+        let mut packet: Vec<u8> = (0u16..900).map(|i| (i % 251) as u8).collect();
+        packet[0] |= ferrox_core::hysteria::GECKO_FLAG;
+        let mut buf = [0u8; 2048];
+        writer.send_to(&packet, b_addr).expect("sends");
+        let (n, _) = reader.recv_from(&mut buf).expect("reassembles");
+        assert_eq!(&buf[..n], &packet[..]);
+        writer.send_to(&packet, b_addr).expect("sends");
+        let ((n, _), counts) =
+            ferrox_core::alloc_count::measure(|| reader.recv_from(&mut buf).expect("reassembles"));
+        assert_eq!(&buf[..n], &packet[..]);
+        assert_eq!(
+            counts.allocs, 0,
+            "the spare message, its arena and the table's bucket are reused: {counts:?}"
+        );
+        let reassembly = reader
+            .gecko
+            .as_ref()
+            .expect("a gecko lane")
+            .reassembly
+            .lock()
+            .expect("lock");
+        assert_eq!(
+            reassembly.copies,
+            4 * packet.len(),
+            "each message costs one copy into the arena and one into the caller's buffer"
+        );
+    }
+
+    /// A datagram that lands on a table whose earliest expiry is still ahead is not a
+    /// reason to walk it: the sweep only runs when some message can actually expire.
+    #[test]
+    fn a_gecko_table_is_walked_only_when_a_message_can_expire() {
+        let now = Instant::now();
+        let mut table = Reassembly {
+            messages: HashMap::from([(
+                (IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 1),
+                GeckoMessage {
+                    slots: Vec::new(),
+                    arena: Vec::new(),
+                    total: 1,
+                    received: 1,
+                    until: now + Duration::from_secs(60),
+                },
+            )]),
+            ..Reassembly::default()
+        };
+        table.sweep(now);
+        assert_eq!(table.walked, 1, "the first sweep finds the earliest expiry");
+        table.sweep(now);
+        table.sweep(now + Duration::from_secs(1));
+        assert_eq!(table.walked, 1, "an unexpired table is not walked again");
+        table.sweep(now + Duration::from_secs(61));
+        assert_eq!(
+            table.walked, 2,
+            "the expiry the sweep recorded opens it once"
+        );
+        assert_eq!(table.messages.len(), 0, "the expired message is gone");
+        assert!(
+            table.next_expiry.is_none(),
+            "an empty table has no next expiry"
+        );
     }
 
     /// A peer that never fragments still reads back whole: a long-header packet sent

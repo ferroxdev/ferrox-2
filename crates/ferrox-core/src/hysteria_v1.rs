@@ -234,33 +234,41 @@ pub fn encode_udp(message: &UdpMessage<'_>, out: &mut Vec<u8>) -> Result<(), Req
 /// already validated its whole message once — the relay's [`fragments_udp`], whose every fragment
 /// shares the whole's host and slices its payload — must not pay the same check per fragment.
 pub fn encode_udp_unchecked(message: &UdpMessage<'_>, out: &mut Vec<u8>) {
-    out.extend_from_slice(&message.session.to_be_bytes());
-    out.extend_from_slice(&(message.host.len() as u16).to_be_bytes());
+    let head = u64::from(message.session) << 16 | u64::from(message.host.len() as u16);
+    out.extend_from_slice(&head.to_be_bytes()[2..]);
     out.extend_from_slice(message.host.as_bytes());
-    out.extend_from_slice(&message.port.to_be_bytes());
-    out.extend_from_slice(&message.packet.to_be_bytes());
-    out.push(message.frag);
-    out.push(message.frags);
-    out.extend_from_slice(&(message.payload.len() as u16).to_be_bytes());
+    let tail = u64::from(message.port) << 48
+        | u64::from(message.packet) << 32
+        | u64::from(message.frag) << 24
+        | u64::from(message.frags) << 16
+        | u64::from(message.payload.len() as u16);
+    out.extend_from_slice(&tail.to_be_bytes());
     out.extend_from_slice(message.payload);
 }
 
 pub fn decode_udp(packet: &[u8]) -> Result<UdpMessage<'_>, RequestError> {
-    let mut at = 0usize;
-    let session = take_u32(packet, &mut at)?;
-    let host_len = usize::from(take_u16(packet, &mut at)?);
+    // The six-byte front, the host and the eight-byte tail are three slices, so a datagram costs three length checks instead of one per field.
+    let front = packet.get(..6).ok_or(RequestError::Incomplete)?;
+    let session = u32::from_be_bytes([front[0], front[1], front[2], front[3]]);
+    let host_len = usize::from(u16::from_be_bytes([front[4], front[5]]));
     if host_len > MAX_ADDRESS {
         return Err(RequestError::Invalid);
     }
-    let raw = take(packet, &mut at, host_len)?;
+    let rest = packet.get(6..).ok_or(RequestError::Incomplete)?;
+    let raw = rest.get(..host_len).ok_or(RequestError::Incomplete)?;
     let host = std::str::from_utf8(raw).map_err(|_| RequestError::Invalid)?;
-    let port = take_u16(packet, &mut at)?;
-    let packet_id = take_u16(packet, &mut at)?;
-    let frag = take_u8(packet, &mut at)?;
-    let frags = take_u8(packet, &mut at)?;
-    let data_len = usize::from(take_u16(packet, &mut at)?);
-    let payload = take(packet, &mut at, data_len)?;
-    if at != packet.len() {
+    let tail = rest
+        .get(host_len..host_len + 8)
+        .ok_or(RequestError::Incomplete)?;
+    let port = u16::from_be_bytes([tail[0], tail[1]]);
+    let packet_id = u16::from_be_bytes([tail[2], tail[3]]);
+    let frag = tail[4];
+    let frags = tail[5];
+    let data_len = usize::from(u16::from_be_bytes([tail[6], tail[7]]));
+    let payload = rest
+        .get(host_len + 8..host_len + 8 + data_len)
+        .ok_or(RequestError::Incomplete)?;
+    if host_len + 8 + data_len != rest.len() {
         return Err(RequestError::Invalid);
     }
     let message = UdpMessage {
@@ -358,9 +366,11 @@ pub struct Defrag {
     packet: u16,
     host: String,
     port: u16,
-    slots: Vec<Option<Vec<u8>>>,
+    slots: Vec<Option<(usize, usize)>>,
+    arena: Vec<u8>,
     have: usize,
-    size: usize,
+    #[cfg(test)]
+    copies: usize,
 }
 
 impl Defrag {
@@ -369,7 +379,7 @@ impl Defrag {
         Self::default()
     }
 
-    /// Fold one message in; `Some(message)` when a datagram is whole. A single fragment passes straight through, borrowing the caller's datagram.
+    /// Fold one message in; `Some(message)` when a datagram is whole. A single fragment passes straight through, borrowing the caller's datagram. Reassembly writes each fragment into the one arena the association keeps and hands that arena to the caller, so a steady run allocates nothing and copies each byte once.
     pub fn feed<'a>(
         &mut self,
         message: &UdpMessage<'a>,
@@ -379,7 +389,7 @@ impl Defrag {
             return Err(RequestError::Invalid);
         }
         if message.frags == 1 {
-            *self = Self::default();
+            self.reset();
             return Ok(Some(*message));
         }
         if self.slots.is_empty() || self.packet != message.packet || self.session != message.session
@@ -388,44 +398,66 @@ impl Defrag {
             self.session = message.session;
             message.host.clone_into(&mut self.host);
             self.port = message.port;
-            self.slots = vec![None; usize::from(message.frags)];
+            self.slots.clear();
+            self.slots.resize(usize::from(message.frags), None);
+            self.arena.clear();
             self.have = 0;
-            self.size = 0;
         }
         if self.host != message.host
             || self.port != message.port
             || self.slots.len() != usize::from(message.frags)
         {
-            *self = Self::default();
+            self.reset();
             return Err(RequestError::Invalid);
         }
         let slot = &mut self.slots[usize::from(message.frag)];
         if slot.is_some() {
             return Ok(None);
         }
-        let Some(size) = self
-            .size
-            .checked_add(message.payload.len())
-            .filter(|size| *size <= MAX_UDP_PAYLOAD)
-        else {
-            *self = Self::default();
+        let Some(size) = self.arena.len().checked_add(message.payload.len()) else {
+            self.reset();
             return Err(RequestError::Invalid);
         };
-        self.size = size;
-        *slot = Some(message.payload.to_vec());
+        if size > MAX_UDP_PAYLOAD {
+            self.reset();
+            return Err(RequestError::Invalid);
+        }
+        let at = self.arena.len();
+        let len = message.payload.len();
+        self.arena.extend_from_slice(message.payload);
+        *slot = Some((at, len));
+        #[cfg(test)]
+        {
+            self.copies += len;
+        }
         self.have += 1;
         if self.have != self.slots.len() {
             return Ok(None);
         }
-        let size = self.size;
-        self.host.clear();
-        out.clear();
-        out.reserve(size);
-        for fragment in std::mem::take(&mut self.slots).into_iter().flatten() {
-            out.extend_from_slice(&fragment);
+        let mut next = 0usize;
+        let ordered = self.slots.iter().all(|slot| match *slot {
+            Some((at, len)) if at == next => {
+                next += len;
+                true
+            }
+            _ => false,
+        });
+        if ordered {
+            out.clear();
+            std::mem::swap(out, &mut self.arena);
+        } else {
+            out.clear();
+            out.reserve(self.arena.len());
+            for &(at, len) in self.slots.iter().flatten() {
+                out.extend_from_slice(&self.arena[at..at + len]);
+                #[cfg(test)]
+                {
+                    self.copies += len;
+                }
+            }
         }
+        self.slots.clear();
         self.have = 0;
-        self.size = 0;
         Ok(Some(UdpMessage {
             session: message.session,
             host: message.host,
@@ -435,6 +467,16 @@ impl Defrag {
             frags: 1,
             payload: out,
         }))
+    }
+
+    fn reset(&mut self) {
+        self.session = 0;
+        self.packet = 0;
+        self.host.clear();
+        self.port = 0;
+        self.slots.clear();
+        self.arena.clear();
+        self.have = 0;
     }
 }
 
@@ -702,6 +744,100 @@ mod tests {
             }
             assert_eq!(seen, len);
         }
+    }
+
+    #[test]
+    fn a_fragmented_v1_datagram_assembles_in_one_buffer_without_a_fresh_allocation() {
+        let payload = vec![0x5au8; 4096];
+        let mut defrag = Defrag::new();
+        let mut out = Vec::new();
+        // Two packets, because the ordered handover swaps the arena with the caller's buffer: after the second swap both hold a 4096-byte capacity.
+        run_fragmented_v1(&mut defrag, &mut out, 1, &payload);
+        run_fragmented_v1(&mut defrag, &mut out, 2, &payload);
+        let copies = defrag.copies;
+        let ((), counts) = crate::alloc_count::measure(|| {
+            for packet in 3..=10u16 {
+                run_fragmented_v1(&mut defrag, &mut out, packet, &payload);
+            }
+        });
+        assert_eq!(
+            counts.allocs, 0,
+            "the arena, its slots and the caller's buffer are reused, never reallocated"
+        );
+        assert_eq!(
+            defrag.copies - copies,
+            8 * payload.len(),
+            "each payload byte reaches the arena once and the ordered handover moves the buffer instead of copying it"
+        );
+    }
+
+    /// Drives one 4096-byte datagram in order through a 1200-byte window.
+    fn run_fragmented_v1(defrag: &mut Defrag, out: &mut Vec<u8>, packet: u16, payload: &[u8]) {
+        let message = UdpMessage {
+            session: 9,
+            host: "example.org",
+            port: 443,
+            packet,
+            frag: 0,
+            frags: 1,
+            payload,
+        };
+        let mut whole = false;
+        for fragment in fragments_udp(&message, 1200).expect("fragments") {
+            if let Some(got) = defrag.feed(&fragment, out).expect("feeds") {
+                assert_eq!(got.payload, payload, "reassembles to the datagram's bytes");
+                whole = true;
+            }
+        }
+        assert!(whole, "reassembles exactly once");
+    }
+
+    #[test]
+    fn the_unchecked_v1_fragment_costs_the_bytes_and_nothing_else() {
+        let payload: Vec<u8> = (0..3000).map(|i| (i % 251) as u8).collect();
+        let message = UdpMessage {
+            session: 7,
+            host: "edge.example",
+            port: 443,
+            packet: 42,
+            frag: 0,
+            frags: 1,
+            payload: &payload,
+        };
+        let mut wire = Vec::with_capacity(1200);
+        let mut fold = 0u32;
+        for _ in 0..512 {
+            for frag in fragments_udp(std::hint::black_box(&message), 1200).expect("fragments") {
+                wire.clear();
+                encode_udp_unchecked(std::hint::black_box(&frag), &mut wire);
+                fold = fold.wrapping_add(wire.len() as u32);
+            }
+        }
+        assert!(fold > 0, "the fragments were written");
+    }
+
+    /// The same 3000-byte datagram read 512 times, so one ops job reports the decode frame and the
+    /// encode frame above and only their difference is a claim about the fields.
+    #[test]
+    fn the_v1_udp_decode_costs_the_bytes_and_nothing_else() {
+        let payload: Vec<u8> = (0..3000).map(|i| (i % 251) as u8).collect();
+        let message = UdpMessage {
+            session: 7,
+            host: "edge.example",
+            port: 443,
+            packet: 42,
+            frag: 0,
+            frags: 1,
+            payload: &payload,
+        };
+        let mut wire = Vec::with_capacity(1200);
+        encode_udp(&message, &mut wire).expect("encodes");
+        let mut fold = 0u32;
+        for _ in 0..512 {
+            let decoded = decode_udp(std::hint::black_box(&wire)).expect("decodes");
+            fold = fold.wrapping_add(decoded.payload.len() as u32);
+        }
+        assert!(fold > 0, "the datagrams were read");
     }
 
     /// The unchecked fragment writes what the checked one wrote for every fragment the v1 fragmenter

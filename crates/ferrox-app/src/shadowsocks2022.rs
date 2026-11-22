@@ -33,6 +33,15 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// The v2 server message's associated data before the address: the type byte, the timestamp, the client session and the two reserved bytes, in one store rather than four.
+fn push_seal_ad_head(out: &mut Vec<u8>, client_session: u64) {
+    let mut head = [0u8; 19];
+    head[0] = 1;
+    head[1..9].copy_from_slice(&now_secs().to_be_bytes());
+    head[9..17].copy_from_slice(&client_session.to_be_bytes());
+    out.extend_from_slice(&head);
+}
+
 fn salt_seen(salt: &[u8]) -> bool {
     static WINDOW: OnceLock<Mutex<crate::proxy::Replay>> = OnceLock::new();
     let mut key = [0u8; 32];
@@ -2074,10 +2083,7 @@ impl Datagrams {
             let at = out.len();
             out.extend_from_slice(&server_session.to_be_bytes());
             out.extend_from_slice(&server_packet.to_be_bytes());
-            out.push(1);
-            out.extend_from_slice(&now_secs().to_be_bytes());
-            out.extend_from_slice(&client_session.to_be_bytes());
-            out.extend_from_slice(&0u16.to_be_bytes());
+            push_seal_ad_head(out, client_session);
             push_addr(out, dest, 4);
             out.extend_from_slice(&dest.port().to_be_bytes());
             out.extend_from_slice(payload);
@@ -2101,10 +2107,7 @@ impl Datagrams {
             out.reserve(16 + 19 + payload.len() + TAG_LEN);
             out.extend_from_slice(&enc);
             let at = out.len();
-            out.push(1);
-            out.extend_from_slice(&now_secs().to_be_bytes());
-            out.extend_from_slice(&client_session.to_be_bytes());
-            out.extend_from_slice(&0u16.to_be_bytes());
+            push_seal_ad_head(out, client_session);
             push_addr(out, dest, 4);
             out.extend_from_slice(&dest.port().to_be_bytes());
             out.extend_from_slice(payload);
@@ -3813,6 +3816,29 @@ mod tests {
                 "{method}: damage is refused"
             );
         }
+    }
+
+    /// The same reply sealed 512 times on one live session, so one ops job reports the associated
+    /// data head and the seal frame beside it and only their difference is a claim about the head.
+    #[test]
+    fn the_server_reply_seal_costs_the_associated_data_and_the_body() {
+        let psk = vec![0x33u8; Method::Aes256Gcm.key_len()];
+        let target: SocketAddr = "127.0.0.1:53".parse().expect("addr");
+        let mut server = Datagrams::new();
+        let mut fold = 0usize;
+        for _ in 0..512 {
+            let sealed = server
+                .seal_server(
+                    Method::Aes256Gcm,
+                    std::hint::black_box(&psk),
+                    0x7172_7374_7576_7778,
+                    std::hint::black_box(&target),
+                    b"reply-payload",
+                )
+                .expect("seals");
+            fold = fold.wrapping_add(sealed.len());
+        }
+        assert!(fold > 0, "the replies were sealed");
     }
 
     /// The assembled client seals requests on one codec and opens replies on another in a reader thread: the reply codec must be seeded with the request codec's session, or every reply drops as forged.

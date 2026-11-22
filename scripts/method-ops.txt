@@ -73,6 +73,7 @@ shadowsocks-2022  shadowsocks2022::tests::udp_multi_user_packs_one_eih_and_opens
 shadowsocks-2022  shadowsocks2022::tests::udp_server_replies_are_server_typed_and_stay_with_their_session  ferrox_app::shadowsocks2022::Datagrams::seal_server
 shadowsocks-2022  shadowsocks2022::tests::udp_server_replies_are_server_typed_and_stay_with_their_session  ferrox_app::shadowsocks2022::Datagrams::open_server
 shadowsocks-2022  shadowsocks2022::tests::the_session_subkey_probe_costs_the_derive_and_nothing_else  ferrox_core::shadowsocks2022::session_subkey
+shadowsocks-2022  shadowsocks2022::tests::the_server_reply_seal_costs_the_associated_data_and_the_body  ferrox_app::shadowsocks2022::tests::the_server_reply_seal_costs_the_associated_data_and_the_body
 vmess  vmess::tests::a_batch_on_the_wire_is_the_frames_written_one_at_a_time  vmess::stage_frame
 vmess  vmess::tests::frames_reuse_the_callers_buffers  vmess::read_frame
 vmess  vmess::tests::an_aes_batch_is_the_frames_written_one_at_a_time  vmess::stage_frame
@@ -184,6 +185,15 @@ carrier-hysteria  realm::tests::an_encoded_and_decoded_packet_takes_no_heap  fer
 # job reports both frames, and only their difference is a claim about the validation.
 carrier-hysteria  hysteria::tests::the_checked_fragment_costs_the_validate_and_nothing_else  ferrox_core::hysteria::tests::the_checked_fragment_costs_the_validate_and_nothing_else
 carrier-hysteria  hysteria::tests::the_unchecked_fragment_costs_the_bytes_and_nothing_else  ferrox_core::hysteria::tests::the_unchecked_fragment_costs_the_bytes_and_nothing_else
+# The v1 datagram's two stores and its three-slice decode: one ops job reports the frames, and
+# only their difference is a claim about the fields the decode still reads.
+carrier-hysteria  hysteria_v1::tests::the_unchecked_v1_fragment_costs_the_bytes_and_nothing_else  ferrox_core::hysteria_v1::tests::the_unchecked_v1_fragment_costs_the_bytes_and_nothing_else
+carrier-hysteria  hysteria_v1::tests::the_v1_udp_decode_costs_the_bytes_and_nothing_else  ferrox_core::hysteria_v1::tests::the_v1_udp_decode_costs_the_bytes_and_nothing_else
+# The gecko hand-back and the expiry gate, and the reply lane's one lock: each probe is the
+# method's own loop, so one ops job reports the frame that changed.
+carrier-hysteria  quic::tests::a_gecko_message_reassembles_without_a_fresh_allocation  ferrox_app::quic::tests::a_gecko_message_reassembles_without_a_fresh_allocation
+carrier-hysteria  quic::tests::a_gecko_table_is_walked_only_when_a_message_can_expire  ferrox_app::quic::tests::a_gecko_table_is_walked_only_when_a_message_can_expire
+carrier-hysteria  hysteria::tests::a_reply_costs_one_lock_and_the_body  ferrox_app::hysteria::tests::a_reply_costs_one_lock_and_the_body
 finalmask  finalmask::tests::a_hello_record_is_cut_into_records_of_the_configured_widths  ferrox_core::finalmask::Chain::write
 finalmask  finalmask::tests::a_hello_record_is_cut_into_records_of_the_configured_widths  ferrox_core::finalmask::Fragment::write_hello
 finalmask  finalmask::tests::a_delayed_piece_hands_the_body_over_where_it_lies  ferrox_core::finalmask::write_record
