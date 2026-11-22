@@ -279,10 +279,11 @@ pub(crate) fn send_all(session: &Session, stream: u64, buf: &[u8], fin: bool) ->
 fn send_all_metered(
     session: &Session,
     stream: u64,
-    mut buf: &[u8],
+    buf: &[u8],
     fin: bool,
     meter: Option<&crate::stats::Meter>,
 ) -> bool {
+    let mut buf = bytes::Bytes::copy_from_slice(buf);
     let deadline = Instant::now() + crate::quic::SEND_WAIT;
     let mut paced = false;
     loop {
@@ -294,12 +295,12 @@ fn send_all_metered(
         let Ok(mut conn) = session.shared.lock() else {
             return false;
         };
-        match conn.stream_send(stream, buf, fin && last) {
-            Ok(written) => {
+        match conn.stream_send_zc(stream, buf.clone(), fin && last) {
+            Ok((written, remainder)) => {
                 if let Some(meter) = meter {
                     meter.write(written);
                 }
-                buf = &buf[written..];
+                buf = remainder.unwrap_or_default();
                 crate::quic::flush_egress(&mut conn, &session.sock);
                 if buf.is_empty() && (!fin || last) {
                     return true;

@@ -3274,13 +3274,13 @@ impl H3 {
 
     fn send(&mut self, stream: u64, buf: &[u8], fin: bool) -> Result<(), Failure> {
         let deadline = Instant::now() + SEND_WAIT;
-        let mut rest = buf;
+        let mut rest = bytes::Bytes::copy_from_slice(buf);
         while !rest.is_empty() {
-            let written = self
-                .with_conn(|conn| conn.stream_send(stream, rest, false))
+            let (written, remainder) = self
+                .with_conn(|conn| conn.stream_send_zc(stream, rest.clone(), false))
                 .ok_or(Failure::Io)?
                 .map_err(|_| Failure::Io)?;
-            rest = &rest[written..];
+            rest = remainder.unwrap_or_default();
             if written == 0 {
                 if Instant::now() >= deadline {
                     return Err(Failure::Io);

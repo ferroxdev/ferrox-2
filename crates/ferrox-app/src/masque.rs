@@ -2281,7 +2281,23 @@ fn send_data(conn: &mut QuicheConnection, stream: u64, bytes: &[u8]) -> Result<(
     let mut frame = Vec::with_capacity(length + bytes.len());
     frame.extend_from_slice(&head[..length]);
     frame.extend_from_slice(bytes);
-    send_stream(conn, stream, &frame, false)
+    let mut rest = bytes::Bytes::from(frame);
+    loop {
+        match conn.stream_send_zc(stream, rest.clone(), false) {
+            Ok((0, _)) => return Err("masque: the stream accepted no bytes".to_owned()),
+            Ok((_, remainder)) => {
+                rest = remainder.unwrap_or_default();
+                if rest.is_empty() {
+                    return Ok(());
+                }
+            }
+            Err(quiche::Error::Done) if rest.is_empty() => return Ok(()),
+            Err(quiche::Error::Done) => {
+                return Err("masque: the stream stopped accepting a frame".to_owned());
+            }
+            Err(error) => return Err(format!("masque: cannot write the stream: {error}")),
+        }
+    }
 }
 
 /// The request authority: configured host, else SNI, with a non-default port.

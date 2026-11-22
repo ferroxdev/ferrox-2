@@ -961,23 +961,23 @@ impl Write for ClientStream {
             return Ok(0);
         }
         let deadline = Instant::now() + crate::budgets::relay_stall();
-        let mut rest = buf;
+        let mut rest = bytes::Bytes::copy_from_slice(buf);
         while !rest.is_empty() {
             let Ok(mut conn) = self.conn.lock() else {
                 return Err(std::io::Error::other("h3 connection lock poisoned"));
             };
-            match conn.stream_send(self.id, rest, false) {
-                Ok(0) | Err(quiche::Error::Done) => {
+            match conn.stream_send_zc(self.id, rest.clone(), false) {
+                Ok((0, _)) | Err(quiche::Error::Done) => {
                     drop(conn);
                     if Instant::now() >= deadline {
                         return Err(std::io::Error::other("h3 stream send timed out"));
                     }
                     std::thread::sleep(POLL);
                 }
-                Ok(n) => {
+                Ok((_, remainder)) => {
                     self.activity.touch();
                     quic::flush_egress(&mut conn, &self.sock);
-                    rest = &rest[n..];
+                    rest = remainder.unwrap_or_default();
                 }
                 Err(error) => {
                     return Err(std::io::Error::other(format!("h3 stream send: {error:?}")));

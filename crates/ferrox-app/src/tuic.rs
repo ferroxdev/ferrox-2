@@ -243,7 +243,7 @@ struct UdpSink {
 
 struct Pending {
     id: Option<u64>,
-    data: Vec<u8>,
+    data: bytes::Bytes,
     at: usize,
     finish: bool,
 }
@@ -898,7 +898,7 @@ fn queue_stream(
     wire::encode_fragment(association, packet, 1, 0, address, payload, &mut data);
     pending.push(Pending {
         id: None,
-        data,
+        data: data.into(),
         at: 0,
         finish: true,
     });
@@ -912,7 +912,7 @@ fn queue_dissociate(pending: &mut Vec<Pending>, association: u16) {
     wire::encode_dissociate(association, &mut data);
     pending.push(Pending {
         id: None,
-        data,
+        data: data.into(),
         at: 0,
         finish: true,
     });
@@ -927,8 +927,8 @@ fn flush_one(conn: &mut QuicheConnection, frame: &mut Pending, next_uni: &Atomic
             return Sent::Blocked;
         }
         let id = next_uni.load(Ordering::Relaxed);
-        match conn.stream_send(id, &frame.data[frame.at..], false) {
-            Ok(n) if n > 0 => {
+        match conn.stream_send_zc(id, frame.data.slice(frame.at..), false) {
+            Ok((n, _)) if n > 0 => {
                 frame.id = Some(id);
                 next_uni.store(id.wrapping_add(4), Ordering::Relaxed);
                 frame.at += n;
@@ -946,8 +946,8 @@ fn flush_one(conn: &mut QuicheConnection, frame: &mut Pending, next_uni: &Atomic
         return Sent::Blocked;
     };
     while frame.at < frame.data.len() {
-        match conn.stream_send(id, &frame.data[frame.at..], false) {
-            Ok(n) if n > 0 => frame.at += n,
+        match conn.stream_send_zc(id, frame.data.slice(frame.at..), false) {
+            Ok((n, _)) if n > 0 => frame.at += n,
             Ok(_) | Err(quiche::Error::Done | quiche::Error::StreamLimit) => {
                 return Sent::Blocked;
             }
