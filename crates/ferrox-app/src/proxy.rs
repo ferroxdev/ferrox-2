@@ -32001,10 +32001,8 @@ fn serve_socks_udp_foxy_ip(
     if let Some(associate) = associate {
         let _ = associate.set_read_timeout(Some(budgets::SESSION_POLL));
     }
-    // The tunnel and its owned source addresses are opened once and shared: that is this row's whole point. One request names both families, so both sources live here, four bytes at zero and sixteen at sixteen.
+    // The tunnel and its owned source addresses are opened once and shared: that is this row's whole point. The lane keeps the set, so a later assignment updates both families without a second open.
     let mut tunnel: Option<crate::foxy::Ip> = None;
-    let mut source = [0u8; 32];
-    let mut width = [0usize; 2];
     let mut buf = udp_buffer();
     let mut reply = Vec::with_capacity(UDP_BUF);
     let mut packet = Vec::with_capacity(UDP_BUF);
@@ -32036,10 +32034,7 @@ fn serve_socks_udp_foxy_ip(
                     quiet = Instant::now();
                     pin_address(&mut pinned, src);
                     client = Some(src);
-                    if width[0] == 0
-                        && width[1] == 0
-                        && !open_foxy_ip_tunnel(foxy, &mut tunnel, &mut source, &mut width)
-                    {
+                    if tunnel.is_none() && !open_foxy_ip_tunnel(foxy, &mut tunnel) {
                         continue;
                     }
                     let Some(port) = ports.get(&dest).copied().or_else(|| {
@@ -32061,11 +32056,15 @@ fn serve_socks_udp_foxy_ip(
                             &address
                         }
                     };
-                    // The packet's family is the tunnel's: it cannot carry an address the proxy never assigned.
+                    // The packet's family is the tunnel's: it cannot carry an address the proxy never assigned, and each assignment capsule replaces the whole set it could carry.
                     let at = match destination.len() {
                         4 => 0,
                         16 => 16,
                         _ => continue,
+                    };
+                    let Some((source, width)) = tunnel.as_ref().map(crate::foxy::Ip::assigned)
+                    else {
+                        continue;
                     };
                     if destination.len() != width[at / 16] {
                         continue;
@@ -32084,7 +32083,6 @@ fn serve_socks_udp_foxy_ip(
                             // No credit is the lane waiting for a grant the next read pass carries, so the packet is lost and the tunnel is not; only a broken lane is dialled again.
                             if !is_timeout(&error) {
                                 tunnel = None;
-                                width = [0; 2];
                                 ports.clear();
                             }
                         }
@@ -32111,7 +32109,6 @@ fn serve_socks_udp_foxy_ip(
                 Some(_) => quiet = Instant::now(),
                 None => {
                     tunnel = None;
-                    width = [0; 2];
                     ports.clear();
                 }
             }
@@ -32166,12 +32163,7 @@ fn socket_from_bytes(source: &[u8], destination: &[u8]) -> SocketAddr {
 }
 
 /// Opens the tunnel on the first answering edge, HTTP/3 then HTTP/2; no assigned address means refuse, not guess.
-fn open_foxy_ip_tunnel(
-    foxy: &FoxyOut,
-    tunnel: &mut Option<crate::foxy::Ip>,
-    source: &mut [u8; 32],
-    width: &mut [usize; 2],
-) -> bool {
+fn open_foxy_ip_tunnel(foxy: &FoxyOut, tunnel: &mut Option<crate::foxy::Ip>) -> bool {
     if edge_limited(&foxy.limited_until, now_secs()) {
         return false;
     }
@@ -32214,20 +32206,11 @@ fn open_foxy_ip_tunnel(
                 _ => None,
             };
             match crate::foxy::Ip::open(&dial, quic) {
-                Ok((mut lane, assigned)) => {
+                Ok((mut lane, _)) => {
                     debug_lane(edge, carrier, || "connect-ip opened".to_owned());
                     clear_limited(&foxy.limited_strikes, &foxy.limited_until);
                     foxy.carrier_answered(edge, carrier);
-                    let granted = assigned.into_iter().filter(|grant| !grant.refused());
-                    let mut any = false;
-                    for grant in granted {
-                        let at = if grant.version == 4 { 0 } else { 16 };
-                        let bytes = grant.width();
-                        source[at..at + bytes].copy_from_slice(grant.bytes());
-                        width[at / 16] = bytes;
-                        any = true;
-                    }
-                    if !any {
+                    if lane.assigned().1 == [0, 0] {
                         debug_lane(edge, carrier, || {
                             "the edge granted no address, so the tunnel carries nothing".to_owned()
                         });
@@ -80071,10 +80054,8 @@ mod tests {
             }
         }
         let mut tunnel = None;
-        let mut source = [0u8; 32];
-        let mut width = [0usize; 2];
         assert!(
-            !open_foxy_ip_tunnel(&foxy, &mut tunnel, &mut source, &mut width),
+            !open_foxy_ip_tunnel(&foxy, &mut tunnel),
             "an edge silent on every capsule carrier grants no address"
         );
         assert_eq!(
@@ -80091,7 +80072,7 @@ mod tests {
             );
         }
         assert!(
-            !open_foxy_ip_tunnel(&foxy, &mut tunnel, &mut source, &mut width),
+            !open_foxy_ip_tunnel(&foxy, &mut tunnel),
             "the rested carrier still has nothing to open"
         );
         assert_ne!(

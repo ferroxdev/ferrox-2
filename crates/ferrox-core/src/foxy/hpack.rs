@@ -647,9 +647,11 @@ pub fn qpack_content_length(block: &[u8]) -> Result<Option<usize>, Malformed> {
     Ok(length)
 }
 
-/// A `content-length` value as a number: digits only after the optional whitespace, so a sign or a trailing byte is malformed rather than accepted by `parse`.
+/// A `content-length` value as a number: digits only after the optional whitespace, so a sign or a trailing byte is malformed rather than accepted by `parse`. Only SP and HTAB are trimmed: `str::trim` would also take the CR and LF an HTTP field value may not carry.
 fn content_length_of(value: &[u8]) -> Option<usize> {
-    let text = std::str::from_utf8(value).ok()?.trim();
+    let text = std::str::from_utf8(value)
+        .ok()?
+        .trim_matches(|ch| ch == ' ' || ch == '\t');
     if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
@@ -1302,11 +1304,14 @@ mod tests {
     /// A `content-length` is digits and nothing else: `parse` would take a sign or a trailing byte the field grammar does not.
     #[test]
     fn a_signed_content_length_is_malformed() {
-        for text in ["+5", "-1", "5x", ""] {
+        for text in ["+5", "-1", "5x", "", "\n5", "5\r\n"] {
             let mut block = Vec::new();
             qpack_literal(&mut block, "content-length", text.as_bytes());
             assert_eq!(qpack_content_length(&block), Err(Malformed), "{text:?}");
         }
+        let mut spaced = Vec::new();
+        qpack_literal(&mut spaced, "content-length", b" \t5 \t");
+        assert_eq!(qpack_content_length(&spaced), Ok(Some(5)));
     }
 
     /// Two content-length fields that disagree make the block malformed, not length-less: a caller that treated the conflict as absent could smuggle a body past the check. A repeat of the same number is the one length.

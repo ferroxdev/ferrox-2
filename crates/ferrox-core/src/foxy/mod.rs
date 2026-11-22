@@ -596,8 +596,9 @@ impl EdgeStrikes {
             .map_or(0, |&(_, (count, _))| count);
         let next = count_tunnel_end(count, lasted);
         if next == 0 {
-            self.entries
-                .retain(|(known, _)| known.host.as_ref() != host || known.port != port);
+            self.entries.retain(|(known, _)| {
+                !known.host.as_ref().eq_ignore_ascii_case(host) || known.port != port
+            });
             return;
         }
         let entry = next >= EDGE_REST_STRIKES;
@@ -1331,6 +1332,11 @@ mod tests {
         strikes.note_end("Edge.Example", 443, short, 100);
         strikes.note_end("edge.EXAMPLE", 443, short, 100);
         assert!(strikes.resting("EDGE.example", 443, 100));
+        strikes.note_end("EDGE.EXAMPLE", 443, TUNNEL_STAYED_UP, 200);
+        assert!(
+            !strikes.resting("edge.example", 443, 200),
+            "a tunnel that stayed up clears the streak whatever its case"
+        );
         let mut refusals = Refusals::new(8);
         refusals.remember(1, "Edge.Example", 443, 200);
         assert!(refusals.blocked(1, "edge.example", 443, 100));
