@@ -5,7 +5,7 @@
 - symbols: outbound_supports_network
 - scenarios: vless-raw, vmess-raw, trojan-raw, shadowsocks-raw
 <!-- scope:end -->
-Row 117's group half: a sing-box `selector` outbound dials one member until the selection changes, and a `urltest` outbound probes its members and dials the fastest one it has a reading for. The four xray balancer strategies on the same row stay in [`engine-router`](engine-router.md) and read the observatory in [`engine-observatory`](engine-observatory.md); this page is the `protocol/group` half.
+Row 125's group half: a sing-box `selector` outbound dials one member until the selection changes, and a `urltest` outbound probes its members and dials the fastest one it has a reading for. The four xray balancer strategies on the same row stay in [`engine-router`](engine-router.md) and read the observatory in [`engine-observatory`](engine-observatory.md); this page is the `protocol/group` half.
 
 A group is an ordinary entry in `outbounds`, named by `type` or by `protocol` as `selector` or `urltest`. Its `outbounds` is an ordered list of member tags; the list or its `settings.outbounds` twin is non-empty, a repeated tag is refused, and a member that no outbound names is refused by that name. The tag is required, because that is how a rule reaches the group. A group holding itself, directly or through another group, is refused before startup completes; membership and `detour`/`dialerProxy` edges are checked as one graph, so a group holding a leaf that detours back to the group is refused too.
 
