@@ -6,6 +6,7 @@ use crate::json::Json;
 use crate::proxy::{Destination, Outbound, RouteShared};
 use ferrox_core::tls::TlsProvider as _;
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::Shutdown;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1016,9 +1017,11 @@ fn request_any(
         }
         None => direct_stream(&url, deadline)?,
     };
-    let stream = DeadlineIo::new(stream, deadline);
+    let mut stream = DeadlineIo::new(stream, deadline);
     if !url.tls {
-        return exchange(&url, stream);
+        write_request(&url, &mut stream)?;
+        stream.end_request();
+        return read_response(&mut stream);
     }
     let config = ferrox_core::tls::TlsConfig {
         server_name: url.host.clone(),
@@ -1030,7 +1033,8 @@ fn request_any(
     let mut session = ferrox_core::tls::RustlsProvider::connect(&config, stream)
         .map_err(|error| error.to_string())?;
     session.handshake().map_err(|error| error.to_string())?;
-    exchange(&url, session)
+    write_request(&url, &mut session)?;
+    read_response(&mut session)
 }
 
 fn fetch_budget(deadline: Option<Instant>) -> Result<Duration, String> {
@@ -1048,7 +1052,8 @@ fn fetch_timeout() -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, "remote fetch outlasted its budget")
 }
 
-/// macOS returns EINVAL from a timeout set after the peer has closed; the buffered reply still reads.
+/// macOS refuses a socket timeout once the peer has gone, with EINVAL; such a socket is terminal,
+/// so the read that follows cannot block and the deadline is still checked for it afterwards.
 fn arm_timeout(result: io::Result<()>) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     if result
@@ -1086,6 +1091,12 @@ impl DeadlineIo {
     fn expired(&self) -> bool {
         self.deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    /// The request is whole: half-close so a server that answers before reading it sees end of
+    /// stream instead of aborting the connection, which on BSD discards the reply it already sent.
+    fn end_request(&self) {
+        let _ = self.inner.shutdown(Shutdown::Write);
     }
 }
 
@@ -1166,7 +1177,7 @@ fn direct_stream(
     })
 }
 
-fn exchange<S: Read + Write>(url: &HttpUrl, mut stream: S) -> Result<Response, String> {
+fn write_request(url: &HttpUrl, stream: &mut impl Write) -> Result<(), String> {
     let head = format!(
         "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {USER_AGENT}\r\nAccept: */*\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n",
         url.path, url.authority
@@ -1174,8 +1185,7 @@ fn exchange<S: Read + Write>(url: &HttpUrl, mut stream: S) -> Result<Response, S
     stream
         .write_all(head.as_bytes())
         .map_err(|error| error.to_string())?;
-    stream.flush().map_err(|error| error.to_string())?;
-    read_response(&mut stream)
+    stream.flush().map_err(|error| error.to_string())
 }
 
 /// One head line, bounded: `read_line` grows a `String` without limit, so a malicious
@@ -1867,10 +1877,23 @@ mod tests {
                     }
                     Err(error) => panic!("accepts: {error}"),
                 };
+                stream.set_nonblocking(false).expect("blocking");
                 arm_timeout(stream.set_read_timeout(Some(Duration::from_secs(1))))
                     .expect("read timeout");
                 let mut request = [0u8; 1024];
-                let _ = stream.read(&mut request);
+                let mut filled = 0;
+                while filled < request.len() {
+                    match stream.read(&mut request[filled..]) {
+                        Ok(0) => break,
+                        Ok(read) => {
+                            filled += read;
+                            if request[..filled].ends_with(b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(error) => panic!("reads request: {error}"),
+                    }
+                }
                 let response = format!(
                     "HTTP/1.1 302 Found\r\nLocation: /{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                     at + 1
@@ -1883,6 +1906,30 @@ mod tests {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().expect("server");
         assert!(error.contains("20 redirects"), "{error}");
+    }
+
+    #[test]
+    fn a_remote_fetch_closes_its_write_side_after_the_request() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .expect("timeout");
+            let mut request = Vec::new();
+            stream
+                .read_to_end(&mut request)
+                .expect("the request arrives whole");
+            assert!(request.ends_with(b"\r\n\r\n"), "the head is complete");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .expect("replies");
+        });
+        let body = fetch_remote(&format!("http://127.0.0.1:{port}/rules")).expect("fetches");
+        server.join().expect("server");
+        assert_eq!(body, b"ok");
     }
 
     #[test]
