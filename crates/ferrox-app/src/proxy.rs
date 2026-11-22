@@ -31789,32 +31789,26 @@ fn serve_socks_udp_split(
                 };
                 let lane_ref = lane_out.as_ref().unwrap_or(&*out);
                 let lane_address = if let Some(tag) = lane_key.as_deref() {
-                    match retire_finished_lane(&mut lanes, &mut replies, tag) {
-                        Some(address) => Some(address),
-                        None => {
-                            let spawned = match (lane_out.as_ref(), lane_start) {
-                                (Some(member), Some(start)) => spawn_udp_lane_with_cancel(
-                                    member,
-                                    local,
-                                    client.try_clone().ok(),
-                                    Some(local),
-                                    None,
-                                    Some(start),
-                                ),
-                                _ => spawn_udp_lane(
-                                    &out,
-                                    local,
-                                    client.try_clone().ok(),
-                                    Some(local),
-                                ),
-                            };
-                            spawned.map(|lane| {
-                                replies.insert(lane.address);
-                                let address = lane.address;
-                                lanes.insert(tag.to_owned(), lane);
-                                address
-                            })
-                        }
+                    if let Some(address) = retire_finished_lane(&mut lanes, &mut replies, tag) {
+                        Some(address)
+                    } else {
+                        let spawned = match (lane_out.as_ref(), lane_start) {
+                            (Some(member), Some(start)) => spawn_udp_lane_with_cancel(
+                                member,
+                                local,
+                                client.try_clone().ok(),
+                                Some(local),
+                                None,
+                                Some(start),
+                            ),
+                            _ => spawn_udp_lane(&out, local, client.try_clone().ok(), Some(local)),
+                        };
+                        spawned.map(|lane| {
+                            replies.insert(lane.address);
+                            let address = lane.address;
+                            lanes.insert(tag.to_owned(), lane);
+                            address
+                        })
                     }
                 } else {
                     default_udp_lane(
