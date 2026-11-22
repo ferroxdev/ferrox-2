@@ -8356,7 +8356,7 @@ pub(crate) fn serve_mux_tunnel(
         (io.dial)(&address)
     });
     let udp: MuxUdpOk = Arc::new(|_| true);
-    serve_mux_wire(&wire, &dial, &udp, None, carried);
+    serve_mux_wire(&wire, &dial, &udp, None, carried, None);
 }
 
 /// One sing-mux session's streams: each accepted stream carries its own destination and status.
@@ -8664,7 +8664,7 @@ fn serve_sealed_mux<S>(
         (io.dial)(&address)
     });
     let udp: MuxUdpOk = Arc::new(|_| true);
-    serve_mux_wire(&wire, &dial, &udp, None, &[]);
+    serve_mux_wire(&wire, &dial, &udp, None, &[], None);
 }
 
 /// The sealed relay reads at least one full record, even where the reference's policy buffer
@@ -10250,10 +10250,38 @@ impl BridgeLane {
 
     fn udp(&self, target: &MuxTarget) -> bool {
         let asked = target.destination();
-        matches!(
-            self.pick(&asked, crate::router::Network::Udp).as_deref(),
-            Some(Outbound::Freedom(_))
-        )
+        self.udp_route(&asked).is_some()
+    }
+
+    /// The outbound one datagram takes and the tag that names its lane. The settings that tag
+    /// carries are installed only when the caller opens a lane, so a reused lane never inherits
+    /// another tag's source.
+    fn udp_route(&self, asked: &Destination) -> Option<(Outbound, Option<String>)> {
+        let (picked, key) = match &self.plan {
+            Some(plan) => plan.lane_with_protocol_untracked(
+                asked,
+                crate::router::Network::Udp,
+                None,
+                FlowFacts::default(),
+            ),
+            None => (Picked::Static(self.fixed.as_ref()?), None),
+        };
+        if !udp_lane_supported(&picked) {
+            return None;
+        }
+        Some((picked.into_owned(), key.map(|key| key.into_owned())))
+    }
+
+    /// The source and options the picked tag names, left for `spawn_udp_lane` on this thread.
+    fn arm(&self, tag: Option<&str>) {
+        match &self.plan {
+            Some(plan) => plan.carry_dial_settings(tag),
+            None => {
+                SEND_THROUGH.with(|cell| cell.set(None));
+                DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take());
+                TARGET_STRATEGY.with(|cell| cell.set(None));
+            }
+        }
     }
 }
 
@@ -10286,9 +10314,10 @@ fn serve_bridge_mux(
     state: &Arc<crate::reverse::WorkerState>,
 ) {
     let udp_lane = Arc::clone(&lane);
+    let bridge = Arc::clone(&lane);
     let udp: MuxUdpOk = Arc::new(move |target| udp_lane.udp(target));
     let dial: MuxDial = Arc::new(move |target| lane.tcp(target));
-    serve_mux_wire(wire, &dial, &udp, Some(state), &[]);
+    serve_mux_wire(wire, &dial, &udp, Some(state), &[], Some(&bridge));
 }
 
 /// Starts every bridge the config names; each monitor keeps one session per portal tag alive.
@@ -10383,12 +10412,72 @@ struct MuxOut<'a> {
 
 struct UdpMux {
     socket: Arc<UdpSocket>,
-    dest: Mutex<SocketAddr>,
+    routed: bool,
+    frame: Mutex<Vec<u8>>,
+    dest: Mutex<Destination>,
     id: Arc<AtomicU16>,
     done: Arc<AtomicBool>,
     stop: std::sync::mpsc::Sender<()>,
+    lane_stop: Option<Arc<AtomicBool>>,
     wire: MuxWire,
     _connection: Option<crate::reverse::ConnectionGuard>,
+}
+
+impl UdpMux {
+    /// A routed flow speaks the SOCKS5 datagram frame to the bridge's relay; the direct flow names
+    /// the destination in `send_to`, as it always has.
+    fn send(&self, dest: &Destination, payload: &[u8]) -> std::io::Result<()> {
+        if self.routed {
+            if matches!(dest, Destination::Name(host, _) if host.len() > u8::MAX as usize) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "udp destination name too long",
+                ));
+            }
+            let mut frame = self
+                .frame
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            frame.clear();
+            frame.extend_from_slice(&[0, 0, 0]);
+            dest.push_addr(&mut frame, 4, 3);
+            frame.extend_from_slice(&dest.port().to_be_bytes());
+            frame.extend_from_slice(payload);
+            self.socket.send(&frame[..]).map(|_| ())
+        } else {
+            let address = dest.socket().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "unresolved destination")
+            })?;
+            self.socket.send_to(payload, address).map(|_| ())
+        }
+    }
+
+    fn retire(&self) {
+        let _ = self.stop.send(());
+        self.done.store(true, Ordering::Relaxed);
+        if let Some(stop) = &self.lane_stop {
+            stop.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// One read from a mux UDP socket: a direct flow reads the datagram where it lands, and a routed
+/// flow strips the SOCKS5 header the bridge's lane wrote, returning the payload's span.
+fn recv_mux_udp(
+    read: &UdpSocket,
+    routed: bool,
+    buf: &mut [u8],
+) -> std::io::Result<(usize, usize, SocketAddr)> {
+    if routed {
+        let n = read.recv(buf)?;
+        let (source, payload) = parse_socks_udp(&buf[..n])
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad udp frame"))?;
+        let start = n - payload.len();
+        Ok((start, payload.len(), source))
+    } else {
+        let (n, source) = read.recv_from(buf)?;
+        Ok((0, n, source))
+    }
 }
 
 type UdpTable = HashMap<u16, Arc<UdpMux>>;
@@ -10426,7 +10515,7 @@ where
         (io.dial)(&address)
     });
     let udp: MuxUdpOk = Arc::new(|_| true);
-    serve_mux_wire(&wire, &dial, &udp, None, carried);
+    serve_mux_wire(&wire, &dial, &udp, None, carried, None);
 }
 
 /// One mux session over a wire, whoever dialed it: a VLESS inbound's own socket, or the bridge's
@@ -10439,6 +10528,7 @@ fn serve_mux_wire(
     udp_ok: &MuxUdpOk,
     worker: Option<&Arc<crate::reverse::WorkerState>>,
     carried: &[u8],
+    bridge: Option<&Arc<BridgeLane>>,
 ) {
     let Some(mut read) = wire.reader() else {
         return;
@@ -10485,7 +10575,16 @@ fn serve_mux_wire(
                         handles: &mut handles,
                         worker,
                     };
-                    handle_mux_frame(frame, &table, &mut udp, &mut global, &mut out, dial, udp_ok);
+                    handle_mux_frame(
+                        frame,
+                        &table,
+                        &mut udp,
+                        &mut global,
+                        &mut out,
+                        dial,
+                        udp_ok,
+                        bridge,
+                    );
                 }
             }
         }
@@ -10522,8 +10621,7 @@ fn teardown_mux(
         flow.control.cancel();
     }
     for session in udp.values() {
-        let _ = session.stop.send(());
-        session.done.store(true, Ordering::Relaxed);
+        session.retire();
     }
     if let Some(worker) = worker {
         worker.closed();
@@ -10541,6 +10639,7 @@ fn handle_mux_frame(
     out: &mut MuxOut<'_>,
     dial: &MuxDial,
     udp_ok: &MuxUdpOk,
+    bridge: Option<&Arc<BridgeLane>>,
 ) {
     use ferrox_core::mux::{Network, Status};
     match frame.status {
@@ -10550,7 +10649,7 @@ fn handle_mux_frame(
                 handle_mux_control_new(frame, table, out);
             } else if frame.target.is_some_and(|t| t.network == Network::Udp) {
                 if target.as_ref().is_none_or(|target| udp_ok(target)) {
-                    handle_mux_udp_new(frame, udp, global, out);
+                    handle_mux_udp_new(frame, udp, global, out, bridge);
                 } else {
                     send_mux_end(out.wire, out.staging, frame.id);
                 }
@@ -10565,14 +10664,16 @@ fn handle_mux_frame(
             if let Some(session) = udp.get(&frame.id).cloned() {
                 let dest = frame
                     .target
-                    .and_then(|t| mux_target_addr(&t))
+                    .and_then(|t| MuxTarget::of(&t))
+                    .map(|target| target.destination())
                     .unwrap_or_else(|| {
-                        *session
+                        session
                             .dest
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone()
                     });
-                let _ = session.socket.send_to(data, dest);
+                let _ = session.send(&stored, data);
                 return;
             }
             if frame.target.is_some() {
@@ -10599,7 +10700,7 @@ fn handle_mux_frame(
         }
         Status::End => {
             if let Some(session) = udp.remove(&frame.id) {
-                session.done.store(true, Ordering::Relaxed);
+                session.retire();
                 global.retain(|_, id| *id != frame.id);
             }
             if let Ok(mut table) = table.lock() {
@@ -10783,15 +10884,41 @@ fn handle_mux_udp_new(
     udp: &mut UdpTable,
     global: &mut UdpGlobal,
     out: &mut MuxOut<'_>,
+    bridge: Option<&Arc<BridgeLane>>,
 ) {
-    let Some(dest) = frame.target.and_then(|t| mux_target_addr(&t)) else {
+    let Some(target) = frame.target.and_then(|t| MuxTarget::of(&t)) else {
         return send_mux_end(out.wire, out.staging, frame.id);
+    };
+    let dest = target.destination();
+    let direct = if bridge.is_none() {
+        dest.socket()
+    } else {
+        None
+    };
+    if bridge.is_none() && direct.is_none() {
+        return send_mux_end(out.wire, out.staging, frame.id);
+    }
+    let stored = match (bridge, direct) {
+        (None, Some(address)) => Destination::Address(address),
+        _ => dest.clone(),
     };
     let empty = [0u8; ferrox_core::mux::GLOBAL_ID];
     let identity = frame.global_id.filter(|identity| *identity != empty);
     let reused = identity
         .and_then(|identity| global.get(&identity).copied())
         .and_then(|id| udp.remove(&id).map(|session| (id, session)));
+    let routed = bridge.is_some();
+    let reused = match reused {
+        Some((old, session)) if session.routed == routed => Some((old, session)),
+        Some((old, session)) => {
+            if old != frame.id {
+                send_mux_end(out.wire, out.staging, old);
+            }
+            session.retire();
+            None
+        }
+        None => None,
+    };
     let session = if let Some((old, session)) = reused {
         if old != frame.id {
             send_mux_end(out.wire, out.staging, old);
@@ -10800,25 +10927,55 @@ fn handle_mux_udp_new(
         *session
             .dest
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = dest;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = stored.clone();
         session
     } else {
-        let bound = if dest.is_ipv6() {
-            UdpSocket::bind("[::]:0")
+        let (socket, lane_stop) = if let Some(bridge) = bridge {
+            let Ok(relay) = UdpSocket::bind("127.0.0.1:0") else {
+                return send_mux_end(out.wire, out.staging, frame.id);
+            };
+            let Ok(relay_address) = relay.local_addr() else {
+                return send_mux_end(out.wire, out.staging, frame.id);
+            };
+            let Ok(leg) = relay_leg(relay_address) else {
+                return send_mux_end(out.wire, out.staging, frame.id);
+            };
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_stop = Arc::clone(&stop);
+            let lane = Arc::clone(bridge);
+            if thread::Builder::new()
+                .name("ferrox-reverse-bridge-udp".to_owned())
+                .spawn(move || serve_bridge_udp(&relay, &lane, &thread_stop))
+                .is_err()
+            {
+                return send_mux_end(out.wire, out.staging, frame.id);
+            }
+            (leg, Some(stop))
         } else {
-            UdpSocket::bind("0.0.0.0:0")
-        };
-        let Ok(socket) = bound else {
-            return send_mux_end(out.wire, out.staging, frame.id);
+            let Some(address) = direct else {
+                return send_mux_end(out.wire, out.staging, frame.id);
+            };
+            let bound = if address.is_ipv6() {
+                UdpSocket::bind("[::]:0")
+            } else {
+                UdpSocket::bind("0.0.0.0:0")
+            };
+            let Ok(socket) = bound else {
+                return send_mux_end(out.wire, out.staging, frame.id);
+            };
+            (socket, None)
         };
         let (stop, stopped) = std::sync::mpsc::channel();
         let connection = out.worker.map(crate::reverse::WorkerState::note_connection);
         let session = Arc::new(UdpMux {
             socket: Arc::new(socket),
-            dest: Mutex::new(dest),
+            routed,
+            frame: Mutex::new(Vec::with_capacity(HEAD + UDP_BUF)),
+            dest: Mutex::new(stored.clone()),
             id: Arc::new(AtomicU16::new(frame.id)),
             done: Arc::new(AtomicBool::new(false)),
             stop,
+            lane_stop,
             wire: out.wire.clone(),
             _connection: connection,
         });
@@ -10830,15 +10987,99 @@ fn handle_mux_udp_new(
     };
     if let Some(old) = udp.insert(frame.id, Arc::clone(&session)) {
         // The stop orders the death with a reader's check-then-write, so no replaced datagram lands after the id.
-        let _ = old.stop.send(());
-        old.done.store(true, Ordering::Relaxed);
+        old.retire();
     }
     global.retain(|_, id| *id != frame.id);
     if let Some(identity) = identity {
         global.insert(identity, frame.id);
     }
     if let Some(data) = frame.data {
-        let _ = session.socket.send_to(data, dest);
+        let _ = session.send(&stored, data);
+    }
+}
+
+/// One bridge datagram flow: the mux socket speaks SOCKS5 UDP frames, and this relay sends each
+/// one to the lane its destination picked. Replies come back framed, so the reader learns the
+/// address that answered.
+fn serve_bridge_udp(relay: &UdpSocket, bridge: &BridgeLane, stop: &AtomicBool) {
+    let _ = relay.set_read_timeout(Some(RELAY_POLL));
+    let local = relay.local_addr().map_or(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        |addr| addr.ip(),
+    );
+    let mut lanes: HashMap<String, UdpLane> = HashMap::new();
+    let mut default_lane: Option<UdpLane> = None;
+    let mut replies: HashSet<SocketAddr> = HashSet::new();
+    let mut client: Option<SocketAddr> = None;
+    let mut buf = udp_buffer();
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let (n, src) = match relay.recv_from(&mut buf) {
+            Ok(read) => read,
+            Err(error) if is_timeout(&error) => continue,
+            Err(_) => break,
+        };
+        if replies.contains(&src) {
+            if let Some(client) = client {
+                let _ = relay.send_to(&buf[..n], client);
+            }
+            continue;
+        }
+        match client {
+            Some(held) if held != src => continue,
+            None => client = Some(src),
+            Some(_) => {}
+        }
+        let Some((dest, payload)) = parse_socks_udp_dest(&buf[..n]) else {
+            continue;
+        };
+        if payload.is_empty() || payload.len() > ferrox_core::mux::CHUNK_MAX {
+            continue;
+        }
+        let Some((out, key)) = bridge.udp_route(&dest) else {
+            continue;
+        };
+        if matches!(out, Outbound::Block(_)) {
+            continue;
+        }
+        let lane_address = if let Some(tag) = key.as_deref() {
+            match retire_finished_lane(&mut lanes, &mut replies, tag) {
+                Some(address) => Some(address),
+                None => {
+                    bridge.arm(key.as_deref());
+                    spawn_udp_lane(&out, local, None, Some(local)).map(|spawned| {
+                        replies.insert(spawned.address);
+                        let address = spawned.address;
+                        lanes.insert(tag.to_owned(), spawned);
+                        address
+                    })
+                }
+            }
+        } else if let Some(running) = default_lane
+            .as_ref()
+            .filter(|lane| !lane.handle.is_finished())
+        {
+            Some(running.address)
+        } else {
+            if let Some(finished) = default_lane.take() {
+                replies.remove(&finished.address);
+            }
+            bridge.arm(None);
+            spawn_udp_lane(&out, local, None, Some(local)).map(|spawned| {
+                replies.insert(spawned.address);
+                let address = spawned.address;
+                default_lane = Some(spawned);
+                address
+            })
+        };
+        if let Some(lane_address) = lane_address {
+            let _ = relay.send_to(&buf[..n], lane_address);
+        }
+    }
+    if let Ok(relay) = relay.try_clone() {
+        retire_udp_lanes(relay, lanes, default_lane);
     }
 }
 
@@ -10851,14 +11092,15 @@ fn spawn_mux_udp_reader(
     let wire = session.wire.clone();
     let id = Arc::clone(&session.id);
     let done = Arc::clone(&session.done);
+    let routed = session.routed;
     #[cfg(target_os = "linux")]
     {
         let (finished, end) = std::sync::mpsc::channel();
         let mut buf = udp_buffer();
         let mut staging = Vec::with_capacity(8192);
         lane_pool::submit(
-            Box::new(move || match read.recv_from(&mut buf) {
-                Ok((n, source)) => {
+            Box::new(move || match recv_mux_udp(&read, routed, &mut buf) {
+                Ok((start, len, source)) => {
                     if done.load(Ordering::Relaxed) || stopped.try_recv().is_ok() {
                         return Next::Done;
                     }
@@ -10869,7 +11111,7 @@ fn spawn_mux_udp_reader(
                         target: Some(mux_target_of(source)),
                         global_id: None,
                     };
-                    if !wire.write_frame(&mut staging, keep, Some(&buf[..n])) {
+                    if !wire.write_frame(&mut staging, keep, Some(&buf[start..start + len])) {
                         return Next::Done;
                     }
                     Next::More
@@ -10902,8 +11144,8 @@ fn spawn_mux_udp_reader(
             let mut buf = udp_buffer();
             let mut staging = Vec::with_capacity(8192);
             loop {
-                match read.recv_from(&mut buf) {
-                    Ok((n, source)) => {
+                match recv_mux_udp(&read, routed, &mut buf) {
+                    Ok((start, len, source)) => {
                         if done.load(Ordering::Relaxed) || stopped.try_recv().is_ok() {
                             return;
                         }
@@ -10914,7 +11156,7 @@ fn spawn_mux_udp_reader(
                             target: Some(mux_target_of(source)),
                             global_id: None,
                         };
-                        if !wire.write_frame(&mut staging, keep, Some(&buf[..n])) {
+                        if !wire.write_frame(&mut staging, keep, Some(&buf[start..start + len])) {
                             return;
                         }
                     }
@@ -87865,6 +88107,56 @@ mod reverse_tests {
         server.join().expect("server joins");
     }
 
+    #[test]
+    fn a_bridge_udp_flow_reaches_an_echo_through_a_non_freedom_outbound() {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("echo");
+        let echo_addr = echo.local_addr().expect("addr");
+        echo.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let server = thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            let (n, src) = echo.recv_from(&mut buf).expect("reads");
+            echo.send_to(&buf[..n], src).expect("echoes");
+        });
+
+        let outbound = loopback_out(
+            "bridge-udp",
+            None,
+            false,
+            Some(Outbound::Freedom(Arc::new(FreedomOut::default()))),
+            None,
+        );
+        let lane = Arc::new(BridgeLane::with_inbound("bridge", None, Some(&outbound)));
+        let (mut bridge_side, mut portal_side) = crate::reverse::loopback_pair().expect("pair");
+        portal_side.write_all(&[0, 0]).expect("portal reply");
+        let mut reply = [0u8; 2];
+        bridge_side.read_exact(&mut reply).expect("portal reply");
+        let portal_tunnel = crate::reverse::Tunnel::from_connection(&portal_side).expect("tunnel");
+        let bridge_wire =
+            MuxWire::Tunnel(crate::reverse::Tunnel::from_connection(&bridge_side).expect("tunnel"));
+        let state = crate::reverse::WorkerState::new();
+        let worker = Arc::clone(&state);
+        thread::spawn(move || serve_bridge_mux(&bridge_wire, lane, &worker));
+
+        let portal = crate::reverse::Portal::new("portal");
+        let session = portal.attach(portal_tunnel).expect("session");
+        let (id, flow) = session
+            .open(
+                mux_target_of(echo_addr),
+                ferrox_core::mux::DEFAULT_CAP as u32,
+            )
+            .expect("flow");
+        assert!(session.send(id, b"hello"));
+        let (data, from) = flow
+            .down
+            .recv_timeout(Duration::from_secs(10))
+            .expect("reply");
+        assert_eq!(data, b"hello");
+        assert_eq!(from, Some(echo_addr));
+        session.end(id);
+        server.join().expect("server joins");
+    }
+
     fn portal_echo(payload: &[u8]) {
         let echo = crate::conn::Listener::bind(&crate::conn::Target::Ip(
             "127.0.0.1:0".parse().expect("address"),
@@ -87898,7 +88190,7 @@ mod reverse_tests {
                 .and_then(|address| Connection::connect(address).ok())
         });
         let udp: MuxUdpOk = Arc::new(|_| true);
-        thread::spawn(move || serve_mux_wire(&wire, &dial, &udp, Some(&worker), &[]));
+        thread::spawn(move || serve_mux_wire(&wire, &dial, &udp, Some(&worker), &[], None));
 
         let portal = crate::reverse::Portal::new("portal");
         portal.attach(portal_tunnel).expect("session");
@@ -87973,7 +88265,7 @@ mod reverse_tests {
             MuxWire::Tunnel(crate::reverse::Tunnel::from_connection(&bridge_side).expect("tunnel"));
         let dial: MuxDial = Arc::new(|_| None);
         let udp: MuxUdpOk = Arc::new(|_| true);
-        thread::spawn(move || serve_mux_wire(&wire, &dial, &udp, Some(&worker), &[]));
+        thread::spawn(move || serve_mux_wire(&wire, &dial, &udp, Some(&worker), &[], None));
 
         let portal = crate::reverse::Portal::new("portal");
         let session = portal.attach(portal_tunnel).expect("session");

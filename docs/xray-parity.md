@@ -61,7 +61,7 @@ What runs against what: `xray-rust` interop (24 tests, seam `XRAY_VLESS_FULL_BIN
 | DNS client: DoH, DoQ, local, cached, fakeDNS | `proxy/dns` outbound done (row 29); the resolver app implemented (row 118): UDP/TCP/DoT/DoH/DoQ, cache, hosts, FakeDNS, filters and parallel groups |
 | Router with rules, balancers (leastload/leastping/random), webhook | rules, selectors, geodata refresh and the `webhook` action partial (row 115); the four balancer strategies done, urltest and selector planned (row 117); rule sets and scripts partial (row 116) |
 | Observatory / burst probe | implemented (row 124): legacy and burst probes, `leastPing`/`leastLoad`, healthcheck front |
-| Reverse portal / bridge | partial (row 119): modern VLESS reverse both roles over every carried transport; TCP bridge flows leave through any routed outbound, UDP bridge flows remain direct freedom |
+| Reverse portal / bridge | done (row 119): modern VLESS reverse both roles over every carried transport; TCP bridge flows leave through any routed outbound; UDP flows through any routed outbound that serves UDP |
 | Stats, metrics (Prometheus), policy manager | implemented (row 54): reference counters, an online map with source IPs and last-seen times, access log and policies |
 | `app/commander` gRPC API (config/inbound/outbound/log/router/stats) | implemented (row 120): every service, including `AddRule`/`RemoveRule` over the live table; an add refuses a duplicate tag, an unknown target, or a rule a server inbound cannot evaluate |
 | Geodata (.dat) loader/downloader | partial (row 115): geodata refresh carried inside routing; the full loader/downloader surface is not |
