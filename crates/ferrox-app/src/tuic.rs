@@ -1623,7 +1623,7 @@ pub(crate) fn serve_inbound(
     let heartbeat = setting("heartbeat").unwrap_or(HEARTBEAT);
     let auth_timeout = setting("auth_timeout").unwrap_or(AUTH_TIMEOUT);
     let udp_timeout = setting("udp_timeout").unwrap_or(UDP_IDLE);
-    if let Some(name) = inbound
+    let name = inbound
         .get("settings")
         .and_then(|node| {
             node.get("congestion_control")
@@ -1631,15 +1631,14 @@ pub(crate) fn serve_inbound(
         })
         .and_then(Json::as_str)
         .filter(|value| !value.is_empty())
-    {
-        if !matches!(name, "cubic" | "new_reno" | "reno" | "bbr") {
-            eprintln!("tuic congestion_control `{name}` is not carried");
-            return false;
-        }
-        if template.set_cc_algorithm_name(quiche_cc(name)).is_err() {
-            eprintln!("tuic congestion_control `{name}` is not carried");
-            return false;
-        }
+        .unwrap_or("bbr");
+    if !matches!(name, "cubic" | "new_reno" | "reno" | "bbr") {
+        eprintln!("tuic congestion_control `{name}` is not carried");
+        return false;
+    }
+    if template.set_cc_algorithm_name(quiche_cc(name)).is_err() {
+        eprintln!("tuic congestion_control `{name}` is not carried");
+        return false;
     }
     template.enable_dgram(true, quic::MAX_DATAGRAM, DGRAM_SEND_QUEUE);
     if inbound.get("settings").is_some_and(|node| {
