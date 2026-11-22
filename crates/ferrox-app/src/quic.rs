@@ -5122,7 +5122,7 @@ impl QuicStream {
     /// Close the whole connection with an HTTP/3 application error: a frame a request stream may not carry is a connection error, not a stream reset.
     pub(crate) fn close_connection(&self, code: u64) {
         if let Ok(mut conn) = self.conn.lock() {
-            let _ = conn.close(false, code, b"");
+            let _ = conn.close(true, code, b"");
             flush_egress(&mut conn, &self.sock);
         }
     }

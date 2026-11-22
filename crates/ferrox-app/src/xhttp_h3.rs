@@ -1019,7 +1019,7 @@ impl ClientStream {
         let Ok(mut conn) = self.conn.lock() else {
             return;
         };
-        let _ = conn.close(false, code, b"");
+        let _ = conn.close(true, code, b"");
         quic::flush_egress(&mut conn, &self.sock);
     }
 }

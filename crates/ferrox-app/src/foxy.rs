@@ -2933,6 +2933,9 @@ impl H3 {
     }
     /// Whether a frame or capsule is already waiting on this lane: the proxy drains it before its next client datagram, so an assignment carried behind a reply revokes the old source before it is used again.
     fn readable(&self) -> bool {
+        if self.fin || self.closed || self.failure.is_some() {
+            return true;
+        }
         if self.pending.is_none() && self.parse_head().is_some() {
             return true;
         }
@@ -4241,6 +4244,14 @@ impl Tls2 {
         let Ok(inner) = self.session.inner.lock() else {
             return false;
         };
+        if inner.terminal.is_some()
+            || inner
+                .streams
+                .get(&self.stream)
+                .is_none_or(|stream| stream.fin)
+        {
+            return true;
+        }
         if !inner.tls.wants_read() {
             return true;
         }

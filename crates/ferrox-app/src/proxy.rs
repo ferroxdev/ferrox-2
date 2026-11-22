@@ -32015,97 +32015,105 @@ fn serve_socks_udp_foxy_ip(
     loop {
         // The client's datagrams go out as a burst, and the destination address rides a stack buffer: one packet per pass and one `Vec` per packet are both a cost the association has no reason to pay.
         let mut ended = false;
-        for _ in 0..UDP_BURST {
-            match relay.recv_from(&mut buf) {
-                Ok((n, src)) => {
-                    if !source_admitted(peer, pinned, src) {
-                        if quiet.elapsed() >= budgets::udp_idle() {
-                            ended = true;
-                            break;
-                        }
-                        continue;
+        let mut burst = 0;
+        // A datagram that arrives while an assignment is still behind the tunnel's replies stays in `buf`: it is re-examined without another `recv_from`, so it is neither dropped nor sent under a source set the pending assignment replaces.
+        let mut held: Option<(usize, std::net::SocketAddr)> = None;
+        while burst < UDP_BURST {
+            let (n, src) = if let Some((n, src)) = held.take() {
+                (n, src)
+            } else {
+                burst += 1;
+                match relay.recv_from(&mut buf) {
+                    Ok(packet) => packet,
+                    Err(error) if is_timeout(&error) => {
+                        ended = associate.is_some_and(peer_left)
+                            || quiet.elapsed() >= budgets::udp_idle();
+                        break;
                     }
-                    let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
-                        continue;
-                    };
-                    if payload.is_empty() {
-                        continue;
-                    }
-                    quiet = Instant::now();
-                    pin_address(&mut pinned, src);
-                    client = Some(src);
-                    if tunnel.is_none() && !open_foxy_ip_tunnel(foxy, &mut tunnel) {
-                        continue;
-                    }
-                    // The assignment that arrived behind a reply replaces the source set before this datagram selects one; the drain stops as soon as the tunnel is quiet.
-                    if let Some(lane) = tunnel.as_mut() {
-                        if drain_foxy_ip_tunnel(lane, relay, client, &mut reply, &mut packet)
-                            .is_none()
-                        {
-                            tunnel = None;
-                            ports.clear();
-                            continue;
-                        }
-                    }
-                    let Some(port) = ports.get(&dest).copied().or_else(|| {
-                        let port = next_port;
-                        next_port = next_port.wrapping_add(1).max(1);
-                        ports.insert(dest, port);
-                        Some(port)
-                    }) else {
-                        continue;
-                    };
-                    let mut address = [0u8; 16];
-                    let destination: &[u8] = match dest.ip() {
-                        std::net::IpAddr::V4(ip) => {
-                            address[..4].copy_from_slice(&ip.octets());
-                            &address[..4]
-                        }
-                        std::net::IpAddr::V6(ip) => {
-                            address.copy_from_slice(&ip.octets());
-                            &address
-                        }
-                    };
-                    // The packet's family is the tunnel's: it cannot carry an address the proxy never assigned, and each assignment capsule replaces the whole set it could carry.
-                    let at = match destination.len() {
-                        4 => 0,
-                        16 => 16,
-                        _ => continue,
-                    };
-                    let Some((source, width)) = tunnel.as_ref().map(crate::foxy::Ip::assigned)
-                    else {
-                        continue;
-                    };
-                    if destination.len() != width[at / 16] {
-                        continue;
-                    }
-                    if let Some(lane) = tunnel.as_mut() {
-                        if let Err(error) = lane
-                            .write(
-                                &source[at..at + destination.len()],
-                                destination,
-                                port,
-                                dest.port(),
-                                payload,
-                            )
-                            .and_then(|_| lane.flush())
-                        {
-                            // No credit is the lane waiting for a grant the next read pass carries, so the packet is lost and the tunnel is not; only a broken lane is dialled again.
-                            if !is_timeout(&error) {
-                                tunnel = None;
-                                ports.clear();
-                            }
-                        }
+                    Err(_) => {
+                        ended = true;
+                        break;
                     }
                 }
-                Err(error) if is_timeout(&error) => {
-                    ended =
-                        associate.is_some_and(peer_left) || quiet.elapsed() >= budgets::udp_idle();
-                    break;
-                }
-                Err(_) => {
+            };
+            if !source_admitted(peer, pinned, src) {
+                if quiet.elapsed() >= budgets::udp_idle() {
                     ended = true;
                     break;
+                }
+                continue;
+            }
+            let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
+                continue;
+            };
+            if payload.is_empty() {
+                continue;
+            }
+            quiet = Instant::now();
+            pin_address(&mut pinned, src);
+            client = Some(src);
+            if tunnel.is_none() && !open_foxy_ip_tunnel(foxy, &mut tunnel) {
+                continue;
+            }
+            // The assignment that arrived behind a reply replaces the source set before this datagram selects one; a drain that leaves the tunnel readable may still be hiding it, so the held datagram waits for the next bounded drain.
+            if let Some(lane) = tunnel.as_mut() {
+                if drain_foxy_ip_tunnel(lane, relay, client, &mut reply, &mut packet).is_none() {
+                    tunnel = None;
+                    ports.clear();
+                    continue;
+                }
+                if lane.readable() {
+                    held = Some((n, src));
+                    continue;
+                }
+            }
+            let Some(port) = ports.get(&dest).copied().or_else(|| {
+                let port = next_port;
+                next_port = next_port.wrapping_add(1).max(1);
+                ports.insert(dest, port);
+                Some(port)
+            }) else {
+                continue;
+            };
+            let mut address = [0u8; 16];
+            let destination: &[u8] = match dest.ip() {
+                std::net::IpAddr::V4(ip) => {
+                    address[..4].copy_from_slice(&ip.octets());
+                    &address[..4]
+                }
+                std::net::IpAddr::V6(ip) => {
+                    address.copy_from_slice(&ip.octets());
+                    &address
+                }
+            };
+            // The packet's family is the tunnel's: it cannot carry an address the proxy never assigned, and each assignment capsule replaces the whole set it could carry.
+            let at = match destination.len() {
+                4 => 0,
+                16 => 16,
+                _ => continue,
+            };
+            let Some((source, width)) = tunnel.as_ref().map(crate::foxy::Ip::assigned) else {
+                continue;
+            };
+            if destination.len() != width[at / 16] {
+                continue;
+            }
+            if let Some(lane) = tunnel.as_mut() {
+                if let Err(error) = lane
+                    .write(
+                        &source[at..at + destination.len()],
+                        destination,
+                        port,
+                        dest.port(),
+                        payload,
+                    )
+                    .and_then(|_| lane.flush())
+                {
+                    // No credit is the lane waiting for a grant the next read pass carries, so the packet is lost and the tunnel is not; only a broken lane is dialled again.
+                    if !is_timeout(&error) {
+                        tunnel = None;
+                        ports.clear();
+                    }
                 }
             }
         }
