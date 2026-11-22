@@ -314,7 +314,7 @@ pub fn jwt_expiry(token: &str) -> Option<u64> {
     top_level_exp(json.as_bytes())
 }
 
-/// The `exp` member of the payload's top-level object, read by walking its depth rather than materialising the document: a nested `exp` is a different claim, and the token's own sits beside keys of either shape.
+/// The `exp` member of the payload's top-level object, read by walking its depth rather than materialising the document: a nested `exp` is a different claim, and the token's own sits beside keys of either shape. A name that repeats is refused, because two claims of one name are not one expiry.
 fn top_level_exp(bytes: &[u8]) -> Option<u64> {
     let mut at = json_space(bytes, 0);
     if *bytes.get(at)? != b'{' {
@@ -324,12 +324,13 @@ fn top_level_exp(bytes: &[u8]) -> Option<u64> {
     if *bytes.get(at)? == b'}' {
         return None;
     }
+    let mut expiry = None;
     loop {
         if *bytes.get(at)? != b'"' {
             return None;
         }
         let name_end = json_string_end(bytes, at)?;
-        let is_exp = &bytes[at + 1..name_end - 1] == b"exp";
+        let is_exp = json_name_is(bytes, at + 1, name_end - 1, b"exp");
         at = json_space(bytes, name_end);
         if *bytes.get(at)? != b':' {
             return None;
@@ -337,14 +338,144 @@ fn top_level_exp(bytes: &[u8]) -> Option<u64> {
         at = json_space(bytes, at + 1);
         let end = json_skip(bytes, at)?;
         if is_exp {
-            return std::str::from_utf8(&bytes[at..end]).ok()?.parse().ok();
+            if expiry.is_some() {
+                return None;
+            }
+            expiry = Some(json_exp_value(&bytes[at..end])?);
         }
         at = json_space(bytes, end);
         match *bytes.get(at)? {
             b',' => at = json_space(bytes, at + 1),
+            b'}' => return expiry,
             _ => return None,
         }
     }
+}
+
+/// Whether the string body `bytes[from..to]` decodes to `name`: an escape that spells the name is the name.
+fn json_name_is(bytes: &[u8], from: usize, to: usize, name: &[u8]) -> bool {
+    let mut at = from;
+    let mut want = 0;
+    while at < to {
+        let Some(ch) = json_char(bytes, &mut at, to) else {
+            return false;
+        };
+        if want >= name.len() || ch != u32::from(name[want]) {
+            return false;
+        }
+        want += 1;
+    }
+    want == name.len()
+}
+
+/// One decoded JSON string character: an escaped byte, `\uXXXX`, or a surrogate pair joined into its code point.
+fn json_char(bytes: &[u8], at: &mut usize, to: usize) -> Option<u32> {
+    let byte = *bytes.get(*at)?;
+    if byte != b'\\' {
+        *at += 1;
+        return Some(u32::from(byte));
+    }
+    let escape = *bytes.get(*at + 1)?;
+    *at += 2;
+    Some(match escape {
+        b'"' => u32::from(b'"'),
+        b'\\' => u32::from(b'\\'),
+        b'/' => u32::from(b'/'),
+        b'b' => 0x08,
+        b'f' => 0x0c,
+        b'n' => u32::from(b'\n'),
+        b'r' => u32::from(b'\r'),
+        b't' => u32::from(b'\t'),
+        b'u' => {
+            if *at + 4 > to {
+                return None;
+            }
+            let mut first = json_hex4(bytes, *at)?;
+            *at += 4;
+            if (0xd800..0xdc00).contains(&first) {
+                if *at + 6 > to
+                    || bytes.get(*at) != Some(&b'\\')
+                    || bytes.get(*at + 1) != Some(&b'u')
+                {
+                    return None;
+                }
+                let second = json_hex4(bytes, *at + 2)?;
+                if !(0xdc00..0xe000).contains(&second) {
+                    return None;
+                }
+                *at += 6;
+                first = 0x10000 + ((first - 0xd800) << 10) + (second - 0xdc00);
+            } else if (0xdc00..0xe000).contains(&first) {
+                return None;
+            }
+            first
+        }
+        _ => return None,
+    })
+}
+
+fn json_hex4(bytes: &[u8], at: usize) -> Option<u32> {
+    let mut value = 0;
+    for offset in 0..4 {
+        value = (value << 4) | char::from(*bytes.get(at + offset)?).to_digit(16)?;
+    }
+    Some(value)
+}
+
+/// The `exp` value as whole seconds: a JSON number, integer or fractional, truncated toward zero; a negative, non-finite or overflowing one is no expiry at all.
+fn json_exp_value(token: &[u8]) -> Option<u64> {
+    let floating = json_number_ok(token)?;
+    let text = std::str::from_utf8(token).ok()?;
+    if !floating {
+        return text.parse().ok();
+    }
+    let value: f64 = text.parse().ok()?;
+    if !value.is_finite() || value < 0.0 || value >= 18_446_744_073_709_551_616.0 {
+        return None;
+    }
+    Some(value as u64)
+}
+
+/// Validates a JSON number's grammar and says whether it needs a floating-point read; `parse` alone would take a sign and a leading zero JSON does not.
+fn json_number_ok(token: &[u8]) -> Option<bool> {
+    let mut at = match token.first()? {
+        b'0' => 1,
+        b'1'..=b'9' => {
+            let mut at = 1;
+            while matches!(token.get(at), Some(b'0'..=b'9')) {
+                at += 1;
+            }
+            at
+        }
+        _ => return None,
+    };
+    let mut floating = false;
+    if token.get(at) == Some(&b'.') {
+        at += 1;
+        let start = at;
+        while matches!(token.get(at), Some(b'0'..=b'9')) {
+            at += 1;
+        }
+        if at == start {
+            return None;
+        }
+        floating = true;
+    }
+    if matches!(token.get(at), Some(b'e' | b'E')) {
+        floating = true;
+        at += 1;
+        if matches!(token.get(at), Some(b'+' | b'-')) {
+            at += 1;
+        }
+        let start = at;
+        while matches!(token.get(at), Some(b'0'..=b'9')) {
+            at += 1;
+        }
+        if at == start {
+            return None;
+        }
+    }
+    (at == token.len()).then_some(floating)
 }
 
 fn json_space(bytes: &[u8], mut at: usize) -> usize {
@@ -623,6 +754,40 @@ mod tests {
             None,
             "a token with no top-level exp has no expiry"
         );
+        assert_eq!(
+            jwt_expiry(&token(br#"{"exp":1735689600,"metadata":{}}"#)),
+            Some(1_735_689_600),
+            "the object closes after the claim"
+        );
+        assert_eq!(
+            jwt_expiry(&token(br#"{"exp":1735689600.75}"#)),
+            Some(1_735_689_600),
+            "a fractional expiry truncates to whole seconds"
+        );
+        assert_eq!(
+            jwt_expiry(&token(br#"{"exp":1.7356896e9}"#)),
+            Some(1_735_689_600),
+            "an exponent is a number"
+        );
+        assert_eq!(
+            jwt_expiry(&token(br#"{"e\u0078p":1735689600}"#)),
+            Some(1_735_689_600),
+            "an escaped name is the name"
+        );
+        assert_eq!(
+            jwt_expiry(&token(br#"{"exp":1735689600,"exp":1735689601}"#)),
+            None,
+            "two claims of one name are not one expiry"
+        );
+        for claims in [
+            br#"{"exp":-1}"#.as_slice(),
+            br#"{"exp":+5}"#.as_slice(),
+            br#"{"exp":01}"#.as_slice(),
+            br#"{"exp":1e400}"#.as_slice(),
+            br#"{"exp":18446744073709551616}"#.as_slice(),
+        ] {
+            assert_eq!(jwt_expiry(&token(claims)), None, "{claims:?}");
+        }
     }
 
     #[test]

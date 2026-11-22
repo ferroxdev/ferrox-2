@@ -577,6 +577,9 @@ pub fn qpack_status(block: &[u8]) -> Option<u16> {
                 return None;
             }
             let index = read_integer(block, &mut at, 6)?;
+            if index >= QPACK_STATIC.len() {
+                return None;
+            }
             // A field the lane does not read is walked past, the way the `h2` reader does: the status is what the block has, not the first line it met.
             if let Some(code) = static_status(index, false) {
                 status = Some(code);
@@ -589,7 +592,7 @@ pub fn qpack_status(block: &[u8]) -> Option<u16> {
                 return None;
             }
             let index = read_integer(block, &mut at, 4)?;
-            static_name(index) == Some(b":status".as_slice())
+            static_name(index)? == b":status"
         } else if first & 0xE0 == 0x20 {
             qpack_name(block, &mut at)?.is_status()
         } else {
@@ -634,10 +637,7 @@ pub fn qpack_content_length(block: &[u8]) -> Result<Option<usize>, Malformed> {
         };
         let value = string_literal(block, &mut at).ok_or(Malformed)?;
         if name_is_length {
-            let parsed = std::str::from_utf8(value.as_bytes())
-                .ok()
-                .and_then(|text| text.trim().parse().ok())
-                .ok_or(Malformed)?;
+            let parsed = content_length_of(value.as_bytes()).ok_or(Malformed)?;
             length = Some(match length {
                 Some(known) if known != parsed => return Err(Malformed),
                 _ => parsed,
@@ -645,6 +645,15 @@ pub fn qpack_content_length(block: &[u8]) -> Result<Option<usize>, Malformed> {
         }
     }
     Ok(length)
+}
+
+/// A `content-length` value as a number: digits only after the optional whitespace, so a sign or a trailing byte is malformed rather than accepted by `parse`.
+fn content_length_of(value: &[u8]) -> Option<usize> {
+    let text = std::str::from_utf8(value).ok()?.trim();
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
 }
 
 /// A QPACK section that cannot be read as one `content-length`: a field is malformed, the static index names no entry, or the length repeats with a different value.
@@ -1273,6 +1282,31 @@ mod tests {
         let mut length = vec![0x00, 0x00];
         integer(&mut length, 6, 0x80, 4);
         assert_eq!(qpack_content_length(&length), Err(Malformed));
+    }
+
+    /// A reference outside the 99 static entries is not a line to walk past: it names a table this lane never fills, so the block is refused instead of leaving an earlier status standing.
+    #[test]
+    fn a_qpack_reference_past_the_static_table_is_refused() {
+        let mut indexed = vec![0x00, 0x00];
+        integer(&mut indexed, 6, 0xC0, 25);
+        integer(&mut indexed, 6, 0xC0, 99);
+        assert_eq!(qpack_status(&indexed), None);
+        let mut named = vec![0x00, 0x00];
+        integer(&mut named, 4, 0x50, 99);
+        integer(&mut named, 7, 0x00, 3);
+        named.extend_from_slice(b"200");
+        assert_eq!(qpack_status(&named), None);
+        assert_eq!(qpack_fields(&named), None);
+    }
+
+    /// A `content-length` is digits and nothing else: `parse` would take a sign or a trailing byte the field grammar does not.
+    #[test]
+    fn a_signed_content_length_is_malformed() {
+        for text in ["+5", "-1", "5x", ""] {
+            let mut block = Vec::new();
+            qpack_literal(&mut block, "content-length", text.as_bytes());
+            assert_eq!(qpack_content_length(&block), Err(Malformed), "{text:?}");
+        }
     }
 
     /// Two content-length fields that disagree make the block malformed, not length-less: a caller that treated the conflict as absent could smuggle a body past the check. A repeat of the same number is the one length.
