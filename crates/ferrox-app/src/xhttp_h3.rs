@@ -972,12 +972,15 @@ impl Read for ClientStream {
         if buf.is_empty() {
             return Ok(0);
         }
+        if self.owner.dead.load(Ordering::Relaxed) {
+            return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        }
         if self.peer_fin.load(Ordering::Relaxed) {
             return Ok(0);
         }
         let deadline = Instant::now() + crate::budgets::RELAY_POLL;
         loop {
-            if self.owner.rejected(self.id) {
+            if self.owner.dead.load(Ordering::Relaxed) || self.owner.rejected(self.id) {
                 return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
             }
             let Ok(mut conn) = self.conn.lock() else {
@@ -1022,10 +1025,13 @@ impl Write for ClientStream {
         if buf.is_empty() {
             return Ok(0);
         }
+        if self.owner.dead.load(Ordering::Relaxed) {
+            return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        }
         let deadline = Instant::now() + crate::budgets::relay_stall();
         let mut rest = buf;
         while !rest.is_empty() {
-            if self.owner.rejected(self.id) {
+            if self.owner.dead.load(Ordering::Relaxed) || self.owner.rejected(self.id) {
                 return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
             }
             let Ok(mut conn) = self.conn.lock() else {
@@ -1074,7 +1080,10 @@ impl ClientStream {
             let Ok(mut conn) = self.conn.lock() else {
                 return Err(std::io::Error::other("h3 connection lock poisoned"));
             };
-            if self.owner.draining.load(Ordering::Relaxed) || self.owner.rejected(self.id) {
+            if self.owner.dead.load(Ordering::Relaxed)
+                || self.owner.draining.load(Ordering::Relaxed)
+                || self.owner.rejected(self.id)
+            {
                 return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
             }
             match conn.stream_send(self.id, rest, false) {
@@ -2088,6 +2097,24 @@ mod tests {
             peer_fin: Arc::new(AtomicBool::new(false)),
             activity: Arc::new(Activity::new()),
         })
+    }
+
+    #[test]
+    fn a_dead_h3_client_fails_its_attached_streams() {
+        let (identity, roots) = minted_identity("localhost");
+        let port = serve_answer(&identity, "200", b"");
+        let client = client(port, roots);
+        let mut wire = raw_stream(&client);
+        client.dead.store(true, Ordering::Relaxed);
+        let mut room = [0u8; 1];
+        assert_eq!(
+            wire.read(&mut room).unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionReset
+        );
+        assert_eq!(
+            wire.write(b"x").unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
     }
 
     fn send_frame(wire: &Wire, kind: u64, payload: &[u8]) {
