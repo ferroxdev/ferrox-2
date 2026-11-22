@@ -827,9 +827,9 @@ fn read_final_head(io: &mut dyn Read) -> Result<(Vec<u8>, usize, usize), String>
     let mut start = 0;
     loop {
         let end = read_head(io, &mut head, start)?;
-        if status_code(&head[start..end])
-            .is_none_or(|status| !(100..200).contains(&status) || status == 101)
-        {
+        let status = status_code(&head[start..end])
+            .ok_or_else(|| "the response has no status code".to_owned())?;
+        if !(100..200).contains(&status) || status == 101 {
             return Ok((head, start, end));
         }
         start = end;
@@ -1154,6 +1154,16 @@ mod tests {
         assert!(start > 0);
         assert_eq!(status_code(&head[start..end]), Some(200));
         assert_eq!(end, head.len());
+    }
+
+    #[test]
+    fn a_malformed_status_is_not_a_healthy_head() {
+        let answer: &[u8] = b"HTTP/1.1 nope\r\n\r\n";
+        let mut io = Trickle {
+            bytes: answer,
+            window: answer.len(),
+        };
+        assert!(read_final_head(&mut io).is_err());
     }
 
     #[test]
