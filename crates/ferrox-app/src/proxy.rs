@@ -32012,12 +32012,12 @@ fn serve_socks_udp_foxy_ip(
     let mut ports: HashMap<SocketAddr, u16> = HashMap::new();
     let mut next_port = 40_000u16;
     let mut quiet = Instant::now();
+    // A datagram that arrives while an assignment is still behind the tunnel's replies stays in `buf`: it is re-examined without another `recv_from`, so it is neither dropped nor sent under a source set the pending assignment replaces. It outlives a burst so the last receive of one is not lost at the boundary.
+    let mut held: Option<(usize, std::net::SocketAddr)> = None;
     loop {
         // The client's datagrams go out as a burst, and the destination address rides a stack buffer: one packet per pass and one `Vec` per packet are both a cost the association has no reason to pay.
         let mut ended = false;
         let mut burst = 0;
-        // A datagram that arrives while an assignment is still behind the tunnel's replies stays in `buf`: it is re-examined without another `recv_from`, so it is neither dropped nor sent under a source set the pending assignment replaces.
-        let mut held: Option<(usize, std::net::SocketAddr)> = None;
         while burst < UDP_BURST {
             let (n, src) = if let Some((n, src)) = held.take() {
                 (n, src)
