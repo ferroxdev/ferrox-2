@@ -3248,6 +3248,15 @@ impl Picked<'_> {
             Self::Dynamic(out) => (*out).clone(),
         }
     }
+
+    /// The identity of the table entry behind this answer, so a cached lane can tell a
+    /// replacement under the same tag from the outbound it was opened for.
+    fn identity(&self) -> usize {
+        match self {
+            Self::Static(out) => std::ptr::from_ref(*out) as usize,
+            Self::Dynamic(out) => Arc::as_ptr(out) as usize,
+        }
+    }
 }
 
 /// The lane `device_dial` resolved for a flow that still needs the front's own relay: the outbound
@@ -10227,17 +10236,28 @@ impl BridgeLane {
         }
     }
 
-    fn pick(&self, asked: &Destination, network: crate::router::Network) -> Option<Picked<'_>> {
-        match &self.plan {
-            Some(plan) => Some(plan.pick(asked, network, None, None)),
-            None => self.fixed.as_ref().map(Picked::Static),
-        }
+    /// The outbound one stream takes and the tag that names its lane, with that tag's dial
+    /// settings installed for the worker that dials it.
+    fn tcp_route(&self, asked: &Destination) -> Option<(Outbound, Option<String>)> {
+        let (picked, key) = match &self.plan {
+            Some(plan) => plan.lane_with_protocol(
+                asked,
+                crate::router::Network::Tcp,
+                None,
+                FlowFacts::default(),
+            ),
+            None => {
+                self.arm(None);
+                (Picked::Static(self.fixed.as_ref()?), None)
+            }
+        };
+        Some((picked.into_owned(), key.map(std::borrow::Cow::into_owned)))
     }
 
     fn tcp(&self, target: &MuxTarget) -> Option<Connection> {
         let asked = target.destination();
-        let picked = self.pick(&asked, crate::router::Network::Tcp)?.into_owned();
-        match picked {
+        let (out, tag) = self.tcp_route(&asked)?;
+        match out {
             Outbound::Freedom(freedom) => freedom_socket(&freedom, &asked)
                 .filter(|address| {
                     !freedom.blocks(crate::router::Network::Tcp, address.ip(), address.port())
@@ -10245,7 +10265,7 @@ impl BridgeLane {
                 .and_then(|address| dial_or_report(&address))
                 .map(|stream| stream.with_mask(freedom.fragment.as_deref())),
             Outbound::Block(_) => None,
-            out => bridge_tunnel(out, asked),
+            out => bridge_tunnel(out, asked, tag),
         }
     }
 
@@ -10264,7 +10284,7 @@ impl BridgeLane {
     /// The outbound one datagram takes and the tag that names its lane. The settings that tag
     /// carries are installed only when the caller opens a lane, so a reused lane never inherits
     /// another tag's source.
-    fn udp_route(&self, asked: &Destination) -> Option<(Outbound, Option<String>)> {
+    fn udp_route(&self, asked: &Destination) -> Option<(Outbound, Option<String>, usize)> {
         let (picked, key) = match &self.plan {
             Some(plan) => plan.lane_with_protocol_untracked(
                 asked,
@@ -10277,7 +10297,12 @@ impl BridgeLane {
         if !udp_lane_supported(&picked) {
             return None;
         }
-        Some((picked.into_owned(), key.map(std::borrow::Cow::into_owned)))
+        let identity = picked.identity();
+        Some((
+            picked.into_owned(),
+            key.map(std::borrow::Cow::into_owned),
+            identity,
+        ))
     }
 
     /// The source and options the picked tag names, left for `spawn_udp_lane` on this thread.
@@ -10294,23 +10319,40 @@ impl BridgeLane {
 
 /// A stream through any outbound the config names: the flow crosses one loopback pair, the same
 /// hop every front uses when it needs a stream from a lane that hands back a relay.
-fn bridge_tunnel(out: Outbound, target: Destination) -> Option<Connection> {
+fn bridge_tunnel(out: Outbound, target: Destination, tag: Option<String>) -> Option<Connection> {
     let (client, server) = crate::reverse::loopback_pair()?;
+    bridge_connect(server, out, target, Front::Probe, tag).then_some(client)
+}
+
+/// Serves one routed stream on its own worker, carrying the picked tag's dial settings across
+/// the thread boundary the way the datagram lane does.
+fn bridge_connect(
+    client: Connection,
+    out: Outbound,
+    target: Destination,
+    front: Front,
+    tag: Option<String>,
+) -> bool {
+    let source = SEND_THROUGH.with(std::cell::Cell::take);
+    let sockopts = DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take());
+    let strategy = TARGET_STRATEGY.with(std::cell::Cell::take);
     thread::Builder::new()
         .name("ferrox-reverse-bridge".to_owned())
         .spawn(move || {
+            SEND_THROUGH.with(|cell| cell.set(source));
+            DIAL_SOCKOPTS.with(|cell| *cell.borrow_mut() = sockopts);
+            TARGET_STRATEGY.with(|cell| cell.set(strategy));
             serve_connect(
-                server,
+                client,
                 &out,
                 &target,
-                Front::Probe,
+                front,
                 &[],
-                None,
+                tag.as_deref(),
                 FlowFacts::default(),
             );
         })
-        .ok()?;
-    Some(client)
+        .is_ok()
 }
 
 /// Serves one bridge session: the portal's flows arrive as mux frames over `wire`, and each leaves
@@ -10335,10 +10377,9 @@ fn start_bridges(root: &Json, outbound: Option<&Outbound>, route: Option<&Arc<Ro
             let (client, server) = crate::reverse::loopback_pair()?;
             let tunnel = crate::reverse::Tunnel::from_connection(&server)?;
             let state = crate::reverse::WorkerState::new();
-            let edge = resolve_outbound(&vless.address, vless.port)?;
             let dial = vless.clone();
             thread::spawn(move || {
-                dial_vless_reverse(&client, &edge, &dial);
+                dial_vless_reverse(&client, &dial.address, dial.port, &dial);
             });
             let worker_state = Arc::clone(&state);
             let worker_lane = Arc::clone(&lane);
@@ -10382,23 +10423,14 @@ fn start_bridges(root: &Json, outbound: Option<&Outbound>, route: Option<&Arc<Ro
             let state = crate::reverse::WorkerState::new();
             let asked = Destination::Name(domain.clone(), 0);
             let worker_state = Arc::clone(&state);
-            let pick_lane = Arc::clone(&worker_lane);
             let mux_lane = Arc::clone(&worker_lane);
-            thread::spawn(move || {
-                let Some(picked) = pick_lane.pick(&asked, crate::router::Network::Tcp) else {
-                    let _ = client.shutdown(Shutdown::Both);
-                    return;
-                };
-                serve_connect(
-                    client,
-                    &picked,
-                    &asked,
-                    Front::Socks,
-                    &[],
-                    None,
-                    FlowFacts::default(),
-                );
-            });
+            let Some((picked, tag)) = worker_lane.tcp_route(&asked) else {
+                let _ = client.shutdown(Shutdown::Both);
+                return None;
+            };
+            if !bridge_connect(client, picked, asked, Front::Socks, tag) {
+                return None;
+            }
             let wire = MuxWire::Tunnel(tunnel.clone());
             thread::spawn(move || serve_bridge_mux(&wire, mux_lane, &worker_state));
             Some(crate::reverse::BridgeHandle {
@@ -10968,6 +11000,7 @@ fn handle_mux_udp_new(
             _connection: connection,
         });
         let Some(reader) = spawn_mux_udp_reader(&session, stopped) else {
+            session.retire();
             return send_mux_end(out.wire, out.staging, frame.id);
         };
         out.handles.push(reader);
@@ -10990,12 +11023,13 @@ fn handle_mux_udp_new(
 fn spawn_bridge_udp_relay(bridge: &Arc<BridgeLane>) -> Option<(UdpSocket, Arc<AtomicBool>)> {
     let relay = UdpSocket::bind("127.0.0.1:0").ok()?;
     let leg = relay_leg(relay.local_addr().ok()?).ok()?;
+    let client = leg.local_addr().ok()?;
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
     let lane = Arc::clone(bridge);
     thread::Builder::new()
         .name("ferrox-reverse-bridge-udp".to_owned())
-        .spawn(move || serve_bridge_udp(&relay, &lane, &thread_stop))
+        .spawn(move || serve_bridge_udp(&relay, &lane, &thread_stop, client))
         .ok()?;
     Some((leg, stop))
 }
@@ -11003,16 +11037,20 @@ fn spawn_bridge_udp_relay(bridge: &Arc<BridgeLane>) -> Option<(UdpSocket, Arc<At
 /// One bridge datagram flow: the mux socket speaks SOCKS5 UDP frames, and this relay sends each
 /// one to the lane its destination picked. Replies come back framed, so the reader learns the
 /// address that answered.
-fn serve_bridge_udp(relay: &UdpSocket, bridge: &BridgeLane, stop: &AtomicBool) {
+fn serve_bridge_udp(
+    relay: &UdpSocket,
+    bridge: &BridgeLane,
+    stop: &Arc<AtomicBool>,
+    client: SocketAddr,
+) {
     let _ = relay.set_read_timeout(Some(RELAY_POLL));
     let local = relay.local_addr().map_or(
         std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
         |addr| addr.ip(),
     );
-    let mut lanes: HashMap<String, UdpLane> = HashMap::new();
-    let mut default_lane: Option<UdpLane> = None;
+    let mut lanes: HashMap<usize, HashMap<String, UdpLane>> = HashMap::new();
+    let mut default_lane: Option<(usize, UdpLane)> = None;
     let mut replies: HashSet<SocketAddr> = HashSet::new();
-    let mut client: Option<SocketAddr> = None;
     let mut buf = udp_buffer();
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -11024,64 +11062,91 @@ fn serve_bridge_udp(relay: &UdpSocket, bridge: &BridgeLane, stop: &AtomicBool) {
             Err(_) => break,
         };
         if replies.contains(&src) {
-            if let Some(client) = client {
-                let _ = relay.send_to(&buf[..n], client);
-            }
+            let _ = relay.send_to(&buf[..n], client);
             continue;
         }
-        match client {
-            Some(held) if held != src => continue,
-            None => client = Some(src),
-            Some(_) => {}
+        if src != client {
+            continue;
         }
         let Some((dest, payload)) = parse_socks_udp_dest(&buf[..n]) else {
             continue;
         };
-        if payload.is_empty() || payload.len() > ferrox_core::mux::CHUNK_MAX {
+        if payload.len() > ferrox_core::mux::CHUNK_MAX {
             continue;
         }
-        let Some((out, key)) = bridge.udp_route(&dest) else {
+        let Some((out, key, identity)) = bridge.udp_route(&dest) else {
             continue;
         };
         if matches!(&out, Outbound::Block(_)) {
             continue;
         }
         let lane_address = if let Some(tag) = key.as_deref() {
-            if let Some(address) = retire_finished_lane(&mut lanes, &mut replies, tag) {
+            if let Some(address) = retire_bridge_lane(&mut lanes, &mut replies, tag, identity) {
                 Some(address)
             } else {
                 bridge.arm(key.as_deref());
-                spawn_udp_lane(&out, local, None, Some(local)).map(|spawned| {
-                    replies.insert(spawned.address);
-                    let address = spawned.address;
-                    lanes.insert(tag.to_owned(), spawned);
-                    address
-                })
+                spawn_udp_lane_cancelled(&out, local, None, Some(local), Arc::clone(stop)).map(
+                    |spawned| {
+                        replies.insert(spawned.address);
+                        let address = spawned.address;
+                        lanes
+                            .entry(identity)
+                            .or_default()
+                            .insert(tag.to_owned(), spawned);
+                        address
+                    },
+                )
             }
         } else if let Some(running) = default_lane
             .as_ref()
-            .filter(|lane| !lane.handle.is_finished())
+            .filter(|entry| entry.0 == identity && !entry.1.handle.is_finished())
         {
-            Some(running.address)
+            Some(running.1.address)
         } else {
-            if let Some(finished) = default_lane.take() {
+            if let Some((_, finished)) = default_lane.take() {
                 replies.remove(&finished.address);
             }
             bridge.arm(None);
-            spawn_udp_lane(&out, local, None, Some(local)).map(|spawned| {
-                replies.insert(spawned.address);
-                let address = spawned.address;
-                default_lane = Some(spawned);
-                address
-            })
+            spawn_udp_lane_cancelled(&out, local, None, Some(local), Arc::clone(stop)).map(
+                |spawned| {
+                    replies.insert(spawned.address);
+                    let address = spawned.address;
+                    default_lane = Some((identity, spawned));
+                    address
+                },
+            )
         };
         if let Some(lane_address) = lane_address {
             let _ = relay.send_to(&buf[..n], lane_address);
         }
     }
+    stop.store(true, Ordering::Relaxed);
     if let Ok(relay) = relay.try_clone() {
-        retire_udp_lanes(relay, lanes, default_lane);
+        retire_udp_lanes(
+            relay,
+            lanes.into_values().flat_map(|lane| lane.into_values()),
+            default_lane.map(|(_, lane)| lane),
+        );
     }
+}
+
+/// A lane is only reused while it still belongs to the outbound the live table picked for its
+/// tag; a tag the management API replaced opens a fresh lane and leaves the old one to retire.
+fn retire_bridge_lane(
+    lanes: &mut HashMap<usize, HashMap<String, UdpLane>>,
+    replies: &mut HashSet<SocketAddr>,
+    tag: &str,
+    identity: usize,
+) -> Option<SocketAddr> {
+    let held = lanes.get_mut(&identity)?;
+    let lane = held.get(tag)?;
+    if !lane.handle.is_finished() {
+        return Some(lane.address);
+    }
+    if let Some(lane) = held.remove(tag) {
+        replies.remove(&lane.address);
+    }
+    None
 }
 
 fn spawn_mux_udp_reader(
@@ -14554,7 +14619,7 @@ fn dial_vless(
 /// The bridge's own session: command 4 over whichever carrier the outbound names, then the
 /// portal's empty response. The stream arms share `dial_vless`; the four carriers whose dial is
 /// not a ladder rung take their own opener here.
-fn dial_vless_reverse(client: &Connection, server: &SocketAddr, vless: &VlessOut) {
+fn dial_vless_reverse(client: &Connection, address: &str, port: u16, vless: &VlessOut) {
     let Some(header) = vless_request_header(vless, None) else {
         return;
     };
@@ -14581,7 +14646,12 @@ fn dial_vless_reverse(client: &Connection, server: &SocketAddr, vless: &VlessOut
         Carrier::Xdrive { .. } => {
             dial_vless_xdrive_header(client, vless, &header, budgets::relay_stall());
         }
-        _ => dial_vless(client, server, vless, None, Ladder::global()),
+        _ => {
+            let Some(server) = resolve_outbound(address, port) else {
+                return;
+            };
+            dial_vless(client, &server, vless, None, Ladder::global());
+        }
     }
 }
 
@@ -30887,7 +30957,7 @@ fn serve_socks_udp_sniffed(mut client: Connection, out: &Outbound) {
         };
         let _ = relay.send_to(frame, lane_address);
     }
-    retire_udp_lanes(relay, HashMap::new(), Some(lane));
+    retire_udp_lanes(relay, std::iter::empty(), Some(lane));
 }
 
 /// One lane for the whole association: every datagram reaches the same outbound.
@@ -31272,7 +31342,7 @@ fn serve_socks_udp_split(
             }
         }
     }
-    retire_udp_lanes(relay, lanes, default_lane);
+    retire_udp_lanes(relay, lanes.into_values(), default_lane);
 }
 
 /// The upstream socket's family follows the relay's: an IPv4 relay gets an unspecified IPv4 bind, an IPv6 relay an unspecified IPv6 bind.
@@ -31339,6 +31409,28 @@ fn spawn_udp_lane(
     associate: Option<Connection>,
     peer: Option<IpAddr>,
 ) -> Option<UdpLane> {
+    spawn_udp_lane_with_cancel(out, local, associate, peer, None)
+}
+
+/// A bridge-owned lane carries the relay's stop flag so its SOCKS worker leaves when the mux
+/// flow does, instead of waiting out the idle deadline.
+fn spawn_udp_lane_cancelled(
+    out: &Outbound,
+    local: std::net::IpAddr,
+    associate: Option<Connection>,
+    peer: Option<IpAddr>,
+    cancel: Arc<AtomicBool>,
+) -> Option<UdpLane> {
+    spawn_udp_lane_with_cancel(out, local, associate, peer, Some(cancel))
+}
+
+fn spawn_udp_lane_with_cancel(
+    out: &Outbound,
+    local: std::net::IpAddr,
+    associate: Option<Connection>,
+    peer: Option<IpAddr>,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Option<UdpLane> {
     let socket = UdpSocket::bind(SocketAddr::new(local, 0)).ok()?;
     let address = socket.local_addr().ok()?;
     let waker = socket.try_clone().ok()?;
@@ -31361,7 +31453,7 @@ fn spawn_udp_lane(
             source,
             sockopts.as_ref(),
             Some(local),
-            None,
+            cancel.as_deref(),
         );
     });
     Some(UdpLane {
@@ -31376,18 +31468,19 @@ fn spawn_udp_lane(
 /// has joined so a late answer cannot reach a later association on the reused port.
 fn retire_udp_lanes(
     relay: UdpSocket,
-    lanes: HashMap<String, UdpLane>,
+    lanes: impl IntoIterator<Item = UdpLane>,
     default_lane: Option<UdpLane>,
 ) {
+    let lanes: Vec<UdpLane> = lanes.into_iter().collect();
     if lanes.is_empty() && default_lane.is_none() {
         return;
     }
     thread::spawn(move || {
-        for lane in lanes.values().chain(default_lane.iter()) {
+        for lane in lanes.iter().chain(default_lane.iter()) {
             let _ = lane.waker.set_read_timeout(Some(UDP_POLL));
             let _ = relay.send_to(&[0u8], lane.address);
         }
-        for lane in lanes.into_values().chain(default_lane) {
+        for lane in lanes.into_iter().chain(default_lane) {
             let _ = lane.handle.join();
         }
     });
@@ -31475,20 +31568,23 @@ fn serve_socks_udp_client(
                 if !source_admitted(peer, pinned, src) {
                     continue;
                 }
-                let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
+                let Some((dest, payload)) = parse_socks_udp_dest(&buf[..n]) else {
                     continue;
                 };
-                if payload.is_empty() {
-                    continue;
-                }
                 pin_source(&mut pinned, &source, src);
                 touch(&activity);
-                let forwarded = socks_udp_forwarded(&buf[..n], &dest, payload);
-                let sent = if let Some(whole) = forwarded {
-                    sender.send(whole).is_ok()
-                } else {
-                    let (front, tail) = socks_udp_parts(&mut frame, &dest, payload);
-                    send_two(&sender, front, tail).is_ok()
+                let sent = match &dest {
+                    // The server owns name resolution, so the client's frame goes on unchanged.
+                    Destination::Name(..) => sender.send(&buf[..n]).is_ok(),
+                    Destination::Address(address) => {
+                        let forwarded = socks_udp_forwarded(&buf[..n], address, payload);
+                        if let Some(whole) = forwarded {
+                            sender.send(whole).is_ok()
+                        } else {
+                            let (front, tail) = socks_udp_parts(&mut frame, address, payload);
+                            send_two(&sender, front, tail).is_ok()
+                        }
+                    }
                 };
                 if !sent {
                     break;
@@ -88108,6 +88204,92 @@ mod reverse_tests {
         stream.read_exact(&mut back).expect("reads");
         assert_eq!(&back, b"ping");
         server.join().expect("server joins");
+    }
+
+    #[test]
+    fn a_bridge_udp_name_crosses_a_socks_outbound_unresolved() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let server_addr = listener.local_addr().expect("addr");
+        let upstream_relay = UdpSocket::bind("127.0.0.1:0").expect("relay");
+        upstream_relay
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let relay_addr = upstream_relay.local_addr().expect("relay addr");
+        let seen = Arc::new(Mutex::new(None));
+        let seen_server = Arc::clone(&seen);
+        let name = "only-the-server-resolves.invalid";
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            let mut greeting = [0u8; 3];
+            read_exact_bytes(&mut stream, &mut greeting);
+            assert_eq!(greeting, [5, 1, 0]);
+            stream.write_all(&[5, 0]).expect("greeting");
+            let mut head = [0u8; 4];
+            read_exact_bytes(&mut stream, &mut head);
+            assert_eq!(head, [5, 3, 0, 1]);
+            read_exact_bytes(&mut stream, &mut [0u8; 6]);
+            let mut reply = vec![5, 0, 0, 1];
+            let SocketAddr::V4(address) = relay_addr else {
+                panic!("the test relay is v4");
+            };
+            reply.extend_from_slice(&address.ip().octets());
+            reply.extend_from_slice(&relay_addr.port().to_be_bytes());
+            stream.write_all(&reply).expect("associate");
+            let mut frame = [0u8; 512];
+            let (n, src) = upstream_relay.recv_from(&mut frame).expect("udp");
+            assert_eq!(frame[3], 3, "the name was resolved on the bridge");
+            assert_eq!(&frame[5..5 + name.len()], name.as_bytes());
+            *seen_server
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(frame[..n].to_vec());
+            let mut answer = vec![0, 0, 0, 1, 127, 0, 0, 1];
+            answer.extend_from_slice(&src.port().to_be_bytes());
+            answer.extend_from_slice(b"ok");
+            upstream_relay.send_to(&answer, src).expect("reply");
+        });
+
+        let lane = UdpSocket::bind("127.0.0.1:0").expect("lane");
+        let lane_addr = lane.local_addr().expect("lane addr");
+        let stop = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::clone(&stop);
+        let serving = thread::spawn(move || {
+            serve_socks_udp_client(
+                &lane,
+                server_addr,
+                &crate::socks::Credential::default(),
+                crate::socks::Version::V5,
+                None,
+                None,
+                Some(&cancel),
+            );
+        });
+        let client = UdpSocket::bind("127.0.0.1:0").expect("client");
+        let mut frame = vec![0, 0, 0, 3, name.len() as u8];
+        frame.extend_from_slice(name.as_bytes());
+        frame.extend_from_slice(&80u16.to_be_bytes());
+        frame.extend_from_slice(b"ping");
+        client.send_to(&frame, lane_addr).expect("sends");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        stop.store(true, Ordering::Relaxed);
+        serving.join().expect("lane joins");
+        server.join().expect("server joins");
+        assert!(
+            seen.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some(),
+            "the upstream received the name"
+        );
     }
 
     #[test]
