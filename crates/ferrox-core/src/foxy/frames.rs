@@ -243,13 +243,12 @@ pub fn h2_event(frame: H2Frame, payload: &[u8], ours: u32) -> H2Event<'_> {
         GOAWAY => H2Event::GoAway {
             code: be32(payload.get(4..).unwrap_or_default()),
         },
-        // A promise short enough to name no stream cannot be refused on the stream it promised.
+        // A promise shorter than its four-byte stream id is a connection error, not an event to drop.
         PUSH_PROMISE => match framed_body(PUSH_PROMISE, frame.flags, payload) {
             Some(body) if body.len() >= 4 => H2Event::Push {
                 promised: be32(body) & 0x7fff_ffff,
             },
-            Some(_) => H2Event::Other { kind: PUSH_PROMISE },
-            None => H2Event::Malformed { kind: PUSH_PROMISE },
+            _ => H2Event::Malformed { kind: PUSH_PROMISE },
         },
         _ => H2Event::Other { kind: frame.kind },
     }
@@ -301,13 +300,12 @@ pub fn h2_routed(frame: H2Frame, payload: &[u8]) -> H2Routed<'_> {
         GOAWAY => H2Routed::GoAway {
             code: be32(payload.get(4..).unwrap_or_default()),
         },
-        // A promise short enough to name no stream cannot be refused on the stream it promised.
+        // A promise shorter than its four-byte stream id is a connection error, not an event to drop.
         PUSH_PROMISE => match framed_body(PUSH_PROMISE, frame.flags, payload) {
             Some(body) if body.len() >= 4 => H2Routed::Push {
                 promised: be32(body) & 0x7fff_ffff,
             },
-            Some(_) => H2Routed::Other { kind: PUSH_PROMISE },
-            None => H2Routed::Malformed { kind: PUSH_PROMISE },
+            _ => H2Routed::Malformed { kind: PUSH_PROMISE },
         },
         _ => H2Routed::Other { kind: frame.kind },
     }
@@ -503,8 +501,8 @@ pub fn h3_event(frame: H3Frame, payload: &[u8]) -> H3Event<'_> {
         H3_GOAWAY => {
             let mut at = 0;
             match quic_read(payload, &mut at) {
-                Some(id) => H3Event::GoAway { id },
-                None => H3Event::Malformed { kind: frame.kind },
+                Some(id) if at == payload.len() => H3Event::GoAway { id },
+                _ => H3Event::Malformed { kind: frame.kind },
             }
         }
         _ => H3Event::Other { kind: frame.kind },
@@ -900,15 +898,15 @@ mod tests {
             h2_routed(frame, &raw[H2_HEADER..]),
             H2Routed::Push { promised: 2 }
         );
-        // A promise that names no stream is not a promise this lane can answer.
+        // A promise shorter than its stream id is a connection error, never something to drop.
         let (frame, raw) = frame_of(PUSH_PROMISE, 0, 0, b"x");
         assert_eq!(
             h2_event(frame, &raw[H2_HEADER..], 1),
-            H2Event::Other { kind: PUSH_PROMISE }
+            H2Event::Malformed { kind: PUSH_PROMISE }
         );
         assert_eq!(
             h2_routed(frame, &raw[H2_HEADER..]),
-            H2Routed::Other { kind: PUSH_PROMISE }
+            H2Routed::Malformed { kind: PUSH_PROMISE }
         );
         let (frame, raw) = frame_of(0x10, 0, 1, b"x");
         assert_eq!(
@@ -1024,6 +1022,17 @@ mod tests {
                     length: 0
                 },
                 &[]
+            ),
+            H3Event::Malformed { kind: H3_GOAWAY }
+        );
+        // The id is the whole body: a byte after it is H3_FRAME_ERROR, not a longer id.
+        assert_eq!(
+            h3_event(
+                H3Frame {
+                    kind: H3_GOAWAY,
+                    length: 2
+                },
+                &[0x01, 0x01]
             ),
             H3Event::Malformed { kind: H3_GOAWAY }
         );

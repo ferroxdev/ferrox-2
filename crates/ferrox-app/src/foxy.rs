@@ -861,6 +861,7 @@ fn open_session(dial: &FoxyDial) -> Result<Arc<Session>, Failure> {
             out: Vec::new(),
             scratch: Vec::new(),
             gone: false,
+            terminal: None,
             conn_pending: 0,
             park: None,
             quantum: crate::budgets::head_arrival(),
@@ -1289,12 +1290,40 @@ struct SessionInner {
     scratch: Vec<u8>,
     /// The session answered with a reset, a `GOAWAY`, or a broken frame: it can carry no flow further and is never lent again.
     gone: bool,
+    /// Why the session stopped, kept apart from `gone` so a reader that was not cleanly finished can return an error rather than an end of stream.
+    terminal: Option<Terminal>,
     /// The bytes the edge has sent into the connection's granted window that the session has taken but not yet granted back, over every stream: the connection's own credit is owed once, whatever stream the bytes arrived on.
     conn_pending: u32,
     /// The wait a leg that has handed the lock back may spend on this session's socket: the quantum a relay armed, less the grain its blocking read takes. `None` until one arms it, because a caller that reads this session alone has no lock to release.
     park: Option<Duration>,
     /// The wait one socket read takes: the grain the relay armed, and the bound the head walk waits under.
     quantum: Duration,
+}
+
+/// Why a session stopped: a frame the lane could not read, or the edge's `GOAWAY`.
+#[derive(Clone, Copy)]
+enum Terminal {
+    Malformed,
+    GoAway,
+}
+
+impl Terminal {
+    fn error(self) -> std::io::Error {
+        match self {
+            Self::Malformed => {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed h2 frame")
+            }
+            Self::GoAway => std::io::Error::from(std::io::ErrorKind::ConnectionAborted),
+        }
+    }
+}
+
+impl SessionInner {
+    /// Stops the session for good, recording why: the first reason is the one a reader sees, because every frame after it was read under the same broken session.
+    fn fail(&mut self, why: Terminal) {
+        self.gone = true;
+        self.terminal.get_or_insert(why);
+    }
 }
 
 /// One CONNECT stream on a session: its own credit, its own staged bytes, its own capsule stream.
@@ -1754,7 +1783,7 @@ impl Tls2 {
             }
             // RFC 9113 §6.1: a frame whose padding or priority prefix does not fit its length is a connection error, not an event to drop.
             frames::H2Routed::Malformed { .. } => {
-                inner.gone = true;
+                inner.fail(Terminal::Malformed);
                 inner.out = payload;
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -1912,8 +1941,12 @@ impl Tls2 {
                                 take_status(inner, own)
                             }
                         }
-                        frames::H2Routed::GoAway { .. } | frames::H2Routed::Malformed { .. } => {
-                            inner.gone = true;
+                        frames::H2Routed::GoAway { .. } => {
+                            inner.fail(Terminal::GoAway);
+                            Err(Failure::Stream)
+                        }
+                        frames::H2Routed::Malformed { .. } => {
+                            inner.fail(Terminal::Malformed);
                             Err(Failure::Stream)
                         }
                         _ => take_status(inner, own),
@@ -2011,16 +2044,19 @@ impl Tls2 {
                 }
                 return Ok(take);
             }
-            let fin = {
+            let (fin, terminal) = {
                 let inner = self.inner().map_err(io)?;
-                inner.gone
-                    || inner
-                        .streams
-                        .get(&self.stream)
-                        .is_none_or(|stream| stream.fin)
+                let fin = inner
+                    .streams
+                    .get(&self.stream)
+                    .is_none_or(|stream| stream.fin);
+                (fin, inner.terminal)
             };
             if fin {
                 return Ok(0);
+            }
+            if let Some(why) = terminal {
+                return Err(why.error());
             }
             let over = {
                 let inner = self.inner().map_err(io)?;
@@ -2104,11 +2140,11 @@ fn stage_datagram(
             Ok(0)
         }
         frames::H2Routed::GoAway { .. } => {
-            inner.gone = true;
+            inner.fail(Terminal::GoAway);
             Ok(0)
         }
         frames::H2Routed::Malformed { .. } => {
-            inner.gone = true;
+            inner.fail(Terminal::Malformed);
             Err(io(Failure::Stream))
         }
         _ => Ok(0),
@@ -2144,11 +2180,11 @@ fn stage_address(
             Ok(())
         }
         frames::H2Routed::GoAway { .. } => {
-            inner.gone = true;
+            inner.fail(Terminal::GoAway);
             Ok(())
         }
         frames::H2Routed::Malformed { .. } => {
-            inner.gone = true;
+            inner.fail(Terminal::Malformed);
             Err(io(Failure::Stream))
         }
         _ => Ok(()),
@@ -2216,11 +2252,11 @@ fn route_packet(
             Ok(false)
         }
         frames::H2Routed::GoAway { .. } => {
-            inner.gone = true;
+            inner.fail(Terminal::GoAway);
             Ok(false)
         }
         frames::H2Routed::Malformed { .. } => {
-            inner.gone = true;
+            inner.fail(Terminal::Malformed);
             Err(io(Failure::Stream))
         }
         _ => Ok(false),
@@ -2311,16 +2347,20 @@ impl Read for Tls2 {
             if staged {
                 return Ok(self.take(buf));
             }
-            let fin = {
+            let (fin, terminal) = {
                 let inner = self.inner().map_err(io)?;
-                inner.gone
-                    || inner
-                        .streams
-                        .get(&self.stream)
-                        .is_none_or(|stream| stream.fin)
+                let fin = inner
+                    .streams
+                    .get(&self.stream)
+                    .is_none_or(|stream| stream.fin);
+                (fin, inner.terminal)
             };
+            // A clean end drains what was staged and then answers zero; a session that broke must not look like one that finished.
             if fin {
                 return Ok(0);
+            }
+            if let Some(why) = terminal {
+                return Err(why.error());
             }
             // An unpadded payload is copied once, by the frame reader, straight into the caller's buffer: nothing is staged between the lane and its caller, and a frame the caller has no room left for resumes in the caller's own space on the next read.
             let own = self.stream;
@@ -2370,12 +2410,11 @@ impl Read for Tls2 {
                             Ok(0)
                         }
                         frames::H2Routed::GoAway { .. } => {
-                            inner.gone = true;
-                            end_stream(inner, own, 8);
+                            inner.fail(Terminal::GoAway);
                             Ok(0)
                         }
                         frames::H2Routed::Malformed { .. } => {
-                            inner.gone = true;
+                            inner.fail(Terminal::Malformed);
                             Err(io(Failure::Stream))
                         }
                         _ => Ok(0),
@@ -2695,8 +2734,8 @@ impl H3 {
         let status = lane.read_head()?;
         opened(status)?;
         let mut request = Vec::new();
-        connectip::address_request(1, 4, &[0, 0, 0, 0], &mut request);
-        connectip::address_request(2, 6, &[0; 16], &mut request);
+        // Both families in one capsule: the proxy replaces its allowed sources with each answer, so a second request would leave the first family unroutable.
+        connectip::address_requests(&[(1, 4, &[0, 0, 0, 0]), (2, 6, &[0; 16])], &mut request);
         // The request rides one DATA frame the way a packet does: capsules here are framed, and raw bytes would read as a frame header.
         let mut head = [0u8; 9];
         let hl = frames::h3_data_header(&mut head, request.len() as u64);
@@ -2780,7 +2819,7 @@ impl H3 {
                 self.take_block(body, length, true, started)?;
                 Ok(())
             }
-            frames::H3_RESET | frames::H3_GOAWAY => {
+            frames::H3_GOAWAY => {
                 self.fin = true;
                 self.carried = self.filled;
                 Ok(())
@@ -2795,12 +2834,11 @@ impl H3 {
         }
     }
 
-    /// Sends the address request and reads the assignment: without one the lane has no source address to write into a packet, and a proxy that refuses is refused rather than guessed at.
+    /// Sends the address request and reads the assignment: without one the lane has no source address to write into a packet, and a proxy that refuses is refused rather than guessed at. Every family it granted comes back, because one request names both and one answer replaces every source the proxy allows.
     pub(crate) fn address_assign(
         &mut self,
-    ) -> Result<Option<ferrox_core::foxy::connectip::Assigned>, Failure> {
+    ) -> Result<Vec<ferrox_core::foxy::connectip::Assigned>, Failure> {
         let deadline = Instant::now() + HEADER_TIMEOUT;
-        let mut assigned = None;
         while Instant::now() < deadline {
             if let Some((used, capsule)) =
                 connectip::capsule_split(&self.capsule_buf[self.capsule_at..])
@@ -2809,37 +2847,35 @@ impl H3 {
                     connectip::Capsule::AddressAssign(body) => {
                         let mut into = Vec::new();
                         if connectip::address_assign(body, &mut into).is_none() {
-                            (None, true)
+                            (Vec::new(), true)
                         } else {
-                            (into.into_iter().find(|grant| !grant.refused()), false)
+                            into.retain(|grant| !grant.refused());
+                            (into, false)
                         }
                     }
                     connectip::Capsule::RouteAdvert(body) => {
                         let mut routes = Vec::new();
                         let _ = connectip::route_advert(body, &mut routes);
-                        (None, false)
+                        (Vec::new(), false)
                     }
-                    _ => (None, false),
+                    _ => (Vec::new(), false),
                 };
                 self.capsule_at += used;
                 self.release_capsules();
-                if let Some(granted) = granted {
-                    assigned = Some(granted);
+                if granted.is_empty() {
+                    if quit {
+                        return Err(Failure::Frame);
+                    }
+                    continue;
                 }
-                if quit {
-                    return Err(Failure::Frame);
-                }
-                if assigned.is_some() {
-                    return Ok(assigned);
-                }
-                continue;
+                return Ok(granted);
             }
             if self.fin {
                 return Err(Failure::Stream);
             }
             self.fill_capsules().map_err(io)?;
         }
-        Ok(assigned)
+        Ok(Vec::new())
     }
 
     /// One IP packet, as a frame's payload the caller takes whole: a frame that is exactly one DATAGRAM capsule whose packet is already queued is read straight into the caller's buffer, so the packet crosses userspace once; a capsule that spanned frames is staged and then copied, as before.
@@ -3265,7 +3301,7 @@ impl H3 {
                     self.capsule_buf.truncate(mark);
                     return Ok(status);
                 }
-                frames::H3_RESET | frames::H3_GOAWAY => return Err(Failure::Stream),
+                frames::H3_GOAWAY => return Err(Failure::Stream),
                 _ => {
                     self.take_block(body, length, false, started)?;
                 }
@@ -3299,7 +3335,7 @@ impl H3 {
             .map(|frame| (frame, head))
     }
 
-    /// What one frame's header says the reader should do: a DATA frame's body becomes the caller's to read, a frame the tunnel does not read is consumed, and a reset or a goaway ends the tunnel without a block of its own.
+    /// What one frame's header says the reader should do: a DATA frame's body becomes the caller's to read, a frame the tunnel does not read is consumed, and a goaway ends the tunnel without a block of its own.
     fn dispatch(
         &mut self,
         frame: frames::H3Frame,
@@ -3314,14 +3350,14 @@ impl H3 {
         };
         if frame.kind == frames::H3_DATA {
             self.carried = body_at;
-            // An empty DATA frame carries no bytes and is not the end of the stream: only a finished stream or a reset ends the tunnel, and handing back zero here is what a caller reads as EOF.
+            // An empty DATA frame carries no bytes and is not the end of the stream: only a finished stream or a goaway ends the tunnel, and handing back zero here is what a caller reads as EOF.
             if length == 0 {
                 return Ok(Dispatch::Again);
             }
             self.body = length;
             return Ok(Dispatch::Again);
         }
-        if frame.kind == frames::H3_RESET || frame.kind == frames::H3_GOAWAY {
+        if frame.kind == frames::H3_GOAWAY {
             // The kind is in the header, so an ending needs no block of its own: the frame that follows it is never read.
             self.fin = true;
             self.carried = self.filled;
@@ -3663,7 +3699,7 @@ impl Read for H3 {
 enum Dispatch {
     /// The frame was taken in: a DATA frame's body is now the caller's to read, and a frame the tunnel does not read has been consumed.
     Again,
-    /// The frame was a reset or a goaway: the tunnel is over and the frame that follows it is never read.
+    /// The frame was a goaway: the tunnel is over and the frame that follows it is never read.
     Ended,
 }
 
@@ -3816,11 +3852,11 @@ pub(crate) enum Ip {
 }
 
 impl Ip {
-    /// Opens the tunnel on the carrier the dial names, with the address the proxy assigned.
+    /// Opens the tunnel on the carrier the dial names, with every address the proxy assigned; one request names both families, so the answer can carry both.
     pub(crate) fn open(
         dial: &FoxyDial,
         quic: Option<Quic>,
-    ) -> Result<(Self, Option<ferrox_core::foxy::connectip::Assigned>), Failure> {
+    ) -> Result<(Self, Vec<ferrox_core::foxy::connectip::Assigned>), Failure> {
         match (quic, dial.carrier) {
             (Some(quic), _) => {
                 let mut lane = H3::open_ip(dial, quic)?;
@@ -3904,7 +3940,7 @@ impl Ip {
 /// One CONNECT-IP lane as its own stream on a pooled H2 connection: the tunnel carries UDP datagrams for every destination, so a lane is one tunnel rather than a stream per target.
 pub(crate) fn open_ip_h2(
     dial: &FoxyDial,
-) -> Result<(Tls2, Option<ferrox_core::foxy::connectip::Assigned>), Failure> {
+) -> Result<(Tls2, Vec<ferrox_core::foxy::connectip::Assigned>), Failure> {
     let edge = edge_authority(&dial.host, dial.port);
     let mut lane = open_stream(dial, PoolClass::Ip, |block| {
         connectip::connect_ip(&edge, "*", connectip::IpProto::Any, &dial.pass.token, block);
@@ -3994,17 +4030,14 @@ impl Tls2 {
         Ok(())
     }
 
-    fn address_assign(
-        &mut self,
-    ) -> Result<Option<ferrox_core::foxy::connectip::Assigned>, Failure> {
+    fn address_assign(&mut self) -> Result<Vec<ferrox_core::foxy::connectip::Assigned>, Failure> {
         let mut request = Vec::new();
-        connectip::address_request(1, 4, &[0, 0, 0, 0], &mut request);
-        connectip::address_request(2, 6, &[0; 16], &mut request);
+        // Both families in one capsule: the proxy replaces its allowed sources with each answer, so a second request would leave the first family unroutable.
+        connectip::address_requests(&[(1, 4, &[0, 0, 0, 0]), (2, 6, &[0; 16])], &mut request);
         // The request rides the capsule stream inside DATA frames, the way a packet does: raw TLS bytes would desynchronise the edge's frame walk.
         self.send_capsules(&request)?;
 
         let deadline = Instant::now() + crate::budgets::head_arrival();
-        let mut assigned = None;
         while Instant::now() < deadline {
             let own = self.stream;
             // The capsule is taken out of the stream's own buffer under the lock that owns it, and read before the buffer is drained, so a refused or granted answer costs no copy of it.
@@ -4020,17 +4053,18 @@ impl Tls2 {
                             connectip::Capsule::AddressAssign(body) => {
                                 let mut into = Vec::new();
                                 if connectip::address_assign(body, &mut into).is_none() {
-                                    (None, true)
+                                    (Vec::new(), true)
                                 } else {
-                                    (into.into_iter().find(|grant| !grant.refused()), false)
+                                    into.retain(|grant| !grant.refused());
+                                    (into, false)
                                 }
                             }
                             connectip::Capsule::RouteAdvert(body) => {
                                 let mut routes = Vec::new();
                                 let _ = connectip::route_advert(body, &mut routes);
-                                (None, false)
+                                (Vec::new(), false)
                             }
-                            _ => (None, false),
+                            _ => (Vec::new(), false),
                         };
                         if let Some(stream) = inner.streams.get_mut(&own) {
                             stream.capsule_buf.drain(..used);
@@ -4040,14 +4074,11 @@ impl Tls2 {
                 }
             };
             if let Some((granted, quit)) = capsule {
-                if let Some(granted) = granted {
-                    assigned = Some(granted);
-                }
                 if quit {
                     return Err(Failure::Frame);
                 }
-                if assigned.is_some() {
-                    return Ok(assigned);
+                if !granted.is_empty() {
+                    return Ok(granted);
                 }
                 continue;
             }
@@ -4085,7 +4116,7 @@ impl Tls2 {
                 Err(error) => return Err(error.into()),
             }
         }
-        Ok(assigned)
+        Ok(Vec::new())
     }
 
     /// One IP packet, as a datagram this lane can read both ends of. A capsule whole inside one DATA frame is handed out where it lies, so the packet crosses userspace once instead of through the capsule buffer.
@@ -4126,12 +4157,16 @@ impl Tls2 {
                 }
                 continue;
             }
-            let fin = {
+            let (fin, terminal) = {
                 let inner = self.inner().map_err(io)?;
-                inner.gone || inner.streams.get(&own).is_none_or(|stream| stream.fin)
+                let fin = inner.streams.get(&own).is_none_or(|stream| stream.fin);
+                (fin, inner.terminal)
             };
             if fin {
                 return Ok(false);
+            }
+            if let Some(why) = terminal {
+                return Err(why.error());
             }
             {
                 let mut inner = self.inner().map_err(io)?;
@@ -6116,6 +6151,34 @@ pub(crate) mod loopback {
         second.read_exact(&mut back_two).expect("reads the second");
         assert_eq!(back_one, one, "the first flow got its own bytes");
         assert_eq!(back_two, two, "the second flow got its own bytes");
+    }
+
+    /// A session that broke is an error, not a clean end: a lane that already got its last bytes still finishes cleanly, and a lane that did not gets the reason.
+    #[test]
+    fn a_broken_frame_is_an_error_not_a_clean_end() {
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let edge = terminal_h2_edge(listener, server);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut broken = Tunnel::open(&dial, "one.test:80", None).expect("opens");
+        let mut clean = Tunnel::open(&dial, "two.test:80", None).expect("opens");
+        let mut buf = [0u8; 8];
+        let error = broken
+            .read(&mut buf)
+            .expect_err("a broken frame is not a quiet end");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        let mut back = [0u8; 2];
+        clean
+            .read_exact(&mut back)
+            .expect("the finished lane still reads its bytes");
+        assert_eq!(&back, b"ok");
+        assert_eq!(
+            clean.read(&mut back).expect("the finished lane ends"),
+            0,
+            "a clean end stays a clean end"
+        );
+        let _ = edge.join();
     }
 
     /// A reset names one flow, not the session: the flow that was reset ends, and the flow beside it still reads its own bytes.
@@ -8506,7 +8569,7 @@ pub(crate) mod loopback {
         let edge = ip_h2_edge(listener, server, seen_tx, udp_tx, 1);
         let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
         let (mut lane, assigned) = Ip::open(&dial, None).expect("opens");
-        let assigned = assigned.expect("an address");
+        let assigned = assigned.into_iter().next().expect("an address");
         assert!(!assigned.refused(), "the tunnel owns an address");
         assert_eq!(assigned.bytes(), &[198, 51, 100, 9]);
         assert_eq!(assigned.width(), 4, "an IPv4 tunnel");
@@ -8583,7 +8646,10 @@ pub(crate) mod loopback {
         let edge = ip_h2_quiet_edge(listener, server);
         let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
         let (mut lane, assigned) = Ip::open(&dial, None).expect("opens");
-        assert_eq!(assigned.expect("an address").bytes(), &[198, 51, 100, 9]);
+        assert_eq!(
+            assigned.into_iter().next().expect("an address").bytes(),
+            &[198, 51, 100, 9]
+        );
         lane.set_read_quantum(Duration::from_millis(20))
             .expect("bounds one read");
         let mut staged = Vec::new();
@@ -8620,13 +8686,13 @@ pub(crate) mod loopback {
         let edge = ip_h2_delayed_edge(listener, server, Duration::from_millis(80));
         let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
         let (mut first, assigned) = Ip::open(&dial, None).expect("opens");
-        assert!(assigned.is_some(), "the first tunnel owns an address");
+        assert!(!assigned.is_empty(), "the first tunnel owns an address");
         first
             .set_read_quantum(Duration::from_millis(1))
             .expect("arms the session's grain");
         let (second, assigned) =
             Ip::open(&dial, None).expect("the second open outlasts a grain of read timeout");
-        assert!(assigned.is_some(), "the second tunnel owns an address");
+        assert!(!assigned.is_empty(), "the second tunnel owns an address");
         drop(second);
         drop(first);
         join_edge_within(edge, Duration::from_secs(5));
@@ -8651,7 +8717,7 @@ pub(crate) mod loopback {
             "the head budget expired the assignment, it took {took:?}"
         );
         let (lane, assigned) = opened.expect("the status arrived");
-        assert!(assigned.is_none(), "no address was assigned");
+        assert!(assigned.is_empty(), "no address was assigned");
         drop(lane);
         join_edge_within(edge, Duration::from_secs(5));
     }
@@ -9611,6 +9677,60 @@ pub(crate) mod loopback {
         })
     }
 
+    /// A loopback HTTP/2 edge that answers two CONNECTs, then finishes the second cleanly and breaks the session on the first: the lane that broke is an error, the one that finished is an end of stream.
+    fn terminal_h2_edge(
+        listener: Listener,
+        server: ferrox_core::tls::TlsServerConfig,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            let mut tls = ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+                .expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut head = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut head) {
+                return;
+            }
+            let mut opened = Vec::new();
+            while opened.len() < 2 {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let frame = frames::H2Frame::parse(&header).expect("parses");
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    return;
+                }
+                match frame.kind {
+                    frames::SETTINGS if frame.flags & 0x1 == 0 => {
+                        let mut out = Vec::new();
+                        h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut out);
+                        tls.write_all(&out).expect("acks the settings");
+                    }
+                    frames::HEADERS => {
+                        let mut out = Vec::new();
+                        h2_frame(frames::HEADERS, 0x4, frame.stream, &[0x88], &mut out);
+                        tls.write_all(&out).expect("answers");
+                        opened.push(frame.stream);
+                    }
+                    _ => {}
+                }
+            }
+            let mut out = Vec::new();
+            h2_frame(frames::DATA, frames::END_STREAM, opened[1], b"ok", &mut out);
+            // PADDED with no pad-length byte: a connection error that follows the clean end in the same record.
+            h2_frame(frames::DATA, 0x8, opened[0], &[], &mut out);
+            tls.write_all(&out)
+                .expect("finishes one and breaks the session");
+            tls.flush().expect("flushes");
+            std::thread::sleep(Duration::from_millis(250));
+        })
+    }
+
     /// A loopback HTTP/2 edge that answers the first CONNECT, then answers the second only after putting a status for stream 7 on the wire: the reader of the second lane is the one that sees the foreign status.
     fn foreign_head_h2_edge(
         listener: Listener,
@@ -10053,7 +10173,7 @@ pub(crate) mod loopback {
         let quic = crate::quic::direct_stream("localhost", "127.0.0.1", port, &dial.roots)
             .expect("a connection");
         let (mut lane, assigned) = Ip::open(&dial, Some(quic)).expect("opens");
-        let assigned = assigned.expect("an address");
+        let assigned = assigned.into_iter().next().expect("an address");
         assert!(!assigned.refused(), "the tunnel owns an address");
         assert_eq!(assigned.bytes(), &[198, 51, 100, 9]);
         assert_eq!(assigned.width(), 4, "an IPv4 tunnel");

@@ -328,7 +328,7 @@ pub fn head_field<'a>(head: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
     None
 }
 
-/// Half the remaining life, brought forward by a safety margin so a pass is replaced before the edge refuses it, and clamped so a long pass comes back on a clock.
+/// Half the remaining life, brought forward by a safety margin, floored so a spent pass retries on a clock instead of spinning and clamped so a long pass comes back.
 #[must_use]
 pub fn renewal_delay(expires_at: Option<u64>, now: u64) -> std::time::Duration {
     const SAFETY: u64 = 30;
@@ -338,10 +338,15 @@ pub fn renewal_delay(expires_at: Option<u64>, now: u64) -> std::time::Duration {
     let Some(remaining) = expires_at.map(|at| at.saturating_sub(now)) else {
         return std::time::Duration::from_secs(UNKNOWN);
     };
-    let delay = (remaining / 2)
-        .min(remaining.saturating_sub(SAFETY))
-        .clamp(FLOOR, CEILING)
-        .min(remaining);
+    let delay = if remaining == 0 {
+        FLOOR
+    } else if remaining <= SAFETY {
+        (remaining / 2).max(1)
+    } else {
+        (remaining / 2)
+            .min(remaining - SAFETY)
+            .clamp(FLOOR, CEILING)
+    };
     std::time::Duration::from_secs(delay)
 }
 
@@ -474,7 +479,7 @@ impl Refusals {
     pub fn blocked(&self, carrier: u8, host: &str, port: u16, now: u64) -> bool {
         self.entries.iter().any(|(known, until)| {
             known.carrier == carrier
-                && known.host.as_ref() == host
+                && known.host.as_ref().eq_ignore_ascii_case(host)
                 && known.port == port
                 && *until > now
         })
@@ -482,7 +487,9 @@ impl Refusals {
 
     pub fn remember(&mut self, carrier: u8, host: &str, port: u16, until: u64) {
         if let Some(entry) = self.entries.iter_mut().find(|(known, _)| {
-            known.carrier == carrier && known.host.as_ref() == host && known.port == port
+            known.carrier == carrier
+                && known.host.as_ref().eq_ignore_ascii_case(host)
+                && known.port == port
         }) {
             entry.1 = until;
             return;
@@ -505,7 +512,9 @@ impl Refusals {
 
     pub fn clear(&mut self, carrier: u8, host: &str, port: u16) {
         self.entries.retain(|(known, _)| {
-            known.carrier != carrier || known.host.as_ref() != host || known.port != port
+            known.carrier != carrier
+                || !known.host.as_ref().eq_ignore_ascii_case(host)
+                || known.port != port
         });
     }
 }
@@ -574,7 +583,7 @@ impl EdgeStrikes {
     #[must_use]
     pub fn resting(&self, host: &str, port: u16, now: u64) -> bool {
         self.entries.iter().any(|(known, until)| {
-            known.host.as_ref() == host && known.port == port && until.1 > now
+            known.host.as_ref().eq_ignore_ascii_case(host) && known.port == port && until.1 > now
         })
     }
 
@@ -583,7 +592,7 @@ impl EdgeStrikes {
         let count = self
             .entries
             .iter()
-            .find(|(known, _)| known.host.as_ref() == host && known.port == port)
+            .find(|(known, _)| known.host.as_ref().eq_ignore_ascii_case(host) && known.port == port)
             .map_or(0, |&(_, (count, _))| count);
         let next = count_tunnel_end(count, lasted);
         if next == 0 {
@@ -595,7 +604,7 @@ impl EdgeStrikes {
         let known = self
             .entries
             .iter()
-            .any(|(known, _)| known.host.as_ref() == host && known.port == port);
+            .any(|(known, _)| known.host.as_ref().eq_ignore_ascii_case(host) && known.port == port);
         if !known && self.entries.len() >= self.cap {
             // The entry that expires first is the one to drop: the window is the whole of what an entry says, so the earliest expiry is the oldest news.
             if let Some(at) = self
@@ -616,7 +625,7 @@ impl EdgeStrikes {
         match self
             .entries
             .iter_mut()
-            .find(|(known, _)| known.host.as_ref() == host && known.port == port)
+            .find(|(known, _)| known.host.as_ref().eq_ignore_ascii_case(host) && known.port == port)
         {
             Some(slot) => slot.1 = (next, until),
             None => self.entries.push((EdgeKey::new(host, port), (next, until))),
@@ -730,10 +739,9 @@ impl<'a> DialOrder<'a> {
     /// Whether this edge is already in the order.
     #[must_use]
     pub fn contains(&self, edge: &Candidate) -> bool {
-        self.edges[..self.len]
-            .iter()
-            .flatten()
-            .any(|held| held.host == edge.host && held.port == edge.port)
+        self.edges[..self.len].iter().flatten().any(|held| {
+            held.host.as_ref().eq_ignore_ascii_case(edge.host.as_ref()) && held.port == edge.port
+        })
     }
 
     /// The edge at this place in the order, if the order reaches that far.
@@ -1122,18 +1130,20 @@ mod tests {
         for (expires, now, want) in [
             (Some(1_000_u64), 0_u64, 500_u64),
             (Some(1_000), 400, 300),
-            (Some(100), 90, 10),
+            (Some(100), 90, 5),
             (None, 0, 240),
             (Some(1_000_000), 0, 1_800),
-            (Some(10), 10, 0),
-            (Some(20), 0, 15),
-            (Some(29), 0, 15),
+            (Some(10), 10, 15),
+            (Some(20), 0, 10),
+            (Some(29), 0, 14),
+            (Some(31), 0, 15),
+            (Some(1), 0, 1),
         ] {
-            assert_eq!(renewal_delay(expires, now).as_secs(), want, "at {now}");
-            let remaining = expires.map_or(u64::MAX, |at| at.saturating_sub(now));
+            let delay = renewal_delay(expires, now).as_secs();
+            assert_eq!(delay, want, "at {now}");
             assert!(
-                renewal_delay(expires, now).as_secs() <= remaining,
-                "a renewal is never scheduled after the pass it replaces expires"
+                (1..=1_800).contains(&delay),
+                "a renewal comes back on a clock, never on a zero"
             );
         }
     }
@@ -1312,6 +1322,22 @@ mod tests {
         }
     }
 
+    /// A hostname is one name whatever its case: a config that spells it differently from the catalogue still names the same edge, so a refusal or a strike is not lost.
+    #[test]
+    fn a_host_is_one_key_whatever_its_case() {
+        use std::time::Duration;
+        let short = TUNNEL_STAYED_UP.saturating_sub(Duration::from_secs(1));
+        let mut strikes = EdgeStrikes::new(8);
+        strikes.note_end("Edge.Example", 443, short, 100);
+        strikes.note_end("edge.EXAMPLE", 443, short, 100);
+        assert!(strikes.resting("EDGE.example", 443, 100));
+        let mut refusals = Refusals::new(8);
+        refusals.remember(1, "Edge.Example", 443, 200);
+        assert!(refusals.blocked(1, "edge.example", 443, 100));
+        refusals.clear(1, "EDGE.EXAMPLE", 443);
+        assert!(!refusals.blocked(1, "edge.example", 443, 100));
+    }
+
     #[test]
     fn a_dial_order_holds_one_edge_per_host_and_port() {
         let edges = vec![
@@ -1324,6 +1350,12 @@ mod tests {
             order.iter().map(Candidate::authority).collect::<Vec<_>>(),
             ["de1:443"],
             "a city label is not a second endpoint"
+        );
+        let cased = vec![edge("de1", "DE", "berlin"), edge("DE1", "DE", "frankfurt")];
+        assert_eq!(
+            dial_order(&cased, "DE", None, 3).len(),
+            1,
+            "a hostname's case is not a second endpoint"
         );
     }
 

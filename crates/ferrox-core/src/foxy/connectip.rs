@@ -493,7 +493,11 @@ fn mask_host_bits(address: &mut [u8], prefix: u8) {
 fn route_order_ok(routes: &[Route]) -> bool {
     let mut previous: Option<&Route> = None;
     for route in routes {
-        let width = route.width();
+        let width = match route.version {
+            4 => 4,
+            6 => 16,
+            _ => return false,
+        };
         if route.first[..width] > route.last[..width] {
             return false;
         }
@@ -1588,6 +1592,15 @@ mod tests {
         let mut wire = Vec::new();
         route_advert_encode(&reversed, &mut wire);
         assert!(wire.is_empty(), "a range past its end is refused");
+
+        let unknown = [route(5, &[0; 16], &[0; 16], 0)];
+        let mut wire = Vec::new();
+        route_advert_encode(&unknown, &mut wire);
+        assert!(
+            wire.is_empty(),
+            "a version this lane cannot address is refused"
+        );
+        assert_eq!(route_advert(&route_body(&unknown), &mut Vec::new()), None);
 
         let touching = [
             route(4, &[10, 0, 0, 0], &[10, 0, 0, 9], 0),

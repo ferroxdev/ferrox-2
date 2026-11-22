@@ -2782,7 +2782,6 @@ pub(crate) fn refusal_reason(spec: &Spec) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
     use ferrox_core::foxy::connectip::checksum;
 
     #[test]
@@ -3434,7 +3433,7 @@ mod tests {
         covered.extend_from_slice(&(request.len() as u32).to_be_bytes());
         covered.extend_from_slice(&[0, 0, 0, ICMPV6_PROTO]);
         covered.extend_from_slice(&request);
-        let sum = ferrox_core::foxy::connectip::checksum(&covered);
+        let sum = checksum(&covered);
         request[2..4].copy_from_slice(&sum.to_be_bytes());
         let mut out = Vec::new();
         render_icmp_reply_ip(
@@ -3527,7 +3526,7 @@ mod tests {
             );
         }
         let mut request = [8u8, 0, 0, 0, 0, 1, 0, 1, b'p', b'i', b'n', b'g'];
-        let sum = ferrox_core::foxy::connectip::checksum(&request);
+        let sum = checksum(&request);
         request[2..4].copy_from_slice(&sum.to_be_bytes());
         render_icmp_reply([10, 0, 0, 1], [10, 0, 0, 2], &request, &mut out);
         assert_eq!(
@@ -3564,7 +3563,7 @@ mod tests {
                 }
                 _ => unreachable!("one family"),
             };
-            !ferrox_core::foxy::connectip::checksum(&pseudo[..len])
+            !checksum(&pseudo[..len])
         }
         let segment = [0x5au8; 64];
         for (src, dst, head) in [
