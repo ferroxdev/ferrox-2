@@ -1,5 +1,6 @@
 //! Hysteria v1 over quiche: the binary control stream, the `host:port` request on each flow, and the datagram lane whose messages carry their own session and address.
 
+use bytes::BufMut as _;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, ToSocketAddrs as _, UdpSocket};
@@ -12,7 +13,7 @@ use ferrox_core::hysteria_v1::{Defrag, UdpMessage, XPlus};
 
 use crate::conn::Connection;
 use crate::hysteria::{Dial, Driver, Flow, Session, StreamWake};
-use crate::quic::{Mask, Unfilled, RECV_ROOM};
+use crate::quic::{Mask, QuicheConnection, Unfilled, RECV_ROOM};
 
 const FIRST_FLOW_STREAM: u64 = 4;
 
@@ -46,7 +47,6 @@ fn send_all(session: &Session, stream: u64, buf: &[u8]) -> bool {
 fn read_until(session: &Session, stream: u64, want: impl Fn(&[u8]) -> bool) -> Option<Vec<u8>> {
     let deadline = Instant::now() + crate::quic::HANDSHAKE_TIMEOUT;
     let mut head = Vec::with_capacity(64);
-    let mut room = Unfilled::<4096>::new();
     loop {
         if want(&head) {
             return Some(head);
@@ -54,24 +54,20 @@ fn read_until(session: &Session, stream: u64, want: impl Fn(&[u8]) -> bool) -> O
         if head.len() >= HEAD_CAP || Instant::now() >= deadline {
             return None;
         }
-        let read = {
+        let progressed = {
             let Ok(mut conn) = session.shared.lock() else {
                 return None;
             };
-            match conn.stream_recv(stream, room.as_mut()) {
+            let room = HEAD_CAP - head.len();
+            match conn.stream_recv_buf(stream, (&mut head).limit(room)) {
                 Ok((0, _)) => return None,
-                Ok((n, _)) => Some(n),
-                Err(quiche::Error::Done) => None,
+                Ok((_, _)) => true,
+                Err(quiche::Error::Done) => false,
                 Err(_) => return None,
             }
         };
-        match read {
-            Some(n) => head.extend_from_slice(&room.as_mut()[..n]),
-            None => {
-                if !crate::hysteria::drive_once(session, STREAM_POLL) {
-                    return None;
-                }
-            }
+        if !progressed && !crate::hysteria::drive_once(session, STREAM_POLL) {
+            return None;
         }
     }
 }
@@ -98,7 +94,13 @@ fn connect(dial: &Dial) -> Option<Session> {
         crate::quic::apply_hysteria_quic(&mut config, params, false);
     }
     config.enable_dgram(true, 1024, 1024);
-    let Ok(mut conn) = quiche::connect(Some(&dial.host), &cid, local, peer, &mut config) else {
+    let Ok(mut conn) = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
+        Some(&dial.host),
+        &cid,
+        local,
+        peer,
+        &mut config,
+    ) else {
         return None;
     };
     let xplus = XPlus::new(&dial.config.obfs_password);
@@ -272,7 +274,7 @@ fn server_of(dial: &Dial) -> Server {
     }
 }
 
-fn usable(conn: &quiche::Connection) -> bool {
+fn usable(conn: &QuicheConnection) -> bool {
     !conn.is_closed()
         && !conn.is_draining()
         && conn.local_error().is_none()
@@ -794,7 +796,7 @@ impl Drop for Resolving {
 }
 
 struct Inbound {
-    conn: Arc<Mutex<quiche::Connection>>,
+    conn: Arc<Mutex<QuicheConnection>>,
     authed: bool,
     auth_buf: Vec<u8>,
     served: HashSet<u64>,
@@ -807,7 +809,7 @@ struct Inbound {
 }
 
 fn answer_hello(
-    conn: &mut quiche::Connection,
+    conn: &mut QuicheConnection,
     hello: &wire::ClientHello<'_>,
     auths: &[String],
 ) -> bool {
@@ -859,7 +861,7 @@ fn read_request(flow: &mut Flow, deadline: Instant) -> Option<(bool, String, u16
 }
 
 fn open_udp(
-    shared: &Arc<Mutex<quiche::Connection>>,
+    shared: &Arc<Mutex<QuicheConnection>>,
     sock: &Arc<crate::quic::Datagram>,
     session: u32,
     peer: SocketAddr,
@@ -927,7 +929,7 @@ fn target_addr(sock: &UdpSocket, peer: SocketAddr) -> SocketAddr {
 }
 
 fn udp_reader(
-    shared: &Arc<Mutex<quiche::Connection>>,
+    shared: &Arc<Mutex<QuicheConnection>>,
     sock: &Arc<crate::quic::Datagram>,
     target: &Arc<UdpSocket>,
     last: &Arc<AtomicU64>,
@@ -1039,8 +1041,8 @@ fn serve_udp_stream(mut flow: Flow, next_udp: u32, lane: &Arc<Mutex<UdpLane>>) {
 fn relay_datagrams(
     inbound: &Inbound,
     sock: &Arc<crate::quic::Datagram>,
-    shared: &Arc<Mutex<quiche::Connection>>,
-    conn: &mut quiche::Connection,
+    shared: &Arc<Mutex<QuicheConnection>>,
+    conn: &mut QuicheConnection,
 ) {
     if !inbound.authed {
         return;
@@ -1168,7 +1170,7 @@ fn relay_datagrams(
 #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn resolve_pending(
     lane: Arc<Mutex<UdpLane>>,
-    shared: Arc<Mutex<quiche::Connection>>,
+    shared: Arc<Mutex<QuicheConnection>>,
     sock: Arc<crate::quic::Datagram>,
     session: u32,
     host: String,
@@ -1312,7 +1314,7 @@ fn authenticate(
     routes: &mut HashMap<Vec<u8>, Inbound>,
     auths: &[String],
     dcid: &[u8],
-    conn: &mut quiche::Connection,
+    conn: &mut QuicheConnection,
     sock: &crate::quic::Datagram,
 ) -> Option<()> {
     if routes.get(dcid).is_some_and(|inbound| inbound.authed) {
@@ -1382,7 +1384,9 @@ impl Router<'_> {
             return;
         }
         let cid = quiche::ConnectionId::from_ref(&scid);
-        let Ok(mut conn) = quiche::accept(&cid, None, self.local, from, template) else {
+        let Ok(mut conn) = quiche::accept_with_buf_factory::<crate::quic::BytesBufFactory>(
+            &cid, None, self.local, from, template,
+        ) else {
             return;
         };
         let info = quiche::RecvInfo {
@@ -1545,7 +1549,7 @@ impl Router<'_> {
 
 #[allow(clippy::too_many_arguments)]
 fn serve_tcp_or_udp(
-    shared: &Arc<Mutex<quiche::Connection>>,
+    shared: &Arc<Mutex<QuicheConnection>>,
     sock: &Arc<crate::quic::Datagram>,
     local: SocketAddr,
     stream: u64,
@@ -1815,7 +1819,14 @@ mod tests {
             let cid = quiche::ConnectionId::from_ref(&scid);
             let local: SocketAddr = "127.0.0.1:0".parse().expect("addr");
             let peer: SocketAddr = "127.0.0.1:1".parse().expect("addr");
-            let conn = quiche::connect(None, &cid, local, peer, &mut config).expect("connects");
+            let conn = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
+                None,
+                &cid,
+                local,
+                peer,
+                &mut config,
+            )
+            .expect("connects");
             let stop = Arc::new(AtomicBool::new(false));
             let target = UdpSocket::bind("127.0.0.1:0").expect("binds");
             let mut lane = UdpLane::default();
@@ -1978,7 +1989,14 @@ mod tests {
         let cid = quiche::ConnectionId::from_ref(&scid);
         let local = "127.0.0.1:0".parse().expect("addr");
         let peer = "127.0.0.1:1".parse().expect("addr");
-        let conn = quiche::connect(None, &cid, local, peer, &mut config).expect("connects");
+        let conn = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
+            None,
+            &cid,
+            local,
+            peer,
+            &mut config,
+        )
+        .expect("connects");
         let shared = Arc::new(Mutex::new(conn));
         let sock = Arc::new(crate::quic::Datagram::plain(
             UdpSocket::bind("127.0.0.1:0").expect("binds the lane"),
@@ -2020,7 +2038,14 @@ mod tests {
         let cid = quiche::ConnectionId::from_ref(&scid);
         let local = "127.0.0.1:0".parse().expect("addr");
         let peer = "127.0.0.1:1".parse().expect("addr");
-        let conn = quiche::connect(None, &cid, local, peer, &mut config).expect("connects");
+        let conn = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
+            None,
+            &cid,
+            local,
+            peer,
+            &mut config,
+        )
+        .expect("connects");
         let shared = Arc::new(Mutex::new(conn));
         let sock = Arc::new(crate::quic::Datagram::plain(
             UdpSocket::bind("127.0.0.1:0").expect("binds the lane"),

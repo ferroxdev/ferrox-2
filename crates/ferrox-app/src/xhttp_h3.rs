@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use ferrox_core::foxy::{frames, head_end, hpack};
 
-use crate::quic::{self, Activity, Datagram};
+use crate::quic::{self, Activity, Datagram, QuicheConnection};
 use crate::xhttp::{XhttpMode, XhttpSettings};
 
 const TICK: Duration = Duration::from_millis(20);
@@ -901,7 +901,7 @@ fn serve_one(stream: &quic::QuicStream, settings: &XhttpSettings, service: &Arc<
 #[derive(Clone)]
 pub(crate) struct ClientStream {
     _owner: Arc<H3Client>,
-    conn: Arc<Mutex<quiche::Connection>>,
+    conn: Arc<Mutex<QuicheConnection>>,
     sock: Arc<Datagram>,
     id: u64,
     peer_fin: Arc<AtomicBool>,
@@ -961,23 +961,23 @@ impl Write for ClientStream {
             return Ok(0);
         }
         let deadline = Instant::now() + crate::budgets::relay_stall();
-        let mut rest = buf;
+        let mut rest = bytes::Bytes::copy_from_slice(buf);
         while !rest.is_empty() {
             let Ok(mut conn) = self.conn.lock() else {
                 return Err(std::io::Error::other("h3 connection lock poisoned"));
             };
-            match conn.stream_send(self.id, rest, false) {
-                Ok(0) | Err(quiche::Error::Done) => {
+            match conn.stream_send_zc(self.id, rest.clone(), false) {
+                Ok((0, _)) | Err(quiche::Error::Done) => {
                     drop(conn);
                     if Instant::now() >= deadline {
                         return Err(std::io::Error::other("h3 stream send timed out"));
                     }
                     std::thread::sleep(POLL);
                 }
-                Ok(n) => {
+                Ok((_, remainder)) => {
                     self.activity.touch();
                     quic::flush_egress(&mut conn, &self.sock);
-                    rest = &rest[n..];
+                    rest = remainder.unwrap_or_default();
                 }
                 Err(error) => {
                     return Err(std::io::Error::other(format!("h3 stream send: {error:?}")));
@@ -1027,7 +1027,7 @@ impl ClientStream {
 /// The client side of one H3 connection: streams open on the shared connection and one pump reads
 /// its socket, so an upload waits on credit without stopping the downlink's datagrams.
 pub(crate) struct H3Client {
-    conn: Arc<Mutex<quiche::Connection>>,
+    conn: Arc<Mutex<QuicheConnection>>,
     sock: Arc<Datagram>,
     next: AtomicU64,
     dead: Arc<AtomicBool>,
@@ -1090,7 +1090,14 @@ impl H3Client {
         let mut scid = [0u8; 16];
         getrandom::fill(&mut scid).ok()?;
         let cid = quiche::ConnectionId::from_ref(&scid);
-        let mut conn = quiche::connect(Some(server_name), &cid, local, peer, &mut config).ok()?;
+        let mut conn = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
+            Some(server_name),
+            &cid,
+            local,
+            peer,
+            &mut config,
+        )
+        .ok()?;
         if let Some(list) = &tls.ech_config_list {
             conn.as_mut().set_ech_config_list(list).ok()?;
         }
@@ -1274,7 +1281,7 @@ impl H3Client {
 /// one egress sweep for the run rather than one of each per packet.
 #[cfg(target_os = "linux")]
 fn drain_batch(
-    conn: &Arc<Mutex<quiche::Connection>>,
+    conn: &Arc<Mutex<QuicheConnection>>,
     sock: &Datagram,
     local: SocketAddr,
     batch: &mut quic::Batch,
@@ -1303,7 +1310,7 @@ fn drain_batch(
 
 /// Run the connection's timers and answer what they queued, once the sock has nothing left to read.
 fn sweep(
-    conn: &Arc<Mutex<quiche::Connection>>,
+    conn: &Arc<Mutex<QuicheConnection>>,
     sock: &Datagram,
     local: SocketAddr,
     moved: bool,
@@ -1324,7 +1331,7 @@ fn sweep(
 }
 
 fn pump_connection(
-    conn: &Arc<Mutex<quiche::Connection>>,
+    conn: &Arc<Mutex<QuicheConnection>>,
     sock: &Arc<Datagram>,
     local: SocketAddr,
     peer: SocketAddr,

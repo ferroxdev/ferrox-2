@@ -7,6 +7,7 @@
 //! pool, and forwards a packet to the tunnel that owns its destination — or to
 //! the stack when no tunnel does.
 
+use bytes::BufMut as _;
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -23,7 +24,7 @@ use ferrox_core::tls::TlsConfig;
 use crate::conn::Connection;
 use crate::json::Json;
 use crate::proxy::{Destination, Outbound};
-use crate::quic::{self, Datagram};
+use crate::quic::{self, Datagram, QuicheConnection};
 use crate::wg_stack::{self, ClientFlow, Packet, ToTunnel, UdpForwarder, UdpRoutes};
 use crate::wireguard::DeviceConfig;
 
@@ -996,7 +997,7 @@ fn assemble(
 /// One lane that finished its handshake and its first address assignment: the
 /// connection and request stream the caller now owns, and what it may source.
 struct Lane {
-    conn: quiche::Connection,
+    conn: QuicheConnection,
     stream: u64,
     addresses: Vec<IpAddr>,
     mtu: usize,
@@ -2030,8 +2031,14 @@ fn attempt(
     spec.noize.send_before(|packet| {
         let _ = sock.send_to(packet, peer);
     });
-    let mut conn = quiche::connect(Some(&tls.server_name), &cid, local, peer, &mut config)
-        .map_err(|error| format!("masque: cannot open a connection: {error}"))?;
+    let mut conn = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
+        Some(&tls.server_name),
+        &cid,
+        local,
+        peer,
+        &mut config,
+    )
+    .map_err(|error| format!("masque: cannot open a connection: {error}"))?;
     quic::drive_handshake_by(&mut conn, sock, local, ESTABLISH_TIMEOUT)
         .ok_or("the QUIC handshake did not finish")?;
     verify_edge(spec, &conn)?;
@@ -2091,14 +2098,14 @@ fn attempt(
 /// The datagram ceiling the handshake negotiated, minus the CONNECT-IP stream
 /// prefix. xray refuses a tunnel below its 1280-byte minimum rather than
 /// advertising a packet the datagram cannot carry.
-fn probed_mtu(conn: &quiche::Connection, stream: u64) -> usize {
+fn probed_mtu(conn: &QuicheConnection, stream: u64) -> usize {
     let prefix = frames::quic_varint_len(stream / 4) + 1;
     conn.dgram_max_writable_len()
         .map_or(0, |max| max.saturating_sub(prefix))
 }
 
 /// A config-named `mtu` overrides the probe, which otherwise has to clear the reference's floor.
-fn lane_mtu(spec: &ClientSpec, conn: &quiche::Connection, stream: u64) -> Result<usize, String> {
+fn lane_mtu(spec: &ClientSpec, conn: &QuicheConnection, stream: u64) -> Result<usize, String> {
     if spec.mtu_named {
         return Ok(spec.mtu);
     }
@@ -2142,7 +2149,7 @@ fn assigned(stream: &mut Stream) -> Option<Vec<IpAddr>> {
 }
 
 /// Check the WARP public key or the configured certificate pins.
-fn verify_edge(spec: &ClientSpec, conn: &quiche::Connection) -> Result<(), String> {
+fn verify_edge(spec: &ClientSpec, conn: &QuicheConnection) -> Result<(), String> {
     let tls = spec
         .tls
         .as_deref()
@@ -2176,7 +2183,7 @@ fn verify_edge(spec: &ClientSpec, conn: &quiche::Connection) -> Result<(), Strin
     }
 }
 
-fn open_h3(conn: &mut quiche::Connection, spec: &ClientSpec) -> Result<(), String> {
+fn open_h3(conn: &mut QuicheConnection, spec: &ClientSpec) -> Result<(), String> {
     send_server_settings(conn, 2, 6, 10, spec.warp.is_some())?;
     let authority = authority(spec);
     let mut block = Vec::with_capacity(256 + spec.path.len());
@@ -2200,7 +2207,7 @@ fn open_h3(conn: &mut quiche::Connection, spec: &ClientSpec) -> Result<(), Strin
 }
 
 fn send_server_settings(
-    conn: &mut quiche::Connection,
+    conn: &mut QuicheConnection,
     control: u64,
     encoder: u64,
     decoder: u64,
@@ -2236,7 +2243,7 @@ fn h3_settings(warp: bool) -> Vec<u8> {
 }
 
 fn send_stream(
-    conn: &mut quiche::Connection,
+    conn: &mut QuicheConnection,
     stream: u64,
     bytes: &[u8],
     fin: bool,
@@ -2260,7 +2267,7 @@ fn send_stream(
     }
 }
 
-fn send_address_requests(conn: &mut quiche::Connection, stream: u64) -> Result<(), String> {
+fn send_address_requests(conn: &mut QuicheConnection, stream: u64) -> Result<(), String> {
     let v4 = [0u8; 4];
     let v6 = [0u8; 16];
     let mut requests = Vec::with_capacity(40);
@@ -2268,13 +2275,29 @@ fn send_address_requests(conn: &mut quiche::Connection, stream: u64) -> Result<(
     send_data(conn, stream, &requests)
 }
 
-fn send_data(conn: &mut quiche::Connection, stream: u64, bytes: &[u8]) -> Result<(), String> {
+fn send_data(conn: &mut QuicheConnection, stream: u64, bytes: &[u8]) -> Result<(), String> {
     let mut head = [0u8; 9];
     let length = frames::h3_data_header(&mut head, bytes.len() as u64);
     let mut frame = Vec::with_capacity(length + bytes.len());
     frame.extend_from_slice(&head[..length]);
     frame.extend_from_slice(bytes);
-    send_stream(conn, stream, &frame, false)
+    let mut rest = bytes::Bytes::from(frame);
+    loop {
+        match conn.stream_send_zc(stream, rest.clone(), false) {
+            Ok((0, _)) => return Err("masque: the stream accepted no bytes".to_owned()),
+            Ok((_, remainder)) => {
+                rest = remainder.unwrap_or_default();
+                if rest.is_empty() {
+                    return Ok(());
+                }
+            }
+            Err(quiche::Error::Done) if rest.is_empty() => return Ok(()),
+            Err(quiche::Error::Done) => {
+                return Err("masque: the stream stopped accepting a frame".to_owned());
+            }
+            Err(error) => return Err(format!("masque: cannot write the stream: {error}")),
+        }
+    }
 }
 
 /// The request authority: configured host, else SNI, with a non-default port.
@@ -2420,7 +2443,7 @@ impl Stream {
 
     fn wait_head(
         &mut self,
-        conn: &mut quiche::Connection,
+        conn: &mut QuicheConnection,
         sock: &Datagram,
         local: SocketAddr,
         budget: Duration,
@@ -2442,7 +2465,7 @@ impl Stream {
     /// Deliver one pump into the request stream and hold every matching datagram, refusing a flood.
     fn poll(
         &mut self,
-        conn: &mut quiche::Connection,
+        conn: &mut QuicheConnection,
         sock: &Datagram,
         local: SocketAddr,
         wait: Duration,
@@ -2472,16 +2495,16 @@ impl Stream {
         Ok(())
     }
 
-    fn read_stream(&mut self, conn: &mut quiche::Connection) -> Result<(), String> {
-        let mut room = [0u8; 4096];
+    fn read_stream(&mut self, conn: &mut QuicheConnection) -> Result<(), String> {
         loop {
-            match conn.stream_recv(self.id, &mut room) {
+            // One byte over the cap distinguishes "filled it exactly" from "there is more".
+            let room = CAPSULE_CAP - self.buf.len() + 1;
+            match conn.stream_recv_buf(self.id, (&mut self.buf).limit(room)) {
                 Ok((0, fin)) => {
                     self.done = fin;
                     break;
                 }
-                Ok((n, fin)) => {
-                    self.buf.extend_from_slice(&room[..n]);
+                Ok((_, fin)) => {
                     if self.buf.len() > CAPSULE_CAP {
                         return Err("masque: stream buffer exceeds the capsule cap".to_owned());
                     }
@@ -2753,7 +2776,7 @@ enum Emission {
 }
 
 /// One inner packet on its stream, or the ICMP Packet Too Big it needs instead when the lane cannot carry it: the MTU the answer names is what the inner stack has left after the stream prefix.
-fn send_datagram(conn: &mut quiche::Connection, stream: u64, packet: &[u8]) -> Emission {
+fn send_datagram(conn: &mut QuicheConnection, stream: u64, packet: &[u8]) -> Emission {
     let Some(max) = conn.dgram_max_writable_len() else {
         return Emission::Full;
     };
@@ -3726,7 +3749,9 @@ fn demux(
             }
             guard.set_stateless_reset_token(Some(u128::from_le_bytes(token)));
         }
-        let Ok(conn) = quiche::accept(&scid, None, local, from, &mut guard) else {
+        let Ok(conn) = quiche::accept_with_buf_factory::<crate::quic::BytesBufFactory>(
+            &scid, None, local, from, &mut guard,
+        ) else {
             continue;
         };
         drop(guard);
@@ -3789,7 +3814,7 @@ struct Tunnel {
     flow_at: usize,
 }
 
-fn sweep_due_timer(conn: &mut quiche::Connection) {
+fn sweep_due_timer(conn: &mut QuicheConnection) {
     if conn.timeout().is_some_and(|left| left.is_zero()) {
         conn.on_timeout();
     }
@@ -3797,7 +3822,7 @@ fn sweep_due_timer(conn: &mut quiche::Connection) {
 
 #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn worker(
-    mut conn: quiche::Connection,
+    mut conn: QuicheConnection,
     sock: Arc<Datagram>,
     local: SocketAddr,
     rx: Receiver<Arrival>,
@@ -3904,7 +3929,7 @@ fn worker(
 }
 
 fn register_sources(
-    conn: &mut quiche::Connection,
+    conn: &mut QuicheConnection,
     routes: &Routes,
     worker_id: u64,
     tx: &Sender<Arrival>,
@@ -3929,25 +3954,24 @@ fn register_sources(
 }
 
 fn service(
-    conn: &mut quiche::Connection,
+    conn: &mut QuicheConnection,
     shared: &Arc<Shared>,
     spec: &ServerSpec,
     tunnel: &mut Tunnel,
 ) {
-    let mut room = [0u8; 4096];
     while let Some(id) = conn.stream_readable_next() {
         if id % 4 != 0 {
             // Control and QPACK streams are read and forgotten, so their bytes do not sit on the connection waiting for a handler.
-            while let Ok((n, _)) = conn.stream_recv(id, &mut room) {
-                if n == 0 {
+            while let Ok((n, fin)) = conn.stream_discard(id, usize::MAX) {
+                if n == 0 || fin {
                     break;
                 }
             }
             continue;
         }
         if tunnel.stream.is_some_and(|stream| stream != id) {
-            while let Ok((n, _)) = conn.stream_recv(id, &mut room) {
-                if n == 0 {
+            while let Ok((n, fin)) = conn.stream_discard(id, usize::MAX) {
+                if n == 0 || fin {
                     break;
                 }
             }
@@ -3955,14 +3979,15 @@ fn service(
         }
         tunnel.stream = Some(id);
         loop {
-            match conn.stream_recv(id, &mut room) {
+            // One byte over the cap distinguishes "filled it exactly" from "there is more".
+            let room = CAPSULE_CAP - tunnel.buf.len() + 1;
+            match conn.stream_recv_buf(id, (&mut tunnel.buf).limit(room)) {
                 Ok((0, _)) | Err(quiche::Error::Done) => break,
                 Err(quiche::Error::StreamReset(_)) => {
                     cancel(conn, tunnel);
                     return;
                 }
-                Ok((n, fin)) => {
-                    tunnel.buf.extend_from_slice(&room[..n]);
+                Ok((_, fin)) => {
                     if tunnel.buf.len() > CAPSULE_CAP {
                         let _ = conn.close(false, 0, b"capsule bound");
                         tunnel.rejected = true;
@@ -4214,7 +4239,7 @@ pub(crate) fn path_matches(got: &[u8], want: &str) -> bool {
 }
 
 fn accept(
-    conn: &mut quiche::Connection,
+    conn: &mut QuicheConnection,
     shared: &Arc<Shared>,
     _spec: &ServerSpec,
     tunnel: &mut Tunnel,
@@ -4391,7 +4416,7 @@ pub(crate) fn register(
     })
 }
 
-fn parse_capsules(conn: &mut quiche::Connection, tunnel: &mut Tunnel, mtu: usize) -> bool {
+fn parse_capsules(conn: &mut QuicheConnection, tunnel: &mut Tunnel, mtu: usize) -> bool {
     let Some(answers) = drain_capsules(tunnel, mtu) else {
         return false;
     };
@@ -4464,7 +4489,7 @@ fn drain_capsules(tunnel: &mut Tunnel, mtu: usize) -> Option<Vec<Vec<u8>>> {
 /// Frames one UDP payload into the tunnel's reusable buffer and queues it on the
 /// request stream until the whole capsule is written, so a full stream send buffer
 /// never splits a frame.
-fn drain_udp(conn: &mut quiche::Connection, tunnel: &mut Tunnel) {
+fn drain_udp(conn: &mut QuicheConnection, tunnel: &mut Tunnel) {
     let Some(stream) = tunnel.stream else {
         return;
     };
@@ -4502,7 +4527,7 @@ enum FrameSend {
 }
 
 fn stream_frame(
-    conn: &mut quiche::Connection,
+    conn: &mut QuicheConnection,
     stream: u64,
     frame: &[u8],
     at: &mut usize,
@@ -4523,12 +4548,7 @@ fn flow_fits(queued: usize, add: usize) -> bool {
 }
 
 /// Queues one DATA frame behind a send the stream has not taken whole, so a full send buffer never splits a control frame. A queue past the capsule bound refuses the answer rather than growing for the tunnel's life.
-fn queue_data(
-    conn: &mut quiche::Connection,
-    tunnel: &mut Tunnel,
-    stream: u64,
-    bytes: &[u8],
-) -> bool {
+fn queue_data(conn: &mut QuicheConnection, tunnel: &mut Tunnel, stream: u64, bytes: &[u8]) -> bool {
     if tunnel.flow_at > 0 {
         tunnel.flow.drain(..tunnel.flow_at);
         tunnel.flow_at = 0;
@@ -4544,7 +4564,7 @@ fn queue_data(
     true
 }
 
-fn flush_flow(conn: &mut quiche::Connection, tunnel: &mut Tunnel, stream: u64) {
+fn flush_flow(conn: &mut QuicheConnection, tunnel: &mut Tunnel, stream: u64) {
     if tunnel.flow_at < tunnel.flow.len() {
         match stream_frame(conn, stream, &tunnel.flow, &mut tunnel.flow_at) {
             FrameSend::Sent | FrameSend::Blocked => {}
@@ -4562,7 +4582,7 @@ fn flush_flow(conn: &mut quiche::Connection, tunnel: &mut Tunnel, stream: u64) {
 }
 
 fn read_datagrams(
-    conn: &mut quiche::Connection,
+    conn: &mut QuicheConnection,
     shared: &Arc<Shared>,
     spec: &ServerSpec,
     tunnel: &mut Tunnel,
@@ -4659,7 +4679,7 @@ fn forward_owned(
 }
 
 /// A success response can no longer be completed: reset the stream and give back the lane or grant instead of queueing a status that cannot replace accepted bytes.
-fn cancel(conn: &mut quiche::Connection, tunnel: &mut Tunnel) {
+fn cancel(conn: &mut QuicheConnection, tunnel: &mut Tunnel) {
     if let Some(stream) = tunnel.stream {
         let _ = conn.stream_shutdown(stream, quiche::Shutdown::Write, 0);
         let _ = conn.stream_shutdown(stream, quiche::Shutdown::Read, 0);
@@ -4945,8 +4965,14 @@ mod tests {
         let cid = quiche::ConnectionId::from_ref(&[0u8; 16]);
         let local: SocketAddr = "127.0.0.1:50000".parse().expect("local");
         let peer: SocketAddr = "127.0.0.1:443".parse().expect("peer");
-        let conn = quiche::connect(Some("edge.example"), &cid, local, peer, &mut config)
-            .expect("connection");
+        let conn = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
+            Some("edge.example"),
+            &cid,
+            local,
+            peer,
+            &mut config,
+        )
+        .expect("connection");
         assert!(
             verify_edge(&spec, &conn).is_err(),
             "a pinned edge with no certificate chain was accepted"
@@ -5980,7 +6006,7 @@ mod tests {
         target: &str,
         port: u16,
         bearer: &str,
-    ) -> Result<(quiche::Connection, Datagram, SocketAddr, Stream, u16), String> {
+    ) -> Result<(QuicheConnection, Datagram, SocketAddr, Stream, u16), String> {
         let inbound = inbound(
             r#"{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/24"]}"#,
         );
@@ -6026,8 +6052,14 @@ mod tests {
         let mut scid = [0u8; 16];
         getrandom::fill(&mut scid).map_err(|error| format!("masque: no connection id: {error}"))?;
         let cid = quiche::ConnectionId::from_ref(&scid);
-        let mut conn = quiche::connect(Some("localhost"), &cid, local, peer, &mut config)
-            .map_err(|error| format!("masque: cannot open a connection: {error}"))?;
+        let mut conn = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
+            Some("localhost"),
+            &cid,
+            local,
+            peer,
+            &mut config,
+        )
+        .map_err(|error| format!("masque: cannot open a connection: {error}"))?;
         quic::drive_handshake_by(&mut conn, &sock, local, ESTABLISH_TIMEOUT)
             .ok_or("masque: the QUIC handshake did not finish")?;
         send_server_settings(&mut conn, 2, 6, 10, false)?;
@@ -7270,8 +7302,14 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:8".parse().expect("peer address");
         let cid = [3u8; 16];
         let cid = quiche::ConnectionId::from_ref(&cid);
-        let mut conn =
-            quiche::connect(Some("localhost"), &cid, local, peer, &mut config).expect("connection");
+        let mut conn = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
+            Some("localhost"),
+            &cid,
+            local,
+            peer,
+            &mut config,
+        )
+        .expect("connection");
         let mut packet = vec![0u8; 1350];
         let (n, _) = conn.send(&mut packet).expect("initial");
         assert!(n > 0, "the client produced an initial packet");
@@ -7375,7 +7413,7 @@ mod tests {
         let mut server_id = [0u8; 16];
         getrandom::fill(&mut server_id).expect("random");
         let server_id = quiche::ConnectionId::from_ref(&server_id);
-        let mut server = quiche::accept(
+        let mut server = quiche::accept_with_buf_factory::<crate::quic::BytesBufFactory>(
             &server_id,
             None,
             server_addr,
@@ -7386,7 +7424,7 @@ mod tests {
         let mut client_id = [0u8; 16];
         getrandom::fill(&mut client_id).expect("random");
         let client_id = quiche::ConnectionId::from_ref(&client_id);
-        let mut client = quiche::connect(
+        let mut client = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
             Some("localhost"),
             &client_id,
             client_addr,

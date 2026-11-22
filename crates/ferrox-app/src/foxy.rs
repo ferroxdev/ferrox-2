@@ -1,6 +1,7 @@
 //! Foxy lane: a CONNECT tunnel to an account's CDN edge over H1/H2/H3; a lane hands the caller a carrier-agnostic `Read + Write`.
 
 use crate::conn::Connection;
+use crate::quic::QuicheConnection;
 use ferrox_core::foxy::connectip;
 use ferrox_core::foxy::{
     self, authority, edge_authority, edge_peer, frames, hpack, masque, Failure, Pass,
@@ -2598,7 +2599,7 @@ impl H3 {
             .park
             .filter(|_| self.carried >= self.filled && self.quic.sock.waits_here().is_some())?;
         let tick = self
-            .with_conn_read(quiche::Connection::timeout)
+            .with_conn_read(QuicheConnection::timeout)
             .flatten()
             .unwrap_or(park);
         Some((
@@ -2659,7 +2660,7 @@ impl H3 {
         Ok(lane)
     }
 
-    fn with_conn<T>(&mut self, body: impl FnOnce(&mut quiche::Connection) -> T) -> Option<T> {
+    fn with_conn<T>(&mut self, body: impl FnOnce(&mut QuicheConnection) -> T) -> Option<T> {
         let mut guard = self.quic.conn.lock().ok()?;
         let out = body(&mut guard);
         crate::quic::flush_egress(&mut guard, &self.quic.sock);
@@ -2677,7 +2678,7 @@ impl H3 {
     }
 
     /// The connection under its lock, read-only: a reader that asks what is left has nothing to send, and the egress sweep is a syscall the read did not ask for.
-    fn with_conn_read<T>(&self, body: impl FnOnce(&quiche::Connection) -> T) -> Option<T> {
+    fn with_conn_read<T>(&self, body: impl FnOnce(&QuicheConnection) -> T) -> Option<T> {
         let guard = self.quic.conn.lock().ok()?;
         Some(body(&guard))
     }
@@ -3273,13 +3274,13 @@ impl H3 {
 
     fn send(&mut self, stream: u64, buf: &[u8], fin: bool) -> Result<(), Failure> {
         let deadline = Instant::now() + SEND_WAIT;
-        let mut rest = buf;
+        let mut rest = bytes::Bytes::copy_from_slice(buf);
         while !rest.is_empty() {
-            let written = self
-                .with_conn(|conn| conn.stream_send(stream, rest, false))
+            let (written, remainder) = self
+                .with_conn(|conn| conn.stream_send_zc(stream, rest.clone(), false))
                 .ok_or(Failure::Io)?
                 .map_err(|_| Failure::Io)?;
-            rest = &rest[written..];
+            rest = remainder.unwrap_or_default();
             if written == 0 {
                 if Instant::now() >= deadline {
                     return Err(Failure::Io);
@@ -10322,7 +10323,7 @@ pub(crate) mod loopback {
     fn answer_udp(
         sock: &crate::quic::Datagram,
         local: SocketAddr,
-        conn: &mut quiche::Connection,
+        conn: &mut QuicheConnection,
         stream: u64,
         buf: &mut [u8; 1350],
         out: &mut [u8; 1350],
@@ -10438,7 +10439,7 @@ pub(crate) mod loopback {
     fn answer_ip(
         sock: &crate::quic::Datagram,
         local: SocketAddr,
-        conn: &mut quiche::Connection,
+        conn: &mut QuicheConnection,
         stream: u64,
         udp: &std::sync::mpsc::Sender<(Vec<u8>, u16, Vec<u8>)>,
         want: usize,
@@ -10542,7 +10543,7 @@ pub(crate) mod loopback {
     }
 
     /// One H3 DATA frame carrying `payload` on `stream`: capsules on this stream are framed, and the header is its own send because quiche copies every slice it is handed.
-    fn send_h3_data(conn: &mut quiche::Connection, stream: u64, payload: &[u8]) {
+    fn send_h3_data(conn: &mut QuicheConnection, stream: u64, payload: &[u8]) {
         let mut head = [0u8; 9];
         let hl = frames::h3_data_header(&mut head, payload.len() as u64);
         conn.stream_send(stream, &head[..hl], false)
@@ -11083,7 +11084,7 @@ pub(crate) mod loopback {
     fn echo_stream(
         sock: &crate::quic::Datagram,
         local: SocketAddr,
-        conn: &mut quiche::Connection,
+        conn: &mut QuicheConnection,
         buf: &mut [u8; 1350],
         out: &mut [u8; 1350],
         stream: u64,
@@ -11160,7 +11161,7 @@ pub(crate) mod loopback {
     }
 
     /// One unidirectional stream's bytes plus whether it has closed, merged into the snapshot the test asserts the lane's opening against.
-    fn drain_uni(conn: &mut quiche::Connection, id: u64, streams: &mut Vec<(u64, Vec<u8>, bool)>) {
+    fn drain_uni(conn: &mut QuicheConnection, id: u64, streams: &mut Vec<(u64, Vec<u8>, bool)>) {
         let mut chunk = [0u8; 8192];
         loop {
             match conn.stream_recv(id, &mut chunk) {
@@ -11177,7 +11178,7 @@ pub(crate) mod loopback {
     }
 
     /// Every byte a stream holds, read into a buffer that exists: a `Vec` handed to `stream_recv` is a zero-length slice and never receives anything.
-    fn drain(conn: &mut quiche::Connection, id: u64) -> Vec<u8> {
+    fn drain(conn: &mut QuicheConnection, id: u64) -> Vec<u8> {
         let mut out = Vec::new();
         let mut chunk = [0u8; 8192];
         while let Ok((n, _)) = conn.stream_recv(id, &mut chunk) {

@@ -1,4 +1,6 @@
 use crate::conn::{parse_target, Connection, Listener};
+#[cfg(test)]
+use crate::quic::QuicheConnection;
 use std::collections::{HashMap, HashSet};
 #[cfg(windows)]
 use std::io::IoSliceMut;
@@ -71189,11 +71191,7 @@ mod tests {
         }
     }
 
-    fn quic_server_idle(
-        conn: &mut quiche::Connection,
-        sock: &crate::quic::Datagram,
-        out: &mut [u8],
-    ) {
+    fn quic_server_idle(conn: &mut QuicheConnection, sock: &crate::quic::Datagram, out: &mut [u8]) {
         conn.on_timeout();
         while let Ok((written, info)) = conn.send(out) {
             sock.send_to(&out[..written], info.to).expect("answers");
@@ -71204,7 +71202,7 @@ mod tests {
         sock: &crate::quic::Datagram,
         local: SocketAddr,
         config: &mut quiche::Config,
-    ) -> (quiche::Connection, Vec<u8>) {
+    ) -> (QuicheConnection, Vec<u8>) {
         let mut buf = [0u8; 1350];
         let mut out = [0u8; 1350];
         let knock_deadline = std::time::Instant::now() + QUIC_TEST_TIMEOUT;
@@ -71221,7 +71219,10 @@ mod tests {
             let mut scid = [0u8; 16];
             getrandom::fill(&mut scid).expect("random");
             let cid = quiche::ConnectionId::from_ref(&scid);
-            let mut fresh = quiche::accept(&cid, None, local, from, config).expect("accepts");
+            let mut fresh = quiche::accept_with_buf_factory::<crate::quic::BytesBufFactory>(
+                &cid, None, local, from, config,
+            )
+            .expect("accepts");
             let info = quiche::RecvInfo { from, to: local };
             fresh.recv(&mut buf[..n], info).expect("handshakes");
             while let Ok((written, info)) = fresh.send(&mut out) {
@@ -71392,8 +71393,8 @@ mod tests {
 
     /// The two ends and the addresses they call each other by: one value passed around instead of four.
     struct Pipe {
-        client: quiche::Connection,
-        server: quiche::Connection,
+        client: QuicheConnection,
+        server: QuicheConnection,
         client_addr: SocketAddr,
         server_addr: SocketAddr,
         header: Vec<u8>,
@@ -71644,7 +71645,7 @@ mod tests {
         let mut ccid = [0u8; 16];
         getrandom::fill(&mut ccid).expect("random");
         let ccid = quiche::ConnectionId::from_ref(&ccid);
-        let mut client = quiche::connect(
+        let mut client = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
             Some("localhost"),
             &ccid,
             client_addr,
@@ -71659,8 +71660,14 @@ mod tests {
         let mut scid = [0u8; 16];
         getrandom::fill(&mut scid).expect("random");
         let scid = quiche::ConnectionId::from_ref(&scid);
-        let mut server = quiche::accept(&scid, None, server_addr, client_addr, &mut server_config)
-            .expect("accepts");
+        let mut server = quiche::accept_with_buf_factory::<crate::quic::BytesBufFactory>(
+            &scid,
+            None,
+            server_addr,
+            client_addr,
+            &mut server_config,
+        )
+        .expect("accepts");
         let info = quiche::RecvInfo {
             from: client_addr,
             to: server_addr,
@@ -74820,7 +74827,7 @@ mod tests {
     }
 
     fn hysteria_test_answer_auth(
-        conn: &mut quiche::Connection,
+        conn: &mut QuicheConnection,
         sock: &crate::quic::Datagram,
         local: SocketAddr,
         out: &mut [u8; 1350],
@@ -74855,7 +74862,7 @@ mod tests {
     }
 
     fn hysteria_test_read_prefix(
-        conn: &mut quiche::Connection,
+        conn: &mut QuicheConnection,
         sock: &crate::quic::Datagram,
         local: SocketAddr,
         out: &mut [u8; 1350],
@@ -75091,7 +75098,7 @@ mod tests {
         id: [u8; 16],
         target: SocketAddr,
     ) -> (
-        quiche::Connection,
+        QuicheConnection,
         crate::quic::Datagram,
         SocketAddr,
         std::time::Instant,
@@ -75103,8 +75110,14 @@ mod tests {
         let mut scid = [0u8; 16];
         getrandom::fill(&mut scid).expect("random");
         let cid = quiche::ConnectionId::from_ref(&scid);
-        let mut conn =
-            quiche::connect(Some("localhost"), &cid, local, peer, &mut config).expect("connects");
+        let mut conn = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
+            Some("localhost"),
+            &cid,
+            local,
+            peer,
+            &mut config,
+        )
+        .expect("connects");
         crate::quic::drive_handshake(&mut conn, &sock, local).expect("handshakes");
         let horizon = std::time::Instant::now() + Duration::from_secs(30);
         let mut settings = Vec::new();
@@ -75175,8 +75188,14 @@ mod tests {
         let mut scid = [0u8; 16];
         getrandom::fill(&mut scid).expect("random");
         let cid = quiche::ConnectionId::from_ref(&scid);
-        let mut conn =
-            quiche::connect(Some("localhost"), &cid, local, peer, &mut config).expect("connects");
+        let mut conn = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
+            Some("localhost"),
+            &cid,
+            local,
+            peer,
+            &mut config,
+        )
+        .expect("connects");
         crate::quic::drive_handshake(&mut conn, &sock, local).expect("handshakes");
         let horizon = std::time::Instant::now() + Duration::from_secs(15);
         let mut block = Vec::new();
@@ -75570,8 +75589,14 @@ mod tests {
         let mut scid = [0u8; 16];
         getrandom::fill(&mut scid).expect("random");
         let cid = quiche::ConnectionId::from_ref(&scid);
-        let mut conn =
-            quiche::connect(Some("localhost"), &cid, local, peer, &mut config).expect("connects");
+        let mut conn = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
+            Some("localhost"),
+            &cid,
+            local,
+            peer,
+            &mut config,
+        )
+        .expect("connects");
         crate::quic::drive_handshake(&mut conn, &sock, local).expect("handshakes");
         let horizon = std::time::Instant::now() + Duration::from_secs(30);
         let mut settings = Vec::new();
@@ -75648,8 +75673,14 @@ mod tests {
         let mut scid = [0u8; 16];
         getrandom::fill(&mut scid).expect("random");
         let cid = quiche::ConnectionId::from_ref(&scid);
-        let mut conn =
-            quiche::connect(Some("localhost"), &cid, local, peer, &mut config).expect("connects");
+        let mut conn = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
+            Some("localhost"),
+            &cid,
+            local,
+            peer,
+            &mut config,
+        )
+        .expect("connects");
         crate::quic::drive_handshake(&mut conn, &sock, local).expect("handshakes");
         let horizon = std::time::Instant::now() + Duration::from_secs(15);
         // The right handshake shape — a POST to the auth path — but the wrong password must still refuse and close, never quietly serve the cover page.
@@ -75711,8 +75742,14 @@ mod tests {
         let mut scid = [0u8; 16];
         getrandom::fill(&mut scid).expect("random");
         let cid = quiche::ConnectionId::from_ref(&scid);
-        let mut conn =
-            quiche::connect(Some("localhost"), &cid, local, peer, &mut config).expect("connects");
+        let mut conn = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
+            Some("localhost"),
+            &cid,
+            local,
+            peer,
+            &mut config,
+        )
+        .expect("connects");
         crate::quic::drive_handshake(&mut conn, &sock, local).expect("handshakes");
         let horizon = std::time::Instant::now() + Duration::from_secs(30);
         let mut settings = Vec::new();
@@ -75775,7 +75812,7 @@ mod tests {
     }
 
     fn hysteria_udp_echo_frames(
-        conn: &mut quiche::Connection,
+        conn: &mut QuicheConnection,
         sock: &crate::quic::Datagram,
         out: &mut [u8],
         local: SocketAddr,
