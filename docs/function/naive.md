@@ -36,14 +36,14 @@ graph TD
 | key | value | checked by |
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
-| syscalls-per-connect | UNBLESSED | scripts/count-ops.sh |
+| syscalls-per-connect | UNBLESSED | no per-connect syscall checker yet |
 <!-- counts:end -->
 
 ## What was removed
 
 The pinned Xray-core and ZeroNet trees carry no NaiveProxy method, so the comparison is sing-box's `protocol/naive/` and its `cronet-go` client. Against those, this is a rewrite: one `NaiveStream` serves both roles and both transports, and the HTTP/2 and HTTP/3 lanes reuse the existing `H2Client`/`H2Service` and `H3Reader`/`H3Writer` framing instead of adding a second HTTP stack. The server keeps one HTTP/2 connection per accepted socket and one QUIC connection per H3 session; the outbound spreads flows across up to `insecure_concurrency` pooled connections, so reusing an existing connection avoids a handshake, while a new connection — the first or one added as the pool grows — pays TLS or QUIC before its CONNECT. The reference's padding arithmetic is reproduced exactly: eight wire records in each direction, a u16 payload length, a u8 padding length, zero fill, a split at 65,535 bytes, and a 30–61 byte header whose first 16 bytes come from the reference alphabet. The client does not copy the request head into an intermediate HTTP writer; it builds the QPACK or HPACK block and opens the stream directly.
 
-What is not removed: TLS and the Basic credential remain, the padding header and eight padded records remain, H2/H3 connection pools remain, and every flow still pays one CONNECT head and one response head. UoT adds one stream and one request head per destination, and its datagrams pay a u16 length prefix (plus an address in version 1 or an unconnected version 2 datagram); the outbound relays through the association's one socket, and the inbound binds one IPv4 and one IPv6 UDP socket per stream when the host has each and polls them at the relay budget. The ops and syscall rows above stay `UNBLESSED`: no `ops.yml` run has measured this page yet. No copy checker exists yet, and no tunnel benchmark exists yet, so the page makes no copy or time claim.
+What is not removed: TLS and the Basic credential remain, the padding header and eight padded records remain, H2/H3 connection pools remain, and every flow still pays one CONNECT head and one response head. UoT adds one stream and one request head per destination, and its datagrams pay a u16 length prefix (plus an address in version 1 or an unconnected version 2 datagram); the outbound relays through the association's one socket, and the inbound binds one IPv4 and one IPv6 UDP socket per stream when the host has each and polls them at the relay budget. The ops row above stays `UNBLESSED` until an `ops.yml` run measures this page, and the syscall row stays `UNBLESSED` until a checker keys a syscall count to one connect instead of a whole test process. No copy checker exists yet, and no tunnel benchmark exists yet, so the page makes no copy or time claim.
 
 ## Time
 

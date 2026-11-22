@@ -1018,6 +1018,7 @@ fn serve_connection(
     {
         return;
     }
+    let bounded_read = tls.is_some();
     let (mut reader, writer): (Reader, Writer) = if let Some(identity) = tls {
         let Ok(mut session) = ferrox_core::tls::accept(identity.as_ref(), stream) else {
             return;
@@ -1070,7 +1071,8 @@ fn serve_connection(
             left -= take;
         }
     }
-    if raw.set_read_timeout(None).is_err() {
+    let timeout = bounded_read.then_some(crate::budgets::RELAY_POLL);
+    if raw.set_read_timeout(timeout).is_err() {
         return;
     }
     let session = Arc::new(Session {

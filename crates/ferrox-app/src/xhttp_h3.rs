@@ -1081,8 +1081,8 @@ impl ClientStream {
                 return Err(std::io::Error::other("h3 connection lock poisoned"));
             };
             if self.owner.dead.load(Ordering::Relaxed)
-                || self.owner.draining.load(Ordering::Relaxed)
                 || self.owner.rejected(self.id)
+                || (rest.len() == buf.len() && self.owner.draining.load(Ordering::Relaxed))
             {
                 return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
             }
@@ -1098,6 +1098,9 @@ impl ClientStream {
                     self.activity.touch();
                     quic::flush_egress(&mut conn, &self.sock);
                     rest = &rest[n..];
+                }
+                Err(quiche::Error::StreamLimit) => {
+                    return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
                 }
                 Err(error) => {
                     return Err(std::io::Error::other(format!("h3 stream send: {error:?}")));
@@ -1123,6 +1126,14 @@ impl ClientStream {
         let _ = conn.stream_shutdown(self.id, quiche::Shutdown::Write, 0);
         quic::flush_egress(&mut conn, &self.sock);
     }
+}
+
+/// Why an H3 stream did not open: the peer's stream limit is temporary, while a dead or draining
+/// connection is not.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum H3OpenError {
+    Full,
+    Closed,
 }
 
 /// The client side of one H3 connection: streams open on the shared connection and one pump reads
@@ -1295,6 +1306,7 @@ impl H3Client {
 
     fn open(self: &Arc<Self>, block: &[u8], end_request: bool) -> Option<(H3Reader, H3StreamOut)> {
         self.open_with(block, end_request, Arc::new(Activity::new()))
+            .ok()
     }
 
     /// A `NaiveProxy` CONNECT block: the caller frames its own tunnel, so no xHTTP writer is built.
@@ -1302,10 +1314,10 @@ impl H3Client {
         self: &Arc<Self>,
         block: &[u8],
         end_request: bool,
-    ) -> Option<(H3Reader, H3StreamOut)> {
-        let (mut reader, out) = self.open(block, end_request)?;
+    ) -> Result<(H3Reader, H3StreamOut), H3OpenError> {
+        let (mut reader, out) = self.open_with(block, end_request, Arc::new(Activity::new()))?;
         reader.padding_head = true;
-        Some((reader, out))
+        Ok((reader, out))
     }
 
     fn open_with(
@@ -1313,13 +1325,13 @@ impl H3Client {
         block: &[u8],
         end_request: bool,
         activity: Arc<Activity>,
-    ) -> Option<(H3Reader, H3StreamOut)> {
+    ) -> Result<(H3Reader, H3StreamOut), H3OpenError> {
         if self.dead.load(Ordering::Relaxed) || self.draining.load(Ordering::Relaxed) {
-            return None;
+            return Err(H3OpenError::Closed);
         }
         let id = self.next.fetch_add(4, Ordering::SeqCst);
         if self.rejected(id) {
-            return None;
+            return Err(H3OpenError::Closed);
         }
         let wire = Wire::Client(ClientStream {
             owner: Arc::clone(self),
@@ -1334,14 +1346,20 @@ impl H3Client {
         frames::quic_varint(&mut frame, block.len() as u64);
         frame.extend_from_slice(block);
         let mut writer = wire.clone();
-        if writer.write_opening(&frame).is_err() {
-            wire.close();
-            return None;
+        match writer.write_opening(&frame) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(H3OpenError::Full);
+            }
+            Err(_) => {
+                wire.close();
+                return Err(H3OpenError::Closed);
+            }
         }
         if end_request {
             wire.fin();
         }
-        Some((
+        Ok((
             H3Reader::new(wire.clone()),
             H3StreamOut { wire, owner: None },
         ))
@@ -1423,7 +1441,7 @@ impl H3Client {
         let (head, body) = crate::xhttp::packet_head(host, settings, session, seq, piece);
         let block = block_from_text(&head, host, "https");
         let deadline = Instant::now() + crate::budgets::relay_stall();
-        let Some((mut reader, out)) = self.open_with(&block, false, activity) else {
+        let Some((mut reader, out)) = self.open_with(&block, false, activity).ok() else {
             return false;
         };
         reader.set_deadline(deadline);
@@ -1523,7 +1541,10 @@ fn sweep(
     match h3_control_goaway(&mut conn, control, goaway) {
         Some(true) => draining.store(true, Ordering::Relaxed),
         Some(false) => {}
-        None => return false,
+        None => {
+            quic::flush_egress(&mut conn, sock);
+            return false;
+        }
     }
     true
 }
@@ -1548,7 +1569,7 @@ fn h3_control_goaway(
     if control.id.is_some_and(|id| conn.stream_finished(id))
         || control.critical.iter().any(|id| conn.stream_finished(*id))
     {
-        let _ = conn.close(false, H3_CLOSED_CRITICAL_STREAM, b"critical stream closed");
+        let _ = conn.close(true, H3_CLOSED_CRITICAL_STREAM, b"critical stream closed");
         return None;
     }
     let ids: Vec<u64> = conn
@@ -1579,7 +1600,7 @@ fn h3_control_goaway(
             if Some(id) != control.id {
                 drain_stream(conn, id);
                 if control.critical.contains(&id) && conn.stream_finished(id) {
-                    let _ = conn.close(false, H3_CLOSED_CRITICAL_STREAM, b"critical stream closed");
+                    let _ = conn.close(true, H3_CLOSED_CRITICAL_STREAM, b"critical stream closed");
                     return None;
                 }
                 continue;
@@ -1590,14 +1611,14 @@ fn h3_control_goaway(
             control.buf.extend_from_slice(&chunk[..n]);
         }
         if conn.stream_finished(id) {
-            let _ = conn.close(false, H3_CLOSED_CRITICAL_STREAM, b"critical stream closed");
+            let _ = conn.close(true, H3_CLOSED_CRITICAL_STREAM, b"critical stream closed");
             return None;
         }
     }
     if let Some(drain) = h3_control_frames(&mut control.buf, &mut control.skip, goaway) {
         Some(drain)
     } else {
-        let _ = conn.close(false, H3_ID_ERROR, b"invalid GOAWAY");
+        let _ = conn.close(true, H3_ID_ERROR, b"invalid GOAWAY");
         None
     }
 }
@@ -1640,7 +1661,7 @@ fn h3_control_frames(control: &mut Vec<u8>, skip: &mut u64, goaway: &AtomicU64) 
         if kind == 0x7 {
             let mut cursor = at;
             let cutoff = frames::quic_read(&control[..end], &mut cursor)?;
-            if cursor != end || cutoff % 4 != 0 {
+            if cursor != end || cutoff % 4 != 0 || cutoff > goaway.load(Ordering::SeqCst) {
                 return None;
             }
             goaway.fetch_min(cutoff, Ordering::SeqCst);
@@ -1871,7 +1892,7 @@ pub(crate) fn connect_dual_split(
     let down = crate::xhttp::downlink_head(host, settings, &session);
     let block = block_from_text(&down, host, "https");
     let activity = Arc::new(Activity::new());
-    let (reader, _) = client.open_with(&block, true, Arc::clone(&activity))?;
+    let (reader, _) = client.open_with(&block, true, Arc::clone(&activity)).ok()?;
     let writer = if settings.mode == XhttpMode::PacketUp {
         crate::xhttp::XhttpWriter::packets_h3(
             Arc::clone(&client),
@@ -1883,7 +1904,7 @@ pub(crate) fn connect_dual_split(
     } else {
         let up = crate::xhttp::dial_head(host, settings, &session, None);
         let block = block_from_text(&up, host, "https");
-        let (_, out) = client.open_with(&block, false, activity)?;
+        let (_, out) = client.open_with(&block, false, activity).ok()?;
         let writer = crate::xhttp::XhttpWriter::new(NullWrite);
         writer.set_stream(crate::xhttp::StreamOut::H3(out));
         writer
@@ -2740,6 +2761,22 @@ mod tests {
         assert_eq!(skip, 0);
         assert_eq!(goaway.load(Ordering::SeqCst), 4);
         assert_eq!(control, [] as [u8; 0]);
+    }
+
+    #[test]
+    fn a_goaway_that_increases_its_cutoff_is_an_error() {
+        let mut control = Vec::new();
+        frames::quic_varint(&mut control, 0x7);
+        frames::quic_varint(&mut control, 1);
+        frames::quic_varint(&mut control, 12);
+        let goaway = AtomicU64::new(8);
+        let mut skip = 0;
+        assert_eq!(
+            h3_control_frames(&mut control, &mut skip, &goaway),
+            None,
+            "RFC 9114 rejects a cutoff above the one already accepted"
+        );
+        assert_eq!(goaway.load(Ordering::SeqCst), 8);
     }
 
     #[test]

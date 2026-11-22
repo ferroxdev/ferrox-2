@@ -5,7 +5,7 @@ use crate::conn::Connection;
 use crate::json::Json;
 use crate::proxy::{self, Destination};
 use crate::xhttp_h2::{self, H2Client, H2Conn, H2Service, H2StreamOut, H2StreamReader};
-use crate::xhttp_h3::{H3Client, H3Reader, H3StreamOut, H3Writer, Wire};
+use crate::xhttp_h3::{H3Client, H3OpenError, H3Reader, H3StreamOut, H3Writer, Wire};
 use base64::Engine as _;
 use ferrox_core::foxy::hpack;
 use ferrox_core::hysteria::Congestion;
@@ -1906,34 +1906,54 @@ impl NaiveOut {
     }
 
     fn open_h3(self: &Arc<Self>, target: &Destination) -> Option<NaiveStream> {
-        for _ in 0..2 {
+        let deadline = Instant::now() + crate::budgets::handshake();
+        let mut attempts = 0;
+        while attempts < 2 {
             let client = self.h3_client()?;
             let block = self.h3_block(target);
-            if let Some((mut reader, out)) = client.open_block(&block, false) {
-                let Ok(Some((status, padded))) = reader.read_response_head() else {
-                    out.reset();
-                    self.discard_h3(&client);
-                    continue;
-                };
-                if !(200..300).contains(&status) {
-                    out.reset();
-                    return None;
+            match client.open_block(&block, false) {
+                Ok((mut reader, out)) => {
+                    attempts += 1;
+                    let Ok(Some((status, padded))) = reader.read_response_head() else {
+                        out.reset();
+                        if !client.reusable() {
+                            self.discard_h3(&client);
+                        }
+                        continue;
+                    };
+                    if !(200..300).contains(&status) {
+                        out.reset();
+                        return None;
+                    }
+                    let reader = H3ClientRead { inner: reader };
+                    let writer = H3OutWrite { out: out.clone() };
+                    return Some(NaiveStream::new(
+                        Box::new(reader),
+                        Box::new(writer),
+                        End::H3(out),
+                        padded,
+                    ));
                 }
-                let reader = H3ClientRead { inner: reader };
-                let writer = H3OutWrite { out: out.clone() };
-                return Some(NaiveStream::new(
-                    Box::new(reader),
-                    Box::new(writer),
-                    End::H3(out),
-                    padded,
-                ));
+                Err(H3OpenError::Full) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return None;
+                    }
+                    std::thread::sleep(left.min(crate::budgets::RELAY_POLL));
+                }
+                Err(H3OpenError::Closed) => {
+                    self.discard_h3(&client);
+                    attempts += 1;
+                }
             }
-            self.discard_h3(&client);
         }
         None
     }
 
     fn discard_h3(&self, client: &Arc<H3Client>) {
+        if client.reusable() {
+            return;
+        }
         if let Ok(mut pool) = self.h3.lock() {
             pool.retain(|pooled| !Arc::ptr_eq(pooled, client));
         }
@@ -2354,7 +2374,50 @@ impl Drop for ListenerExit {
     }
 }
 
-type Start = Box<dyn FnOnce(ListenerExit) + Send>;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StartState {
+    Waiting,
+    Serve,
+    Abort,
+}
+
+struct StartGate {
+    state: Mutex<StartState>,
+    ready: Condvar,
+}
+
+impl StartGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(StartState::Waiting),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn wait(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        while *state == StartState::Waiting {
+            state = self
+                .ready
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        *state == StartState::Serve
+    }
+
+    fn release(&self, serve: bool) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        *state = if serve {
+            StartState::Serve
+        } else {
+            StartState::Abort
+        };
+        drop(state);
+        self.ready.notify_all();
+    }
+}
+
+type Start = Box<dyn FnOnce(ListenerExit, Arc<StartGate>) + Send>;
 
 fn tcp_start(
     address: &str,
@@ -2379,7 +2442,10 @@ fn tcp_start(
             return None;
         }
     };
-    Some(Box::new(move |exit| {
+    Some(Box::new(move |exit, gate| {
+        if !gate.wait() {
+            return;
+        }
         for stream in listener.incoming() {
             if halted.load(Ordering::SeqCst) {
                 break;
@@ -2423,7 +2489,10 @@ fn quic_start(
             return None;
         }
     };
-    Some(Box::new(move |exit| {
+    Some(Box::new(move |exit, gate| {
+        if !gate.wait() {
+            return;
+        }
         let serve: crate::quic::Serve = Arc::new(move |stream| {
             serve_h3(&stream, &users, freedom);
         });
@@ -2533,14 +2602,32 @@ pub(crate) fn serve_inbound(
     if starts.is_empty() {
         return false;
     }
-    let left = Arc::new(AtomicUsize::new(starts.len()));
+    let left = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new(StartGate::new());
+    let mut workers = Vec::with_capacity(starts.len());
     for start in starts {
         let exit = ListenerExit {
             left: Arc::clone(&left),
             stop: stop.cloned(),
         };
-        std::thread::spawn(move || start(exit));
+        left.fetch_add(1, Ordering::SeqCst);
+        let gate = Arc::clone(&gate);
+        match std::thread::Builder::new()
+            .name("ferrox-naive-listen".to_owned())
+            .spawn(move || start(exit, gate))
+        {
+            Ok(worker) => workers.push(worker),
+            Err(error) => {
+                eprintln!("naive inbound in {path} cannot start a listener: {error}");
+                gate.release(false);
+                for worker in workers {
+                    let _ = worker.join();
+                }
+                return false;
+            }
+        }
     }
+    gate.release(true);
     true
 }
 
