@@ -84205,24 +84205,36 @@ end
             .expect("picks");
         assert_eq!(tag, "b", "the nested default is honored");
 
-        let shared = group_route(
-            r#"{"outbounds":[
+        let picks = |tolerance: u16| {
+            let config = r#"{"outbounds":[
                 {"tag":"a","protocol":"freedom"},
                 {"tag":"b","protocol":"freedom"},
                 {"tag":"pick","type":"urltest","settings":{
                     "outbounds":["a","b"],
                     "url":"http://127.0.0.1/204",
-                    "tolerance":10
+                    "tolerance":TOLERANCE
                 }}
-            ],"routing":{}}"#,
+            ],"routing":{}}"#
+                .replace("TOLERANCE", &tolerance.to_string());
+            let shared = group_route(&config);
+            let group = group_of(&shared, "pick");
+            group.record("a", 100);
+            let (tag, _) = group
+                .resolve(&shared, crate::router::Network::Tcp)
+                .expect("picks");
+            assert_eq!(tag, "a", "the first lookup makes `a` current");
+            group.record("b", 60);
+            group
+                .resolve(&shared, crate::router::Network::Tcp)
+                .expect("picks")
+                .0
+        };
+        assert_eq!(picks(10), "b", "the nested tolerance is honored");
+        assert_eq!(
+            picks(50),
+            "a",
+            "a winner inside the nested tolerance does not take over"
         );
-        let group = group_of(&shared, "pick");
-        group.record("a", 100);
-        group.record("b", 60);
-        let (tag, _) = group
-            .resolve(&shared, crate::router::Network::Tcp)
-            .expect("picks");
-        assert_eq!(tag, "b", "the nested tolerance is honored");
     }
 
     /// A front resolves a group before it decides whether the leaf grants the reply itself.
