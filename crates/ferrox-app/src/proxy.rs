@@ -31944,7 +31944,7 @@ fn spawn_udp_lane_with_cancel(
         strategy,
     } = start.unwrap_or_else(LaneStart::take_thread);
     let handle = thread::spawn(move || {
-        let _tag = tag.as_deref().map(OutboundTag::enter);
+        let _tag = OutboundTag::enter(tag.as_deref());
         serve_udp_lane_with(
             &socket,
             &out,
