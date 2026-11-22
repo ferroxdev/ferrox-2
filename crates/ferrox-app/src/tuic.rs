@@ -1206,16 +1206,20 @@ fn client_turn(
         }
         let mut data = uni.remove(&id).unwrap_or_default();
         loop {
+            if data.len() > MAX_UNI_COMMAND {
+                let (rest, broken) = share_uni_packets(data, out);
+                if broken || rest.len() > MAX_UNI_COMMAND {
+                    let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
+                    data = Vec::new();
+                    break;
+                }
+                data = rest;
+            }
             // One byte over the cap distinguishes "filled it exactly" from "there is more".
             let room = MAX_UNI_COMMAND - data.len() + 1;
             match conn.stream_recv_buf(id, (&mut data).limit(room)) {
                 Ok((0, _)) | Err(_) => break,
-                Ok((_, _)) => {
-                    if data.len() > MAX_UNI_COMMAND {
-                        let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
-                        break;
-                    }
-                }
+                Ok((_, _)) => {}
             }
         }
         let (rest, broken) = share_uni_packets(data, out);
@@ -2530,16 +2534,27 @@ fn read_uni(conn: &mut QuicheConnection, inner: &mut Inner, id: u64, freedom: bo
     }
     let mut data = inner.uni.remove(&id).unwrap_or_default();
     loop {
+        if data.len() > MAX_UNI_COMMAND {
+            if freedom && data.get(1) == Some(&wire::PACKET) {
+                let Some(at) = read_packets(inner, &data) else {
+                    let _ = conn.close(true, 0, b"command");
+                    return;
+                };
+                if at > 0 {
+                    data.drain(..at);
+                }
+                if data.len() <= MAX_UNI_COMMAND {
+                    continue;
+                }
+            }
+            let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
+            return;
+        }
         // One byte over the cap distinguishes "filled it exactly" from "there is more".
         let room = MAX_UNI_COMMAND - data.len() + 1;
         match conn.stream_recv_buf(id, (&mut data).limit(room)) {
             Ok((0, _)) | Err(_) => break,
-            Ok((_, _)) => {
-                if data.len() > MAX_UNI_COMMAND {
-                    let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
-                    return;
-                }
-            }
+            Ok((_, _)) => {}
         }
     }
     if freedom && data.get(1) == Some(&wire::PACKET) {

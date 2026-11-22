@@ -532,10 +532,8 @@ fn take_queued(conn: &mut QuicheConnection, session: &Session) {
 
 fn read_headers_block(session: &Session, stream: u64, deadline: Instant) -> Option<Vec<u8>> {
     let mut head = Vec::with_capacity(128);
+    let mut fin = false;
     loop {
-        if head.len() >= HEAD_CAP || Instant::now() >= deadline {
-            return None;
-        }
         let mut at = 0usize;
         if let Some(frame) = frames::h3_frame(&head, &mut at) {
             if frame.kind != frames::H3_HEADERS {
@@ -548,18 +546,23 @@ fn read_headers_block(session: &Session, stream: u64, deadline: Instant) -> Opti
                 return Some(head);
             }
         }
-        let progressed = {
+        if fin || head.len() >= HEAD_CAP || Instant::now() >= deadline {
+            return None;
+        }
+        let (progressed, ended) = {
             let Ok(mut conn) = session.shared.lock() else {
                 return None;
             };
             let room = HEAD_CAP - head.len();
             match conn.stream_recv_buf(stream, (&mut head).limit(room)) {
-                Ok((0, _)) | Err(quiche::Error::Done) => false,
-                Ok((_, _)) => true,
+                Ok((0, ended)) => (false, ended),
+                Ok((_, ended)) => (true, ended),
+                Err(quiche::Error::Done) => (false, false),
                 Err(_) => return None,
             }
         };
-        if !progressed {
+        fin = ended;
+        if !progressed && !fin {
             let _ = drive_once(session, STREAM_POLL);
         }
     }

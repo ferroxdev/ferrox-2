@@ -5010,9 +5010,9 @@ impl Write for QuicStream {
         }
         // The lock covers one send each: a flow-control wait must not hold it, or ACKs stop arriving.
         let deadline = Instant::now() + SEND_WAIT;
-        let mut rest = buf;
+        let mut rest = bytes::Bytes::copy_from_slice(buf);
         while !rest.is_empty() {
-            match self.send_once(bytes::Bytes::copy_from_slice(rest)) {
+            match self.send_once(&mut rest) {
                 Ok(0) => {
                     if Instant::now() >= deadline {
                         let sent = buf.len() - rest.len();
@@ -5027,7 +5027,6 @@ impl Write for QuicStream {
                 Ok(n) => {
                     self.meter.write(n);
                     self.activity.touch();
-                    rest = &rest[n..];
                 }
                 Err(error) => {
                     let sent = buf.len() - rest.len();
@@ -5123,7 +5122,7 @@ impl QuicStream {
     }
 
     /// One send flight without holding the lock across the wait behind it.
-    fn send_once(&mut self, buf: bytes::Bytes) -> std::io::Result<usize> {
+    fn send_once(&mut self, rest: &mut bytes::Bytes) -> std::io::Result<usize> {
         let Ok(mut conn) = self.conn.lock() else {
             return Err(std::io::Error::other("quic connection lock poisoned"));
         };
@@ -5131,8 +5130,9 @@ impl QuicStream {
         if conn.is_closed() || conn.is_draining() {
             return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
         }
-        match conn.stream_send_zc(self.id, buf, false) {
-            Ok((n, _)) => {
+        match conn.stream_send_zc(self.id, (*rest).clone(), false) {
+            Ok((n, remainder)) => {
+                *rest = remainder.unwrap_or_default();
                 flush_egress(&mut conn, &self.sock);
                 Ok(n)
             }
