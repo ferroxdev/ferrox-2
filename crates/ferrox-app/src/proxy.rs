@@ -10239,17 +10239,16 @@ impl BridgeLane {
     /// The outbound one stream takes and the tag that names its lane, with that tag's dial
     /// settings installed for the worker that dials it.
     fn tcp_route(&self, asked: &Destination) -> Option<(Outbound, Option<String>)> {
-        let (picked, key) = match &self.plan {
-            Some(plan) => plan.lane_with_protocol(
+        let (picked, key) = if let Some(plan) = &self.plan {
+            plan.lane_with_protocol(
                 asked,
                 crate::router::Network::Tcp,
                 None,
                 FlowFacts::default(),
-            ),
-            None => {
-                self.arm(None);
-                (Picked::Static(self.fixed.as_ref()?), None)
-            }
+            )
+        } else {
+            self.arm(None);
+            (Picked::Static(self.fixed.as_ref()?), None)
         };
         Some((picked.into_owned(), key.map(std::borrow::Cow::into_owned)))
     }
@@ -11124,7 +11123,7 @@ fn serve_bridge_udp(
     if let Ok(relay) = relay.try_clone() {
         retire_udp_lanes(
             relay,
-            lanes.into_values().flat_map(|lane| lane.into_values()),
+            lanes.into_values().flat_map(HashMap::into_values),
             default_lane.map(|(_, lane)| lane),
         );
     }
@@ -31491,7 +31490,7 @@ fn retire_udp_lanes(
 ///
 /// The control leg stays open for the association's life: dropping it ends the
 /// association, and the server stops relaying.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn serve_socks_udp_client(
     relay: &UdpSocket,
     server: SocketAddr,
