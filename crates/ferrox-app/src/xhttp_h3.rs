@@ -1144,6 +1144,7 @@ pub(crate) struct H3Client {
     conn: Arc<Mutex<QuicheConnection>>,
     sock: Arc<Datagram>,
     next: AtomicU64,
+    opening: Mutex<()>,
     dead: Arc<AtomicBool>,
     draining: Arc<AtomicBool>,
     goaway: Arc<AtomicU64>,
@@ -1306,6 +1307,7 @@ impl H3Client {
             conn,
             sock,
             next: AtomicU64::new(0),
+            opening: Mutex::new(()),
             dead,
             draining,
             goaway,
@@ -1334,10 +1336,14 @@ impl H3Client {
         end_request: bool,
         activity: Arc<Activity>,
     ) -> Result<(H3Reader, H3StreamOut), H3OpenError> {
+        let _opening = match self.opening.lock() {
+            Ok(opening) => opening,
+            Err(_) => return Err(H3OpenError::Closed),
+        };
         if self.dead.load(Ordering::Relaxed) || self.draining.load(Ordering::Relaxed) {
             return Err(H3OpenError::Closed);
         }
-        let id = self.next.fetch_add(4, Ordering::SeqCst);
+        let id = self.next.load(Ordering::SeqCst);
         if self.rejected(id) {
             return Err(H3OpenError::Closed);
         }
@@ -1355,11 +1361,12 @@ impl H3Client {
         frame.extend_from_slice(block);
         let mut writer = wire.clone();
         match writer.write_opening(&frame) {
-            Ok(_) => {}
+            Ok(_) => self.next.store(id + 4, Ordering::SeqCst),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 return Err(H3OpenError::Full);
             }
             Err(_) => {
+                self.next.store(id + 4, Ordering::SeqCst);
                 wire.close();
                 return Err(H3OpenError::Closed);
             }
@@ -2020,7 +2027,18 @@ mod tests {
         identity: &ferrox_core::tls::TlsServerConfig,
         script: impl Fn(&Wire) + Send + Sync + 'static,
     ) -> u16 {
-        let config = quic::serve_config(identity).expect("the h3 server config");
+        serve_scripted_with_streams(identity, None, script)
+    }
+
+    fn serve_scripted_with_streams(
+        identity: &ferrox_core::tls::TlsServerConfig,
+        streams: Option<u64>,
+        script: impl Fn(&Wire) + Send + Sync + 'static,
+    ) -> u16 {
+        let mut config = quic::serve_config(identity).expect("the h3 server config");
+        if let Some(streams) = streams {
+            config.set_initial_max_streams_bidi(streams);
+        }
         let sock = quic::bind_datagram_plain("127.0.0.1:0").expect("the h3 server binds");
         let port = sock.local_addr().expect("the h3 server address").port();
         let serve: quic::Serve = Arc::new(move |stream| {
@@ -2110,6 +2128,23 @@ mod tests {
     }
 
     #[test]
+    fn a_full_h3_open_does_not_consume_a_stream_id() {
+        let (identity, roots) = minted_identity("localhost");
+        let port = serve_scripted_with_streams(&identity, Some(1), |_| {});
+        let client = client(port, roots);
+        let head = "POST /o HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let block = block_from_text(head, "localhost", "https");
+        let _first = client
+            .open_block(&block, false)
+            .expect("the first h3 stream opens");
+        assert!(matches!(
+            client.open_block(&block, false),
+            Err(H3OpenError::Full)
+        ));
+        assert_eq!(client.next.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
     fn an_h3_alpn_is_case_sensitive() {
         assert!(is_h3(&[b"h3".to_vec()]));
         assert!(!is_h3(&[b"H3".to_vec()]));
@@ -2117,6 +2152,7 @@ mod tests {
     }
 
     fn raw_stream(client: &Arc<H3Client>) -> Wire {
+        let _opening = client.opening.lock().expect("h3 opening lock");
         let id = client.next.fetch_add(4, Ordering::SeqCst);
         Wire::Client(ClientStream {
             owner: Arc::clone(client),
