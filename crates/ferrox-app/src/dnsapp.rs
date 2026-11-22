@@ -1810,10 +1810,9 @@ fn parse_fake(
     let mut wanted = Vec::new();
     match value {
         Some(Json::Obj(pairs)) if !pairs.is_empty() => wanted.push(value.expect("checked")),
-        Some(Json::Obj(_)) => {}
+        Some(Json::Obj(_)) | None => {}
         Some(Json::Arr(items)) => wanted.extend(items.iter()),
         Some(_) => return Err("dns: fakeDns is not an object or array".into()),
-        None => {}
     }
     if wanted.is_empty() {
         if default_v4 {
