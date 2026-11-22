@@ -50,6 +50,8 @@ anytls padding-scheme-md5 75cff2ad89aadf5e257059ee571ebe11 ferrox-app-anytls::te
 anytls outbound-spellings-parsed 2 ferrox-app-anytls::tests::outbound_spellings_parse
 naive ops-retired-instructions UNBLESSED scripts/count-ops.sh
 naive syscalls-per-connect UNBLESSED no per-connect syscall checker yet
+naive user-space-copies-per-byte-relayed UNBLESSED no copy checker yet
+naive seconds-per-relayed-megabyte UNBLESSED CI bench.yml (no tunnel cell yet)
 
 # --- Shadowsocks AEAD -------------------------------------------------------
 shadowsocks ops-retired-instructions UNBLESSED scripts/count-ops.sh

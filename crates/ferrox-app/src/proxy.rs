@@ -799,15 +799,18 @@ fn serve_inbounds_counted(
                         }
                     }
                     "naive" => {
-                        if crate::naive::serve_inbound(
+                        let listeners = crate::naive::serve_inbound(
                             address,
                             inbound,
                             label,
                             freedom,
                             handler_stop.as_ref(),
-                        ) {
+                        );
+                        if listeners > 0 {
                             if let Some(stop) = &handler_stop {
-                                handler_stops.push((Arc::clone(stop), address.clone()));
+                                for _ in 0..listeners {
+                                    handler_stops.push((Arc::clone(stop), address.clone()));
+                                }
                             }
                             inbounds += 1;
                         }

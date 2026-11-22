@@ -2350,6 +2350,10 @@ impl H2Conn {
                     .unwrap_or(crate::h2::FRAME_CAP)
                     .clamp(16_384, 16_777_215);
             } else if id == S_MAX_CONCURRENT {
+                let _gate = self
+                    .open_gate
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
                 self.peer_max.store(
                     usize::try_from(value).unwrap_or(usize::MAX),
                     Ordering::SeqCst,
@@ -2707,14 +2711,14 @@ fn client_frame(conn: &H2Conn, kind: u8, flags: u8, sid: u32, body: Vec<u8>) -> 
                     .client_head
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner) = None;
-                client_headers(conn, sid, &block, end_stream);
+                client_headers(conn, sid, &block, end_stream)
             } else {
                 *conn
                     .client_head
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner) = Some((sid, block, end_stream));
+                true
             }
-            true
         }
         T_CONT => {
             let pending = conn
@@ -2739,14 +2743,14 @@ fn client_frame(conn: &H2Conn, kind: u8, flags: u8, sid: u32, body: Vec<u8>) -> 
             }
             gathered.extend_from_slice(&body);
             if flags & F_END_HEADERS != 0 {
-                client_headers(conn, sid, &gathered, end_stream);
+                client_headers(conn, sid, &gathered, end_stream)
             } else {
                 *conn
                     .client_head
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner) = Some((sid, gathered, end_stream));
+                true
             }
-            true
         }
         T_DATA => queue_data(conn, flags, sid, body),
         T_RST => {
@@ -2767,13 +2771,14 @@ fn client_frame(conn: &H2Conn, kind: u8, flags: u8, sid: u32, body: Vec<u8>) -> 
 
 /// A complete response head: decode its `:status`, retire the stream when the peer's `END_STREAM`
 /// already rode the head, and wake a reader parked on the answer.
-fn client_headers(conn: &H2Conn, sid: u32, block: &[u8], end_stream: bool) {
+fn client_headers(conn: &H2Conn, sid: u32, block: &[u8], end_stream: bool) -> bool {
     let Some((status, padding)) = conn.response_head(block) else {
         conn.fail_stream(sid);
-        return;
+        conn.compression_error();
+        return false;
     };
     if status.is_some_and(|status| (100..200).contains(&status)) {
-        return;
+        return true;
     }
     let status = status.map(|status| status | if padding { PADDING_BIT } else { 0 });
     let state = conn
@@ -2799,6 +2804,7 @@ fn client_headers(conn: &H2Conn, sid: u32, block: &[u8], end_stream: bool) {
             conn.retire(sid);
         }
     }
+    true
 }
 
 struct NullWrite;
@@ -2817,6 +2823,15 @@ impl crate::proxy::FrameWrite for NullWrite {
     fn write_slices(&mut self, _parts: &[&[u8]]) -> bool {
         true
     }
+}
+
+/// Why a request head did not open: a full stream table is temporary capacity, while a closed
+/// connection or a failed frame write retires it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum H2OpenError {
+    Full,
+    Closed,
+    Failed,
 }
 
 /// One client connection, one stream: the reference opens a stream per session and keeps the
@@ -2988,7 +3003,15 @@ impl H2Client {
         block: &[u8],
         end_request: bool,
     ) -> Option<(H2StreamReader, H2StreamOut)> {
-        self.open_headers(block, None, end_request)
+        self.open_naive_result(block, end_request).ok()
+    }
+
+    pub(crate) fn open_naive_result(
+        &self,
+        block: &[u8],
+        end_request: bool,
+    ) -> Result<(H2StreamReader, H2StreamOut), H2OpenError> {
+        self.open_headers_result(block, None, end_request)
     }
 
     /// Sends one request head on a fresh stream. `end_request` marks a bodyless request (the GET
@@ -2999,12 +3022,28 @@ impl H2Client {
         owner: Option<Arc<ClientOwner>>,
         end_request: bool,
     ) -> Option<(H2StreamReader, H2StreamOut)> {
-        let _gate = self.conn.open_gate.lock().ok()?;
-        if self.conn.goaway.load(Ordering::SeqCst) || !self.has_capacity() {
-            return None;
+        self.open_headers_result(block, owner, end_request).ok()
+    }
+
+    fn open_headers_result(
+        &self,
+        block: &[u8],
+        owner: Option<Arc<ClientOwner>>,
+        end_request: bool,
+    ) -> Result<(H2StreamReader, H2StreamOut), H2OpenError> {
+        let Ok(_gate) = self.conn.open_gate.lock() else {
+            return Err(H2OpenError::Closed);
+        };
+        if self.conn.goaway.load(Ordering::SeqCst) {
+            return Err(H2OpenError::Closed);
+        }
+        if !self.has_capacity() {
+            return Err(H2OpenError::Full);
         }
         let sid = self.next.fetch_add(2, Ordering::SeqCst);
-        let state = self.conn.attach_stream(sid, false)?;
+        let Some(state) = self.conn.attach_stream(sid, false) else {
+            return Err(H2OpenError::Full);
+        };
         let flags = if end_request {
             F_END_HEADERS | F_END
         } else {
@@ -3012,7 +3051,7 @@ impl H2Client {
         };
         if !self.conn.frame(T_HEADERS, flags, sid, block) {
             self.conn.fail_stream(sid);
-            return None;
+            return Err(H2OpenError::Failed);
         }
         if end_request {
             self.conn.mark_request_ended(sid);
@@ -3032,7 +3071,7 @@ impl H2Client {
             _owner: owner,
             client: true,
         };
-        Some((reader, out))
+        Ok((reader, out))
     }
 
     /// One packet-up POST: its own stream, the packet in the body, the answer drained before the
@@ -4419,6 +4458,22 @@ mod tests {
             super::H2Client::new_windowed(std::io::empty(), NullWrite, None, Some(4 * 1024 * 1024))
                 .expect("client");
         assert_eq!(client.conn.recv_window, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn a_full_connection_reports_capacity_without_spending_a_stream() {
+        let client = super::H2Client::new(std::io::empty(), NullWrite, None).expect("client");
+        client.conn.peer_max.store(0, Ordering::SeqCst);
+        let block = block_encode(&[(":method", "CONNECT"), (":authority", "example.test")]);
+        assert!(matches!(
+            client.open_naive_result(&block, false),
+            Err(H2OpenError::Full)
+        ));
+        assert_eq!(
+            client.next.load(Ordering::SeqCst),
+            1,
+            "a capacity refusal does not consume a stream id or send CONNECT"
+        );
     }
 
     #[test]
@@ -6735,6 +6790,18 @@ mod tests {
                 .unwrap_or_else(PoisonError::into_inner)
                 .contains_key(&1),
             "both halves are done, so the stream retires"
+        );
+    }
+
+    /// A response head that does not decode is the same connection-level compression failure:
+    /// the shared HPACK state is out of step, so the pump must not keep the connection reusable.
+    #[test]
+    fn a_bad_response_head_refuses_the_connection() {
+        let (conn, _written, _slices) = bare_conn();
+        assert!(!client_headers(&conn, 1, &[0x80], true));
+        assert!(
+            conn.refused.load(Ordering::SeqCst),
+            "the shared decoder is no longer in step, so the connection must end"
         );
     }
 

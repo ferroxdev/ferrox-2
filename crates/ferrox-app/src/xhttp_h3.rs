@@ -15,8 +15,11 @@ use crate::xhttp::{XhttpMode, XhttpSettings};
 const TICK: Duration = Duration::from_millis(20);
 const POLL: Duration = Duration::from_millis(5);
 const READ_ROOM: usize = 16 * 1024;
+const H3_STREAM_CREATION_ERROR: u64 = 0x0103;
 const H3_CLOSED_CRITICAL_STREAM: u64 = 0x0104;
+const H3_FRAME_ERROR: u64 = 0x0106;
 const H3_ID_ERROR: u64 = 0x0108;
+const H3_MISSING_SETTINGS: u64 = 0x010a;
 
 /// One request stream's byte transport: a served stream on the QUIC driver, or one the client
 /// opened on its own connection. Both clones share the connection, never the buffered bytes.
@@ -66,10 +69,15 @@ impl Wire {
         }
     }
 
-    fn opening_rest(&mut self, buf: &[u8], deadline: Instant) -> std::io::Result<usize> {
+    fn opening_rest(
+        &mut self,
+        buf: &[u8],
+        sent: usize,
+        deadline: Instant,
+    ) -> std::io::Result<usize> {
         match self {
             Self::Server(stream) => stream.write(buf),
-            Self::Client(stream) => stream.opening_rest(buf, deadline),
+            Self::Client(stream) => stream.opening_rest(buf, sent, deadline),
         }
     }
 
@@ -1031,12 +1039,12 @@ impl Write for ClientStream {
         let deadline = Instant::now() + crate::budgets::relay_stall();
         let mut rest = bytes::Bytes::copy_from_slice(buf);
         while !rest.is_empty() {
-            if self.owner.dead.load(Ordering::Relaxed) || self.owner.rejected(self.id) {
-                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
-            }
             let Ok(mut conn) = self.conn.lock() else {
                 return Err(std::io::Error::other("h3 connection lock poisoned"));
             };
+            if self.owner.dead.load(Ordering::Relaxed) || self.owner.rejected(self.id) {
+                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+            }
             match conn.stream_send_zc(self.id, rest.clone(), false) {
                 Ok((0, _)) | Err(quiche::Error::Done) => {
                     drop(conn);
@@ -1099,13 +1107,22 @@ impl ClientStream {
 
     /// Finish HEADERS once the stream exists, waiting for credit without the opening lock; the
     /// drain flag only gates the first attempt, so a stream below a GOAWAY cutoff can finish.
-    fn opening_rest(&mut self, buf: &[u8], deadline: Instant) -> std::io::Result<usize> {
+    fn opening_rest(
+        &mut self,
+        buf: &[u8],
+        sent: usize,
+        deadline: Instant,
+    ) -> std::io::Result<usize> {
         let mut rest = buf;
+        let mut sent = sent;
         while !rest.is_empty() {
             let Ok(mut conn) = self.conn.lock() else {
                 return Err(std::io::Error::other("h3 connection lock poisoned"));
             };
-            if self.owner.dead.load(Ordering::Relaxed) || self.owner.rejected(self.id) {
+            if self.owner.dead.load(Ordering::Relaxed)
+                || self.owner.rejected(self.id)
+                || (sent == 0 && self.owner.draining.load(Ordering::Relaxed))
+            {
                 return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
             }
             match conn.stream_send(self.id, rest, false) {
@@ -1117,6 +1134,7 @@ impl ClientStream {
                     std::thread::sleep(POLL);
                 }
                 Ok(n) => {
+                    sent += n;
                     self.activity.touch();
                     quic::flush_egress(&mut conn, &self.sock);
                     rest = &rest[n..];
@@ -1264,7 +1282,7 @@ impl H3Client {
             config.set_max_stream_window(window);
         }
         if let Some(window) = session_window {
-            let window = window.max(1);
+            let window = window.max(2);
             config.set_initial_max_data(window);
             config.set_max_connection_window(window);
         }
@@ -1403,7 +1421,7 @@ impl H3Client {
             }
         };
         drop(opening);
-        if sent < frame.len() && writer.opening_rest(&frame[sent..], deadline).is_err() {
+        if sent < frame.len() && writer.opening_rest(&frame[sent..], sent, deadline).is_err() {
             wire.close();
             return Err(H3OpenError::Closed);
         }
@@ -1561,7 +1579,11 @@ struct ControlState {
     skipped: Vec<u64>,
     /// Peer QPACK encoder and decoder streams: critical, so their payload is drained but never stopped.
     critical: Vec<u64>,
+    encoder: Option<u64>,
+    decoder: Option<u64>,
     skip: u64,
+    /// Whether the control stream's first frame was SETTINGS, as RFC 9114 requires.
+    settings: bool,
     /// The stream-type bytes seen so far per unidirectional stream, so a varint split across reads
     /// is not mistaken for an unknown stream and stopped.
     types: HashMap<u64, Vec<u8>>,
@@ -1634,9 +1656,40 @@ fn h3_control_goaway(
                     continue;
                 };
                 match kind {
-                    0 if control.id.is_none() => control.id = Some(id),
-                    2 | 3 => {
+                    0 => {
+                        if control.id.is_some() {
+                            let _ = conn.close(
+                                true,
+                                H3_STREAM_CREATION_ERROR,
+                                b"duplicate control stream",
+                            );
+                            return None;
+                        }
+                        control.id = Some(id);
+                    }
+                    2 => {
+                        if control.encoder.is_some() {
+                            let _ = conn.close(
+                                true,
+                                H3_STREAM_CREATION_ERROR,
+                                b"duplicate qpack encoder",
+                            );
+                            return None;
+                        }
                         // RFC 9204: QPACK encoder and decoder streams are critical; never STOP_SENDING them.
+                        control.encoder = Some(id);
+                        control.critical.push(id);
+                    }
+                    3 => {
+                        if control.decoder.is_some() {
+                            let _ = conn.close(
+                                true,
+                                H3_STREAM_CREATION_ERROR,
+                                b"duplicate qpack decoder",
+                            );
+                            return None;
+                        }
+                        control.decoder = Some(id);
                         control.critical.push(id);
                     }
                     _ => {
@@ -1666,25 +1719,37 @@ fn h3_control_goaway(
             return None;
         }
     }
-    if let Some(drain) = h3_control_frames(&mut control.buf, &mut control.skip, goaway) {
-        Some(drain)
-    } else {
-        let _ = conn.close(true, H3_ID_ERROR, b"invalid GOAWAY");
-        None
+    match h3_control_frames(
+        &mut control.buf,
+        &mut control.skip,
+        &mut control.settings,
+        goaway,
+    ) {
+        Ok(drain) => Some(drain),
+        Err(code) => {
+            let _ = conn.close(true, code, b"invalid control frame");
+            None
+        }
     }
 }
 
 /// Consume buffered control frames, skipping an unknown payload as it arrives so the next frame
 /// still starts on its own boundary; a GOAWAY after a large frame is not lost with the payload.
-fn h3_control_frames(control: &mut Vec<u8>, skip: &mut u64, goaway: &AtomicU64) -> Option<bool> {
+fn h3_control_frames(
+    control: &mut Vec<u8>,
+    skip: &mut u64,
+    settings: &mut bool,
+    goaway: &AtomicU64,
+) -> Result<bool, u64> {
     if *skip > 0 {
         let drop = (*skip).min(control.len() as u64) as usize;
         control.drain(..drop);
         *skip -= drop as u64;
         if *skip > 0 {
-            return Some(false);
+            return Ok(false);
         }
     }
+    let mut draining = false;
     loop {
         let mut at = 0;
         let Some(kind) = frames::quic_read(&control[..], &mut at) else {
@@ -1701,6 +1766,9 @@ fn h3_control_frames(control: &mut Vec<u8>, skip: &mut u64, goaway: &AtomicU64) 
             control.clear();
             break;
         };
+        if !*settings && kind != 0x4 {
+            return Err(H3_MISSING_SETTINGS);
+        }
         if end > control.len() {
             if kind != 0x7 {
                 let held = control.len().saturating_sub(at);
@@ -1709,22 +1777,31 @@ fn h3_control_frames(control: &mut Vec<u8>, skip: &mut u64, goaway: &AtomicU64) 
             }
             break;
         }
+        if !*settings {
+            *settings = true;
+        }
         if kind == 0x7 {
             let mut cursor = at;
-            let cutoff = frames::quic_read(&control[..end], &mut cursor)?;
-            if cursor != end || cutoff % 4 != 0 || cutoff > goaway.load(Ordering::SeqCst) {
-                return None;
+            let Some(cutoff) = frames::quic_read(&control[..end], &mut cursor) else {
+                return Err(H3_FRAME_ERROR);
+            };
+            if cursor != end {
+                return Err(H3_FRAME_ERROR);
+            }
+            if cutoff % 4 != 0 || cutoff > goaway.load(Ordering::SeqCst) {
+                return Err(H3_ID_ERROR);
             }
             goaway.fetch_min(cutoff, Ordering::SeqCst);
             control.drain(..end);
-            return Some(true);
+            draining = true;
+            continue;
         }
         control.drain(..end);
     }
     if *skip == 0 && control.len() > 64 * 1024 {
         control.clear();
     }
-    Some(false)
+    Ok(draining)
 }
 
 /// Read just the stream-type varint from a unidirectional stream, leaving its frames unread and
@@ -2884,9 +2961,15 @@ mod tests {
         );
     }
 
+    fn settings_frame(wire: &mut Vec<u8>) {
+        frames::quic_varint(wire, 0x4);
+        frames::quic_varint(wire, 0);
+    }
+
     #[test]
     fn a_large_control_frame_keeps_the_goaway_after_it() {
         let mut wire = Vec::new();
+        settings_frame(&mut wire);
         frames::quic_varint(&mut wire, 0x21);
         frames::quic_varint(&mut wire, 65_536);
         wire.extend(std::iter::repeat_n(0u8, 65_536));
@@ -2896,16 +2979,17 @@ mod tests {
         let split = 50_000;
         let mut control = wire[..split].to_vec();
         let mut skip = 0;
+        let mut settings = false;
         let goaway = AtomicU64::new(u64::MAX);
         assert_eq!(
-            h3_control_frames(&mut control, &mut skip, &goaway),
-            Some(false)
+            h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+            Ok(false)
         );
         assert!(skip > 0, "the unknown payload is skipped incrementally");
         control.extend_from_slice(&wire[split..]);
         assert_eq!(
-            h3_control_frames(&mut control, &mut skip, &goaway),
-            Some(true)
+            h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+            Ok(true)
         );
         assert_eq!(skip, 0);
         assert_eq!(goaway.load(Ordering::SeqCst), 4);
@@ -2915,14 +2999,16 @@ mod tests {
     #[test]
     fn a_goaway_that_increases_its_cutoff_is_an_error() {
         let mut control = Vec::new();
+        settings_frame(&mut control);
         frames::quic_varint(&mut control, 0x7);
         frames::quic_varint(&mut control, 1);
         frames::quic_varint(&mut control, 12);
         let goaway = AtomicU64::new(8);
         let mut skip = 0;
+        let mut settings = false;
         assert_eq!(
-            h3_control_frames(&mut control, &mut skip, &goaway),
-            None,
+            h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+            Err(H3_ID_ERROR),
             "RFC 9114 rejects a cutoff above the one already accepted"
         );
         assert_eq!(goaway.load(Ordering::SeqCst), 8);
@@ -2931,16 +3017,77 @@ mod tests {
     #[test]
     fn a_goaway_must_name_a_client_bidirectional_stream() {
         let mut control = Vec::new();
+        settings_frame(&mut control);
         frames::quic_varint(&mut control, 0x7);
         frames::quic_varint(&mut control, 1);
         frames::quic_varint(&mut control, 1);
         let goaway = AtomicU64::new(u64::MAX);
         let mut skip = 0;
+        let mut settings = false;
         assert_eq!(
-            h3_control_frames(&mut control, &mut skip, &goaway),
-            None,
+            h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+            Err(H3_ID_ERROR),
             "a server stream is not a client request cutoff"
         );
         assert_eq!(goaway.load(Ordering::SeqCst), u64::MAX);
+    }
+
+    #[test]
+    fn a_control_stream_must_start_with_settings() {
+        let mut control = Vec::new();
+        frames::quic_varint(&mut control, 0x7);
+        frames::quic_varint(&mut control, 1);
+        frames::quic_varint(&mut control, 4);
+        let goaway = AtomicU64::new(u64::MAX);
+        let mut skip = 0;
+        let mut settings = false;
+        assert_eq!(
+            h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+            Err(H3_MISSING_SETTINGS)
+        );
+        assert_eq!(goaway.load(Ordering::SeqCst), u64::MAX);
+    }
+
+    #[test]
+    fn a_goaway_with_trailing_bytes_is_a_frame_error() {
+        let mut control = Vec::new();
+        settings_frame(&mut control);
+        frames::quic_varint(&mut control, 0x7);
+        frames::quic_varint(&mut control, 2);
+        frames::quic_varint(&mut control, 4);
+        control.push(0);
+        let goaway = AtomicU64::new(u64::MAX);
+        let mut skip = 0;
+        let mut settings = false;
+        assert_eq!(
+            h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+            Err(H3_FRAME_ERROR)
+        );
+        assert_eq!(goaway.load(Ordering::SeqCst), u64::MAX);
+    }
+
+    #[test]
+    fn every_complete_goaway_in_one_sweep_applies() {
+        let mut control = Vec::new();
+        settings_frame(&mut control);
+        frames::quic_varint(&mut control, 0x7);
+        frames::quic_varint(&mut control, 1);
+        frames::quic_varint(&mut control, 8);
+        frames::quic_varint(&mut control, 0x7);
+        frames::quic_varint(&mut control, 1);
+        frames::quic_varint(&mut control, 4);
+        let goaway = AtomicU64::new(u64::MAX);
+        let mut skip = 0;
+        let mut settings = false;
+        assert_eq!(
+            h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+            Ok(true)
+        );
+        assert_eq!(
+            goaway.load(Ordering::SeqCst),
+            4,
+            "the later complete GOAWAY lowers the cutoff before the lock is released"
+        );
+        assert_eq!(control, [] as [u8; 0]);
     }
 }

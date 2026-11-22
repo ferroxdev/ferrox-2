@@ -4,7 +4,9 @@
 use crate::conn::Connection;
 use crate::json::Json;
 use crate::proxy::{self, Destination};
-use crate::xhttp_h2::{self, H2Client, H2Conn, H2Service, H2StreamOut, H2StreamReader};
+use crate::xhttp_h2::{
+    self, H2Client, H2Conn, H2OpenError, H2Service, H2StreamOut, H2StreamReader,
+};
 use crate::xhttp_h3::{H3Client, H3OpenError, H3Reader, H3StreamOut, H3Writer, Wire};
 use base64::Engine as _;
 use ferrox_core::foxy::hpack;
@@ -1531,6 +1533,10 @@ impl NaiveOut {
                         let (tx, rx) = std::sync::mpsc::sync_channel(MAX_UOT_PENDING_PACKETS);
                         let writer_stream = stream.clone();
                         let writer_done = Arc::clone(&done);
+                        if done.load(Ordering::Relaxed) {
+                            drop(cancel);
+                            continue;
+                        }
                         let PendingUot {
                             target, packets, ..
                         } = lane;
@@ -1550,6 +1556,10 @@ impl NaiveOut {
                             done.store(true, Ordering::Relaxed);
                             stream.abort();
                         } else {
+                            if done.load(Ordering::Relaxed) {
+                                drop(cancel);
+                                continue;
+                            }
                             if lanes.len() >= MAX_UOT_LANES {
                                 let oldest = lanes
                                     .iter()
@@ -1757,8 +1767,7 @@ impl NaiveOut {
         self.open_h2(target)
     }
 
-    fn h2_client(self: &Arc<Self>) -> Option<Arc<H2Client>> {
-        let deadline = Instant::now() + crate::budgets::handshake();
+    fn h2_client(self: &Arc<Self>, deadline: Instant) -> Option<Arc<H2Client>> {
         let mut pool = self.h2.lock().ok()?;
         loop {
             pool.retain(|client| {
@@ -1821,29 +1830,44 @@ impl NaiveOut {
     }
 
     fn open_h2(self: &Arc<Self>, target: &Destination) -> Option<NaiveStream> {
-        for _ in 0..2 {
-            let client = self.h2_client()?;
+        let deadline = Instant::now() + crate::budgets::handshake();
+        let mut attempts = 0;
+        while attempts < 2 {
+            let client = self.h2_client(deadline)?;
             let block = self.h2_block(target);
-            if let Some((reader, out)) = client.open_naive(&block, false) {
-                let Some((status, padded)) = reader.wait_head() else {
-                    out.reset();
-                    self.discard_h2(&client);
-                    continue;
-                };
-                if !(200..300).contains(&status) {
-                    out.reset();
-                    return None;
+            match client.open_naive_result(&block, false) {
+                Ok((reader, out)) => {
+                    let Some((status, padded)) = reader.wait_head() else {
+                        out.reset();
+                        self.discard_h2(&client);
+                        attempts += 1;
+                        continue;
+                    };
+                    if !(200..300).contains(&status) {
+                        out.reset();
+                        return None;
+                    }
+                    let reader = H2ClientRead { inner: reader };
+                    let writer = H2OutWrite { out: out.clone() };
+                    return Some(NaiveStream::new(
+                        Box::new(reader),
+                        Box::new(writer),
+                        End::H2(out),
+                        padded,
+                    ));
                 }
-                let reader = H2ClientRead { inner: reader };
-                let writer = H2OutWrite { out: out.clone() };
-                return Some(NaiveStream::new(
-                    Box::new(reader),
-                    Box::new(writer),
-                    End::H2(out),
-                    padded,
-                ));
+                Err(H2OpenError::Full) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return None;
+                    }
+                    std::thread::sleep(left.min(crate::budgets::RELAY_POLL));
+                }
+                Err(_) => {
+                    self.discard_h2(&client);
+                    attempts += 1;
+                }
             }
-            self.discard_h2(&client);
         }
         None
     }
@@ -2035,7 +2059,8 @@ pub(crate) fn outbound(root: &Json) -> Result<Option<NaiveOut>, String> {
         .ok_or("naive outbound has no server port")?;
     let username = field("username").and_then(Json::as_str).unwrap_or_default();
     let password = field("password").and_then(Json::as_str).unwrap_or_default();
-    let token = (!username.is_empty()).then(|| basic_token(username, password));
+    let token =
+        (!username.is_empty() || !password.is_empty()).then(|| basic_token(username, password));
     let tls = outbound_tls(first, address)?;
     let quic = field("quic").and_then(Json::as_bool).unwrap_or(false);
     let uot = uot_option(field("udp_over_tcp").or_else(|| field("udpOverTcp")));
@@ -2098,12 +2123,52 @@ fn header_pairs(node: &Json) -> Result<Option<Vec<(String, String)>>, String> {
             },
             _ => continue,
         };
+        if !header_name_ok(name) {
+            return Err(format!(
+                "naive extra_headers `{name}` is not a valid HTTP field name"
+            ));
+        }
+        if !header_value_ok(&value) {
+            return Err(format!(
+                "naive extra_headers `{name}` carries a control byte"
+            ));
+        }
         if name.eq_ignore_ascii_case("te") && !value.eq_ignore_ascii_case("trailers") {
             return Err(format!("naive extra_headers `{name}` must be `trailers`"));
         }
         headers.push((name.to_ascii_lowercase(), value));
     }
     Ok(Some(headers))
+}
+
+fn header_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+fn header_value_ok(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte == b'\t' || (0x20..=0x7e).contains(&byte) || byte >= 0x80)
 }
 
 fn connection_specific(name: &str) -> bool {
@@ -2341,6 +2406,9 @@ fn inbound_networks(inbound: &Json, settings: Option<&Json>) -> Result<(bool, bo
         }
         _ => return Err("naive inbound network must be a string or list".to_owned()),
     }
+    if !tcp && !udp {
+        return Err("naive inbound network names no listener".to_owned());
+    }
     Ok((tcp, udp))
 }
 
@@ -2370,11 +2438,12 @@ pub(crate) fn validate_inbound(inbound: &Json) -> Result<(), String> {
 struct ListenerExit {
     left: Arc<AtomicUsize>,
     stop: Option<Arc<proxy::Stop>>,
+    committed: Arc<AtomicBool>,
 }
 
 impl Drop for ListenerExit {
     fn drop(&mut self) {
-        if self.left.fetch_sub(1, Ordering::SeqCst) == 1 {
+        if self.committed.load(Ordering::SeqCst) && self.left.fetch_sub(1, Ordering::SeqCst) == 1 {
             if let Some(stop) = &self.stop {
                 stop.mark_closed();
             }
@@ -2520,27 +2589,27 @@ pub(crate) fn serve_inbound(
     path: &str,
     freedom: bool,
     stop: Option<&Arc<proxy::Stop>>,
-) -> bool {
+) -> usize {
     let settings = inbound.get("settings");
     let (users, (tcp, mut udp)) = match inbound_config(inbound) {
         Ok(config) => config,
         Err(error) => {
             eprintln!("naive inbound in {path}: {error}");
-            return false;
+            return 0;
         }
     };
     let security = crate::config::stream_security(inbound);
     let identity = if security == "tls" {
         let Some(identity) = crate::config::inbound_tls_identity(inbound) else {
             eprintln!("unreadable naive tls identity in {path}: serves nothing");
-            return false;
+            return 0;
         };
         Some(identity)
     } else if security.is_empty() || security == "none" {
         None
     } else {
         eprintln!("naive inbound in {path} asks for `{security}`: serves nothing");
-        return false;
+        return 0;
     };
     let tcp_identity = identity
         .as_ref()
@@ -2556,20 +2625,20 @@ pub(crate) fn serve_inbound(
         Ok(congestion) => congestion.or(Some(Congestion::Bbr)),
         Err(error) => {
             eprintln!("naive inbound in {path}: {error}");
-            return false;
+            return 0;
         }
     };
     if identity.is_none() {
         if !tcp {
             eprintln!("naive inbound in {path} asks for QUIC without TLS: serves nothing");
-            return false;
+            return 0;
         }
         eprintln!("naive inbound in {path} has no TLS: serves plaintext HTTP/2");
         udp = false;
     }
     if !tcp && !udp {
         eprintln!("naive inbound in {path} names no network: serves nothing");
-        return false;
+        return 0;
     }
     let halted = stop
         .as_ref()
@@ -2585,14 +2654,14 @@ pub(crate) fn serve_inbound(
             Arc::clone(&halted),
             stop.cloned(),
         ) else {
-            return false;
+            return 0;
         };
         starts.push(start);
     }
     if udp {
         let Some(identity) = quic_identity else {
             eprintln!("naive inbound in {path} asks for QUIC without TLS: serves nothing");
-            return false;
+            return 0;
         };
         let Some(start) = quic_start(
             address,
@@ -2603,26 +2672,28 @@ pub(crate) fn serve_inbound(
             congestion,
             Arc::clone(&halted),
         ) else {
-            return false;
+            return 0;
         };
         starts.push(start);
     }
     if starts.is_empty() {
-        return false;
+        return 0;
     }
     start_workers(starts, path, stop)
 }
 
-fn start_workers(starts: Vec<Start>, path: &str, stop: Option<&Arc<proxy::Stop>>) -> bool {
+fn start_workers(starts: Vec<Start>, path: &str, stop: Option<&Arc<proxy::Stop>>) -> usize {
+    let total = starts.len();
     let left = Arc::new(AtomicUsize::new(0));
+    let committed = Arc::new(AtomicBool::new(false));
     let gate = Arc::new(StartGate::new());
-    let mut workers = Vec::with_capacity(starts.len());
+    let mut workers = Vec::with_capacity(total);
     for start in starts {
         let exit = ListenerExit {
             left: Arc::clone(&left),
             stop: stop.cloned(),
+            committed: Arc::clone(&committed),
         };
-        left.fetch_add(1, Ordering::SeqCst);
         let worker_gate = Arc::clone(&gate);
         match std::thread::Builder::new()
             .name("ferrox-naive-listen".to_owned())
@@ -2635,12 +2706,14 @@ fn start_workers(starts: Vec<Start>, path: &str, stop: Option<&Arc<proxy::Stop>>
                 for worker in workers {
                     let _ = worker.join();
                 }
-                return false;
+                return 0;
             }
         }
     }
+    left.store(total, Ordering::SeqCst);
+    committed.store(true, Ordering::SeqCst);
     gate.release(true);
-    true
+    total
 }
 
 #[cfg(test)]
@@ -2661,6 +2734,46 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_staged_listener_does_not_close_the_shared_stop() {
+        let stop = Arc::new(proxy::Stop::new());
+        stop.expect_listeners(1);
+        let left = Arc::new(AtomicUsize::new(1));
+        drop(ListenerExit {
+            left: Arc::clone(&left),
+            stop: Some(Arc::clone(&stop)),
+            committed: Arc::new(AtomicBool::new(false)),
+        });
+        assert!(!stop.is_closed(), "a worker that never served is not owed");
+        assert_eq!(left.load(Ordering::SeqCst), 1);
+        drop(ListenerExit {
+            left,
+            stop: Some(Arc::clone(&stop)),
+            committed: Arc::new(AtomicBool::new(true)),
+        });
+        assert!(stop.is_closed());
+    }
+
+    #[test]
+    fn a_committed_address_closes_only_after_both_listeners_exit() {
+        let stop = Arc::new(proxy::Stop::new());
+        stop.expect_listeners(1);
+        let left = Arc::new(AtomicUsize::new(2));
+        let committed = Arc::new(AtomicBool::new(true));
+        drop(ListenerExit {
+            left: Arc::clone(&left),
+            stop: Some(Arc::clone(&stop)),
+            committed: Arc::clone(&committed),
+        });
+        assert!(!stop.is_closed(), "the tcp listener still holds its socket");
+        drop(ListenerExit {
+            left,
+            stop: Some(Arc::clone(&stop)),
+            committed,
+        });
+        assert!(stop.is_closed());
     }
 
     fn padded(payload: &[u8], padding: u8) -> Vec<u8> {
@@ -3057,6 +3170,10 @@ mod tests {
         let forbidden = crate::json::parse(r#"{"X-Custom": "ok", "Connection": "keep-alive"}"#)
             .expect("parses");
         assert!(header_pairs(&forbidden).is_err());
+        let spaced = crate::json::parse(r#"{"X Trace": "enabled"}"#).expect("parses");
+        assert!(header_pairs(&spaced).is_err());
+        let control = crate::json::parse(r#"{"X-Custom": "ok\r\nInjected: yes"}"#).expect("parses");
+        assert!(header_pairs(&control).is_err());
     }
 
     #[test]
@@ -3122,6 +3239,20 @@ mod tests {
         assert_eq!(parsed.port, 8443);
         assert!(parsed.quic);
         assert_eq!(parsed.pool_limit, 4);
+
+        let password_only = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "naive", "settings": {{"address": "c.test", "port": 443, "password": "p"}}, {tls}}}]}}"#
+        ))
+        .expect("parses");
+        let parsed = outbound(&password_only).expect("builds").expect("naive");
+        assert_eq!(parsed.token.as_deref(), Some(basic_token("", "p").as_str()));
+
+        let neither = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "naive", "settings": {{"address": "d.test", "port": 443}}, {tls}}}]}}"#
+        ))
+        .expect("parses");
+        let parsed = outbound(&neither).expect("builds").expect("naive");
+        assert_eq!(parsed.token, None);
     }
 
     #[test]
@@ -3239,6 +3370,13 @@ mod tests {
         .expect("parses");
         assert!(inbound_networks(&mixed, mixed.get("settings")).is_err());
         assert!(validate_inbound(&mixed).is_err());
+
+        let empty = crate::json::parse(
+            r#"{"protocol": "naive", "settings": {"users": [{"username": "u", "password": "p"}], "network": []}}"#,
+        )
+        .expect("parses");
+        assert!(inbound_networks(&empty, empty.get("settings")).is_err());
+        assert!(validate_inbound(&empty).is_err());
 
         let colon = crate::json::parse(
             r#"{"protocol": "naive", "settings": {"users": [{"username": "u:p", "password": "p"}]}}"#,
