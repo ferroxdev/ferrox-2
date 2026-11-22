@@ -31771,7 +31771,7 @@ fn serve_socks_udp_split(
             if peer_left(&client) {
                 break;
             }
-            reap_finished_lanes(&mut lanes, &mut replies);
+            reap_finished_revision_lanes(&mut lanes, &mut replies);
         }
         match relay.recv_from(&mut buf) {
             Ok((n, src)) => {
@@ -31946,7 +31946,7 @@ fn udp_bind_for(relay: SocketAddr) -> SocketAddr {
 
 /// Drop every finished worker, including one whose revision was superseded, so its waker socket and
 /// reply address do not wait for the association to close. Running workers stay for in-flight replies.
-fn reap_finished_lanes(
+fn reap_finished_revision_lanes(
     lanes: &mut HashMap<(String, u64), UdpLane>,
     replies: &mut HashSet<SocketAddr>,
 ) {
@@ -84310,7 +84310,7 @@ end
             ),
         ]);
         let mut replies = HashSet::from([finished, running]);
-        reap_finished_lanes(&mut lanes, &mut replies);
+        reap_finished_revision_lanes(&mut lanes, &mut replies);
         assert!(!lanes.contains_key(&("old".to_owned(), 0)));
         assert!(!replies.contains(&finished));
         assert!(lanes.contains_key(&("live".to_owned(), 1)));
