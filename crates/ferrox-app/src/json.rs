@@ -449,6 +449,7 @@ const HEX: &[u8; 16] = b"0123456789abcdef";
 
 /// JSONC/JSON5: `//`, `/* */` and `#` comments and trailing commas, stripped outside strings
 /// so the strict parser sees the JSON the reference's permissive reader would.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn strip_jsonc(text: &str) -> std::borrow::Cow<'_, str> {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());

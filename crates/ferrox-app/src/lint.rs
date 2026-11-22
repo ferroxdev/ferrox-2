@@ -6,7 +6,7 @@ use crate::json::Json;
 
 type Stage = fn(&mut Json) -> Result<(), String>;
 
-/// The registry, in the reference's name order. FakeDNS is the reference's only built-in stage.
+/// The registry, in the reference's name order. `FakeDNS` is the reference's only built-in stage.
 const STAGES: &[(&str, Stage)] = &[("FakeDNS", fakedns)];
 
 pub(crate) fn run(root: &mut Json) -> Result<(), String> {
@@ -16,8 +16,9 @@ pub(crate) fn run(root: &mut Json) -> Result<(), String> {
     Ok(())
 }
 
-/// The reference's FakeDNS stage: a `fakedns` nameserver with no `fakeDns` block gets the default
-/// pool the query strategy allows, and a config that defines FakeDNS without sniffing it warns.
+/// The reference's `FakeDNS` stage: a `fakedns` nameserver with no `fakeDns` block gets the default
+/// pool the query strategy allows, and a config that defines `FakeDNS` without sniffing it warns.
+#[allow(clippy::unnecessary_wraps)]
 fn fakedns(root: &mut Json) -> Result<(), String> {
     let Some(dns) = root.get("dns") else {
         return Ok(());
