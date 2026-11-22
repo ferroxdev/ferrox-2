@@ -1295,6 +1295,7 @@ struct Session {
     warp: bool,
     half_closed: bool,
     udp_quiet: Option<Instant>,
+    moved: bool,
     end: bool,
 }
 
@@ -1323,6 +1324,7 @@ impl Session {
             warp: false,
             half_closed: false,
             udp_quiet: None,
+            moved: false,
             end: false,
         }
     }
@@ -1408,6 +1410,11 @@ impl Session {
             self.flush(wire);
             if wire.closed || self.end {
                 break;
+            }
+            // Egress the origin produced behind the last wait leaves now, not after the next one: a visit that moved bytes comes back for more before it parks on the socket again.
+            if self.moved {
+                self.moved = false;
+                continue;
             }
             if !wire.fill() {
                 break;
@@ -1778,6 +1785,7 @@ impl Session {
             if !wire.send_frame(frame) {
                 return;
             }
+            self.moved = true;
             let sent = i64::try_from(take).unwrap_or(i64::MAX);
             self.send_window -= sent;
             self.connection_window -= sent;
@@ -1839,6 +1847,7 @@ impl Session {
             self.frame_body(wire, frame, id);
         }
         if pulled > 0 {
+            self.moved = true;
             self.udp_quiet = Some(Instant::now());
         }
         origin_closed
