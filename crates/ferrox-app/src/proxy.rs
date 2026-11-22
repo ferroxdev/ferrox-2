@@ -3227,7 +3227,7 @@ impl Outbound {
 /// management API added after startup and keeps alive for as long as a flow holds it.
 pub(crate) enum Picked<'a> {
     Static(&'a Outbound),
-    Dynamic(Arc<Outbound>),
+    Dynamic { id: u64, out: Arc<Outbound> },
 }
 
 impl std::ops::Deref for Picked<'_> {
@@ -3236,7 +3236,7 @@ impl std::ops::Deref for Picked<'_> {
     fn deref(&self) -> &Outbound {
         match self {
             Self::Static(out) => out,
-            Self::Dynamic(out) => out,
+            Self::Dynamic { out, .. } => out,
         }
     }
 }
@@ -3246,7 +3246,7 @@ impl Picked<'_> {
     pub(crate) fn into_owned(self) -> Outbound {
         match self {
             Self::Static(out) => out.clone(),
-            Self::Dynamic(out) => (*out).clone(),
+            Self::Dynamic { out, .. } => (*out).clone(),
         }
     }
 
@@ -3258,47 +3258,17 @@ impl Picked<'_> {
                 out.clone(),
                 LaneId::Static(std::ptr::from_ref(out) as usize),
             ),
-            Self::Dynamic(out) => {
-                let id = LaneId::Dynamic(Arc::clone(&out));
-                ((*out).clone(), id)
-            }
+            Self::Dynamic { id, out } => ((*out).clone(), LaneId::Dynamic(id)),
         }
     }
 }
 
 /// The table entry a cached lane was opened for. Static entries have a stable address; a dynamic
 /// entry keeps its `Arc` alive for the lane's life, so pointer reuse cannot forge a match.
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum LaneId {
     Static(usize),
-    Dynamic(Arc<Outbound>),
-}
-
-impl PartialEq for LaneId {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Static(left), Self::Static(right)) => left == right,
-            (Self::Dynamic(left), Self::Dynamic(right)) => Arc::ptr_eq(left, right),
-            _ => false,
-        }
-    }
-}
-
-impl Eq for LaneId {}
-
-impl Hash for LaneId {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        match self {
-            Self::Static(pointer) => {
-                0u8.hash(state);
-                pointer.hash(state);
-            }
-            Self::Dynamic(out) => {
-                1u8.hash(state);
-                (Arc::as_ptr(out) as usize).hash(state);
-            }
-        }
-    }
+    Dynamic(u64),
 }
 
 /// The lane `device_dial` resolved for a flow that still needs the front's own relay: the outbound
@@ -3330,8 +3300,21 @@ impl Lane {
 /// blackhole outbound does.
 #[derive(Debug, Default)]
 struct Dynamic {
-    added: HashMap<String, Arc<Outbound>>,
+    added: HashMap<String, DynamicOutbound>,
     removed: HashSet<String>,
+}
+
+/// One outbound the management API added. The id is never reused, so a lane cached for a removed
+/// entry cannot match the entry that replaces its tag.
+#[derive(Debug)]
+struct DynamicOutbound {
+    id: u64,
+    out: Arc<Outbound>,
+}
+
+fn next_dynamic_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// One direct-dial server inbound remembered for a later rule proof.
@@ -3611,7 +3594,13 @@ impl RouteShared {
                 masque.install_route(&shared);
             }
         }
-        dynamic.added.insert(tag.to_owned(), Arc::new(out));
+        dynamic.added.insert(
+            tag.to_owned(),
+            DynamicOutbound {
+                id: next_dynamic_id(),
+                out: Arc::new(out),
+            },
+        );
         self.changed.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -4079,7 +4068,10 @@ impl RoutePlan {
                 return Picked::Static(&self.shared.closed);
             }
             if let Some(out) = dynamic.added.get(tag) {
-                return Picked::Dynamic(Arc::clone(out));
+                return Picked::Dynamic {
+                    id: out.id,
+                    out: Arc::clone(&out.out),
+                };
             }
         }
         if Some(tag) == self.shared.default_tag.as_deref() {
@@ -5379,7 +5371,7 @@ impl RouteShared {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .added
             .values()
-            .any(|out| matches!(out.as_ref(), Outbound::Freedom(_)))
+            .any(|entry| matches!(entry.out.as_ref(), Outbound::Freedom(_)))
     }
 }
 
@@ -5394,8 +5386,8 @@ fn direct_tag(shared: &RouteShared, tag: &str) -> bool {
         if dynamic.removed.contains(tag) {
             return false;
         }
-        if let Some(out) = dynamic.added.get(tag) {
-            return match out.as_ref() {
+        if let Some(entry) = dynamic.added.get(tag) {
+            return match entry.out.as_ref() {
                 Outbound::Freedom(freedom) => !freedom.has_final_rules(),
                 _ => false,
             };
@@ -5431,8 +5423,8 @@ fn portal_tag(shared: &RouteShared, tag: &str) -> bool {
         if dynamic.removed.contains(tag) {
             return false;
         }
-        if let Some(out) = dynamic.added.get(tag) {
-            return matches!(out.as_ref(), Outbound::ReversePortal(_));
+        if let Some(entry) = dynamic.added.get(tag) {
+            return matches!(entry.out.as_ref(), Outbound::ReversePortal(_));
         }
     }
     matches!(shared.tagged.get(tag), Some(Outbound::ReversePortal(_)))
@@ -45966,11 +45958,13 @@ mod tests {
                 .expect("routing"),
         );
         let dynamic = RwLock::new(Dynamic::default());
-        dynamic
-            .write()
-            .expect("lock")
-            .added
-            .insert("api".to_owned(), Arc::new(freedom()));
+        dynamic.write().expect("lock").added.insert(
+            "api".to_owned(),
+            DynamicOutbound {
+                id: next_dynamic_id(),
+                out: Arc::new(freedom()),
+            },
+        );
         assert_eq!(
             pick_script_outbound(
                 &routing,
@@ -46183,6 +46177,12 @@ mod tests {
             Outbound::Block(_)
         ));
         assert!(shared.add_outbound("alt", freedom()).is_ok());
+        let identity = |plan: &RoutePlan| {
+            plan.pick(&asked, crate::router::Network::Tcp, None, None)
+                .into_owned_with_id()
+                .1
+        };
+        let first = identity(&plan);
         assert!(lane(&plan));
         shared.remove_outbound("alt");
         assert!(matches!(
@@ -46190,6 +46190,11 @@ mod tests {
             Outbound::Block(_)
         ));
         assert!(shared.add_outbound("alt", freedom()).is_ok());
+        let second = identity(&plan);
+        assert_ne!(
+            first, second,
+            "a replacement under the same tag has a new lane identity"
+        );
         assert!(lane(&plan));
         assert!(shared.add_outbound("new", freedom()).is_ok());
         assert!(matches!(&*plan.target("new"), Outbound::Freedom(_)));
@@ -88262,16 +88267,14 @@ mod reverse_tests {
     }
 
     #[test]
-    fn a_dynamic_lane_identity_holds_its_outbound_alive() {
+    fn a_dynamic_lane_identity_is_the_generation_of_its_outbound() {
         let out = Arc::new(Outbound::Block(ferrox_core::blackhole::Response::None));
-        let picked = Picked::Dynamic(Arc::clone(&out));
-        let (owned, identity) = picked.into_owned_with_id();
-        drop(out);
-        let LaneId::Dynamic(held) = identity else {
-            panic!("a dynamic pick keeps a dynamic identity");
+        let picked = Picked::Dynamic {
+            id: 7,
+            out: Arc::clone(&out),
         };
-        assert_eq!(Arc::strong_count(&held), 1);
-        assert!(matches!(held.as_ref(), Outbound::Block(_)));
+        let (owned, identity) = picked.into_owned_with_id();
+        assert_eq!(identity, LaneId::Dynamic(7));
         assert!(matches!(owned, Outbound::Block(_)));
     }
 
