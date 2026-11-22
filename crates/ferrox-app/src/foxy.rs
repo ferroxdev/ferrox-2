@@ -2861,7 +2861,7 @@ impl H3 {
                 // RFC 9114 §7.2.6: a GOAWAY on a request stream is H3_FRAME_UNEXPECTED, so the tunnel ends as a protocol error rather than a clean end.
                 self.fin = true;
                 self.carried = self.filled;
-                return Err(Failure::Stream);
+                Err(Failure::Stream)
             }
             _ => {
                 if length > H3_SKIP {
