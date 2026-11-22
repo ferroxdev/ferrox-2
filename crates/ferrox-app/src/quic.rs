@@ -4895,6 +4895,12 @@ impl Read for QuicStream {
                     let (n, fin) = match conn.stream_recv(self.id, buf) {
                         Ok(got) => got,
                         Err(quiche::Error::Done) => (0, false),
+                        Err(quiche::Error::StreamReset(code)) => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionReset,
+                                format!("quic stream reset: {code}"),
+                            ));
+                        }
                         Err(error) => {
                             return Err(std::io::Error::other(format!(
                                 "quic stream read: {error:?}"
@@ -5123,6 +5129,13 @@ impl QuicStream {
     /// Stop the stream in both directions; the connection itself is untouched.
     pub(crate) fn close(&self) {
         stop_stream(&self.conn, &self.sock, self.id);
+    }
+    /// Close the whole connection with an HTTP/3 application error: a frame a request stream may not carry is a connection error, not a stream reset.
+    pub(crate) fn close_connection(&self, code: u64) {
+        if let Ok(mut conn) = self.conn.lock() {
+            let _ = conn.close(true, code, b"");
+            flush_egress(&mut conn, &self.sock);
+        }
     }
 
     /// Stop reading while keeping the send direction, so a FIN already sent is not reset.
@@ -7890,6 +7903,52 @@ mod tests {
             }
         }
         assert_eq!(&after[..got], b"after");
+    }
+
+    /// A peer's `RESET_STREAM` ends this direction as an error, not a clean fin: the caller must not
+    /// read the reset request as a completed one.
+    #[test]
+    fn a_reset_stream_reads_as_connection_reset() {
+        let (mut client, mut server) = lane_pair();
+        client.conn.stream_send(0, b"q", false).expect("opens");
+        pass(
+            &mut client.conn,
+            &client.sock,
+            &mut server.conn,
+            &server.sock,
+            server.addr,
+        );
+        let mut room = [0u8; 8];
+        let (n, _) = server.conn.stream_recv(0, &mut room).expect("reads");
+        assert_eq!(&room[..n], b"q");
+        server
+            .conn
+            .stream_shutdown(0, quiche::Shutdown::Write, 42)
+            .expect("resets");
+        pass(
+            &mut server.conn,
+            &server.sock,
+            &mut client.conn,
+            &client.sock,
+            client.addr,
+        );
+        let mut stream = QuicStream {
+            conn: std::sync::Arc::new(std::sync::Mutex::new(client.conn)),
+            sock: std::sync::Arc::new(client.sock),
+            id: 0,
+            meter: crate::stats::Meter::default(),
+            peer_fin: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fin_sent: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            prefaced: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            activity: std::sync::Arc::new(Activity::new()),
+            stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stalled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            owner: None,
+        };
+        let error = stream
+            .read(&mut [0u8; 8])
+            .expect_err("a reset is not a clean end");
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
     }
 
     /// A write on a connection the peer closed returns at once; waiting `SEND_WAIT` for a
