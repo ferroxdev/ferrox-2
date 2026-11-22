@@ -1814,9 +1814,10 @@ mod tests {
         let port = serve_inbound("127.0.0.1:0", &identity, &settings, Arc::new(Echo), None)
             .expect("the h3 listener binds");
         let client = client(port, roots);
-        let wire = raw_stream(&client);
-        send_frame(&wire, frames::H3_CANCEL_PUSH, &[]);
-        let mut reader = H3Reader::new(wire);
+        let mut reader = H3Reader::new(raw_stream(&client));
+        frames::quic_varint(&mut reader.buf, frames::H3_CANCEL_PUSH);
+        frames::quic_varint(&mut reader.buf, 0);
+        reader.buf_init = reader.buf.len();
         let mut buf = [0u8; 8];
         assert_eq!(
             reader
