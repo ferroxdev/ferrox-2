@@ -1945,6 +1945,8 @@ thread_local! {
     static DIAL_SOCKOPTS: std::cell::RefCell<Option<Arc<crate::sockopt::SocketOptions>>> = const { std::cell::RefCell::new(None) };
     /// The family the outbound a flow entered resolves a named target to before the request carries it.
     static TARGET_STRATEGY: std::cell::Cell<Option<FreedomDomain>> = const { std::cell::Cell::new(None) };
+    /// The deadline a health probe's worker gives its own upstream dials.
+    static PROBE_DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
 }
 
 struct SendThroughGuard;
@@ -2002,6 +2004,23 @@ impl TargetStrategyGuard {
 impl Drop for TargetStrategyGuard {
     fn drop(&mut self) {
         TARGET_STRATEGY.with(|cell| cell.set(None));
+    }
+}
+
+/// The deadline one probe's worker hands its upstream dials, cleared on drop so a lane thread does
+/// not carry a probe's clock into the next flow.
+struct ProbeDeadlineGuard;
+
+impl ProbeDeadlineGuard {
+    fn enter(deadline: Option<Instant>) -> Self {
+        PROBE_DEADLINE.with(|cell| cell.set(deadline));
+        Self
+    }
+}
+
+impl Drop for ProbeDeadlineGuard {
+    fn drop(&mut self) {
+        PROBE_DEADLINE.with(|cell| cell.set(None));
     }
 }
 
@@ -10056,6 +10075,7 @@ fn tunnel_stream_with(
     let _ = client.set_nodelay(true);
     let _ = client.set_read_timeout(Some(timeout));
     let _ = client.set_write_timeout(Some(timeout));
+    let probe_deadline = matches!(front, Front::Probe).then(|| Instant::now() + timeout);
     thread::Builder::new()
         .name(name.to_owned())
         .spawn({
@@ -10065,6 +10085,7 @@ fn tunnel_stream_with(
             let strategy = settings.and_then(|settings| settings.strategy);
             let tag = settings.and_then(|settings| settings.tag.clone());
             move || {
+                let _probe = ProbeDeadlineGuard::enter(probe_deadline);
                 let _source = SendThroughGuard::enter(source);
                 let _sockopts = DialSockoptsGuard::enter(sockopts);
                 let _strategy = TargetStrategyGuard::enter(strategy);
@@ -23313,6 +23334,15 @@ fn dial_tls_session(
         let mask = cut.as_ref().or(mask);
         let uplink = uplink.with_mask(mask);
         let uplink = arm_sni(current, uplink, fast);
+        if let Some(deadline) = PROBE_DEADLINE.with(std::cell::Cell::get) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            let _ = uplink.set_read_timeout(Some(left));
+            uplink.set_read_until(Some(deadline));
+            let _ = uplink.set_write_timeout(Some(left));
+        }
         let Ok(mut session) = ferrox_core::tls::connect(current, uplink) else {
             note_dial_failure(server, Failure::new(Stage::SocketConnected, Kind::Local));
             return None;
@@ -34122,6 +34152,22 @@ pub(crate) fn socks_udp_parts<'a>(
     (head.as_slice(), payload)
 }
 
+/// The address a mux's UDP lane sends to, with the selected leaf's strategy applied before the
+/// name is resolved, so a forced family refuses a name no strategy could carry.
+fn pool_dest(dest: Destination) -> Option<SocketAddr> {
+    if let Some(strategy) = TARGET_STRATEGY.with(std::cell::Cell::get) {
+        match resolve_target(&dest, strategy) {
+            TargetPick::Address(Destination::Address(address)) => return Some(address),
+            TargetPick::Refuse => return None,
+            _ => {}
+        }
+    }
+    match dest {
+        Destination::Address(address) => Some(address),
+        Destination::Name(host, port) => (host.as_str(), port).to_socket_addrs().ok()?.next(),
+    }
+}
+
 /// One association's datagrams over the outbound's shared XUDP carrier: one flow per destination
 /// whose replies land on this association's own relay, and the 443 policy applied before the mux.
 #[allow(clippy::too_many_arguments)]
@@ -34153,10 +34199,13 @@ fn serve_socks_udp_pool<F, G>(
         if !source_admitted(peer, pinned, src) {
             continue;
         }
-        let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
+        let Some((dest, payload)) = parse_socks_udp_dest(&buf[..n]) else {
             continue;
         };
         let at = payload.as_ptr() as usize - buf.as_ptr() as usize;
+        let Some(dest) = pool_dest(dest) else {
+            continue;
+        };
         let len = payload.len();
         if len == 0 || !allowed(&dest) {
             continue;
@@ -55653,6 +55702,32 @@ mod tests {
         server.join().expect("joins");
     }
 
+    /// A probe's worker hands its deadline to the TLS dial, so a peer that accepts and never speaks
+    /// cannot keep the worker past the sweep.
+    #[test]
+    fn a_probe_tls_handshake_does_not_outlive_its_deadline() {
+        use std::time::Instant;
+
+        let (_server_config, client_config) = carried_tls_configs();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let server: SocketAddr = listener.local_addr().expect("addr");
+        let (release, hold) = std::sync::mpsc::channel();
+        let serving = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let _ = hold.recv_timeout(Duration::from_secs(10));
+            drop(stream);
+        });
+        let started = Instant::now();
+        let deadline = ProbeDeadlineGuard::enter(Some(started + Duration::from_millis(250)));
+        let refused = dial_tls_session(&server, &client_config, None).is_none();
+        drop(deadline);
+        let elapsed = started.elapsed();
+        let _ = release.send(());
+        serving.join().expect("joins");
+        assert!(refused, "a silent peer must fail the probe handshake");
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+    }
+
     /// A dialled carrier's reader drives the transport: the wait a read parks on is not the lock
     /// the writer seals under, so a silent peer costs the other direction nothing.
     #[test]
@@ -64926,6 +65001,20 @@ mod tests {
         assert!(parse_socks_udp(&[0, 0, 0]).is_none());
         assert!(parse_socks_udp(&[0, 0, 0, 9, 1, 2, 3]).is_none());
         assert!(parse_socks_udp(&[0, 0, 0, 1, 127, 0, 0]).is_none());
+    }
+
+    /// The mux's UDP lane resolves a name only after the selected leaf's strategy has looked at
+    /// it, so a forced family refuses a name it cannot carry instead of sending IPv4.
+    #[test]
+    fn a_pool_destination_takes_the_strategy_before_the_mux() {
+        let name = || Destination::Name("127.0.0.1".to_owned(), 53);
+        {
+            let _strategy = TargetStrategyGuard::enter(Some(FreedomDomain::ForceIp6));
+            assert!(pool_dest(name()).is_none());
+        }
+        assert!(pool_dest(name()).is_some());
+        let address: SocketAddr = "127.0.0.1:53".parse().expect("addr");
+        assert_eq!(pool_dest(Destination::Address(address)), Some(address));
     }
 
     /// The slice reader must agree with the stream reader on the address and on whether the body parses at all: that identity, over every shape a relayed datagram carries and the forged tails a peer can send, is the gate that dropping the cursor changed nothing but the copies.
