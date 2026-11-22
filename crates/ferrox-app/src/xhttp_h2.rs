@@ -909,14 +909,14 @@ impl H2StreamReader {
                     .state
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
-                if let Some(status) = st.status {
-                    return Some((status & !PADDING_BIT, status & PADDING_BIT != 0));
-                }
                 if st.dead
                     || self.conn.dead.load(Ordering::SeqCst)
                     || (st.status.is_none() && st.read_ended())
                 {
                     return None;
+                }
+                if let Some(status) = st.status {
+                    return Some((status & !PADDING_BIT, status & PADDING_BIT != 0));
                 }
             }
             match self.pump_head(deadline) {
@@ -2918,12 +2918,14 @@ impl H2Client {
         self.conn.close_client();
     }
 
-    /// The pool may hand this connection to another session only while both halves are alive, the
-    /// peer has not asked for the connection to end, and its stream table has room for one more.
+    /// Whether the transport can still carry a stream at all; a full stream table is capacity, not
+    /// a reason to retire a connection that still counts against the pool limit.
     pub(crate) fn reusable(&self) -> bool {
-        if self.conn.dead.load(Ordering::SeqCst) || self.conn.goaway.load(Ordering::SeqCst) {
-            return false;
-        }
+        !self.conn.dead.load(Ordering::SeqCst) && !self.conn.goaway.load(Ordering::SeqCst)
+    }
+
+    /// Whether one more stream fits in this connection's table.
+    pub(crate) fn has_capacity(&self) -> bool {
         let peer_max = self.conn.peer_max.load(Ordering::SeqCst);
         self.conn
             .streams
@@ -2998,16 +3000,7 @@ impl H2Client {
         end_request: bool,
     ) -> Option<(H2StreamReader, H2StreamOut)> {
         let _gate = self.conn.open_gate.lock().ok()?;
-        if self.conn.goaway.load(Ordering::SeqCst) {
-            return None;
-        }
-        let peer_max = self.conn.peer_max.load(Ordering::SeqCst);
-        if self
-            .conn
-            .streams
-            .lock()
-            .is_ok_and(|streams| streams.len() >= MAX_STREAMS as usize || streams.len() >= peer_max)
-        {
+        if self.conn.goaway.load(Ordering::SeqCst) || !self.has_capacity() {
             return None;
         }
         let sid = self.next.fetch_add(2, Ordering::SeqCst);

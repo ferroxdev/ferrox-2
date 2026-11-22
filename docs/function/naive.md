@@ -20,7 +20,10 @@ graph TD
     F --> R["relay both directions"]
     R --> A["Naive inbound<br/>H2 or H3"]
     A --> C["CONNECT + credential + Padding gate"]
-    C --> D["dial -connect-authority"]
+    C --> M{"UoT magic?"}
+    M -- yes --> V["UDP4/UDP6 sockets<br/>datagram relay"]
+    M -- no --> D["dial -connect-authority"]
+    V --> R
     D --> R
     S --> U{"udp_over_tcp?"}
     U -- yes --> Q["UoT stream<br/>magic authority + datagrams"]

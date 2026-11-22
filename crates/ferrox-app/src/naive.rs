@@ -717,8 +717,10 @@ fn uot_out_reader(
         let (from, payload) = packet;
         let destination = if connect { target.clone() } else { from };
         let frame = uot_socks_frame(&destination, &payload);
-        if relay.send_to(&frame, client).is_err() {
-            break;
+        if let Err(error) = relay.send_to(&frame, client) {
+            if !crate::tun_stack::refused(&error) {
+                break;
+            }
         }
     }
     done.store(true, Ordering::Relaxed);
@@ -1186,7 +1188,14 @@ impl H2Service for NaiveH2Service {
             }
             let writer = H2OutWrite { out: out.clone() };
             let stream = NaiveStream::new(Box::new(reader), Box::new(writer), End::H2(out), true);
-            std::thread::spawn(move || serve_uot_stream(&stream, version));
+            let reset = stream.clone();
+            let spawned = std::thread::Builder::new()
+                .name("ferrox-naive-uot".to_owned())
+                .spawn(move || serve_uot_stream(&stream, version));
+            if spawned.is_err() {
+                reset.abort();
+                return false;
+            }
             return true;
         }
         // Answer 200 only after the dial succeeds; the dial itself runs off the demux thread.
@@ -1333,7 +1342,44 @@ fn serve_h2_connection(
     });
 }
 
-type UotOpen = Result<((String, SocketAddr), NaiveStream, Arc<AtomicBool>), (String, SocketAddr)>;
+struct UotCancel {
+    stream: NaiveStream,
+    done: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl UotCancel {
+    fn new(stream: &NaiveStream, done: &Arc<AtomicBool>) -> Self {
+        Self {
+            stream: stream.clone(),
+            done: Arc::clone(done),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UotCancel {
+    fn drop(&mut self) {
+        if self.armed {
+            self.done.store(true, Ordering::Relaxed);
+            self.stream.abort();
+        }
+    }
+}
+
+type UotOpen = Result<
+    (
+        (String, SocketAddr),
+        NaiveStream,
+        Arc<AtomicBool>,
+        UotCancel,
+    ),
+    (String, SocketAddr),
+>;
 
 struct PendingUot {
     target: Destination,
@@ -1472,15 +1518,13 @@ impl NaiveOut {
             });
             while let Ok(opened) = open_rx.try_recv() {
                 match opened {
-                    Ok((key, stream, done)) => {
+                    Ok((key, stream, done, mut cancel)) => {
                         let Some(lane) = pending.remove(&key) else {
-                            done.store(true, Ordering::Relaxed);
-                            stream.abort();
+                            drop(cancel);
                             continue;
                         };
                         if closing.load(Ordering::Relaxed) {
-                            done.store(true, Ordering::Relaxed);
-                            stream.abort();
+                            drop(cancel);
                             continue;
                         }
                         let (tx, rx) = std::sync::mpsc::sync_channel(MAX_UOT_PENDING_PACKETS);
@@ -1526,6 +1570,7 @@ impl NaiveOut {
                                     used: use_tick,
                                 },
                             );
+                            cancel.disarm();
                         }
                     }
                     Err(key) => {
@@ -1642,8 +1687,9 @@ impl NaiveOut {
                             let _ = tx.send(Err(open_key));
                             return;
                         }
-                        if let Err(error) = tx.send(Ok((open_key, stream, done))) {
-                            if let Ok((_, stream, done)) = error.0 {
+                        let cancel = UotCancel::new(&stream, &done);
+                        if let Err(error) = tx.send(Ok((open_key, stream, done, cancel))) {
+                            if let Ok((_, stream, done, _cancel)) = error.0 {
                                 done.store(true, Ordering::Relaxed);
                                 stream.abort();
                             }
@@ -1678,7 +1724,7 @@ impl NaiveOut {
         }
         drop(open_tx);
         while let Ok(opened) = open_rx.try_recv() {
-            if let Ok((_, stream, done)) = opened {
+            if let Ok((_, stream, done, _cancel)) = opened {
                 done.store(true, Ordering::Relaxed);
                 stream.abort();
             }
@@ -1688,7 +1734,7 @@ impl NaiveOut {
             .name("ferrox-naive-uot-drain".to_owned())
             .spawn(move || {
                 while let Ok(opened) = open_rx.recv() {
-                    if let Ok((_, stream, done)) = opened {
+                    if let Ok((_, stream, done, _cancel)) = opened {
                         done.store(true, Ordering::Relaxed);
                         stream.abort();
                     }
@@ -1711,12 +1757,23 @@ impl NaiveOut {
                 client.settle();
                 client.reusable()
             });
+            let len = pool.len();
+            if len > 0 {
+                let start = self.h2_next.fetch_add(1, Ordering::Relaxed);
+                for offset in 0..len {
+                    let at = start.wrapping_add(offset) % len;
+                    if pool[at].has_capacity() {
+                        return Some(Arc::clone(&pool[at]));
+                    }
+                }
+            }
             let inflight = self.h2_inflight.load(Ordering::Relaxed);
             if pool.len() + inflight < self.pool_limit {
                 self.h2_inflight.fetch_add(1, Ordering::Relaxed);
                 drop(pool);
                 let client = self.connect_h2();
-                if let Ok(mut pool) = self.h2.lock() {
+                let mut published = self.h2.lock();
+                if let Ok(pool) = published.as_mut() {
                     if let Some(client) = &client {
                         if pool.len() < self.pool_limit {
                             pool.push(Arc::clone(client));
@@ -1724,18 +1781,18 @@ impl NaiveOut {
                     }
                 }
                 self.h2_inflight.fetch_sub(1, Ordering::Relaxed);
+                drop(published);
                 self.h2_ready.notify_all();
                 return client;
-            }
-            if !pool.is_empty() {
-                let at = self.h2_next.fetch_add(1, Ordering::Relaxed) % pool.len();
-                return Some(Arc::clone(&pool[at]));
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return None;
             }
-            let (next, _) = self.h2_ready.wait_timeout(pool, left).ok()?;
+            let (next, _) = self
+                .h2_ready
+                .wait_timeout(pool, left.min(crate::budgets::RELAY_POLL))
+                .ok()?;
             pool = next;
         }
     }
@@ -1783,9 +1840,13 @@ impl NaiveOut {
     }
 
     fn discard_h2(&self, client: &Arc<H2Client>) {
+        if client.reusable() {
+            return;
+        }
         if let Ok(mut pool) = self.h2.lock() {
             pool.retain(|pooled| !Arc::ptr_eq(pooled, client));
         }
+        self.h2_ready.notify_all();
     }
 
     fn h3_client(self: &Arc<Self>) -> Option<Arc<H3Client>> {
@@ -1798,7 +1859,8 @@ impl NaiveOut {
                 self.h3_inflight.fetch_add(1, Ordering::Relaxed);
                 drop(pool);
                 let client = self.connect_h3();
-                if let Ok(mut pool) = self.h3.lock() {
+                let mut published = self.h3.lock();
+                if let Ok(pool) = published.as_mut() {
                     if let Some(client) = &client {
                         if pool.len() < self.pool_limit {
                             pool.push(Arc::clone(client));
@@ -1806,6 +1868,7 @@ impl NaiveOut {
                     }
                 }
                 self.h3_inflight.fetch_sub(1, Ordering::Relaxed);
+                drop(published);
                 self.h3_ready.notify_all();
                 return client;
             }
@@ -2006,6 +2069,9 @@ fn header_pairs(node: &Json) -> Result<Option<Vec<(String, String)>>, String> {
             },
             _ => continue,
         };
+        if name.eq_ignore_ascii_case("te") && !value.eq_ignore_ascii_case("trailers") {
+            return Err(format!("naive extra_headers `{name}` must be `trailers`"));
+        }
         headers.push((name.to_ascii_lowercase(), value));
     }
     Ok(Some(headers))
@@ -2199,10 +2265,12 @@ pub(crate) fn inbound_sockets(inbound: &Json) -> (bool, bool) {
     if security != "tls" && !security.is_empty() && security != "none" {
         return (false, false);
     }
-    let (mut tcp, mut udp) = inbound_networks(inbound, settings).unwrap_or((false, false));
+    let (tcp, mut udp) = inbound_networks(inbound, settings).unwrap_or((false, false));
     if security != "tls" {
+        if !tcp {
+            return (false, false);
+        }
         udp = false;
-        tcp = true;
     }
     (tcp, udp)
 }
@@ -2253,7 +2321,17 @@ fn inbound_config(inbound: &Json) -> Result<(Users, (bool, bool)), String> {
     if users.is_empty() {
         return Err("naive inbound names no users".to_owned());
     }
-    Ok((users, inbound_networks(inbound, settings)?))
+    let security = crate::config::stream_security(inbound);
+    if !matches!(security.as_str(), "" | "none" | "tls") {
+        return Err(format!(
+            "naive inbound asks for `{security}`: serves nothing"
+        ));
+    }
+    let (tcp, udp) = inbound_networks(inbound, settings)?;
+    if udp && !tcp && security != "tls" {
+        return Err("naive inbound asks for QUIC without TLS: serves nothing".to_owned());
+    }
+    Ok((users, (tcp, udp)))
 }
 
 pub(crate) fn validate_inbound(inbound: &Json) -> Result<(), String> {
@@ -2311,10 +2389,15 @@ fn tcp_start(
             let users = Arc::clone(&users);
             let identity = identity.clone();
             let session = stop.as_ref().and_then(|stop| stop.track_session(&stream));
-            std::thread::spawn(move || {
-                let _session = session;
-                serve_h2_connection(stream, identity, users, freedom);
-            });
+            let spawned = std::thread::Builder::new()
+                .name("ferrox-naive-h2".to_owned())
+                .spawn(move || {
+                    let _session = session;
+                    serve_h2_connection(stream, identity, users, freedom);
+                });
+            if spawned.is_err() {
+                continue;
+            }
         }
         drop(listener);
         drop(exit);
@@ -2364,7 +2447,7 @@ pub(crate) fn serve_inbound(
     stop: Option<&Arc<proxy::Stop>>,
 ) -> bool {
     let settings = inbound.get("settings");
-    let (users, (mut tcp, mut udp)) = match inbound_config(inbound) {
+    let (users, (tcp, mut udp)) = match inbound_config(inbound) {
         Ok(config) => config,
         Err(error) => {
             eprintln!("naive inbound in {path}: {error}");
@@ -2402,9 +2485,12 @@ pub(crate) fn serve_inbound(
         }
     };
     if identity.is_none() {
+        if !tcp {
+            eprintln!("naive inbound in {path} asks for QUIC without TLS: serves nothing");
+            return false;
+        }
         eprintln!("naive inbound in {path} has no TLS: serves plaintext HTTP/2");
         udp = false;
-        tcp = true;
     }
     if !tcp && !udp {
         eprintln!("naive inbound in {path} names no network: serves nothing");
@@ -2967,6 +3053,12 @@ mod tests {
         )
         .expect("parses");
         assert_eq!(inbound_sockets(&udp), (false, true));
+        let plain_udp = crate::json::parse(
+            r#"{"protocol": "naive", "settings": {"users": [{"username": "u", "password": "p"}], "network": "udp"}}"#,
+        )
+        .expect("parses");
+        assert_eq!(inbound_sockets(&plain_udp), (false, false));
+        assert!(validate_inbound(&plain_udp).is_err());
     }
 
     #[test]
@@ -3057,5 +3149,16 @@ mod tests {
         .expect("parses");
         assert!(inbound_users(&colon, colon.get("settings")).is_err());
         assert!(validate_inbound(&colon).is_err());
+    }
+
+    #[test]
+    fn extra_headers_keep_only_the_trailers_te() {
+        let trailers = crate::json::parse(r#"{"TE": "trailers"}"#).expect("parses");
+        assert_eq!(
+            header_pairs(&trailers).expect("headers"),
+            Some(vec![("te".to_owned(), "trailers".to_owned())])
+        );
+        let gzip = crate::json::parse(r#"{"TE": "gzip"}"#).expect("parses");
+        assert!(header_pairs(&gzip).is_err());
     }
 }

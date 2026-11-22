@@ -15,6 +15,8 @@ use crate::xhttp::{XhttpMode, XhttpSettings};
 const TICK: Duration = Duration::from_millis(20);
 const POLL: Duration = Duration::from_millis(5);
 const READ_ROOM: usize = 16 * 1024;
+const H3_CLOSED_CRITICAL_STREAM: u64 = 0x0104;
+const H3_ID_ERROR: u64 = 0x0108;
 
 /// One request stream's byte transport: a served stream on the QUIC driver, or one the client
 /// opened on its own connection. Both clones share the connection, never the buffered bytes.
@@ -794,10 +796,13 @@ fn synth_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Option<Vec<u8>> {
             .map(|(_, value)| value.as_slice())
     };
     let method = field(b":method")?;
-    let target = match field(b":path") {
-        Some(path) => path,
-        None if method == b"CONNECT" => field(b":authority")?,
-        None => return None,
+    let target = if method == b"CONNECT" {
+        if field(b":path").is_some() || field(b":scheme").is_some() {
+            return None;
+        }
+        field(b":authority")?
+    } else {
+        field(b":path")?
     };
     if !h1_token(method) || !h1_token(target) {
         return None;
@@ -972,6 +977,9 @@ impl Read for ClientStream {
         }
         let deadline = Instant::now() + crate::budgets::RELAY_POLL;
         loop {
+            if self.owner.rejected(self.id) {
+                return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+            }
             let Ok(mut conn) = self.conn.lock() else {
                 return Err(std::io::Error::other("h3 connection lock poisoned"));
             };
@@ -1017,6 +1025,9 @@ impl Write for ClientStream {
         let deadline = Instant::now() + crate::budgets::relay_stall();
         let mut rest = buf;
         while !rest.is_empty() {
+            if self.owner.rejected(self.id) {
+                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+            }
             let Ok(mut conn) = self.conn.lock() else {
                 return Err(std::io::Error::other("h3 connection lock poisoned"));
             };
@@ -1063,7 +1074,7 @@ impl ClientStream {
             let Ok(mut conn) = self.conn.lock() else {
                 return Err(std::io::Error::other("h3 connection lock poisoned"));
             };
-            if self.owner.draining.load(Ordering::Relaxed) {
+            if self.owner.draining.load(Ordering::Relaxed) || self.owner.rejected(self.id) {
                 return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
             }
             match conn.stream_send(self.id, rest, false) {
@@ -1113,6 +1124,7 @@ pub(crate) struct H3Client {
     next: AtomicU64,
     dead: Arc<AtomicBool>,
     draining: Arc<AtomicBool>,
+    goaway: Arc<AtomicU64>,
 }
 
 impl Drop for H3Client {
@@ -1130,6 +1142,10 @@ impl H3Client {
     /// connection closes, and a pooled client that fails this is dropped rather than reused.
     pub(crate) fn reusable(&self) -> bool {
         !self.dead.load(Ordering::Relaxed) && !self.draining.load(Ordering::Relaxed)
+    }
+
+    fn rejected(&self, id: u64) -> bool {
+        id >= self.goaway.load(Ordering::SeqCst)
     }
 
     pub(crate) fn connect(
@@ -1237,10 +1253,12 @@ impl H3Client {
         let conn = Arc::new(Mutex::new(conn));
         let dead = Arc::new(AtomicBool::new(false));
         let draining = Arc::new(AtomicBool::new(false));
+        let goaway = Arc::new(AtomicU64::new(u64::MAX));
         let pump = Arc::clone(&conn);
         let pump_sock = Arc::clone(&sock);
         let pump_dead = Arc::clone(&dead);
         let pump_draining = Arc::clone(&draining);
+        let pump_goaway = Arc::clone(&goaway);
         std::thread::Builder::new()
             .name("xhttp-h3-pump".to_owned())
             .spawn(move || {
@@ -1252,6 +1270,7 @@ impl H3Client {
                     net,
                     &pump_dead,
                     &pump_draining,
+                    &pump_goaway,
                 );
             })
             .ok()?;
@@ -1261,6 +1280,7 @@ impl H3Client {
             next: AtomicU64::new(0),
             dead,
             draining,
+            goaway,
         }))
     }
 
@@ -1289,6 +1309,9 @@ impl H3Client {
             return None;
         }
         let id = self.next.fetch_add(4, Ordering::SeqCst);
+        if self.rejected(id) {
+            return None;
+        }
         let wire = Wire::Client(ClientStream {
             owner: Arc::clone(self),
             conn: Arc::clone(&self.conn),
@@ -1474,6 +1497,7 @@ fn sweep(
     moved: bool,
     control: &mut ControlState,
     draining: &Arc<AtomicBool>,
+    goaway: &AtomicU64,
 ) -> bool {
     let Ok(mut conn) = conn.lock() else {
         return false;
@@ -1487,8 +1511,10 @@ fn sweep(
         let _ = conn.close(false, 0, b"rebind");
         return false;
     }
-    if h3_control_goaway(&mut conn, control) {
-        draining.store(true, Ordering::Relaxed);
+    match h3_control_goaway(&mut conn, control, goaway) {
+        Some(true) => draining.store(true, Ordering::Relaxed),
+        Some(false) => {}
+        None => return false,
     }
     true
 }
@@ -1505,7 +1531,17 @@ fn drain_stream(conn: &mut quiche::Connection, id: u64) {
 /// The server's HTTP/3 control stream: its type, SETTINGS, then a GOAWAY that ends new requests but
 /// not the tunnels already open. The stream is found by its type, and a partial frame stays
 /// buffered until the next read completes it.
-fn h3_control_goaway(conn: &mut quiche::Connection, control: &mut ControlState) -> bool {
+fn h3_control_goaway(
+    conn: &mut quiche::Connection,
+    control: &mut ControlState,
+    goaway: &AtomicU64,
+) -> Option<bool> {
+    if control.id.is_some_and(|id| conn.stream_finished(id))
+        || control.critical.iter().any(|id| conn.stream_finished(*id))
+    {
+        let _ = conn.close(false, H3_CLOSED_CRITICAL_STREAM, b"critical stream closed");
+        return None;
+    }
     let ids: Vec<u64> = conn
         .readable()
         .filter(|id| *id % 4 == 3 && !control.skipped.contains(id))
@@ -1524,14 +1560,19 @@ fn h3_control_goaway(conn: &mut quiche::Connection, control: &mut ControlState) 
                     }
                     _ => {
                         // An unknown stream has no reader here, so stop its payload holding credit.
-                        let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
-                        control.skipped.push(id);
+                        if conn.stream_shutdown(id, quiche::Shutdown::Read, 0).is_err() {
+                            control.skipped.push(id);
+                        }
                         continue;
                     }
                 }
             }
             if Some(id) != control.id {
                 drain_stream(conn, id);
+                if control.critical.contains(&id) && conn.stream_finished(id) {
+                    let _ = conn.close(false, H3_CLOSED_CRITICAL_STREAM, b"critical stream closed");
+                    return None;
+                }
                 continue;
             }
         }
@@ -1539,19 +1580,29 @@ fn h3_control_goaway(conn: &mut quiche::Connection, control: &mut ControlState) 
         while let Ok((n, _)) = conn.stream_recv(id, &mut chunk) {
             control.buf.extend_from_slice(&chunk[..n]);
         }
+        if conn.stream_finished(id) {
+            let _ = conn.close(false, H3_CLOSED_CRITICAL_STREAM, b"critical stream closed");
+            return None;
+        }
     }
-    h3_control_frames(&mut control.buf, &mut control.skip)
+    match h3_control_frames(&mut control.buf, &mut control.skip, goaway) {
+        Some(drain) => Some(drain),
+        None => {
+            let _ = conn.close(false, H3_ID_ERROR, b"invalid GOAWAY");
+            None
+        }
+    }
 }
 
 /// Consume buffered control frames, skipping an unknown payload as it arrives so the next frame
 /// still starts on its own boundary; a GOAWAY after a large frame is not lost with the payload.
-fn h3_control_frames(control: &mut Vec<u8>, skip: &mut u64) -> bool {
+fn h3_control_frames(control: &mut Vec<u8>, skip: &mut u64, goaway: &AtomicU64) -> Option<bool> {
     if *skip > 0 {
         let drop = (*skip).min(control.len() as u64) as usize;
         control.drain(..drop);
         *skip -= drop as u64;
         if *skip > 0 {
-            return false;
+            return Some(false);
         }
     }
     loop {
@@ -1578,15 +1629,24 @@ fn h3_control_frames(control: &mut Vec<u8>, skip: &mut u64) -> bool {
             }
             break;
         }
-        control.drain(..end);
         if kind == 0x7 {
-            return true;
+            let mut cursor = at;
+            let Some(cutoff) = frames::quic_read(&control[..end], &mut cursor) else {
+                return None;
+            };
+            if cursor != end || cutoff % 4 != 0 {
+                return None;
+            }
+            goaway.fetch_min(cutoff, Ordering::SeqCst);
+            control.drain(..end);
+            return Some(true);
         }
+        control.drain(..end);
     }
     if *skip == 0 && control.len() > 64 * 1024 {
         control.clear();
     }
-    false
+    Some(false)
 }
 
 /// Read just the stream-type varint from a unidirectional stream, leaving its frames unread and
@@ -1647,6 +1707,7 @@ fn pump_connection(
     generation: u64,
     dead: &Arc<AtomicBool>,
     draining: &Arc<AtomicBool>,
+    goaway: &AtomicU64,
 ) {
     let mut local = local;
     let mut generation = generation;
@@ -1690,14 +1751,14 @@ fn pump_connection(
             match quic::recv_batch(sock, &mut batch) {
                 quic::Drain::Read => {
                     if drain_batch(conn, sock, local, &mut batch, moved)
-                        && sweep(conn, sock, local, moved, &mut control, draining)
+                        && sweep(conn, sock, local, moved, &mut control, draining, goaway)
                     {
                         continue;
                     }
                     break;
                 }
                 quic::Drain::Empty => {
-                    if sweep(conn, sock, local, moved, &mut control, draining) {
+                    if sweep(conn, sock, local, moved, &mut control, draining, goaway) {
                         continue;
                     }
                     break;
@@ -1720,7 +1781,7 @@ fn pump_connection(
                 ) => {}
             Err(_) => break,
         }
-        if !sweep(conn, sock, local, moved, &mut control, draining) {
+        if !sweep(conn, sock, local, moved, &mut control, draining, goaway) {
             break;
         }
     }
@@ -2639,15 +2700,39 @@ mod tests {
         wire.extend(std::iter::repeat_n(0u8, 65_536));
         frames::quic_varint(&mut wire, 0x7);
         frames::quic_varint(&mut wire, 1);
-        wire.push(0);
+        frames::quic_varint(&mut wire, 4);
         let split = 50_000;
         let mut control = wire[..split].to_vec();
         let mut skip = 0;
-        assert!(!h3_control_frames(&mut control, &mut skip));
+        let goaway = AtomicU64::new(u64::MAX);
+        assert_eq!(
+            h3_control_frames(&mut control, &mut skip, &goaway),
+            Some(false)
+        );
         assert!(skip > 0, "the unknown payload is skipped incrementally");
         control.extend_from_slice(&wire[split..]);
-        assert!(h3_control_frames(&mut control, &mut skip));
+        assert_eq!(
+            h3_control_frames(&mut control, &mut skip, &goaway),
+            Some(true)
+        );
         assert_eq!(skip, 0);
+        assert_eq!(goaway.load(Ordering::SeqCst), 4);
         assert_eq!(control, [] as [u8; 0]);
+    }
+
+    #[test]
+    fn a_goaway_must_name_a_client_bidirectional_stream() {
+        let mut control = Vec::new();
+        frames::quic_varint(&mut control, 0x7);
+        frames::quic_varint(&mut control, 1);
+        frames::quic_varint(&mut control, 1);
+        let goaway = AtomicU64::new(u64::MAX);
+        let mut skip = 0;
+        assert_eq!(
+            h3_control_frames(&mut control, &mut skip, &goaway),
+            None,
+            "a server stream is not a client request cutoff"
+        );
+        assert_eq!(goaway.load(Ordering::SeqCst), u64::MAX);
     }
 }
