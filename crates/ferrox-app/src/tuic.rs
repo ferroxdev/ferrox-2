@@ -41,6 +41,7 @@ const RETRY_TOKEN_TAG: usize = 32;
 const MAX_ASSOCIATIONS_PER_SESSION: usize = 256;
 const MAX_UDP_SOCKETS: usize = 2048;
 const MAX_TUIC_LANES: usize = 64;
+const LANES_PER_KEY: usize = 8;
 const MAX_RESOLVING_PER_SESSION: usize = 32;
 const MAX_RESOLVE_PAYLOADS: usize = 4;
 const RESOLVE_QUEUE: usize = 256;
@@ -92,7 +93,7 @@ pub(crate) struct TuicOut {
     cert_pins: Arc<[[u8; 32]]>,
     insecure: bool,
     heartbeat: Duration,
-    lanes: Mutex<HashMap<LaneKey, Arc<Lane>>>,
+    lanes: Mutex<HashMap<LaneKey, Vec<Arc<Lane>>>>,
     session: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
@@ -356,35 +357,54 @@ impl TuicOut {
         let source = proxy::flow_source().ok()?;
         let key = (source, options.clone());
         let mut held = self.lanes.lock().ok()?;
-        held.retain(|_, lane| {
-            lane.leases.load(Ordering::Acquire) > 0
-                || !(lane.stop.load(Ordering::Relaxed)
-                    || lane.conn.lock().is_ok_and(|conn| conn.is_closed()))
-        });
-        if let Some(lane) = held.get(&key) {
-            let live = !lane.stop.load(Ordering::Relaxed)
+        for pool in held.values_mut() {
+            pool.retain(|lane| {
+                lane.leases.load(Ordering::Acquire) > 0
+                    || !(lane.stop.load(Ordering::Relaxed)
+                        || lane.conn.lock().is_ok_and(|conn| conn.is_closed()))
+            });
+        }
+        held.retain(|_, pool| !pool.is_empty());
+        let live = |lane: &Arc<Lane>| {
+            !lane.stop.load(Ordering::Relaxed)
                 && lane
                     .conn
                     .lock()
-                    .is_ok_and(|conn| lane_established(&conn, lane));
-            if live {
-                lane.leases.fetch_add(1, Ordering::AcqRel);
-                return Some(LaneLease(Arc::clone(lane)));
+                    .is_ok_and(|conn| lane_established(&conn, lane))
+        };
+        while held.values().map(Vec::len).sum::<usize>() >= MAX_TUIC_LANES {
+            let idle = held.iter().find_map(|(key, pool)| {
+                pool.iter()
+                    .position(|lane| lane.leases.load(Ordering::Acquire) == 0)
+                    .map(|at| (key.clone(), at))
+            });
+            let Some((key, at)) = idle else {
+                return None;
+            };
+            if let Some(pool) = held.get_mut(&key) {
+                pool.remove(at);
             }
         }
-        held.remove(&key);
-        if held.len() >= MAX_TUIC_LANES {
-            let idle = held
-                .iter()
-                .find(|(_, lane)| lane.leases.load(Ordering::Acquire) == 0)
-                .map(|(key, _)| key.clone());
-            let idle = idle?;
-            held.remove(&idle);
+        let pool = held.entry(key).or_default();
+        if let Some(lane) = pool
+            .iter()
+            .find(|lane| lane.leases.load(Ordering::Acquire) == 0 && live(lane))
+        {
+            lane.leases.fetch_add(1, Ordering::AcqRel);
+            return Some(LaneLease(Arc::clone(lane)));
         }
-        let lane = self.connect_lane(source, options)?;
+        if pool.len() < LANES_PER_KEY {
+            let lane = self.connect_lane(source, options)?;
+            lane.leases.fetch_add(1, Ordering::AcqRel);
+            pool.push(Arc::clone(&lane));
+            return Some(LaneLease(lane));
+        }
+        let lane = pool
+            .iter()
+            .filter(|lane| live(lane))
+            .min_by_key(|lane| lane.leases.load(Ordering::Acquire))?;
         lane.leases.fetch_add(1, Ordering::AcqRel);
-        held.insert(key, Arc::clone(&lane));
-        Some(LaneLease(lane))
+        Some(LaneLease(Arc::clone(lane)))
     }
 
     fn connect_lane(
