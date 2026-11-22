@@ -1,5 +1,6 @@
 use crate::conn::{parse_target, Connection, Listener};
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 #[cfg(windows)]
 use std::io::IoSliceMut;
 use std::io::{IoSlice, Read, Write};
@@ -3249,12 +3250,53 @@ impl Picked<'_> {
         }
     }
 
-    /// The identity of the table entry behind this answer, so a cached lane can tell a
-    /// replacement under the same tag from the outbound it was opened for.
-    fn identity(&self) -> usize {
+    /// The owned outbound and the identity of the table entry behind it. The dynamic identity
+    /// holds its `Arc`, so the allocator cannot hand the same address to a replacement.
+    fn into_owned_with_id(self) -> (Outbound, LaneId) {
         match self {
-            Self::Static(out) => std::ptr::from_ref(*out) as usize,
-            Self::Dynamic(out) => Arc::as_ptr(out) as usize,
+            Self::Static(out) => (
+                out.clone(),
+                LaneId::Static(std::ptr::from_ref(out) as usize),
+            ),
+            Self::Dynamic(out) => {
+                let id = LaneId::Dynamic(Arc::clone(&out));
+                ((*out).clone(), id)
+            }
+        }
+    }
+}
+
+/// The table entry a cached lane was opened for. Static entries have a stable address; a dynamic
+/// entry keeps its `Arc` alive for the lane's life, so pointer reuse cannot forge a match.
+#[derive(Clone)]
+enum LaneId {
+    Static(usize),
+    Dynamic(Arc<Outbound>),
+}
+
+impl PartialEq for LaneId {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Static(left), Self::Static(right)) => left == right,
+            (Self::Dynamic(left), Self::Dynamic(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for LaneId {}
+
+impl Hash for LaneId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            Self::Static(pointer) => {
+                0u8.hash(state);
+                pointer.hash(state);
+            }
+            Self::Dynamic(out) => {
+                1u8.hash(state);
+                (Arc::as_ptr(out) as usize).hash(state);
+            }
         }
     }
 }
@@ -10283,7 +10325,7 @@ impl BridgeLane {
     /// The outbound one datagram takes and the tag that names its lane. The settings that tag
     /// carries are installed only when the caller opens a lane, so a reused lane never inherits
     /// another tag's source.
-    fn udp_route(&self, asked: &Destination) -> Option<(Outbound, Option<String>, usize)> {
+    fn udp_route(&self, asked: &Destination) -> Option<(Outbound, Option<String>, LaneId)> {
         let (picked, key) = match &self.plan {
             Some(plan) => plan.lane_with_protocol_untracked(
                 asked,
@@ -10296,12 +10338,8 @@ impl BridgeLane {
         if !udp_lane_supported(&picked) {
             return None;
         }
-        let identity = picked.identity();
-        Some((
-            picked.into_owned(),
-            key.map(std::borrow::Cow::into_owned),
-            identity,
-        ))
+        let (out, identity) = picked.into_owned_with_id();
+        Some((out, key.map(std::borrow::Cow::into_owned), identity))
     }
 
     /// The source and options the picked tag names, left for `spawn_udp_lane` on this thread.
@@ -11047,8 +11085,8 @@ fn serve_bridge_udp(
         std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
         |addr| addr.ip(),
     );
-    let mut lanes: HashMap<usize, HashMap<String, UdpLane>> = HashMap::new();
-    let mut default_lane: Option<(usize, UdpLane)> = None;
+    let mut lanes: HashMap<LaneId, HashMap<String, UdpLane>> = HashMap::new();
+    let mut default_lane: Option<(LaneId, UdpLane)> = None;
     let mut replies: HashSet<SocketAddr> = HashSet::new();
     let mut buf = udp_buffer();
     loop {
@@ -11079,8 +11117,9 @@ fn serve_bridge_udp(
         if matches!(&out, Outbound::Block(_)) {
             continue;
         }
+        reap_finished_lanes(&mut lanes, &mut replies);
         let lane_address = if let Some(tag) = key.as_deref() {
-            if let Some(address) = retire_bridge_lane(&mut lanes, &mut replies, tag, identity) {
+            if let Some(address) = retire_bridge_lane(&mut lanes, &mut replies, tag, &identity) {
                 Some(address)
             } else {
                 bridge.arm(key.as_deref());
@@ -11129,13 +11168,30 @@ fn serve_bridge_udp(
     }
 }
 
+/// Drops every finished lane in every identity bucket, with its reply address. A live lane stays.
+fn reap_finished_lanes(
+    lanes: &mut HashMap<LaneId, HashMap<String, UdpLane>>,
+    replies: &mut HashSet<SocketAddr>,
+) {
+    lanes.retain(|_, held| {
+        held.retain(|_, lane| {
+            if !lane.handle.is_finished() {
+                return true;
+            }
+            replies.remove(&lane.address);
+            false
+        });
+        !held.is_empty()
+    });
+}
+
 /// A lane is only reused while it still belongs to the outbound the live table picked for its
 /// tag; a tag the management API replaced opens a fresh lane and leaves the old one to retire.
 fn retire_bridge_lane(
-    lanes: &mut HashMap<usize, HashMap<String, UdpLane>>,
+    lanes: &mut HashMap<LaneId, HashMap<String, UdpLane>>,
     replies: &mut HashSet<SocketAddr>,
     tag: &str,
-    identity: usize,
+    identity: &LaneId,
 ) -> Option<SocketAddr> {
     let held = lanes.get_mut(&identity)?;
     let lane = held.get(tag)?;
@@ -88203,6 +88259,56 @@ mod reverse_tests {
         stream.read_exact(&mut back).expect("reads");
         assert_eq!(&back, b"ping");
         server.join().expect("server joins");
+    }
+
+    #[test]
+    fn a_dynamic_lane_identity_holds_its_outbound_alive() {
+        let out = Arc::new(Outbound::Block(ferrox_core::blackhole::Response::None));
+        let picked = Picked::Dynamic(Arc::clone(&out));
+        let (owned, identity) = picked.into_owned_with_id();
+        drop(out);
+        let LaneId::Dynamic(held) = identity else {
+            panic!("a dynamic pick keeps a dynamic identity");
+        };
+        assert_eq!(Arc::strong_count(&held), 1);
+        assert!(matches!(held.as_ref(), Outbound::Block(_)));
+        assert!(matches!(owned, Outbound::Block(_)));
+    }
+
+    #[test]
+    fn a_finished_lane_in_an_old_bucket_is_reaped() {
+        let live_socket = UdpSocket::bind("127.0.0.1:0").expect("live socket");
+        let live_address = live_socket.local_addr().expect("live address");
+        let live = UdpLane {
+            address: live_address,
+            handle: thread::spawn(|| thread::sleep(Duration::from_millis(10))),
+            waker: live_socket.try_clone().expect("live waker"),
+        };
+        let finished_socket = UdpSocket::bind("127.0.0.1:0").expect("finished socket");
+        let finished_address = finished_socket.local_addr().expect("finished address");
+        let finished_handle = thread::spawn(|| {});
+        finished_handle.join().expect("finished joins");
+        let finished = UdpLane {
+            address: finished_address,
+            handle: finished_handle,
+            waker: finished_socket,
+        };
+        let mut lanes = HashMap::from([
+            (
+                LaneId::Static(1),
+                HashMap::from([("old".to_owned(), finished)]),
+            ),
+            (
+                LaneId::Static(2),
+                HashMap::from([("live".to_owned(), live)]),
+            ),
+        ]);
+        let mut replies = HashSet::from([finished_address, live_address]);
+        reap_finished_lanes(&mut lanes, &mut replies);
+        assert!(!lanes.contains_key(&LaneId::Static(1)));
+        assert!(lanes.contains_key(&LaneId::Static(2)));
+        assert!(!replies.contains(&finished_address));
+        assert!(replies.contains(&live_address));
     }
 
     #[test]
