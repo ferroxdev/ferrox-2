@@ -3,7 +3,6 @@
 <!-- scope:begin -->
 - paths: crates/ferrox-app/src/group.rs
 - symbols: outbound_supports_network
-- scenarios: vless-raw, vmess-raw, trojan-raw, shadowsocks-raw
 <!-- scope:end -->
 Row 125's group half: a sing-box `selector` outbound dials one member until the selection changes, and a `urltest` outbound probes its members and dials the fastest one it has a reading for. The four xray balancer strategies on the same row stay in [`engine-router`](engine-router.md) and read the observatory in [`engine-observatory`](engine-observatory.md); this page is the `protocol/group` half.
 
@@ -81,4 +80,4 @@ Every figure in this block is an open claim, not a measured number. `a_selector_
 
 What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
 
-There is no pinned-reference group harness in this tree: the sing-box group tests are in-process Go, and a live URL test is a dial to a connectivity URL, which is CI-only. The in-tree tests hold the selected tag, the tolerance boundary and the startup refusals without opening a socket.
+There is no pinned-reference group harness in this tree: the sing-box group tests are in-process Go, and a live URL test is a dial to a connectivity URL, which is CI-only. The matrix has no selector or urltest scenario yet, so a group change has no matrix coverage; the in-tree tests hold the selected tag, the tolerance boundary and the startup refusals without opening a socket.
