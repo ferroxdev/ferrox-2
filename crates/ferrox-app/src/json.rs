@@ -447,8 +447,8 @@ fn next_json_special_swar(bytes: &[u8]) -> Option<(usize, u8)> {
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
-/// JSONC/JSON5: `//`, `/* */` and `#` comments and trailing commas, stripped outside strings
-/// so the strict parser sees the JSON the reference's permissive reader would.
+/// JSONC (also `.json5`): `//`, `/* */` and `#` comments and trailing commas, stripped outside
+/// strings so the strict parser sees the JSON the reference's permissive reader would.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn strip_jsonc(text: &str) -> std::borrow::Cow<'_, str> {
     let bytes = text.as_bytes();
@@ -484,13 +484,13 @@ pub(crate) fn strip_jsonc(text: &str) -> std::borrow::Cow<'_, str> {
         } else if byte == b'#' {
             changed = true;
             at += 1;
-            while at < bytes.len() && bytes[at] != b'\n' {
+            while at < bytes.len() && bytes[at] != b'\n' && bytes[at] != b'\r' {
                 at += 1;
             }
         } else if byte == b'/' && bytes.get(at + 1) == Some(&b'/') {
             changed = true;
             at += 2;
-            while at < bytes.len() && bytes[at] != b'\n' {
+            while at < bytes.len() && bytes[at] != b'\n' && bytes[at] != b'\r' {
                 at += 1;
             }
         } else if byte == b'/' && bytes.get(at + 1) == Some(&b'*') {
@@ -1114,6 +1114,8 @@ mod tests {
             r##"{"a":"#not a comment","b":"//nor this"}"##
         );
         assert_eq!(strip_jsonc("{'a': '#x'}"), "{'a': '#x'}");
+        assert_eq!(strip_jsonc("{\r# one\r\"a\": 1\r}"), "{\r\r\"a\": 1\r}");
+        assert_eq!(strip_jsonc("{\r// one\r\"a\": 1\r}"), "{\r\r\"a\": 1\r}");
     }
 
     #[test]

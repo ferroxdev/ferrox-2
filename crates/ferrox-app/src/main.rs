@@ -1934,6 +1934,14 @@ mod tests {
     }
 
     #[test]
+    fn a_json5_source_does_not_add_unquoted_keys_or_single_quotes() {
+        let unquoted = crate::config_text(b"{a: 1}", crate::SourceFormat::Json5).expect("jsonc");
+        assert!(crate::json::parse(&unquoted).is_err());
+        let single = crate::config_text(b"{'a': 1}", crate::SourceFormat::Json5).expect("jsonc");
+        assert!(crate::json::parse(&single).is_err());
+    }
+
+    #[test]
     fn the_json_family_accepts_the_reference_comment_dialect() {
         let text = "# python\n{\"a\": 1, // java\n /* block */}";
         for format in [

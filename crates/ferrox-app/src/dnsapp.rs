@@ -1809,7 +1809,8 @@ fn parse_fake(
     };
     let mut wanted = Vec::new();
     match value {
-        Some(Json::Obj(_)) => wanted.push(value.expect("checked")),
+        Some(Json::Obj(pairs)) if !pairs.is_empty() => wanted.push(value.expect("checked")),
+        Some(Json::Obj(_)) => {}
         Some(Json::Arr(items)) => wanted.extend(items.iter()),
         Some(_) => return Err("dns: fakeDns is not an object or array".into()),
         None => {}
@@ -2120,6 +2121,21 @@ mod resolver_tests {
             .lookup_families("example.com", true, true, true)
             .expect("stable");
         assert_eq!(again.0, ips);
+    }
+
+    #[test]
+    fn an_empty_fake_pool_follows_the_query_strategy() {
+        let resolver = Arc::new(
+            Resolver::from_root(&root(
+                r#"{"dns":{"servers":["fakedns"],"queryStrategy":"UseIPv6"},"fakeDns":{}}"#,
+            ))
+            .expect("resolver")
+            .expect("configured"),
+        );
+        let (ips, _) = resolver
+            .lookup_families("example.com", false, true, true)
+            .expect("fake");
+        assert!(ips.iter().all(std::net::IpAddr::is_ipv6));
     }
 
     /// The pool as it stood: three copies of each name and a queue walked on every hit. Kept as the oracle the slot list answers to — the same address for the same name, the same eviction, the same recency order — with the instant handed in so both search from the same place.

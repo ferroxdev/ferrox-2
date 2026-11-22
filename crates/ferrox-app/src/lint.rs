@@ -51,7 +51,13 @@ fn fakedns(root: &mut Json) -> Result<(), String> {
     {
         let pools = default_pools(v4, v6);
         match root {
-            Json::Obj(pairs) => pairs.push(("fakeDns".to_owned(), pools)),
+            Json::Obj(pairs) => {
+                if let Some(entry) = pairs.iter_mut().find(|(key, _)| key.as_str() == "fakeDns") {
+                    entry.1 = pools;
+                } else {
+                    pairs.push(("fakeDns".to_owned(), pools));
+                }
+            }
             _ => return Ok(()),
         }
     }
@@ -117,7 +123,10 @@ fn sniffs_fakedns(root: &Json) -> bool {
                 {
                     return false;
                 }
-                match sniffing.get("destOverride") {
+                let override_list = sniffing
+                    .get("destOverride")
+                    .or_else(|| sniffing.get("destinationOverride"));
+                match override_list {
                     Some(Json::Str(text)) => names_fakedns_override(text),
                     Some(Json::Arr(items)) => items
                         .iter()
@@ -199,6 +208,28 @@ mod tests {
     }
 
     #[test]
+    fn a_null_fakedns_entry_is_replaced_in_place() {
+        let mut root = parsed(r#"{"dns":{"servers":["fakedns"]},"fakeDns":null}"#);
+        run(&mut root).expect("lint");
+        assert_eq!(
+            root.get("fakeDns"),
+            Some(&Json::Arr(vec![
+                Json::Obj(vec![
+                    ("ipPool".to_owned(), Json::Str("198.18.0.0/15".to_owned())),
+                    ("poolSize".to_owned(), Json::Num(32768.0)),
+                ]),
+                Json::Obj(vec![
+                    ("ipPool".to_owned(), Json::Str("2001:2::/48".to_owned())),
+                    ("poolSize".to_owned(), Json::Num(32768.0)),
+                ]),
+            ]))
+        );
+        let mut twice = root.clone();
+        run(&mut twice).expect("lint");
+        assert_eq!(root, twice);
+    }
+
+    #[test]
     fn a_config_without_fakedns_is_untouched() {
         let mut root = parsed(r#"{"dns":{"servers":["192.0.2.1"]}}"#);
         let before = root.clone();
@@ -224,5 +255,9 @@ mod tests {
         let off =
             parsed(r#"{"inbounds":[{"sniffing":{"enabled":false,"destOverride":["fakedns"]}}]}"#);
         assert!(!sniffs_fakedns(&off));
+        let alias = parsed(
+            r#"{"inbounds":[{"sniffing":{"enabled":true,"destinationOverride":["fakedns"]}}]}"#,
+        );
+        assert!(sniffs_fakedns(&alias));
     }
 }
