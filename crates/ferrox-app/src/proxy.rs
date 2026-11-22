@@ -9317,6 +9317,7 @@ fn seize_fallback_tls<S>(
     }
 }
 
+#[cfg(test)]
 fn mux_target_addr(target: &ferrox_core::mux::Target<'_>) -> Option<SocketAddr> {
     let port = target.port;
     match target.addr {
@@ -10276,18 +10277,17 @@ impl BridgeLane {
         if !udp_lane_supported(&picked) {
             return None;
         }
-        Some((picked.into_owned(), key.map(|key| key.into_owned())))
+        Some((picked.into_owned(), key.map(std::borrow::Cow::into_owned)))
     }
 
     /// The source and options the picked tag names, left for `spawn_udp_lane` on this thread.
     fn arm(&self, tag: Option<&str>) {
-        match &self.plan {
-            Some(plan) => plan.carry_dial_settings(tag),
-            None => {
-                SEND_THROUGH.with(|cell| cell.set(None));
-                DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take());
-                TARGET_STRATEGY.with(|cell| cell.set(None));
-            }
+        if let Some(plan) = &self.plan {
+            plan.carry_dial_settings(tag);
+        } else {
+            SEND_THROUGH.with(|cell| cell.set(None));
+            DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take());
+            TARGET_STRATEGY.with(|cell| cell.set(None));
         }
     }
 }
@@ -10638,6 +10638,7 @@ fn teardown_mux(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_mux_frame(
     frame: ferrox_core::mux::Incoming<'_>,
     table: &MuxTable,
@@ -10669,17 +10670,16 @@ fn handle_mux_frame(
                 return;
             };
             if let Some(session) = udp.get(&frame.id).cloned() {
-                let dest = frame
-                    .target
-                    .and_then(|t| MuxTarget::of(&t))
-                    .map(|target| target.destination())
-                    .unwrap_or_else(|| {
+                let dest = frame.target.and_then(|t| MuxTarget::of(&t)).map_or_else(
+                    || {
                         session
                             .dest
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .clone()
-                    });
+                    },
+                    |target| target.destination(),
+                );
                 let _ = session.send(&dest, data);
                 return;
             }
@@ -10935,25 +10935,9 @@ fn handle_mux_udp_new(
         session
     } else {
         let (socket, lane_stop) = if let Some(bridge) = bridge.filter(|_| routed) {
-            let Ok(relay) = UdpSocket::bind("127.0.0.1:0") else {
+            let Some((leg, stop)) = spawn_bridge_udp_relay(bridge) else {
                 return send_mux_end(out.wire, out.staging, frame.id);
             };
-            let Ok(relay_address) = relay.local_addr() else {
-                return send_mux_end(out.wire, out.staging, frame.id);
-            };
-            let Ok(leg) = relay_leg(relay_address) else {
-                return send_mux_end(out.wire, out.staging, frame.id);
-            };
-            let stop = Arc::new(AtomicBool::new(false));
-            let thread_stop = Arc::clone(&stop);
-            let lane = Arc::clone(bridge);
-            if thread::Builder::new()
-                .name("ferrox-reverse-bridge-udp".to_owned())
-                .spawn(move || serve_bridge_udp(&relay, &lane, &thread_stop))
-                .is_err()
-            {
-                return send_mux_end(out.wire, out.staging, frame.id);
-            }
             (leg, Some(stop))
         } else {
             let Some(address) = direct else {
@@ -11000,6 +10984,20 @@ fn handle_mux_udp_new(
     if let Some(data) = frame.data {
         let _ = session.send(&stored, data);
     }
+}
+
+/// The relay one routed bridge datagram flow reads from and the leg the mux flow writes to.
+fn spawn_bridge_udp_relay(bridge: &Arc<BridgeLane>) -> Option<(UdpSocket, Arc<AtomicBool>)> {
+    let relay = UdpSocket::bind("127.0.0.1:0").ok()?;
+    let leg = relay_leg(relay.local_addr().ok()?).ok()?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let lane = Arc::clone(bridge);
+    thread::Builder::new()
+        .name("ferrox-reverse-bridge-udp".to_owned())
+        .spawn(move || serve_bridge_udp(&relay, &lane, &thread_stop))
+        .ok()?;
+    Some((leg, stop))
 }
 
 /// One bridge datagram flow: the mux socket speaks SOCKS5 UDP frames, and this relay sends each
@@ -11049,17 +11047,16 @@ fn serve_bridge_udp(relay: &UdpSocket, bridge: &BridgeLane, stop: &AtomicBool) {
             continue;
         }
         let lane_address = if let Some(tag) = key.as_deref() {
-            match retire_finished_lane(&mut lanes, &mut replies, tag) {
-                Some(address) => Some(address),
-                None => {
-                    bridge.arm(key.as_deref());
-                    spawn_udp_lane(&out, local, None, Some(local)).map(|spawned| {
-                        replies.insert(spawned.address);
-                        let address = spawned.address;
-                        lanes.insert(tag.to_owned(), spawned);
-                        address
-                    })
-                }
+            if let Some(address) = retire_finished_lane(&mut lanes, &mut replies, tag) {
+                Some(address)
+            } else {
+                bridge.arm(key.as_deref());
+                spawn_udp_lane(&out, local, None, Some(local)).map(|spawned| {
+                    replies.insert(spawned.address);
+                    let address = spawned.address;
+                    lanes.insert(tag.to_owned(), spawned);
+                    address
+                })
             }
         } else if let Some(running) = default_lane
             .as_ref()
