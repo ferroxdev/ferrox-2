@@ -8733,7 +8733,7 @@ pub(crate) mod loopback {
         edge.join().expect("joins");
     }
 
-    /// A later ADDRESS_ASSIGN is the whole set, not a delta: the family it omits is removed, so a v4 tunnel told `v6 only` stops carrying its old source.
+    /// A later `ADDRESS_ASSIGN` is the whole set, not a delta: the family it omits is removed, so a v4 tunnel told `v6 only` stops carrying its old source.
     #[test]
     fn a_later_assignment_replaces_the_whole_source_set() {
         let (roots, server) = minted(b"\x68\x32");
