@@ -733,7 +733,7 @@ fn finish_at(now: Instant, started: Instant, deadline: Instant) -> Result<Durati
     if now >= deadline {
         return Err("the probe deadline expired".to_owned());
     }
-    Ok(started.elapsed())
+    Ok(now.saturating_duration_since(started))
 }
 
 /// A probe's reads and writes share one absolute deadline: every call gets only the time left, so
@@ -863,12 +863,19 @@ fn read_head(io: &mut dyn Read, head: &mut Vec<u8>, start: usize) -> Result<usiz
 }
 
 fn status_code(head: &[u8]) -> Option<u16> {
-    std::str::from_utf8(head.split(|byte| *byte == b'\n').next()?)
-        .ok()?
-        .split_whitespace()
-        .nth(1)?
-        .parse()
-        .ok()
+    let mut fields = head
+        .split(|byte| *byte == b'\n')
+        .next()?
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty());
+    fields.next()?;
+    let code = fields.next()?;
+    if code.len() != 3 || !code.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    code.iter().fold(Some(0u16), |value, digit| {
+        value.map(|value| value * 10 + u16::from(*digit - b'0'))
+    })
 }
 
 fn content_length(head: &[u8]) -> usize {
@@ -959,6 +966,16 @@ mod tests {
         assert!(
             finish_at(started + Duration::from_secs(1), started, deadline).is_err(),
             "a result after the deadline is rejected"
+        );
+    }
+
+    #[test]
+    fn a_result_records_the_timestamp_that_passed_the_check() {
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(2);
+        assert_eq!(
+            finish_at(started + Duration::from_secs(1), started, deadline),
+            Ok(Duration::from_secs(1))
         );
     }
 
@@ -1164,6 +1181,13 @@ mod tests {
             window: answer.len(),
         };
         assert!(read_final_head(&mut io).is_err());
+    }
+
+    #[test]
+    fn a_reason_phrase_need_not_be_utf8() {
+        let head: &[u8] = b"HTTP/1.1 200 Caf\xe9\r\n\r\n";
+        assert_eq!(status_code(head), Some(200));
+        assert_eq!(status_code(b"HTTP/1.1 20x OK\r\n\r\n"), None);
     }
 
     #[test]
