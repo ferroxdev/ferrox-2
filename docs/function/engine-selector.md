@@ -51,15 +51,15 @@ What was not removed: one sleeping thread exists per `urltest` group for the lif
 
 ## Time
 
-No duration is claimed here. Benchmarks are CI-only, and a local probe measures this host's path to a connectivity URL, not the reference's. The operation-count gate needs valgrind, which does not exist for macOS/aarch64, so the ops and syscall rows are `UNBLESSED` and the gate is the `ops.yml` artefact. The selection hysteresis and the cycle refusals are exact and are held by the in-tree tests. Copies are not counted: the probe request is formatted once per probe and the response head is read into a fixed window, but no checker observes copies yet.
+No duration is claimed here. Benchmarks are CI-only, and a local probe measures this host's path to a connectivity URL, not the reference's. The operation-count gate needs valgrind, which does not exist for macOS/aarch64, so the ops and syscall rows are `UNBLESSED`. No selector test is wired to `count-ops.sh` yet; until one exists the only signal is the `ops.yml` artefact. The selection hysteresis and the cycle refusals are exact and are held by the in-tree tests. Copies are not counted: the probe request is formatted once per probe and the response head is read into a fixed window, but no checker observes copies yet.
 
 ## Measured
 
 <!-- counts:begin -->
 | key | value | checked by |
 | --- | --- | --- |
-| ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
-| syscalls-per-flow | UNBLESSED | scripts/count-ops.sh |
+| ops-retired-instructions | UNBLESSED | no selector workload yet |
+| syscalls-per-flow | UNBLESSED | no selector workload yet |
 | copies-per-flow | UNBLESSED | no copy checker yet |
 | seconds-per-flow | UNBLESSED | CI bench.yml (no cell yet) |
 <!-- counts:end -->
