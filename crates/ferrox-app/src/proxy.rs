@@ -10680,7 +10680,7 @@ fn handle_mux_frame(
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .clone()
                     });
-                let _ = session.send(&stored, data);
+                let _ = session.send(&dest, data);
                 return;
             }
             if frame.target.is_some() {
@@ -11045,7 +11045,7 @@ fn serve_bridge_udp(relay: &UdpSocket, bridge: &BridgeLane, stop: &AtomicBool) {
         let Some((out, key)) = bridge.udp_route(&dest) else {
             continue;
         };
-        if matches!(out, Outbound::Block(_)) {
+        if matches!(&out, Outbound::Block(_)) {
             continue;
         }
         let lane_address = if let Some(tag) = key.as_deref() {
@@ -67416,6 +67416,7 @@ mod tests {
                 &mut out,
                 &dial,
                 &udp_ok,
+                None,
             );
         };
         feed(new(first_port));
@@ -67473,7 +67474,7 @@ mod tests {
                 handles: &mut handles,
                 worker: None,
             };
-            handle_mux_udp_new(new(first_port), &mut udp, &mut global, &mut out);
+            handle_mux_udp_new(new(first_port), &mut udp, &mut global, &mut out, None);
         }
         let old = Arc::clone(udp.get(&7).expect("first session"));
         {
@@ -67483,7 +67484,7 @@ mod tests {
                 handles: &mut handles,
                 worker: None,
             };
-            handle_mux_udp_new(new(second_port), &mut udp, &mut global, &mut out);
+            handle_mux_udp_new(new(second_port), &mut udp, &mut global, &mut out, None);
         }
         assert!(
             old.done.load(Ordering::Relaxed),
@@ -67523,7 +67524,7 @@ mod tests {
                 handles: &mut handles,
                 worker: Some(&worker),
             };
-            handle_mux_udp_new(new(first_port), &mut udp, &mut global, &mut out);
+            handle_mux_udp_new(new(first_port), &mut udp, &mut global, &mut out, None);
         }
         let old = Arc::clone(udp.get(&7).expect("first session"));
         let old_addr = SocketAddr::from((
@@ -67537,7 +67538,7 @@ mod tests {
                 handles: &mut handles,
                 worker: Some(&worker),
             };
-            handle_mux_udp_new(new(second_port), &mut udp, &mut global, &mut out);
+            handle_mux_udp_new(new(second_port), &mut udp, &mut global, &mut out, None);
         }
         drop(old);
         assert_eq!(
@@ -67628,7 +67629,7 @@ mod tests {
                 handles: &mut handles,
                 worker: None,
             };
-            handle_mux_udp_new(new(first_port), &mut udp, &mut global, &mut out);
+            handle_mux_udp_new(new(first_port), &mut udp, &mut global, &mut out, None);
         }
         let old = Arc::clone(udp.get(&7).expect("first session"));
         let old_addr = SocketAddr::from((
@@ -67646,7 +67647,7 @@ mod tests {
                 handles: &mut handles,
                 worker: None,
             };
-            handle_mux_udp_new(new(second_port), &mut udp, &mut global, &mut out);
+            handle_mux_udp_new(new(second_port), &mut udp, &mut global, &mut out, None);
         }
         // The replacement's flag can still read false on the old reader; the stop is the ordered signal.
         old.done.store(false, Ordering::Relaxed);
@@ -68363,6 +68364,7 @@ mod tests {
             &mut out,
             &dial,
             &udp_ok,
+            None,
         );
         client
             .set_read_timeout(Some(Duration::from_secs(2)))
