@@ -326,8 +326,11 @@ ferrox_app::psiphon_quic::tests::word_varint_probe 131079 psiphon_quic::tests::t
 # links into the same ferrox-app bin, moving its thin-LTO layout;
 # psiphon_shadowsocks.rs is untouched. ops.yml run 43968877918.
 # Re-blessed 47810192 on main df177ae: the rebase moved the same ferrox-app
-# thin-LTO layout another few hundred instructions; psiphon_shadowsocks.rs is
-# untouched. ops.yml run 45014795044.
+# thin-LTO layout another thirty instructions; psiphon_shadowsocks.rs is
+# untouched. ops.yml run 43989485702.
+# Re-blessed 49775923 on 9725582 by the QUIC send-buffer pass: the same
+# ferrox-app thin-LTO layout moved 349 instructions; psiphon_shadowsocks.rs
+# is untouched. ops.yml run 45014795044.
 ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe 49775923 psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy
 # The fused size-line walk: 256 turns over a twelve-byte line, the first digit
 # changed each turn so the call is not hoisted. The hex run is parsed in place
