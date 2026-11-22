@@ -2435,6 +2435,16 @@ enum Fast {
     Refused,
 }
 
+/// The dial budget a probe's worker keeps after its own clock, so a TCP connect cannot outlive
+/// the sweep while an ordinary flow keeps the full dial budget.
+fn probe_dial_budget(budget: Duration) -> Duration {
+    PROBE_DEADLINE
+        .with(std::cell::Cell::get)
+        .map_or(budget, |deadline| {
+            budget.min(deadline.saturating_duration_since(Instant::now()))
+        })
+}
+
 /// The same dial, with Fast Open wanted on a direct leg. A second round fetches the cookie the
 /// first handshake did not carry; a failed second round keeps the first socket, and a server that
 /// still answers directly leaves the first-record rewrite in place.
@@ -2454,7 +2464,7 @@ fn dial_kind(target: &SocketAddr, fast: bool) -> Result<(Connection, Fast), Fail
     if fast && crate::fastopen::supported() {
         let mut kept = None;
         let mut outcome = Fast::Refused;
-        let budget = budgets::dial();
+        let budget = probe_dial_budget(budgets::dial());
         let started = std::time::Instant::now();
         for round in 0..2 {
             let left = budget.saturating_sub(started.elapsed());
@@ -2494,11 +2504,12 @@ fn dial_kind(target: &SocketAddr, fast: bool) -> Result<(Connection, Fast), Fail
         return Ok((outbound_metered(stream), outcome));
     }
     let outcome = if fast { Fast::Absent } else { Fast::Off };
+    let budget = probe_dial_budget(budgets::dial());
     let stream = match (source, sockopts) {
-        (None, None) => crate::conn::connect(&crate::conn::Target::Ip(*target), budgets::dial())
+        (None, None) => crate::conn::connect(&crate::conn::Target::Ip(*target), budget)
             .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?,
         (source, sockopts) => Connection::Tcp(
-            dial_from(target, source, sockopts.as_deref(), false, budgets::dial())
+            dial_from(target, source, sockopts.as_deref(), false, budget)
                 .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?
                 .0,
         ),
@@ -29138,13 +29149,20 @@ fn freedom_socket(freedom: &FreedomOut, asked: &Destination) -> Option<SocketAdd
         .redirect
         .as_ref()
         .map_or_else(|| asked.clone(), |redirect| redirect.apply(asked));
+    freedom_socket_resolved(freedom, &asked)
+}
+
+/// A destination whose Freedom redirect has already been applied, resolved by the outbound's own
+/// family policy, so a caller that had to redirect before `targetStrategy` keeps that answer.
+fn freedom_socket_resolved(freedom: &FreedomOut, asked: &Destination) -> Option<SocketAddr> {
     match asked {
-        Destination::Address(address) => Some(address),
+        Destination::Address(address) => Some(*address),
         Destination::Name(host, port) => {
+            let port = *port;
             if freedom.domain == FreedomDomain::AsIs {
-                return resolve_endpoint(&host, port);
+                return resolve_endpoint(host, port);
             }
-            let ips = freedom_lookup(&host, port)?;
+            let ips = freedom_lookup(host, port)?;
             if let Some(ip) = freedom.domain.pick(&ips) {
                 return Some(SocketAddr::new(ip, port));
             }
@@ -29155,9 +29173,28 @@ fn freedom_socket(freedom: &FreedomOut, asked: &Destination) -> Option<SocketAdd
                 );
                 return None;
             }
-            resolve_endpoint(&host, port)
+            resolve_endpoint(host, port)
         }
     }
+}
+
+/// The address a Freedom datagram lane sends to: its redirect first, then the selected leaf's
+/// strategy, then Freedom's own resolver only if the strategy left a name.
+fn freedom_udp_target(freedom: &FreedomOut, asked: Destination) -> Option<SocketAddr> {
+    let asked = if let Some(redirect) = &freedom.redirect {
+        redirect.apply(&asked)
+    } else {
+        asked
+    };
+    let asked = match TARGET_STRATEGY.with(std::cell::Cell::get) {
+        Some(strategy) => match resolve_target(&asked, strategy) {
+            TargetPick::Address(address) => address,
+            TargetPick::Refuse => return None,
+            TargetPick::Keep => asked,
+        },
+        None => asked,
+    };
+    freedom_socket_resolved(freedom, &asked)
 }
 
 fn freedom_lookup(host: &str, port: u16) -> Option<Vec<std::net::IpAddr>> {
@@ -32482,18 +32519,7 @@ fn serve_socks_udp_freedom(
         // A datagram that passes admission and framing is the only one that keeps the lane alive.
         seen = replies.load(Ordering::Relaxed);
         last = Instant::now();
-        let mut asked = asked;
-        if let Some(redirect) = &freedom.redirect {
-            asked = redirect.apply(&asked);
-        }
-        if let Some(strategy) = TARGET_STRATEGY.with(std::cell::Cell::get) {
-            match resolve_target(&asked, strategy) {
-                TargetPick::Address(address) => asked = address,
-                TargetPick::Refuse => continue,
-                TargetPick::Keep => {}
-            }
-        }
-        let Some(dest) = freedom_socket(freedom, &asked) else {
+        let Some(dest) = freedom_udp_target(freedom, asked) else {
             continue;
         };
         let blocked = freedom.blocks(crate::router::Network::Udp, dest.ip(), dest.port());
@@ -55776,6 +55802,28 @@ mod tests {
         assert_eq!(&back, b"ok");
     }
 
+    /// A probe's own clock caps the TCP connect, including a retry, while an ordinary flow keeps
+    /// the full dial budget.
+    #[test]
+    fn a_probe_caps_the_dial_budget_and_leaves_the_ordinary_budget() {
+        use std::time::Instant;
+
+        assert_eq!(
+            probe_dial_budget(Duration::from_secs(30)),
+            Duration::from_secs(30)
+        );
+        {
+            let _deadline =
+                ProbeDeadlineGuard::enter(Some(Instant::now() + Duration::from_secs(5)));
+            let capped = probe_dial_budget(Duration::from_secs(30));
+            assert!(capped <= Duration::from_secs(5), "{capped:?}");
+        }
+        {
+            let _deadline = ProbeDeadlineGuard::enter(Some(Instant::now()));
+            assert!(probe_dial_budget(Duration::from_secs(30)).is_zero());
+        }
+    }
+
     /// A dialled carrier's reader drives the transport: the wait a read parks on is not the lock
     /// the writer seals under, so a silent peer costs the other direction nothing.
     #[test]
@@ -66425,6 +66473,30 @@ mod tests {
         let (_, payload) = parse_socks_udp(&back[..n]).expect("splits");
         assert_eq!(payload, b"ping");
         drop(client);
+    }
+
+    /// A hostname redirect is applied once: after the strategy picks an address, Freedom's own
+    /// resolver must not replace it with the redirect name again.
+    #[test]
+    fn a_freedom_udp_hostname_redirect_keeps_the_strategy_address() {
+        let has_ipv6 = freedom_lookup("localhost", 53)
+            .is_some_and(|ips| ips.iter().any(std::net::IpAddr::is_ipv6));
+        if !has_ipv6 {
+            return;
+        }
+        let freedom = FreedomOut {
+            redirect: Some(FreedomRedirect::Address("localhost".to_owned(), 53)),
+            domain: FreedomDomain::ForceIp4,
+            ..FreedomOut::default()
+        };
+        let _strategy = TargetStrategyGuard::enter(Some(FreedomDomain::ForceIp6));
+        let dest = freedom_udp_target(
+            &freedom,
+            Destination::Name("forceipv6.invalid".to_owned(), 1),
+        )
+        .expect("the selected IPv6 address survives");
+        assert!(dest.is_ipv6(), "{dest}");
+        assert_eq!(dest.port(), 53);
     }
 
     /// A blocked UDP destination still receives the decoy before the final rule drops the payload,
