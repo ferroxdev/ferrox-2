@@ -25,9 +25,10 @@ graph TD
     M -- no --> D["dial -connect-authority"]
     V --> R
     D --> R
-    S --> U{"udp_over_tcp?"}
-    U -- yes --> Q["UoT stream<br/>magic authority + datagrams"]
-    Q --> A
+    U["SOCKS UDP"] --> G{"udp_over_tcp?"}
+    G -- yes --> Q["UoT stream<br/>magic authority + datagrams"]
+    Q --> O
+    G -- no --> N["no UDP lane"]
 ```
 
 ## Measured

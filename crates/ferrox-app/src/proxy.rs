@@ -23782,6 +23782,34 @@ impl Sealed {
             Err(_) => Settle::Lost,
         }
     }
+
+    /// A plain `Write` has no `settle`, so a paced tail parks the writer here until the socket leaves `keep` bytes.
+    fn drain_paced(&mut self, keep: usize) -> std::io::Result<()> {
+        if !self.paced {
+            return Ok(());
+        }
+        let deadline = Instant::now() + crate::budgets::relay_stall();
+        while self.bytes.len() > keep {
+            self.send()?;
+            if self.bytes.len() <= keep {
+                return Ok(());
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            std::thread::sleep(left.min(crate::budgets::RELAY_POLL));
+        }
+        Ok(())
+    }
+
+    fn bound_tail(&mut self) -> std::io::Result<()> {
+        self.drain_paced(PACED_TAIL - 1)
+    }
+
+    fn drain_all(&mut self) -> std::io::Result<()> {
+        self.drain_paced(0)
+    }
 }
 
 /// Seals under the session's lock and sends after it drops: the transport write is the one wait
@@ -23808,7 +23836,29 @@ fn seal_out<S: CipherOpen>(
         }
     };
     out.send()?;
+    out.bound_tail()?;
     Ok(wrote)
+}
+
+/// A flush owns the wait the write path parks: a caller that asks for the bytes to be out gets them out.
+fn flush_out<S: CipherOpen>(
+    session: &Arc<Mutex<S>>,
+    out: &Arc<Mutex<Sealed>>,
+) -> std::io::Result<()> {
+    let mut out = out
+        .lock()
+        .map_err(|_| std::io::Error::other("tls half poisoned"))?;
+    {
+        let mut session = session
+            .lock()
+            .map_err(|_| std::io::Error::other("tls half poisoned"))?;
+        if let Err(error) = session.seal_into(&[], &mut out.bytes) {
+            out.bytes.clear();
+            return Err(error);
+        }
+    }
+    out.send()?;
+    out.drain_all()
 }
 
 fn seal_slices_out<S: CipherOpen>(
@@ -23828,7 +23878,8 @@ fn seal_slices_out<S: CipherOpen>(
             return Err(error);
         }
     }
-    out.send()
+    out.send()?;
+    out.bound_tail()
 }
 
 // A reader that drives the transport parks outside the session lock; one that cannot stays behind it.
@@ -24697,9 +24748,9 @@ impl<S: CipherOpen, R> Write for DrivenHalf<S, R> {
 
     fn flush(&mut self) -> std::io::Result<()> {
         if let Some(prefix) = self.write_prefix.take() {
-            return seal_slices_out(&self.session, &self.out, &[&prefix]);
+            seal_slices_out(&self.session, &self.out, &[&prefix])?;
         }
-        seal_out(&self.session, &self.out, &[]).map(|_| ())
+        flush_out(&self.session, &self.out)
     }
 }
 
@@ -24735,7 +24786,7 @@ impl<S: ferrox_core::tls::TlsProvider, R> Write for TlsHalf<S, R> {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        seal_out(&self.session, &self.out, &[]).map(|_| ())
+        flush_out(&self.session, &self.out)
     }
 }
 

@@ -17,6 +17,7 @@ const POLL: Duration = Duration::from_millis(5);
 const READ_ROOM: usize = 16 * 1024;
 const H3_STREAM_CREATION_ERROR: u64 = 0x0103;
 const H3_CLOSED_CRITICAL_STREAM: u64 = 0x0104;
+const H3_FRAME_UNEXPECTED: u64 = 0x0105;
 const H3_FRAME_ERROR: u64 = 0x0106;
 const H3_ID_ERROR: u64 = 0x0108;
 const H3_MISSING_SETTINGS: u64 = 0x010a;
@@ -1258,6 +1259,31 @@ impl H3Client {
         stream_window: Option<u64>,
         session_window: Option<u64>,
     ) -> Option<Arc<Self>> {
+        Self::connect_windowed_by(
+            peer,
+            server_name,
+            tls,
+            quic_params,
+            default_bbr,
+            cc,
+            stream_window,
+            session_window,
+            crate::budgets::handshake(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn connect_windowed_by(
+        peer: SocketAddr,
+        server_name: &str,
+        tls: &ferrox_core::tls::TlsConfig,
+        quic_params: Option<&ferrox_core::hysteria::QuicParams>,
+        default_bbr: bool,
+        cc: Option<ferrox_core::hysteria::Congestion>,
+        stream_window: Option<u64>,
+        session_window: Option<u64>,
+        budget: Duration,
+    ) -> Option<Arc<Self>> {
         let mut config = if tls.insecure || !tls.cert_pins.is_empty() {
             let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).ok()?;
             config.verify_peer(false);
@@ -1313,7 +1339,7 @@ impl H3Client {
         if let Some(list) = &tls.ech_config_list {
             conn.as_mut().set_ech_config_list(list).ok()?;
         }
-        quic::drive_handshake_by(&mut conn, &sock, local, crate::budgets::handshake())?;
+        quic::drive_handshake_by(&mut conn, &sock, local, budget)?;
         if !tls.cert_pins.is_empty() {
             let chain: Vec<Vec<u8>> = match conn.peer_cert_chain() {
                 Some(chain) => chain.iter().map(|cert| cert.to_vec()).collect(),
@@ -1762,14 +1788,20 @@ fn h3_control_frames(
             control.clear();
             break;
         };
+        if kind == 0x7 && !(1..=8).contains(&len) {
+            return Err(H3_FRAME_ERROR);
+        }
         let Some(end) = at.checked_add(len) else {
             control.clear();
             break;
         };
-        if !*settings && kind != 0x4 {
+        if *settings {
+            if matches!(kind, 0x0 | 0x1 | 0x4 | 0x5 | 0xe) {
+                return Err(H3_FRAME_UNEXPECTED);
+            }
+        } else if kind != 0x4 {
             return Err(H3_MISSING_SETTINGS);
-        }
-        if !*settings {
+        } else {
             *settings = true;
         }
         if end > control.len() {
@@ -3086,6 +3118,54 @@ mod tests {
             Err(H3_FRAME_ERROR)
         );
         assert_eq!(goaway.load(Ordering::SeqCst), u64::MAX);
+    }
+
+    #[test]
+    fn a_second_settings_is_a_frame_error() {
+        let mut control = Vec::new();
+        settings_frame(&mut control);
+        settings_frame(&mut control);
+        let goaway = AtomicU64::new(u64::MAX);
+        let mut skip = 0;
+        let mut settings = false;
+        assert_eq!(
+            h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+            Err(H3_FRAME_UNEXPECTED)
+        );
+    }
+
+    #[test]
+    fn data_on_the_control_stream_is_a_frame_error() {
+        let mut control = Vec::new();
+        settings_frame(&mut control);
+        frames::quic_varint(&mut control, 0x0);
+        frames::quic_varint(&mut control, 1);
+        control.push(0);
+        let goaway = AtomicU64::new(u64::MAX);
+        let mut skip = 0;
+        let mut settings = false;
+        assert_eq!(
+            h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+            Err(H3_FRAME_UNEXPECTED)
+        );
+    }
+
+    #[test]
+    fn a_goaway_length_outside_one_to_eight_is_a_frame_error() {
+        for len in [0, 9] {
+            let mut control = Vec::new();
+            settings_frame(&mut control);
+            frames::quic_varint(&mut control, 0x7);
+            frames::quic_varint(&mut control, len);
+            let goaway = AtomicU64::new(u64::MAX);
+            let mut skip = 0;
+            let mut settings = false;
+            assert_eq!(
+                h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+                Err(H3_FRAME_ERROR),
+                "a GOAWAY payload is one varint, so length {len} cannot be valid"
+            );
+        }
     }
 
     #[test]

@@ -1882,15 +1882,15 @@ impl NaiveOut {
         self.h2_ready.notify_all();
     }
 
-    fn h3_client(self: &Arc<Self>, deadline: Instant) -> Option<Arc<H3Client>> {
+    fn h3_client(self: &Arc<Self>, deadline: Instant, fill: bool) -> Option<Arc<H3Client>> {
         let mut pool = self.h3.lock().ok()?;
         loop {
             pool.retain(|client| client.reusable());
             let inflight = self.h3_inflight.load(Ordering::Relaxed);
-            if pool.len() + inflight < self.pool_limit {
+            if fill && pool.len() + inflight < self.pool_limit {
                 self.h3_inflight.fetch_add(1, Ordering::Relaxed);
                 drop(pool);
-                let client = self.connect_h3();
+                let client = self.connect_h3(deadline);
                 let mut published = self.h3.lock();
                 let mut existing = None;
                 if let Ok(pool) = published.as_mut() {
@@ -1921,14 +1921,18 @@ impl NaiveOut {
         }
     }
 
-    fn connect_h3(self: &Arc<Self>) -> Option<Arc<H3Client>> {
+    fn connect_h3(self: &Arc<Self>, deadline: Instant) -> Option<Arc<H3Client>> {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return None;
+        }
         let server = proxy::resolve_outbound(&self.address, self.port)?;
         let name = if self.tls.server_name.is_empty() {
             &self.address
         } else {
             &self.tls.server_name
         };
-        H3Client::connect_windowed(
+        H3Client::connect_windowed_by(
             server,
             name,
             &self.tls,
@@ -1937,14 +1941,16 @@ impl NaiveOut {
             self.congestion,
             Some(self.stream_window.unwrap_or(QUIC_STREAM_WINDOW)),
             Some(self.session_window.unwrap_or(QUIC_SESSION_WINDOW)),
+            left,
         )
     }
 
     fn open_h3(self: &Arc<Self>, target: &Destination) -> Option<NaiveStream> {
         let deadline = Instant::now() + crate::budgets::handshake();
         let mut attempts = 0;
+        let mut fill = true;
         while attempts < 2 {
-            let client = self.h3_client(deadline)?;
+            let client = self.h3_client(deadline, fill)?;
             let block = self.h3_block(target);
             match client.open_block(&block, false) {
                 Ok((mut reader, out)) => {
@@ -1970,6 +1976,7 @@ impl NaiveOut {
                     ));
                 }
                 Err(H3OpenError::Full) => {
+                    fill = false;
                     let left = deadline.saturating_duration_since(Instant::now());
                     if left.is_zero() {
                         return None;
@@ -1979,6 +1986,7 @@ impl NaiveOut {
                 Err(H3OpenError::Closed) => {
                     self.discard_h3(&client);
                     attempts += 1;
+                    fill = true;
                 }
             }
         }
