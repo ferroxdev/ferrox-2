@@ -66210,7 +66210,7 @@ mod tests {
         };
 
         let (force6, udp6, relay6) = associate(freedom_out(
-            r#"{"outbounds":[{"protocol":"freedom","targetStrategy":"forceIp6"}]}"#,
+            r#"{"outbounds":[{"protocol":"freedom","targetStrategy":"forceipv6"}]}"#,
         ));
         udp6.send_to(&name_frame(echo_port), relay6).expect("sends");
         let mut back = vec![0u8; UDP_BUF];
