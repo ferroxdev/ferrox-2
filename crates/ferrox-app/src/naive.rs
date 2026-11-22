@@ -2247,13 +2247,17 @@ fn inbound_networks(inbound: &Json, settings: Option<&Json>) -> Result<(bool, bo
     Ok((tcp, udp))
 }
 
-pub(crate) fn validate_inbound(inbound: &Json) -> Result<(), String> {
+fn inbound_config(inbound: &Json) -> Result<(Users, (bool, bool)), String> {
     let settings = inbound.get("settings");
-    if inbound_users(inbound, settings)?.is_empty() {
+    let users = inbound_users(inbound, settings)?;
+    if users.is_empty() {
         return Err("naive inbound names no users".to_owned());
     }
-    inbound_networks(inbound, settings)?;
-    Ok(())
+    Ok((users, inbound_networks(inbound, settings)?))
+}
+
+pub(crate) fn validate_inbound(inbound: &Json) -> Result<(), String> {
+    inbound_config(inbound).map(|_| ())
 }
 
 struct ListenerExit {
@@ -2360,17 +2364,13 @@ pub(crate) fn serve_inbound(
     stop: Option<&Arc<proxy::Stop>>,
 ) -> bool {
     let settings = inbound.get("settings");
-    let users = match inbound_users(inbound, settings) {
-        Ok(users) => users,
+    let (users, (mut tcp, mut udp)) = match inbound_config(inbound) {
+        Ok(config) => config,
         Err(error) => {
             eprintln!("naive inbound in {path}: {error}");
             return false;
         }
     };
-    if users.is_empty() {
-        eprintln!("naive inbound in {path} names no users: serves nothing");
-        return false;
-    }
     let security = crate::config::stream_security(inbound);
     let identity = if security == "tls" {
         let Some(identity) = crate::config::inbound_tls_identity(inbound) else {
@@ -2396,13 +2396,6 @@ pub(crate) fn serve_inbound(
             .or_else(|| inbound.get("quic_congestion_control")),
     ) {
         Ok(congestion) => congestion.or(Some(Congestion::Bbr)),
-        Err(error) => {
-            eprintln!("naive inbound in {path}: {error}");
-            return false;
-        }
-    };
-    let (mut tcp, mut udp) = match inbound_networks(inbound, settings) {
-        Ok(networks) => networks,
         Err(error) => {
             eprintln!("naive inbound in {path}: {error}");
             return false;
