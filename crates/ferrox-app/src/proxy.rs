@@ -23334,7 +23334,8 @@ fn dial_tls_session(
         let mask = cut.as_ref().or(mask);
         let uplink = uplink.with_mask(mask);
         let uplink = arm_sni(current, uplink, fast);
-        if let Some(deadline) = PROBE_DEADLINE.with(std::cell::Cell::get) {
+        let probe_bound = PROBE_DEADLINE.with(std::cell::Cell::get);
+        if let Some(deadline) = probe_bound {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return None;
@@ -23349,6 +23350,12 @@ fn dial_tls_session(
         };
         match session.handshake() {
             Ok(()) if settle_ktls(&mut session) => {
+                if probe_bound.is_some() {
+                    let uplink = session.get_ref();
+                    let _ = uplink.set_read_timeout(None);
+                    uplink.set_read_until(None);
+                    let _ = uplink.set_write_timeout(None);
+                }
                 ready = Some(session);
                 break;
             }
@@ -55726,6 +55733,47 @@ mod tests {
         serving.join().expect("joins");
         assert!(refused, "a silent peer must fail the probe handshake");
         assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+    }
+
+    /// The probe bound covers the handshake only: a carrier opened under it must not carry an
+    /// expired read or write clock into the mux pool that later flows share.
+    #[test]
+    fn a_probe_handshake_clears_its_deadline_before_the_session_is_reused() {
+        use ferrox_core::tls::TlsProvider as _;
+        use std::io::{Read as _, Write as _};
+        use std::time::Instant;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let server: SocketAddr = listener.local_addr().expect("addr");
+        let (release, hold) = std::sync::mpsc::channel();
+        let (ready, accepted) = std::sync::mpsc::channel();
+        let serving = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let _ = ready.send(());
+            let _ = hold.recv_timeout(Duration::from_secs(10));
+            tls.write_all(b"ok").expect("writes");
+            tls.flush().expect("flushes");
+        });
+        let started = Instant::now();
+        let deadline = ProbeDeadlineGuard::enter(Some(started + Duration::from_millis(150)));
+        let mut session = dial_tls_session(&server, &client_config, None).expect("dialled");
+        accepted
+            .recv_timeout(Duration::from_secs(5))
+            .expect("handshook");
+        drop(deadline);
+        thread::sleep(Duration::from_millis(300));
+        let _ = release.send(());
+        let mut back = [0u8; 2];
+        let read = session.read(&mut back);
+        serving.join().expect("joins");
+        assert!(
+            read.is_ok(),
+            "the cleared probe clock must not expire the reused session"
+        );
+        assert_eq!(&back, b"ok");
     }
 
     /// A dialled carrier's reader drives the transport: the wait a read parks on is not the lock
