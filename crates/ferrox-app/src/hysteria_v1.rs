@@ -1,5 +1,6 @@
 //! Hysteria v1 over quiche: the binary control stream, the `host:port` request on each flow, and the datagram lane whose messages carry their own session and address.
 
+use bytes::BufMut as _;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, ToSocketAddrs as _, UdpSocket};
@@ -12,7 +13,7 @@ use ferrox_core::hysteria_v1::{Defrag, UdpMessage, XPlus};
 
 use crate::conn::Connection;
 use crate::hysteria::{Dial, Driver, Flow, Session, StreamWake};
-use crate::quic::{Mask, Unfilled, RECV_ROOM};
+use crate::quic::{Mask, QuicheConnection, Unfilled, RECV_ROOM};
 
 const FIRST_FLOW_STREAM: u64 = 4;
 
@@ -46,7 +47,6 @@ fn send_all(session: &Session, stream: u64, buf: &[u8]) -> bool {
 fn read_until(session: &Session, stream: u64, want: impl Fn(&[u8]) -> bool) -> Option<Vec<u8>> {
     let deadline = Instant::now() + crate::quic::HANDSHAKE_TIMEOUT;
     let mut head = Vec::with_capacity(64);
-    let mut room = Unfilled::<4096>::new();
     loop {
         if want(&head) {
             return Some(head);
@@ -54,24 +54,20 @@ fn read_until(session: &Session, stream: u64, want: impl Fn(&[u8]) -> bool) -> O
         if head.len() >= HEAD_CAP || Instant::now() >= deadline {
             return None;
         }
-        let read = {
+        let progressed = {
             let Ok(mut conn) = session.shared.lock() else {
                 return None;
             };
-            match conn.stream_recv(stream, room.as_mut()) {
+            let room = HEAD_CAP - head.len();
+            match conn.stream_recv_buf(stream, (&mut head).limit(room)) {
                 Ok((0, _)) => return None,
-                Ok((n, _)) => Some(n),
-                Err(quiche::Error::Done) => None,
+                Ok((_, _)) => true,
+                Err(quiche::Error::Done) => false,
                 Err(_) => return None,
             }
         };
-        match read {
-            Some(n) => head.extend_from_slice(&room.as_mut()[..n]),
-            None => {
-                if !crate::hysteria::drive_once(session, STREAM_POLL) {
-                    return None;
-                }
-            }
+        if !progressed && !crate::hysteria::drive_once(session, STREAM_POLL) {
+            return None;
         }
     }
 }
@@ -98,7 +94,13 @@ fn connect(dial: &Dial) -> Option<Session> {
         crate::quic::apply_hysteria_quic(&mut config, params, false);
     }
     config.enable_dgram(true, 1024, 1024);
-    let Ok(mut conn) = quiche::connect(Some(&dial.host), &cid, local, peer, &mut config) else {
+    let Ok(mut conn) = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
+        Some(&dial.host),
+        &cid,
+        local,
+        peer,
+        &mut config,
+    ) else {
         return None;
     };
     let xplus = XPlus::new(&dial.config.obfs_password);
@@ -272,7 +274,7 @@ fn server_of(dial: &Dial) -> Server {
     }
 }
 
-fn usable(conn: &quiche::Connection) -> bool {
+fn usable(conn: &QuicheConnection) -> bool {
     !conn.is_closed()
         && !conn.is_draining()
         && conn.local_error().is_none()
@@ -606,6 +608,8 @@ struct Assocs {
     hit: Option<usize>,
     #[cfg(test)]
     probes: usize,
+    #[cfg(test)]
+    waited: usize,
 }
 
 impl Assocs {
@@ -655,10 +659,13 @@ impl Assocs {
         self.waiting += 1;
     }
 
-    fn drain(&mut self, at: usize) -> Vec<Vec<u8>> {
-        let drained = std::mem::take(&mut self.list[at].waiting);
-        self.waiting = self.waiting.saturating_sub(drained.len());
-        drained
+    fn drain(&mut self, at: usize, mut send: impl FnMut(&[u8])) {
+        let assoc = &mut self.list[at];
+        let len = assoc.waiting.len();
+        for payload in assoc.waiting.drain(..) {
+            send(&payload);
+        }
+        self.waiting = self.waiting.saturating_sub(len);
     }
 
     fn evict(&mut self, at: usize) {
@@ -671,6 +678,10 @@ impl Assocs {
         for assoc in &mut self.list {
             if keys.len() >= room {
                 break;
+            }
+            #[cfg(test)]
+            {
+                self.waited += 1;
             }
             if assoc.resolving || assoc.waiting.is_empty() {
                 continue;
@@ -732,6 +743,23 @@ impl UdpFlow {
 }
 
 impl UdpLane {
+    /// A datagram that queued a payload is the only one whose sweep can start resolver work; the
+    /// free-slot paths keep their own lane-wide resume.
+    fn resume_if(&mut self, session: u32, due: bool) -> Vec<(u32, String, u16)> {
+        if !due {
+            return Vec::new();
+        }
+        let room = MAX_PENDING_RESOLVERS.saturating_sub(self.resolving);
+        let Some(flow) = self.flows.get_mut(&session) else {
+            return Vec::new();
+        };
+        let mut spawn = Vec::new();
+        for (host, port) in flow.assocs.start_waiting(room) {
+            spawn.push((session, host, port));
+        }
+        spawn
+    }
+
     fn start_waiting(&mut self, room: usize) -> Vec<(u32, String, u16)> {
         let mut spawn = Vec::new();
         for (session, flow) in &mut self.flows {
@@ -794,7 +822,7 @@ impl Drop for Resolving {
 }
 
 struct Inbound {
-    conn: Arc<Mutex<quiche::Connection>>,
+    conn: Arc<Mutex<QuicheConnection>>,
     authed: bool,
     auth_buf: Vec<u8>,
     served: HashSet<u64>,
@@ -807,7 +835,7 @@ struct Inbound {
 }
 
 fn answer_hello(
-    conn: &mut quiche::Connection,
+    conn: &mut QuicheConnection,
     hello: &wire::ClientHello<'_>,
     auths: &[String],
 ) -> bool {
@@ -859,7 +887,7 @@ fn read_request(flow: &mut Flow, deadline: Instant) -> Option<(bool, String, u16
 }
 
 fn open_udp(
-    shared: &Arc<Mutex<quiche::Connection>>,
+    shared: &Arc<Mutex<QuicheConnection>>,
     sock: &Arc<crate::quic::Datagram>,
     session: u32,
     peer: SocketAddr,
@@ -927,7 +955,7 @@ fn target_addr(sock: &UdpSocket, peer: SocketAddr) -> SocketAddr {
 }
 
 fn udp_reader(
-    shared: &Arc<Mutex<quiche::Connection>>,
+    shared: &Arc<Mutex<QuicheConnection>>,
     sock: &Arc<crate::quic::Datagram>,
     target: &Arc<UdpSocket>,
     last: &Arc<AtomicU64>,
@@ -1039,28 +1067,29 @@ fn serve_udp_stream(mut flow: Flow, next_udp: u32, lane: &Arc<Mutex<UdpLane>>) {
 fn relay_datagrams(
     inbound: &Inbound,
     sock: &Arc<crate::quic::Datagram>,
-    shared: &Arc<Mutex<quiche::Connection>>,
-    conn: &mut quiche::Connection,
+    shared: &Arc<Mutex<QuicheConnection>>,
+    conn: &mut QuicheConnection,
 ) {
     if !inbound.authed {
         return;
     }
     let lane_handle = Arc::clone(&inbound.udp);
-    // One sweep takes the queue behind the packet the turn waited for, so the route, the lane handle and the clock are the sweep's, not each datagram's.
-    let now = now_nanos();
+    // One sweep takes the queue behind the packet the turn waited for, so the route, the lane, the lock and the clock are the sweep's, not each datagram's.
     let mut assembled = Vec::new();
+    let Ok(mut lane) = lane_handle.lock() else {
+        return;
+    };
+    let now = now_nanos();
     while let Ok(data) = conn.dgram_recv_buf() {
         let Ok(message) = wire::decode_udp(&data) else {
             continue;
-        };
-        let Ok(mut lane) = lane_handle.lock() else {
-            return;
         };
         let session = message.session;
         let host = message.host;
         let port = message.port;
         let mut known = false;
         let mut forged = false;
+        let mut queued = false;
         if let Some(flow) = lane.flows.get_mut(&session) {
             known = true;
             flow.last.store(now, Ordering::Relaxed);
@@ -1079,12 +1108,13 @@ fn relay_datagrams(
                     });
                     if let Some(peer) = peer {
                         assoc.dest = Some(peer);
-                        drop(flow.assocs.drain(at));
+                        flow.assocs.drain(at, |_| {});
                         let _ = flow
                             .target
                             .send_to(message.payload, target_addr(&flow.target, peer));
                     } else if flow.assocs.waiting < MAX_PENDING_DATAGRAMS {
                         flow.assocs.enqueue(at, message.payload.to_vec());
+                        queued = true;
                     }
                 }
                 Ok(None) => {}
@@ -1096,8 +1126,7 @@ fn relay_datagrams(
             if forged {
                 lane.flows.remove(&session);
             } else {
-                let room = MAX_PENDING_RESOLVERS.saturating_sub(lane.resolving);
-                spawn = lane.start_waiting(room);
+                spawn = lane.resume_if(session, queued);
             }
             lane.resolving += spawn.len();
             for (session, host, port) in spawn {
@@ -1168,7 +1197,7 @@ fn relay_datagrams(
 #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn resolve_pending(
     lane: Arc<Mutex<UdpLane>>,
-    shared: Arc<Mutex<quiche::Connection>>,
+    shared: Arc<Mutex<QuicheConnection>>,
     sock: Arc<crate::quic::Datagram>,
     session: u32,
     host: String,
@@ -1229,11 +1258,11 @@ fn resolve_pending(
     }
     if !flow.assocs.list.is_empty() {
         flow.assocs.list[0].dest = Some(peer);
-        for payload in flow.assocs.drain(0) {
+        flow.assocs.drain(0, |payload| {
             let _ = flow
                 .target
-                .send_to(&payload, target_addr(&flow.target, peer));
-        }
+                .send_to(payload, target_addr(&flow.target, peer));
+        });
     }
     guard.flows.insert(session, flow);
     resolving.release_in(&mut guard);
@@ -1283,12 +1312,11 @@ fn resolve_dest(handle: Arc<Mutex<UdpLane>>, session: u32, host: String, port: u
             flow.assocs.list[at].resolving = false;
             if let Some(peer) = peer {
                 flow.assocs.list[at].dest = Some(peer);
-                let queued = flow.assocs.drain(at);
-                for payload in queued {
+                flow.assocs.drain(at, |payload| {
                     let _ = flow
                         .target
-                        .send_to(&payload, target_addr(&flow.target, peer));
-                }
+                        .send_to(payload, target_addr(&flow.target, peer));
+                });
             } else {
                 flow.assocs.evict(at);
             }
@@ -1312,7 +1340,7 @@ fn authenticate(
     routes: &mut HashMap<Vec<u8>, Inbound>,
     auths: &[String],
     dcid: &[u8],
-    conn: &mut quiche::Connection,
+    conn: &mut QuicheConnection,
     sock: &crate::quic::Datagram,
 ) -> Option<()> {
     if routes.get(dcid).is_some_and(|inbound| inbound.authed) {
@@ -1382,7 +1410,9 @@ impl Router<'_> {
             return;
         }
         let cid = quiche::ConnectionId::from_ref(&scid);
-        let Ok(mut conn) = quiche::accept(&cid, None, self.local, from, template) else {
+        let Ok(mut conn) = quiche::accept_with_buf_factory::<crate::quic::BytesBufFactory>(
+            &cid, None, self.local, from, template,
+        ) else {
             return;
         };
         let info = quiche::RecvInfo {
@@ -1545,7 +1575,7 @@ impl Router<'_> {
 
 #[allow(clippy::too_many_arguments)]
 fn serve_tcp_or_udp(
-    shared: &Arc<Mutex<quiche::Connection>>,
+    shared: &Arc<Mutex<QuicheConnection>>,
     sock: &Arc<crate::quic::Datagram>,
     local: SocketAddr,
     stream: u64,
@@ -1815,7 +1845,14 @@ mod tests {
             let cid = quiche::ConnectionId::from_ref(&scid);
             let local: SocketAddr = "127.0.0.1:0".parse().expect("addr");
             let peer: SocketAddr = "127.0.0.1:1".parse().expect("addr");
-            let conn = quiche::connect(None, &cid, local, peer, &mut config).expect("connects");
+            let conn = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
+                None,
+                &cid,
+                local,
+                peer,
+                &mut config,
+            )
+            .expect("connects");
             let stop = Arc::new(AtomicBool::new(false));
             let target = UdpSocket::bind("127.0.0.1:0").expect("binds");
             let mut lane = UdpLane::default();
@@ -1978,7 +2015,14 @@ mod tests {
         let cid = quiche::ConnectionId::from_ref(&scid);
         let local = "127.0.0.1:0".parse().expect("addr");
         let peer = "127.0.0.1:1".parse().expect("addr");
-        let conn = quiche::connect(None, &cid, local, peer, &mut config).expect("connects");
+        let conn = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
+            None,
+            &cid,
+            local,
+            peer,
+            &mut config,
+        )
+        .expect("connects");
         let shared = Arc::new(Mutex::new(conn));
         let sock = Arc::new(crate::quic::Datagram::plain(
             UdpSocket::bind("127.0.0.1:0").expect("binds the lane"),
@@ -2020,7 +2064,14 @@ mod tests {
         let cid = quiche::ConnectionId::from_ref(&scid);
         let local = "127.0.0.1:0".parse().expect("addr");
         let peer = "127.0.0.1:1".parse().expect("addr");
-        let conn = quiche::connect(None, &cid, local, peer, &mut config).expect("connects");
+        let conn = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
+            None,
+            &cid,
+            local,
+            peer,
+            &mut config,
+        )
+        .expect("connects");
         let shared = Arc::new(Mutex::new(conn));
         let sock = Arc::new(crate::quic::Datagram::plain(
             UdpSocket::bind("127.0.0.1:0").expect("binds the lane"),
@@ -2116,12 +2167,69 @@ mod tests {
         );
         let waiting = flow.assocs.start_waiting(MAX_UDP_ASSOCIATIONS);
         assert_eq!(waiting.len(), MAX_UDP_ASSOCIATIONS);
-        assert_eq!(
-            flow.assocs.drain(0).len(),
-            1,
-            "a resolution takes the queue it waited on"
-        );
+        let mut drained = 0usize;
+        flow.assocs.drain(0, |_| drained += 1);
+        assert_eq!(drained, 1, "a resolution takes the queue it waited on");
         assert_eq!(flow.assocs.waiting, MAX_UDP_ASSOCIATIONS - 1);
+    }
+
+    /// A datagram that queued no payload does not walk the waiting lists, and a queued one walks
+    /// only its own flow.
+    #[test]
+    fn a_datagram_that_queued_nothing_does_not_walk_the_waiting_lists() {
+        let mut lane = UdpLane::default();
+        for session in 0..2u32 {
+            let target = UdpSocket::bind("127.0.0.1:0").expect("binds");
+            let mut flow = UdpFlow {
+                target: Arc::new(target),
+                assocs: Assocs::default(),
+                last: Arc::new(AtomicU64::new(now_nanos())),
+                stop: Arc::new(AtomicBool::new(false)),
+            };
+            let at = flow.assocs.insert("queued.test", 53, 0).expect("room");
+            flow.assocs.enqueue(at, vec![1]);
+            lane.flows.insert(session, flow);
+        }
+        assert_eq!(lane.resume_if(0, false), Vec::new());
+        let walked: usize = lane.flows.values().map(|flow| flow.assocs.waited).sum();
+        assert_eq!(walked, 0, "a datagram that queued nothing walked no list");
+        let spawn = lane.resume_if(0, true);
+        assert_eq!(spawn.len(), 1, "only the sending flow's queue is started");
+        assert_eq!(spawn[0].0, 0, "the spawn names the sending session");
+        let walked: usize = lane.flows.values().map(|flow| flow.assocs.waited).sum();
+        assert_eq!(walked, 1, "a due sweep walks one flow, not every flow");
+    }
+
+    /// A drained queue keeps its buffer, so the next datagram for the same destination reuses it.
+    #[test]
+    fn a_drained_queue_keeps_its_buffer_for_the_next_datagram() {
+        let mut assocs = Assocs::default();
+        let at = assocs.insert("queued.test", 53, 0).expect("room");
+        assocs.enqueue(at, vec![1; 32]);
+        let cap = assocs.list[at].waiting.capacity();
+        let mut sent = 0usize;
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            assocs.drain(at, |_| sent += 1);
+        });
+        assert_eq!(sent, 1);
+        assert_eq!(counts.allocs, 0, "draining a payload frees no queue buffer");
+        assert_eq!(
+            assocs.list[at].waiting.capacity(),
+            cap,
+            "the queue buffer stayed"
+        );
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            assocs.enqueue(at, vec![2; 32]);
+            assocs.drain(at, |_| sent += 1);
+        });
+        assert_eq!(sent, 2);
+        assert_eq!(counts.allocs, 1, "only the next payload allocates");
+        assert_eq!(
+            assocs.list[at].waiting.capacity(),
+            cap,
+            "still the same queue buffer"
+        );
+        assert_eq!(assocs.waiting, 0);
     }
 
     /// A datagram on a known association finds its destination in place: no key is cloned and no

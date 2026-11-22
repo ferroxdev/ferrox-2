@@ -1,6 +1,7 @@
 //! HTTP/3 over QUIC for the CDN-fronted meek entries that carry QUIC.
 
 use crate::psiphon_webrtc::WebRtcStream;
+use crate::quic::QuicheConnection;
 use quiche::h3::NameValue as _;
 use std::io;
 use std::io::{Read as _, Write as _};
@@ -261,7 +262,7 @@ pub(crate) struct H3 {
     udp: bool,
     peer: SocketAddr,
     local: SocketAddr,
-    conn: quiche::Connection,
+    conn: QuicheConnection,
     http3: quiche::h3::Connection,
     stream: Option<u64>,
     response: Response,
@@ -358,8 +359,14 @@ impl H3 {
         let scid = crate::psiphon_ssh::random::<{ quiche::MAX_CONN_ID_LEN }>();
         let scid = quiche::ConnectionId::from_ref(&scid);
         let sni = (!sni.is_empty()).then_some(sni);
-        let mut conn = quiche::connect(sni, &scid, local, peer, &mut config)
-            .map_err(|error| format!("psiphon h3 start {dial}: {error}"))?;
+        let mut conn = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
+            sni,
+            &scid,
+            local,
+            peer,
+            &mut config,
+        )
+        .map_err(|error| format!("psiphon h3 start {dial}: {error}"))?;
         let deadline = Instant::now() + timeout;
         let mut buffer = vec![0u8; 65535];
         let mut out = [0u8; MAX_DATAGRAM];

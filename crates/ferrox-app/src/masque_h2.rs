@@ -23,6 +23,8 @@ use crate::wg_stack::{Packet, UdpRoutes};
 const HANDSHAKE: Duration = Duration::from_secs(10);
 const EDGE_RETRY: Duration = Duration::from_secs(1);
 const READ_WAIT: Duration = Duration::from_millis(10);
+/// The read a burst takes: shorter than the idle wait, so egress the stack produces right after data lands leaves without it, the same re-arm the QUIC pump takes.
+const READ_TAIL: Duration = Duration::from_micros(250);
 const CLOSE_WAIT: Duration = Duration::from_millis(100);
 const UDP_DRAIN: Duration = Duration::from_secs(1);
 const WARP_ASSIGN_WAIT: Duration = Duration::from_millis(250);
@@ -82,6 +84,8 @@ pub(crate) struct DeadlineStream {
     io: Connection,
     deadline: Deadline,
     read_wait: std::cell::Cell<Duration>,
+    armed: std::cell::Cell<Duration>,
+    landed: std::cell::Cell<bool>,
     read_tight: std::cell::Cell<bool>,
     write_tight: std::cell::Cell<bool>,
 }
@@ -92,6 +96,8 @@ impl DeadlineStream {
             io,
             deadline,
             read_wait: std::cell::Cell::new(HANDSHAKE),
+            armed: std::cell::Cell::new(HANDSHAKE),
+            landed: std::cell::Cell::new(false),
             read_tight: std::cell::Cell::new(false),
             write_tight: std::cell::Cell::new(false),
         }
@@ -102,8 +108,23 @@ impl DeadlineStream {
         let wait = wait.unwrap_or(HANDSHAKE);
         self.read_wait.set(wait);
         if !self.read_tight.get() {
-            let _ = self.io.set_read_timeout(Some(wait));
+            let _ = self.arm(wait);
         }
+    }
+
+    /// Arm the socket description only when the value it carries moves, so a steady state pays no syscall.
+    fn arm(&self, want: Duration) -> std::io::Result<()> {
+        if self.armed.get() != want {
+            self.io.set_read_timeout(Some(want))?;
+            self.armed.set(want);
+        }
+        Ok(())
+    }
+
+    /// What the last read armed: the tail after a burst, the idle wait otherwise.
+    #[cfg(test)]
+    pub(crate) fn armed(&self) -> Duration {
+        self.armed.get()
     }
 
     fn prepare_read(&self) -> std::io::Result<()> {
@@ -111,15 +132,19 @@ impl DeadlineStream {
             None => {
                 if self.read_tight.replace(false) {
                     self.io.set_read_until(None);
-                    let _ = self.io.set_read_timeout(Some(self.read_wait.get()));
                 }
-                Ok(())
+                // A read that landed bytes is a burst: the stack's reply is one hop behind it, so the next read waits the tail rather than the idle wait.
+                let want = if self.landed.get() {
+                    self.read_wait.get().min(READ_TAIL)
+                } else {
+                    self.read_wait.get()
+                };
+                self.arm(want)
             }
             Some(left) if left.is_zero() => Err(std::io::ErrorKind::TimedOut.into()),
             Some(left) => {
                 self.io.set_read_until(Some(Instant::now() + left));
-                self.io
-                    .set_read_timeout(Some(left.min(self.read_wait.get())))?;
+                self.arm(left.min(self.read_wait.get()))?;
                 self.read_tight.set(true);
                 Ok(())
             }
@@ -162,7 +187,9 @@ pub(crate) fn handshake_stream(tcp: Connection) -> (DeadlineStream, Deadline) {
 impl Read for DeadlineStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.prepare_read()?;
-        self.io.read(buf)
+        let read = self.io.read(buf);
+        self.landed.set(matches!(&read, Ok(n) if *n > 0));
+        read
     }
 }
 
@@ -2563,6 +2590,35 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_landed_read_arms_the_tail_and_a_timeout_restores_the_idle_wait() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a listener");
+        let address = listener.local_addr().expect("an address");
+        let peer = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).expect("connects");
+            stream.write_all(&[7; 4]).expect("writes");
+            std::thread::sleep(Duration::from_millis(500));
+        });
+        let (stream, _) = listener.accept().expect("accepts");
+        let mut stream = DeadlineStream::new(stream.into(), Deadline::default());
+        stream.set_read_timeout(Some(READ_WAIT));
+        let mut burst = [0u8; 4];
+        assert_eq!(stream.read(&mut burst).expect("the burst"), 4);
+        let mut idle = [0u8; 4];
+        assert!(
+            stream.read(&mut idle).is_err(),
+            "the burst's tail timed out"
+        );
+        assert_eq!(stream.armed(), READ_TAIL, "a burst parks on the tail");
+        assert!(stream.read(&mut idle).is_err(), "the idle read timed out");
+        assert_eq!(
+            stream.armed(),
+            READ_WAIT,
+            "a timeout restores the idle wait"
+        );
+        let _ = peer.join();
     }
 
     #[test]

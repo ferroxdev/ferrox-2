@@ -447,40 +447,59 @@ fn next_json_special_swar(bytes: &[u8]) -> Option<(usize, u8)> {
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
-/// JSONC: `//` and `/* */` comments and trailing commas, stripped outside strings so the
-/// strict parser sees the JSON the reference's jsonc decoder would.
+/// JSONC (also `.json5`): `//`, `/* */` and `#` comments and trailing commas, stripped outside
+/// strings so the strict parser sees the JSON the reference's permissive reader would.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn strip_jsonc(text: &str) -> std::borrow::Cow<'_, str> {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut at = 0;
-    let mut quoted = false;
+    let mut quote = 0u8;
     let mut escaped = false;
     let mut changed = false;
     while at < bytes.len() {
         let byte = bytes[at];
-        if quoted {
+        if quote != 0 {
             out.push(byte);
-            match byte {
-                _ if escaped => escaped = false,
-                b'\\' => escaped = true,
-                b'"' => quoted = false,
-                _ => {}
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == quote {
+                quote = 0;
             }
             at += 1;
-        } else if byte == b'"' {
-            quoted = true;
+        } else if byte == b'"' || byte == b'\'' {
+            quote = byte;
             out.push(byte);
             at += 1;
+        } else if byte == b'\\' {
+            out.push(byte);
+            if let Some(&next) = bytes.get(at + 1) {
+                out.push(next);
+                at += 2;
+            } else {
+                at += 1;
+            }
+        } else if byte == b'#' {
+            changed = true;
+            at += 1;
+            while at < bytes.len() && bytes[at] != b'\n' && bytes[at] != b'\r' {
+                at += 1;
+            }
         } else if byte == b'/' && bytes.get(at + 1) == Some(&b'/') {
             changed = true;
             at += 2;
-            while at < bytes.len() && bytes[at] != b'\n' {
+            while at < bytes.len() && bytes[at] != b'\n' && bytes[at] != b'\r' {
                 at += 1;
             }
         } else if byte == b'/' && bytes.get(at + 1) == Some(&b'*') {
             changed = true;
             at += 2;
             while at + 1 < bytes.len() && !(bytes[at] == b'*' && bytes[at + 1] == b'/') {
+                if bytes[at] == b'\n' {
+                    out.push(b'\n');
+                }
                 at += 1;
             }
             at = (at + 2).min(bytes.len());
@@ -492,24 +511,25 @@ pub(crate) fn strip_jsonc(text: &str) -> std::borrow::Cow<'_, str> {
     let comments = changed;
     let mut kept = Vec::with_capacity(out.len());
     let mut at = 0;
-    let mut quoted = false;
+    let mut quote = 0u8;
     let mut escaped = false;
     let mut trimmed = false;
     while at < out.len() {
         let byte = out[at];
-        if quoted {
+        if quote != 0 {
             kept.push(byte);
-            match byte {
-                _ if escaped => escaped = false,
-                b'\\' => escaped = true,
-                b'"' => quoted = false,
-                _ => {}
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == quote {
+                quote = 0;
             }
             at += 1;
             continue;
         }
-        if byte == b'"' {
-            quoted = true;
+        if byte == b'"' || byte == b'\'' {
+            quote = byte;
             kept.push(byte);
             at += 1;
             continue;
@@ -537,6 +557,42 @@ pub(crate) fn strip_jsonc(text: &str) -> std::borrow::Cow<'_, str> {
         return std::borrow::Cow::Borrowed(text);
     }
     std::borrow::Cow::Owned(String::from_utf8_lossy(&kept).into_owned())
+}
+
+/// A merged config's `_priority` order: every array whose elements carry the marker is sorted
+/// smallest first, ties keeping file order, and the marker is dropped before a handler reads it.
+pub(crate) fn order_by_priority(value: &mut Json) {
+    match value {
+        Json::Arr(items) => {
+            if items.iter().any(|item| priority(item).is_some()) {
+                items.sort_by(|left, right| {
+                    priority(left)
+                        .unwrap_or(0.0)
+                        .partial_cmp(&priority(right).unwrap_or(0.0))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
+            for item in items.iter_mut() {
+                if let Json::Obj(pairs) = item {
+                    pairs.retain(|(key, _)| key != "_priority");
+                }
+                order_by_priority(item);
+            }
+        }
+        Json::Obj(pairs) => {
+            for (_, child) in pairs.iter_mut() {
+                order_by_priority(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn priority(item: &Json) -> Option<f64> {
+    match item.get("_priority") {
+        Some(Json::Num(number)) => Some(*number),
+        _ => None,
+    }
 }
 
 pub(crate) fn parse(text: &str) -> Result<Json, String> {
@@ -1045,6 +1101,46 @@ mod tests {
         assert_eq!(strip_jsonc(r#"{"a":{}}"#), r#"{"a":{}}"#);
         let quoted = r#"{"a":",}"}"#;
         assert_eq!(strip_jsonc(quoted), quoted);
+    }
+
+    #[test]
+    fn the_permissive_reader_strips_python_and_java_comments_but_not_inside_strings() {
+        assert_eq!(
+            strip_jsonc("{\n # one\n \"a\": 1 // two\n}"),
+            "{\n \n \"a\": 1 \n}"
+        );
+        assert_eq!(
+            strip_jsonc(r##"{"a":"#not a comment","b":"//nor this"}"##),
+            r##"{"a":"#not a comment","b":"//nor this"}"##
+        );
+        assert_eq!(strip_jsonc("{'a': '#x'}"), "{'a': '#x'}");
+        assert_eq!(strip_jsonc("{\r# one\r\"a\": 1\r}"), "{\r\r\"a\": 1\r}");
+        assert_eq!(strip_jsonc("{\r// one\r\"a\": 1\r}"), "{\r\r\"a\": 1\r}");
+    }
+
+    #[test]
+    fn a_priority_marker_orders_a_late_rule_first_and_is_dropped() {
+        let mut doc = parse(
+            r#"{"routing":{"rules":[{"outboundTag":"a"},{"outboundTag":"b","_priority":-1}]}}"#,
+        )
+        .expect("parses");
+        order_by_priority(&mut doc);
+        let rules = doc
+            .get("routing")
+            .expect("routing")
+            .get("rules")
+            .expect("rules")
+            .as_arr()
+            .expect("array");
+        assert_eq!(
+            rules[0].get("outboundTag").and_then(Json::as_str),
+            Some("b")
+        );
+        assert_eq!(
+            rules[1].get("outboundTag").and_then(Json::as_str),
+            Some("a")
+        );
+        assert!(rules.iter().all(|rule| rule.get("_priority").is_none()));
     }
 
     #[test]

@@ -160,8 +160,14 @@ pub(crate) fn doq(
     let cid = quiche::ConnectionId::from_ref(&scid);
     let mut config = crate::quic::quiche_config_alpn(&roots, None, &[b"doq"])
         .ok_or_else(|| "dns doq: no trust roots".to_owned())?;
-    let mut conn = quiche::connect(Some(host), &cid, local, peer, &mut config)
-        .map_err(|error| format!("dns doq connect: {error}"))?;
+    let mut conn = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
+        Some(host),
+        &cid,
+        local,
+        peer,
+        &mut config,
+    )
+    .map_err(|error| format!("dns doq connect: {error}"))?;
     crate::quic::drive_handshake_by(&mut conn, &socket, local, timeout)
         .ok_or_else(|| "dns doq handshake".to_owned())?;
     let deadline = Instant::now() + timeout;

@@ -2538,7 +2538,7 @@ fn macos_socket_table() -> Option<Vec<u8>> {
             sysctlbyname(
                 name.as_ptr(),
                 std::ptr::null_mut(),
-                &mut len,
+                &raw mut len,
                 std::ptr::null_mut(),
                 0,
             )
@@ -2552,7 +2552,7 @@ fn macos_socket_table() -> Option<Vec<u8>> {
             sysctlbyname(
                 name.as_ptr(),
                 table.as_mut_ptr().cast(),
-                &mut len,
+                &raw mut len,
                 std::ptr::null_mut(),
                 0,
             )

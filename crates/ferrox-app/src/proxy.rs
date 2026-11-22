@@ -1,4 +1,6 @@
 use crate::conn::{parse_target, Connection, Listener};
+#[cfg(test)]
+use crate::quic::QuicheConnection;
 use std::collections::{HashMap, HashSet};
 #[cfg(windows)]
 use std::io::IoSliceMut;
@@ -67,7 +69,10 @@ fn foxy_edge_row(edge: &ferrox_core::foxy::Candidate, reading: Option<u64>) -> S
 }
 
 pub(crate) fn serve_json(label: &str, body: &str, test: bool) -> ! {
-    let root = crate::json::parse(body)
+    let mut root = crate::json::parse(body)
+        .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
+    crate::json::order_by_priority(&mut root);
+    crate::lint::run(&mut root)
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
     serve_root(label, &root, None, test)
 }
@@ -3263,23 +3268,19 @@ impl std::ops::Deref for Picked<'_> {
 }
 
 impl Picked<'_> {
+    /// The table entry behind the answer, as the identity a cached lane is keyed by.
+    fn id(&self) -> LaneId {
+        match self {
+            Self::Static(out) => LaneId::Static(std::ptr::from_ref(*out) as usize),
+            Self::Dynamic { id, .. } => LaneId::Dynamic(*id),
+        }
+    }
+
     /// The answer as an owned outbound, for a lane that outlives the plan's borrow.
     pub(crate) fn into_owned(self) -> Outbound {
         match self {
             Self::Static(out) => out.clone(),
             Self::Dynamic { out, .. } => (*out).clone(),
-        }
-    }
-
-    /// The owned outbound and the identity of the table entry behind it. A dynamic identity is a
-    /// never-reused generation, so a replacement cannot match a cached lane.
-    fn into_owned_with_id(self) -> (Outbound, LaneId) {
-        match self {
-            Self::Static(out) => (
-                out.clone(),
-                LaneId::Static(std::ptr::from_ref(out) as usize),
-            ),
-            Self::Dynamic { id, out } => ((*out).clone(), LaneId::Dynamic(id)),
         }
     }
 }
@@ -10343,7 +10344,10 @@ impl BridgeLane {
     /// The outbound one datagram takes and the tag that names its lane. The settings that tag
     /// carries are installed only when the caller opens a lane, so a reused lane never inherits
     /// another tag's source.
-    fn udp_route(&self, asked: &Destination) -> Option<(Outbound, Option<String>, LaneId)> {
+    fn udp_route<'a>(
+        &'a self,
+        asked: &Destination,
+    ) -> Option<(Picked<'a>, Option<std::borrow::Cow<'a, str>>, LaneId)> {
         let (picked, key) = match &self.plan {
             Some(plan) => plan.lane_with_protocol_untracked(
                 asked,
@@ -10356,8 +10360,8 @@ impl BridgeLane {
         if !udp_lane_supported(&picked) {
             return None;
         }
-        let (out, identity) = picked.into_owned_with_id();
-        Some((out, key.map(std::borrow::Cow::into_owned), identity))
+        let identity = picked.id();
+        Some((picked, key, identity))
     }
 
     /// The source and options the picked tag names, left for `spawn_udp_lane` on this thread.
@@ -11132,7 +11136,7 @@ fn serve_bridge_udp(
         let Some((out, key, identity)) = bridge.udp_route(&dest) else {
             continue;
         };
-        if matches!(&out, Outbound::Block(_)) {
+        if matches!(&*out, Outbound::Block(_)) {
             continue;
         }
         reap_finished_lanes(&mut lanes, &mut default_lane, &mut replies);
@@ -32590,90 +32594,108 @@ fn serve_socks_udp_foxy_ip(
     let mut ports: HashMap<SocketAddr, u16> = HashMap::new();
     let mut next_port = 40_000u16;
     let mut quiet = Instant::now();
+    // A datagram that arrives while an assignment is still behind the tunnel's replies stays in `buf`: it is re-examined without another `recv_from`, so it is neither dropped nor sent under a source set the pending assignment replaces. It outlives a burst so the last receive of one is not lost at the boundary.
+    let mut held: Option<(usize, std::net::SocketAddr)> = None;
     loop {
         // The client's datagrams go out as a burst, and the destination address rides a stack buffer: one packet per pass and one `Vec` per packet are both a cost the association has no reason to pay.
         let mut ended = false;
-        for _ in 0..UDP_BURST {
-            match relay.recv_from(&mut buf) {
-                Ok((n, src)) => {
-                    if !source_admitted(peer, pinned, src) {
-                        if quiet.elapsed() >= budgets::udp_idle() {
-                            ended = true;
-                            break;
-                        }
-                        continue;
+        let mut burst = 0;
+        while burst < UDP_BURST {
+            let (n, src) = if let Some((n, src)) = held.take() {
+                (n, src)
+            } else {
+                burst += 1;
+                match relay.recv_from(&mut buf) {
+                    Ok(packet) => packet,
+                    Err(error) if is_timeout(&error) => {
+                        ended = associate.is_some_and(peer_left)
+                            || quiet.elapsed() >= budgets::udp_idle();
+                        break;
                     }
-                    let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
-                        continue;
-                    };
-                    if payload.is_empty() {
-                        continue;
-                    }
-                    quiet = Instant::now();
-                    pin_address(&mut pinned, src);
-                    client = Some(src);
-                    if tunnel.is_none() && !open_foxy_ip_tunnel(foxy, &mut tunnel) {
-                        continue;
-                    }
-                    let Some(port) = ports.get(&dest).copied().or_else(|| {
-                        let port = next_port;
-                        next_port = next_port.wrapping_add(1).max(1);
-                        ports.insert(dest, port);
-                        Some(port)
-                    }) else {
-                        continue;
-                    };
-                    let mut address = [0u8; 16];
-                    let destination: &[u8] = match dest.ip() {
-                        std::net::IpAddr::V4(ip) => {
-                            address[..4].copy_from_slice(&ip.octets());
-                            &address[..4]
-                        }
-                        std::net::IpAddr::V6(ip) => {
-                            address.copy_from_slice(&ip.octets());
-                            &address
-                        }
-                    };
-                    // The packet's family is the tunnel's: it cannot carry an address the proxy never assigned, and each assignment capsule replaces the whole set it could carry.
-                    let at = match destination.len() {
-                        4 => 0,
-                        16 => 16,
-                        _ => continue,
-                    };
-                    let Some((source, width)) = tunnel.as_ref().map(crate::foxy::Ip::assigned)
-                    else {
-                        continue;
-                    };
-                    if destination.len() != width[at / 16] {
-                        continue;
-                    }
-                    if let Some(lane) = tunnel.as_mut() {
-                        if let Err(error) = lane
-                            .write(
-                                &source[at..at + destination.len()],
-                                destination,
-                                port,
-                                dest.port(),
-                                payload,
-                            )
-                            .and_then(|_| lane.flush())
-                        {
-                            // No credit is the lane waiting for a grant the next read pass carries, so the packet is lost and the tunnel is not; only a broken lane is dialled again.
-                            if !is_timeout(&error) {
-                                tunnel = None;
-                                ports.clear();
-                            }
-                        }
+                    Err(_) => {
+                        ended = true;
+                        break;
                     }
                 }
-                Err(error) if is_timeout(&error) => {
-                    ended =
-                        associate.is_some_and(peer_left) || quiet.elapsed() >= budgets::udp_idle();
-                    break;
-                }
-                Err(_) => {
+            };
+            if !source_admitted(peer, pinned, src) {
+                if quiet.elapsed() >= budgets::udp_idle() {
                     ended = true;
                     break;
+                }
+                continue;
+            }
+            let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
+                continue;
+            };
+            if payload.is_empty() {
+                continue;
+            }
+            quiet = Instant::now();
+            pin_address(&mut pinned, src);
+            client = Some(src);
+            if tunnel.is_none() && !open_foxy_ip_tunnel(foxy, &mut tunnel) {
+                continue;
+            }
+            // The assignment that arrived behind a reply replaces the source set before this datagram selects one; a drain that leaves the tunnel readable may still be hiding it, so the held datagram waits for the next bounded drain.
+            if let Some(lane) = tunnel.as_mut() {
+                if drain_foxy_ip_tunnel(lane, relay, client, &mut reply, &mut packet).is_none() {
+                    tunnel = None;
+                    ports.clear();
+                    continue;
+                }
+                if lane.readable() {
+                    held = Some((n, src));
+                    continue;
+                }
+            }
+            let Some(port) = ports.get(&dest).copied().or_else(|| {
+                let port = next_port;
+                next_port = next_port.wrapping_add(1).max(1);
+                ports.insert(dest, port);
+                Some(port)
+            }) else {
+                continue;
+            };
+            let mut address = [0u8; 16];
+            let destination: &[u8] = match dest.ip() {
+                std::net::IpAddr::V4(ip) => {
+                    address[..4].copy_from_slice(&ip.octets());
+                    &address[..4]
+                }
+                std::net::IpAddr::V6(ip) => {
+                    address.copy_from_slice(&ip.octets());
+                    &address
+                }
+            };
+            // The packet's family is the tunnel's: it cannot carry an address the proxy never assigned, and each assignment capsule replaces the whole set it could carry.
+            let at = match destination.len() {
+                4 => 0,
+                16 => 16,
+                _ => continue,
+            };
+            let Some((source, width)) = tunnel.as_ref().map(crate::foxy::Ip::assigned) else {
+                continue;
+            };
+            if destination.len() != width[at / 16] {
+                continue;
+            }
+            if let Some(lane) = tunnel.as_mut() {
+                if let Err(error) = lane
+                    .write(
+                        &source[at..at + destination.len()],
+                        destination,
+                        port,
+                        dest.port(),
+                        payload,
+                    )
+                    .and_then(|_| lane.flush())
+                {
+                    // No credit is the lane waiting for a grant the next read pass carries, so the packet is lost and the tunnel is not; only a broken lane is dialled again.
+                    if !is_timeout(&error) {
+                        tunnel = None;
+                        ports.clear();
+                    }
                 }
             }
         }
@@ -32704,6 +32726,9 @@ fn drain_foxy_ip_tunnel(
 ) -> Option<usize> {
     let mut packets = 0usize;
     for _ in 0..UDP_BURST {
+        if !lane.readable() {
+            break;
+        }
         match lane.read(packet) {
             Ok(true) => {
                 packets += 1;
@@ -45565,6 +45590,32 @@ fn b64url(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// A bridge datagram borrows the configured outbound and its tag; the clone belongs to the
+    /// lane spawn, not to every datagram.
+    #[test]
+    fn a_bridge_datagram_route_borrows_its_lane() {
+        let bridge = BridgeLane {
+            plan: None,
+            fixed: Some(Outbound::Dns(DnsOut {
+                tcp: None,
+                address: Some("127.0.0.1".to_owned()),
+                port: 53,
+                rules: Vec::new(),
+            })),
+        };
+        let dest = Destination::Address("203.0.113.9:53".parse().expect("addr"));
+        let (route, counts) = ferrox_core::alloc_count::measure(|| bridge.udp_route(&dest));
+        assert!(route.is_some(), "the dns outbound carries a udp lane");
+        assert_eq!(
+            counts.allocs, 0,
+            "the route borrows the configured outbound"
+        );
+        let ((), before) = ferrox_core::alloc_count::measure(|| {
+            let _ = bridge.fixed.as_ref().expect("fixed").clone();
+        });
+        assert!(before.allocs > 0, "the old shape cloned it a datagram");
+    }
+
     impl Mux {
         /// The mux a config with only `enabled: true` folds to: the 128 concurrency floor and the shared datagram carrier.
         fn on() -> Mux {
@@ -46263,8 +46314,7 @@ mod tests {
         assert!(shared.add_outbound("alt", freedom()).is_ok());
         let identity = |plan: &RoutePlan| {
             plan.pick(&asked, crate::router::Network::Tcp, None, None)
-                .into_owned_with_id()
-                .1
+                .id()
         };
         let first = identity(&plan);
         assert!(lane(&plan));
@@ -71237,11 +71287,7 @@ mod tests {
         }
     }
 
-    fn quic_server_idle(
-        conn: &mut quiche::Connection,
-        sock: &crate::quic::Datagram,
-        out: &mut [u8],
-    ) {
+    fn quic_server_idle(conn: &mut QuicheConnection, sock: &crate::quic::Datagram, out: &mut [u8]) {
         conn.on_timeout();
         while let Ok((written, info)) = conn.send(out) {
             sock.send_to(&out[..written], info.to).expect("answers");
@@ -71252,7 +71298,7 @@ mod tests {
         sock: &crate::quic::Datagram,
         local: SocketAddr,
         config: &mut quiche::Config,
-    ) -> (quiche::Connection, Vec<u8>) {
+    ) -> (QuicheConnection, Vec<u8>) {
         let mut buf = [0u8; 1350];
         let mut out = [0u8; 1350];
         let knock_deadline = std::time::Instant::now() + QUIC_TEST_TIMEOUT;
@@ -71269,7 +71315,10 @@ mod tests {
             let mut scid = [0u8; 16];
             getrandom::fill(&mut scid).expect("random");
             let cid = quiche::ConnectionId::from_ref(&scid);
-            let mut fresh = quiche::accept(&cid, None, local, from, config).expect("accepts");
+            let mut fresh = quiche::accept_with_buf_factory::<crate::quic::BytesBufFactory>(
+                &cid, None, local, from, config,
+            )
+            .expect("accepts");
             let info = quiche::RecvInfo { from, to: local };
             fresh.recv(&mut buf[..n], info).expect("handshakes");
             while let Ok((written, info)) = fresh.send(&mut out) {
@@ -71440,8 +71489,8 @@ mod tests {
 
     /// The two ends and the addresses they call each other by: one value passed around instead of four.
     struct Pipe {
-        client: quiche::Connection,
-        server: quiche::Connection,
+        client: QuicheConnection,
+        server: QuicheConnection,
         client_addr: SocketAddr,
         server_addr: SocketAddr,
         header: Vec<u8>,
@@ -71692,7 +71741,7 @@ mod tests {
         let mut ccid = [0u8; 16];
         getrandom::fill(&mut ccid).expect("random");
         let ccid = quiche::ConnectionId::from_ref(&ccid);
-        let mut client = quiche::connect(
+        let mut client = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
             Some("localhost"),
             &ccid,
             client_addr,
@@ -71707,8 +71756,14 @@ mod tests {
         let mut scid = [0u8; 16];
         getrandom::fill(&mut scid).expect("random");
         let scid = quiche::ConnectionId::from_ref(&scid);
-        let mut server = quiche::accept(&scid, None, server_addr, client_addr, &mut server_config)
-            .expect("accepts");
+        let mut server = quiche::accept_with_buf_factory::<crate::quic::BytesBufFactory>(
+            &scid,
+            None,
+            server_addr,
+            client_addr,
+            &mut server_config,
+        )
+        .expect("accepts");
         let info = quiche::RecvInfo {
             from: client_addr,
             to: server_addr,
@@ -74868,7 +74923,7 @@ mod tests {
     }
 
     fn hysteria_test_answer_auth(
-        conn: &mut quiche::Connection,
+        conn: &mut QuicheConnection,
         sock: &crate::quic::Datagram,
         local: SocketAddr,
         out: &mut [u8; 1350],
@@ -74903,7 +74958,7 @@ mod tests {
     }
 
     fn hysteria_test_read_prefix(
-        conn: &mut quiche::Connection,
+        conn: &mut QuicheConnection,
         sock: &crate::quic::Datagram,
         local: SocketAddr,
         out: &mut [u8; 1350],
@@ -75139,7 +75194,7 @@ mod tests {
         id: [u8; 16],
         target: SocketAddr,
     ) -> (
-        quiche::Connection,
+        QuicheConnection,
         crate::quic::Datagram,
         SocketAddr,
         std::time::Instant,
@@ -75151,8 +75206,14 @@ mod tests {
         let mut scid = [0u8; 16];
         getrandom::fill(&mut scid).expect("random");
         let cid = quiche::ConnectionId::from_ref(&scid);
-        let mut conn =
-            quiche::connect(Some("localhost"), &cid, local, peer, &mut config).expect("connects");
+        let mut conn = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
+            Some("localhost"),
+            &cid,
+            local,
+            peer,
+            &mut config,
+        )
+        .expect("connects");
         crate::quic::drive_handshake(&mut conn, &sock, local).expect("handshakes");
         let horizon = std::time::Instant::now() + Duration::from_secs(30);
         let mut settings = Vec::new();
@@ -75223,8 +75284,14 @@ mod tests {
         let mut scid = [0u8; 16];
         getrandom::fill(&mut scid).expect("random");
         let cid = quiche::ConnectionId::from_ref(&scid);
-        let mut conn =
-            quiche::connect(Some("localhost"), &cid, local, peer, &mut config).expect("connects");
+        let mut conn = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
+            Some("localhost"),
+            &cid,
+            local,
+            peer,
+            &mut config,
+        )
+        .expect("connects");
         crate::quic::drive_handshake(&mut conn, &sock, local).expect("handshakes");
         let horizon = std::time::Instant::now() + Duration::from_secs(15);
         let mut block = Vec::new();
@@ -75618,8 +75685,14 @@ mod tests {
         let mut scid = [0u8; 16];
         getrandom::fill(&mut scid).expect("random");
         let cid = quiche::ConnectionId::from_ref(&scid);
-        let mut conn =
-            quiche::connect(Some("localhost"), &cid, local, peer, &mut config).expect("connects");
+        let mut conn = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
+            Some("localhost"),
+            &cid,
+            local,
+            peer,
+            &mut config,
+        )
+        .expect("connects");
         crate::quic::drive_handshake(&mut conn, &sock, local).expect("handshakes");
         let horizon = std::time::Instant::now() + Duration::from_secs(30);
         let mut settings = Vec::new();
@@ -75696,8 +75769,14 @@ mod tests {
         let mut scid = [0u8; 16];
         getrandom::fill(&mut scid).expect("random");
         let cid = quiche::ConnectionId::from_ref(&scid);
-        let mut conn =
-            quiche::connect(Some("localhost"), &cid, local, peer, &mut config).expect("connects");
+        let mut conn = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
+            Some("localhost"),
+            &cid,
+            local,
+            peer,
+            &mut config,
+        )
+        .expect("connects");
         crate::quic::drive_handshake(&mut conn, &sock, local).expect("handshakes");
         let horizon = std::time::Instant::now() + Duration::from_secs(15);
         // The right handshake shape — a POST to the auth path — but the wrong password must still refuse and close, never quietly serve the cover page.
@@ -75759,8 +75838,14 @@ mod tests {
         let mut scid = [0u8; 16];
         getrandom::fill(&mut scid).expect("random");
         let cid = quiche::ConnectionId::from_ref(&scid);
-        let mut conn =
-            quiche::connect(Some("localhost"), &cid, local, peer, &mut config).expect("connects");
+        let mut conn = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
+            Some("localhost"),
+            &cid,
+            local,
+            peer,
+            &mut config,
+        )
+        .expect("connects");
         crate::quic::drive_handshake(&mut conn, &sock, local).expect("handshakes");
         let horizon = std::time::Instant::now() + Duration::from_secs(30);
         let mut settings = Vec::new();
@@ -75823,7 +75908,7 @@ mod tests {
     }
 
     fn hysteria_udp_echo_frames(
-        conn: &mut quiche::Connection,
+        conn: &mut QuicheConnection,
         sock: &crate::quic::Datagram,
         out: &mut [u8],
         local: SocketAddr,
@@ -88387,7 +88472,8 @@ mod reverse_tests {
             id: 7,
             out: Arc::clone(&out),
         };
-        let (owned, identity) = picked.into_owned_with_id();
+        let identity = picked.id();
+        let owned = picked.into_owned();
         assert_eq!(identity, LaneId::Dynamic(7));
         assert!(matches!(owned, Outbound::Block(_)));
     }

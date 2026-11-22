@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use ferrox_core::foxy::{frames, head_end, hpack};
 
-use crate::quic::{self, Activity, Datagram};
+use crate::quic::{self, Activity, Datagram, QuicheConnection};
 use crate::xhttp::{XhttpMode, XhttpSettings};
 
 const TICK: Duration = Duration::from_millis(20);
@@ -81,6 +81,14 @@ impl Wire {
             Self::Client(stream) => stream.close(),
         }
     }
+
+    /// Closes the whole connection with an HTTP/3 application error, for a frame a request stream may not carry.
+    pub(crate) fn abort(&self, code: u64) {
+        match self {
+            Self::Server(stream) => stream.close_connection(code),
+            Self::Client(stream) => stream.close_connection(code),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -132,7 +140,6 @@ pub(crate) struct H3Reader {
     content_length: Option<usize>,
     frame_left: usize,
     ended: bool,
-    reset: bool,
     head_seen: bool,
     expect_request: bool,
     /// Only a CONNECT reads `Padding`; an ordinary answer leaves the field list unbuilt.
@@ -160,7 +167,6 @@ impl H3Reader {
             content_length: None,
             frame_left: 0,
             ended: false,
-            reset: false,
             head_seen: false,
             expect_request,
             padding_head: false,
@@ -435,9 +441,14 @@ impl H3Reader {
                         self.status = status;
                     }
                 }
-                frames::H3_RESET => {
+                frames::H3_CANCEL_PUSH => {
+                    // RFC 9114 §7.2.3: `CANCEL_PUSH` belongs to the control stream, so on a request stream it is `H3_FRAME_UNEXPECTED`, a connection error; a request reset is QUIC `RESET_STREAM`, not a frame.
+                    self.wire.abort(frames::H3_FRAME_UNEXPECTED);
                     self.ended = true;
-                    self.reset = true;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "h3 cancel_push on a request stream",
+                    ));
                 }
                 _ => {}
             }
@@ -484,12 +495,6 @@ impl H3Reader {
         if self.ended {
             return self.finish();
         }
-        if self.reset {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionReset,
-                "h3 stream was reset",
-            ));
-        }
         Ok(self.data_available())
     }
 
@@ -499,12 +504,6 @@ impl H3Reader {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "h3 data frame ended early",
-            ));
-        }
-        if self.reset {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionReset,
-                "h3 stream was reset",
             ));
         }
         if self.buf_at < self.buf.len() {
@@ -558,12 +557,6 @@ impl H3Reader {
                 continue;
             }
             if self.ended {
-                if self.reset {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::ConnectionReset,
-                        "h3 stream was reset",
-                    ));
-                }
                 return Ok(0);
             }
             self.parse()?;
@@ -960,7 +953,7 @@ fn serve_one(stream: &quic::QuicStream, settings: &XhttpSettings, service: &Arc<
 #[derive(Clone)]
 pub(crate) struct ClientStream {
     owner: Arc<H3Client>,
-    conn: Arc<Mutex<quiche::Connection>>,
+    conn: Arc<Mutex<QuicheConnection>>,
     sock: Arc<Datagram>,
     id: u64,
     peer_fin: Arc<AtomicBool>,
@@ -1029,7 +1022,7 @@ impl Write for ClientStream {
             return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
         }
         let deadline = Instant::now() + crate::budgets::relay_stall();
-        let mut rest = buf;
+        let mut rest = bytes::Bytes::copy_from_slice(buf);
         while !rest.is_empty() {
             if self.owner.dead.load(Ordering::Relaxed) || self.owner.rejected(self.id) {
                 return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
@@ -1037,18 +1030,18 @@ impl Write for ClientStream {
             let Ok(mut conn) = self.conn.lock() else {
                 return Err(std::io::Error::other("h3 connection lock poisoned"));
             };
-            match conn.stream_send(self.id, rest, false) {
-                Ok(0) | Err(quiche::Error::Done) => {
+            match conn.stream_send_zc(self.id, rest.clone(), false) {
+                Ok((0, _)) | Err(quiche::Error::Done) => {
                     drop(conn);
                     if Instant::now() >= deadline {
                         return Err(std::io::Error::other("h3 stream send timed out"));
                     }
                     std::thread::sleep(POLL);
                 }
-                Ok(n) => {
+                Ok((_, remainder)) => {
                     self.activity.touch();
                     quic::flush_egress(&mut conn, &self.sock);
-                    rest = &rest[n..];
+                    rest = remainder.unwrap_or_default();
                 }
                 Err(error) => {
                     return Err(std::io::Error::other(format!("h3 stream send: {error:?}")));
@@ -1126,6 +1119,15 @@ impl ClientStream {
         let _ = conn.stream_shutdown(self.id, quiche::Shutdown::Write, 0);
         quic::flush_egress(&mut conn, &self.sock);
     }
+
+    /// Closes the whole connection with an HTTP/3 application error.
+    fn close_connection(&self, code: u64) {
+        let Ok(mut conn) = self.conn.lock() else {
+            return;
+        };
+        let _ = conn.close(true, code, b"");
+        quic::flush_egress(&mut conn, &self.sock);
+    }
 }
 
 /// Why an H3 stream did not open: the peer's stream limit is temporary, while a dead or draining
@@ -1139,7 +1141,7 @@ pub(crate) enum H3OpenError {
 /// The client side of one H3 connection: streams open on the shared connection and one pump reads
 /// its socket, so an upload waits on credit without stopping the downlink's datagrams.
 pub(crate) struct H3Client {
-    conn: Arc<Mutex<quiche::Connection>>,
+    conn: Arc<Mutex<QuicheConnection>>,
     sock: Arc<Datagram>,
     next: AtomicU64,
     dead: Arc<AtomicBool>,
@@ -1252,7 +1254,14 @@ impl H3Client {
         let mut scid = [0u8; 16];
         getrandom::fill(&mut scid).ok()?;
         let cid = quiche::ConnectionId::from_ref(&scid);
-        let mut conn = quiche::connect(Some(server_name), &cid, local, peer, &mut config).ok()?;
+        let mut conn = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
+            Some(server_name),
+            &cid,
+            local,
+            peer,
+            &mut config,
+        )
+        .ok()?;
         if let Some(list) = &tls.ech_config_list {
             conn.as_mut().set_ech_config_list(list).ok()?;
         }
@@ -1475,7 +1484,7 @@ impl H3Client {
 /// one egress sweep for the run rather than one of each per packet.
 #[cfg(target_os = "linux")]
 fn drain_batch(
-    conn: &Arc<Mutex<quiche::Connection>>,
+    conn: &Arc<Mutex<QuicheConnection>>,
     sock: &Datagram,
     local: SocketAddr,
     batch: &mut quic::Batch,
@@ -1518,7 +1527,7 @@ struct ControlState {
 
 /// Run the connection's timers and answer what they queued, once the sock has nothing left to read.
 fn sweep(
-    conn: &Arc<Mutex<quiche::Connection>>,
+    conn: &Arc<Mutex<QuicheConnection>>,
     sock: &Datagram,
     local: SocketAddr,
     moved: bool,
@@ -1549,7 +1558,7 @@ fn sweep(
     true
 }
 
-fn drain_stream(conn: &mut quiche::Connection, id: u64) {
+fn drain_stream(conn: &mut QuicheConnection, id: u64) {
     let mut chunk = [0u8; 1024];
     while let Ok((n, _)) = conn.stream_recv(id, &mut chunk) {
         if n == 0 {
@@ -1562,7 +1571,7 @@ fn drain_stream(conn: &mut quiche::Connection, id: u64) {
 /// not the tunnels already open. The stream is found by its type, and a partial frame stays
 /// buffered until the next read completes it.
 fn h3_control_goaway(
-    conn: &mut quiche::Connection,
+    conn: &mut QuicheConnection,
     control: &mut ControlState,
     goaway: &AtomicU64,
 ) -> Option<bool> {
@@ -1679,7 +1688,7 @@ fn h3_control_frames(control: &mut Vec<u8>, skip: &mut u64, goaway: &AtomicU64) 
 /// Read just the stream-type varint from a unidirectional stream, leaving its frames unread and
 /// keeping a partial varint until the next read completes it.
 fn read_stream_varint(
-    conn: &mut quiche::Connection,
+    conn: &mut QuicheConnection,
     id: u64,
     types: &mut HashMap<u64, Vec<u8>>,
 ) -> Option<u64> {
@@ -1727,7 +1736,7 @@ fn read_stream_varint(
 
 #[allow(clippy::too_many_lines)]
 fn pump_connection(
-    conn: &Arc<Mutex<quiche::Connection>>,
+    conn: &Arc<Mutex<QuicheConnection>>,
     sock: &Arc<Datagram>,
     local: SocketAddr,
     peer: SocketAddr,
@@ -2249,22 +2258,23 @@ mod tests {
     }
 
     #[test]
-    fn a_reset_stream_is_an_error_not_a_clean_end() {
+    fn a_cancel_push_is_a_frame_error_not_a_reset() {
         let (identity, roots) = minted_identity("localhost");
         let settings = settings();
         let port = serve_inbound("127.0.0.1:0", &identity, &settings, Arc::new(Echo), None)
             .expect("the h3 listener binds");
         let client = client(port, roots);
-        let wire = raw_stream(&client);
-        send_frame(&wire, frames::H3_RESET, &[]);
-        let mut reader = H3Reader::new(wire);
+        let mut reader = H3Reader::new(raw_stream(&client));
+        frames::quic_varint(&mut reader.buf, frames::H3_CANCEL_PUSH);
+        frames::quic_varint(&mut reader.buf, 0);
+        reader.buf_init = reader.buf.len();
         let mut buf = [0u8; 8];
         assert_eq!(
             reader
                 .read(&mut buf)
-                .expect_err("a reset is not EOF")
+                .expect_err("cancel_push on a request stream is not EOF")
                 .kind(),
-            std::io::ErrorKind::ConnectionReset
+            std::io::ErrorKind::InvalidData
         );
     }
 

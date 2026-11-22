@@ -1,6 +1,7 @@
 //! Foxy lane: a CONNECT tunnel to an account's CDN edge over H1/H2/H3; a lane hands the caller a carrier-agnostic `Read + Write`.
 
 use crate::conn::Connection;
+use crate::quic::QuicheConnection;
 use ferrox_core::foxy::connectip;
 use ferrox_core::foxy::{
     self, authority, edge_authority, edge_peer, frames, hpack, masque, Failure, Pass,
@@ -2559,6 +2560,8 @@ pub(crate) struct H3 {
     /// The source addresses the proxy currently lets this CONNECT-IP lane use, replaced whole by each assignment capsule.
     assigned: Assignment,
     fin: bool,
+    /// Why the request stream ended as an error: kept after the bytes already delivered are handed back, so the next read reports the terminal state instead of a clean fin.
+    failure: Option<Failure>,
     /// The peer sent its fin: nothing more will arrive on the request stream, so a reader that has the bytes it was given is at the end of the tunnel and a reader that has none is at the end of a stream that carried none.
     closed: bool,
     deadline: Instant,
@@ -2596,7 +2599,7 @@ impl H3 {
             .park
             .filter(|_| self.carried >= self.filled && self.quic.sock.waits_here().is_some())?;
         let tick = self
-            .with_conn_read(quiche::Connection::timeout)
+            .with_conn_read(QuicheConnection::timeout)
             .flatten()
             .unwrap_or(park);
         Some((
@@ -2634,6 +2637,7 @@ impl H3 {
             direct: 0,
             assigned: ([0u8; 32], [0usize; 2]),
             fin: false,
+            failure: None,
             closed: false,
             deadline: Instant::now(),
             head_wait,
@@ -2656,7 +2660,7 @@ impl H3 {
         Ok(lane)
     }
 
-    fn with_conn<T>(&mut self, body: impl FnOnce(&mut quiche::Connection) -> T) -> Option<T> {
+    fn with_conn<T>(&mut self, body: impl FnOnce(&mut QuicheConnection) -> T) -> Option<T> {
         let mut guard = self.quic.conn.lock().ok()?;
         let out = body(&mut guard);
         crate::quic::flush_egress(&mut guard, &self.quic.sock);
@@ -2674,7 +2678,7 @@ impl H3 {
     }
 
     /// The connection under its lock, read-only: a reader that asks what is left has nothing to send, and the egress sweep is a syscall the read did not ask for.
-    fn with_conn_read<T>(&self, body: impl FnOnce(&quiche::Connection) -> T) -> Option<T> {
+    fn with_conn_read<T>(&self, body: impl FnOnce(&QuicheConnection) -> T) -> Option<T> {
         let guard = self.quic.conn.lock().ok()?;
         Some(body(&guard))
     }
@@ -2716,6 +2720,7 @@ impl H3 {
             direct: 0,
             assigned: ([0u8; 32], [0usize; 2]),
             fin: false,
+            failure: None,
             closed: false,
             deadline: Instant::now(),
             head_wait: HEADER_TIMEOUT,
@@ -2745,6 +2750,7 @@ impl H3 {
             direct: 0,
             assigned: ([0u8; 32], [0usize; 2]),
             fin: false,
+            failure: None,
             closed: false,
             deadline: Instant::now(),
             head_wait: HEADER_TIMEOUT,
@@ -2861,6 +2867,7 @@ impl H3 {
                 // RFC 9114 §7.2.6: a GOAWAY on a request stream is H3_FRAME_UNEXPECTED, so the tunnel ends as a protocol error rather than a clean end.
                 self.quic.cancel();
                 self.fin = true;
+                self.failure = Some(Failure::Stream);
                 self.carried = self.filled;
                 Err(Failure::Stream)
             }
@@ -2925,9 +2932,34 @@ impl H3 {
     pub(crate) fn assigned(&self) -> Assignment {
         self.assigned
     }
+    /// Whether a frame or capsule is already waiting on this lane: the proxy drains it before its next client datagram, so an assignment carried behind a reply revokes the old source before it is used again.
+    fn readable(&self) -> bool {
+        if self.fin || self.closed || self.failure.is_some() {
+            return true;
+        }
+        if self.pending.is_none() && self.parse_head().is_some() {
+            return true;
+        }
+        if connectip::capsule_split(&self.capsule_buf[self.capsule_at..]).is_some() {
+            return true;
+        }
+        if self
+            .with_conn_read(|conn| conn.stream_readable_len(self.quic.id, usize::MAX) > 0)
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        self.quic
+            .sock
+            .waits_here()
+            .is_some_and(|sock| sock.wait_readable(Duration::ZERO).unwrap_or(false))
+    }
 
     /// One IP packet, as a frame's payload the caller takes whole: a frame that is exactly one DATAGRAM capsule whose packet is already queued is read straight into the caller's buffer, so the packet crosses userspace once; a capsule that spanned frames is staged and then copied, as before.
     pub(crate) fn read_ip(&mut self, into: &mut Vec<u8>) -> std::io::Result<bool> {
+        if let Some(failure) = self.failure {
+            return Err(io(failure));
+        }
         let started = Instant::now();
         // One wait per call, armed from its start: the peek below may pull before the first walk arms it.
         self.deadline = started + HEADER_TIMEOUT;
@@ -3242,13 +3274,13 @@ impl H3 {
 
     fn send(&mut self, stream: u64, buf: &[u8], fin: bool) -> Result<(), Failure> {
         let deadline = Instant::now() + SEND_WAIT;
-        let mut rest = buf;
+        let mut rest = bytes::Bytes::copy_from_slice(buf);
         while !rest.is_empty() {
-            let written = self
-                .with_conn(|conn| conn.stream_send(stream, rest, false))
+            let (written, remainder) = self
+                .with_conn(|conn| conn.stream_send_zc(stream, rest.clone(), false))
                 .ok_or(Failure::Io)?
                 .map_err(|_| Failure::Io)?;
-            rest = &rest[written..];
+            rest = remainder.unwrap_or_default();
             if written == 0 {
                 if Instant::now() >= deadline {
                     return Err(Failure::Io);
@@ -3421,6 +3453,7 @@ impl H3 {
             // RFC 9114 §7.2.6: a GOAWAY on a request stream is H3_FRAME_UNEXPECTED, so the tunnel ends as a protocol error rather than a clean end.
             self.quic.cancel();
             self.fin = true;
+            self.failure = Some(Failure::Stream);
             self.carried = self.filled;
             return Err(Failure::Stream);
         }
@@ -3678,6 +3711,9 @@ impl Read for H3 {
         if buf.is_empty() {
             return Ok(0);
         }
+        if let Some(failure) = self.failure {
+            return Err(io(failure));
+        }
         let started = Instant::now();
         // One wait per read call, armed from its own start: re-arming inside the loop would let a peer that answers nothing park this lane forever, where the socket carriers' read timeout costs the caller `head_wait` and returns.
         self.deadline = started + self.head_wait;
@@ -3713,7 +3749,13 @@ impl Read for H3 {
                         // A remainder that is not a frame header: the peer sent bytes no frame names, and a tunnel that ends on them is a broken tunnel.
                         return Err(io(Failure::Stream));
                     };
-                    self.dispatch(frame, head, started).map_err(io)?;
+                    if let Err(failure) = self.dispatch(frame, head, started) {
+                        return if delivered > 0 {
+                            Ok(delivered)
+                        } else {
+                            Err(io(failure))
+                        };
+                    }
                     continue;
                 }
                 if self.drained() {
@@ -3746,7 +3788,13 @@ impl Read for H3 {
                 }
                 continue;
             };
-            self.dispatch(frame, head, started).map_err(io)?;
+            if let Err(failure) = self.dispatch(frame, head, started) {
+                return if delivered > 0 {
+                    Ok(delivered)
+                } else {
+                    Err(io(failure))
+                };
+            }
         }
     }
 }
@@ -3932,6 +3980,13 @@ impl Ip {
         match self {
             Self::H2(lane) => lane.assigned(),
             Self::H3(lane) => lane.assigned(),
+        }
+    }
+    /// Whether the lane already holds a frame or capsule: a client packet must not outrun an assignment it carries.
+    pub(crate) fn readable(&self) -> bool {
+        match self {
+            Self::H2(lane) => lane.readable(),
+            Self::H3(lane) => lane.readable(),
         }
     }
 
@@ -4184,6 +4239,34 @@ impl Tls2 {
     /// The source addresses the proxy currently allows this tunnel: the last assignment capsule's whole set.
     pub(crate) fn assigned(&self) -> Assignment {
         self.assigned
+    }
+    /// Whether a capsule is already staged or the edge socket is readable: the proxy drains it before its next client datagram, so an assignment behind a reply revokes the old source before it is used again.
+    fn readable(&self) -> bool {
+        let Ok(inner) = self.session.inner.lock() else {
+            return false;
+        };
+        if inner.terminal.is_some()
+            || inner
+                .streams
+                .get(&self.stream)
+                .is_none_or(|stream| stream.fin)
+        {
+            return true;
+        }
+        if !inner.tls.wants_read() {
+            return true;
+        }
+        if inner
+            .streams
+            .get(&self.stream)
+            .is_some_and(|stream| connectip::capsule_split(&stream.capsule_buf).is_some())
+        {
+            return true;
+        }
+        let Some(sock) = parked_socket(&inner.tls, &inner.wait) else {
+            return false;
+        };
+        sock.wait_readable(Duration::ZERO).unwrap_or(false)
     }
 
     /// One IP packet, as a datagram this lane can read both ends of. A capsule whole inside one DATA frame is handed out where it lies, so the packet crosses userspace once instead of through the capsule buffer.
@@ -10240,7 +10323,7 @@ pub(crate) mod loopback {
     fn answer_udp(
         sock: &crate::quic::Datagram,
         local: SocketAddr,
-        conn: &mut quiche::Connection,
+        conn: &mut QuicheConnection,
         stream: u64,
         buf: &mut [u8; 1350],
         out: &mut [u8; 1350],
@@ -10356,7 +10439,7 @@ pub(crate) mod loopback {
     fn answer_ip(
         sock: &crate::quic::Datagram,
         local: SocketAddr,
-        conn: &mut quiche::Connection,
+        conn: &mut QuicheConnection,
         stream: u64,
         udp: &std::sync::mpsc::Sender<(Vec<u8>, u16, Vec<u8>)>,
         want: usize,
@@ -10460,7 +10543,7 @@ pub(crate) mod loopback {
     }
 
     /// One H3 DATA frame carrying `payload` on `stream`: capsules on this stream are framed, and the header is its own send because quiche copies every slice it is handed.
-    fn send_h3_data(conn: &mut quiche::Connection, stream: u64, payload: &[u8]) {
+    fn send_h3_data(conn: &mut QuicheConnection, stream: u64, payload: &[u8]) {
         let mut head = [0u8; 9];
         let hl = frames::h3_data_header(&mut head, payload.len() as u64);
         conn.stream_send(stream, &head[..hl], false)
@@ -11001,7 +11084,7 @@ pub(crate) mod loopback {
     fn echo_stream(
         sock: &crate::quic::Datagram,
         local: SocketAddr,
-        conn: &mut quiche::Connection,
+        conn: &mut QuicheConnection,
         buf: &mut [u8; 1350],
         out: &mut [u8; 1350],
         stream: u64,
@@ -11078,7 +11161,7 @@ pub(crate) mod loopback {
     }
 
     /// One unidirectional stream's bytes plus whether it has closed, merged into the snapshot the test asserts the lane's opening against.
-    fn drain_uni(conn: &mut quiche::Connection, id: u64, streams: &mut Vec<(u64, Vec<u8>, bool)>) {
+    fn drain_uni(conn: &mut QuicheConnection, id: u64, streams: &mut Vec<(u64, Vec<u8>, bool)>) {
         let mut chunk = [0u8; 8192];
         loop {
             match conn.stream_recv(id, &mut chunk) {
@@ -11095,7 +11178,7 @@ pub(crate) mod loopback {
     }
 
     /// Every byte a stream holds, read into a buffer that exists: a `Vec` handed to `stream_recv` is a zero-length slice and never receives anything.
-    fn drain(conn: &mut quiche::Connection, id: u64) -> Vec<u8> {
+    fn drain(conn: &mut QuicheConnection, id: u64) -> Vec<u8> {
         let mut out = Vec::new();
         let mut chunk = [0u8; 8192];
         while let Ok((n, _)) = conn.stream_recv(id, &mut chunk) {
@@ -11226,6 +11309,68 @@ pub(crate) mod loopback {
             0,
             "nothing the tunnel does not read was left on the lane"
         );
+        edge.join().expect("joins");
+    }
+
+    /// A GOAWAY after DATA ends the tunnel as an error, but only after the bytes already copied reach the caller: the next read reports the terminal state rather than a clean fin.
+    #[test]
+    fn an_h3_goaway_after_data_hands_back_the_data_first() {
+        const PAYLOAD: &[u8] = b"the bytes before the goaway";
+        let (roots, server) = minted(b"h3");
+        let sock =
+            crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
+        let port = sock.local_addr().expect("addr").port();
+        let edge = h3_scripted_edge(
+            sock,
+            server,
+            vec![
+                (h3_answer(), Duration::ZERO),
+                (h3_data(PAYLOAD), Duration::ZERO),
+                (h3_goaway(), Duration::ZERO),
+            ],
+        );
+
+        let dial = dial_for(roots, port, Carrier::H3, foxy::pin::Pins::default());
+        let quic = crate::quic::direct_stream("localhost", "127.0.0.1", port, &dial.roots)
+            .expect("a connection");
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", Some(quic)).expect("opens");
+        tunnel
+            .set_read_quantum(Duration::from_millis(100))
+            .expect("arms");
+
+        let mut chunk = [0u8; 128];
+        let mut got: Vec<u8> = Vec::new();
+        let until = std::time::Instant::now() + Duration::from_secs(30);
+        while got.len() < PAYLOAD.len() {
+            assert!(std::time::Instant::now() < until, "the data arrives");
+            match tunnel.read(&mut chunk) {
+                Ok(0) => panic!("the goaway was a clean end before the data"),
+                Ok(read) => got.extend_from_slice(&chunk[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("the data was lost to the goaway: {error}"),
+            }
+        }
+        assert_eq!(
+            got, PAYLOAD,
+            "the bytes copied before the goaway are the caller's"
+        );
+        let until = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            assert!(std::time::Instant::now() < until, "the goaway reports");
+            match tunnel.read(&mut chunk) {
+                Ok(0) => panic!("the goaway ended as a clean fin"),
+                Ok(_) => panic!("the goaway produced more bytes"),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+                    assert!(
+                        error.to_string().contains("closed the stream"),
+                        "unexpected terminal error: {error}"
+                    );
+                    break;
+                }
+            }
+        }
         edge.join().expect("joins");
     }
 
@@ -11455,6 +11600,11 @@ pub(crate) mod loopback {
                 crate::quic::server_idle(&mut conn, &sock, &mut out);
             }
         })
+    }
+
+    /// One GOAWAY frame on a request stream: varint kind, one-byte length, and the stream id it carries.
+    fn h3_goaway() -> Vec<u8> {
+        vec![0x07, 0x01, 0x00]
     }
 
     /// One DATA frame holding `payload`, the way an edge sends it: varint kind, varint length, bytes.

@@ -1600,26 +1600,52 @@ pub(crate) struct Datagrams {
     client_body: Option<Cipher>,
     client_psk: Vec<u8>,
     client_session: [u8; 8],
+    list_psks: Vec<Vec<u8>>,
+    list_hashes: Vec<[u8; BLOCK_LEN]>,
+    #[cfg(test)]
+    ledger: Ledger,
+}
+
+/// What one receive path spends per datagram, so a test can hold the count where the rewrite put it.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct Ledger {
+    clocks: usize,
+    derivations: usize,
+    window_checks: usize,
+    user_lists: usize,
+    opens: usize,
+}
+
+/// A session seen for the first time: the body key is the caller's to fill in.
+fn fresh_session(now: Instant) -> ServerUdp {
+    ServerUdp {
+        window: shadowsocks2022::SlidingWindow::new(),
+        seen: now,
+        cipher: None,
+        user: None,
+        server_session: 0,
+        server_packet: 0,
+        server_cipher: None,
+    }
 }
 
 impl Datagrams {
-    /// Admit a client session, refusing a new one past the cap; the listener's live-aware sweep owns expiry.
-    fn session_mut(&mut self, session: u64) -> Option<&mut ServerUdp> {
-        let now = Instant::now();
-        if !self.sessions.contains_key(&session) && self.sessions.len() >= MAX_UDP_SESSIONS {
-            return None;
+    /// The user hashes a multi-user key list names, built once for the list and kept while it is unchanged: the EIH on every datagram carries one hash, so rebuilding the list per datagram walks every user.
+    fn refresh_user_hashes(&mut self, psks: &[Vec<u8>]) {
+        if self.list_psks.as_slice() == psks {
+            return;
         }
-        let entry = self.sessions.entry(session).or_insert_with(|| ServerUdp {
-            window: shadowsocks2022::SlidingWindow::new(),
-            seen: now,
-            cipher: None,
-            user: None,
-            server_session: 0,
-            server_packet: 0,
-            server_cipher: None,
-        });
-        entry.seen = now;
-        Some(entry)
+        self.list_psks.clear();
+        self.list_psks.extend_from_slice(psks);
+        self.list_hashes.clear();
+        for psk in psks {
+            self.list_hashes.push(shadowsocks2022::user_hash(psk));
+        }
+        #[cfg(test)]
+        {
+            self.ledger.user_lists += 1;
+        }
     }
 
     pub(crate) fn new() -> Self {
@@ -1642,6 +1668,10 @@ impl Datagrams {
             client_body: None,
             client_psk: Vec::new(),
             client_session: [0u8; 8],
+            list_psks: Vec::new(),
+            list_hashes: Vec::new(),
+            #[cfg(test)]
+            ledger: Ledger::default(),
         }
     }
     pub(crate) fn seal(
@@ -1739,13 +1769,13 @@ impl Datagrams {
             self.client_session = session;
         }
         let enc = shadowsocks2022::block_encrypt(&psks[0], &raw)?;
+        self.refresh_user_hashes(psks);
         let (out, body_key) = (&mut self.sealed, self.client_body.as_ref()?);
         out.clear();
         out.reserve((1 + psks.len()) * BLOCK_LEN + 11 + payload.len() + TAG_LEN);
         out.extend_from_slice(&enc);
-        for pair in psks.windows(2) {
-            let hash = shadowsocks2022::user_hash(&pair[1]);
-            let eih = shadowsocks2022::encrypt_udp_eih(&pair[0], &raw, &hash)?;
+        for (at, pair) in psks.windows(2).enumerate() {
+            let eih = shadowsocks2022::encrypt_udp_eih(&pair[0], &raw, &self.list_hashes[at + 1])?;
             out.extend_from_slice(&eih);
         }
         let mut nonce = [0u8; 12];
@@ -1760,6 +1790,7 @@ impl Datagrams {
         body_key.seal_tail_with_nonce(&nonce, out, at)?;
         Some(out)
     }
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn open<'a>(
         &mut self,
         psk: &[u8],
@@ -1794,19 +1825,32 @@ impl Datagrams {
             if body.len() < 11 + pad {
                 return None;
             }
-            if !self
-                .sessions
-                .get(&session)
-                .is_none_or(|entry| entry.window.check(packet_id))
-            {
-                return None;
-            }
             let (target, used) = parse_addr_header(&body[11 + pad..])?;
             if body.len() < 11 + pad + used {
                 return None;
             }
-            let entry = self.session_mut(session)?;
-            entry.window.add(packet_id);
+            if self.sessions.len() >= MAX_UDP_SESSIONS && !self.sessions.contains_key(&session) {
+                return None;
+            }
+            let now = Instant::now();
+            #[cfg(test)]
+            {
+                self.ledger.clocks += 1;
+            }
+            let entry = match self.sessions.entry(session) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(fresh_session(now))
+                }
+            };
+            #[cfg(test)]
+            {
+                self.ledger.window_checks += 1;
+            }
+            if !entry.window.check_and_add(packet_id) {
+                return None;
+            }
+            entry.seen = now;
             Some((
                 target,
                 &packet[24 + 16 + 11 + pad + used..24 + len],
@@ -1822,28 +1866,66 @@ impl Datagrams {
             let raw = shadowsocks2022::block_decrypt(psk, &enc)?;
             let session = u64::from_be_bytes(raw[..8].try_into().ok()?);
             let packet_id = u64::from_be_bytes(raw[8..].try_into().ok()?);
-            let sub = shadowsocks2022::session_subkey(psk, &raw[..8])?;
-            let cipher = Cipher::from_subkey(method, &sub[..key_len])?;
             let mut nonce = [0u8; 12];
             nonce.copy_from_slice(&raw[4..16]);
-            let len = authenticate_body(&cipher, &nonce, &mut packet[16..])?;
-            let (target, total) = parse_body(&packet[16..16 + len], 11, 0)?;
-            if !self
-                .sessions
-                .get(&session)
-                .is_none_or(|entry| entry.window.check(packet_id))
-            {
+            if self.sessions.len() >= MAX_UDP_SESSIONS && !self.sessions.contains_key(&session) {
                 return None;
             }
-            let entry = self.session_mut(session)?;
-            if !entry.window.check_and_add(packet_id) {
-                return None;
-            }
-            entry.seen = Instant::now();
-            self.sessions
-                .get_mut(&session)?
-                .cipher
-                .get_or_insert(cipher);
+            let (target, total, len) = match self.sessions.entry(session) {
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    #[cfg(test)]
+                    {
+                        self.ledger.window_checks += 1;
+                    }
+                    if !entry.get().window.check(packet_id) {
+                        return None;
+                    }
+                    let cached = entry.get().cipher.as_ref();
+                    let (len, derived) =
+                        open_body(cached, psk, method, &raw[..8], &nonce, &mut packet[16..])?;
+                    #[cfg(test)]
+                    {
+                        self.ledger.opens += 1;
+                        if derived.is_some() {
+                            self.ledger.derivations += 1;
+                        }
+                    }
+                    let (target, total) = parse_body(&packet[16..16 + len], 11, 0)?;
+                    let now = Instant::now();
+                    #[cfg(test)]
+                    {
+                        self.ledger.clocks += 1;
+                    }
+                    let entry = entry.into_mut();
+                    entry.window.add(packet_id);
+                    entry.seen = now;
+                    if let Some(cipher) = derived {
+                        entry.cipher.get_or_insert(cipher);
+                    }
+                    (target, total, len)
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let (len, derived) =
+                        open_body(None, psk, method, &raw[..8], &nonce, &mut packet[16..])?;
+                    #[cfg(test)]
+                    {
+                        self.ledger.opens += 1;
+                        self.ledger.derivations += 1;
+                    }
+                    let (target, total) = parse_body(&packet[16..16 + len], 11, 0)?;
+                    let now = Instant::now();
+                    #[cfg(test)]
+                    {
+                        self.ledger.clocks += 1;
+                        self.ledger.window_checks += 1;
+                    }
+                    let mut fresh = fresh_session(now);
+                    fresh.window.add(packet_id);
+                    fresh.cipher = derived;
+                    entry.insert(fresh);
+                    (target, total, len)
+                }
+            };
             Some((target, &packet[16 + total..16 + len], session))
         }
     }
@@ -1868,42 +1950,64 @@ impl Datagrams {
         let mut eih = [0u8; BLOCK_LEN];
         eih.copy_from_slice(&packet[16..32]);
         let hash = shadowsocks2022::decrypt_udp_eih(&psks[0], &raw, &eih)?;
-        let idx = psks[1..]
+        self.refresh_user_hashes(psks);
+        let idx = self.list_hashes[1..]
             .iter()
-            .position(|p| shadowsocks2022::user_hash(p) == hash)?
+            .position(|held| *held == hash)?
             + 1;
-        let sub = shadowsocks2022::session_subkey(&psks[idx], &raw[..8])?;
-        let cipher = Cipher::from_subkey(method, &sub[..key_len])?;
         let mut nonce = [0u8; 12];
         nonce.copy_from_slice(&raw[4..16]);
-        let len = authenticate_body(&cipher, &nonce, &mut packet[32..])?;
+        let held = self.sessions.get(&session);
+        if held
+            .and_then(|entry| entry.user)
+            .is_some_and(|user| user != idx)
+        {
+            return None;
+        }
+        #[cfg(test)]
+        {
+            self.ledger.window_checks += 1;
+        }
+        if held.is_some_and(|entry| !entry.window.check(packet_id)) {
+            return None;
+        }
+        let cached = held.and_then(|entry| entry.cipher.as_ref());
+        let (len, derived) = open_body(
+            cached,
+            &psks[idx],
+            method,
+            &raw[..8],
+            &nonce,
+            &mut packet[32..],
+        )?;
+        #[cfg(test)]
+        {
+            self.ledger.opens += 1;
+            if derived.is_some() {
+                self.ledger.derivations += 1;
+            }
+        }
         let (target, total) = parse_body(&packet[32..32 + len], 11, 0)?;
-        if self
-            .sessions
-            .get(&session)
-            .is_some_and(|entry| entry.user.is_some_and(|user| user != idx))
+        if self.sessions.len() >= MAX_UDP_SESSIONS && !self.sessions.contains_key(&session) {
+            return None;
+        }
+        let now = Instant::now();
+        #[cfg(test)]
         {
-            return None;
+            self.ledger.clocks += 1;
         }
-        if !self
-            .sessions
-            .get(&session)
-            .is_none_or(|entry| entry.window.check(packet_id))
-        {
-            return None;
-        }
-        let entry = self.session_mut(session)?;
-        if !entry.window.check_and_add(packet_id) {
-            return None;
-        }
-        entry.seen = Instant::now();
+        let entry = match self.sessions.entry(session) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(fresh_session(now)),
+        };
+        entry.window.add(packet_id);
+        entry.seen = now;
         if entry.user.is_none() {
             entry.user = Some(idx);
         }
-        self.sessions
-            .get_mut(&session)?
-            .cipher
-            .get_or_insert(cipher);
+        if let Some(cipher) = derived {
+            entry.cipher.get_or_insert(cipher);
+        }
         Some((target, &packet[32 + total..32 + len], idx, session))
     }
     pub(crate) fn seal_server(
@@ -1917,12 +2021,20 @@ impl Datagrams {
         if user_psk.len() != method.key_len() {
             return None;
         }
-        if let Some(entry) = self.sessions.get_mut(&client_session) {
-            entry.seen = Instant::now();
+        let now = Instant::now();
+        #[cfg(test)]
+        {
+            self.ledger.clocks += 1;
         }
-        let fresh = self.sessions.get(&client_session).is_none_or(|e| {
-            e.server_session == 0 || (!method.is_chacha() && e.server_cipher.is_none())
-        });
+        let fresh = if let Some(entry) = self.sessions.get_mut(&client_session) {
+            entry.seen = now;
+            entry.server_session == 0 || (!method.is_chacha() && entry.server_cipher.is_none())
+        } else {
+            if self.sessions.len() >= MAX_UDP_SESSIONS {
+                return None;
+            }
+            true
+        };
         if fresh {
             let mut sid = [0u8; 8];
             getrandom::fill(&mut sid).ok()?;
@@ -1930,11 +2042,20 @@ impl Datagrams {
             if sid == 0 {
                 return None;
             }
-            let entry = self.session_mut(client_session)?;
+            let cipher = if method.is_chacha() {
+                None
+            } else {
+                let sub = shadowsocks2022::session_subkey(user_psk, &sid.to_be_bytes())?;
+                Cipher::from_subkey(method, &sub[..method.key_len()])
+            };
+            let entry = self
+                .sessions
+                .entry(client_session)
+                .or_insert_with(|| fresh_session(now));
+            entry.seen = now;
             entry.server_session = sid;
             if !method.is_chacha() {
-                let sub = shadowsocks2022::session_subkey(user_psk, &sid.to_be_bytes())?;
-                entry.server_cipher = Cipher::from_subkey(method, &sub[..method.key_len()]);
+                entry.server_cipher = cipher;
             }
         }
         if method.is_chacha() {
@@ -1963,18 +2084,17 @@ impl Datagrams {
             shadowsocks2022::x_seal_tail(user_psk, &nonce, out, at)?;
             Some(out)
         } else {
-            let (server_session, server_packet) = {
+            let (server_session, server_packet, cipher) = {
                 let entry = self.sessions.get_mut(&client_session)?;
                 let id = entry.server_packet;
                 entry.server_packet = entry.server_packet.wrapping_add(1);
-                (entry.server_session, id)
+                (entry.server_session, id, entry.server_cipher.as_ref())
             };
             let mut raw = [0u8; BLOCK_LEN];
             raw[..8].copy_from_slice(&server_session.to_be_bytes());
             raw[8..].copy_from_slice(&server_packet.to_be_bytes());
             let enc = shadowsocks2022::block_encrypt(user_psk, &raw)?;
-            let (out, sessions) = (&mut self.sealed, &self.sessions);
-            let cipher = sessions.get(&client_session)?.server_cipher.as_ref()?;
+            let out = &mut self.sealed;
             let mut nonce = [0u8; 12];
             nonce.copy_from_slice(&raw[4..16]);
             out.clear();
@@ -1988,7 +2108,7 @@ impl Datagrams {
             push_addr(out, dest, 4);
             out.extend_from_slice(&dest.port().to_be_bytes());
             out.extend_from_slice(payload);
-            cipher.seal_tail_with_nonce(&nonce, out, at)?;
+            cipher?.seal_tail_with_nonce(&nonce, out, at)?;
             Some(out)
         }
     }
@@ -2029,9 +2149,6 @@ impl Datagrams {
             if body.len() < 19 + pad {
                 return None;
             }
-            if replayed(&self.peers, session, packet_id) {
-                return None;
-            }
             let (target, used) = parse_addr_header(&body[19 + pad..])?;
             if body.len() < 19 + pad + used {
                 return None;
@@ -2051,15 +2168,12 @@ impl Datagrams {
             let packet_id = u64::from_be_bytes(raw[8..].try_into().ok()?);
             let mut nonce = [0u8; 12];
             nonce.copy_from_slice(&raw[4..16]);
-            let (len, derived) = open_peer_body(
-                &self.peers,
-                session,
-                psk,
-                method,
-                &raw[..8],
-                &nonce,
-                &mut packet[16..],
-            )?;
+            let held = self
+                .peers
+                .get(&session)
+                .and_then(|peer| peer.cipher.as_ref());
+            let (len, derived) =
+                open_body(held, psk, method, &raw[..8], &nonce, &mut packet[16..])?;
             if len > packet.len() - 16 {
                 return None;
             }
@@ -2077,9 +2191,6 @@ impl Datagrams {
             if body.len() < 19 + pad {
                 return None;
             }
-            if replayed(&self.peers, session, packet_id) {
-                return None;
-            }
             let (target, used) = parse_addr_header(&body[19 + pad..])?;
             if body.len() < 19 + pad + used {
                 return None;
@@ -2088,12 +2199,8 @@ impl Datagrams {
                 return None;
             }
             if let Some(cipher) = derived {
-                if self
-                    .peers
-                    .get(&session)
-                    .is_none_or(|peer| peer.cipher.is_none())
-                {
-                    self.peers.get_mut(&session)?.cipher = Some(cipher);
+                if let Some(peer) = self.peers.get_mut(&session) {
+                    peer.cipher.get_or_insert(cipher);
                 }
             }
             Some((target, &packet[16 + 19 + pad + used..16 + len]))
@@ -2101,27 +2208,20 @@ impl Datagrams {
     }
 }
 
-fn open_peer_body(
-    peers: &HashMap<u64, PeerServer>,
-    session: u64,
+fn open_body(
+    cached: Option<&Cipher>,
     psk: &[u8],
     method: Method,
     salt: &[u8],
     nonce: &[u8; 12],
     body: &mut [u8],
 ) -> Option<(usize, Option<Cipher>)> {
-    if let Some(cipher) = peers.get(&session).and_then(|peer| peer.cipher.as_ref()) {
+    if let Some(cipher) = cached {
         return Some((cipher.open_with_nonce(nonce, body)?, None));
     }
     let sub = shadowsocks2022::session_subkey(psk, salt)?;
     let cipher = Cipher::from_subkey(method, &sub[..method.key_len()])?;
     Some((cipher.open_with_nonce(nonce, body)?, Some(cipher)))
-}
-
-fn replayed(peers: &HashMap<u64, PeerServer>, session: u64, packet_id: u64) -> bool {
-    peers
-        .get(&session)
-        .is_some_and(|peer| !peer.window.check(packet_id))
 }
 
 fn peer_check(
@@ -2151,11 +2251,6 @@ fn peer_check(
     }
     peers.insert(session, peer);
     true
-}
-
-fn authenticate_body(cipher: &Cipher, nonce: &[u8; 12], body: &mut [u8]) -> Option<usize> {
-    let len = cipher.open_with_nonce(nonce, body)?;
-    (len <= body.len()).then_some(len)
 }
 
 fn parse_body(body: &[u8], header: usize, kind: u8) -> Option<(SocketAddr, usize)> {
@@ -2406,6 +2501,7 @@ pub(crate) fn serve_udp_on(
     let mut order: Vec<(u64, bool)> = Vec::new();
     let mut ordered: HashSet<(u64, bool)> = HashSet::new();
     let mut seen: HashSet<(u64, bool)> = HashSet::new();
+    let mut live: HashSet<u64> = HashSet::new();
     let mut cursor = 0usize;
     let mut resume: Option<(u64, bool)> = None;
     loop {
@@ -2498,7 +2594,8 @@ pub(crate) fn serve_udp_on(
                     .is_some_and(|at| now.saturating_duration_since(*at) < UPSTREAM_IDLE)
         });
         used.retain(|key, _| upstreams.contains_key(key));
-        let live: HashSet<u64> = upstreams.keys().map(|(session, _)| *session).collect();
+        live.clear();
+        live.extend(upstreams.keys().map(|(session, _)| *session));
         clients_of.retain(|session, _| live.contains(session));
         users.retain(|session, _| live.contains(session));
         let replay_ttl = Duration::from_secs(SKEW * 2 + 1);
@@ -3513,6 +3610,94 @@ mod tests {
                 "round {round}: payload is a separate buffer"
             );
         }
+    }
+
+    #[test]
+    fn a_datagram_costs_one_derivation_one_clock_and_one_window() {
+        let method = Method::Aes256Gcm;
+        let psk = vec![0x21u8; 32];
+        let target: SocketAddr = "127.0.0.1:53".parse().expect("addr");
+        let mut client = Datagrams::new();
+        let mut server = Datagrams::new();
+        for round in 0..3 {
+            let mut packet = client
+                .seal(&psk, method, &target, b"shared session")
+                .expect("seals")
+                .to_vec();
+            server
+                .open(&psk, method, &mut packet)
+                .unwrap_or_else(|| panic!("round {round} opens"));
+        }
+        assert_eq!(
+            server.ledger.derivations, 1,
+            "a session's body key is derived once, not once a datagram"
+        );
+        assert_eq!(server.ledger.clocks, 3, "one monotonic read a datagram");
+        assert_eq!(
+            server.ledger.window_checks, 3,
+            "one window entry a datagram"
+        );
+    }
+
+    #[test]
+    fn a_replayed_datagram_does_not_open_the_body_again() {
+        let method = Method::Aes256Gcm;
+        let psk = vec![0x41u8; 32];
+        let target: SocketAddr = "127.0.0.1:53".parse().expect("addr");
+        let mut client = Datagrams::new();
+        let mut server = Datagrams::new();
+        let sealed = client
+            .seal(&psk, method, &target, b"one body open")
+            .expect("seals")
+            .to_vec();
+        let mut first = sealed.clone();
+        let (got, payload, _) = server.open(&psk, method, &mut first).expect("opens");
+        assert_eq!(got, target);
+        assert_eq!(payload, b"one body open");
+        assert_eq!(server.ledger.opens, 1);
+        for round in 0..3 {
+            let mut again = sealed.clone();
+            assert!(
+                server.open(&psk, method, &mut again).is_none(),
+                "round {round}: a replay is refused"
+            );
+            assert_eq!(
+                again, sealed,
+                "round {round}: a refused replay leaves the bytes alone"
+            );
+        }
+        assert_eq!(
+            server.ledger.opens, 1,
+            "a replay is refused before the body AEAD runs"
+        );
+    }
+
+    #[test]
+    fn a_multi_user_list_is_hashed_once_and_not_a_datagram() {
+        let method = Method::Aes128Gcm;
+        let list = vec![vec![0x11u8; 16], vec![0x22u8; 16]];
+        let target: SocketAddr = "127.0.0.1:53".parse().expect("addr");
+        let mut client = Datagrams::new();
+        let mut server = Datagrams::new();
+        for round in 0..3 {
+            let mut packet = client
+                .seal_list(method, &list, &target, b"multi")
+                .unwrap_or_else(|| panic!("round {round} seals"))
+                .to_vec();
+            let (_, payload, idx, _) = server
+                .open_multi(method, &list, &mut packet)
+                .unwrap_or_else(|| panic!("round {round} opens"));
+            assert_eq!(payload, b"multi");
+            assert_eq!(idx, 1, "the user psk is the one the EIH named");
+        }
+        assert_eq!(
+            client.ledger.user_lists, 1,
+            "sealing reuses the list it hashed once"
+        );
+        assert_eq!(
+            server.ledger.user_lists, 1,
+            "opening hashes the user list once, not once a datagram"
+        );
     }
 
     #[test]

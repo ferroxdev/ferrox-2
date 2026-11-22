@@ -3,7 +3,8 @@
 use crate::conn::Connection;
 use crate::json::Json;
 use crate::proxy::{self, Destination};
-use crate::quic::{self, Datagram, QuicStream};
+use crate::quic::{self, Datagram, QuicStream, QuicheConnection};
+use bytes::BufMut as _;
 use ferrox_core::tls::Anchors;
 use ferrox_core::tuic as wire;
 use std::borrow::Cow;
@@ -125,7 +126,7 @@ impl Drop for LaneLease {
 }
 
 struct Lane {
-    conn: Arc<Mutex<quiche::Connection>>,
+    conn: Arc<Mutex<QuicheConnection>>,
     sock: Arc<Datagram>,
     leases: AtomicUsize,
     local: SocketAddr,
@@ -143,7 +144,7 @@ struct Lane {
     establish_by: Option<Instant>,
 }
 
-fn lane_established(conn: &quiche::Connection, lane: &Lane) -> bool {
+fn lane_established(conn: &QuicheConnection, lane: &Lane) -> bool {
     if conn.is_closed() {
         return false;
     }
@@ -242,7 +243,7 @@ struct UdpSink {
 
 struct Pending {
     id: Option<u64>,
-    data: Vec<u8>,
+    data: bytes::Bytes,
     at: usize,
     finish: bool,
 }
@@ -412,7 +413,14 @@ impl TuicOut {
         let mut scid = [0u8; SCID_LEN];
         getrandom::fill(&mut scid).ok()?;
         let cid = quiche::ConnectionId::from_ref(&scid);
-        let mut conn = quiche::connect(Some(&self.host), &cid, local, peer, &mut config).ok()?;
+        let mut conn = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
+            Some(&self.host),
+            &cid,
+            local,
+            peer,
+            &mut config,
+        )
+        .ok()?;
         if self.zero_rtt {
             if let Ok(session) = self.session.lock() {
                 if let Some(blob) = session.as_deref() {
@@ -743,7 +751,7 @@ fn pinned_config(pins: Arc<[[u8; 32]]>, name: String) -> Option<quiche::Config> 
     quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder).ok()
 }
 
-fn remember_session(conn: &quiche::Connection, session: &Mutex<Option<Vec<u8>>>) -> bool {
+fn remember_session(conn: &QuicheConnection, session: &Mutex<Option<Vec<u8>>>) -> bool {
     let Some(blob) = conn.session() else {
         return false;
     };
@@ -754,7 +762,7 @@ fn remember_session(conn: &quiche::Connection, session: &Mutex<Option<Vec<u8>>>)
 }
 
 fn heartbeat(
-    conn: &Arc<Mutex<quiche::Connection>>,
+    conn: &Arc<Mutex<QuicheConnection>>,
     sock: &Arc<Datagram>,
     every: Duration,
     stop: Arc<AtomicBool>,
@@ -781,13 +789,13 @@ fn heartbeat(
 }
 
 fn export_token(
-    conn: &mut quiche::Connection,
+    conn: &mut QuicheConnection,
     uuid: &[u8; 16],
     password: &[u8],
 ) -> Option<[u8; wire::TOKEN_LEN]> {
     use foreign_types::ForeignTypeRef as _;
     let mut token = [0u8; wire::TOKEN_LEN];
-    let ssl = <quiche::Connection as AsMut<boring::ssl::SslRef>>::as_mut(conn);
+    let ssl = <QuicheConnection as AsMut<boring::ssl::SslRef>>::as_mut(conn);
     let ok = unsafe {
         boring_sys::SSL_export_keying_material(
             ssl.as_ptr(),
@@ -809,7 +817,7 @@ fn export_token(
 
 #[allow(clippy::too_many_arguments)]
 fn send_message(
-    conn: &mut quiche::Connection,
+    conn: &mut QuicheConnection,
     sock: &Datagram,
     mode: RelayMode,
     association: u16,
@@ -890,7 +898,7 @@ fn queue_stream(
     wire::encode_fragment(association, packet, 1, 0, address, payload, &mut data);
     pending.push(Pending {
         id: None,
-        data,
+        data: data.into(),
         at: 0,
         finish: true,
     });
@@ -904,13 +912,13 @@ fn queue_dissociate(pending: &mut Vec<Pending>, association: u16) {
     wire::encode_dissociate(association, &mut data);
     pending.push(Pending {
         id: None,
-        data,
+        data: data.into(),
         at: 0,
         finish: true,
     });
 }
 
-fn flush_one(conn: &mut quiche::Connection, frame: &mut Pending, next_uni: &AtomicU64) -> Sent {
+fn flush_one(conn: &mut QuicheConnection, frame: &mut Pending, next_uni: &AtomicU64) -> Sent {
     if frame.id.is_none() {
         if conn.is_closed() {
             return Sent::Failed;
@@ -919,8 +927,8 @@ fn flush_one(conn: &mut quiche::Connection, frame: &mut Pending, next_uni: &Atom
             return Sent::Blocked;
         }
         let id = next_uni.load(Ordering::Relaxed);
-        match conn.stream_send(id, &frame.data[frame.at..], false) {
-            Ok(n) if n > 0 => {
+        match conn.stream_send_zc(id, frame.data.slice(frame.at..), false) {
+            Ok((n, _)) if n > 0 => {
                 frame.id = Some(id);
                 next_uni.store(id.wrapping_add(4), Ordering::Relaxed);
                 frame.at += n;
@@ -938,8 +946,8 @@ fn flush_one(conn: &mut quiche::Connection, frame: &mut Pending, next_uni: &Atom
         return Sent::Blocked;
     };
     while frame.at < frame.data.len() {
-        match conn.stream_send(id, &frame.data[frame.at..], false) {
-            Ok(n) if n > 0 => frame.at += n,
+        match conn.stream_send_zc(id, frame.data.slice(frame.at..), false) {
+            Ok((n, _)) if n > 0 => frame.at += n,
             Ok(_) | Err(quiche::Error::Done | quiche::Error::StreamLimit) => {
                 return Sent::Blocked;
             }
@@ -958,7 +966,7 @@ fn flush_one(conn: &mut quiche::Connection, frame: &mut Pending, next_uni: &Atom
 }
 
 fn flush_pending(
-    conn: &mut quiche::Connection,
+    conn: &mut QuicheConnection,
     sock: &Datagram,
     pending: &mut Vec<Pending>,
     next_uni: &AtomicU64,
@@ -982,7 +990,7 @@ fn is_wait(error: &std::io::Error) -> bool {
     )
 }
 
-fn service(conn: &mut quiche::Connection, lane: &Lane) -> bool {
+fn service(conn: &mut QuicheConnection, lane: &Lane) -> bool {
     if conn
         .timeout_instant()
         .is_some_and(|at| at <= Instant::now())
@@ -1052,9 +1060,9 @@ fn drive_client(weak: &std::sync::Weak<Lane>) {
                 }
                 lane.finish_handshake() && {
                     let turned = match lane.conn.lock() {
-                        Ok(mut conn) => client_turn(
-                            &mut conn, &lane, &mut buf, &replies, &mut out, &mut uni, &mut ids,
-                        ),
+                        Ok(mut conn) => {
+                            client_turn(&mut conn, &lane, &replies, &mut out, &mut uni, &mut ids)
+                        }
                         Err(_) => false,
                     };
                     turned && hand_off(&mut out, &replies)
@@ -1085,7 +1093,7 @@ fn drive_client(weak: &std::sync::Weak<Lane>) {
                     lane.finish_handshake() && {
                         let turned = match lane.conn.lock() {
                             Ok(mut conn) => client_turn(
-                                &mut conn, &lane, &mut buf, &replies, &mut out, &mut uni, &mut ids,
+                                &mut conn, &lane, &replies, &mut out, &mut uni, &mut ids,
                             ),
                             Err(_) => false,
                         };
@@ -1179,9 +1187,8 @@ fn hand_off(out: &mut Vec<Reply>, replies: &SyncSender<Reply>) -> bool {
 /// the timers behind them. The lock, the readable sweep and the egress flush are each paid once
 /// per batch instead of once per packet.
 fn client_turn(
-    conn: &mut quiche::Connection,
+    conn: &mut QuicheConnection,
     lane: &Lane,
-    buf: &mut [u8],
     replies: &SyncSender<Reply>,
     out: &mut Vec<Reply>,
     uni: &mut HashMap<u64, Vec<u8>>,
@@ -1198,15 +1205,22 @@ fn client_turn(
             continue;
         }
         let mut data = uni.remove(&id).unwrap_or_default();
-        while let Ok((read, _)) = conn.stream_recv(id, buf) {
-            if read == 0 {
-                break;
+        loop {
+            if data.len() > MAX_UNI_COMMAND {
+                let (rest, broken) = share_uni_packets(data, out);
+                if broken || rest.len() > MAX_UNI_COMMAND {
+                    let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
+                    data = Vec::new();
+                    break;
+                }
+                data = rest;
             }
-            if data.len() + read > MAX_UNI_COMMAND {
-                let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
-                break;
+            // One byte over the cap distinguishes "filled it exactly" from "there is more".
+            let room = MAX_UNI_COMMAND - data.len() + 1;
+            match conn.stream_recv_buf(id, (&mut data).limit(room)) {
+                Ok((0, _)) | Err(_) => break,
+                Ok((_, _)) => {}
             }
-            data.extend_from_slice(&buf[..read]);
         }
         let (rest, broken) = share_uni_packets(data, out);
         if broken {
@@ -1220,7 +1234,7 @@ fn client_turn(
     service(conn, lane)
 }
 
-fn flush_lane(lane: &Lane, conn: &mut quiche::Connection) {
+fn flush_lane(lane: &Lane, conn: &mut QuicheConnection) {
     if let Ok(mut pending) = lane.pending.lock() {
         flush_pending(conn, &lane.sock, &mut pending, &lane.next_uni);
     } else {
@@ -1756,7 +1770,7 @@ impl Drop for LiveWorker {
 }
 
 struct Session {
-    conn: Arc<Mutex<quiche::Connection>>,
+    conn: Arc<Mutex<QuicheConnection>>,
     born: Instant,
     auth_from: Mutex<Option<Instant>>,
     heartbeat: Mutex<Instant>,
@@ -1786,6 +1800,8 @@ struct Inner {
     expired: Vec<u16>,
     #[cfg(test)]
     clocks: usize,
+    #[cfg(test)]
+    expiry_passes: usize,
 }
 
 struct UdpAssoc {
@@ -1965,7 +1981,7 @@ impl Server {
         let mut scid = [0u8; SCID_LEN];
         getrandom::fill(&mut scid).ok()?;
         let cid = quiche::ConnectionId::from_ref(&scid);
-        let conn: quiche::Connection = quiche::accept_with_retry(
+        let conn: QuicheConnection = quiche::accept_with_retry::<crate::quic::BytesBufFactory>(
             &cid,
             quiche::RetryConnectionIds {
                 original_destination_cid: &odcid,
@@ -2006,6 +2022,8 @@ impl Server {
                 expired: Vec::new(),
                 #[cfg(test)]
                 clocks: 0,
+                #[cfg(test)]
+                expiry_passes: 0,
             }),
         });
         self.conns.insert(scid.to_vec(), Arc::clone(&session));
@@ -2144,7 +2162,7 @@ impl Server {
         quic::flush_egress(&mut conn, &self.sock);
     }
 
-    fn beat(&self, session: &Session, conn: &mut quiche::Connection, now: Instant) {
+    fn beat(&self, session: &Session, conn: &mut QuicheConnection, now: Instant) {
         let due = session
             .heartbeat
             .lock()
@@ -2304,18 +2322,17 @@ fn retry_token_valid(
     Some((odcid, scid))
 }
 
-fn authenticate(conn: &mut quiche::Connection, inner: &mut Inner, users: &[User]) -> bool {
-    let mut room = [0u8; 512];
+fn authenticate(conn: &mut QuicheConnection, inner: &mut Inner, users: &[User]) -> bool {
     if inner.auth.len() < wire::AUTH_LEN {
         if let Some(id) = inner.auth_id {
-            if !read_command(conn, id, &mut inner.auth, &mut room) {
+            if !read_command(conn, id, &mut inner.auth) {
                 return false;
             }
         } else {
             let ids: Vec<u64> = conn.readable().filter(|id| id % 4 == 2).collect();
             for id in ids {
                 let mut data = inner.uni.remove(&id).unwrap_or_default();
-                read_prefix(conn, id, &mut data, &mut room);
+                read_prefix(conn, id, &mut data);
                 if data.len() < 2 {
                     if !data.is_empty() {
                         inner.uni.insert(id, data);
@@ -2327,7 +2344,7 @@ fn authenticate(conn: &mut quiche::Connection, inner: &mut Inner, users: &[User]
                     return false;
                 }
                 if data[1] == wire::AUTHENTICATE {
-                    if !read_command(conn, id, &mut data, &mut room) {
+                    if !read_command(conn, id, &mut data) {
                         return false;
                     }
                     inner.auth_id = Some(id);
@@ -2382,38 +2399,34 @@ fn authenticate(conn: &mut quiche::Connection, inner: &mut Inner, users: &[User]
     true
 }
 
-fn read_prefix(conn: &mut quiche::Connection, id: u64, data: &mut Vec<u8>, room: &mut [u8]) {
+fn read_prefix(conn: &mut QuicheConnection, id: u64, data: &mut Vec<u8>) {
     while data.len() < 2 {
         let need = 2 - data.len();
-        match conn.stream_recv(id, &mut room[..need]) {
+        match conn.stream_recv_buf(id, (&mut *data).limit(need)) {
             Ok((0, _)) | Err(_) => break,
-            Ok((n, _)) => data.extend_from_slice(&room[..n]),
+            Ok((_, _)) => {}
         }
     }
 }
 
-fn read_command(
-    conn: &mut quiche::Connection,
-    id: u64,
-    data: &mut Vec<u8>,
-    room: &mut [u8],
-) -> bool {
+fn read_command(conn: &mut QuicheConnection, id: u64, data: &mut Vec<u8>) -> bool {
     while data.len() < MAX_UNI_COMMAND {
-        match conn.stream_recv(id, room) {
+        // One byte over the cap distinguishes "filled it exactly" from "there is more".
+        let room = MAX_UNI_COMMAND - data.len() + 1;
+        match conn.stream_recv_buf(id, (&mut *data).limit(room)) {
             Ok((0, _)) | Err(_) => break,
-            Ok((n, _)) if data.len() + n <= MAX_UNI_COMMAND => {
-                data.extend_from_slice(&room[..n]);
+            Ok((_, _)) => {
+                if data.len() > MAX_UNI_COMMAND {
+                    let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
+                    let _ = conn.close(true, 0, b"command");
+                    return false;
+                }
                 if data.len() >= wire::AUTH_LEN
                     && data.first() == Some(&wire::VERSION)
                     && data.get(1) == Some(&wire::AUTHENTICATE)
                 {
                     break;
                 }
-            }
-            Ok(_) => {
-                let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
-                let _ = conn.close(true, 0, b"command");
-                return false;
             }
         }
     }
@@ -2506,29 +2519,10 @@ fn read_stream_address(stream: &mut QuicStream, deadline: Instant) -> Option<(St
     Some((host, u16::from_be_bytes(port)))
 }
 
-thread_local! {
-    static UNI_ROOM: std::cell::RefCell<Vec<u8>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-fn read_uni(conn: &mut quiche::Connection, inner: &mut Inner, id: u64, freedom: bool) {
-    let mut room = UNI_ROOM.with(|held| std::mem::take(&mut *held.borrow_mut()));
-    room.resize(UDP_BUFFER, 0);
-    read_uni_with(conn, inner, id, freedom, &mut room);
-    UNI_ROOM.with(|held| *held.borrow_mut() = room);
-}
-
-fn read_uni_with(
-    conn: &mut quiche::Connection,
-    inner: &mut Inner,
-    id: u64,
-    freedom: bool,
-    room: &mut [u8],
-) {
+fn read_uni(conn: &mut QuicheConnection, inner: &mut Inner, id: u64, freedom: bool) {
     if inner.auth_id == Some(id) {
-        let mut room = [0u8; 512];
-        while let Ok((n, _)) = conn.stream_recv(id, &mut room) {
-            if n == 0 {
+        while let Ok((n, fin)) = conn.stream_discard(id, usize::MAX) {
+            if n == 0 || fin {
                 break;
             }
         }
@@ -2539,15 +2533,29 @@ fn read_uni_with(
         return;
     }
     let mut data = inner.uni.remove(&id).unwrap_or_default();
-    while let Ok((n, _)) = conn.stream_recv(id, &mut *room) {
-        if n == 0 {
-            break;
-        }
-        if data.len() + n > MAX_UNI_COMMAND {
+    loop {
+        if data.len() > MAX_UNI_COMMAND {
+            if freedom && data.get(1) == Some(&wire::PACKET) {
+                let Some(at) = read_packets(inner, &data) else {
+                    let _ = conn.close(true, 0, b"command");
+                    return;
+                };
+                if at > 0 {
+                    data.drain(..at);
+                }
+                if data.len() <= MAX_UNI_COMMAND {
+                    continue;
+                }
+            }
             let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
             return;
         }
-        data.extend_from_slice(&room[..n]);
+        // One byte over the cap distinguishes "filled it exactly" from "there is more".
+        let room = MAX_UNI_COMMAND - data.len() + 1;
+        match conn.stream_recv_buf(id, (&mut data).limit(room)) {
+            Ok((0, _)) | Err(_) => break,
+            Ok((_, _)) => {}
+        }
     }
     if freedom && data.get(1) == Some(&wire::PACKET) {
         let Some(at) = read_packets(inner, &data) else {
@@ -2712,11 +2720,24 @@ fn expire_udp(inner: &mut Inner, now: Instant, timeout: Duration) {
             .filter(|(_, assoc)| now.duration_since(assoc.last) >= timeout)
             .map(|(association, _)| *association),
     );
-    for association in expired.drain(..) {
-        inner.udp.remove(&association);
-        inner.reassembly.retain(|key, _| key.0 != association);
-        inner.resolving.retain(|key, _| key.0 != association);
+    if expired.is_empty() {
+        inner.expired = expired;
+        return;
     }
+    expired.sort_unstable();
+    for association in &expired {
+        inner.udp.remove(association);
+    }
+    #[cfg(test)]
+    {
+        inner.expiry_passes += 2;
+    }
+    inner
+        .reassembly
+        .retain(|key, _| expired.binary_search(&key.0).is_err());
+    inner
+        .resolving
+        .retain(|key, _| expired.binary_search(&key.0).is_err());
     inner.expired = expired;
 }
 
@@ -2737,13 +2758,13 @@ fn deliver_udp(
     let _ = socket.send_to(payload, target);
 }
 
-fn flush_inner(conn: &mut quiche::Connection, sock: &Arc<Datagram>, inner: &mut Inner) {
+fn flush_inner(conn: &mut QuicheConnection, sock: &Arc<Datagram>, inner: &mut Inner) {
     let mut pending = std::mem::take(&mut inner.pending);
     flush_pending(conn, sock, &mut pending, &inner.next_uni);
     inner.pending = pending;
 }
 
-fn poll_udp(conn: &mut quiche::Connection, sock: &Datagram, inner: &mut Inner, now: Instant) {
+fn poll_udp(conn: &mut QuicheConnection, sock: &Datagram, inner: &mut Inner, now: Instant) {
     let max = conn.dgram_max_writable_len();
     let mut buf = std::mem::take(&mut inner.udp_buf);
     buf.resize(UDP_BUFFER, 0);
@@ -2937,8 +2958,14 @@ mod tests {
             let mut scid = [0u8; 16];
             getrandom::fill(&mut scid).expect("random");
             let cid = quiche::ConnectionId::from_ref(&scid);
-            let mut second =
-                quiche::accept(&cid, None, address, from, &mut config).expect("accepts");
+            let mut second = quiche::accept_with_buf_factory::<crate::quic::BytesBufFactory>(
+                &cid,
+                None,
+                address,
+                from,
+                &mut config,
+            )
+            .expect("accepts");
             second
                 .recv(&mut buf[..n], quiche::RecvInfo { from, to: address })
                 .expect("drives");
@@ -3023,6 +3050,8 @@ mod tests {
                 expired: Vec::new(),
                 #[cfg(test)]
                 clocks: 0,
+                #[cfg(test)]
+                expiry_passes: 0,
             },
             done,
         )
@@ -3318,6 +3347,32 @@ mod tests {
         assert!(
             inner.udp.is_empty(),
             "an expired lookup does not recreate the association"
+        );
+    }
+
+    #[test]
+    fn every_expired_association_costs_one_pass_per_map() {
+        let (mut inner, _done) = empty_inner();
+        for association in 0..3u16 {
+            select_assoc(&mut inner, association, false).expect("the association is recorded");
+            inner.resolving.insert(
+                (association, "example.test".to_owned(), 53),
+                Resolving {
+                    generation: 0,
+                    payloads: Vec::new(),
+                },
+            );
+        }
+        expire_udp(
+            &mut inner,
+            Instant::now() + Duration::from_secs(2),
+            Duration::from_secs(1),
+        );
+        assert!(inner.udp.is_empty(), "every idle association expires");
+        assert!(inner.resolving.is_empty(), "with every lookup it held");
+        assert_eq!(
+            inner.expiry_passes, 2,
+            "one walk of each map, however many associations expired"
         );
     }
 

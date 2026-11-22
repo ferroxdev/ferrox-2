@@ -442,8 +442,10 @@ pub fn quic_read(bytes: &[u8], at: &mut usize) -> Option<u64> {
 /// On a request stream HEADERS is 0x1 and DATA is 0x0; on the control stream those numbers mean control and push, which is why neither name is reused for a control type here.
 pub const H3_DATA: u64 = 0x00;
 pub const H3_HEADERS: u64 = 0x01;
-pub const H3_RESET: u64 = 0x03;
+pub const H3_CANCEL_PUSH: u64 = 0x03;
 pub const H3_GOAWAY: u64 = 0x07;
+/// The application error a request stream's forbidden frame closes the connection with (RFC 9114 §8.1).
+pub const H3_FRAME_UNEXPECTED: u64 = 0x105;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct H3Frame {
@@ -1040,12 +1042,14 @@ mod tests {
         assert_eq!(
             h3_event(
                 H3Frame {
-                    kind: H3_RESET,
+                    kind: H3_CANCEL_PUSH,
                     length: 0
                 },
                 &[]
             ),
-            H3Event::Other { kind: H3_RESET }
+            H3Event::Other {
+                kind: H3_CANCEL_PUSH
+            }
         );
         assert_eq!(
             h3_event(

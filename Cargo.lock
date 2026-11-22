@@ -952,6 +952,7 @@ dependencies = [
  "base64",
  "boring",
  "boring-sys",
+ "bytes",
  "chacha20 0.10.2",
  "chacha20poly1305 0.11.0",
  "crypto_box",

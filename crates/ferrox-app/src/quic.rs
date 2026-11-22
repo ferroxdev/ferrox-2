@@ -1,4 +1,5 @@
 use crate::conn::Connection;
+use bytes::BufMut as _;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
@@ -6,6 +7,25 @@ use std::net::{IpAddr, Shutdown, SocketAddr, ToSocketAddrs as _, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+/// The stream buffers quiche keeps: `Bytes` is what `stream_send_zc` appends without copying, and a clone is a refcount bump.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BytesBufFactory;
+
+impl quiche::BufFactory for BytesBufFactory {
+    type Buf = bytes::Bytes;
+    type DgramBuf = Vec<u8>;
+
+    fn buf_from_slice(buf: &[u8]) -> bytes::Bytes {
+        bytes::Bytes::copy_from_slice(buf)
+    }
+
+    fn dgram_buf_from_slice(buf: &[u8]) -> Vec<u8> {
+        buf.to_vec()
+    }
+}
+
+pub(crate) type QuicheConnection = quiche::Connection<BytesBufFactory>;
 
 /// One request stream's last moved byte, so a quiet direction does not idle a tunnel whose other direction is busy.
 #[derive(Debug)]
@@ -128,7 +148,7 @@ struct PooledState {
 
 /// The shared connection a flow rides, its socket, its local address, and the bidirectional stream id it opened.
 pub(crate) struct PooledStream {
-    pub(crate) conn: Arc<Mutex<quiche::Connection>>,
+    pub(crate) conn: Arc<Mutex<QuicheConnection>>,
     pub(crate) sock: Arc<Datagram>,
     pub(crate) local: SocketAddr,
     pub(crate) id: u64,
@@ -207,7 +227,7 @@ impl PooledStream {
 }
 
 /// Stops one stream in both directions: the connection itself is untouched and keeps carrying other flows.
-fn stop_stream(conn: &Mutex<quiche::Connection>, sock: &Datagram, id: u64) {
+fn stop_stream(conn: &Mutex<QuicheConnection>, sock: &Datagram, id: u64) {
     if let Ok(mut conn) = conn.lock() {
         let _ = conn.stream_shutdown(id, quiche::Shutdown::Write, 0);
         let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
@@ -217,7 +237,7 @@ fn stop_stream(conn: &Mutex<quiche::Connection>, sock: &Datagram, id: u64) {
 
 #[derive(Clone)]
 struct PooledConn {
-    conn: Arc<Mutex<quiche::Connection>>,
+    conn: Arc<Mutex<QuicheConnection>>,
     table: Arc<Mutex<PooledState>>,
     sock: Arc<Datagram>,
     peer: SocketAddr,
@@ -405,6 +425,9 @@ const PUMP_POLL: Duration = Duration::from_millis(500);
 
 /// The pump drain's read window: one lock is amortised over this many bytes on the downlink, and it is the uplink relay's read quantum on the same lane.
 const PUMP_WINDOW: usize = 32 * 1024;
+
+/// How many downlink buffers a lane recycles: a stalled client holds at most one per stream, and the rest return here instead of the allocator.
+const PUMP_BUFFERS: usize = 8;
 
 pub(crate) const SEND_WAIT: Duration = Duration::from_secs(10);
 
@@ -946,7 +969,7 @@ const SEND_SLOTS: usize = 64;
 #[cfg(target_os = "linux")]
 const GSO_SEGMENTS: usize = 48;
 
-pub(crate) fn flush_egress(conn: &mut quiche::Connection, sock: &Datagram) {
+pub(crate) fn flush_egress(conn: &mut QuicheConnection, sock: &Datagram) {
     sock.retry_held();
     if sock.held.holding.load(Ordering::Relaxed) {
         return;
@@ -967,7 +990,7 @@ pub(crate) fn flush_egress(conn: &mut quiche::Connection, sock: &Datagram) {
 
 /// Every datagram quiche has ready, in batches of `SEND_SLOTS`. Each packet is written straight into its own slot and addressed by the peer quiche named for it, and only the slots a sweep fills pay a header, so the batch costs neither a copy nor any wiring the per-packet loop did not already make.
 #[cfg(target_os = "linux")]
-fn flush_burst(conn: &mut quiche::Connection, sock: &Datagram) {
+fn flush_burst(conn: &mut QuicheConnection, sock: &Datagram) {
     let mut slots: [Unfilled<MAX_DATAGRAM>; SEND_SLOTS] =
         std::array::from_fn(|_| Unfilled::<MAX_DATAGRAM>::new());
     let mut lens = [0usize; SEND_SLOTS];
@@ -1572,7 +1595,7 @@ pub(crate) fn recv_batch(_sock: &Datagram, _batch: &mut Batch) -> Drain {
 }
 
 /// The HTTP/3 opening, carried exactly once per connection: a second control stream is a connection error.
-pub(crate) fn send_h3_opening(conn: &mut quiche::Connection, sock: &Datagram) -> bool {
+pub(crate) fn send_h3_opening(conn: &mut QuicheConnection, sock: &Datagram) -> bool {
     for (stream, payload) in crate::foxy::H3::h3_opening() {
         let mut rest = &payload[..];
         while !rest.is_empty() {
@@ -1588,7 +1611,7 @@ pub(crate) fn send_h3_opening(conn: &mut quiche::Connection, sock: &Datagram) ->
 
 /// The server half of `send_h3_opening`: the same control stream on the server's unidirectional
 /// ids (3, 7, 11) rather than the client's (2, 6, 10).
-pub(crate) fn send_h3_server_opening(conn: &mut quiche::Connection, sock: &Datagram) -> bool {
+pub(crate) fn send_h3_server_opening(conn: &mut QuicheConnection, sock: &Datagram) -> bool {
     for (index, (_, payload)) in crate::foxy::H3::h3_opening().into_iter().enumerate() {
         let stream = [3u64, 7, 11][index];
         let mut rest = &payload[..];
@@ -1610,7 +1633,7 @@ const PUMP_BURST: usize = 64;
 pub(crate) const PUMP_TAIL: Duration = Duration::from_millis(1);
 
 pub(crate) fn pump_once(
-    conn: &mut quiche::Connection,
+    conn: &mut QuicheConnection,
     sock: &Datagram,
     local: SocketAddr,
     wait: Duration,
@@ -1690,7 +1713,7 @@ pub(crate) fn pump_once(
 }
 
 pub(crate) fn drive_handshake(
-    conn: &mut quiche::Connection,
+    conn: &mut QuicheConnection,
     sock: &Datagram,
     local: SocketAddr,
 ) -> Option<()> {
@@ -1699,7 +1722,7 @@ pub(crate) fn drive_handshake(
 
 /// The handshake loop under the caller's budget: only the deadline differs, and a probe chooses a smaller one.
 pub(crate) fn drive_handshake_by(
-    conn: &mut quiche::Connection,
+    conn: &mut QuicheConnection,
     sock: &Datagram,
     local: SocketAddr,
     budget: Duration,
@@ -1709,7 +1732,7 @@ pub(crate) fn drive_handshake_by(
 
 /// The handshake loop with the silence floor named, so a test can watch a dead path be abandoned without waiting five seconds.
 fn drive_handshake_watching(
-    conn: &mut quiche::Connection,
+    conn: &mut QuicheConnection,
     sock: &Datagram,
     local: SocketAddr,
     budget: Duration,
@@ -1745,7 +1768,7 @@ fn drive_handshake_watching(
 }
 
 /// One handshake's shape behind `FOXY_DEBUG`: the seconds it took, the turns it waited in and the packets each way — the three numbers that tell a slow edge from a slow pump.
-fn debug_handshake(trace: Option<Instant>, how: &str, turns: u32, conn: &quiche::Connection) {
+fn debug_handshake(trace: Option<Instant>, how: &str, turns: u32, conn: &QuicheConnection) {
     let Some(started) = trace else { return };
     let stats = conn.stats();
     eprintln!(
@@ -1780,7 +1803,7 @@ fn debug_pool(
 }
 
 pub(crate) fn stream_send_all(
-    conn: &mut quiche::Connection,
+    conn: &mut QuicheConnection,
     sock: &Datagram,
     stream: u64,
     mut buf: &[u8],
@@ -1817,7 +1840,7 @@ pub(crate) fn stream_send_all(
 
 /// Flush, then read the socket before retrying a blocked send: sleeping deaf to it leaves the peer's
 /// `MAX_STREAM_DATA` unread, so a send past the initial flow window never resumes.
-fn send_credit_wait(conn: &mut quiche::Connection, sock: &Datagram, deadline: Instant) -> bool {
+fn send_credit_wait(conn: &mut QuicheConnection, sock: &Datagram, deadline: Instant) -> bool {
     flush_egress(conn, sock);
     if Instant::now() >= deadline {
         return false;
@@ -1831,7 +1854,7 @@ fn send_credit_wait(conn: &mut quiche::Connection, sock: &Datagram, deadline: In
 
 /// A send on a lane whose pump owns the socket: the caller never reads it, so a blocked send waits for the pump's ACK instead of stealing its datagram.
 fn stream_send_all_parked(
-    shared: &Mutex<quiche::Connection>,
+    shared: &Mutex<QuicheConnection>,
     sock: &Datagram,
     stream: u64,
     mut buf: &[u8],
@@ -1882,16 +1905,15 @@ fn stream_send_all_parked(
 
 /// The receive half of `stream_send_all_parked`: the pump feeds the connection, so the waiter polls it without reading the socket.
 fn stream_recv_exact_parked(
-    shared: &Mutex<quiche::Connection>,
+    shared: &Mutex<QuicheConnection>,
     stream: u64,
     want: usize,
     deadline: Instant,
 ) -> Option<(Vec<u8>, bool)> {
     let mut out = Vec::with_capacity(want);
     let mut fin = false;
-    let mut chunk = [0u8; 8192];
     while out.len() < want {
-        let end = (want - out.len()).min(chunk.len());
+        let end = want - out.len();
         let found = {
             let Ok(mut conn) = shared.lock() else {
                 return None;
@@ -1899,15 +1921,14 @@ fn stream_recv_exact_parked(
             if conn.is_closed() {
                 return None;
             }
-            match conn.stream_recv(stream, &mut chunk[..end]) {
+            match conn.stream_recv_buf(stream, (&mut out).limit(end)) {
                 Ok((0, true)) => return None,
                 Ok((0, false)) | Err(quiche::Error::Done) => None,
-                Ok(found) => Some(found),
+                Ok((_, ended)) => Some(ended),
                 Err(_) => return None,
             }
         };
-        if let Some((n, ended)) = found {
-            out.extend_from_slice(&chunk[..n]);
+        if let Some(ended) = found {
             fin = ended;
             if fin {
                 break;
@@ -1922,7 +1943,7 @@ fn stream_recv_exact_parked(
 }
 
 pub(crate) fn stream_recv_exact(
-    conn: &mut quiche::Connection,
+    conn: &mut QuicheConnection,
     sock: &Datagram,
     local: SocketAddr,
     stream: u64,
@@ -1930,10 +1951,9 @@ pub(crate) fn stream_recv_exact(
     deadline: Instant,
 ) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(want);
-    let mut chunk = [0u8; 8192];
     while out.len() < want {
-        let end = (want - out.len()).min(chunk.len());
-        match conn.stream_recv(stream, &mut chunk[..end]) {
+        let end = want - out.len();
+        match conn.stream_recv_buf(stream, (&mut out).limit(end)) {
             Ok((0, true)) => return None,
             Ok((0, false)) | Err(quiche::Error::Done) => {
                 if conn.is_closed() || Instant::now() >= deadline {
@@ -1944,8 +1964,7 @@ pub(crate) fn stream_recv_exact(
                     return None;
                 }
             }
-            Ok((n, fin)) => {
-                out.extend_from_slice(&chunk[..n]);
+            Ok((_, fin)) => {
                 if fin {
                     break;
                 }
@@ -2087,7 +2106,7 @@ pub(crate) fn network_generation() -> u64 {
 /// `peer`: the connection keeps its IDs and stream ids, and the next write leaves
 /// from the new source. A lane that cannot move says so rather than closing.
 pub(crate) fn rebind_path(
-    conn: &mut quiche::Connection,
+    conn: &mut QuicheConnection,
     sock: &Datagram,
     peer: SocketAddr,
 ) -> Rebind {
@@ -2158,7 +2177,7 @@ pub(crate) fn rebind_path(
 
 /// Hand a connection and its lane the fresh socket `rebind_path` bound: spare IDs first, so the
 /// peer can walk to a new path, then the migration and the swap, then the packet that proves it.
-fn move_socket(conn: &mut quiche::Connection, sock: &Datagram, fresh: UdpSocket) -> Rebind {
+fn move_socket(conn: &mut QuicheConnection, sock: &Datagram, fresh: UdpSocket) -> Rebind {
     let Ok(new_local) = fresh.local_addr() else {
         return Rebind::Failed;
     };
@@ -2180,7 +2199,7 @@ fn move_socket(conn: &mut quiche::Connection, sock: &Datagram, fresh: UdpSocket)
 
 /// Whether quiche has failed to validate `local` as a path, which leaves the move without
 /// a source the peer can answer on and lets the carrier end instead of waiting for idle.
-pub(crate) fn path_failed(conn: &mut quiche::Connection, local: SocketAddr) -> bool {
+pub(crate) fn path_failed(conn: &mut QuicheConnection, local: SocketAddr) -> bool {
     let mut failed = false;
     while let Some(event) = conn.path_event_next() {
         if let quiche::PathEvent::FailedValidation(from, _) = event {
@@ -3942,7 +3961,7 @@ fn resumption_entry(key: &QuicServer) -> Option<Vec<u8>> {
 
 /// Keep the ticket a completed handshake read, already stamped with the keys of that handshake.
 /// A peer that issues none leaves nothing behind, and a later dial retries the cold path.
-fn resumption_remember(key: &QuicServer, conn: &quiche::Connection) {
+fn resumption_remember(key: &QuicServer, conn: &QuicheConnection) {
     let Some(blob) = conn.session().map(<[u8]>::to_vec) else {
         return;
     };
@@ -3980,12 +3999,19 @@ pub(crate) fn handshake_within(
     default_cc: Option<ferrox_core::hysteria::Congestion>,
     budget: Duration,
     resume: Option<&QuicServer>,
-) -> Option<(quiche::Connection, bool)> {
+) -> Option<(QuicheConnection, bool)> {
     let mut scid = [0u8; SCID_LEN];
     getrandom::fill(&mut scid).ok()?;
     let cid = quiche::ConnectionId::from_ref(&scid);
     let mut conn = with_config(roots, default_cc, |config| {
-        quiche::connect(Some(server_name), &cid, local, peer, config).ok()
+        quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
+            Some(server_name),
+            &cid,
+            local,
+            peer,
+            config,
+        )
+        .ok()
     })?;
     if let Some(list) = ech_config_list {
         conn.as_mut().set_ech_config_list(list).ok()?;
@@ -4022,9 +4048,8 @@ pub(crate) fn handshake_within(
 
 /// The leases a readable stream belongs to: a stream nobody rides is drained here, so its bytes do not sit on a connection waiting for a flow that already ended.
 fn hand_off(
-    conn: &mut quiche::Connection,
+    conn: &mut QuicheConnection,
     table: &Arc<Mutex<PooledState>>,
-    chunk: &mut [u8],
     ready: &mut Vec<(u64, Arc<Connection>)>,
 ) {
     for id in conn.readable() {
@@ -4036,8 +4061,8 @@ fn hand_off(
         }
         let Some(half) = leases.sessions.get(&id).cloned() else {
             drop(leases);
-            while let Ok((n, _)) = conn.stream_recv(id, chunk) {
-                if n == 0 {
+            while let Ok((n, fin)) = conn.stream_discard(id, usize::MAX) {
+                if n == 0 || fin {
                     break;
                 }
             }
@@ -4048,7 +4073,7 @@ fn hand_off(
 }
 
 /// Hand every datagram a batch holds to quiche as its own packet, in the order the kernel wrote them.
-fn deliver_batch(conn: &mut quiche::Connection, batch: &mut Batch, local: SocketAddr) {
+fn deliver_batch(conn: &mut QuicheConnection, batch: &mut Batch, local: SocketAddr) {
     for at in 0..batch.len() {
         let Some((bytes, from)) = batch.at(at) else {
             continue;
@@ -4069,7 +4094,7 @@ fn route_changed(net: &AtomicU64, now: u64) -> bool {
 
 /// Move this lane when the route generation changed: a moved source updates the local the pump stamps on every received datagram, and a failed move ends the turn so the next lease redials.
 fn rebind_if_moved(
-    shared: &Arc<Mutex<quiche::Connection>>,
+    shared: &Arc<Mutex<QuicheConnection>>,
     sock: &Datagram,
     peer: SocketAddr,
     net: &AtomicU64,
@@ -4107,11 +4132,39 @@ struct PendingWrite {
     fin: bool,
 }
 
+/// Take one downlink chunk into a recycled buffer: `stream_recv_buf` appends only the readable bytes, so the old scratch-and-`to_vec` copy is gone.
+fn read_downlink(
+    conn: &mut QuicheConnection,
+    id: u64,
+    pool: &mut Vec<Vec<u8>>,
+) -> Result<(Vec<u8>, usize, bool), quiche::Error> {
+    let mut bytes = pool
+        .pop()
+        .unwrap_or_else(|| Vec::with_capacity(PUMP_WINDOW));
+    bytes.clear();
+    match conn.stream_recv_buf(id, (&mut bytes).limit(PUMP_WINDOW)) {
+        Ok((n, fin)) => Ok((bytes, n, fin)),
+        Err(error) => {
+            recycle_downlink(bytes, pool);
+            Err(error)
+        }
+    }
+}
+
+/// Keep a drained chunk for the next read; a lane holds a bounded number, so a stalled stream cannot grow the pool without limit.
+fn recycle_downlink(mut bytes: Vec<u8>, pool: &mut Vec<Vec<u8>>) {
+    if pool.len() < PUMP_BUFFERS {
+        bytes.clear();
+        pool.push(bytes);
+    }
+}
+
 /// Offer each pending chunk again; a short write keeps its tail, and a timeout leaves it for the next turn instead of failing a flow whose client is merely slower than the lane.
 fn flush_downlink(
     pending: &mut Vec<PendingWrite>,
+    pool: &mut Vec<Vec<u8>>,
     table: &Arc<Mutex<PooledState>>,
-    conn: &Arc<Mutex<quiche::Connection>>,
+    conn: &Arc<Mutex<QuicheConnection>>,
     sock: &Datagram,
     only: Option<u64>,
 ) {
@@ -4127,7 +4180,8 @@ fn flush_downlink(
             Ok(0) => {
                 stop_stream(conn, sock, write.id);
                 fail_session(table, write.id);
-                pending.swap_remove(at);
+                let done = pending.swap_remove(at);
+                recycle_downlink(done.bytes, pool);
             }
             Ok(n) => {
                 write.at += n;
@@ -4136,7 +4190,8 @@ fn flush_downlink(
                         let _ = write.up.shutdown(Shutdown::Write);
                         finish_session(table, write.id, false);
                     }
-                    pending.swap_remove(at);
+                    let done = pending.swap_remove(at);
+                    recycle_downlink(done.bytes, pool);
                 } else {
                     at += 1;
                 }
@@ -4152,7 +4207,8 @@ fn flush_downlink(
             Err(_) => {
                 stop_stream(conn, sock, write.id);
                 fail_session(table, write.id);
-                pending.swap_remove(at);
+                let done = pending.swap_remove(at);
+                recycle_downlink(done.bytes, pool);
             }
         }
     }
@@ -4161,7 +4217,7 @@ fn flush_downlink(
 /// Drive one connection's reads and writes until its socket or connection ends, taking a batch of datagrams per turn.
 #[allow(clippy::too_many_lines)]
 fn pump(
-    shared: &Arc<Mutex<quiche::Connection>>,
+    shared: &Arc<Mutex<QuicheConnection>>,
     table: &Arc<Mutex<PooledState>>,
     sock: &Datagram,
     peer: SocketAddr,
@@ -4170,7 +4226,7 @@ fn pump(
 ) {
     let mut ready: Vec<(u64, Arc<Connection>)> = Vec::new();
     // One lock per 32 KiB rather than per 8: the drain is the connection's busiest shared path, and every pass pays the mutex twice.
-    let mut chunk = crate::proxy::RelayBuf::with_len(PUMP_WINDOW).into_vec();
+    let mut pool: Vec<Vec<u8>> = Vec::new();
     // The obfuscated fallback lands the salt in the room too, so `masked_read` unmasks in place rather than staging every plaintext through a scratch.
     let mut room = Unfilled::<RECV_ROOM>::new();
     let buf = room.as_mut();
@@ -4180,7 +4236,7 @@ fn pump(
     let mut pending: Vec<PendingWrite> = Vec::new();
     let mut exit = PumpExit { table, armed: true };
     loop {
-        flush_downlink(&mut pending, table, shared, sock, None);
+        flush_downlink(&mut pending, &mut pool, table, shared, sock, None);
         let before = *local;
         if !rebind_if_moved(shared, sock, peer, net, local) {
             return;
@@ -4204,11 +4260,15 @@ fn pump(
                 .timeout()
                 .map_or(PUMP_POLL, |left| left.min(PUMP_POLL))
                 .max(Duration::from_millis(1));
-            if pending.is_empty() {
+            let wait = if pending.is_empty() {
                 wait
             } else {
                 wait.min(PUMP_RETRY)
-            }
+            };
+            // The kernel arms milliseconds, so rounding the shrinking timeout up re-arms it once per millisecond.
+            Duration::from_millis(
+                u64::try_from(wait.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX),
+            )
         };
         if !sock.refresh_read_timeout(timeout) {
             return;
@@ -4267,7 +4327,7 @@ fn pump(
                 conn.on_timeout();
             }
             flush_egress(&mut conn, sock);
-            hand_off(&mut conn, table, &mut chunk, &mut ready);
+            hand_off(&mut conn, table, &mut ready);
             if conn.is_closed() {
                 return;
             }
@@ -4287,29 +4347,31 @@ fn pump(
                     let Ok(mut conn) = shared.lock() else {
                         return;
                     };
-                    match conn.stream_recv(id, &mut chunk) {
+                    match read_downlink(&mut conn, id, &mut pool) {
                         Err(quiche::Error::Done) => break,
                         Err(_) => Err(()),
                         Ok(found) => Ok(found),
                     }
                 };
-                let Ok((n, fin)) = received else {
+                let Ok((bytes, n, fin)) = received else {
                     fail_session(table, id);
                     break;
                 };
-                if n == 0 && !fin {
-                    break;
-                }
-                if n > 0 {
+                if n == 0 {
+                    recycle_downlink(bytes, &mut pool);
+                    if !fin {
+                        break;
+                    }
+                } else {
                     let _ = up.set_write_timeout(Some(PUMP_WRITE));
                     pending.push(PendingWrite {
                         id,
                         up: Arc::clone(&up),
-                        bytes: chunk[..n].to_vec(),
+                        bytes,
                         at: 0,
                         fin,
                     });
-                    flush_downlink(&mut pending, table, shared, sock, Some(id));
+                    flush_downlink(&mut pending, &mut pool, table, shared, sock, Some(id));
                     if fin || pending.iter().any(|write| write.id == id) {
                         break;
                     }
@@ -4508,7 +4570,7 @@ fn uplink_stream(pooled: &PooledConn, id: u64, client: &Connection) {
                     qms(),
                     read_at.elapsed().as_millis()
                 ));
-                let mut rest = &chunk[..n];
+                let mut rest = bytes::Bytes::copy_from_slice(&chunk[..n]);
                 let deadline = Instant::now() + SEND_WAIT;
                 let sent = loop {
                     #[cfg(test)]
@@ -4530,9 +4592,9 @@ fn uplink_stream(pooled: &PooledConn, id: u64, client: &Connection) {
                         qstage(format!("{} t={} up-closed {id}", port, qms()));
                         break false;
                     }
-                    match conn.stream_send(id, rest, false) {
-                        Ok(written) => {
-                            rest = &rest[written..];
+                    match conn.stream_send_zc(id, rest.clone(), false) {
+                        Ok((written, remainder)) => {
+                            rest = remainder.unwrap_or_default();
                             flush_egress(&mut conn, &flush_sock);
                             if rest.is_empty() {
                                 break true;
@@ -4840,7 +4902,7 @@ fn build_pooled_within(dial: &QuicDial, budget: Duration) -> Option<PooledConn> 
 /// One VLESS session on a serving connection: stream bytes through the shared connection lock.
 #[derive(Clone)]
 pub(crate) struct QuicStream {
-    conn: Arc<Mutex<quiche::Connection>>,
+    conn: Arc<Mutex<QuicheConnection>>,
     sock: Arc<Datagram>,
     id: u64,
     meter: crate::stats::Meter,
@@ -4895,6 +4957,12 @@ impl Read for QuicStream {
                     let (n, fin) = match conn.stream_recv(self.id, buf) {
                         Ok(got) => got,
                         Err(quiche::Error::Done) => (0, false),
+                        Err(quiche::Error::StreamReset(code)) => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionReset,
+                                format!("quic stream reset: {code}"),
+                            ));
+                        }
                         Err(error) => {
                             return Err(std::io::Error::other(format!(
                                 "quic stream read: {error:?}"
@@ -4942,9 +5010,9 @@ impl Write for QuicStream {
         }
         // The lock covers one send each: a flow-control wait must not hold it, or ACKs stop arriving.
         let deadline = Instant::now() + SEND_WAIT;
-        let mut rest = buf;
+        let mut rest = bytes::Bytes::copy_from_slice(buf);
         while !rest.is_empty() {
-            match self.send_once(rest) {
+            match self.send_once(&mut rest) {
                 Ok(0) => {
                     if Instant::now() >= deadline {
                         let sent = buf.len() - rest.len();
@@ -4959,7 +5027,6 @@ impl Write for QuicStream {
                 Ok(n) => {
                     self.meter.write(n);
                     self.activity.touch();
-                    rest = &rest[n..];
                 }
                 Err(error) => {
                     let sent = buf.len() - rest.len();
@@ -4994,7 +5061,7 @@ impl QuicStream {
     /// A stream handle built by a carrier that owns its own ids: the caller opens the stream first
     /// and keeps it live until both directions end.
     pub(crate) fn new(
-        conn: Arc<Mutex<quiche::Connection>>,
+        conn: Arc<Mutex<QuicheConnection>>,
         sock: Arc<Datagram>,
         id: u64,
         meter: crate::stats::Meter,
@@ -5055,7 +5122,7 @@ impl QuicStream {
     }
 
     /// One send flight without holding the lock across the wait behind it.
-    fn send_once(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    fn send_once(&mut self, rest: &mut bytes::Bytes) -> std::io::Result<usize> {
         let Ok(mut conn) = self.conn.lock() else {
             return Err(std::io::Error::other("quic connection lock poisoned"));
         };
@@ -5063,8 +5130,9 @@ impl QuicStream {
         if conn.is_closed() || conn.is_draining() {
             return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
         }
-        match conn.stream_send(self.id, buf, false) {
-            Ok(n) => {
+        match conn.stream_send_zc(self.id, (*rest).clone(), false) {
+            Ok((n, remainder)) => {
+                *rest = remainder.unwrap_or_default();
                 flush_egress(&mut conn, &self.sock);
                 Ok(n)
             }
@@ -5124,6 +5192,13 @@ impl QuicStream {
     pub(crate) fn close(&self) {
         stop_stream(&self.conn, &self.sock, self.id);
     }
+    /// Close the whole connection with an HTTP/3 application error: a frame a request stream may not carry is a connection error, not a stream reset.
+    pub(crate) fn close_connection(&self, code: u64) {
+        if let Ok(mut conn) = self.conn.lock() {
+            let _ = conn.close(true, code, b"");
+            flush_egress(&mut conn, &self.sock);
+        }
+    }
 
     /// Stop reading while keeping the send direction, so a FIN already sent is not reset.
     pub(crate) fn shutdown_read(&self) {
@@ -5156,7 +5231,7 @@ impl QuicStream {
 
 /// One serving session: the QUIC connection behind one lock, the stream ids already handed out.
 struct ServerConn {
-    conn: Arc<Mutex<quiche::Connection>>,
+    conn: Arc<Mutex<QuicheConnection>>,
     seen: Mutex<HashSet<u64>>,
     visit: AtomicU64,
     established: AtomicBool,
@@ -5224,7 +5299,7 @@ pub(crate) type Serve = Arc<dyn Fn(QuicStream) + Send + Sync>;
 
 /// One stream a reap hands to a new worker: the connection, the stream id, the preface flag and the driver's stop.
 type FreshStream = (
-    Arc<Mutex<quiche::Connection>>,
+    Arc<Mutex<QuicheConnection>>,
     u64,
     Arc<AtomicBool>,
     Arc<AtomicBool>,
@@ -5361,7 +5436,7 @@ pub(crate) fn serve_loop(
 fn learn_ids(
     conns: &mut HashMap<Vec<u8>, Arc<ServerConn>>,
     state: &Arc<ServerConn>,
-    conn: &quiche::Connection,
+    conn: &QuicheConnection,
 ) {
     for id in conn.source_ids() {
         if !conns.contains_key(id.as_ref()) {
@@ -5482,7 +5557,9 @@ fn route(
     let Ok(mut guard) = config.lock() else {
         return;
     };
-    let Ok(mut conn) = quiche::accept(&cid, None, local, from, &mut guard) else {
+    let Ok(mut conn) = quiche::accept_with_buf_factory::<crate::quic::BytesBufFactory>(
+        &cid, None, local, from, &mut guard,
+    ) else {
         return;
     };
     drop(guard);
@@ -5744,7 +5821,7 @@ pub(crate) fn server_poll(sock: &Datagram, buf: &mut [u8]) -> Option<(usize, Soc
 
 /// Lets a waiting connection run its own timers and answer what it queued between packets.
 #[cfg(test)]
-pub(crate) fn server_idle(conn: &mut quiche::Connection, sock: &Datagram, out: &mut [u8]) {
+pub(crate) fn server_idle(conn: &mut QuicheConnection, sock: &Datagram, out: &mut [u8]) {
     conn.on_timeout();
     while let Ok((written, info)) = conn.send(out) {
         let _ = sock.send_to(&out[..written], info.to);
@@ -5757,7 +5834,7 @@ pub(crate) fn server_accept(
     sock: &Datagram,
     local: SocketAddr,
     config: &mut quiche::Config,
-) -> quiche::Connection {
+) -> QuicheConnection {
     let mut buf = [0u8; MAX_DATAGRAM];
     let mut out = [0u8; MAX_DATAGRAM];
     let mut conn = loop {
@@ -5773,7 +5850,10 @@ pub(crate) fn server_accept(
         let mut scid = [0u8; 16];
         getrandom::fill(&mut scid).expect("random");
         let cid = quiche::ConnectionId::from_ref(&scid);
-        let mut fresh = quiche::accept(&cid, None, local, from, config).expect("accepts");
+        let mut fresh = quiche::accept_with_buf_factory::<crate::quic::BytesBufFactory>(
+            &cid, None, local, from, config,
+        )
+        .expect("accepts");
         let info = quiche::RecvInfo { from, to: local };
         fresh.recv(&mut buf[..n], info).expect("handshakes");
         while let Ok((written, info)) = fresh.send(&mut out) {
@@ -5797,7 +5877,7 @@ pub(crate) fn server_accept(
 
 /// Mint two spare source IDs for a client to walk onto a migrated path with. Each ID gets an
 /// independent reset token; the router SCID length is named by the caller.
-fn issue_two_scids(conn: &mut quiche::Connection, len: usize) -> std::io::Result<()> {
+fn issue_two_scids(conn: &mut QuicheConnection, len: usize) -> std::io::Result<()> {
     for _ in 0..2 {
         if conn.active_scids() >= 2 {
             break;
@@ -5821,12 +5901,12 @@ fn issue_two_scids(conn: &mut quiche::Connection, len: usize) -> std::io::Result
 /// Issue spare source IDs a client can walk onto a migrated path with: without them a fresh path
 /// has no destination ID to name it. Two per established connection is the number the migration
 /// tests and the references walk; the transport limit `4` keeps a third spare if one retires.
-pub(crate) fn issue_spare_scids(conn: &mut quiche::Connection, sock: &Datagram, out: &mut [u8]) {
+pub(crate) fn issue_spare_scids(conn: &mut QuicheConnection, sock: &Datagram, out: &mut [u8]) {
     issue_spare_scids_len(conn, sock, out, SCID_LEN);
 }
 
 pub(crate) fn issue_spare_scids_len(
-    conn: &mut quiche::Connection,
+    conn: &mut QuicheConnection,
     sock: &Datagram,
     _out: &mut [u8],
     len: usize,
@@ -6053,8 +6133,14 @@ mod tests {
         let cid = quiche::ConnectionId::from_ref(&scid);
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("config");
         config.set_application_protos(&[ALPN]).expect("alpn");
-        let mut conn =
-            quiche::connect(Some("held.test"), &cid, local, to, &mut config).expect("connects");
+        let mut conn = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
+            Some("held.test"),
+            &cid,
+            local,
+            to,
+            &mut config,
+        )
+        .expect("connects");
 
         flush_egress(&mut conn, &sock);
         let mut buf = [0u8; 2048];
@@ -6108,7 +6194,7 @@ mod tests {
         let cid = quiche::ConnectionId::from_ref(&scid);
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("config");
         config.set_application_protos(&[ALPN]).expect("alpn");
-        let mut conn = quiche::connect(
+        let mut conn = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
             Some("silent.test"),
             &cid,
             local,
@@ -6899,7 +6985,14 @@ mod tests {
         for (params, want) in [(parrot, 0usize), (masked, SCID_LEN)] {
             let cid = hysteria_client_cid(Some(&params)).expect("cid");
             let mut conn = with_config(&roots, None, |config| {
-                quiche::connect(Some("held.test"), &cid, local, peer, config).ok()
+                quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
+                    Some("held.test"),
+                    &cid,
+                    local,
+                    peer,
+                    config,
+                )
+                .ok()
             })
             .expect("connects");
             let mut out = [0u8; MAX_DATAGRAM];
@@ -7568,7 +7661,7 @@ mod tests {
     }
 
     /// A socket, its address and a connection that answers nothing: the pump's queue is what these witnesses read, so no peer and no handshake is needed to fill it.
-    fn deaf_lane() -> (Datagram, SocketAddr, quiche::Connection) {
+    fn deaf_lane() -> (Datagram, SocketAddr, QuicheConnection) {
         let sock = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));
         let local = sock.local_addr().expect("addr");
         let mut config = serve_config(&minted_identity()).expect("serves");
@@ -7576,7 +7669,14 @@ mod tests {
         getrandom::fill(&mut cid).expect("random");
         let cid = quiche::ConnectionId::from_ref(&cid);
         let peer: SocketAddr = "127.0.0.1:53099".parse().expect("addr");
-        let conn = quiche::accept(&cid, None, local, peer, &mut config).expect("accepts");
+        let conn = quiche::accept_with_buf_factory::<crate::quic::BytesBufFactory>(
+            &cid,
+            None,
+            local,
+            peer,
+            &mut config,
+        )
+        .expect("accepts");
         (sock, local, conn)
     }
 
@@ -7609,9 +7709,9 @@ mod tests {
 
     /// One side's sweep, then everything its peer's socket holds delivered into that peer: the handshake and the gate both ride the batched path rather than a ferry of their own.
     fn pass(
-        from: &mut quiche::Connection,
+        from: &mut QuicheConnection,
         from_sock: &Datagram,
-        to: &mut quiche::Connection,
+        to: &mut QuicheConnection,
         to_lane: &Datagram,
         to_addr: SocketAddr,
     ) {
@@ -7630,7 +7730,7 @@ mod tests {
     struct Lane {
         sock: Datagram,
         addr: SocketAddr,
-        conn: quiche::Connection,
+        conn: QuicheConnection,
     }
 
     /// Client and server handshaked over two real loopback sockets, because a batched sweep is only readable from the peer's side of the wire.
@@ -7698,7 +7798,7 @@ mod tests {
         let mut bytes = [0u8; 16];
         getrandom::fill(&mut bytes).expect("random");
         let server_id = quiche::ConnectionId::from_ref(&bytes);
-        let server = quiche::accept(
+        let server = quiche::accept_with_buf_factory::<crate::quic::BytesBufFactory>(
             &server_id,
             None,
             server_addr,
@@ -7708,7 +7808,7 @@ mod tests {
         .expect("accepts");
         getrandom::fill(&mut bytes).expect("random");
         let client_id = quiche::ConnectionId::from_ref(&bytes);
-        let mut client = quiche::connect(
+        let mut client = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
             name,
             &client_id,
             client_addr,
@@ -7900,6 +8000,52 @@ mod tests {
         assert_eq!(&after[..got], b"after");
     }
 
+    /// A peer's `RESET_STREAM` ends this direction as an error, not a clean fin: the caller must not
+    /// read the reset request as a completed one.
+    #[test]
+    fn a_reset_stream_reads_as_connection_reset() {
+        let (mut client, mut server) = lane_pair();
+        client.conn.stream_send(0, b"q", false).expect("opens");
+        pass(
+            &mut client.conn,
+            &client.sock,
+            &mut server.conn,
+            &server.sock,
+            server.addr,
+        );
+        let mut room = [0u8; 8];
+        let (n, _) = server.conn.stream_recv(0, &mut room).expect("reads");
+        assert_eq!(&room[..n], b"q");
+        server
+            .conn
+            .stream_shutdown(0, quiche::Shutdown::Write, 42)
+            .expect("resets");
+        pass(
+            &mut server.conn,
+            &server.sock,
+            &mut client.conn,
+            &client.sock,
+            client.addr,
+        );
+        let mut stream = QuicStream {
+            conn: std::sync::Arc::new(std::sync::Mutex::new(client.conn)),
+            sock: std::sync::Arc::new(client.sock),
+            id: 0,
+            meter: crate::stats::Meter::default(),
+            peer_fin: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fin_sent: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            prefaced: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            activity: std::sync::Arc::new(Activity::new()),
+            stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stalled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            owner: None,
+        };
+        let error = stream
+            .read(&mut [0u8; 8])
+            .expect_err("a reset is not a clean end");
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+    }
+
     /// A write on a connection the peer closed returns at once; waiting `SEND_WAIT` for a
     /// stream that can never make progress is the stall, not the close.
     #[test]
@@ -7912,7 +8058,7 @@ mod tests {
         let cid = quiche::ConnectionId::from_ref(&scid);
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("config");
         config.set_application_protos(&[ALPN]).expect("alpn");
-        let mut conn = quiche::connect(
+        let mut conn = quiche::connect_with_buffer_factory::<crate::quic::BytesBufFactory>(
             Some("closed.test"),
             &cid,
             local,
