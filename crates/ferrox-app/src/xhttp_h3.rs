@@ -1268,10 +1268,10 @@ impl H3Client {
                     local,
                     peer,
                     net,
-                    &pump_dead,
                     &pump_draining,
                     &pump_goaway,
                 );
+                pump_dead.store(true, Ordering::Relaxed);
             })
             .ok()?;
         Some(Arc::new(Self {
@@ -1585,12 +1585,11 @@ fn h3_control_goaway(
             return None;
         }
     }
-    match h3_control_frames(&mut control.buf, &mut control.skip, goaway) {
-        Some(drain) => Some(drain),
-        None => {
-            let _ = conn.close(false, H3_ID_ERROR, b"invalid GOAWAY");
-            None
-        }
+    if let Some(drain) = h3_control_frames(&mut control.buf, &mut control.skip, goaway) {
+        Some(drain)
+    } else {
+        let _ = conn.close(false, H3_ID_ERROR, b"invalid GOAWAY");
+        None
     }
 }
 
@@ -1631,9 +1630,7 @@ fn h3_control_frames(control: &mut Vec<u8>, skip: &mut u64, goaway: &AtomicU64) 
         }
         if kind == 0x7 {
             let mut cursor = at;
-            let Some(cutoff) = frames::quic_read(&control[..end], &mut cursor) else {
-                return None;
-            };
+            let cutoff = frames::quic_read(&control[..end], &mut cursor)?;
             if cursor != end || cutoff % 4 != 0 {
                 return None;
             }
@@ -1705,7 +1702,6 @@ fn pump_connection(
     local: SocketAddr,
     peer: SocketAddr,
     generation: u64,
-    dead: &Arc<AtomicBool>,
     draining: &Arc<AtomicBool>,
     goaway: &AtomicU64,
 ) {
@@ -1785,7 +1781,6 @@ fn pump_connection(
             break;
         }
     }
-    dead.store(true, Ordering::Relaxed);
 }
 
 struct H3Post {

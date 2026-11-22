@@ -2389,15 +2389,12 @@ fn tcp_start(
             let users = Arc::clone(&users);
             let identity = identity.clone();
             let session = stop.as_ref().and_then(|stop| stop.track_session(&stream));
-            let spawned = std::thread::Builder::new()
+            let _ = std::thread::Builder::new()
                 .name("ferrox-naive-h2".to_owned())
                 .spawn(move || {
                     let _session = session;
                     serve_h2_connection(stream, identity, users, freedom);
                 });
-            if spawned.is_err() {
-                continue;
-            }
         }
         drop(listener);
         drop(exit);
