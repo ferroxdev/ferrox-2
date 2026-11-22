@@ -2216,8 +2216,8 @@ fn udp_lane_supported(out: &Outbound) -> bool {
         Outbound::Loopback(loopback) => loopback.dial.as_ref().is_some_and(udp_lane_supported),
         Outbound::Vless(vless) => match &vless.carrier {
             Carrier::Quic => true,
-            Carrier::Raw(_) if vless.mux.udp_manager().is_some() => true,
-            Carrier::Ws { .. }
+            Carrier::Raw(_)
+            | Carrier::Ws { .. }
             | Carrier::HttpUpgrade { .. }
             | Carrier::Grpc(_)
             | Carrier::Xhttp { .. }
