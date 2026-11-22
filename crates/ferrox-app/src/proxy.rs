@@ -67,7 +67,10 @@ fn foxy_edge_row(edge: &ferrox_core::foxy::Candidate, reading: Option<u64>) -> S
 }
 
 pub(crate) fn serve_json(label: &str, body: &str, test: bool) -> ! {
-    let root = crate::json::parse(body)
+    let mut root = crate::json::parse(body)
+        .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
+    crate::json::order_by_priority(&mut root);
+    crate::lint::run(&mut root)
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
     serve_root(label, &root, None, test)
 }

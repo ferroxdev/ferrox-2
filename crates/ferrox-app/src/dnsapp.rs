@@ -21,6 +21,10 @@ const DEFAULT_TTL: u32 = 300;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(4);
 const HOSTS_TTL: u32 = 10;
 const RESOLVE_CACHE_CAP: usize = 4096;
+pub(crate) const FAKE_V4_POOL: &str = "198.18.0.0/15";
+pub(crate) const FAKE_V6_POOL: &str = "2001:2::/48";
+pub(crate) const FAKE_DOUBLE_POOL_SIZE: u32 = 32768;
+pub(crate) const FAKE_SINGLE_POOL_SIZE: u32 = 65535;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Strategy {
@@ -1805,10 +1809,10 @@ fn parse_fake(
     };
     let mut wanted = Vec::new();
     match value {
-        Some(Json::Obj(_)) => wanted.push(value.expect("checked")),
+        Some(Json::Obj(pairs)) if !pairs.is_empty() => wanted.push(value.expect("checked")),
+        Some(Json::Obj(_)) | None => {}
         Some(Json::Arr(items)) => wanted.extend(items.iter()),
         Some(_) => return Err("dns: fakeDns is not an object or array".into()),
-        None => {}
     }
     if wanted.is_empty() {
         if default_v4 {
@@ -1827,21 +1831,37 @@ fn parse_fake(
                 let single = default_v4 != default_v6;
                 let (pool, size) = if default_v4 && !only_v4 {
                     only_v4 = true;
-                    ("198.18.0.0/15", if single { 65535 } else { 32768 })
+                    (
+                        FAKE_V4_POOL,
+                        if single {
+                            FAKE_SINGLE_POOL_SIZE
+                        } else {
+                            FAKE_DOUBLE_POOL_SIZE
+                        },
+                    )
                 } else if default_v6 && !only_v6 {
                     only_v6 = true;
-                    ("2001:2::/48", if single { 65535 } else { 32768 })
+                    (
+                        FAKE_V6_POOL,
+                        if single {
+                            FAKE_SINGLE_POOL_SIZE
+                        } else {
+                            FAKE_DOUBLE_POOL_SIZE
+                        },
+                    )
                 } else {
-                    ("198.18.0.0/15", 32768)
+                    (FAKE_V4_POOL, FAKE_DOUBLE_POOL_SIZE)
                 };
-                (pool.to_owned(), size)
+                (pool.to_owned(), size as usize)
             }
             Json::Obj(_) => (
                 item.get("ipPool")
                     .and_then(Json::as_str)
-                    .unwrap_or("198.18.0.0/15")
+                    .unwrap_or(FAKE_V4_POOL)
                     .to_owned(),
-                item.get("poolSize").and_then(Json::as_u32).unwrap_or(65535) as usize,
+                item.get("poolSize")
+                    .and_then(Json::as_u32)
+                    .unwrap_or(FAKE_SINGLE_POOL_SIZE) as usize,
             ),
             _ => return Err("dns: fakeDns pool is not an object".into()),
         };
@@ -2100,6 +2120,21 @@ mod resolver_tests {
             .lookup_families("example.com", true, true, true)
             .expect("stable");
         assert_eq!(again.0, ips);
+    }
+
+    #[test]
+    fn an_empty_fake_pool_follows_the_query_strategy() {
+        let resolver = Arc::new(
+            Resolver::from_root(&root(
+                r#"{"dns":{"servers":["fakedns"],"queryStrategy":"UseIPv6"},"fakeDns":{}}"#,
+            ))
+            .expect("resolver")
+            .expect("configured"),
+        );
+        let (ips, _) = resolver
+            .lookup_families("example.com", false, true, true)
+            .expect("fake");
+        assert!(ips.iter().all(std::net::IpAddr::is_ipv6));
     }
 
     /// The pool as it stood: three copies of each name and a queue walked on every hit. Kept as the oracle the slot list answers to — the same address for the same name, the same eviction, the same recency order — with the instant handed in so both search from the same place.

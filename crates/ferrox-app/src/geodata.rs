@@ -1048,6 +1048,18 @@ fn fetch_timeout() -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, "remote fetch outlasted its budget")
 }
 
+/// macOS returns EINVAL from a timeout set after the peer has closed; the buffered reply still reads.
+fn arm_timeout(result: io::Result<()>) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    if result
+        .as_ref()
+        .is_err_and(|error| error.kind() == io::ErrorKind::InvalidInput)
+    {
+        return Ok(());
+    }
+    result
+}
+
 /// The dial's socket with one absolute deadline over every read and write, so a peer that keeps
 /// trickling below the idle timeout still runs out of the fetch's budget.
 struct DeadlineIo {
@@ -1081,8 +1093,10 @@ impl Read for DeadlineIo {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.deadline.is_some() {
             let left = self.remaining()?;
-            self.inner
-                .set_read_timeout(Some(left.max(Duration::from_millis(1))))?;
+            arm_timeout(
+                self.inner
+                    .set_read_timeout(Some(left.max(Duration::from_millis(1)))),
+            )?;
             self.inner.set_read_until(self.deadline);
         }
         let read = self.inner.read(buf)?;
@@ -1097,8 +1111,10 @@ impl Write for DeadlineIo {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if self.deadline.is_some() {
             let left = self.remaining()?;
-            self.inner
-                .set_write_timeout(Some(left.max(Duration::from_millis(1))))?;
+            arm_timeout(
+                self.inner
+                    .set_write_timeout(Some(left.max(Duration::from_millis(1)))),
+            )?;
         }
         let written = self.inner.write(buf)?;
         if self.expired() {
@@ -1130,14 +1146,14 @@ fn direct_stream(
     .ok_or_else(|| format!("cannot resolve {} within its budget", url.authority))?;
     let mut last = None;
     for address in addresses {
-        let left = fetch_budget(deadline)?.min(IDLE);
+        let left = fetch_budget(deadline)?
+            .min(IDLE)
+            .max(Duration::from_millis(1));
         match std::net::TcpStream::connect_timeout(&address, left) {
             Ok(stream) => {
-                stream
-                    .set_read_timeout(Some(left))
+                arm_timeout(stream.set_read_timeout(Some(left)))
                     .map_err(|error| error.to_string())?;
-                stream
-                    .set_write_timeout(Some(left))
+                arm_timeout(stream.set_write_timeout(Some(left)))
                     .map_err(|error| error.to_string())?;
                 return Ok(crate::conn::Connection::Tcp(stream));
             }
@@ -1833,13 +1849,16 @@ mod tests {
     fn a_remote_fetch_follows_twenty_redirects_and_refuses_the_next() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_stop = std::sync::Arc::clone(&stop);
         let server = std::thread::spawn(move || {
             use std::io::{ErrorKind, Read as _, Write as _};
+            use std::sync::atomic::Ordering;
             use std::time::{Duration, Instant};
             listener.set_nonblocking(true).expect("nonblocking");
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = Instant::now() + Duration::from_secs(30);
             let mut at = 0;
-            while at < 21 && Instant::now() < deadline {
+            while at < 21 && !server_stop.load(Ordering::Relaxed) && Instant::now() < deadline {
                 let (mut stream, _) = match listener.accept() {
                     Ok(accepted) => accepted,
                     Err(error) if error.kind() == ErrorKind::WouldBlock => {
@@ -1848,8 +1867,7 @@ mod tests {
                     }
                     Err(error) => panic!("accepts: {error}"),
                 };
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(1)))
+                arm_timeout(stream.set_read_timeout(Some(Duration::from_secs(1))))
                     .expect("read timeout");
                 let mut request = [0u8; 1024];
                 let _ = stream.read(&mut request);
@@ -1862,6 +1880,7 @@ mod tests {
             }
         });
         let error = fetch_remote(&format!("http://127.0.0.1:{port}/0")).expect_err("refused");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().expect("server");
         assert!(error.contains("20 redirects"), "{error}");
     }
