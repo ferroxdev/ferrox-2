@@ -1499,6 +1499,7 @@ impl NaiveOut {
                 .ok()
                 .map(|()| associate)
         });
+        let dial = proxy::FlowDial::capture();
         let mut lanes: HashMap<(String, SocketAddr), UotLane> = HashMap::new();
         let mut pending: HashMap<(String, SocketAddr), PendingUot> = HashMap::new();
         let (open_tx, open_rx) = std::sync::mpsc::channel::<UotOpen>();
@@ -1639,61 +1640,68 @@ impl NaiveOut {
                 let tx = open_tx.clone();
                 let closing = Arc::clone(&closing);
                 let this = Arc::clone(self);
+                let dial = dial.clone();
                 let open_key = key.clone();
                 let open_target = target;
                 let spawned = std::thread::Builder::new()
                     .name("ferrox-naive-uot-open".to_owned())
                     .spawn(move || {
-                        if closing.load(Ordering::Relaxed) {
-                            let _ = tx.send(Err(open_key));
-                            return;
-                        }
-                        let magic =
-                            Destination::Name(if connect { UOT_V2 } else { UOT_V1 }.to_owned(), 0);
-                        let Some(stream) = this.open(&magic) else {
-                            let _ = tx.send(Err(open_key));
-                            return;
-                        };
-                        if closing.load(Ordering::Relaxed) {
-                            stream.abort();
-                            let _ = tx.send(Err(open_key));
-                            return;
-                        }
-                        let mut writer = stream.clone();
-                        if connect && write_uot_request(&mut writer, true, &open_target).is_err() {
-                            stream.abort();
-                            let _ = tx.send(Err(open_key));
-                            return;
-                        }
-                        let done = Arc::new(AtomicBool::new(false));
-                        let reader_done = Arc::clone(&done);
-                        let reader_target = open_target.clone();
-                        let reader_stream = writer;
-                        let reader = std::thread::Builder::new()
-                            .name("ferrox-naive-uot-out".to_owned())
-                            .spawn(move || {
-                                uot_out_reader(
-                                    reader_stream,
-                                    reply_relay,
-                                    source,
-                                    reader_target,
-                                    connect,
-                                    reader_done,
-                                );
-                            });
-                        if reader.is_err() {
-                            done.store(true, Ordering::Relaxed);
-                            stream.abort();
-                            let _ = tx.send(Err(open_key));
-                            return;
-                        }
-                        let cancel = UotCancel::new(&stream, &done);
-                        if let Err(error) = tx.send(Ok((open_key, stream, done, cancel))) {
-                            if let Ok((_, stream, done, _cancel)) = error.0 {
+                        dial.run(|| {
+                            if closing.load(Ordering::Relaxed) {
+                                let _ = tx.send(Err(open_key));
+                                return;
+                            }
+                            let magic = Destination::Name(
+                                if connect { UOT_V2 } else { UOT_V1 }.to_owned(),
+                                0,
+                            );
+                            let Some(stream) = this.open(&magic) else {
+                                let _ = tx.send(Err(open_key));
+                                return;
+                            };
+                            if closing.load(Ordering::Relaxed) {
+                                stream.abort();
+                                let _ = tx.send(Err(open_key));
+                                return;
+                            }
+                            let mut writer = stream.clone();
+                            if connect
+                                && write_uot_request(&mut writer, true, &open_target).is_err()
+                            {
+                                stream.abort();
+                                let _ = tx.send(Err(open_key));
+                                return;
+                            }
+                            let done = Arc::new(AtomicBool::new(false));
+                            let reader_done = Arc::clone(&done);
+                            let reader_target = open_target.clone();
+                            let reader_stream = writer;
+                            let reader = std::thread::Builder::new()
+                                .name("ferrox-naive-uot-out".to_owned())
+                                .spawn(move || {
+                                    uot_out_reader(
+                                        reader_stream,
+                                        reply_relay,
+                                        source,
+                                        reader_target,
+                                        connect,
+                                        reader_done,
+                                    );
+                                });
+                            if reader.is_err() {
                                 done.store(true, Ordering::Relaxed);
                                 stream.abort();
+                                let _ = tx.send(Err(open_key));
+                                return;
                             }
-                        }
+                            let cancel = UotCancel::new(&stream, &done);
+                            if let Err(error) = tx.send(Ok((open_key, stream, done, cancel))) {
+                                if let Ok((_, stream, done, _cancel)) = error.0 {
+                                    done.store(true, Ordering::Relaxed);
+                                    stream.abort();
+                                }
+                            }
+                        });
                     });
                 if spawned.is_err() {
                     pending.remove(&key);

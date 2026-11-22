@@ -2017,6 +2017,30 @@ impl Drop for TargetStrategyGuard {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct FlowDial {
+    source: Option<SendThrough>,
+    sockopts: Option<Arc<crate::sockopt::SocketOptions>>,
+    strategy: Option<FreedomDomain>,
+}
+
+impl FlowDial {
+    pub(crate) fn capture() -> Self {
+        Self {
+            source: SEND_THROUGH.with(std::cell::Cell::get),
+            sockopts: DIAL_SOCKOPTS.with(|cell| cell.borrow().clone()),
+            strategy: TARGET_STRATEGY.with(std::cell::Cell::get),
+        }
+    }
+
+    pub(crate) fn run<T>(&self, f: impl FnOnce() -> T) -> T {
+        let _source = SendThroughGuard::enter(self.source);
+        let _sockopts = DialSockoptsGuard::enter(self.sockopts.clone());
+        let _strategy = TargetStrategyGuard::enter(self.strategy);
+        f()
+    }
+}
+
 /// The outbound-level `sendThrough`: an address or a CIDR, while xray's two names for the inbound's
 /// own addresses warn and leave the dial unbound.
 fn parse_send_through(outbound: &Json) -> Result<Option<SendThrough>, String> {
