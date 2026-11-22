@@ -2203,7 +2203,7 @@ fn udp_lane_supported(out: &Outbound) -> bool {
         Outbound::Vless(vless) => match &vless.carrier {
             Carrier::Quic => true,
             Carrier::Raw(_) => vless.tls.is_none(),
-            Carrier::Kcp(_) => vless.mux.tcp.is_some(),
+            Carrier::Kcp(_) => vless.mux.udp_manager().is_some(),
             Carrier::Hysteria(_) => {
                 vless.mux.tcp.is_none() && hysteria_dial_session(vless).is_some()
             }
@@ -11108,7 +11108,7 @@ fn serve_bridge_udp(
         if matches!(&out, Outbound::Block(_)) {
             continue;
         }
-        reap_finished_lanes(&mut lanes, &mut replies);
+        reap_finished_lanes(&mut lanes, &mut default_lane, &mut replies);
         let lane_address = if let Some(tag) = key.as_deref() {
             if let Some(address) = retire_bridge_lane(&mut lanes, &mut replies, tag, &identity) {
                 Some(address)
@@ -11159,9 +11159,11 @@ fn serve_bridge_udp(
     }
 }
 
-/// Drops every finished lane in every identity bucket, with its reply address. A live lane stays.
+/// Drops every finished lane in every identity bucket and the untagged default, with its reply
+/// address. A live lane stays.
 fn reap_finished_lanes(
     lanes: &mut HashMap<LaneId, HashMap<String, UdpLane>>,
+    default_lane: &mut Option<(LaneId, UdpLane)>,
     replies: &mut HashSet<SocketAddr>,
 ) {
     lanes.retain(|_, held| {
@@ -11174,6 +11176,14 @@ fn reap_finished_lanes(
         });
         !held.is_empty()
     });
+    if default_lane
+        .as_ref()
+        .is_some_and(|(_, lane)| lane.handle.is_finished())
+    {
+        if let Some((_, lane)) = default_lane.take() {
+            replies.remove(&lane.address);
+        }
+    }
 }
 
 /// A lane is only reused while it still belongs to the outbound the live table picked for its
@@ -60747,6 +60757,35 @@ mod tests {
         assert_eq!(off.mux, Mux::default(), "a disabled mux carries nothing");
     }
 
+    /// A KCP bridge lane is admitted only when the mux carries a UDP pool, the same test the
+    /// worker uses before it opens the datagram path.
+    #[test]
+    fn a_kcp_lane_follows_its_udp_pool() {
+        let root = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "vless", "mux": {"enabled": true, "concurrency": 8, "xudpConcurrency": -1}, "settings": {"vnext": [{"address": "127.0.0.1", "port": 443, "users": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]}]}, "streamSettings": {"network": "kcp"}}]}"#,
+        )
+        .expect("parses");
+        let out = find_vless_outbound(&root).expect("finds");
+        assert!(out.mux.tcp.is_some(), "the tcp pool is open");
+        assert_eq!(out.mux.udp_manager(), None, "xudp is off");
+        assert!(
+            !udp_lane_supported(&Outbound::Vless(out)),
+            "a tcp-only mux cannot carry datagrams"
+        );
+
+        let root = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "vless", "mux": {"enabled": true, "concurrency": -1, "xudpConcurrency": 7}, "settings": {"vnext": [{"address": "127.0.0.1", "port": 443, "users": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]}]}, "streamSettings": {"network": "kcp"}}]}"#,
+        )
+        .expect("parses");
+        let out = find_vless_outbound(&root).expect("finds");
+        assert_eq!(out.mux.tcp, None, "the tcp pool is off");
+        assert_eq!(out.mux.udp_manager(), Some(7), "xudp has its own pool");
+        assert!(
+            udp_lane_supported(&Outbound::Vless(out)),
+            "the datagram lane rides xudp"
+        );
+    }
+
     /// The reference refuses the outbound when `xudpProxyUDP443` names a policy it does not know.
     #[test]
     fn an_unknown_udp_443_policy_refuses_the_outbound() {
@@ -88300,6 +88339,20 @@ mod reverse_tests {
             handle: finished_handle,
             waker: finished_socket,
         };
+        let default_socket = UdpSocket::bind("127.0.0.1:0").expect("default socket");
+        let default_address = default_socket.local_addr().expect("default address");
+        let default_handle = thread::spawn(|| {});
+        while !default_handle.is_finished() {
+            thread::yield_now();
+        }
+        let mut default_lane = Some((
+            LaneId::Static(3),
+            UdpLane {
+                address: default_address,
+                handle: default_handle,
+                waker: default_socket,
+            },
+        ));
         let mut lanes = HashMap::from([
             (
                 LaneId::Static(1),
@@ -88310,12 +88363,14 @@ mod reverse_tests {
                 HashMap::from([("live".to_owned(), live)]),
             ),
         ]);
-        let mut replies = HashSet::from([finished_address, live_address]);
-        reap_finished_lanes(&mut lanes, &mut replies);
+        let mut replies = HashSet::from([finished_address, live_address, default_address]);
+        reap_finished_lanes(&mut lanes, &mut default_lane, &mut replies);
         assert!(!lanes.contains_key(&LaneId::Static(1)));
         assert!(lanes.contains_key(&LaneId::Static(2)));
         assert!(!replies.contains(&finished_address));
         assert!(replies.contains(&live_address));
+        assert!(default_lane.is_none(), "a finished default lane is reaped");
+        assert!(!replies.contains(&default_address));
         let live = lanes
             .remove(&LaneId::Static(2))
             .expect("live bucket")
@@ -88332,7 +88387,7 @@ mod reverse_tests {
         let server_addr = listener.local_addr().expect("addr");
         let relay = UdpSocket::bind("127.0.0.1:0").expect("relay");
         relay
-            .set_read_timeout(Some(Duration::from_secs(10)))
+            .set_read_timeout(Some(Duration::from_millis(20)))
             .expect("timeout");
         let relay_addr = relay.local_addr().expect("relay addr");
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -88358,13 +88413,33 @@ mod reverse_tests {
             reply.extend_from_slice(&relay_addr.port().to_be_bytes());
             stream.write_all(&reply).expect("associate");
             let mut frame = [0u8; 512];
-            let (n, src) = relay.recv_from(&mut frame).expect("udp");
-            seen_server
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(frame[..n].to_vec());
-            let _ = relay.send_to(b"ok", src);
-            let _ = hold.recv();
+            loop {
+                match relay.recv_from(&mut frame) {
+                    Ok((n, src)) => {
+                        seen_server
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(frame[..n].to_vec());
+                        let _ = relay.send_to(b"ok", src);
+                    }
+                    Err(error) if is_timeout(&error) => match hold.try_recv() {
+                        Ok(()) => {
+                            relay.set_nonblocking(true).ok();
+                            while let Ok((n, src)) = relay.recv_from(&mut frame) {
+                                seen_server
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .push(frame[..n].to_vec());
+                                let _ = relay.send_to(b"ok", src);
+                            }
+                            break;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    },
+                    Err(_) => break,
+                }
+            }
         });
         (server_addr, seen, server)
     }
@@ -88379,6 +88454,12 @@ mod reverse_tests {
         {
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn probe_frames(seen: &Arc<Mutex<Vec<Vec<u8>>>>) -> Vec<Vec<u8>> {
+        seen.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     #[test]
@@ -88428,12 +88509,9 @@ mod reverse_tests {
         leg.send(&frame(b"first")).expect("sends first");
         wait_for_probe(&first_seen);
         assert_eq!(
-            first_seen
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .len(),
-            1,
-            "the first lane receives"
+            probe_frames(&first_seen),
+            vec![frame(b"first")],
+            "the first lane receives only the first frame"
         );
         shared.remove_outbound("alt");
         shared
@@ -88441,20 +88519,15 @@ mod reverse_tests {
             .expect("second lane");
         leg.send(&frame(b"second")).expect("sends second");
         wait_for_probe(&second_seen);
+        thread::sleep(Duration::from_millis(100));
         assert_eq!(
-            second_seen
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .len(),
-            1,
-            "the replacement lane receives"
+            probe_frames(&second_seen),
+            vec![frame(b"second")],
+            "the replacement lane receives only the second frame"
         );
         assert_eq!(
-            first_seen
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .len(),
-            1,
+            probe_frames(&first_seen),
+            vec![frame(b"first")],
             "the old lane receives no second datagram"
         );
         stop.store(true, Ordering::Relaxed);
