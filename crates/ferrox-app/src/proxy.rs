@@ -84373,7 +84373,7 @@ end
             {"tag":"pick","type":"selector","outbounds":["block","direct"],"default":"block"},
             {"tag":"block","protocol":"blackhole"},
             {"tag":"direct","protocol":"freedom"}
-        ],"routing":{"rules":[{"type":"field","port":1,"outboundTag":"block"}]}}"#;
+        ],"routing":{"rules":[{"type":"field","network":"tcp","port":1,"outboundTag":"block"}]}}"#;
         let out = route_outbound(config, Some("in"), true);
         let port = socks_front_with(out);
         let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
