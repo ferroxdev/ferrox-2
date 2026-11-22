@@ -41,6 +41,8 @@ struct Pacer {
     rate: u64,
     tokens: f64,
     last: Instant,
+    #[cfg(test)]
+    clocks: usize,
 }
 
 impl Pacer {
@@ -49,6 +51,8 @@ impl Pacer {
             rate,
             tokens: 0.0,
             last: Instant::now(),
+            #[cfg(test)]
+            clocks: 0,
         }
     }
 
@@ -72,13 +76,18 @@ impl Pacer {
             return;
         }
         let now = Instant::now();
+        #[cfg(test)]
+        {
+            self.clocks += 1;
+        }
         let earned = now.duration_since(self.last).as_secs_f64() * self.rate as f64;
         self.tokens = (self.tokens + earned).min(self.rate as f64) - bytes as f64;
+        self.last = now;
         if self.tokens < 0.0 {
             std::thread::sleep(Duration::from_secs_f64(-self.tokens / self.rate as f64));
             self.tokens = 0.0;
+            self.last = Instant::now();
         }
-        self.last = Instant::now();
     }
 }
 
@@ -4745,6 +4754,16 @@ fn peer_key(addrs: &[IpAddr]) -> [u8; 32] {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn a_paced_write_reads_one_clock() {
+        let mut pacer = Pacer::new(1 << 30);
+        pacer.tokens = f64::from(1u32 << 30);
+        for _ in 0..3 {
+            pacer.account(1);
+        }
+        assert_eq!(pacer.clocks, 3, "one clock a paced write, not two");
+    }
 
     #[test]
     fn a_flow_queue_stops_at_the_capsule_bound() {

@@ -1786,6 +1786,8 @@ struct Inner {
     expired: Vec<u16>,
     #[cfg(test)]
     clocks: usize,
+    #[cfg(test)]
+    expiry_passes: usize,
 }
 
 struct UdpAssoc {
@@ -2006,6 +2008,8 @@ impl Server {
                 expired: Vec::new(),
                 #[cfg(test)]
                 clocks: 0,
+                #[cfg(test)]
+                expiry_passes: 0,
             }),
         });
         self.conns.insert(scid.to_vec(), Arc::clone(&session));
@@ -2712,11 +2716,24 @@ fn expire_udp(inner: &mut Inner, now: Instant, timeout: Duration) {
             .filter(|(_, assoc)| now.duration_since(assoc.last) >= timeout)
             .map(|(association, _)| *association),
     );
-    for association in expired.drain(..) {
-        inner.udp.remove(&association);
-        inner.reassembly.retain(|key, _| key.0 != association);
-        inner.resolving.retain(|key, _| key.0 != association);
+    if expired.is_empty() {
+        inner.expired = expired;
+        return;
     }
+    expired.sort_unstable();
+    for association in &expired {
+        inner.udp.remove(association);
+    }
+    #[cfg(test)]
+    {
+        inner.expiry_passes += 2;
+    }
+    inner
+        .reassembly
+        .retain(|key, _| expired.binary_search(&key.0).is_err());
+    inner
+        .resolving
+        .retain(|key, _| expired.binary_search(&key.0).is_err());
     inner.expired = expired;
 }
 
@@ -3023,6 +3040,8 @@ mod tests {
                 expired: Vec::new(),
                 #[cfg(test)]
                 clocks: 0,
+                #[cfg(test)]
+                expiry_passes: 0,
             },
             done,
         )
@@ -3318,6 +3337,32 @@ mod tests {
         assert!(
             inner.udp.is_empty(),
             "an expired lookup does not recreate the association"
+        );
+    }
+
+    #[test]
+    fn every_expired_association_costs_one_pass_per_map() {
+        let (mut inner, _done) = empty_inner();
+        for association in 0..3u16 {
+            select_assoc(&mut inner, association, false).expect("the association is recorded");
+            inner.resolving.insert(
+                (association, "example.test".to_owned(), 53),
+                Resolving {
+                    generation: 0,
+                    payloads: Vec::new(),
+                },
+            );
+        }
+        expire_udp(
+            &mut inner,
+            Instant::now() + Duration::from_secs(2),
+            Duration::from_secs(1),
+        );
+        assert!(inner.udp.is_empty(), "every idle association expires");
+        assert!(inner.resolving.is_empty(), "with every lookup it held");
+        assert_eq!(
+            inner.expiry_passes, 2,
+            "one walk of each map, however many associations expired"
         );
     }
 

@@ -1046,15 +1046,15 @@ fn relay_datagrams(
         return;
     }
     let lane_handle = Arc::clone(&inbound.udp);
-    // One sweep takes the queue behind the packet the turn waited for, so the route, the lane handle and the clock are the sweep's, not each datagram's.
+    // One sweep takes the queue behind the packet the turn waited for, so the route, the lane, the lock and the clock are the sweep's, not each datagram's.
     let now = now_nanos();
     let mut assembled = Vec::new();
+    let Ok(mut lane) = lane_handle.lock() else {
+        return;
+    };
     while let Ok(data) = conn.dgram_recv_buf() {
         let Ok(message) = wire::decode_udp(&data) else {
             continue;
-        };
-        let Ok(mut lane) = lane_handle.lock() else {
-            return;
         };
         let session = message.session;
         let host = message.host;

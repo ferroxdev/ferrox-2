@@ -1295,3 +1295,9 @@ carrier-hysteria established-destination-comparisons-per-datagram 1 ferrox-app-h
 carrier-hysteria evicted-association-hint-answers 0 ferrox-app-hysteria_v1::tests::a_known_destination_is_one_comparison_not_a_walk
 socks reply-head-allocations-per-reply-datagram 0 ferrox-app-proxy::tests::a_reply_head_is_written_without_a_buffer
 socks reply-ns-per-reply 2.3 .github/workflows/bench.yml
+shadowsocks-2022 udp-session-body-key-derivations-per-session 1 ferrox-app-shadowsocks2022::tests::a_datagram_costs_one_derivation_one_clock_and_one_window
+shadowsocks-2022 udp-monotonic-reads-per-datagram 1 ferrox-app-shadowsocks2022::tests::a_datagram_costs_one_derivation_one_clock_and_one_window
+shadowsocks-2022 udp-window-checks-per-datagram 1 ferrox-app-shadowsocks2022::tests::a_datagram_costs_one_derivation_one_clock_and_one_window
+shadowsocks-2022 udp-user-list-builds-per-list 1 ferrox-app-shadowsocks2022::tests::a_multi_user_list_is_hashed_once_and_not_a_datagram
+tuic expiry-map-passes-per-sweep 2 ferrox-app-tuic::tests::every_expired_association_costs_one_pass_per_map
+carrier-masque paced-write-clock-reads 1 ferrox-app-masque::tests::a_paced_write_reads_one_clock

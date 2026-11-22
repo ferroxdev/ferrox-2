@@ -118,6 +118,7 @@ graph TD
 | quic-v2-bait-bytes | 1200 | ferrox-app-masque::tests::the_bait_is_a_v2_versioned_long_header_of_the_minimum_size |
 | quic-v2-bait-answer | consumed | ferrox-app-masque::tests::the_bait_triggers_a_version_negotiation_from_a_v1_only_server |
 | h3-lane-prefix-bytes-moved-per-datagram | 0 | ferrox-app-masque::tests::a_lane_datagram_keeps_its_prefix |
+| paced-write-clock-reads | 1 | ferrox-app-masque::tests::a_paced_write_reads_one_clock |
 <!-- counts:end -->
 
 The row 202 noise hook is the HTTP/3 client's: `masqueSettings.noize` is read into `ClientSpec`, and `attempt` sends that profile's junk and `i1`/`i2` before `quiche::connect`, so the QUIC ClientHello follows them. The default is `off` when the setting is absent; WARP-generated MASQUE settings always write `firewall` unless the operator chooses another profile. HTTP/2 and HTTP/1.1 have no pre-handshake UDP datagrams and take no noise, and the server role is unchanged. `noize::tests::masque_signatures_follow_the_reference_order` and `noize::tests::an_off_profile_sends_nothing` are the checkers.
@@ -131,6 +132,8 @@ No duration is quoted here. The matrix's `masque-down-8` h3 cell, the `masque-h2
 The server leg's 0.15x ack clock points at the inner congestion window: the peer coalesces acknowledgements, and a window that grows by one segment per acknowledgement turns slow start into a linear ramp. Removing that window collapsed the server leg on its first `masque-down-8` run; bounding it at 64 KiB lifted the ferrox client to 176.67 MiB/s but left the xray-core client at 0.02x (run `42609428370`), so the accepted socket keeps Cubic. The rerun after the worker-wakeup fix measured 9.56 against 70.94 MiB/s (0.13x, run `42599287743`), still below the 0.15x floor. What the counts above witness is shape, not speed: one TCP echo per family, one UDP datagram, the 401, the pool's containment rule, five assignment outcomes, the Packet Too Big at both families, the echo answers and refusals, one h2 tunnel's assignment and echoed datagram, the h2 dialer's assignment and TCP echo, the eight ALPN choices, the h1 and h2c TCP echoes, the reference's flat and nested outbound spellings, and the ICMP shapes.
 
 ## What we removed
+
+- **A second clock read per paced write.** `Pacer::account` read `Instant::now()` to earn tokens and read it again to move `last`, so an h3 datagram the pacer held back cost two reads; a write that does not sleep reads once now, and a sleeping one re-reads only after the sleep it must not credit to the next write. `a_paced_write_reads_one_clock` accounts three writes against a full token bucket and pins three reads (`paced-write-clock-reads 1`); the tokens earned and the sleep are the same.
 
 - **A clock read per drained h2 frame.** `Client::pump` stamped `last_frame` inside the per-frame handler, so a burst of k frames read the clock k times. The stamp is one read per pump, after the drain; the keepalive compare only asks whether a frame arrived since the ping, so the gated value is unchanged. No row: a clock read the tree does not count.
 
