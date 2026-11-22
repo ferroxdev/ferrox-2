@@ -346,7 +346,13 @@ fn top_level_exp(bytes: &[u8]) -> Option<u64> {
         at = json_space(bytes, end);
         match *bytes.get(at)? {
             b',' => at = json_space(bytes, at + 1),
-            b'}' => return expiry,
+            b'}' => {
+                // The object is the whole payload: a byte after it is not a claim this reader can trust.
+                if json_space(bytes, at + 1) != bytes.len() {
+                    return None;
+                }
+                return expiry;
+            }
             _ => return None,
         }
     }
@@ -422,22 +428,97 @@ fn json_hex4(bytes: &[u8], at: usize) -> Option<u32> {
     Some(value)
 }
 
-/// The `exp` value as whole seconds: a JSON number, integer or fractional, truncated toward zero; a negative, non-finite or overflowing one is no expiry at all.
+/// The `exp` value as whole seconds: a JSON number, integer or fractional, truncated toward zero. The digits and the exponent are read as integers, because a `f64` rounds `1735689600.99999999` up to the next second and treats the top of the `u64` range as the rejection threshold.
 fn json_exp_value(token: &[u8]) -> Option<u64> {
-    let floating = json_number_ok(token)?;
-    let text = std::str::from_utf8(token).ok()?;
-    if !floating {
-        return text.parse().ok();
+    json_number_ok(token)?;
+    // Only the leading significant digits can reach a `u64`: the rest are place value, counted rather than stored.
+    let mut head = [0u8; 39];
+    let mut head_len = 0usize;
+    let mut digits = 0usize;
+    let mut fraction = 0i64;
+    let mut seen = false;
+    let mut dotted = false;
+    let mut at = 0usize;
+    while let Some(byte) = token.get(at).copied() {
+        match byte {
+            b'0'..=b'9' => {
+                if byte != b'0' {
+                    seen = true;
+                }
+                if seen {
+                    digits += 1;
+                    if head_len < head.len() {
+                        head[head_len] = byte - b'0';
+                        head_len += 1;
+                    }
+                }
+                if dotted {
+                    fraction = fraction.saturating_add(1);
+                }
+            }
+            b'.' => dotted = true,
+            b'e' | b'E' => break,
+            _ => {}
+        }
+        at += 1;
     }
-    let value: f64 = text.parse().ok()?;
-    if !value.is_finite() || value < 0.0 || value >= 18_446_744_073_709_551_616.0 {
+    let mut exponent = 0i64;
+    if matches!(token.get(at), Some(b'e' | b'E')) {
+        at += 1;
+        let negative = token.get(at) == Some(&b'-');
+        if matches!(token.get(at), Some(b'+' | b'-')) {
+            at += 1;
+        }
+        while let Some(byte) = token.get(at).copied() {
+            if !byte.is_ascii_digit() {
+                break;
+            }
+            exponent = exponent
+                .saturating_mul(10)
+                .saturating_add(i64::from(byte - b'0'));
+            at += 1;
+        }
+        if negative {
+            exponent = -exponent;
+        }
+    }
+    if at != token.len() {
         return None;
     }
-    Some(value as u64)
+    if !seen {
+        return Some(0);
+    }
+    let shift = exponent.saturating_sub(fraction);
+    // A negative shift drops that many trailing digits, so only the leading digits are kept; a positive one scales every digit, so the whole number has to fit.
+    let kept = if shift >= 0 {
+        if i64::try_from(digits).ok()? > 20i64.saturating_sub(shift) {
+            return None;
+        }
+        digits
+    } else {
+        let drop = shift.unsigned_abs();
+        if drop >= u64::try_from(digits).ok()? {
+            return Some(0);
+        }
+        digits - usize::try_from(drop).ok()?
+    };
+    if kept > 20 || kept > head_len {
+        return None;
+    }
+    let mut value = 0u64;
+    for digit in head.iter().take(kept) {
+        value = value.checked_mul(10)?.checked_add(u64::from(*digit))?;
+    }
+    if shift >= 0 {
+        for _ in 0..shift {
+            value = value.checked_mul(10)?;
+        }
+    }
+    Some(value)
 }
 
-/// Validates a JSON number's grammar and says whether it needs a floating-point read; `parse` alone would take a sign and a leading zero JSON does not.
-fn json_number_ok(token: &[u8]) -> Option<bool> {
+/// Validates a JSON number's grammar; `parse` alone would take a sign and a leading zero JSON does not.
+fn json_number_ok(token: &[u8]) -> Option<()> {
     let mut at = match token.first()? {
         b'0' => 1,
         b'1'..=b'9' => {
@@ -449,7 +530,6 @@ fn json_number_ok(token: &[u8]) -> Option<bool> {
         }
         _ => return None,
     };
-    let mut floating = false;
     if token.get(at) == Some(&b'.') {
         at += 1;
         let start = at;
@@ -459,10 +539,8 @@ fn json_number_ok(token: &[u8]) -> Option<bool> {
         if at == start {
             return None;
         }
-        floating = true;
     }
     if matches!(token.get(at), Some(b'e' | b'E')) {
-        floating = true;
         at += 1;
         if matches!(token.get(at), Some(b'+' | b'-')) {
             at += 1;
@@ -475,7 +553,7 @@ fn json_number_ok(token: &[u8]) -> Option<bool> {
             return None;
         }
     }
-    (at == token.len()).then_some(floating)
+    (at == token.len()).then_some(())
 }
 
 fn json_space(bytes: &[u8], mut at: usize) -> usize {
@@ -778,6 +856,42 @@ mod tests {
             jwt_expiry(&token(br#"{"exp":1735689600,"exp":1735689601}"#)),
             None,
             "two claims of one name are not one expiry"
+        );
+        assert_eq!(
+            jwt_expiry(&token(br#"{"exp":1735689600.99999999}"#)),
+            Some(1_735_689_600),
+            "a decimal rounds nowhere before it is truncated"
+        );
+        assert_eq!(
+            jwt_expiry(&token(br#"{"exp":18446744073709551615.0}"#)),
+            Some(u64::MAX),
+            "the top of the range is a number, not a threshold"
+        );
+        assert_eq!(
+            jwt_expiry(&token(br#"{"exp":18446744073709551616.0}"#)),
+            None,
+            "one past the range is no expiry"
+        );
+        assert_eq!(
+            jwt_expiry(&token(br#"{"exp":0.0e400}"#)),
+            Some(0),
+            "a zero is zero whatever the exponent"
+        );
+        assert_eq!(
+            jwt_expiry(&token(br#"{"exp":1e-400}"#)),
+            Some(0),
+            "a value below a second truncates to zero"
+        );
+        for claims in [
+            br#"{"exp":1735689600}x"#.as_slice(),
+            br#"{"exp":1735689600} {}"#.as_slice(),
+        ] {
+            assert_eq!(jwt_expiry(&token(claims)), None, "{claims:?}");
+        }
+        assert_eq!(
+            jwt_expiry(&token(br#"{"exp":1735689600} "#)),
+            Some(1_735_689_600),
+            "whitespace after the payload is not a claim"
         );
         for claims in [
             br#"{"exp":-1}"#.as_slice(),

@@ -908,6 +908,7 @@ fn attach(
         session: Arc::clone(session),
         stream,
         class,
+        assigned: ([0u8; 32], [0usize; 2]),
         ended: false,
     };
     let status = match lane.await_status() {
@@ -1251,6 +1252,8 @@ pub(crate) struct Tls2 {
     stream: u32,
     /// What this session carries: a TCP stream stages raw bytes in `carry`, while a capsule stream stages into `capsule_buf`.
     class: PoolClass,
+    /// The source addresses the proxy currently lets this CONNECT-IP lane use, replaced whole by each assignment capsule.
+    assigned: Assignment,
     /// Whether this lane has already handed its stream back or reset it, so a second drop is a no-op.
     ended: bool,
 }
@@ -1323,6 +1326,33 @@ impl SessionInner {
     fn fail(&mut self, why: Terminal) {
         self.gone = true;
         self.terminal.get_or_insert(why);
+    }
+}
+
+/// The request ids the tunnel names: one per family, so an answer names the family it was asked for.
+const ADDRESS_V4: u64 = 1;
+const ADDRESS_V6: u64 = 2;
+
+/// The source addresses a CONNECT-IP lane may write from: four bytes of IPv4 at zero and sixteen of IPv6 at sixteen, with the width of each family zero when the proxy has assigned none.
+pub(crate) type Assignment = ([u8; 32], [usize; 2]);
+
+/// Whether a grant answers one of the tunnel's own requests rather than naming some unrelated assignment.
+fn asked_for(grant: &connectip::Assigned) -> bool {
+    !grant.refused()
+        && matches!(
+            (grant.request_id, grant.version),
+            (ADDRESS_V4, 4) | (ADDRESS_V6, 6)
+        )
+}
+
+/// Replaces the lane's source set with one `ADDRESS_ASSIGN` capsule: RFC 9484 §4.7.1 says each capsule carries the whole current list, so a family it omits is a family the proxy removed.
+fn take_assignment(into: &mut Assignment, grants: &[connectip::Assigned]) {
+    *into = ([0u8; 32], [0usize; 2]);
+    for grant in grants.iter().filter(|grant| asked_for(grant)) {
+        let at = if grant.version == 4 { 0 } else { 16 };
+        let width = grant.width();
+        into.0[at..at + width].copy_from_slice(grant.bytes());
+        into.1[at / 16] = width;
     }
 }
 
@@ -2411,7 +2441,7 @@ impl Read for Tls2 {
                         }
                         frames::H2Routed::GoAway { .. } => {
                             inner.fail(Terminal::GoAway);
-                            Ok(0)
+                            Err(Terminal::GoAway.error())
                         }
                         frames::H2Routed::Malformed { .. } => {
                             inner.fail(Terminal::Malformed);
@@ -2526,6 +2556,8 @@ pub(crate) struct H3 {
     handed: usize,
     /// Payload octets still owed by a DATA frame that held exactly one DATAGRAM capsule: the capsule's bytes are read from the stream straight into the caller, so the frame is not first staged in `capsule_buf`.
     direct: usize,
+    /// The source addresses the proxy currently lets this CONNECT-IP lane use, replaced whole by each assignment capsule.
+    assigned: Assignment,
     fin: bool,
     /// The peer sent its fin: nothing more will arrive on the request stream, so a reader that has the bytes it was given is at the end of the tunnel and a reader that has none is at the end of a stream that carried none.
     closed: bool,
@@ -2600,6 +2632,7 @@ impl H3 {
             capsule_at: 0,
             handed: 0,
             direct: 0,
+            assigned: ([0u8; 32], [0usize; 2]),
             fin: false,
             closed: false,
             deadline: Instant::now(),
@@ -2681,6 +2714,7 @@ impl H3 {
             capsule_at: 0,
             handed: 0,
             direct: 0,
+            assigned: ([0u8; 32], [0usize; 2]),
             fin: false,
             closed: false,
             deadline: Instant::now(),
@@ -2709,6 +2743,7 @@ impl H3 {
             capsule_at: 0,
             handed: 0,
             direct: 0,
+            assigned: ([0u8; 32], [0usize; 2]),
             fin: false,
             closed: false,
             deadline: Instant::now(),
@@ -2735,7 +2770,10 @@ impl H3 {
         opened(status)?;
         let mut request = Vec::new();
         // Both families in one capsule: the proxy replaces its allowed sources with each answer, so a second request would leave the first family unroutable.
-        connectip::address_requests(&[(1, 4, &[0, 0, 0, 0]), (2, 6, &[0; 16])], &mut request);
+        connectip::address_requests(
+            &[(ADDRESS_V4, 4, &[0, 0, 0, 0]), (ADDRESS_V6, 6, &[0; 16])],
+            &mut request,
+        );
         // The request rides one DATA frame the way a packet does: capsules here are framed, and raw bytes would read as a frame header.
         let mut head = [0u8; 9];
         let hl = frames::h3_data_header(&mut head, request.len() as u64);
@@ -2843,25 +2881,28 @@ impl H3 {
             if let Some((used, capsule)) =
                 connectip::capsule_split(&self.capsule_buf[self.capsule_at..])
             {
-                let (granted, quit) = match capsule {
+                let (granted, quit, assignment) = match capsule {
                     connectip::Capsule::AddressAssign(body) => {
                         let mut into = Vec::new();
                         if connectip::address_assign(body, &mut into).is_none() {
-                            (Vec::new(), true)
+                            (Vec::new(), true, false)
                         } else {
-                            into.retain(|grant| !grant.refused());
-                            (into, false)
+                            into.retain(asked_for);
+                            (into, false, true)
                         }
                     }
                     connectip::Capsule::RouteAdvert(body) => {
                         let mut routes = Vec::new();
                         let _ = connectip::route_advert(body, &mut routes);
-                        (Vec::new(), false)
+                        (Vec::new(), false, false)
                     }
-                    _ => (Vec::new(), false),
+                    _ => (Vec::new(), false, false),
                 };
                 self.capsule_at += used;
                 self.release_capsules();
+                if assignment {
+                    take_assignment(&mut self.assigned, &granted);
+                }
                 if granted.is_empty() {
                     if quit {
                         return Err(Failure::Frame);
@@ -2876,6 +2917,11 @@ impl H3 {
             self.fill_capsules().map_err(io)?;
         }
         Ok(Vec::new())
+    }
+
+    /// The source addresses the proxy currently allows this tunnel: the last assignment capsule's whole set.
+    pub(crate) fn assigned(&self) -> Assignment {
+        self.assigned
     }
 
     /// One IP packet, as a frame's payload the caller takes whole: a frame that is exactly one DATAGRAM capsule whose packet is already queued is read straight into the caller's buffer, so the packet crosses userspace once; a capsule that spanned frames is staged and then copied, as before.
@@ -2917,17 +2963,29 @@ impl H3 {
             if let Some((used, capsule)) =
                 connectip::capsule_split(&self.capsule_buf[self.capsule_at..])
             {
-                let connectip::Capsule::Datagram(packet) = capsule else {
-                    self.capsule_at += used;
-                    self.release_capsules();
-                    continue;
-                };
-                into.clear();
-                into.extend_from_slice(packet);
-                self.capsule_at += used;
-                self.release_capsules();
-                if !into.is_empty() {
-                    return Ok(true);
+                match capsule {
+                    connectip::Capsule::Datagram(packet) => {
+                        into.clear();
+                        into.extend_from_slice(packet);
+                        self.capsule_at += used;
+                        self.release_capsules();
+                        if !into.is_empty() {
+                            return Ok(true);
+                        }
+                    }
+                    connectip::Capsule::AddressAssign(body) => {
+                        let mut grants = Vec::new();
+                        if connectip::address_assign(body, &mut grants).is_none() {
+                            return Err(io(Failure::Frame));
+                        }
+                        take_assignment(&mut self.assigned, &grants);
+                        self.capsule_at += used;
+                        self.release_capsules();
+                    }
+                    _ => {
+                        self.capsule_at += used;
+                        self.release_capsules();
+                    }
                 }
                 continue;
             }
@@ -3879,6 +3937,14 @@ impl Ip {
         }
     }
 
+    /// The source addresses the carrier currently allows this tunnel: both families, with a zero width for one the proxy has removed.
+    pub(crate) fn assigned(&self) -> Assignment {
+        match self {
+            Self::H2(lane) => lane.assigned(),
+            Self::H3(lane) => lane.assigned(),
+        }
+    }
+
     /// One UDP payload out, as one IP packet: the build is the codec's, the frame that carries it is the carrier's.
     pub(crate) fn write(
         &mut self,
@@ -4033,7 +4099,10 @@ impl Tls2 {
     fn address_assign(&mut self) -> Result<Vec<ferrox_core::foxy::connectip::Assigned>, Failure> {
         let mut request = Vec::new();
         // Both families in one capsule: the proxy replaces its allowed sources with each answer, so a second request would leave the first family unroutable.
-        connectip::address_requests(&[(1, 4, &[0, 0, 0, 0]), (2, 6, &[0; 16])], &mut request);
+        connectip::address_requests(
+            &[(ADDRESS_V4, 4, &[0, 0, 0, 0]), (ADDRESS_V6, 6, &[0; 16])],
+            &mut request,
+        );
         // The request rides the capsule stream inside DATA frames, the way a packet does: raw TLS bytes would desynchronise the edge's frame walk.
         self.send_capsules(&request)?;
 
@@ -4049,33 +4118,36 @@ impl Tls2 {
                 match connectip::capsule_split(&stream.capsule_buf) {
                     None => None,
                     Some((used, capsule)) => {
-                        let (granted, quit) = match capsule {
+                        let (granted, quit, assignment) = match capsule {
                             connectip::Capsule::AddressAssign(body) => {
                                 let mut into = Vec::new();
                                 if connectip::address_assign(body, &mut into).is_none() {
-                                    (Vec::new(), true)
+                                    (Vec::new(), true, false)
                                 } else {
-                                    into.retain(|grant| !grant.refused());
-                                    (into, false)
+                                    into.retain(asked_for);
+                                    (into, false, true)
                                 }
                             }
                             connectip::Capsule::RouteAdvert(body) => {
                                 let mut routes = Vec::new();
                                 let _ = connectip::route_advert(body, &mut routes);
-                                (Vec::new(), false)
+                                (Vec::new(), false, false)
                             }
-                            _ => (Vec::new(), false),
+                            _ => (Vec::new(), false, false),
                         };
                         if let Some(stream) = inner.streams.get_mut(&own) {
                             stream.capsule_buf.drain(..used);
                         }
-                        Some((granted, quit))
+                        Some((granted, quit, assignment))
                     }
                 }
             };
-            if let Some((granted, quit)) = capsule {
+            if let Some((granted, quit, assignment)) = capsule {
                 if quit {
                     return Err(Failure::Frame);
+                }
+                if assignment {
+                    take_assignment(&mut self.assigned, &granted);
                 }
                 if !granted.is_empty() {
                     return Ok(granted);
@@ -4119,11 +4191,18 @@ impl Tls2 {
         Ok(Vec::new())
     }
 
+    /// The source addresses the proxy currently allows this tunnel: the last assignment capsule's whole set.
+    pub(crate) fn assigned(&self) -> Assignment {
+        self.assigned
+    }
+
     /// One IP packet, as a datagram this lane can read both ends of. A capsule whole inside one DATA frame is handed out where it lies, so the packet crosses userspace once instead of through the capsule buffer.
     pub(crate) fn read_ip(&mut self, into: &mut Vec<u8>) -> std::io::Result<bool> {
         loop {
             let own = self.stream;
             // The capsule is taken out of the stream's own buffer under the lock that owns it: the packet is a slice of that buffer, so the lock has to be held while it is copied out.
+            let mut malformed = false;
+            let mut update: Option<Vec<connectip::Assigned>> = None;
             let staged = {
                 let mut inner = self.inner().map_err(io)?;
                 // The capsule buffer is taken out for the walk and put back after it: a capsule is a slice of that buffer, and a slice and the buffer cannot be held at once.
@@ -4136,11 +4215,22 @@ impl Tls2 {
                 let mut at = 0usize;
                 while let Some((used, capsule)) = connectip::capsule_split(&staged[at..]) {
                     at += used;
-                    if let connectip::Capsule::Datagram(packet) = capsule {
-                        into.clear();
-                        into.extend_from_slice(packet);
-                        found = true;
-                        break;
+                    match capsule {
+                        connectip::Capsule::Datagram(packet) => {
+                            into.clear();
+                            into.extend_from_slice(packet);
+                            found = true;
+                            break;
+                        }
+                        connectip::Capsule::AddressAssign(body) => {
+                            let mut grants = Vec::new();
+                            if connectip::address_assign(body, &mut grants).is_none() {
+                                malformed = true;
+                            } else {
+                                update = Some(grants);
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 if at > 0 {
@@ -4151,6 +4241,12 @@ impl Tls2 {
                 }
                 found.then_some(())
             };
+            if malformed {
+                return Err(io(Failure::Frame));
+            }
+            if let Some(grants) = update {
+                take_assignment(&mut self.assigned, &grants);
+            }
             if staged.is_some() {
                 if !into.is_empty() {
                     return Ok(true);
@@ -8637,6 +8733,102 @@ pub(crate) mod loopback {
         edge.join().expect("joins");
     }
 
+    /// A later ADDRESS_ASSIGN is the whole set, not a delta: the family it omits is removed, so a v4 tunnel told `v6 only` stops carrying its old source.
+    #[test]
+    fn a_later_assignment_replaces_the_whole_source_set() {
+        let (roots, server) = minted(b"\x68\x32");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let edge = ip_h2_reassign_edge(listener, server);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let (mut lane, assigned) = Ip::open(&dial, None).expect("opens");
+        let mut v4 = [0u8; 32];
+        v4[..4].copy_from_slice(&[198, 51, 100, 9]);
+        assert_eq!(assigned.len(), 1, "the v4 grant");
+        assert_eq!(lane.assigned(), (v4, [4, 0]), "the first assignment");
+        lane.set_read_quantum(Duration::from_millis(20))
+            .expect("arms the read");
+        let mut packet = Vec::new();
+        for _ in 0..100 {
+            match lane.read(&mut packet) {
+                Ok(_) => {}
+                Err(error) => {
+                    assert!(
+                        matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::Interrupted
+                        ),
+                        "the reassignment is behind a quiet quantum: {error}"
+                    );
+                    break;
+                }
+            }
+        }
+        let (source, width) = lane.assigned();
+        assert_eq!(width, [0, 16], "a capsule replaces both families");
+        assert_eq!(
+            &source[16..],
+            &[0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            "the v6 address the second capsule named"
+        );
+        drop(lane);
+        join_edge_within(edge, Duration::from_secs(5));
+    }
+
+    /// A GOAWAY closes the connection, not just the stream: a lane that mapped it to a clean end would tell the caller the tunnel finished on purpose.
+    #[test]
+    fn a_goaway_is_a_closed_connection_not_a_clean_end() {
+        let (roots, server) = minted(b"\x68\x32");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let edge = ip_h2_goaway_edge(listener, server);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let (mut lane, assigned) = Ip::open(&dial, None).expect("opens");
+        assert_eq!(assigned.len(), 1);
+        let mut packet = Vec::new();
+        let error = lane.read(&mut packet).expect_err("a goaway is an error");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionAborted,
+            "a goaway ends the connection, it does not finish the tunnel"
+        );
+        drop(lane);
+        join_edge_within(edge, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn an_assignment_replaces_the_set_and_ignores_a_foreign_id() {
+        let mut into = ([0u8; 32], [0usize; 2]);
+        take_assignment(&mut into, &[ip_tunnel_grant()]);
+        assert_eq!(into.1, [4, 0]);
+        let mut address = [0u8; 16];
+        address[0] = 0xfd;
+        address[15] = 1;
+        let v6 = connectip::Assigned {
+            request_id: 2,
+            version: 6,
+            address,
+            prefix: 128,
+        };
+        take_assignment(&mut into, &[v6]);
+        assert_eq!(into.1, [0, 16], "the capsule is the whole set");
+        assert_eq!(&into.0[16..], &address, "the v6 bytes at sixteen");
+        let foreign = connectip::Assigned {
+            request_id: 7,
+            version: 4,
+            address: [0x0a, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            prefix: 32,
+        };
+        take_assignment(&mut into, &[foreign]);
+        assert_eq!(
+            into.1,
+            [0, 0],
+            "an id the lanes never asked for grants nothing"
+        );
+    }
+
     /// A route capsule staged in front of a packet does not cost that packet a wire read: every complete capsule already in the stream's buffer is drained before the socket is touched, so the packet behind a route is handed over even when the edge sends nothing more.
     #[test]
     fn a_staged_route_does_not_delay_the_packet_behind_it() {
@@ -9121,6 +9313,129 @@ pub(crate) mod loopback {
         h2_frame(frames::DATA, 0, stream, &capsule, &mut frame);
         tls.write_all(&frame).expect("assigns an address");
         tls.flush().expect("flushes the assignment");
+    }
+
+    /// A CONNECT-IP edge that assigns v4 on open and then replaces the whole set with a v6-only one: a later capsule is the current set, so the family it omits is removed.
+    fn ip_h2_reassign_edge(
+        listener: Listener,
+        server: ferrox_core::tls::TlsServerConfig,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let socket = stream.try_clone().expect("clones");
+            stream
+                .set_read_timeout(Some(crate::budgets::handshake()))
+                .expect("times out");
+            let mut tls = ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+                .expect("accepts");
+            tls.handshake().expect("handshakes");
+            socket
+                .set_read_timeout(Some(crate::budgets::RELAY_QUANTUM))
+                .expect("times out");
+            let mut head = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut head) {
+                return;
+            }
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let frame = frames::H2Frame::parse(&header).expect("parses");
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    return;
+                }
+                match frames::h2_event(frame, &payload, 1) {
+                    frames::H2Event::Settings { ack: false, .. } => {
+                        let mut out = Vec::new();
+                        h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut out);
+                        tls.write_all(&out).expect("acks the settings");
+                    }
+                    frames::H2Event::Headers { .. } => {
+                        let mut out = Vec::new();
+                        h2_frame(frames::HEADERS, 0x4, 1, &[0x88], &mut out);
+                        tls.write_all(&out).expect("answers");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            ip_h2_assign(&mut tls);
+            let mut address = [0u8; 16];
+            address[0] = 0xfd;
+            address[15] = 1;
+            let mut capsule = Vec::new();
+            connectip::address_assign_encode(
+                &[connectip::Assigned {
+                    request_id: 2,
+                    version: 6,
+                    address,
+                    prefix: 128,
+                }],
+                &mut capsule,
+            );
+            let mut frame = Vec::new();
+            h2_frame(frames::DATA, 0, 1, &capsule, &mut frame);
+            tls.write_all(&frame).expect("reassigns");
+            tls.flush().expect("flushes the assignment");
+            std::thread::sleep(Duration::from_millis(250));
+        })
+    }
+
+    /// A CONNECT-IP edge that answers the open and then sends GOAWAY: a lane that took that as a plain end would report a clean close where the edge refused the whole connection.
+    fn ip_h2_goaway_edge(
+        listener: Listener,
+        server: ferrox_core::tls::TlsServerConfig,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let socket = stream.try_clone().expect("clones");
+            stream
+                .set_read_timeout(Some(crate::budgets::handshake()))
+                .expect("times out");
+            let mut tls = ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+                .expect("accepts");
+            tls.handshake().expect("handshakes");
+            socket
+                .set_read_timeout(Some(crate::budgets::RELAY_QUANTUM))
+                .expect("times out");
+            let mut head = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut head) {
+                return;
+            }
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let frame = frames::H2Frame::parse(&header).expect("parses");
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    return;
+                }
+                match frames::h2_event(frame, &payload, 1) {
+                    frames::H2Event::Settings { ack: false, .. } => {
+                        let mut out = Vec::new();
+                        h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut out);
+                        tls.write_all(&out).expect("acks the settings");
+                    }
+                    frames::H2Event::Headers { .. } => {
+                        let mut out = Vec::new();
+                        h2_frame(frames::HEADERS, 0x4, 1, &[0x88], &mut out);
+                        tls.write_all(&out).expect("answers");
+                        ip_h2_assign(&mut tls);
+                        let mut goaway = Vec::new();
+                        h2_frame(frames::GOAWAY, 0, 0, &[0u8; 8], &mut goaway);
+                        tls.write_all(&goaway).expect("refuses");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            tls.flush().expect("flushes the goaway");
+            std::thread::sleep(Duration::from_millis(250));
+        })
     }
 
     /// A CONNECT-IP edge that assigns on the first open at once and on the second only after a pause longer than the socket's grain: a lane that gives up on its first timeout never sees the second assignment.
