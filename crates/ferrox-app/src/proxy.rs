@@ -81995,7 +81995,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("timeout");
         client.send(b"ping").expect("sends");
-        let mut back = [0u8; UDP_BUF];
+        let mut back = vec![0u8; UDP_BUF];
         let n = client.recv(&mut back).expect("echoes");
         assert_eq!(&back[..n], b"ping");
         stop.store(true, Ordering::Relaxed);

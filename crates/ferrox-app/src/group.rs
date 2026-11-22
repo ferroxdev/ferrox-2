@@ -15,6 +15,9 @@ const DEFAULT_IDLE: Duration = Duration::from_mins(30);
 const DEFAULT_TOLERANCE: u16 = 50;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
+type ResolvedMember = Option<(String, Outbound, Option<u64>)>;
+type ResolvedMembers = HashMap<String, ResolvedMember>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kind {
     Selector,
@@ -178,7 +181,7 @@ impl Group {
         &self,
         route: &RouteShared,
         network: Network,
-        resolved: &mut HashMap<String, Option<(String, Outbound, Option<u64>)>>,
+        resolved: &mut ResolvedMembers,
     ) -> Option<(String, Outbound, Option<u64>)> {
         if let Some(done) = resolved.get(&self.tag) {
             return done.clone();
@@ -199,7 +202,7 @@ impl Group {
         &self,
         route: &RouteShared,
         network: Network,
-        resolved: &mut HashMap<String, Option<(String, Outbound, Option<u64>)>>,
+        resolved: &mut ResolvedMembers,
     ) -> Option<(String, Outbound, Option<u64>)> {
         let current = self
             .selected
@@ -344,7 +347,7 @@ fn resolve_member(
     route: &RouteShared,
     tag: &str,
     network: Network,
-    resolved: &mut HashMap<String, Option<(String, Outbound, Option<u64>)>>,
+    resolved: &mut ResolvedMembers,
 ) -> Option<(String, Outbound, Option<u64>)> {
     if let Some(done) = resolved.get(tag) {
         return done.clone();

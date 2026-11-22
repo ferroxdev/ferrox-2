@@ -866,15 +866,15 @@ fn status_code(head: &[u8]) -> Option<u16> {
     let mut fields = head
         .split(|byte| *byte == b'\n')
         .next()?
-        .split(|byte| byte.is_ascii_whitespace())
+        .split(u8::is_ascii_whitespace)
         .filter(|field| !field.is_empty());
     fields.next()?;
     let code = fields.next()?;
     if code.len() != 3 || !code.iter().all(u8::is_ascii_digit) {
         return None;
     }
-    code.iter().fold(Some(0u16), |value, digit| {
-        value.map(|value| value * 10 + u16::from(*digit - b'0'))
+    code.iter().try_fold(0u16, |value, digit| {
+        value.checked_mul(10)?.checked_add(u16::from(*digit - b'0'))
     })
 }
 
