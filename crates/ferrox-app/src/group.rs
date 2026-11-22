@@ -171,14 +171,15 @@ impl Group {
         network: Network,
     ) -> Option<(String, Outbound)> {
         self.resolve_with(route, network, &mut HashMap::new())
+            .map(|(leaf, out, _)| (leaf, out))
     }
 
     fn resolve_with(
         &self,
         route: &RouteShared,
         network: Network,
-        resolved: &mut HashMap<String, Option<(String, Outbound)>>,
-    ) -> Option<(String, Outbound)> {
+        resolved: &mut HashMap<String, Option<(String, Outbound, Option<u64>)>>,
+    ) -> Option<(String, Outbound, Option<u64>)> {
         if let Some(done) = resolved.get(&self.tag) {
             return done.clone();
         }
@@ -198,39 +199,39 @@ impl Group {
         &self,
         route: &RouteShared,
         network: Network,
-        resolved: &mut HashMap<String, Option<(String, Outbound)>>,
-    ) -> Option<(String, Outbound)> {
+        resolved: &mut HashMap<String, Option<(String, Outbound, Option<u64>)>>,
+    ) -> Option<(String, Outbound, Option<u64>)> {
         let current = self
             .selected
             .lock()
             .ok()
             .and_then(|selected| selected.get(network).map(str::to_owned))
             .and_then(|member| {
-                let (leaf, out) = resolve_member(route, &member, network, resolved)?;
-                carries(&out, network).then_some((member, leaf, out))
+                let (leaf, out, revision) = resolve_member(route, &member, network, resolved)?;
+                carries(&out, network).then_some((member, leaf, out, revision))
             });
-        let current_delay = current.as_ref().and_then(|(_, leaf, _)| {
-            let revision = route.leaf_revision(leaf)?;
-            self.history.load(leaf, revision)
+        let current_delay = current.as_ref().and_then(|(_, leaf, _, revision)| {
+            revision.and_then(|revision| self.history.load(leaf, revision))
         });
-        let mut best: Option<(u16, String, String, Outbound)> = None;
-        let mut fallback = None;
+        let mut best: Option<(u16, String, String, Outbound, u64)> = None;
+        let mut fallback: Option<(String, String, Outbound, u64)> = None;
         for member in &self.members {
-            let Some((leaf, out)) = resolve_member(route, member, network, resolved) else {
+            let Some((leaf, out, revision)) = resolve_member(route, member, network, resolved)
+            else {
                 continue;
             };
             if !carries(&out, network) {
                 continue;
             }
-            fallback.get_or_insert_with(|| (member.clone(), leaf.clone(), out.clone()));
-            let Some(revision) = route.leaf_revision(&leaf) else {
+            let Some(revision) = revision else {
                 continue;
             };
+            fallback.get_or_insert_with(|| (member.clone(), leaf.clone(), out.clone(), revision));
             let Some(delay) = self.history.load(&leaf, revision) else {
                 continue;
             };
             if best.as_ref().is_none_or(|(fastest, ..)| delay < *fastest) {
-                best = Some((delay, member.clone(), leaf, out));
+                best = Some((delay, member.clone(), leaf, out, revision));
             }
         }
         let takeover = match (&current, current_delay) {
@@ -239,15 +240,18 @@ impl Group {
             }),
             _ => true,
         };
-        let fastest = best.map(|(_, member, leaf, out)| (member, leaf, out));
+        let fastest =
+            best.map(|(_, member, leaf, out, revision)| (member, leaf, out, Some(revision)));
         let chosen = if takeover { fastest } else { current };
-        let chosen = chosen.or(fallback);
-        if let Some((member, _, _)) = &chosen {
+        let chosen = chosen.or_else(|| {
+            fallback.map(|(member, leaf, out, revision)| (member, leaf, out, Some(revision)))
+        });
+        if let Some((member, _, _, _)) = &chosen {
             if let Ok(mut selected) = self.selected.lock() {
                 selected.set(network, member.clone());
             }
         }
-        chosen.map(|(_, leaf, out)| (leaf, out))
+        chosen.map(|(_, leaf, out, revision)| (leaf, out, revision))
     }
 
     fn leaves(&self, route: &Arc<RouteShared>) -> Vec<String> {
@@ -340,15 +344,18 @@ fn resolve_member(
     route: &RouteShared,
     tag: &str,
     network: Network,
-    resolved: &mut HashMap<String, Option<(String, Outbound)>>,
-) -> Option<(String, Outbound)> {
+    resolved: &mut HashMap<String, Option<(String, Outbound, Option<u64>)>>,
+) -> Option<(String, Outbound, Option<u64>)> {
     if let Some(done) = resolved.get(tag) {
         return done.clone();
     }
-    let out = route.member(tag)?;
+    let Some((out, revision)) = route.member_revision(tag) else {
+        resolved.insert(tag.to_owned(), None);
+        return None;
+    };
     let done = match &out {
         Outbound::Group(group) => group.resolve_with(route, network, resolved),
-        _ => Some((tag.to_owned(), out)),
+        _ => Some((tag.to_owned(), out, revision)),
     };
     resolved.insert(tag.to_owned(), done.clone());
     done
@@ -455,6 +462,8 @@ impl Group {
                         named.clone_into(&mut url);
                     }
                 }
+                crate::conn::HttpUrl::parse(&url)
+                    .map_err(|error| format!("urltest `{tag}` url `{url}`: {error}"))?;
                 interval = duration(field(config, "interval"), DEFAULT_INTERVAL, "interval")?;
                 idle = duration(field(config, "idle_timeout"), DEFAULT_IDLE, "idle_timeout")?;
                 if interval > idle {
@@ -596,6 +605,17 @@ impl Group {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_invalid_probe_url_is_refused_at_startup() {
+        let config = crate::json::parse(
+            r#"{"type":"urltest","outbounds":["a"],"url":"example.com/health"}"#,
+        )
+        .expect("json");
+        let error = Group::parse("pick", &config, Arc::new(History::default()))
+            .expect_err("a url without a scheme is refused");
+        assert!(error.contains("pick"), "{error}");
+    }
 
     #[test]
     fn a_reading_only_names_the_revision_it_measured() {
