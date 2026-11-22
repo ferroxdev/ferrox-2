@@ -12,7 +12,7 @@ use ferrox_core::hysteria_v1::{Defrag, UdpMessage, XPlus};
 
 use crate::conn::Connection;
 use crate::hysteria::{Dial, Driver, Flow, Session, StreamWake};
-use crate::quic::{Mask, Unfilled, MAX_DATAGRAM, RECV_ROOM};
+use crate::quic::{Mask, Unfilled, RECV_ROOM};
 
 const FIRST_FLOW_STREAM: u64 = 4;
 
@@ -390,7 +390,6 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial, peer: Option<std::net::I
     });
     let mut buf = vec![0u8; UDP_TARGET_BUF];
     let mut wire = Vec::with_capacity(UDP_TARGET_BUF + 64);
-    let mut out = Unfilled::<MAX_DATAGRAM>::new();
     let mut packet = 0u16;
     let mut host_room = [0u8; HOST_ROOM];
     let mut stream: Option<Flow> = None;
@@ -453,7 +452,7 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial, peer: Option<std::net::I
             wire::encode_udp_unchecked(&frag, &mut wire);
             let _ = conn.dgram_send(&wire);
         }
-        flush(&session.sock, &mut conn, out.as_mut());
+        crate::quic::flush_egress(&mut conn, &session.sock);
     }
     stop.store(true, Ordering::Relaxed);
     let _ = reader.join();
@@ -540,12 +539,6 @@ fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpS
             reply.extend_from_slice(payload);
             let _ = relay.send_to(&reply, src);
         }
-    }
-}
-
-fn flush(sock: &crate::quic::Datagram, conn: &mut quiche::Connection, out: &mut [u8]) {
-    while let Ok((written, info)) = conn.send(out) {
-        let _ = sock.send_to(&out[..written], info.to);
     }
 }
 
@@ -943,7 +936,6 @@ fn udp_reader(
 ) {
     let mut buf = vec![0u8; UDP_TARGET_BUF];
     let mut wire = Vec::new();
-    let mut out = Unfilled::<MAX_DATAGRAM>::new();
     let mut packet = 0u16;
     let mut host_room = [0u8; HOST_ROOM];
     loop {
@@ -1000,7 +992,7 @@ fn udp_reader(
             wire::encode_udp_unchecked(&frag, &mut wire);
             let _ = conn.dgram_send(&wire);
         }
-        flush(sock, &mut conn, out.as_mut());
+        crate::quic::flush_egress(&mut conn, sock);
     }
 }
 
@@ -1045,33 +1037,30 @@ fn serve_udp_stream(mut flow: Flow, next_udp: u32, lane: &Arc<Mutex<UdpLane>>) {
 
 #[allow(clippy::too_many_lines)]
 fn relay_datagrams(
-    routes: &mut HashMap<Vec<u8>, Inbound>,
+    inbound: &Inbound,
     sock: &Arc<crate::quic::Datagram>,
     shared: &Arc<Mutex<quiche::Connection>>,
-    dcid: &[u8],
     conn: &mut quiche::Connection,
 ) {
+    if !inbound.authed {
+        return;
+    }
+    let lane_handle = Arc::clone(&inbound.udp);
+    // One sweep takes the queue behind the packet the turn waited for, so the route, the lane handle and the clock are the sweep's, not each datagram's.
+    let now = now_nanos();
+    let mut assembled = Vec::new();
     while let Ok(data) = conn.dgram_recv_buf() {
         let Ok(message) = wire::decode_udp(&data) else {
             continue;
         };
-        let Some(inbound) = routes.get(dcid) else {
-            return;
-        };
-        if !inbound.authed {
-            continue;
-        }
-        let lane_handle = Arc::clone(&inbound.udp);
         let Ok(mut lane) = lane_handle.lock() else {
             return;
         };
         let session = message.session;
         let host = message.host;
         let port = message.port;
-        let now = now_nanos();
         let mut known = false;
         let mut forged = false;
-        let mut assembled = Vec::new();
         if let Some(flow) = lane.flows.get_mut(&session) {
             known = true;
             flow.last.store(now, Ordering::Relaxed);
@@ -1161,7 +1150,6 @@ fn relay_datagrams(
         else {
             continue;
         };
-        let mut assembled = Vec::new();
         let whole = pending.assocs.list[at]
             .defrag
             .feed(&message, &mut assembled);
@@ -1326,7 +1314,6 @@ fn authenticate(
     dcid: &[u8],
     conn: &mut quiche::Connection,
     sock: &crate::quic::Datagram,
-    out: &mut [u8],
 ) -> Option<()> {
     if routes.get(dcid).is_some_and(|inbound| inbound.authed) {
         return Some(());
@@ -1356,17 +1343,17 @@ fn authenticate(
         Err(ferrox_core::hysteria::RequestError::Incomplete) if !finished => return None,
         Err(_) => {
             let _ = conn.close(false, 1, b"protocol error");
-            flush(sock, conn, out);
+            crate::quic::flush_egress(conn, sock);
             return None;
         }
     };
     let ok = answer_hello(conn, &hello, auths);
-    flush(sock, conn, out);
+    crate::quic::flush_egress(conn, sock);
     inbound.auth_buf.clear();
     inbound.authed = true;
     if !ok {
         let _ = conn.close(false, 2, b"auth error");
-        flush(sock, conn, out);
+        crate::quic::flush_egress(conn, sock);
         return None;
     }
     Some(())
@@ -1375,7 +1362,6 @@ fn authenticate(
 struct Router<'a> {
     sock: Arc<crate::quic::Datagram>,
     local: SocketAddr,
-    out: Unfilled<MAX_DATAGRAM>,
     auths: &'a [String],
     serve: &'a Serve,
     udp_idle: Duration,
@@ -1406,7 +1392,7 @@ impl Router<'_> {
         if conn.recv(packet, info).is_err() {
             return;
         }
-        flush(&self.sock, &mut conn, self.out.as_mut());
+        crate::quic::flush_egress(&mut conn, &self.sock);
         self.routes.insert(
             scid.to_vec(),
             Inbound {
@@ -1428,7 +1414,6 @@ impl Router<'_> {
         let Self {
             routes,
             sock,
-            out,
             auths,
             serve,
             local,
@@ -1445,14 +1430,14 @@ impl Router<'_> {
             if conn.recv(packet, info).is_err() {
                 return;
             }
-            flush(sock, &mut conn, out.as_mut());
+            crate::quic::flush_egress(&mut conn, sock);
             if let Some(inbound) = routes.get(dcid) {
                 inbound.send.bump();
             }
             if !conn.is_established() || conn.is_closed() {
                 return;
             }
-            if authenticate(routes, auths, dcid, &mut conn, sock, out.as_mut()).is_none() {
+            if authenticate(routes, auths, dcid, &mut conn, sock).is_none() {
                 return;
             }
             let mut streams = Vec::new();
@@ -1505,8 +1490,10 @@ impl Router<'_> {
                     );
                 });
             }
-            relay_datagrams(routes, sock, &shared, dcid, &mut conn);
-            flush(sock, &mut conn, out.as_mut());
+            if let Some(inbound) = routes.get(dcid) {
+                relay_datagrams(inbound, sock, &shared, &mut conn);
+            }
+            crate::quic::flush_egress(&mut conn, sock);
         }
     }
 
@@ -1518,7 +1505,6 @@ impl Router<'_> {
         let Self {
             routes,
             sock,
-            out,
             udp_idle,
             ..
         } = self;
@@ -1539,7 +1525,7 @@ impl Router<'_> {
                 return false;
             }
             conn.on_timeout();
-            flush(sock, &mut conn, out.as_mut());
+            crate::quic::flush_egress(&mut conn, sock);
             inbound.send.bump();
             if let Ok(mut lane) = inbound.udp.lock() {
                 lane.flows.retain(|_, flow| {
@@ -1617,7 +1603,6 @@ pub(crate) fn serve_loop(
     let mut router = Router {
         sock: Arc::new(sock),
         local,
-        out: Unfilled::<MAX_DATAGRAM>::new(),
         auths,
         serve,
         udp_idle: Duration::from_secs(config.udp_idle),
@@ -1866,7 +1851,6 @@ mod tests {
             let mut router = Router {
                 sock: Arc::new(crate::quic::Datagram::plain(sock)),
                 local,
-                out: Unfilled::new(),
                 auths: &auths,
                 serve: &handler,
                 udp_idle,
@@ -1975,8 +1959,7 @@ mod tests {
         {
             let mut conn = session.shared.lock().expect("locks");
             conn.dgram_send(&datagram).expect("sends");
-            let mut out = Unfilled::<MAX_DATAGRAM>::new();
-            flush(&session.sock, &mut conn, out.as_mut());
+            crate::quic::flush_egress(&mut conn, &session.sock);
         }
         let mut buf = [0u8; 64];
         assert!(

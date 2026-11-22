@@ -2450,6 +2450,9 @@ fn relay_datagrams(
     if !matches!(inbound.standing, Standing::Authed) {
         return;
     }
+    // The sweep's own instant stamps every association it touched, and the reassembly buffer is the sweep's rather than each fragmented datagram's.
+    let now = Instant::now();
+    let mut assembled = Vec::new();
     while let Ok(data) = conn.dgram_recv_buf() {
         let Ok(message) = hysteria::decode_udp_allow_empty(&data) else {
             continue;
@@ -2468,9 +2471,8 @@ fn relay_datagrams(
                 vacant.insert(opened)
             }
         };
-        let mut assembled = Vec::new();
         let whole = flow.defrag.feed_allow_empty(&message, &mut assembled);
-        flow.last = Instant::now();
+        flow.last = now;
         let forged = whole.is_err();
         match whole {
             Ok(Some((_address, payload))) => {

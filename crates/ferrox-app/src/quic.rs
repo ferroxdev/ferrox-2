@@ -334,17 +334,28 @@ thread_local! {
     static BUFFERS: RefCell<BufferPool> = const { RefCell::new(BufferPool::new()) };
 }
 
+// The pool takes this thread's sends have made, so a test can show a sweep of empty slots borrows nothing until quiche fills one.
+#[cfg(test)]
+thread_local! {
+    static BORROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl<const N: usize> Unfilled<N> {
+    /// A slot with no bytes yet: a sweep builds `SEND_SLOTS` of them and quiche fills only the ones it has packets for, so construction takes nothing from the pool and the first write pays the one take.
     #[must_use]
     pub(crate) fn new() -> Self {
-        let bytes = BUFFERS
-            .with(|pool| pool.borrow_mut().take(N))
-            .unwrap_or_else(|| vec![0; N]);
-        Self { bytes }
+        Self { bytes: Vec::new() }
     }
 
     #[must_use]
     pub(crate) fn as_mut(&mut self) -> &mut [u8] {
+        if self.bytes.len() != N {
+            #[cfg(test)]
+            BORROWS.with(|borrows| borrows.set(borrows.get() + 1));
+            self.bytes = BUFFERS
+                .with(|pool| pool.borrow_mut().take(N))
+                .unwrap_or_else(|| vec![0; N]);
+        }
         &mut self.bytes
     }
 
@@ -5903,13 +5914,49 @@ mod tests {
         let mut first = Unfilled::<256>::new();
         first.as_mut()[0] = 0xa5;
         drop(first);
-        let (mut second, counts) = ferrox_core::alloc_count::measure(Unfilled::<256>::new);
+        let (seen, counts) = ferrox_core::alloc_count::measure(|| {
+            let mut second = Unfilled::<256>::new();
+            second.as_mut()[0]
+        });
         assert_eq!(counts.allocs, 0, "a returned buffer is reused");
         assert_eq!(
-            second.as_mut()[0],
-            0xa5,
+            seen, 0xa5,
             "the reused buffer keeps the bytes it already had"
         );
+    }
+
+    /// A sweep of send slots is as many empty `Vec`s as quiche may want, and only the slots it writes borrow a
+    /// buffer: a flush carrying one datagram takes one from the pool where the old array took sixty-four up front.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_sweep_borrows_a_buffer_only_where_quiche_writes() {
+        BORROWS.with(|borrows| borrows.set(0));
+        let mut slots: [Unfilled<MAX_DATAGRAM>; SEND_SLOTS] =
+            std::array::from_fn(|_| Unfilled::<MAX_DATAGRAM>::new());
+        assert_eq!(
+            BORROWS.with(std::cell::Cell::get),
+            0,
+            "construction borrows nothing"
+        );
+        slots[0].as_mut()[0] = 1;
+        assert_eq!(
+            BORROWS.with(std::cell::Cell::get),
+            1,
+            "a written slot borrows one"
+        );
+        slots[0].as_mut()[1] = 2;
+        assert_eq!(
+            BORROWS.with(std::cell::Cell::get),
+            1,
+            "a second write to the same slot borrows nothing"
+        );
+        slots[SEND_SLOTS - 1].as_mut()[0] = 3;
+        assert_eq!(
+            BORROWS.with(std::cell::Cell::get),
+            2,
+            "each slot borrows once"
+        );
+        drop(slots);
     }
 
     /// Only a refusal that clears is retried: a held datagram is a second chance, and a

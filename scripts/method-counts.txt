@@ -30,6 +30,7 @@ record-layer backends-a-differential-test-cannot-lie-to 6 ferrox-bench-gate-1
 # --- TUIC v5 ----------------------------------------------------------------
 tuic ops-retired-instructions UNBLESSED scripts/count-ops.sh
 tuic syscalls-per-connect UNBLESSED scripts/count-ops.sh
+tuic packet-run-clock-reads 1 ferrox-app-tuic::tests::a_packet_run_stamps_its_associations_from_one_clock
 tuic single-fragment-payload-copies-per-packet 0 ferrox-app-tuic::tests::a_single_fragment_packet_payload_is_not_copied
 tuic ordered-reassembly-handover-allocations 0 ferrox-app-tuic::tests::an_ordered_reassembly_hands_over_the_fragments_own_buffer
 tuic nanoseconds-per-packet 13.8 .github/workflows/bench.yml
@@ -519,6 +520,8 @@ carrier-quic stream-window-ceiling-bytes 8000000 ferrox-app-quic::tests::the_win
 carrier-quic connection-window-ceiling-bytes 32000000 ferrox-app-quic::tests::the_window_ceiling_leaves_the_autotuner_room
 carrier-quic send-datagram-bytes 1350 ferrox-app-quic::tests::the_lane_sends_the_datagram_its_buffer_holds
 carrier-quic route-key-copies-per-packet 0 ferrox-app-quic::tests::a_route_key_is_a_window_into_the_packet
+carrier-quic send-slot-buffer-borrows-per-empty-sweep 0 ferrox-app-quic::tests::a_sweep_borrows_a_buffer_only_where_quiche_writes
+carrier-quic send-slot-buffer-borrows-per-written-slot 1 ferrox-app-quic::tests::a_sweep_borrows_a_buffer_only_where_quiche_writes
 carrier-quic route-key-allocations 0 ferrox-app-quic::tests::the_route_key_replaces_the_allocating_header_parse
 carrier-quic quic-config-builds-per-warm-dial 0 ferrox-app-quic::tests::one_trust_bundle_shares_its_built_config
 carrier-quic quic-config-lookup-allocations 0 ferrox-app-quic::tests::a_warm_config_lookup_allocates_nothing
@@ -1103,6 +1106,8 @@ wireguard reassembly-peer-byte-cap 524288 ferrox-app-wg-stack::tests::a_peer_can
 wireguard reassembly-range-cap 256 ferrox-app-wg-stack::tests::range_metadata_is_bounded
 wireguard range-merge-allocations 0 ferrox-app-wg-stack::tests::merging_fragment_ranges_reuses_the_list
 wireguard timeout-walks-per-unexpired-fragment 0 ferrox-app-wg-stack::tests::an_unexpired_fragment_does_not_walk_the_sets
+wireguard reassembly-clock-reads-per-fragment 1 ferrox-app-wg-stack::tests::a_fragment_stream_reads_one_clock_per_fragment
+wireguard idle-turn-clock-reads 0 ferrox-app-wg-stack::tests::an_idle_turn_reads_no_clock
 wireguard reassembly-byte-cap 8388608 ferrox-app-wg-stack::tests::a_growing_set_cannot_exceed_the_reassembly_byte_cap
 wireguard large-segment-fragments 4 ferrox-app-wg-stack::tests::a_large_inner_packet_fragments_to_the_tunnel_and_reassembles
 wireguard ipv4-fragment-round-trips 1 ferrox-app-wg-stack::tests::a_large_inner_packet_fragments_to_the_tunnel_and_reassembles

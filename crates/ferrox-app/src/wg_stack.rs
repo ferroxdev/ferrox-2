@@ -725,6 +725,8 @@ struct Reassembly {
     next_expiry: Option<StdInstant>,
     #[cfg(test)]
     scans: usize,
+    #[cfg(test)]
+    clocks: usize,
 }
 
 enum Reassembled {
@@ -739,7 +741,13 @@ impl Reassembly {
         else {
             return Reassembled::Pass;
         };
-        self.expire();
+        // One clock read carries a fragment through both the expiry check and the set it may admit.
+        let now = StdInstant::now();
+        #[cfg(test)]
+        {
+            self.clocks += 1;
+        }
+        self.expire(now);
         if end > INNER_MTU || (packet[0] >> 4 == 4 && header_len + end > 65_535) {
             return Reassembled::Held;
         }
@@ -750,7 +758,7 @@ impl Reassembly {
             if !self.make_room(end, key) {
                 return Reassembled::Held;
             }
-            self.insert_set(key, at, StdInstant::now());
+            self.insert_set(key, at, now);
         }
         if let Some(part) = self.parts.get_mut(&key) {
             part.at = at;
@@ -944,9 +952,19 @@ impl Reassembly {
         Some(part)
     }
 
+    /// Drop sets past the timeout, reading the clock only when one is due.
+    fn expire_due(&mut self) {
+        if self.next_expiry.is_some() {
+            #[cfg(test)]
+            {
+                self.clocks += 1;
+            }
+            self.expire(StdInstant::now());
+        }
+    }
+
     /// Drop sets past the timeout and rebuild the peer table if any went.
-    fn expire(&mut self) {
-        let now = StdInstant::now();
+    fn expire(&mut self, now: StdInstant) {
         if self.next_expiry.is_none_or(|next| now < next) {
             return;
         }
@@ -1780,7 +1798,7 @@ impl ClientStack {
     /// Drive the interface, every flow, and the queued transmits one turn.
     fn poll(&mut self) -> bool {
         let now = self.now();
-        self.reassembly.expire();
+        self.reassembly.expire_due();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         let ready = self.readiness.sync(&self.flows);
         let mut retiring = std::mem::take(&mut self.retiring);
@@ -2047,7 +2065,7 @@ impl ServerStack {
     /// Drive the server interface and hand off every completed flow.
     fn poll(&mut self) -> bool {
         self.syn_ports.clear();
-        self.reassembly.expire();
+        self.reassembly.expire_due();
         for (packet, at) in &self.device.rx {
             if let Some(port) = tcp_syn_port(&packet[*at..]) {
                 self.syn_ports.push(port);
@@ -4590,6 +4608,35 @@ mod tests {
         assert_eq!(complete.as_deref(), Some(original.as_slice()));
     }
 
+    /// A fragment's expiry check and the set it may admit share one stamp: four fragments of one
+    /// datagram read the clock four times, where the expiry and the set each read it on the first.
+    #[test]
+    fn a_fragment_stream_reads_one_clock_per_fragment() {
+        let original = tcp_data([10, 0, 0, 2], [192, 0, 2, 1], &[0x5a; 5000]);
+        let fragments = fragment_packet(&original, 0, TUNNEL_FRAGMENT).expect("fragments");
+        let mut reassembly = Reassembly::default();
+        for fragment in &fragments {
+            assert!(matches!(
+                reassembly.accept([0u8; 32], fragment, 0),
+                Reassembled::Held | Reassembled::Complete(_)
+            ));
+        }
+        assert_eq!(
+            reassembly.clocks,
+            fragments.len(),
+            "one stamp per fragment, shared by the expiry check and the set the first one admits"
+        );
+        assert_eq!(reassembly.scans, 0, "no set ever outlives the timeout walk");
+    }
+
+    /// A turn with no set waiting reads no clock at all: nothing can be due.
+    #[test]
+    fn an_idle_turn_reads_no_clock() {
+        let mut reassembly = Reassembly::default();
+        reassembly.expire_due();
+        assert_eq!(reassembly.clocks, 0, "no set is waiting, so none is timed");
+    }
+
     #[test]
     fn an_ipv6_packet_fragments_and_reassembles_without_its_fragment_header() {
         let source = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
@@ -4866,7 +4913,7 @@ mod tests {
             .expect("instant");
         reassembly.parts.values_mut().next().expect("a set").started = expired;
         reassembly.next_expiry = Some(expired + REASSEMBLY_TIMEOUT);
-        reassembly.expire();
+        reassembly.expire(StdInstant::now());
         let peers_in_parts: HashSet<_> = reassembly.parts.keys().map(FragmentKey::peer).collect();
         let peers_in_table: HashSet<_> = reassembly.peers.keys().copied().collect();
         assert_eq!(

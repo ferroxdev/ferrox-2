@@ -1784,6 +1784,8 @@ struct Inner {
     udp_frame: Vec<u8>,
     readable: Vec<u64>,
     expired: Vec<u16>,
+    #[cfg(test)]
+    clocks: usize,
 }
 
 struct UdpAssoc {
@@ -2002,6 +2004,8 @@ impl Server {
                 udp_frame: Vec::new(),
                 readable: Vec::new(),
                 expired: Vec::new(),
+                #[cfg(test)]
+                clocks: 0,
             }),
         });
         self.conns.insert(scid.to_vec(), Arc::clone(&session));
@@ -2121,14 +2125,14 @@ impl Server {
         }
         ids.clear();
         state.readable = ids;
+        let now = Instant::now();
         while let Ok(data) = conn.dgram_recv_buf() {
             if self.freedom {
                 if let Ok(packet) = wire::parse_packet(&data) {
-                    accept_packet(&mut inner, &packet, false);
+                    accept_packet(&mut inner, &packet, false, now);
                 }
             }
         }
-        let now = Instant::now();
         drain_resolved(&mut inner, now);
         poll_udp(&mut conn, &self.sock, &mut inner, now);
         inner
@@ -2546,20 +2550,10 @@ fn read_uni_with(
         data.extend_from_slice(&room[..n]);
     }
     if freedom && data.get(1) == Some(&wire::PACKET) {
-        let mut at = 0usize;
-        loop {
-            match wire::parse_packet_prefix(&data[at..]) {
-                Ok((packet, used)) => {
-                    accept_packet(inner, &packet, true);
-                    at += used;
-                }
-                Err(wire::FrameError::Short) => break,
-                Err(_) => {
-                    let _ = conn.close(true, 0, b"command");
-                    return;
-                }
-            }
-        }
+        let Some(at) = read_packets(inner, &data) else {
+            let _ = conn.close(true, 0, b"command");
+            return;
+        };
         if at > 0 {
             data.drain(..at);
         }
@@ -2587,7 +2581,29 @@ fn read_uni_with(
     }
 }
 
-fn accept_packet(inner: &mut Inner, packet: &wire::Packet<'_>, stream: bool) {
+/// Delivers the PACKET frames a uni run carries under one stamp; `None` is a frame past the
+/// parser's prefix, which ends the connection, and `Some` is the bytes consumed.
+fn read_packets(inner: &mut Inner, data: &[u8]) -> Option<usize> {
+    let now = Instant::now();
+    #[cfg(test)]
+    {
+        inner.clocks += 1;
+    }
+    let mut at = 0usize;
+    loop {
+        match wire::parse_packet_prefix(&data[at..]) {
+            Ok((packet, used)) => {
+                accept_packet(inner, &packet, true, now);
+                at += used;
+            }
+            Err(wire::FrameError::Short) => break,
+            Err(_) => return None,
+        }
+    }
+    Some(at)
+}
+
+fn accept_packet(inner: &mut Inner, packet: &wire::Packet<'_>, stream: bool, now: Instant) {
     let Some(generation) = select_assoc(inner, packet.association, stream) else {
         return;
     };
@@ -2596,7 +2612,7 @@ fn accept_packet(inner: &mut Inner, packet: &wire::Packet<'_>, stream: bool) {
     };
     match destination {
         Destination::Address(target) => {
-            deliver_udp(inner, packet.association, target, &payload, Instant::now());
+            deliver_udp(inner, packet.association, target, &payload, now);
         }
         Destination::Name(host, port) => {
             let job = ResolveJob {
@@ -3005,6 +3021,8 @@ mod tests {
                 udp_frame: Vec::new(),
                 readable: Vec::new(),
                 expired: Vec::new(),
+                #[cfg(test)]
+                clocks: 0,
             },
             done,
         )
@@ -3106,6 +3124,36 @@ mod tests {
         assert!(counts.allocs < before_counts.allocs, "one cell for the run");
         let replied: Vec<Vec<u8>> = out.iter().map(|reply| reply.packet().to_vec()).collect();
         assert_eq!(replied, before, "the same packets ride the same frames");
+    }
+
+    /// A burst of PACKET frames reads one clock for the whole run: every association it delivers
+    /// to is stamped from that single instant, and the next run takes its own.
+    #[test]
+    fn a_packet_run_stamps_its_associations_from_one_clock() {
+        let sink = UdpSocket::bind("127.0.0.1:0").expect("a sink");
+        sink.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("a timeout");
+        let port = sink.local_addr().expect("its address").port();
+        let address = wire::address_port("127.0.0.1", port).expect("an address");
+        let mut run = Vec::new();
+        for payload in [b"first".as_slice(), b"second".as_slice()] {
+            let mut frame = Vec::new();
+            wire::encode_fragment(1, 2, 1, 0, &address, payload, &mut frame);
+            run.extend_from_slice(&frame);
+        }
+        let (mut inner, _done) = empty_inner();
+        assert_eq!(read_packets(&mut inner, &run), Some(run.len()));
+        assert_eq!(
+            inner.clocks, 1,
+            "a run stamps every association from one instant"
+        );
+        let mut buf = [0u8; 16];
+        for expected in [b"first".as_slice(), b"second".as_slice()] {
+            let (n, _) = sink.recv_from(&mut buf).expect("the sink reads a packet");
+            assert_eq!(&buf[..n], expected, "both packets reach the sink");
+        }
+        assert_eq!(read_packets(&mut inner, &run), Some(run.len()));
+        assert_eq!(inner.clocks, 2, "a second run takes its own stamp");
     }
 
     /// A full reply queue waits for the forwarder instead of dropping a stream packet: a
