@@ -1,6 +1,5 @@
 use crate::conn::{parse_target, Connection, Listener};
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 #[cfg(windows)]
 use std::io::IoSliceMut;
 use std::io::{IoSlice, Read, Write};
@@ -11185,7 +11184,7 @@ fn retire_bridge_lane(
     tag: &str,
     identity: &LaneId,
 ) -> Option<SocketAddr> {
-    let held = lanes.get_mut(&identity)?;
+    let held = lanes.get_mut(identity)?;
     let lane = held.get(tag)?;
     if !lane.handle.is_finished() {
         return Some(lane.address);
@@ -88290,7 +88289,9 @@ mod reverse_tests {
         let finished_socket = UdpSocket::bind("127.0.0.1:0").expect("finished socket");
         let finished_address = finished_socket.local_addr().expect("finished address");
         let finished_handle = thread::spawn(|| {});
-        finished_handle.join().expect("finished joins");
+        while !finished_handle.is_finished() {
+            thread::yield_now();
+        }
         let finished = UdpLane {
             address: finished_address,
             handle: finished_handle,
