@@ -28590,23 +28590,25 @@ fn serve_socks_connected(mut client: Connection, out: &Outbound, handshake: &Han
             return;
         }
     }
-    let (dial, out, tag) = match first {
-        Some((lane, tag)) => (
-            None,
-            lane,
-            tag.map(|tag| tag.into_owned())
-                .or_else(|| group_tag.map(str::to_owned)),
-        ),
-        None => {
+    let (dial, out, tag) = first.map_or_else(
+        || {
             let (dial, out, tag) = sniff_lane(out, &handshake.asked, &client, user, level);
             (
                 dial,
                 out,
-                tag.map(|tag| tag.into_owned())
+                tag.map(std::borrow::Cow::into_owned)
                     .or_else(|| group_tag.map(str::to_owned)),
             )
-        }
-    };
+        },
+        |(lane, tag)| {
+            (
+                None,
+                lane,
+                tag.map(std::borrow::Cow::into_owned)
+                    .or_else(|| group_tag.map(str::to_owned)),
+            )
+        },
+    );
     let asked = dial.as_ref().unwrap_or(&handshake.asked);
     serve_connect(
         client,
@@ -30839,23 +30841,25 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
             {
                 return;
             }
-            let (dial, out, tag) = match first {
-                Some((lane, tag)) => (
-                    None,
-                    lane,
-                    tag.map(|tag| tag.into_owned())
-                        .or_else(|| group_tag.map(str::to_owned)),
-                ),
-                None => {
+            let (dial, out, tag) = first.map_or_else(
+                || {
                     let (dial, out, tag) = sniff_lane(out, &asked, &client, user, level);
                     (
                         dial,
                         out,
-                        tag.map(|tag| tag.into_owned())
+                        tag.map(std::borrow::Cow::into_owned)
                             .or_else(|| group_tag.map(str::to_owned)),
                     )
-                }
-            };
+                },
+                |(lane, tag)| {
+                    (
+                        None,
+                        lane,
+                        tag.map(std::borrow::Cow::into_owned)
+                            .or_else(|| group_tag.map(str::to_owned)),
+                    )
+                },
+            );
             let asked = dial.as_ref().unwrap_or(&asked);
             serve_connect(
                 client,
