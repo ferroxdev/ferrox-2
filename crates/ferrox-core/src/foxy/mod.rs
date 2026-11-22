@@ -1332,7 +1332,7 @@ mod tests {
         strikes.note_end("edge.EXAMPLE", 443, short, 100);
         assert!(strikes.resting("EDGE.example", 443, 100));
         let mut refusals = Refusals::new(8);
-        refusals.remember(1, "Edge.Example", 443, 100);
+        refusals.remember(1, "Edge.Example", 443, 200);
         assert!(refusals.blocked(1, "edge.example", 443, 100));
         refusals.clear(1, "EDGE.EXAMPLE", 443);
         assert!(!refusals.blocked(1, "edge.example", 443, 100));

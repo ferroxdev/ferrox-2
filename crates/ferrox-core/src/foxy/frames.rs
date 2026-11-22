@@ -1032,7 +1032,7 @@ mod tests {
                     kind: H3_GOAWAY,
                     length: 2
                 },
-                &[0x40, 0x01]
+                &[0x01, 0x01]
             ),
             H3Event::Malformed { kind: H3_GOAWAY }
         );
