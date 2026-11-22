@@ -88325,9 +88325,9 @@ mod reverse_tests {
         live.handle.join().expect("live lane joins");
     }
 
-    fn socks_udp_recorder(
-        hold: std::sync::mpsc::Receiver<()>,
-    ) -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>, thread::JoinHandle<()>) {
+    type SocksUdpProbe = (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>, thread::JoinHandle<()>);
+
+    fn socks_udp_recorder(hold: std::sync::mpsc::Receiver<()>) -> SocksUdpProbe {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
         let server_addr = listener.local_addr().expect("addr");
         let relay = UdpSocket::bind("127.0.0.1:0").expect("relay");
