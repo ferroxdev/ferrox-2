@@ -31647,6 +31647,24 @@ struct UdpLane {
     waker: UdpSocket,
 }
 
+struct LaneStart {
+    tag: Option<String>,
+    source: Option<SendThrough>,
+    sockopts: Option<Arc<crate::sockopt::SocketOptions>>,
+    strategy: Option<FreedomDomain>,
+}
+
+impl LaneStart {
+    fn take_thread() -> Self {
+        Self {
+            tag: None,
+            source: SEND_THROUGH.with(std::cell::Cell::take),
+            sockopts: DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take()),
+            strategy: TARGET_STRATEGY.with(std::cell::Cell::take),
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn serve_socks_udp_split(
     mut client: Connection,
@@ -31750,28 +31768,59 @@ fn serve_socks_udp_split(
                 if matches!(&*out, Outbound::Block(_)) {
                     continue;
                 }
-                let lane_key = match &*out {
-                    Outbound::Group(group) => group
-                        .resolve_bound(crate::router::Network::Udp)
-                        .map(|(leaf, _)| leaf),
-                    _ => key.as_deref().map(str::to_owned),
+                let (lane_out, lane_key, lane_start) = match &*out {
+                    Outbound::Group(group) => {
+                        let Some((leaf, member)) = group.resolve_bound(crate::router::Network::Udp)
+                        else {
+                            continue;
+                        };
+                        let (source, sockopts, strategy) = group
+                            .route_handle()
+                            .map_or((None, None, None), |route| route.tag_dial_settings(&leaf));
+                        let start = LaneStart {
+                            tag: Some(leaf.clone()),
+                            source,
+                            sockopts,
+                            strategy,
+                        };
+                        (Some(member), Some(leaf), Some(start))
+                    }
+                    _ => (None, key.as_deref().map(str::to_owned), None),
                 };
+                let lane_ref = lane_out.as_ref().unwrap_or(&*out);
                 let lane_address = if let Some(tag) = lane_key.as_deref() {
                     match retire_finished_lane(&mut lanes, &mut replies, tag) {
                         Some(address) => Some(address),
-                        None => spawn_udp_lane(&out, local, client.try_clone().ok(), Some(local))
-                            .map(|lane| {
+                        None => {
+                            let spawned = match (lane_out.as_ref(), lane_start) {
+                                (Some(member), Some(start)) => spawn_udp_lane_with_cancel(
+                                    member,
+                                    local,
+                                    client.try_clone().ok(),
+                                    Some(local),
+                                    None,
+                                    Some(start),
+                                ),
+                                _ => spawn_udp_lane(
+                                    &out,
+                                    local,
+                                    client.try_clone().ok(),
+                                    Some(local),
+                                ),
+                            };
+                            spawned.map(|lane| {
                                 replies.insert(lane.address);
                                 let address = lane.address;
                                 lanes.insert(tag.to_owned(), lane);
                                 address
-                            }),
+                            })
+                        }
                     }
                 } else {
                     default_udp_lane(
                         &mut default_lane,
                         &mut replies,
-                        &out,
+                        lane_ref,
                         local,
                         client.try_clone().ok(),
                         Some(local),
@@ -31859,7 +31908,7 @@ fn spawn_udp_lane(
     associate: Option<Connection>,
     peer: Option<IpAddr>,
 ) -> Option<UdpLane> {
-    spawn_udp_lane_with_cancel(out, local, associate, peer, None)
+    spawn_udp_lane_with_cancel(out, local, associate, peer, None, None)
 }
 
 /// A bridge-owned lane carries the relay's stop flag so its SOCKS worker leaves when the mux
@@ -31871,7 +31920,7 @@ fn spawn_udp_lane_cancelled(
     peer: Option<IpAddr>,
     cancel: Arc<AtomicBool>,
 ) -> Option<UdpLane> {
-    spawn_udp_lane_with_cancel(out, local, associate, peer, Some(cancel))
+    spawn_udp_lane_with_cancel(out, local, associate, peer, Some(cancel), None)
 }
 
 fn spawn_udp_lane_with_cancel(
@@ -31880,22 +31929,22 @@ fn spawn_udp_lane_with_cancel(
     associate: Option<Connection>,
     peer: Option<IpAddr>,
     cancel: Option<Arc<AtomicBool>>,
+    start: Option<LaneStart>,
 ) -> Option<UdpLane> {
     let socket = UdpSocket::bind(SocketAddr::new(local, 0)).ok()?;
     let address = socket.local_addr().ok()?;
     let waker = socket.try_clone().ok()?;
     let _ = socket.set_read_timeout(Some(budgets::udp_idle()));
     arm_control(associate.as_ref());
-    let source = SEND_THROUGH.with(std::cell::Cell::take);
-    let sockopts = DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take());
-    let strategy = TARGET_STRATEGY.with(std::cell::Cell::take);
     let out = out.clone();
+    let LaneStart {
+        tag,
+        source,
+        sockopts,
+        strategy,
+    } = start.unwrap_or_else(LaneStart::take_thread);
     let handle = thread::spawn(move || {
-        // The lane's own thread starts with the settings the pick left on this one.
-        SEND_THROUGH.with(|cell| cell.set(source));
-        DIAL_SOCKOPTS.with(|cell| *cell.borrow_mut() = sockopts);
-        let source = SEND_THROUGH.with(std::cell::Cell::take);
-        let sockopts = DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take());
+        let _tag = tag.as_deref().map(OutboundTag::enter);
         serve_udp_lane_with(
             &socket,
             &out,
@@ -84197,6 +84246,65 @@ end
         let (member, leaf) = front_group_lane(&out).expect("a group resolves");
         assert_eq!(leaf, "b");
         assert!(matches!(member, Outbound::Block(_)));
+    }
+
+    /// A split lane keeps the leaf it resolved even when the group's reading moves before the worker starts.
+    #[test]
+    fn a_split_group_lane_keeps_the_leaf_it_resolved() {
+        let shared = group_route(
+            r#"{"outbounds":[
+                {"tag":"allowed","protocol":"freedom"},
+                {"tag":"blocked","protocol":"blackhole"},
+                {"tag":"pick","type":"urltest","settings":{
+                    "outbounds":["allowed","blocked"],
+                    "url":"http://127.0.0.1/204",
+                    "tolerance":0
+                }}
+            ],"routing":{}}"#,
+        );
+        let group = group_of(&shared, "pick");
+        group.record("allowed", 10);
+        group.record("blocked", 100);
+        let (leaf, member) = group
+            .resolve(&shared, crate::router::Network::Udp)
+            .expect("picks");
+        assert_eq!(leaf, "allowed");
+        group.record("allowed", 200);
+        group.record("blocked", 10);
+        let (source, sockopts, strategy) = group
+            .route_handle()
+            .map_or((None, None, None), |route| route.tag_dial_settings(&leaf));
+        let start = LaneStart {
+            tag: Some(leaf),
+            source,
+            sockopts,
+            strategy,
+        };
+        let local = std::net::Ipv4Addr::LOCALHOST.into();
+        let stop = Arc::new(AtomicBool::new(false));
+        let lane = spawn_udp_lane_with_cancel(
+            &member,
+            local,
+            None,
+            Some(local),
+            Some(Arc::clone(&stop)),
+            Some(start),
+        )
+        .expect("a lane");
+        let allowed = udp_echo_loop();
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let mut frame = vec![0u8, 0, 0];
+        push_socks_addr(
+            &mut frame,
+            &format!("127.0.0.1:{allowed}").parse().expect("addr"),
+        );
+        frame.extend_from_slice(b"ping");
+        let answered =
+            udp_roundtrip_within(&udp, lane.address, &frame, b"ping", Duration::from_secs(2))
+                .is_some();
+        stop.store(true, Ordering::Relaxed);
+        lane.handle.join().expect("lane joins");
+        assert!(answered, "the lane followed the group's new reading");
     }
 
     /// A urltest keeps the selected member until another is faster by more than the tolerance.
