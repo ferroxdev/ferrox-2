@@ -32039,13 +32039,12 @@ fn serve_socks_udp_foxy_ip(
                     }
                     // The assignment that arrived behind a reply replaces the source set before this datagram selects one; the drain stops as soon as the tunnel is quiet.
                     if let Some(lane) = tunnel.as_mut() {
-                        match drain_foxy_ip_tunnel(lane, relay, client, &mut reply, &mut packet) {
-                            Some(_) => {}
-                            None => {
-                                tunnel = None;
-                                ports.clear();
-                                continue;
-                            }
+                        if drain_foxy_ip_tunnel(lane, relay, client, &mut reply, &mut packet)
+                            .is_none()
+                        {
+                            tunnel = None;
+                            ports.clear();
+                            continue;
                         }
                     }
                     let Some(port) = ports.get(&dest).copied().or_else(|| {
