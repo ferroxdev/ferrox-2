@@ -5,13 +5,13 @@
 - symbols: serve_hc_inbound, HcHandler, hc_content_length
 - scenarios: vless-raw, vmess-raw, trojan-raw, shadowsocks-raw
 <!-- scope:end -->
-Row 123's front half: a `hc` inbound answers one HTTP path with one fixed body, so a remote urltest or `leastPing` probe can ask "is this server up?" without a real destination. The config is Leaf's shape:
+Row 131's front half: an `hc` inbound answers one HTTP path with one fixed body, so a remote urltest or `leastPing` probe can ask whether the server is up without a real destination. The config is Leaf's shape:
 
 ```json
 {"protocol": "hc", "settings": {"path": "/health", "request": "optional body", "response": "ok"}}
 ```
 
-`path` and `response` are required; `request` is optional. The inbound binds TCP on its `listen`/`port` like every other front. `GET path` is the expected request when `request` is absent; when it is present the expected method is `POST` and the body must equal `request` exactly. The answer is fixed, whatever the request headers after the first line are:
+`path` and `response` are required; `request` is optional. The inbound binds TCP on its `listen`/`port` like every front. `GET path` is expected when `request` is absent; when present the expected method is `POST` and the body must equal `request` exactly. The answer is fixed, whatever the request headers after the first line:
 
 ```
 HTTP/1.1 200 OK
@@ -22,7 +22,7 @@ Connection: close
 <response>
 ```
 
-A path mismatch, a method mismatch, or a POST body mismatch closes the connection with no bytes. A request head over 64 KiB also closes. This is the reference's refusal behavior minus its random delay before the close: a gate that holds a socket for up to ten seconds is a denial-of-service surface, so this tree closes at once and reports the close. The difference is timing only; the bytes a successful peer sees are the reference's.
+A path, method or POST-body mismatch closes with no bytes; a head over 64 KiB also closes. This is the reference's refusal minus its random delay before close: a gate holding a socket up to 10 s is a DoS surface, so this tree closes at once. Timing differs only; a successful peer sees the reference's bytes.
 
 ## Data path
 
@@ -43,21 +43,21 @@ graph TD
 
 ## The exchange
 
-The reader keeps one growing head buffer and one 8192-byte read buffer. It stops at the first `\r\n\r\n`, keeps whatever bytes followed as the body's prefix, and reads the rest of the declared `Content-Length`. The terminator is found by [`ferrox_core::foxy::head_end`](carrier-foxy.md) — the tree's one `\r\n\r\n` scan — and each round asks it only about the octets that just arrived, from three octets before the seam so a terminator split across two reads is still found. A head that arrives in sixteen windows is therefore walked once, not sixteen times times its own growth. The length is read case-insensitively from any header line; a POST with no length, a zero length, or a length over 8192 closes without reading a body, exactly as the reference leaves the body empty in those cases. The successful answer is one prebuilt byte string and one write; the body is the configured string, not a value built from the request.
+The reader keeps one growing head buffer and one 8192-byte read buffer. It stops at the first `\r\n\r\n`, keeps following bytes as the body prefix, and reads the declared `Content-Length`. `ferrox_core::foxy::head_end` — the tree's one terminator scan — is asked only about new octets, from three before the seam so a split terminator is found, so a head in sixteen windows is walked once. Length is read case-insensitively from any header; a POST with no length, zero, or over 8192 closes without reading a body, as the reference leaves it empty. The answer is one prebuilt string and one write.
 
 ## What was removed
 
-- **A head that was walked again for every window it arrived in.** The reader compared four bytes at every offset of the whole accumulated head after every read, so a head that arrives in sixteen windows paid the sum of its own growth — 69 632 four-byte window comparisons for an 8 KiB head. `read_hc_head` asks the tree's one `\r\n\r\n` scan about the octets that just arrived, from three octets before the seam, so the walk is one pass over the head however it was split. `an_hc_head_is_found_at_every_split_of_its_arrival` drives every arrival width from one octet to the whole head and asserts the offset, the octets handed on and the terminator itself; `the_front_scan_costs_every_window_it_has_already_walked` and `the_seam_scan_costs_the_bytes_it_has_not_walked` answer the same sixteen-window head, priced apart under **Measured** below.
-- **The per-request answer allocation.** The reference formats the response on every successful probe; this tree formats it once when the inbound is built and writes that same buffer, so an answer allocates nothing.
-- **A body buffer beyond the configured signature.** The reference allocates a fresh `Vec` in each remaining-body read; this tree reuses one 8192-byte stack read buffer and appends into the body it already has, so a POST body costs the body vector and no per-read allocation. The head grows only as far as the request sends it; a 64 KiB cap ends a peer that never sends the terminator.
-- **A per-connection copy of the configured strings.** The path, request and prebuilt answer are built once into an `HcHandler`, and each accepted stream takes one `Arc` reference to it instead of cloning three `String`s and reparsing the settings block.
-- **The reference's failure delay.** Named under "what was not removed" instead: the random delay before a refused close is not carried. It changes no successful response and no refusal byte, but it does change how long a refused socket lives.
+- **A head re-walked for every window.** The reader compared four bytes at every offset after every read, so a 16-window 8 KiB head paid 69 632 comparisons. `read_hc_head` asks the one `\r\n\r\n` scan about new octets from three before the seam, so one pass however split. `an_hc_head_is_found_at_every_split_of_its_arrival` drives every arrival width; the two scan tests are priced under **Measured**.
+- **The per-request answer allocation.** The reference formats on every successful probe; this tree formats once at build and writes that buffer, so an answer allocates nothing.
+- **A body buffer beyond the signature.** The reference allocates a fresh `Vec` per remaining-body read; this tree reuses one 8192-byte stack buffer and appends into the body it has. The head grows only as far as the request sends; a 64 KiB cap ends a peer that never terminates.
+- **A per-connection copy of configured strings.** Path, request and prebuilt answer live once in `HcHandler`; each accepted stream takes one `Arc` instead of cloning three `String`s and reparsing settings.
+- **The reference's failure delay.** The random delay before a refused close is not carried: it changes no successful response or refusal byte, only how long a refused socket lives.
 
-What was not removed: the inbound still accepts one connection per probe and closes it after one answer; it does not keep a connection pool. A malformed request is still read up to 64 KiB before the close, as the reference's `read_until_eoh` is.
+What was not removed: the inbound accepts one connection per probe and closes it after one answer; it keeps no pool. A malformed request is still read up to 64 KiB before close, as the reference's `read_until_eoh` is.
 
 ## Time
 
-No duration is claimed. The answer is one write of a fixed string; benchmarks are CI-only and no matrix cell names this front. The refusal path is bounded by the client's request and the 64 KiB cap, not by a timer.
+No duration is claimed. The answer is one write of a fixed string; benchmarks are CI-only and no matrix cell names this front. The refusal path is bounded by the request and the 64 KiB cap, not a timer.
 
 ## Measured
 
@@ -72,9 +72,9 @@ No duration is claimed. The answer is one write of a fixed string; benchmarks ar
 | answer-bytes | 85 | ferrox-app-proxy::hc_tests::an_hc_answer_is_prebuilt_without_allocating |
 <!-- counts:end -->
 
-`an_hc_answer_is_prebuilt_without_allocating` reads the answer for the empty-body `"ok"` case under `ferrox_core::alloc_count`: zero allocations, 85 bytes including the response head and the body. The returned slice starts at the handler's own buffer, that pointer and the buffer's capacity do not change across reads, so a retrieval-side copy or reallocation fails the identity assertions; a changed header or body fails the byte count. That test does not write an answer, so the per-byte write-copy row stays `UNBLESSED`. The GET and POST round trips are gated by `an_hc_get_answers_the_configured_body_after_the_exact_path` and `an_hc_post_checks_the_body_and_a_mismatch_answers_nothing`, which assert the exact bytes and the empty refusal.
+`an_hc_answer_is_prebuilt_without_allocating` reads the empty-body `"ok"` answer under `ferrox_core::alloc_count`: zero allocations, 85 bytes including head and body. The returned slice starts at the handler's buffer, whose pointer and capacity do not change across reads, so a retrieval-side copy or reallocation fails the identity assertions; a changed header or body fails the byte count. That test does not write an answer, so the per-byte write-copy row stays `UNBLESSED`. GET and POST round trips are gated by `an_hc_get_answers_the_configured_body_after_the_exact_path` and `an_hc_post_checks_the_body_and_a_mismatch_answers_nothing`.
 
-Two probe pairs price the head scan on `ops.yml` run `40883882281` (x86_64 Linux, artefact `method-ops`, this branch): `the_front_scan_costs_every_window_it_has_already_walked` retires **35 909 473** instructions against `the_seam_scan_costs_the_bytes_it_has_not_walked`'s **2 022 915** — the same eight-kilobyte head arriving in sixteen windows, answered sixty-four times, at the same offset both frames fold into the same pinned `u32` — 0.056× the instructions, **17.8×** fewer. Neither figure is a gate: the gate is `an_hc_head_is_found_at_every_split_of_its_arrival`, which drives every arrival width from one octet to the whole head and asserts the offset, the octets handed on and the terminator itself, so the count is read against a scan already held bit-identical to the whole-buffer walk.
+The two probe pairs on `ops.yml` `40883882281` (x86_64 Linux, `method-ops`, this branch): `the_front_scan_costs_every_window_it_has_already_walked` retires **35 909 473** instructions vs `the_seam_scan_costs_the_bytes_it_has_not_walked`'s **2 022 915** for the same 8 KiB head in sixteen windows, answered 64 times, at the same offset — 0.056×, **17.8×** fewer. Neither is a gate; the gate is `an_hc_head_is_found_at_every_split_of_its_arrival`, which drives every arrival width and asserts offset, handed-on octets and terminator, so the count reads against a scan already bit-identical.
 
 ## Pins
 

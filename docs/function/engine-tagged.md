@@ -5,7 +5,7 @@
 - symbols: dial_through_proxy, dial_udp_through_proxy, kcp_dial_session, serve_connect_at
 - scenarios: vless-raw, vmess-raw, trojan-raw, shadowsocks-raw
 <!-- scope:end -->
-Row 125: a `streamSettings.sockopt.dialerProxy` names another outbound, and every dial the socket makes leaves through it instead of the machine's own route. The reference carries it at the socket dialer (`transport/internet/dialer.go`) and at the tagged dialer the UDP carriers use (`transport/internet/tagged/tagged.go`); this page is both arms. [`engine-router`](engine-router.md) is the rule scan that chooses the outbound; the hop is resolved in the same table.
+Row 133: a `streamSettings.sockopt.dialerProxy` names another outbound, and every dial the socket makes leaves through it instead of the machine's own route. The reference carries it at the socket dialer (`transport/internet/dialer.go`) and at the tagged dialer the UDP carriers use (`transport/internet/tagged/tagged.go`); this page is both arms. [`engine-router`](engine-router.md) is the rule scan that chooses the outbound; the hop is resolved in the same table.
 
 ## The TCP arm
 

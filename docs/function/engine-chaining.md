@@ -4,7 +4,7 @@
 - paths: -
 - symbols: next_hop_tag, flatten_chain, ChainLane, chain_lane_tag, build_chain_lanes
 <!-- scope:end -->
-Row 147: an outbound may name the outbound it dials through with xray's
+Row 155: an outbound may name the outbound it dials through with xray's
 `streamSettings.sockopt.dialerProxy`, sing-box's top-level `detour`, or an LxBox ordered
 `type: "chain"` list. All three are one hop graph. [`engine-tagged`](engine-tagged.md) is the
 one-hop socket seam this page extends; [`engine-router`](engine-router.md) chooses the outbound that

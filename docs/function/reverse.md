@@ -1,12 +1,12 @@
 # The reverse tunnel: bridge and portal
 
-A bridge behind a NAT opens a VLESS request with command 4 — the header names no address — and the portal answers with the empty response header and treats the rest of that connection as a mux session. The portal then picks that session for any flow its rules send to the inbound user's `reverse.tag`, and the bridge dials the target on the portal's behalf. Both roles are the pinned reference's modern VLESS reverse: there is no separate reverse inbound, outbound or dispatcher any more, and no `rvs` control socket.
+A bridge behind NAT opens a VLESS request with command 4; the header names no address. The portal answers with an empty header and treats the rest as a mux session. The portal picks that session for any flow its rules send to the inbound user's `reverse.tag`, and the bridge dials on the portal's behalf. Both roles are the pinned reference's modern VLESS reverse: no separate inbound/outbound/dispatcher and no `rvs` socket.
 
-The control stream is a mux UDP flow to the internal domain `reverse`. A protobuf `Control` carries `state` (0 `ACTIVE`, 1 `DRAIN`) and a random pad; the portal sends one every two seconds, but only when the counter is 1 or the session is draining, and the bridge decodes it into `WorkerState`. A session drains once it has carried 256 flows; the picker prefers the least-loaded live session, skips a draining one until nothing else is left, and a bridge monitor opens another session when none is live or the live ones average more than sixteen flows each. A session whose control stream is silent for 60 seconds is closed by the monitor.
+Control is a mux UDP flow to the internal domain `reverse`. A protobuf `Control` carries `state` (0 `ACTIVE`, 1 `DRAIN`) and random pad; the portal sends one every 2 s only when the counter is 1 or the session is draining, and the bridge decodes it into `WorkerState`. A session drains after 256 flows; the picker prefers the least-loaded live session, skips a draining one until nothing else is left, and a bridge monitor opens another when none is live or live ones average more than 16 flows. A control stream silent for 60 s is closed.
 
-Both roles carry every VLESS transport that exposes a stream: raw, TLS, REALITY, WebSocket, gRPC, HTTPUpgrade, HTTPHeader, xHTTP, QUIC, KCP, hysteria and xdrive. A bridge flow then leaves through any outbound the config's rules name that serves its network, not just `freedom` or `blackhole`. A TCP flow gets a loopback stream, the same hop every front uses when a lane returns a relay instead of a socket. A UDP flow that a route plan sends through a chosen lane gets a loopback relay; the bridge frames each datagram with its destination, routes it to the outbound tag the rules picked, and forwards the lane's framed reply back into the mux flow. A name stays a name through a SOCKS5 outbound, an empty datagram is carried, and the relay's stop flag cancels the lane's worker when the mux flow ends. A bridge with one fixed `freedom` outbound keeps the direct socket.
+Both roles carry every VLESS transport that exposes a stream: raw, TLS, REALITY, WebSocket, gRPC, HTTPUpgrade, HTTPHeader, xHTTP, QUIC, KCP, hysteria and xdrive. A bridge flow leaves through any routed outbound that serves its network, not just `freedom` or `blackhole`. A TCP flow gets a loopback stream; a UDP flow gets a loopback relay, the bridge frames each datagram with its destination, routes it to the rule-picked tag, and forwards the framed reply. A name stays a name through SOCKS5, an empty datagram is carried, and the relay stop flag cancels the lane worker when the mux flow ends. A bridge with one fixed `freedom` outbound keeps the direct socket.
 
-What refuses, by name at startup: a bridge whose carrier has no stream to hand the mux (MASQUE, plain HTTP, or an unknown network), a bridge or portal user whose flow is `xtls-rprx-vision`, a reverse user opening anything but command 4, and a forward user opening command 4.
+Startup refusals by name: a bridge carrier with no stream to hand the mux (MASQUE, plain HTTP, unknown network), a bridge/portal user whose flow is `xtls-rprx-vision`, a reverse user opening anything but command 4, and a forward user opening command 4.
 
 ## Data path
 
@@ -38,9 +38,9 @@ graph TD
 | tcp-echo-bytes-preserved | 5 | ferrox-app-proxy::reverse_tests::a_portal_flow_reaches_the_bridge_and_comes_back |
 <!-- counts:end -->
 
-Syscalls: one loopback `connect` plus one `accept` per bridge worker at startup, one more pair per TCP flow that leaves through a non-freedom outbound, one mux frame write per uplink chunk, one outbound `connect` per TCP flow the bridge dials, and the relay's own reads and writes. A UDP bridge flow that a route plan routes adds one loopback relay pair, one relay read and write per datagram, and one lane per outbound tag; a lane's own socket and carrier writes follow the outbound it picked. A fixed-`freedom` bridge keeps the direct socket. No checker counts this yet.
+Syscalls: one loopback `connect`/`accept` per bridge worker at startup, one more pair per TCP flow through a non-`freedom` outbound, one mux frame write per uplink chunk, one outbound `connect` per bridged TCP flow, plus relay reads/writes. A routed UDP flow adds a loopback relay pair, a read/write per datagram, and one lane per tag. A fixed-`freedom` bridge keeps the direct socket. No checker counts this yet.
 
-Copies: a whole downlink frame is parsed where the read landed it and copied once, into the flow's queue (`data.to_vec()`), because the queue is what lets a slow consumer cost only its own flow. Only a frame that straddles two reads is copied into a carry first. The uplink copies nothing: the header is built in the session's scratch and the caller's payload is written with one `writev`, the same two-part write a direct mux session makes. A routed UDP datagram copies its payload once into the SOCKS5 frame the relay reads; the reply is parsed where the relay read landed it and written into the mux frame without another copy. A pointer-identity test does not exist for either arm yet, so both stay prose rather than manifest rows.
+Copies: a whole downlink frame is parsed in place and copied once into the flow queue (`data.to_vec()`), so a slow consumer costs only its flow; only a straddling frame is carried. The uplink copies nothing: the header is built in session scratch and the payload written with one `writev`. A routed UDP datagram copies once into the SOCKS5 frame; the reply is parsed in place and written into the mux frame. No pointer-identity test exists, so both stay prose.
 
 ## Ops
 
@@ -48,24 +48,27 @@ Copies: a whole downlink frame is parsed where the read landed it and copied onc
 ./scripts/count-ops.sh report \
   proxy::reverse_tests::a_sixteen_kib_downlink_is_echoed_whole 'reverse::Session::read_loop'
 ```
+./scripts/count-ops.sh report \
+  proxy::reverse_tests::a_sixteen_kib_downlink_is_echoed_whole 'reverse::Session::read_loop'
+```
 
-**80,066 retired instructions** for a 16 KiB downlink (two 8 KiB mux frames), from CI `ops` run 40137286906; the same downlink cost **109,108** before the read loop parsed it in place (run 40130833832), so the copy and the common drain removal is **-29,042 instructions (-26.6%)**. Three after runs read 79,952, 80,066 and 80,534: the socket's frame split moves this informational row by about 0.7%, so it is not a blessed gate. The 5-byte echo is correctness, not a priced downlink.
+**80,066 retired instructions** for a 16 KiB downlink (two 8 KiB mux frames), down from **109,108** — **-29,042 (-26.6%)**. Three runs read 79,952, 80,066, 80,534; the socket's frame split moves this informational row ~0.7%, so it is not a blessed gate. The 5-byte echo is correctness, not a priced downlink.
 
 ## Time
 
-**Not measured yet.** Durations in this repository come from CI runners (`bench.yml`, `parity.yml`); no CI artefact has been read, and a laptop behind a VPN measures a tunnel either way.
+**Not measured.** Durations come from CI runners (`bench.yml`, `parity.yml`); a laptop behind a VPN measures a tunnel.
 
 ## What we removed
 
-**The downlink's second copy of a whole frame.** `read_loop` read into a 32 KiB `chunk`, extended a `buf` with the whole chunk, parsed it, then `drain`ed the consumed prefix — so a whole frame crossed user space twice before the flow queue copied its payload. The loop now parses the read where it landed; only a frame that straddles two reads is copied into a carry. A 16 KiB downlink (two 8 KiB mux frames) costs **80,066 Ir**, down from **109,108** (**-29,042, -26.6%**), in CI `ops` runs 40137286906 and 40130833832; the 16 KiB echo test holds the bytes, and the 5-byte flow still passes.
+**The downlink's second copy of a whole frame.** `read_loop` parses in place; only a straddling frame is carried. 80,066 Ir vs 109,108 (-29,042, -26.6%); the 16 KiB echo and 5-byte flow hold the bytes.
 
-The reference's separate dispatcher and its own mux client. Xray used to serve reverse through `app/reverse`'s inbound/outbound pair and, in ZeroNet, through a `reverse.rs` that implemented Mux.cool framing again. Here the portal registers one `Outbound::ReversePortal` inside the route registry the config already built, the session is a mux client used by nothing else, and the bridge serves the portal's flows through the same `serve_mux_wire` a VLESS mux inbound uses. The three command-4 checks (header, user, flow) live in one `reverse_ask`, so no carrier can grow its own. sing-box has no VLESS reverse portal or bridge at this pin, so there is no shape of its to compare.
+**The reference's separate dispatcher and mux client.** The portal registers one `Outbound::ReversePortal` in the config's route registry; the session is a mux client used by nothing else; the bridge serves portal flows through the same `serve_mux_wire` as a VLESS mux inbound. The three command-4 checks (header, user, flow) live in one `reverse_ask`. sing-box has no VLESS reverse at this pin.
 
 ## What was not removed
 
-The local hop. A bridge still needs a stream that `dial_vless` returns, and that function relays a `Connection`, so each worker opens an extra loopback TCP pair — one connect, one accept, two sockets the reference does not need — and a flow's bytes cross it. Removing that is a `dial_vless` that hands back its relayed halves instead of pumping them, and it is the largest cost on this page.
+The local hop: `dial_vless` returns a relayed `Connection`, so each worker opens an extra loopback TCP pair and bytes cross it; removing it means a `dial_vless` that hands back its halves instead of pumping them, and it is the largest cost here.
 
-A TCP bridge flow that leaves through an outbound other than `freedom` adds a loopback TCP pair the reference does not need: one connect, one accept, two sockets, and a relay between them. The direct `freedom` lane keeps the shorter path. A UDP bridge flow that a route plan routes adds one loopback relay pair and one lane per outbound tag; a fixed-`freedom` bridge keeps only the mux socket. A lane lives until its idle budget expires or its flow ends, so a silent datagram flow holds its relay and lane until then; a replaced outbound under the same tag opens a fresh lane rather than reusing the old one, a dynamic outbound carries a never-reused generation so a freed address cannot match, and a finished lane in an obsolete identity bucket, and a finished untagged default lane, are reaped on the next datagram. Draining closes the control writer and the tunnel but sends `End` for the control id rather than interrupting the reader the way the reference does; the bytes differ on that teardown only. Per-flow queued downlink is a fixed 32 KiB, not the policy `bufferSize`.
+A TCP bridge flow through a non-`freedom` outbound adds a loopback pair and relay; direct `freedom` keeps the shorter path. A routed UDP flow adds a loopback relay pair and one lane per tag; fixed-`freedom` keeps only the mux socket. A lane lives until its idle budget or flow end, so a silent datagram flow holds it; a replaced outbound opens a fresh lane, a dynamic outbound carries a never-reused generation, and finished obsolete/default lanes are reaped on the next datagram. Draining closes the control writer and tunnel but sends `End` for the control id rather than interrupting the reader, so bytes differ on that teardown only. Per-flow queued downlink is a fixed 32 KiB, not `bufferSize`.
 
 ## Pins
 
