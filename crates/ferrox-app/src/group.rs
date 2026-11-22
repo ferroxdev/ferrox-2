@@ -56,26 +56,39 @@ pub(crate) fn is_present(root: &Json) -> bool {
         .is_some_and(|outbounds| outbounds.iter().any(is_config))
 }
 
+#[derive(Debug)]
+struct Reading {
+    revision: u64,
+    delay: u16,
+}
+
 /// The latest delay a probe stored for one leaf tag, shared by every urltest group.
 #[derive(Debug, Default)]
 pub(crate) struct History {
-    delays: Mutex<HashMap<String, u16>>,
+    delays: Mutex<HashMap<String, Reading>>,
 }
 
 impl History {
-    fn load(&self, tag: &str) -> Option<u16> {
-        self.delays.lock().ok()?.get(tag).copied()
+    fn load(&self, tag: &str, revision: u64) -> Option<u16> {
+        let delays = self.delays.lock().ok()?;
+        let reading = delays.get(tag)?;
+        (reading.revision == revision).then_some(reading.delay)
     }
 
-    fn store(&self, tag: &str, delay: u16) {
+    fn store(&self, tag: &str, revision: u64, delay: u16) {
         if let Ok(mut delays) = self.delays.lock() {
-            delays.insert(tag.to_owned(), delay);
+            delays.insert(tag.to_owned(), Reading { revision, delay });
         }
     }
 
-    fn delete(&self, tag: &str) {
+    fn delete(&self, tag: &str, revision: u64) {
         if let Ok(mut delays) = self.delays.lock() {
-            delays.remove(tag);
+            let stale = delays
+                .get(tag)
+                .is_some_and(|reading| reading.revision == revision);
+            if stale {
+                delays.remove(tag);
+            }
         }
     }
 }
@@ -196,9 +209,10 @@ impl Group {
                 let (leaf, out) = resolve_member(route, &member, network, resolved)?;
                 carries(&out, network).then_some((member, leaf, out))
             });
-        let current_delay = current
-            .as_ref()
-            .and_then(|(_, leaf, _)| self.history.load(leaf));
+        let current_delay = current.as_ref().and_then(|(_, leaf, _)| {
+            let revision = route.leaf_revision(leaf)?;
+            self.history.load(leaf, revision)
+        });
         let mut best: Option<(u16, String, String, Outbound)> = None;
         let mut fallback = None;
         for member in &self.members {
@@ -209,7 +223,10 @@ impl Group {
                 continue;
             }
             fallback.get_or_insert_with(|| (member.clone(), leaf.clone(), out.clone()));
-            let Some(delay) = self.history.load(&leaf) else {
+            let Some(revision) = route.leaf_revision(&leaf) else {
+                continue;
+            };
+            let Some(delay) = self.history.load(&leaf, revision) else {
                 continue;
             };
             if best.as_ref().is_none_or(|(fastest, ..)| delay < *fastest) {
@@ -248,27 +265,37 @@ impl Group {
         let next = AtomicUsize::new(0);
         let url = &self.url;
         std::thread::scope(|scope| {
-            for _ in 0..leaves.len().min(FANOUT) {
-                scope.spawn(|| loop {
-                    let at = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(leaf) = leaves.get(at) else {
-                        break;
-                    };
-                    let revision = route.leaf_revision(leaf);
-                    let delay = route.probe_target(leaf).map(|target| {
-                        crate::observatory::probe(&target, url, "HEAD", PROBE_TIMEOUT, false)
-                            .ok()
-                            .map(|delay| u16::try_from(delay.as_millis()).unwrap_or(u16::MAX))
-                    });
-                    if route.leaf_revision(leaf) != revision {
-                        continue;
-                    }
-                    match delay {
-                        Some(Some(millis)) => self.history.store(leaf, millis),
-                        Some(None) => self.history.delete(leaf),
-                        None => {}
-                    }
+            let sweep = || loop {
+                let at = next.fetch_add(1, Ordering::Relaxed);
+                let Some(leaf) = leaves.get(at) else {
+                    break;
+                };
+                let Some(revision) = route.leaf_revision(leaf) else {
+                    continue;
+                };
+                let delay = route.probe_target(leaf).map(|target| {
+                    crate::observatory::probe(&target, url, "HEAD", PROBE_TIMEOUT, false)
+                        .ok()
+                        .map(|delay| u16::try_from(delay.as_millis()).unwrap_or(u16::MAX))
                 });
+                if route.leaf_revision(leaf) != Some(revision) {
+                    continue;
+                }
+                match delay {
+                    Some(Some(millis)) => self.history.store(leaf, revision, millis),
+                    Some(None) => self.history.delete(leaf, revision),
+                    None => {}
+                }
+            };
+            let mut started = 0usize;
+            for _ in 0..leaves.len().min(FANOUT) {
+                match std::thread::Builder::new().spawn_scoped(scope, sweep) {
+                    Ok(_) => started += 1,
+                    Err(_) => break,
+                }
+            }
+            if started == 0 {
+                sweep();
             }
         });
     }
@@ -562,6 +589,23 @@ impl Group {
 
     #[cfg(test)]
     pub(crate) fn record(&self, tag: &str, delay: u16) {
-        self.history.store(tag, delay);
+        self.history.store(tag, 0, delay);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_reading_only_names_the_revision_it_measured() {
+        let history = History::default();
+        history.store("a", 1, 10);
+        assert_eq!(history.load("a", 1), Some(10));
+        assert_eq!(history.load("a", 2), None);
+        history.delete("a", 2);
+        assert_eq!(history.load("a", 1), Some(10));
+        history.delete("a", 1);
+        assert_eq!(history.load("a", 1), None);
     }
 }

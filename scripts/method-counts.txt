@@ -1073,6 +1073,7 @@ engine-observatory failed-legacy-delay-ms 99999999 ferrox-app-observatory::tests
 engine-observatory default-burst-samples 10 ferrox-app-observatory::tests::burst_settings_default_to_ten_samples_and_head
 engine-selector ops-retired-instructions UNBLESSED scripts/count-ops.sh
 engine-selector syscalls-per-flow UNBLESSED scripts/count-ops.sh
+engine-selector copies-per-flow UNBLESSED no copy checker yet
 engine-selector seconds-per-flow UNBLESSED CI bench.yml (no cell yet)
 front-healthcheck ops-retired-instructions UNBLESSED scripts/count-ops.sh
 front-healthcheck syscalls-per-answer UNBLESSED scripts/count-ops.sh

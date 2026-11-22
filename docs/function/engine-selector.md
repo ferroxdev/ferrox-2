@@ -61,6 +61,7 @@ No duration is claimed here. Benchmarks are CI-only, and a local probe measures 
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
 | syscalls-per-flow | UNBLESSED | scripts/count-ops.sh |
+| copies-per-flow | UNBLESSED | no copy checker yet |
 | seconds-per-flow | UNBLESSED | CI bench.yml (no cell yet) |
 <!-- counts:end -->
 

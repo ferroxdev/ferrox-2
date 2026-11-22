@@ -2217,6 +2217,15 @@ fn udp_lane_supported(out: &Outbound) -> bool {
         Outbound::Vless(vless) => match &vless.carrier {
             Carrier::Quic => true,
             Carrier::Raw(_) if vless.mux.udp_manager().is_some() => true,
+            Carrier::Ws { .. }
+            | Carrier::HttpUpgrade { .. }
+            | Carrier::Grpc(_)
+            | Carrier::Xhttp { .. }
+            | Carrier::HttpHeader { .. }
+                if vless.mux.udp_manager().is_some() =>
+            {
+                true
+            }
             Carrier::Raw(_) => vless.tls.is_none(),
             Carrier::Kcp(_) => vless.mux.udp_manager().is_some(),
             Carrier::Hysteria(_) => {
@@ -31741,7 +31750,13 @@ fn serve_socks_udp_split(
                 if matches!(&*out, Outbound::Block(_)) {
                     continue;
                 }
-                let lane_address = if let Some(tag) = key.as_deref() {
+                let lane_key = match &*out {
+                    Outbound::Group(group) => group
+                        .resolve_bound(crate::router::Network::Udp)
+                        .map(|(leaf, _)| leaf),
+                    _ => key.as_deref().map(str::to_owned),
+                };
+                let lane_address = if let Some(tag) = lane_key.as_deref() {
                     match retire_finished_lane(&mut lanes, &mut replies, tag) {
                         Some(address) => Some(address),
                         None => spawn_udp_lane(&out, local, client.try_clone().ok(), Some(local))
@@ -65206,6 +65221,20 @@ mod tests {
         assert!(udp_lane_supported(&Outbound::Vless(vless.clone())));
         vless.mux.xudp = Xudp::Off;
         assert!(!udp_lane_supported(&Outbound::Vless(vless)));
+    }
+
+    /// A WebSocket VLESS lane whose mux has a UDP pool carries datagrams through the same
+    /// XUDP opener the other stream carriers use.
+    #[test]
+    fn a_mux_vless_websocket_lane_declares_udp() {
+        let root = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "vless", "mux": {"enabled": true, "xudpConcurrency": 7}, "settings": {"vnext": [{"address": "192.0.2.1", "port": 443, "users": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]}]}, "streamSettings": {"network": "ws", "wsSettings": {"path": "/t"}}}]}"#,
+        )
+        .expect("parses");
+        let out = find_vless_outbound(&root).expect("finds");
+        assert!(matches!(out.carrier, Carrier::Ws { .. }));
+        assert_eq!(out.mux.udp_manager(), Some(7));
+        assert!(udp_lane_supported(&Outbound::Vless(out)));
     }
 
     /// The VLESS mux skip policy leaves the mux for a direct UDP lane; a peer that waits for the
