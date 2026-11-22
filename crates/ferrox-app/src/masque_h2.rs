@@ -114,8 +114,9 @@ impl DeadlineStream {
 
     /// Arm the socket description only when the value it carries moves, so a steady state pays no syscall.
     fn arm(&self, want: Duration) -> std::io::Result<()> {
-        if self.armed.replace(want) != want {
+        if self.armed.get() != want {
             self.io.set_read_timeout(Some(want))?;
+            self.armed.set(want);
         }
         Ok(())
     }
