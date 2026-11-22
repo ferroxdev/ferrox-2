@@ -1285,8 +1285,7 @@ impl H3Client {
         let draining = Arc::new(AtomicBool::new(false));
         let goaway = Arc::new(AtomicU64::new(u64::MAX));
         let (pump, pump_sock) = (Arc::clone(&conn), Arc::clone(&sock));
-        let pump_dead = Arc::clone(&dead);
-        let pump_draining = Arc::clone(&draining);
+        let (pump_dead, pump_draining) = (Arc::clone(&dead), Arc::clone(&draining));
         let pump_goaway = Arc::clone(&goaway);
         std::thread::Builder::new()
             .name("xhttp-h3-pump".to_owned())
@@ -1336,9 +1335,8 @@ impl H3Client {
         end_request: bool,
         activity: Arc<Activity>,
     ) -> Result<(H3Reader, H3StreamOut), H3OpenError> {
-        let _opening = match self.opening.lock() {
-            Ok(opening) => opening,
-            Err(_) => return Err(H3OpenError::Closed),
+        let Ok(_opening) = self.opening.lock() else {
+            return Err(H3OpenError::Closed);
         };
         if self.dead.load(Ordering::Relaxed) || self.draining.load(Ordering::Relaxed) {
             return Err(H3OpenError::Closed);
