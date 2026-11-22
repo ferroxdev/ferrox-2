@@ -2291,23 +2291,19 @@ pub(crate) fn dial_udp_through_proxy(
     if OUTBOUND_TAG.with(|cell| cell.borrow().as_deref() == Some(tag)) {
         return None;
     }
-    let out = shared.outbound_ref(tag)?.clone();
+    let out = if tag.is_empty() {
+        shared.outbound_ref(tag)?.clone()
+    } else {
+        shared.member_revision(tag)?.0
+    };
+    let (leaf, out) = match out {
+        Outbound::Group(group) => group.resolve(&shared, crate::router::Network::Udp)?,
+        out => (tag.to_owned(), out),
+    };
     if !udp_lane_supported(&out) {
         return None;
     }
-    let (source, sockopts, strategy) = if shared.default_tag.as_deref() == Some(tag) {
-        (
-            shared.default_source,
-            shared.default_sockopts.clone(),
-            shared.default_strategy,
-        )
-    } else {
-        (
-            shared.sources.get(tag).copied(),
-            shared.sockopts.get(tag).cloned(),
-            shared.strategies.get(tag).copied(),
-        )
-    };
+    let (source, sockopts, strategy) = shared.tag_dial_settings(&leaf);
     let relay = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).ok()?;
     let relay_addr = relay.local_addr().ok()?;
     relay.set_read_timeout(Some(budgets::udp_idle())).ok()?;
@@ -2372,7 +2368,7 @@ pub(crate) fn dial_udp_through_proxy(
         stop.store(true, Ordering::Relaxed);
         return None;
     }
-    let name = tag.to_owned();
+    let name = leaf;
     let relay_stop = Arc::clone(&stop);
     if thread::Builder::new()
         .name("ferrox-tagged-udp".to_owned())
@@ -3501,26 +3497,27 @@ impl RouteShared {
     }
 
     /// One tag's handler and the revision behind it from the same lookup, so a lane cannot pair a
-    /// handler with a revision that names a different entry.
-    pub(crate) fn member_revision(&self, tag: &str) -> Option<(Outbound, u64)> {
+    /// handler with a revision that names a different entry. A removed tag keeps the closed sentinel
+    /// with no revision, so a selector stays closed while a url-test can skip it.
+    pub(crate) fn member_revision(&self, tag: &str) -> Option<(Outbound, Option<u64>)> {
         if self.changed.load(Ordering::Relaxed) {
             let dynamic = self
                 .dynamic
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if dynamic.removed.contains(tag) {
-                return None;
+                return Some((self.closed.clone(), None));
             }
             if let Some(out) = dynamic.added.get(tag) {
-                return Some(((*out.out).clone(), out.id));
+                return Some(((*out.out).clone(), Some(out.id)));
             }
         }
         self.tagged
             .get(tag)
             .cloned()
-            .map(|out| (out, 0))
+            .map(|out| (out, Some(0)))
             .or_else(|| {
-                (self.default_tag.as_deref() == Some(tag)).then(|| (self.default.clone(), 0))
+                (self.default_tag.as_deref() == Some(tag)).then(|| (self.default.clone(), Some(0)))
             })
     }
 
@@ -31845,7 +31842,8 @@ fn serve_socks_udp_split(
                         else {
                             continue;
                         };
-                        let Some((member, revision)) = plan.shared.member_revision(&leaf) else {
+                        let Some((member, Some(revision))) = plan.shared.member_revision(&leaf)
+                        else {
                             continue;
                         };
                         if !udp_lane_supported(&member) {
@@ -31864,7 +31862,8 @@ fn serve_socks_udp_split(
                     }
                     _ => {
                         if let Some(tag) = key.as_deref() {
-                            let Some((member, revision)) = plan.shared.member_revision(tag) else {
+                            let Some((member, Some(revision))) = plan.shared.member_revision(tag)
+                            else {
                                 continue;
                             };
                             if !udp_lane_supported(&member) {
@@ -32437,7 +32436,7 @@ fn serve_socks_udp_freedom(
         if !source_admitted(peer, pinned, src) {
             continue;
         }
-        let Some((mut asked, payload)) = parse_socks_udp_dest(&buf[..n]) else {
+        let Some((asked, payload)) = parse_socks_udp_dest(&buf[..n]) else {
             continue;
         };
         if payload.is_empty() {
@@ -32446,6 +32445,10 @@ fn serve_socks_udp_freedom(
         // A datagram that passes admission and framing is the only one that keeps the lane alive.
         seen = replies.load(Ordering::Relaxed);
         last = Instant::now();
+        let mut asked = asked;
+        if let Some(redirect) = &freedom.redirect {
+            asked = redirect.apply(&asked);
+        }
         if let Some(strategy) = TARGET_STRATEGY.with(std::cell::Cell::get) {
             match resolve_target(&asked, strategy) {
                 TargetPick::Address(address) => asked = address,
@@ -32522,6 +32525,7 @@ fn retire_freedom_uplinks(uplinks: HashMap<SocketAddr, FreedomUplink>, stop: &At
         if let Some(stop) = tagged_stop {
             stop.store(true, Ordering::Relaxed);
         }
+        let _ = socket2::SockRef::from(&writer).shutdown(std::net::Shutdown::Read);
         let _ = writer.set_read_timeout(Some(UDP_POLL));
         let _ = handle.join();
     }
@@ -66231,6 +66235,61 @@ mod tests {
         drop(plain);
     }
 
+    /// A redirect replaces the destination before the strategy looks at it, so a forced family
+    /// cannot refuse the name the redirect would have replaced.
+    #[test]
+    fn a_freedom_udp_redirect_is_applied_before_the_target_strategy() {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut buf = vec![0u8; UDP_BUF];
+            loop {
+                let Ok((n, src)) = echo.recv_from(&mut buf) else {
+                    return;
+                };
+                if echo.send_to(&buf[..n], src).is_err() {
+                    return;
+                }
+            }
+        });
+        let out = freedom_out(&format!(
+            r#"{{"outbounds":[{{"protocol":"freedom","targetStrategy":"forceipv6","settings":{{"redirect":"127.0.0.1:{echo_port}"}}}}]}}"#
+        ));
+        let front = socks_front_with(out);
+        let mut client = Connection::connect(("127.0.0.1", front)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        let relay = SocketAddr::new(
+            std::net::IpAddr::V4([127, 0, 0, 1].into()),
+            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+        );
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        udp.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let host = b"forceipv6.invalid";
+        let mut frame = vec![0, 0, 0, 3, host.len() as u8];
+        frame.extend_from_slice(host);
+        frame.extend_from_slice(&echo_port.to_be_bytes());
+        frame.extend_from_slice(b"ping");
+        udp.send_to(&frame, relay).expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        let (n, _) = udp
+            .recv_from(&mut back)
+            .expect("the redirect answers before the forced family resolves the name");
+        let (_, payload) = parse_socks_udp(&back[..n]).expect("splits");
+        assert_eq!(payload, b"ping");
+        drop(client);
+    }
+
     /// A blocked UDP destination still receives the decoy before the final rule drops the payload,
     /// and the socket stays open, as the reference's noise writer runs ahead of its rule check.
     #[test]
@@ -81894,6 +81953,54 @@ mod tests {
         assert_eq!(payload, b"ping");
     }
 
+    /// A tag that names a group hands the datagram to the leaf the group resolved once, not a
+    /// second lookup in the worker that could see the leaf replaced.
+    #[test]
+    fn a_tagged_udp_group_hop_uses_the_selected_leaf() {
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::a_tagged_udp_group_hop_uses_the_selected_leaf",
+        ) {
+            return;
+        }
+        let echo_port = udp_echo_loop();
+        let closed = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind");
+        let closed_port = closed.local_addr().expect("address").port();
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds":[
+                {{"tag":"direct","protocol":"freedom","streamSettings":{{"sockopt":{{"dialerProxy":"hop"}}}}}},
+                {{"tag":"a","protocol":"freedom"}},
+                {{"tag":"b","protocol":"freedom","settings":{{"redirect":"127.0.0.1:{echo_port}"}}}},
+                {{"tag":"hop","type":"selector","outbounds":["a","b"],"default":"b"}}
+            ],"routing":{{}}}}"#
+        ))
+        .expect("parses");
+        let routing = crate::router::Routing::parse(&root)
+            .expect("parses")
+            .expect("routing");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("shared");
+        let options = crate::sockopt::parse_outbound(Some(
+            &crate::json::parse(r#"{"dialerProxy":"hop"}"#).expect("parses"),
+        ))
+        .expect("parses")
+        .expect("options");
+        options.install_route(&shared);
+        let (client, stop) = dial_udp_through_proxy(
+            SocketAddr::from(([127, 0, 0, 1], closed_port)),
+            "hop",
+            &options,
+        )
+        .expect("the selected leaf carries datagrams");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        client.send(b"ping").expect("sends");
+        let mut back = [0u8; UDP_BUF];
+        let n = client.recv(&mut back).expect("echoes");
+        assert_eq!(&back[..n], b"ping");
+        stop.store(true, Ordering::Relaxed);
+    }
+
     /// A hop with no datagram lane is refused before the caller gets a socket that never answers.
     #[test]
     fn a_tagged_udp_lane_refuses_a_hop_without_datagrams() {
@@ -84796,6 +84903,25 @@ end
             .resolve(&shared, crate::router::Network::Tcp)
             .expect("picks");
         assert!(matches!(out, Outbound::Block(_)));
+    }
+
+    /// A removed member cannot hold a url-test's fallback slot while a live member remains.
+    #[test]
+    fn a_removed_urltest_member_is_not_the_fallback() {
+        let shared = group_route(
+            r#"{"outbounds":[
+                {"tag":"a","protocol":"freedom"},
+                {"tag":"b","protocol":"freedom"},
+                {"tag":"pick","type":"urltest","outbounds":["a","b"]}
+            ],"routing":{}}"#,
+        );
+        let group = group_of(&shared, "pick");
+        shared.remove_outbound("a");
+        let (leaf, out) = group
+            .resolve(&shared, crate::router::Network::Tcp)
+            .expect("picks the live member");
+        assert_eq!(leaf, "b");
+        assert!(matches!(out, Outbound::Freedom(_)));
     }
 
     /// A group naming an unknown member, a selector default outside its list, or a cycle is a
