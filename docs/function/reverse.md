@@ -4,7 +4,9 @@ A bridge behind a NAT opens a VLESS request with command 4 — the header names 
 
 The control stream is a mux UDP flow to the internal domain `reverse`. A protobuf `Control` carries `state` (0 `ACTIVE`, 1 `DRAIN`) and a random pad; the portal sends one every two seconds, but only when the counter is 1 or the session is draining, and the bridge decodes it into `WorkerState`. A session drains once it has carried 256 flows; the picker prefers the least-loaded live session, skips a draining one until nothing else is left, and a bridge monitor opens another session when none is live or the live ones average more than sixteen flows each. A session whose control stream is silent for 60 seconds is closed by the monitor.
 
-What refuses, by name and once per process: a bridge whose carrier cannot be split into a stream (xhttp; QUIC, KCP, hysteria and xdrive are refused at startup), a bridge or portal user whose flow is `xtls-rprx-vision`, a reverse user opening anything but command 4, a forward user opening command 4, and a portal flow whose route names any outbound other than `freedom` or `blackhole` — the bridge has no dial that returns a stream, so it says which tag it refused and drops that flow.
+Both roles carry every VLESS transport that exposes a stream: raw, TLS, REALITY, WebSocket, gRPC, HTTPUpgrade, HTTPHeader, xHTTP, QUIC, KCP, hysteria and xdrive. A bridge flow then leaves through any outbound the config's rules name that serves its network, not just `freedom` or `blackhole`. A TCP flow gets a loopback stream, the same hop every front uses when a lane returns a relay instead of a socket. A UDP flow that a route plan sends through a chosen lane gets a loopback relay; the bridge frames each datagram with its destination, routes it to the outbound tag the rules picked, and forwards the lane's framed reply back into the mux flow. A name stays a name through a SOCKS5 outbound, an empty datagram is carried, and the relay's stop flag cancels the lane's worker when the mux flow ends. A bridge with one fixed `freedom` outbound keeps the direct socket.
+
+What refuses, by name at startup: a bridge whose carrier has no stream to hand the mux (MASQUE, plain HTTP, or an unknown network), a bridge or portal user whose flow is `xtls-rprx-vision`, a reverse user opening anything but command 4, and a forward user opening command 4.
 
 ## Data path
 
@@ -19,8 +21,10 @@ graph TD
     C["portal front: socks / http / dokodemo"] --> R["route: Outbound::ReversePortal"]
     R -->|"pick least-loaded session"| S
     S -->|"mux New + Keep"| M
-    M -->|"bridge dial: freedom"| T["target"]
+    M -->|"TCP: bridge dial: routed outbound"| T["target"]
+    M -->|"UDP: loopback relay + routed lane"| U["target"]
     T -->|"origin bytes"| M
+    U -->|"framed reply"| M
     M -->|"mux Keep"| S
     S -->|"flow.down queue"| C
 ```
@@ -34,9 +38,9 @@ graph TD
 | tcp-echo-bytes-preserved | 5 | ferrox-app-proxy::reverse_tests::a_portal_flow_reaches_the_bridge_and_comes_back |
 <!-- counts:end -->
 
-Syscalls: one loopback `connect` plus one `accept` per bridge worker at startup, one mux frame write per uplink chunk, one outbound `connect` per flow the bridge dials, and the relay's own reads and writes — no checker counts this yet.
+Syscalls: one loopback `connect` plus one `accept` per bridge worker at startup, one more pair per TCP flow that leaves through a non-freedom outbound, one mux frame write per uplink chunk, one outbound `connect` per TCP flow the bridge dials, and the relay's own reads and writes. A UDP bridge flow that a route plan routes adds one loopback relay pair, one relay read and write per datagram, and one lane per outbound tag; a lane's own socket and carrier writes follow the outbound it picked. A fixed-`freedom` bridge keeps the direct socket. No checker counts this yet.
 
-Copies: a whole downlink frame is parsed where the read landed it and copied once, into the flow's queue (`data.to_vec()`), because the queue is what lets a slow consumer cost only its own flow. Only a frame that straddles two reads is copied into a carry first. The uplink copies nothing: the header is built in the session's scratch and the caller's payload is written with one `writev`, the same two-part write a direct mux session makes. A pointer-identity test does not exist for either arm yet, so both stay prose rather than manifest rows.
+Copies: a whole downlink frame is parsed where the read landed it and copied once, into the flow's queue (`data.to_vec()`), because the queue is what lets a slow consumer cost only its own flow. Only a frame that straddles two reads is copied into a carry first. The uplink copies nothing: the header is built in the session's scratch and the caller's payload is written with one `writev`, the same two-part write a direct mux session makes. A routed UDP datagram copies its payload once into the SOCKS5 frame the relay reads; the reply is parsed where the relay read landed it and written into the mux frame without another copy. A pointer-identity test does not exist for either arm yet, so both stay prose rather than manifest rows.
 
 ## Ops
 
@@ -61,9 +65,7 @@ The reference's separate dispatcher and its own mux client. Xray used to serve r
 
 The local hop. A bridge still needs a stream that `dial_vless` returns, and that function relays a `Connection`, so each worker opens an extra loopback TCP pair — one connect, one accept, two sockets the reference does not need — and a flow's bytes cross it. Removing that is a `dial_vless` that hands back its relayed halves instead of pumping them, and it is the largest cost on this page.
 
-The bridge also carries only `freedom` and `blackhole` lanes. The reference routes returned flows through the normal dispatcher, so a portal flow can leave through any outbound; here a lane naming another proxy is refused with one line and the flow is dropped, because there is no stream-returning dial behind those outbounds either.
-
-xhttp, QUIC, KCP, hysteria and xdrive carriers are not carried: xhttp frames its own stream rather than exposing one, and the other four have no stream to hand to the mux. The refusal is one line for each. Draining closes the control writer and the tunnel but sends `End` for the control id rather than interrupting the reader the way the reference does; the bytes differ on that teardown only. Per-flow queued downlink is a fixed 32 KiB, not the policy `bufferSize`.
+A TCP bridge flow that leaves through an outbound other than `freedom` adds a loopback TCP pair the reference does not need: one connect, one accept, two sockets, and a relay between them. The direct `freedom` lane keeps the shorter path. A UDP bridge flow that a route plan routes adds one loopback relay pair and one lane per outbound tag; a fixed-`freedom` bridge keeps only the mux socket. A lane lives until its idle budget expires or its flow ends, so a silent datagram flow holds its relay and lane until then; a replaced outbound under the same tag opens a fresh lane rather than reusing the old one, a dynamic outbound carries a never-reused generation so a freed address cannot match, and a finished lane in an obsolete identity bucket, and a finished untagged default lane, are reaped on the next datagram. Draining closes the control writer and the tunnel but sends `End` for the control id rather than interrupting the reader the way the reference does; the bytes differ on that teardown only. Per-flow queued downlink is a fixed 32 KiB, not the policy `bufferSize`.
 
 ## Pins
 
@@ -76,6 +78,6 @@ xhttp, QUIC, KCP, hysteria and xdrive carriers are not carried: xhttp frames its
 
 <!-- scope:begin -->
 - paths: crates/ferrox-app/src/reverse.rs
-- symbols: reverse_portals, reverse_carried, reverse_ask, ReverseAsk, attach_reverse, attach_reverse_session, serve_reverse_tcp, vless_reverse_header, BridgeLane, refuse_bridge_lane, serve_bridge_mux, start_bridges, find_bridges, reverse_tests, portal_echo, a_portal_flow_reaches_the_bridge_and_comes_back, a_sixteen_kib_downlink_is_echoed_whole, connection_closer, into_tunnel
+- symbols: reverse_portals, reverse_carried, reverse_ask, ReverseAsk, attach_reverse, attach_reverse_session, serve_reverse_tcp, vless_reverse_header, BridgeLane, bridge_tunnel, serve_bridge_mux, serve_bridge_udp, reap_finished_lanes, udp_route, recv_mux_udp, UdpMux, start_bridges, find_bridges, dial_vless_reverse, dial_vless_kcp_header, dial_vless_xdrive_header, reverse_tests, portal_echo, a_portal_flow_reaches_the_bridge_and_comes_back, a_sixteen_kib_downlink_is_echoed_whole, a_reverse_account_attaches_a_kcp_session_without_freedom, a_bridge_lane_routes_a_flow_through_a_socks_outbound, a_bridge_udp_name_crosses_a_socks_outbound_unresolved, a_bridge_udp_flow_reaches_an_echo_through_a_non_freedom_outbound, connection_closer, into_tunnel
 - go: ./proxy/vless/..., ./app/reverse/...
 <!-- scope:end -->
