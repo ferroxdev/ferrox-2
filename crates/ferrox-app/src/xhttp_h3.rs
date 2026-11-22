@@ -59,10 +59,17 @@ impl Wire {
         }
     }
 
-    fn write_opening(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    fn opening_start(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
             Self::Server(stream) => stream.write(buf),
-            Self::Client(stream) => stream.write_opening(buf),
+            Self::Client(stream) => stream.opening_start(buf),
+        }
+    }
+
+    fn opening_rest(&mut self, buf: &[u8], deadline: Instant) -> std::io::Result<usize> {
+        match self {
+            Self::Server(stream) => stream.write(buf),
+            Self::Client(stream) => stream.opening_rest(buf, deadline),
         }
     }
 
@@ -1061,22 +1068,44 @@ impl Write for ClientStream {
 }
 
 impl ClientStream {
-    /// Send the opening HEADERS under the connection lock, after the drain flag the GOAWAY pump
-    /// publishes, so a pause between the pool's check and this write cannot open a new stream.
-    fn write_opening(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    /// One non-blocking opening attempt: `StreamLimit` leaves the id unallocated, while a created
+    /// stream may still be waiting for credit after this returns.
+    fn opening_start(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
-        let deadline = Instant::now() + crate::budgets::relay_stall();
+        let Ok(mut conn) = self.conn.lock() else {
+            return Err(std::io::Error::other("h3 connection lock poisoned"));
+        };
+        if self.owner.dead.load(Ordering::Relaxed)
+            || self.owner.rejected(self.id)
+            || self.owner.draining.load(Ordering::Relaxed)
+        {
+            return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        }
+        match conn.stream_send(self.id, buf, false) {
+            Ok(sent) => {
+                self.activity.touch();
+                quic::flush_egress(&mut conn, &self.sock);
+                Ok(sent)
+            }
+            Err(quiche::Error::Done) => Ok(0),
+            Err(quiche::Error::StreamLimit) => {
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            }
+            Err(error) => Err(std::io::Error::other(format!("h3 stream send: {error:?}"))),
+        }
+    }
+
+    /// Finish HEADERS once the stream exists, waiting for credit without the opening lock; the
+    /// drain flag only gates the first attempt, so a stream below a GOAWAY cutoff can finish.
+    fn opening_rest(&mut self, buf: &[u8], deadline: Instant) -> std::io::Result<usize> {
         let mut rest = buf;
         while !rest.is_empty() {
             let Ok(mut conn) = self.conn.lock() else {
                 return Err(std::io::Error::other("h3 connection lock poisoned"));
             };
-            if self.owner.dead.load(Ordering::Relaxed)
-                || self.owner.rejected(self.id)
-                || (rest.len() == buf.len() && self.owner.draining.load(Ordering::Relaxed))
-            {
+            if self.owner.dead.load(Ordering::Relaxed) || self.owner.rejected(self.id) {
                 return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
             }
             match conn.stream_send(self.id, rest, false) {
@@ -1335,7 +1364,7 @@ impl H3Client {
         end_request: bool,
         activity: Arc<Activity>,
     ) -> Result<(H3Reader, H3StreamOut), H3OpenError> {
-        let Ok(_opening) = self.opening.lock() else {
+        let Ok(opening) = self.opening.lock() else {
             return Err(H3OpenError::Closed);
         };
         if self.dead.load(Ordering::Relaxed) || self.draining.load(Ordering::Relaxed) {
@@ -1358,8 +1387,12 @@ impl H3Client {
         frames::quic_varint(&mut frame, block.len() as u64);
         frame.extend_from_slice(block);
         let mut writer = wire.clone();
-        match writer.write_opening(&frame) {
-            Ok(_) => self.next.store(id + 4, Ordering::SeqCst),
+        let deadline = Instant::now() + crate::budgets::relay_stall();
+        let sent = match writer.opening_start(&frame) {
+            Ok(sent) => {
+                self.next.store(id + 4, Ordering::SeqCst);
+                sent
+            }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 return Err(H3OpenError::Full);
             }
@@ -1368,6 +1401,11 @@ impl H3Client {
                 wire.close();
                 return Err(H3OpenError::Closed);
             }
+        };
+        drop(opening);
+        if sent < frame.len() && writer.opening_rest(&frame[sent..], deadline).is_err() {
+            wire.close();
+            return Err(H3OpenError::Closed);
         }
         if end_request {
             wire.fin();
@@ -2061,6 +2099,32 @@ mod tests {
         port
     }
 
+    fn serve_ignored_with_streams(
+        identity: &ferrox_core::tls::TlsServerConfig,
+        streams: u64,
+        stream_window: u64,
+    ) -> u16 {
+        let mut config = quic::serve_config(identity).expect("the h3 server config");
+        config.set_initial_max_streams_bidi(streams);
+        config.set_initial_max_stream_data_bidi_remote(stream_window);
+        config.set_initial_max_data(1 << 20);
+        let sock = quic::bind_datagram_plain("127.0.0.1:0").expect("the h3 server binds");
+        let port = sock.local_addr().expect("the h3 server address").port();
+        let serve: quic::Serve = Arc::new(|_| {});
+        std::thread::Builder::new()
+            .name("xhttp-h3-ignored".to_owned())
+            .spawn(move || {
+                quic::serve_loop(
+                    Datagram::plain(sock),
+                    &Arc::new(Mutex::new(config)),
+                    &serve,
+                    &Arc::new(AtomicBool::new(false)),
+                );
+            })
+            .expect("the h3 ignored thread");
+        port
+    }
+
     /// Answer every request with one status and body, without the xhttp dispatch: the shape a plain store service speaks.
     fn serve_answer(
         identity: &ferrox_core::tls::TlsServerConfig,
@@ -2140,6 +2204,48 @@ mod tests {
             Err(H3OpenError::Full)
         ));
         assert_eq!(client.next.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn a_second_h3_open_completes_while_the_first_waits_for_credit() {
+        let (identity, roots) = minted_identity("localhost");
+        let port = serve_ignored_with_streams(&identity, 4, 100);
+        let client = client(port, roots);
+        let large = vec![b'x'; 200];
+        let small = vec![b'y'; 20];
+        let first_client = Arc::clone(&client);
+        let first = std::thread::spawn(move || first_client.open_block(&large, false));
+        let started = Instant::now();
+        while client.next.load(Ordering::SeqCst) == 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the first open never started"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let watchdog = {
+            let client = Arc::clone(&client);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                if !stop.load(Ordering::Relaxed) {
+                    client.dead.store(true, Ordering::Relaxed);
+                }
+            })
+        };
+        let second = client.open_block(&small, false);
+        assert!(
+            second.is_ok(),
+            "the second open completed while the first waited"
+        );
+        stop.store(true, Ordering::Relaxed);
+        client.dead.store(true, Ordering::Relaxed);
+        let _ = first.join();
+        let _ = watchdog.join();
     }
 
     #[test]
