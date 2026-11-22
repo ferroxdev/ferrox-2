@@ -1943,10 +1943,7 @@ mod tests {
         ] {
             let body = crate::config_text(text.as_bytes(), format).expect("json");
             let root = crate::json::parse(&body).expect("json");
-            assert_eq!(
-                root.get("a").and_then(crate::json::Json::as_u32),
-                Some(1)
-            );
+            assert_eq!(root.get("a").and_then(crate::json::Json::as_u32), Some(1));
         }
     }
 

@@ -80,8 +80,14 @@ fn default_pools(v4: bool, v6: bool) -> Json {
     };
     match (v4, v6) {
         (true, true) => Json::Arr(vec![
-            pool(crate::dnsapp::FAKE_V4_POOL, crate::dnsapp::FAKE_DOUBLE_POOL_SIZE),
-            pool(crate::dnsapp::FAKE_V6_POOL, crate::dnsapp::FAKE_DOUBLE_POOL_SIZE),
+            pool(
+                crate::dnsapp::FAKE_V4_POOL,
+                crate::dnsapp::FAKE_DOUBLE_POOL_SIZE,
+            ),
+            pool(
+                crate::dnsapp::FAKE_V6_POOL,
+                crate::dnsapp::FAKE_DOUBLE_POOL_SIZE,
+            ),
         ]),
         (false, true) => pool(
             crate::dnsapp::FAKE_V6_POOL,
@@ -112,9 +118,9 @@ fn sniffs_fakedns(root: &Json) -> bool {
                 }
                 match sniffing.get("destOverride") {
                     Some(Json::Str(text)) => names_fakedns_override(text),
-                    Some(Json::Arr(items)) => items.iter().any(|item| {
-                        item.as_str().is_some_and(names_fakedns_override)
-                    }),
+                    Some(Json::Arr(items)) => items
+                        .iter()
+                        .any(|item| item.as_str().is_some_and(names_fakedns_override)),
                     _ => false,
                 }
             })
@@ -154,9 +160,8 @@ mod tests {
 
     #[test]
     fn a_single_family_strategy_gets_one_pool_of_the_reference_size() {
-        let mut v4 = parsed(
-            r#"{"dns":{"servers":[{"address":"fakedns"}],"queryStrategy":"UseIPv4"}}"#,
-        );
+        let mut v4 =
+            parsed(r#"{"dns":{"servers":[{"address":"fakedns"}],"queryStrategy":"UseIPv4"}}"#);
         run(&mut v4).expect("lint");
         assert_eq!(
             v4.get("fakeDns"),
@@ -194,7 +199,7 @@ mod tests {
 
     #[test]
     fn a_config_without_fakedns_is_untouched() {
-        let mut root = parsed(r#"{"dns":{"servers":["1.1.1.1"]}}"#);
+        let mut root = parsed(r#"{"dns":{"servers":["192.0.2.1"]}}"#);
         let before = root.clone();
         run(&mut root).expect("lint");
         assert_eq!(root, before);
@@ -215,9 +220,8 @@ mod tests {
             r#"{"inbounds":[{"sniffing":{"enabled":true,"destOverride":["fakedns+others"]}}]}"#,
         );
         assert!(sniffs_fakedns(&sniffing));
-        let off = parsed(
-            r#"{"inbounds":[{"sniffing":{"enabled":false,"destOverride":["fakedns"]}}]}"#,
-        );
+        let off =
+            parsed(r#"{"inbounds":[{"sniffing":{"enabled":false,"destOverride":["fakedns"]}}]}"#);
         assert!(!sniffs_fakedns(&off));
     }
 }

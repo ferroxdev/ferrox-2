@@ -1129,8 +1129,14 @@ mod tests {
             .expect("rules")
             .as_arr()
             .expect("array");
-        assert_eq!(rules[0].get("outboundTag").and_then(Json::as_str), Some("b"));
-        assert_eq!(rules[1].get("outboundTag").and_then(Json::as_str), Some("a"));
+        assert_eq!(
+            rules[0].get("outboundTag").and_then(Json::as_str),
+            Some("b")
+        );
+        assert_eq!(
+            rules[1].get("outboundTag").and_then(Json::as_str),
+            Some("a")
+        );
         assert!(rules.iter().all(|rule| rule.get("_priority").is_none()));
     }
 
