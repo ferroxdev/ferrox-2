@@ -373,14 +373,11 @@ impl TuicOut {
                     .is_ok_and(|conn| lane_established(&conn, lane))
         };
         while held.values().map(Vec::len).sum::<usize>() >= MAX_TUIC_LANES {
-            let idle = held.iter().find_map(|(key, pool)| {
+            let (key, at) = held.iter().find_map(|(key, pool)| {
                 pool.iter()
                     .position(|lane| lane.leases.load(Ordering::Acquire) == 0)
                     .map(|at| (key.clone(), at))
-            });
-            let Some((key, at)) = idle else {
-                return None;
-            };
+            })?;
             if let Some(pool) = held.get_mut(&key) {
                 pool.remove(at);
             }
