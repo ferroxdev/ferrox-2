@@ -1283,8 +1283,7 @@ impl H3Client {
         let dead = Arc::new(AtomicBool::new(false));
         let draining = Arc::new(AtomicBool::new(false));
         let goaway = Arc::new(AtomicU64::new(u64::MAX));
-        let pump = Arc::clone(&conn);
-        let pump_sock = Arc::clone(&sock);
+        let (pump, pump_sock) = (Arc::clone(&conn), Arc::clone(&sock));
         let pump_dead = Arc::clone(&dead);
         let pump_draining = Arc::clone(&draining);
         let pump_goaway = Arc::clone(&goaway);

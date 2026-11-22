@@ -2602,6 +2602,10 @@ pub(crate) fn serve_inbound(
     if starts.is_empty() {
         return false;
     }
+    start_workers(starts, path, stop)
+}
+
+fn start_workers(starts: Vec<Start>, path: &str, stop: Option<&Arc<proxy::Stop>>) -> bool {
     let left = Arc::new(AtomicUsize::new(0));
     let gate = Arc::new(StartGate::new());
     let mut workers = Vec::with_capacity(starts.len());
