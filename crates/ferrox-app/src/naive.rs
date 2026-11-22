@@ -2322,7 +2322,7 @@ fn inbound_config(inbound: &Json) -> Result<(Users, (bool, bool)), String> {
         return Err("naive inbound names no users".to_owned());
     }
     let security = crate::config::stream_security(inbound);
-    if !matches!(security.as_str(), "" | "none" | "tls") {
+    if !matches!(security, "" | "none" | "tls") {
         return Err(format!(
             "naive inbound asks for `{security}`: serves nothing"
         ));
