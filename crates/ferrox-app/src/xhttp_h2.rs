@@ -2998,14 +2998,6 @@ impl H2Client {
 
     /// A pooled `NaiveProxy` CONNECT: the caller owns the connection, so the stream carries no
     /// `ClientOwner` and a closing stream leaves the connection for the next tunnel.
-    pub(crate) fn open_naive(
-        &self,
-        block: &[u8],
-        end_request: bool,
-    ) -> Option<(H2StreamReader, H2StreamOut)> {
-        self.open_naive_result(block, end_request).ok()
-    }
-
     pub(crate) fn open_naive_result(
         &self,
         block: &[u8],

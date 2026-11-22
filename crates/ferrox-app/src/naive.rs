@@ -3067,7 +3067,7 @@ mod tests {
             ("proxy-authorization", "Basic wrong"),
             ("padding", "x"),
         ]);
-        let (mut reader, out) = h2.open_naive(&block, false).expect("stream");
+        let (mut reader, out) = h2.open_naive_result(&block, false).expect("stream");
         let mut one = [0u8; 1];
         let _ = reader.read(&mut one);
         assert_eq!(reader.status(), Some(407));
