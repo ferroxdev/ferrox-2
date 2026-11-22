@@ -16,6 +16,7 @@ mod budgets;
 #[cfg(test)]
 #[macro_use]
 mod census;
+mod bench_counters;
 mod blackhole;
 mod browser_dialer;
 mod commander;
@@ -665,6 +666,7 @@ fn cmd_psiphon_broker<I: Iterator<Item = String>>(args: &mut I) {
 }
 
 fn main() {
+    bench_counters::install();
     let _ = browser_dialer::active();
     let mut args = std::env::args().skip(1);
     let Some(cmd) = args.next() else {

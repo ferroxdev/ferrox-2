@@ -108,6 +108,9 @@ jobs:
               "$base.symbols.txt" 2>/dev/null || true)"
             [[ -n "$top" ]] && perf annotate --stdio -i "$data" -s "$top" \
               > "$base.annotate.txt" 2>&1 || true
+            # The artifact zip carries perf.data and the SVGs, too big to fetch back; the frames that matter belong in the log.
+            echo "=== $(basename "$base"): top frames ==="
+            head -14 "$base.symbols.txt" 2>/dev/null || true
           done
           du -sh profile || true
       - uses: actions/upload-artifact@v4

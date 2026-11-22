@@ -1569,6 +1569,7 @@ fn wait_for_tun(stack: &ServerStack, wake: &std::os::unix::net::UnixStream) -> b
 
 /// One server turn, or true once the inbound is closed.
 fn server_turn(stack: &mut ServerStack, packets: &Packets, tick: Duration) -> bool {
+    crate::bench_counters::bump(crate::bench_counters::TURNS);
     let mut closed = false;
     for _ in 0..RX_BURST {
         match packets.try_recv() {
@@ -1588,8 +1589,13 @@ fn server_turn(stack: &mut ServerStack, packets: &Packets, tick: Duration) -> bo
         return false;
     }
     match packets.recv_timeout(tick) {
-        Ok(packet) => stack.receive(packet),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        Ok(packet) => {
+            crate::bench_counters::bump(crate::bench_counters::CHANNEL_PACKETS);
+            stack.receive(packet)
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            crate::bench_counters::bump(crate::bench_counters::IDLE_WAITS);
+        }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return true,
     }
     false
@@ -2092,6 +2098,7 @@ impl ServerStack {
             if !send_packet(&self.to_tunnel, packet, self.headroom, self.fragment) {
                 return moved;
             }
+            crate::bench_counters::bump(crate::bench_counters::SERVED_PACKETS);
         }
         self.flows.retain(|flow| {
             if flow.done {

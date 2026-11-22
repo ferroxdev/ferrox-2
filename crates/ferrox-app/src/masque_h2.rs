@@ -471,8 +471,12 @@ impl Wire {
                 self.closed = true;
                 false
             }
-            Ok(_) => true,
+            Ok(read) => {
+                crate::bench_counters::add(crate::bench_counters::READ_BYTES, read as u64);
+                true
+            }
             Err(error) if ferrox_core::tls::TlsError::is_timeout(&error) => {
+                crate::bench_counters::bump(crate::bench_counters::READ_WAITS);
                 if self.deadline.remaining().is_some_and(|left| left.is_zero()) {
                     self.closed = true;
                     false
@@ -1368,6 +1372,7 @@ impl Session {
         settings.extend_from_slice(&1u32.to_be_bytes());
         wire.send(h2::T_SETTINGS, 0, 0, &settings);
         while !wire.closed && !self.end {
+            crate::bench_counters::bump(crate::bench_counters::VISITS);
             if self
                 .stop
                 .as_ref()
@@ -1799,8 +1804,10 @@ impl Session {
 
     /// Gathers the queued packets into DATA frames, one per batch and never past the peer's frame limit.
     fn gather(&mut self, wire: &mut Wire, frame: &mut Vec<u8>) -> bool {
+        crate::bench_counters::bump(crate::bench_counters::GATHERS);
         let mut origin_closed = false;
         let mut pulled = 0;
+        let mut pulled_bytes = 0u64;
         let Some(id) = self.request else {
             return false;
         };
@@ -1830,6 +1837,7 @@ impl Session {
             let Some(packet) = packet else {
                 break;
             };
+            pulled_bytes += packet.len() as u64;
             if self.warp {
                 bare_datagram(&packet, frame);
             } else {
@@ -1848,6 +1856,14 @@ impl Session {
         if pulled > 0 {
             self.udp_quiet = Some(Instant::now());
         }
+        crate::bench_counters::add(crate::bench_counters::QUEUED_PACKETS, pulled as u64);
+        crate::bench_counters::add(crate::bench_counters::QUEUED_BYTES, pulled_bytes);
+        // `full` means our own cap stopped the pull; `dry` means the channel had nothing left to give.
+        if pulled >= QUEUED_CAP {
+            crate::bench_counters::bump(crate::bench_counters::GATHER_FULL);
+        } else {
+            crate::bench_counters::bump(crate::bench_counters::GATHER_DRY);
+        }
         origin_closed
     }
 
@@ -1863,6 +1879,7 @@ impl Session {
         if self.end || wire.closed || self.request.is_none() {
             return;
         }
+        crate::bench_counters::bump(crate::bench_counters::FRAMES);
         let body = &frame[FRAME_HEAD..];
         let length = i64::try_from(body.len()).unwrap_or(i64::MAX);
         if self.queued.is_empty()
@@ -1875,6 +1892,7 @@ impl Session {
             }
             return;
         }
+        crate::bench_counters::bump(crate::bench_counters::FRAMES_QUEUED);
         self.capsule(wire, body);
     }
 
@@ -1907,6 +1925,7 @@ impl Session {
         if self.end || wire.closed {
             return;
         }
+        crate::bench_counters::bump(crate::bench_counters::FLUSHES);
         let mut frame = std::mem::take(&mut self.frame);
         self.drain_queued(wire, &mut frame);
         // CONNECT-IP keeps its grant and sender alive, so waiting for `outgoing` to disconnect is a wait it never reaches; both datagram modes drain on a quiet window instead.

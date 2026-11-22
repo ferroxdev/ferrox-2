@@ -521,7 +521,13 @@ matrix_start_server() {
     positional) args=(run "$config") ;;
     dash-c) args=(-c "$config") ;;
   esac
-  "$bin" "${args[@]}" >>"$logdir/server.log" 2>&1 &
+  # A diagnostic run (PROFILE_DIR, profile.yml) also records the server's own tallies beside the profile.
+  if [[ -n "${PROFILE_DIR:-}" && "$label" == "${PROFILE_SERVER:-ferrox}" ]]; then
+    FERROX_BENCH_COUNTERS="$logdir/server-counters.json" \
+      "$bin" "${args[@]}" >>"$logdir/server.log" 2>&1 &
+  else
+    "$bin" "${args[@]}" >>"$logdir/server.log" 2>&1 &
+  fi
   server_pid=$!
 }
 
@@ -827,6 +833,10 @@ while read -r id traffic connections iterations payload duration_ms; do
       wait "$perf_pid" 2>/dev/null || true
     fi
     matrix_stop_server
+    if [[ -n "${PROFILE_DIR:-}" && -f "$celldir/server-counters.json" ]]; then
+      cp "$celldir/server-counters.json" "$PROFILE_DIR/$cell.counters.json"
+      echo "::notice::$cell server counters: $(cat "$celldir/server-counters.json")"
+    fi
     {
       echo "# $cell: $traffic $connections flows, $iterations x $payload B, $repeats repeats"
       echo "# server: $server at $celldir/server.json ; client: $celldir/client.json"
