@@ -444,6 +444,8 @@ pub const H3_DATA: u64 = 0x00;
 pub const H3_HEADERS: u64 = 0x01;
 pub const H3_CANCEL_PUSH: u64 = 0x03;
 pub const H3_GOAWAY: u64 = 0x07;
+/// The application error a request stream's forbidden frame closes the connection with (RFC 9114 §8.1).
+pub const H3_FRAME_UNEXPECTED: u64 = 0x105;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct H3Frame {

@@ -71,6 +71,14 @@ impl Wire {
             Self::Client(stream) => stream.close(),
         }
     }
+
+    /// Closes the whole connection with an HTTP/3 application error, for a frame a request stream may not carry.
+    pub(crate) fn abort(&self, code: u64) {
+        match self {
+            Self::Server(stream) => stream.close_connection(code),
+            Self::Client(stream) => stream.close_connection(code),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -393,8 +401,8 @@ impl H3Reader {
                     }
                 }
                 frames::H3_CANCEL_PUSH => {
-                    // RFC 9114 §7.2.3: `CANCEL_PUSH` belongs to the control stream, so on a request stream it is `H3_FRAME_UNEXPECTED`; a request reset is QUIC `RESET_STREAM`, not a frame.
-                    self.reset();
+                    // RFC 9114 §7.2.3: `CANCEL_PUSH` belongs to the control stream, so on a request stream it is `H3_FRAME_UNEXPECTED`, a connection error; a request reset is QUIC `RESET_STREAM`, not a frame.
+                    self.wire.abort(frames::H3_FRAME_UNEXPECTED);
                     self.ended = true;
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -1003,6 +1011,15 @@ impl ClientStream {
         };
         let _ = conn.stream_shutdown(self.id, quiche::Shutdown::Read, 0);
         let _ = conn.stream_shutdown(self.id, quiche::Shutdown::Write, 0);
+        quic::flush_egress(&mut conn, &self.sock);
+    }
+
+    /// Closes the whole connection with an HTTP/3 application error.
+    fn close_connection(&self, code: u64) {
+        let Ok(mut conn) = self.conn.lock() else {
+            return;
+        };
+        let _ = conn.close(false, code, b"");
         quic::flush_egress(&mut conn, &self.sock);
     }
 }
