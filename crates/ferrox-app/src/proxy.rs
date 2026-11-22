@@ -84125,14 +84125,14 @@ end
     #[test]
     fn a_finished_udp_lane_is_retired_before_its_key_is_reused() {
         let address: SocketAddr = "127.0.0.1:9".parse().expect("addr");
-        let key = "lane";
+        let key = ("lane".to_owned(), 0);
         let handle = thread::spawn(|| {});
         while !handle.is_finished() {
             thread::yield_now();
         }
         let waker = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let mut lanes = HashMap::from([(
-            key.to_owned(),
+            key.clone(),
             UdpLane {
                 address,
                 handle,
@@ -84140,8 +84140,8 @@ end
             },
         )]);
         let mut replies = HashSet::from([address]);
-        let _ = retire_finished_lane(&mut lanes, &mut replies, key);
-        assert!(!lanes.contains_key(key));
+        let _ = retire_finished_lane(&mut lanes, &mut replies, &key);
+        assert!(!lanes.contains_key(&key));
         assert!(!replies.contains(&address));
     }
 
