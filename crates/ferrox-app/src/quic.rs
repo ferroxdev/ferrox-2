@@ -7851,7 +7851,7 @@ mod tests {
         assert_eq!(&after[..got], b"after");
     }
 
-    /// A peer's RESET_STREAM ends this direction as an error, not a clean fin: the caller must not
+    /// A peer's `RESET_STREAM` ends this direction as an error, not a clean fin: the caller must not
     /// read the reset request as a completed one.
     #[test]
     fn a_reset_stream_reads_as_connection_reset() {

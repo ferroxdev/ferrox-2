@@ -393,7 +393,7 @@ impl H3Reader {
                     }
                 }
                 frames::H3_CANCEL_PUSH => {
-                    // RFC 9114 §7.2.3: CANCEL_PUSH belongs to the control stream, so on a request stream it is H3_FRAME_UNEXPECTED; a request reset is QUIC RESET_STREAM, not a frame.
+                    // RFC 9114 §7.2.3: `CANCEL_PUSH` belongs to the control stream, so on a request stream it is `H3_FRAME_UNEXPECTED`; a request reset is QUIC `RESET_STREAM`, not a frame.
                     self.reset();
                     self.ended = true;
                     return Err(std::io::Error::new(
