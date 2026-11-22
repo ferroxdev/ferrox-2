@@ -1053,6 +1053,7 @@ engine-dns seconds-per-lookup UNBLESSED CI bench.yml (no cell yet)
 # --- the reverse tunnel -----------------------------------------------------
 reverse ops-retired-instructions 80066 scripts/count-ops.sh
 reverse tcp-echo-bytes-preserved 5 ferrox-app-proxy::reverse_tests::a_portal_flow_reaches_the_bridge_and_comes_back
+reverse fixed-bridge-route-allocations-per-datagram 0 ferrox-app-proxy::tests::a_bridge_datagram_route_borrows_its_lane
 
 # --- health observatory and healthcheck inbound -----------------------------
 engine-observatory ops-retired-instructions UNBLESSED scripts/count-ops.sh
@@ -1293,14 +1294,19 @@ carrier-hysteria established-destination-allocations-per-datagram 0 ferrox-app-h
 carrier-hysteria queued-datagram-allocations-per-datagram 0 ferrox-app-hysteria_v1::tests::an_established_destination_costs_no_key_and_no_insert
 carrier-hysteria established-destination-comparisons-per-datagram 1 ferrox-app-hysteria_v1::tests::a_known_destination_is_one_comparison_not_a_walk
 carrier-hysteria evicted-association-hint-answers 0 ferrox-app-hysteria_v1::tests::a_known_destination_is_one_comparison_not_a_walk
+carrier-hysteria waiting-list-scans-per-unqueued-datagram 0 ferrox-app-hysteria_v1::tests::a_datagram_that_queued_nothing_does_not_walk_the_waiting_lists
+carrier-hysteria waiting-list-flows-per-queued-datagram 1 ferrox-app-hysteria_v1::tests::a_datagram_that_queued_nothing_does_not_walk_the_waiting_lists
+carrier-hysteria queue-buffer-allocations-after-the-first 0 ferrox-app-hysteria_v1::tests::a_drained_queue_keeps_its_buffer_for_the_next_datagram
 socks reply-head-allocations-per-reply-datagram 0 ferrox-app-proxy::tests::a_reply_head_is_written_without_a_buffer
 socks reply-ns-per-reply 2.3 .github/workflows/bench.yml
 shadowsocks-2022 udp-session-body-key-derivations-per-session 1 ferrox-app-shadowsocks2022::tests::a_datagram_costs_one_derivation_one_clock_and_one_window
 shadowsocks-2022 udp-monotonic-reads-per-datagram 1 ferrox-app-shadowsocks2022::tests::a_datagram_costs_one_derivation_one_clock_and_one_window
 shadowsocks-2022 udp-window-checks-per-datagram 1 ferrox-app-shadowsocks2022::tests::a_datagram_costs_one_derivation_one_clock_and_one_window
+shadowsocks-2022 aead-body-opens-per-replayed-datagram 0 ferrox-app-shadowsocks2022::tests::a_replayed_datagram_does_not_open_the_body_again
 shadowsocks-2022 udp-user-list-builds-per-list 1 ferrox-app-shadowsocks2022::tests::a_multi_user_list_is_hashed_once_and_not_a_datagram
 tuic expiry-map-passes-per-sweep 2 ferrox-app-tuic::tests::every_expired_association_costs_one_pass_per_map
 carrier-masque paced-write-clock-reads 1 ferrox-app-masque::tests::a_paced_write_reads_one_clock
+carrier-masque paced-sleep-clock-reads 2 ferrox-app-masque::tests::a_paced_sleep_reads_the_clock_again_to_charge_itself_once
 
 # --- config formats + lint ---------------------------------------------------
 engine-config ops-retired-instructions UNBLESSED scripts/count-ops.sh

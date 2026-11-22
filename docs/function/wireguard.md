@@ -98,6 +98,8 @@ The two routing rows are one test's two wrappers: `route_scan_once` calls the pe
 
 The reassembly clock is read once per fragment, not twice, and not at all on an idle turn. A fragment used to read `StdInstant::now()` inside `expire` and again for the set a first fragment admits, so a four-fragment segment paid eight reads; `accept` takes one stamp and hands it to both (`reassembly-clock-reads-per-fragment` 1, no timeout walk). `expire_due` checks the earliest expiry first, so a turn with no set reads no clock (`idle-turn-clock-reads` 0). Both stamps feed the same 30 s timeout and `next_expiry`; only a fragment reaches either path.
 
+An extending fragment used to probe the set map five times — `contains_key`, a `get_mut` for the stamp, a `get` for the length, a `get_mut` to resize and a last `get_mut` for the payload — plus the peer row's probe. `accept` now takes one `get` for the length, admits a first fragment in place, and re-fetches only after the growth room is decided, so the path to an extending fragment's payload is three lookups, not five; a fragment that completes the segment adds the one `remove` it always paid. No mutable borrow is held across the admission or the growth. No row: the hash probe is not a counter the tree keeps, and the fragment suites assert the bytes and the caps, not the probe count.
+
 ## Ops
 
 ```bash

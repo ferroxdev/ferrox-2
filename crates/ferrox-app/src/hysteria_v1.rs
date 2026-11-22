@@ -608,6 +608,8 @@ struct Assocs {
     hit: Option<usize>,
     #[cfg(test)]
     probes: usize,
+    #[cfg(test)]
+    waited: usize,
 }
 
 impl Assocs {
@@ -657,10 +659,13 @@ impl Assocs {
         self.waiting += 1;
     }
 
-    fn drain(&mut self, at: usize) -> Vec<Vec<u8>> {
-        let drained = std::mem::take(&mut self.list[at].waiting);
-        self.waiting = self.waiting.saturating_sub(drained.len());
-        drained
+    fn drain(&mut self, at: usize, mut send: impl FnMut(&[u8])) {
+        let assoc = &mut self.list[at];
+        let len = assoc.waiting.len();
+        for payload in assoc.waiting.drain(..) {
+            send(&payload);
+        }
+        self.waiting = self.waiting.saturating_sub(len);
     }
 
     fn evict(&mut self, at: usize) {
@@ -673,6 +678,10 @@ impl Assocs {
         for assoc in &mut self.list {
             if keys.len() >= room {
                 break;
+            }
+            #[cfg(test)]
+            {
+                self.waited += 1;
             }
             if assoc.resolving || assoc.waiting.is_empty() {
                 continue;
@@ -734,6 +743,23 @@ impl UdpFlow {
 }
 
 impl UdpLane {
+    /// A datagram that queued a payload is the only one whose sweep can start resolver work; the
+    /// free-slot paths keep their own lane-wide resume.
+    fn resume_if(&mut self, session: u32, due: bool) -> Vec<(u32, String, u16)> {
+        if !due {
+            return Vec::new();
+        }
+        let room = MAX_PENDING_RESOLVERS.saturating_sub(self.resolving);
+        let Some(flow) = self.flows.get_mut(&session) else {
+            return Vec::new();
+        };
+        let mut spawn = Vec::new();
+        for (host, port) in flow.assocs.start_waiting(room) {
+            spawn.push((session, host, port));
+        }
+        spawn
+    }
+
     fn start_waiting(&mut self, room: usize) -> Vec<(u32, String, u16)> {
         let mut spawn = Vec::new();
         for (session, flow) in &mut self.flows {
@@ -1049,11 +1075,11 @@ fn relay_datagrams(
     }
     let lane_handle = Arc::clone(&inbound.udp);
     // One sweep takes the queue behind the packet the turn waited for, so the route, the lane, the lock and the clock are the sweep's, not each datagram's.
-    let now = now_nanos();
     let mut assembled = Vec::new();
     let Ok(mut lane) = lane_handle.lock() else {
         return;
     };
+    let now = now_nanos();
     while let Ok(data) = conn.dgram_recv_buf() {
         let Ok(message) = wire::decode_udp(&data) else {
             continue;
@@ -1063,6 +1089,7 @@ fn relay_datagrams(
         let port = message.port;
         let mut known = false;
         let mut forged = false;
+        let mut queued = false;
         if let Some(flow) = lane.flows.get_mut(&session) {
             known = true;
             flow.last.store(now, Ordering::Relaxed);
@@ -1081,12 +1108,13 @@ fn relay_datagrams(
                     });
                     if let Some(peer) = peer {
                         assoc.dest = Some(peer);
-                        drop(flow.assocs.drain(at));
+                        flow.assocs.drain(at, |_| {});
                         let _ = flow
                             .target
                             .send_to(message.payload, target_addr(&flow.target, peer));
                     } else if flow.assocs.waiting < MAX_PENDING_DATAGRAMS {
                         flow.assocs.enqueue(at, message.payload.to_vec());
+                        queued = true;
                     }
                 }
                 Ok(None) => {}
@@ -1098,8 +1126,7 @@ fn relay_datagrams(
             if forged {
                 lane.flows.remove(&session);
             } else {
-                let room = MAX_PENDING_RESOLVERS.saturating_sub(lane.resolving);
-                spawn = lane.start_waiting(room);
+                spawn = lane.resume_if(session, queued);
             }
             lane.resolving += spawn.len();
             for (session, host, port) in spawn {
@@ -1231,11 +1258,11 @@ fn resolve_pending(
     }
     if !flow.assocs.list.is_empty() {
         flow.assocs.list[0].dest = Some(peer);
-        for payload in flow.assocs.drain(0) {
+        flow.assocs.drain(0, |payload| {
             let _ = flow
                 .target
-                .send_to(&payload, target_addr(&flow.target, peer));
-        }
+                .send_to(payload, target_addr(&flow.target, peer));
+        });
     }
     guard.flows.insert(session, flow);
     resolving.release_in(&mut guard);
@@ -1285,12 +1312,11 @@ fn resolve_dest(handle: Arc<Mutex<UdpLane>>, session: u32, host: String, port: u
             flow.assocs.list[at].resolving = false;
             if let Some(peer) = peer {
                 flow.assocs.list[at].dest = Some(peer);
-                let queued = flow.assocs.drain(at);
-                for payload in queued {
+                flow.assocs.drain(at, |payload| {
                     let _ = flow
                         .target
-                        .send_to(&payload, target_addr(&flow.target, peer));
-                }
+                        .send_to(payload, target_addr(&flow.target, peer));
+                });
             } else {
                 flow.assocs.evict(at);
             }
@@ -2141,12 +2167,69 @@ mod tests {
         );
         let waiting = flow.assocs.start_waiting(MAX_UDP_ASSOCIATIONS);
         assert_eq!(waiting.len(), MAX_UDP_ASSOCIATIONS);
-        assert_eq!(
-            flow.assocs.drain(0).len(),
-            1,
-            "a resolution takes the queue it waited on"
-        );
+        let mut drained = 0usize;
+        flow.assocs.drain(0, |_| drained += 1);
+        assert_eq!(drained, 1, "a resolution takes the queue it waited on");
         assert_eq!(flow.assocs.waiting, MAX_UDP_ASSOCIATIONS - 1);
+    }
+
+    /// A datagram that queued no payload does not walk the waiting lists, and a queued one walks
+    /// only its own flow.
+    #[test]
+    fn a_datagram_that_queued_nothing_does_not_walk_the_waiting_lists() {
+        let mut lane = UdpLane::default();
+        for session in 0..2u32 {
+            let target = UdpSocket::bind("127.0.0.1:0").expect("binds");
+            let mut flow = UdpFlow {
+                target: Arc::new(target),
+                assocs: Assocs::default(),
+                last: Arc::new(AtomicU64::new(now_nanos())),
+                stop: Arc::new(AtomicBool::new(false)),
+            };
+            let at = flow.assocs.insert("queued.test", 53, 0).expect("room");
+            flow.assocs.enqueue(at, vec![1]);
+            lane.flows.insert(session, flow);
+        }
+        assert_eq!(lane.resume_if(0, false), Vec::new());
+        let walked: usize = lane.flows.values().map(|flow| flow.assocs.waited).sum();
+        assert_eq!(walked, 0, "a datagram that queued nothing walked no list");
+        let spawn = lane.resume_if(0, true);
+        assert_eq!(spawn.len(), 1, "only the sending flow's queue is started");
+        assert_eq!(spawn[0].0, 0, "the spawn names the sending session");
+        let walked: usize = lane.flows.values().map(|flow| flow.assocs.waited).sum();
+        assert_eq!(walked, 1, "a due sweep walks one flow, not every flow");
+    }
+
+    /// A drained queue keeps its buffer, so the next datagram for the same destination reuses it.
+    #[test]
+    fn a_drained_queue_keeps_its_buffer_for_the_next_datagram() {
+        let mut assocs = Assocs::default();
+        let at = assocs.insert("queued.test", 53, 0).expect("room");
+        assocs.enqueue(at, vec![1; 32]);
+        let cap = assocs.list[at].waiting.capacity();
+        let mut sent = 0usize;
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            assocs.drain(at, |_| sent += 1);
+        });
+        assert_eq!(sent, 1);
+        assert_eq!(counts.allocs, 0, "draining a payload frees no queue buffer");
+        assert_eq!(
+            assocs.list[at].waiting.capacity(),
+            cap,
+            "the queue buffer stayed"
+        );
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            assocs.enqueue(at, vec![2; 32]);
+            assocs.drain(at, |_| sent += 1);
+        });
+        assert_eq!(sent, 2);
+        assert_eq!(counts.allocs, 1, "only the next payload allocates");
+        assert_eq!(
+            assocs.list[at].waiting.capacity(),
+            cap,
+            "still the same queue buffer"
+        );
+        assert_eq!(assocs.waiting, 0);
     }
 
     /// A datagram on a known association finds its destination in place: no key is cloned and no

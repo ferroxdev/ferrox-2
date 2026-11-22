@@ -119,6 +119,7 @@ graph TD
 | quic-v2-bait-answer | consumed | ferrox-app-masque::tests::the_bait_triggers_a_version_negotiation_from_a_v1_only_server |
 | h3-lane-prefix-bytes-moved-per-datagram | 0 | ferrox-app-masque::tests::a_lane_datagram_keeps_its_prefix |
 | paced-write-clock-reads | 1 | ferrox-app-masque::tests::a_paced_write_reads_one_clock |
+| paced-sleep-clock-reads | 2 | ferrox-app-masque::tests::a_paced_sleep_reads_the_clock_again_to_charge_itself_once |
 <!-- counts:end -->
 
 The row 202 noise hook is the HTTP/3 client's: `masqueSettings.noize` is read into `ClientSpec`, and `attempt` sends that profile's junk and `i1`/`i2` before `quiche::connect`, so the QUIC ClientHello follows them. The default is `off` when the setting is absent; WARP-generated MASQUE settings always write `firewall` unless the operator chooses another profile. HTTP/2 and HTTP/1.1 have no pre-handshake UDP datagrams and take no noise, and the server role is unchanged. `noize::tests::masque_signatures_follow_the_reference_order` and `noize::tests::an_off_profile_sends_nothing` are the checkers.
@@ -133,7 +134,7 @@ The server leg's 0.15x ack clock points at the inner congestion window: the peer
 
 ## What we removed
 
-- **A second clock read per paced write.** `Pacer::account` read `Instant::now()` to earn tokens and read it again to move `last`, so an h3 datagram the pacer held back cost two reads; a write that does not sleep reads once now, and a sleeping one re-reads only after the sleep it must not credit to the next write. `a_paced_write_reads_one_clock` accounts three writes against a full token bucket and pins three reads (`paced-write-clock-reads 1`); the tokens earned and the sleep are the same.
+- **A second clock read per paced write.** `Pacer::account` read `Instant::now()` to earn tokens and read it again to move `last`, so an h3 datagram the pacer held back cost two reads; a write that does not sleep reads once now, and a sleeping one re-reads only after the sleep it must not credit to the next write. `a_paced_write_reads_one_clock` accounts three writes against a full token bucket and pins three reads (`paced-write-clock-reads 1`); the tokens earned and the sleep are the same. The budget reads through one counted `clock()`, so the reconciliation is observable: `a_paced_sleep_reads_the_clock_again_to_charge_itself_once` pins the sleep path at two reads and the bucket back at zero (`paced-sleep-clock-reads 2`), and an empty `account` reads none.
 
 - **A clock read per drained h2 frame.** `Client::pump` stamped `last_frame` inside the per-frame handler, so a burst of k frames read the clock k times. The stamp is one read per pump, after the drain; the keepalive compare only asks whether a frame arrived since the ping, so the gated value is unchanged. No row: a clock read the tree does not count.
 

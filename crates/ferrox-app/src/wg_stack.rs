@@ -754,16 +754,15 @@ impl Reassembly {
         if offset == end {
             return Reassembled::Held;
         }
-        if !self.parts.contains_key(&key) {
+        let len = if let Some(part) = self.parts.get(&key) {
+            part.payload.len()
+        } else {
             if !self.make_room(end, key) {
                 return Reassembled::Held;
             }
             self.insert_set(key, at, now);
-        }
-        if let Some(part) = self.parts.get_mut(&key) {
-            part.at = at;
-        }
-        let len = self.parts.get(&key).map_or(0, |part| part.payload.len());
+            0
+        };
         if end > len {
             let grow = end - len;
             if !self.make_growth_room(grow, &key) {
@@ -782,6 +781,7 @@ impl Reassembly {
                 .resize(end, 0);
         }
         let part = self.parts.get_mut(&key).expect("the set was just admitted");
+        part.at = at;
         if offset == 0 && part.header.is_empty() {
             part.header.extend_from_slice(&packet[..header_len]);
             part.next_header = if packet[0] >> 4 == 6 { packet[40] } else { 0 };

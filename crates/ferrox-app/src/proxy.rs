@@ -3246,23 +3246,19 @@ impl std::ops::Deref for Picked<'_> {
 }
 
 impl Picked<'_> {
+    /// The table entry behind the answer, as the identity a cached lane is keyed by.
+    fn id(&self) -> LaneId {
+        match self {
+            Self::Static(out) => LaneId::Static(std::ptr::from_ref(*out) as usize),
+            Self::Dynamic { id, .. } => LaneId::Dynamic(*id),
+        }
+    }
+
     /// The answer as an owned outbound, for a lane that outlives the plan's borrow.
     pub(crate) fn into_owned(self) -> Outbound {
         match self {
             Self::Static(out) => out.clone(),
             Self::Dynamic { out, .. } => (*out).clone(),
-        }
-    }
-
-    /// The owned outbound and the identity of the table entry behind it. A dynamic identity is a
-    /// never-reused generation, so a replacement cannot match a cached lane.
-    fn into_owned_with_id(self) -> (Outbound, LaneId) {
-        match self {
-            Self::Static(out) => (
-                out.clone(),
-                LaneId::Static(std::ptr::from_ref(out) as usize),
-            ),
-            Self::Dynamic { id, out } => ((*out).clone(), LaneId::Dynamic(id)),
         }
     }
 }
@@ -10324,7 +10320,10 @@ impl BridgeLane {
     /// The outbound one datagram takes and the tag that names its lane. The settings that tag
     /// carries are installed only when the caller opens a lane, so a reused lane never inherits
     /// another tag's source.
-    fn udp_route(&self, asked: &Destination) -> Option<(Outbound, Option<String>, LaneId)> {
+    fn udp_route<'a>(
+        &'a self,
+        asked: &Destination,
+    ) -> Option<(Picked<'a>, Option<std::borrow::Cow<'a, str>>, LaneId)> {
         let (picked, key) = match &self.plan {
             Some(plan) => plan.lane_with_protocol_untracked(
                 asked,
@@ -10337,8 +10336,8 @@ impl BridgeLane {
         if !udp_lane_supported(&picked) {
             return None;
         }
-        let (out, identity) = picked.into_owned_with_id();
-        Some((out, key.map(std::borrow::Cow::into_owned), identity))
+        let identity = picked.id();
+        Some((picked, key, identity))
     }
 
     /// The source and options the picked tag names, left for `spawn_udp_lane` on this thread.
@@ -11113,7 +11112,7 @@ fn serve_bridge_udp(
         let Some((out, key, identity)) = bridge.udp_route(&dest) else {
             continue;
         };
-        if matches!(&out, Outbound::Block(_)) {
+        if matches!(&*out, Outbound::Block(_)) {
             continue;
         }
         reap_finished_lanes(&mut lanes, &mut default_lane, &mut replies);
@@ -45519,6 +45518,32 @@ fn b64url(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// A bridge datagram borrows the configured outbound and its tag; the clone belongs to the
+    /// lane spawn, not to every datagram.
+    #[test]
+    fn a_bridge_datagram_route_borrows_its_lane() {
+        let bridge = BridgeLane {
+            plan: None,
+            fixed: Some(Outbound::Dns(DnsOut {
+                tcp: None,
+                address: Some("127.0.0.1".to_owned()),
+                port: 53,
+                rules: Vec::new(),
+            })),
+        };
+        let dest = Destination::Address("203.0.113.9:53".parse().expect("addr"));
+        let (route, counts) = ferrox_core::alloc_count::measure(|| bridge.udp_route(&dest));
+        assert!(route.is_some(), "the dns outbound carries a udp lane");
+        assert_eq!(
+            counts.allocs, 0,
+            "the route borrows the configured outbound"
+        );
+        let ((), before) = ferrox_core::alloc_count::measure(|| {
+            let _ = bridge.fixed.as_ref().expect("fixed").clone();
+        });
+        assert!(before.allocs > 0, "the old shape cloned it a datagram");
+    }
+
     impl Mux {
         /// The mux a config with only `enabled: true` folds to: the 128 concurrency floor and the shared datagram carrier.
         fn on() -> Mux {
@@ -46217,8 +46242,7 @@ mod tests {
         assert!(shared.add_outbound("alt", freedom()).is_ok());
         let identity = |plan: &RoutePlan| {
             plan.pick(&asked, crate::router::Network::Tcp, None, None)
-                .into_owned_with_id()
-                .1
+                .id()
         };
         let first = identity(&plan);
         assert!(lane(&plan));
@@ -88375,7 +88399,8 @@ mod reverse_tests {
             id: 7,
             out: Arc::clone(&out),
         };
-        let (owned, identity) = picked.into_owned_with_id();
+        let identity = picked.id();
+        let owned = picked.into_owned();
         assert_eq!(identity, LaneId::Dynamic(7));
         assert!(matches!(owned, Outbound::Block(_)));
     }

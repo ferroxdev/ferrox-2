@@ -36,6 +36,7 @@ graph TD
 | --- | --- | --- |
 | ops-retired-instructions | 80066 | scripts/count-ops.sh |
 | tcp-echo-bytes-preserved | 5 | ferrox-app-proxy::reverse_tests::a_portal_flow_reaches_the_bridge_and_comes_back |
+| fixed-bridge-route-allocations-per-datagram | 0 | ferrox-app-proxy::tests::a_bridge_datagram_route_borrows_its_lane |
 <!-- counts:end -->
 
 Syscalls: one loopback `connect`/`accept` per bridge worker at startup, one more pair per TCP flow through a non-`freedom` outbound, one mux frame write per uplink chunk, one outbound `connect` per bridged TCP flow, plus relay reads/writes. A routed UDP flow adds a loopback relay pair, a read/write per datagram, and one lane per tag. A fixed-`freedom` bridge keeps the direct socket. No checker counts this yet.
@@ -63,6 +64,8 @@ Copies: a whole downlink frame is parsed in place and copied once into the flow 
 **The downlink's second copy of a whole frame.** `read_loop` parses in place; only a straddling frame is carried. 80,066 Ir vs 109,108 (-29,042, -26.6%); the 16 KiB echo and 5-byte flow hold the bytes.
 
 **The reference's separate dispatcher and mux client.** The portal registers one `Outbound::ReversePortal` in the config's route registry; the session is a mux client used by nothing else; the bridge serves portal flows through the same `serve_mux_wire` as a VLESS mux inbound. The three command-4 checks (header, user, flow) live in one `reverse_ask`. sing-box has no VLESS reverse at this pin.
+
+**The outbound clone behind every routed UDP datagram.** `BridgeLane::udp_route` took the routing answer by value, so a plan-backed datagram cloned the whole `Outbound` config and its tag `String` before the lane was even consulted, and the fixed-`freedom` bridge cloned its outbound too. The route now returns the borrowed `Picked` and the plan's own `Cow`, and the owned clone happens once, in the lane spawn. `a_bridge_datagram_route_borrows_its_lane` measures a fixed `Dns` outbound: the route allocates nothing, while the old by-value answer cloned that outbound; a plan-backed route keeps the plan's own `Cow` instead of taking a `String` (`fixed-bridge-route-allocations-per-datagram 0`). A plan-backed route still returns an owned tag per datagram — the route plan builds it — so the row is scoped to the fixed outbound and the plan path is not claimed.
 
 ## What was not removed
 

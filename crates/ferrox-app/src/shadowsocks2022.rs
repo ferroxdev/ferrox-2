@@ -1614,6 +1614,7 @@ struct Ledger {
     derivations: usize,
     window_checks: usize,
     user_lists: usize,
+    opens: usize,
 }
 
 /// A session seen for the first time: the body key is the caller's to fill in.
@@ -1870,31 +1871,33 @@ impl Datagrams {
             if self.sessions.len() >= MAX_UDP_SESSIONS && !self.sessions.contains_key(&session) {
                 return None;
             }
-            let now = Instant::now();
-            #[cfg(test)]
-            {
-                self.ledger.clocks += 1;
-            }
             let (target, total, len) = match self.sessions.entry(session) {
                 std::collections::hash_map::Entry::Occupied(entry) => {
+                    #[cfg(test)]
+                    {
+                        self.ledger.window_checks += 1;
+                    }
+                    if !entry.get().window.check(packet_id) {
+                        return None;
+                    }
                     let cached = entry.get().cipher.as_ref();
                     let (len, derived) =
                         open_body(cached, psk, method, &raw[..8], &nonce, &mut packet[16..])?;
                     #[cfg(test)]
                     {
+                        self.ledger.opens += 1;
                         if derived.is_some() {
                             self.ledger.derivations += 1;
                         }
                     }
                     let (target, total) = parse_body(&packet[16..16 + len], 11, 0)?;
-                    let entry = entry.into_mut();
+                    let now = Instant::now();
                     #[cfg(test)]
                     {
-                        self.ledger.window_checks += 1;
+                        self.ledger.clocks += 1;
                     }
-                    if !entry.window.check_and_add(packet_id) {
-                        return None;
-                    }
+                    let entry = entry.into_mut();
+                    entry.window.add(packet_id);
                     entry.seen = now;
                     if let Some(cipher) = derived {
                         entry.cipher.get_or_insert(cipher);
@@ -1906,17 +1909,18 @@ impl Datagrams {
                         open_body(None, psk, method, &raw[..8], &nonce, &mut packet[16..])?;
                     #[cfg(test)]
                     {
+                        self.ledger.opens += 1;
                         self.ledger.derivations += 1;
                     }
                     let (target, total) = parse_body(&packet[16..16 + len], 11, 0)?;
-                    let mut fresh = fresh_session(now);
+                    let now = Instant::now();
                     #[cfg(test)]
                     {
+                        self.ledger.clocks += 1;
                         self.ledger.window_checks += 1;
                     }
-                    if !fresh.window.check_and_add(packet_id) {
-                        return None;
-                    }
+                    let mut fresh = fresh_session(now);
+                    fresh.window.add(packet_id);
                     fresh.cipher = derived;
                     entry.insert(fresh);
                     (target, total, len)
@@ -1960,6 +1964,13 @@ impl Datagrams {
         {
             return None;
         }
+        #[cfg(test)]
+        {
+            self.ledger.window_checks += 1;
+        }
+        if held.is_some_and(|entry| !entry.window.check(packet_id)) {
+            return None;
+        }
         let cached = held.and_then(|entry| entry.cipher.as_ref());
         let (len, derived) = open_body(
             cached,
@@ -1971,6 +1982,7 @@ impl Datagrams {
         )?;
         #[cfg(test)]
         {
+            self.ledger.opens += 1;
             if derived.is_some() {
                 self.ledger.derivations += 1;
             }
@@ -1988,13 +2000,7 @@ impl Datagrams {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => entry.insert(fresh_session(now)),
         };
-        #[cfg(test)]
-        {
-            self.ledger.window_checks += 1;
-        }
-        if !entry.window.check_and_add(packet_id) {
-            return None;
-        }
+        entry.window.add(packet_id);
         entry.seen = now;
         if entry.user.is_none() {
             entry.user = Some(idx);
@@ -2495,6 +2501,7 @@ pub(crate) fn serve_udp_on(
     let mut order: Vec<(u64, bool)> = Vec::new();
     let mut ordered: HashSet<(u64, bool)> = HashSet::new();
     let mut seen: HashSet<(u64, bool)> = HashSet::new();
+    let mut live: HashSet<u64> = HashSet::new();
     let mut cursor = 0usize;
     let mut resume: Option<(u64, bool)> = None;
     loop {
@@ -2587,7 +2594,8 @@ pub(crate) fn serve_udp_on(
                     .is_some_and(|at| now.saturating_duration_since(*at) < UPSTREAM_IDLE)
         });
         used.retain(|key, _| upstreams.contains_key(key));
-        let live: HashSet<u64> = upstreams.keys().map(|(session, _)| *session).collect();
+        live.clear();
+        live.extend(upstreams.keys().map(|(session, _)| *session));
         clients_of.retain(|session, _| live.contains(session));
         users.retain(|session, _| live.contains(session));
         let replay_ttl = Duration::from_secs(SKEW * 2 + 1);
@@ -3628,6 +3636,39 @@ mod tests {
         assert_eq!(
             server.ledger.window_checks, 3,
             "one window entry a datagram"
+        );
+    }
+
+    #[test]
+    fn a_replayed_datagram_does_not_open_the_body_again() {
+        let method = Method::Aes256Gcm;
+        let psk = vec![0x41u8; 32];
+        let target: SocketAddr = "127.0.0.1:53".parse().expect("addr");
+        let mut client = Datagrams::new();
+        let mut server = Datagrams::new();
+        let sealed = client
+            .seal(&psk, method, &target, b"one body open")
+            .expect("seals")
+            .to_vec();
+        let mut first = sealed.clone();
+        let (got, payload, _) = server.open(&psk, method, &mut first).expect("opens");
+        assert_eq!(got, target);
+        assert_eq!(payload, b"one body open");
+        assert_eq!(server.ledger.opens, 1);
+        for round in 0..3 {
+            let mut again = sealed.clone();
+            assert!(
+                server.open(&psk, method, &mut again).is_none(),
+                "round {round}: a replay is refused"
+            );
+            assert_eq!(
+                again, sealed,
+                "round {round}: a refused replay leaves the bytes alone"
+            );
+        }
+        assert_eq!(
+            server.ledger.opens, 1,
+            "a replay is refused before the body AEAD runs"
         );
     }
 

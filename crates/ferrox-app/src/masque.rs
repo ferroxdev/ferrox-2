@@ -71,23 +71,29 @@ impl Pacer {
         (rate > 0).then_some(rate)
     }
 
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn clock(&mut self) -> Instant {
+        #[cfg(test)]
+        {
+            self.clocks += 1;
+        }
+        Instant::now()
+    }
+
     #[allow(clippy::cast_precision_loss)]
     fn account(&mut self, bytes: u64) {
         if bytes == 0 {
             return;
         }
-        let now = Instant::now();
-        #[cfg(test)]
-        {
-            self.clocks += 1;
-        }
+        let now = self.clock();
         let earned = now.duration_since(self.last).as_secs_f64() * self.rate as f64;
         self.tokens = (self.tokens + earned).min(self.rate as f64) - bytes as f64;
         self.last = now;
         if self.tokens < 0.0 {
             std::thread::sleep(Duration::from_secs_f64(-self.tokens / self.rate as f64));
             self.tokens = 0.0;
-            self.last = Instant::now();
+            // The sleep is charged once: the next read is based on the post-sleep instant.
+            self.last = self.clock();
         }
     }
 }
@@ -4783,6 +4789,19 @@ mod tests {
             pacer.account(1);
         }
         assert_eq!(pacer.clocks, 3, "one clock a paced write, not two");
+    }
+
+    #[test]
+    fn a_paced_sleep_reads_the_clock_again_to_charge_itself_once() {
+        let mut pacer = Pacer::new(1_000_000);
+        pacer.account(0);
+        assert_eq!(pacer.clocks, 0, "an empty account reads no clock");
+        pacer.account(pacer.rate + 1);
+        assert_eq!(
+            pacer.clocks, 2,
+            "the worked read and the post-sleep read, nothing else"
+        );
+        assert_eq!(pacer.tokens, 0.0, "the sleep is charged once, not twice");
     }
 
     #[test]
