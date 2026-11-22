@@ -10253,6 +10253,13 @@ impl BridgeLane {
         self.udp_route(&asked).is_some()
     }
 
+    /// A bridge with one fixed `freedom` outbound has no second lane to choose, so its datagrams
+    /// keep the direct socket. A route plan can pick another outbound per destination and needs the
+    /// relay even when this first destination lands on `freedom`.
+    fn direct_udp(&self) -> bool {
+        self.plan.is_none() && matches!(self.fixed.as_ref(), Some(Outbound::Freedom(_)))
+    }
+
     /// The outbound one datagram takes and the tag that names its lane. The settings that tag
     /// carries are installed only when the caller opens a lane, so a reused lane never inherits
     /// another tag's source.
@@ -10890,24 +10897,21 @@ fn handle_mux_udp_new(
         return send_mux_end(out.wire, out.staging, frame.id);
     };
     let dest = target.destination();
-    let direct = if bridge.is_none() {
-        dest.socket()
+    let routed = bridge.is_some_and(|bridge| !bridge.direct_udp());
+    let direct = if routed { None } else { dest.socket() };
+    let stored = if routed {
+        dest.clone()
     } else {
-        None
-    };
-    if bridge.is_none() && direct.is_none() {
-        return send_mux_end(out.wire, out.staging, frame.id);
-    }
-    let stored = match (bridge, direct) {
-        (None, Some(address)) => Destination::Address(address),
-        _ => dest.clone(),
+        let Some(address) = direct else {
+            return send_mux_end(out.wire, out.staging, frame.id);
+        };
+        Destination::Address(address)
     };
     let empty = [0u8; ferrox_core::mux::GLOBAL_ID];
     let identity = frame.global_id.filter(|identity| *identity != empty);
     let reused = identity
         .and_then(|identity| global.get(&identity).copied())
         .and_then(|id| udp.remove(&id).map(|session| (id, session)));
-    let routed = bridge.is_some();
     let reused = match reused {
         Some((old, session)) if session.routed == routed => Some((old, session)),
         Some((old, session)) => {
@@ -10930,7 +10934,7 @@ fn handle_mux_udp_new(
             .unwrap_or_else(std::sync::PoisonError::into_inner) = stored.clone();
         session
     } else {
-        let (socket, lane_stop) = if let Some(bridge) = bridge {
+        let (socket, lane_stop) = if let Some(bridge) = bridge.filter(|_| routed) {
             let Ok(relay) = UdpSocket::bind("127.0.0.1:0") else {
                 return send_mux_end(out.wire, out.staging, frame.id);
             };
