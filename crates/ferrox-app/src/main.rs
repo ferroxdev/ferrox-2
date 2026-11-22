@@ -44,6 +44,7 @@ mod hysteria_realm;
 mod hysteria_v1;
 mod json;
 mod limit;
+mod lint;
 mod masque;
 mod masque_h1;
 mod masque_h2;
@@ -835,10 +836,10 @@ fn read_conf_dir(dir: &str, format: Option<&str>, out: &mut Vec<String>) {
     let entries = std::fs::read_dir(dir)
         .unwrap_or_else(|error| proxy::exit(&format!("cannot read {dir}: {error}")));
     let suffixes: &[&str] = match format.map(str::to_ascii_lowercase).as_deref() {
-        Some("json" | "jsonc") => &["json", "jsonc"],
+        Some("json" | "jsonc" | "json5") => &["json", "jsonc", "json5"],
         Some("toml") => &["toml"],
         Some("yaml" | "yml") => &["yaml", "yml"],
-        _ => &["json", "jsonc", "toml", "yaml", "yml"],
+        _ => &["json", "jsonc", "json5", "toml", "yaml", "yml"],
     };
     let mut names: Vec<std::path::PathBuf> = entries
         .filter_map(Result::ok)
@@ -935,6 +936,7 @@ fn dump_config(configs: &[String], named: Option<&str>) -> ! {
             crate::json::merge(&mut merged, &root, &label);
         }
     }
+    crate::json::order_by_priority(&mut merged);
     let mut text = String::new();
     crate::json::write(&merged, &mut text);
     println!("{text}");
@@ -957,6 +959,7 @@ fn require_object(root: crate::json::Json) -> Result<crate::json::Json, String> 
 enum SourceFormat {
     Json,
     Jsonc,
+    Json5,
     Yaml,
     Toml,
     Protobuf,
@@ -970,6 +973,7 @@ fn discover_config() -> String {
         for name in [
             "config.json",
             "config.jsonc",
+            "config.json5",
             "config.toml",
             "config.yaml",
             "config.yml",
@@ -1000,14 +1004,13 @@ fn discover_config() -> String {
 fn source_format(named: Option<&str>, source: &str) -> SourceFormat {
     match named.map(str::to_ascii_lowercase).as_deref() {
         Some("pb" | "protobuf") => SourceFormat::Protobuf,
-        Some("json") => {
-            if config_extension(source).eq_ignore_ascii_case("jsonc") {
-                SourceFormat::Jsonc
-            } else {
-                SourceFormat::Json
-            }
-        }
+        Some("json") => match config_extension(source).to_ascii_lowercase().as_str() {
+            "jsonc" => SourceFormat::Jsonc,
+            "json5" => SourceFormat::Json5,
+            _ => SourceFormat::Json,
+        },
         Some("jsonc") => SourceFormat::Jsonc,
+        Some("json5") => SourceFormat::Json5,
         Some("yaml" | "yml") => SourceFormat::Yaml,
         Some("toml") => SourceFormat::Toml,
         Some("auto") | None => {
@@ -1016,6 +1019,8 @@ fn source_format(named: Option<&str>, source: &str) -> SourceFormat {
                 SourceFormat::Protobuf
             } else if extension.eq_ignore_ascii_case("jsonc") {
                 SourceFormat::Jsonc
+            } else if extension.eq_ignore_ascii_case("json5") {
+                SourceFormat::Json5
             } else if extension.eq_ignore_ascii_case("yaml")
                 || extension.eq_ignore_ascii_case("yml")
             {
@@ -1744,14 +1749,25 @@ fn config_text(bytes: &[u8], format: SourceFormat) -> Result<std::borrow::Cow<'_
             crate::json::write(&toml_json(&value)?, &mut out);
             Ok(std::borrow::Cow::Owned(out))
         }
-        SourceFormat::Json => Ok(std::borrow::Cow::Borrowed(
-            std::str::from_utf8(bytes).map_err(|error| error.to_string())?,
-        )),
-        SourceFormat::Jsonc => Ok(crate::json::strip_jsonc(
-            std::str::from_utf8(bytes).map_err(|error| error.to_string())?,
-        )),
+        SourceFormat::Json | SourceFormat::Jsonc | SourceFormat::Json5 => {
+            let text = std::str::from_utf8(bytes).map_err(|error| error.to_string())?;
+            if strict_json() {
+                Ok(std::borrow::Cow::Borrowed(text))
+            } else {
+                Ok(crate::json::strip_jsonc(text))
+            }
+        }
         SourceFormat::Protobuf => Err("protobuf is not JSON".to_owned()),
     }
+}
+
+/// `xray.json.strict`, or its normalized spelling, turns the permissive JSON reader off, as the
+/// reference's `UseStrictJSON` does.
+fn strict_json() -> bool {
+    ["xray.json.strict", "XRAY_JSON_STRICT"]
+        .iter()
+        .find_map(|name| std::env::var(name).ok())
+        .is_some_and(|value| value == "true")
 }
 
 fn yaml_mapping(map: &serde_yaml_ng::Mapping) -> Result<Vec<(String, crate::json::Json)>, String> {
@@ -1899,6 +1915,39 @@ mod tests {
             crate::source_format(Some("json"), "https://example/config.json"),
             crate::SourceFormat::Json
         ));
+    }
+
+    #[test]
+    fn a_json5_source_is_the_permissive_reader() {
+        assert!(matches!(
+            crate::source_format(None, "config.json5"),
+            crate::SourceFormat::Json5
+        ));
+        assert!(matches!(
+            crate::source_format(Some("json5"), "config.any"),
+            crate::SourceFormat::Json5
+        ));
+        assert!(matches!(
+            crate::source_format(Some("json"), "config.json5"),
+            crate::SourceFormat::Json5
+        ));
+    }
+
+    #[test]
+    fn the_json_family_accepts_the_reference_comment_dialect() {
+        let text = "# python\n{\"a\": 1, // java\n /* block */}";
+        for format in [
+            crate::SourceFormat::Json,
+            crate::SourceFormat::Jsonc,
+            crate::SourceFormat::Json5,
+        ] {
+            let body = crate::config_text(text.as_bytes(), format).expect("json");
+            let root = crate::json::parse(&body).expect("json");
+            assert_eq!(
+                root.get("a").and_then(crate::json::Json::as_u32),
+                Some(1)
+            );
+        }
     }
 
     #[test]

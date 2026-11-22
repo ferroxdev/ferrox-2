@@ -21,6 +21,10 @@ const DEFAULT_TTL: u32 = 300;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(4);
 const HOSTS_TTL: u32 = 10;
 const RESOLVE_CACHE_CAP: usize = 4096;
+pub(crate) const FAKE_V4_POOL: &str = "198.18.0.0/15";
+pub(crate) const FAKE_V6_POOL: &str = "2001:2::/48";
+pub(crate) const FAKE_DOUBLE_POOL_SIZE: u32 = 32768;
+pub(crate) const FAKE_SINGLE_POOL_SIZE: u32 = 65535;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Strategy {
@@ -1827,21 +1831,37 @@ fn parse_fake(
                 let single = default_v4 != default_v6;
                 let (pool, size) = if default_v4 && !only_v4 {
                     only_v4 = true;
-                    ("198.18.0.0/15", if single { 65535 } else { 32768 })
+                    (
+                        FAKE_V4_POOL,
+                        if single {
+                            FAKE_SINGLE_POOL_SIZE
+                        } else {
+                            FAKE_DOUBLE_POOL_SIZE
+                        },
+                    )
                 } else if default_v6 && !only_v6 {
                     only_v6 = true;
-                    ("2001:2::/48", if single { 65535 } else { 32768 })
+                    (
+                        FAKE_V6_POOL,
+                        if single {
+                            FAKE_SINGLE_POOL_SIZE
+                        } else {
+                            FAKE_DOUBLE_POOL_SIZE
+                        },
+                    )
                 } else {
-                    ("198.18.0.0/15", 32768)
+                    (FAKE_V4_POOL, FAKE_DOUBLE_POOL_SIZE)
                 };
-                (pool.to_owned(), size)
+                (pool.to_owned(), size as usize)
             }
             Json::Obj(_) => (
                 item.get("ipPool")
                     .and_then(Json::as_str)
-                    .unwrap_or("198.18.0.0/15")
+                    .unwrap_or(FAKE_V4_POOL)
                     .to_owned(),
-                item.get("poolSize").and_then(Json::as_u32).unwrap_or(65535) as usize,
+                item.get("poolSize")
+                    .and_then(Json::as_u32)
+                    .unwrap_or(FAKE_SINGLE_POOL_SIZE) as usize,
             ),
             _ => return Err("dns: fakeDns pool is not an object".into()),
         };
