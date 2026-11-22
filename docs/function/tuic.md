@@ -82,6 +82,8 @@ CI's `bench.yml` run `44694951611` prices the removed per-frame tail shift on a 
 
 CI's `bench.yml` run `44783358849` sweeps a worker's 1024 sessions, the cap the map holds: scanning the touched list costs **98.6 ns** per session against **15.6** marking the identity set on linux x86_64, **90.2** against **13.7** on linux aarch64 and **85.8** against **12.5** on windows x86_64. The set's per-session cost is fixed overhead spread over the sweep, so the row reads the cap rather than a session count the map cannot reach; the visits and their order are the same in both shapes. That run's macos cell was cancelled by the runner, not by a failure.
 
+A lane whose settings name no `congestion_control` now takes the protocol client's own default, `bbr`, on both the client and the inbound, where it previously kept quiche's cubic and paid the reference's slower window growth; a config that names `cubic`, `reno` or `new_reno` still gets exactly that. The `tuic-raw-down-8`, `tuic-raw-duplex-8` and `tuic-raw-up-1` cells are the gate, and their configs name no controller, so they read the default.
+
 <!-- scope:begin -->
 - paths: crates/ferrox-app/src/tuic.rs, crates/ferrox-core/src/tuic.rs
 - symbols: tuic

@@ -4926,8 +4926,8 @@ pub(crate) struct QuicStream {
 /// How long one stream read polls quiche before idling: FIN and close land inside the next quantum.
 const STREAM_QUANTUM: Duration = Duration::from_millis(100);
 
-/// What a flow-control-blocked writer waits before it asks quiche again: the window reopens on an ack that lands in microseconds, and a quantum of 5 ms caps a stream at window/quantum.
-const SEND_POLL: Duration = Duration::from_micros(250);
+/// What a flow-control-blocked writer waits before it asks quiche again: the window reopens on an ack that lands in microseconds, and a quantum of 25 µs caps a stream at window/quantum.
+const SEND_POLL: Duration = Duration::from_micros(25);
 
 /// Between polls of quiche state, so a waiting read never holds the connection lock.
 const STREAM_POLL: Duration = Duration::from_millis(5);
