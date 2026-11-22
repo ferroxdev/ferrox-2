@@ -2558,6 +2558,7 @@ pub(crate) struct H3 {
     direct: usize,
     /// The source addresses the proxy currently lets this CONNECT-IP lane use, replaced whole by each assignment capsule.
     assigned: Assignment,
+    fin: bool,
     /// The peer sent its fin: nothing more will arrive on the request stream, so a reader that has the bytes it was given is at the end of the tunnel and a reader that has none is at the end of a stream that carried none.
     closed: bool,
     deadline: Instant,
@@ -2632,6 +2633,7 @@ impl H3 {
             handed: 0,
             direct: 0,
             assigned: ([0u8; 32], [0usize; 2]),
+            fin: false,
             closed: false,
             deadline: Instant::now(),
             head_wait,
@@ -2713,6 +2715,7 @@ impl H3 {
             handed: 0,
             direct: 0,
             assigned: ([0u8; 32], [0usize; 2]),
+            fin: false,
             closed: false,
             deadline: Instant::now(),
             head_wait: HEADER_TIMEOUT,
@@ -2741,6 +2744,7 @@ impl H3 {
             handed: 0,
             direct: 0,
             assigned: ([0u8; 32], [0usize; 2]),
+            fin: false,
             closed: false,
             deadline: Instant::now(),
             head_wait: HEADER_TIMEOUT,
@@ -2855,6 +2859,8 @@ impl H3 {
             }
             frames::H3_GOAWAY => {
                 // RFC 9114 §7.2.6: a GOAWAY on a request stream is H3_FRAME_UNEXPECTED, so the tunnel ends as a protocol error rather than a clean end.
+                self.fin = true;
+                self.carried = self.filled;
                 return Err(Failure::Stream);
             }
             _ => {
@@ -2905,6 +2911,9 @@ impl H3 {
                     continue;
                 }
                 return Ok(granted);
+            }
+            if self.fin {
+                return Err(Failure::Stream);
             }
             self.fill_capsules().map_err(io)?;
         }
@@ -2981,6 +2990,9 @@ impl H3 {
                 }
                 continue;
             }
+            if self.fin {
+                return Ok(false);
+            }
             if self.closed {
                 // The peer finished the stream: the packet that never came is a packet the peer never sent.
                 return Ok(false);
@@ -3036,6 +3048,9 @@ impl H3 {
 
     /// One UDP payload as one DATAGRAM capsule inside one DATA frame. The two headers ride the lane's own scratch and the payload keeps the caller's buffer: quiche copies every slice it is handed, so joining the datagram ahead of that copy crossed each of its bytes in userspace twice.
     pub(crate) fn write_datagram(&mut self, payload: &[u8]) -> std::io::Result<()> {
+        if self.fin {
+            return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        }
         let mut prefix = [0u8; 10];
         let plen = masque::datagram_prefix_into(&mut prefix, payload.len());
         let mut head = [0u8; 9];
@@ -3103,6 +3118,9 @@ impl H3 {
                     continue;
                 }
                 return Ok(take);
+            }
+            if self.fin {
+                return Ok(0);
             }
             if self.closed {
                 // The peer finished the stream: the datagram that never came is a datagram the peer never sent, and `Ok(0)` is the end of the stream.
@@ -3400,6 +3418,8 @@ impl H3 {
         }
         if frame.kind == frames::H3_GOAWAY {
             // RFC 9114 §7.2.6: a GOAWAY on a request stream is H3_FRAME_UNEXPECTED, so the tunnel ends as a protocol error rather than a clean end.
+            self.fin = true;
+            self.carried = self.filled;
             return Err(Failure::Stream);
         }
         if length > H3_SKIP {
@@ -3630,6 +3650,9 @@ impl H3 {
 
 impl Write for H3 {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.fin {
+            return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        }
         let frame = foxy::flow::frame_size(buf.len(), H3_FRAME);
         if frame == 0 {
             return Ok(0);
@@ -3671,6 +3694,10 @@ impl Read for H3 {
                     };
                 }
                 continue;
+            }
+            if self.fin {
+                // The tunnel is over: the bytes already delivered are the caller's, and the next read is the end of the stream.
+                return Ok(delivered);
             }
             if self.closed {
                 // The peer finished the stream. The bytes it sent are in the caller's hands, and what the stream still holds behind them is the caller's too: a fin says no more will arrive, not that none arrived.
