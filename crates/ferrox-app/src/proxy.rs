@@ -368,7 +368,8 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, tes
     });
     if !test {
         if let Some(route) = &route {
-            crate::group::spawn(&route.groups, route);
+            crate::group::spawn(&route.groups, route)
+                .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
         }
     }
     if let Some(observatory) = &observatory {
@@ -3390,7 +3391,6 @@ pub(crate) struct RouteShared {
     has_dial_settings: bool,
     dynamic: Arc<RwLock<Dynamic>>,
     changed: AtomicBool,
-    revision: AtomicU64,
     closed: Outbound,
     /// The table's own weak handle, so an outbound the management API adds later can bind a
     /// loopback's second routing pass without the table keeping itself alive.
@@ -3443,10 +3443,22 @@ impl RouteShared {
         }
     }
 
-    /// A counter that moves whenever a tag is added or removed, so a probe can discard a reading
-    /// whose outbound changed while it was in flight.
-    pub(crate) fn revision(&self) -> u64 {
-        self.revision.load(Ordering::Relaxed)
+    /// A marker for one tag that moves when that tag is added or removed, so a probe discards only
+    /// a reading whose own outbound changed.
+    pub(crate) fn leaf_revision(&self, tag: &str) -> Option<u64> {
+        if self.changed.load(Ordering::Relaxed) {
+            let dynamic = self
+                .dynamic
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if dynamic.removed.contains(tag) {
+                return None;
+            }
+            if let Some(out) = dynamic.added.get(tag) {
+                return Some(out.id);
+            }
+        }
+        (self.tagged.contains_key(tag) || self.default_tag.as_deref() == Some(tag)).then_some(0)
     }
 
     /// The outbound a `geodata.outbound` tag names, borrowed from the registry rather than copied.
@@ -3687,7 +3699,6 @@ impl RouteShared {
             },
         );
         self.changed.store(true, Ordering::Relaxed);
-        self.revision.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -3705,7 +3716,6 @@ impl RouteShared {
         }
         if was_added || was_static {
             self.changed.store(true, Ordering::Relaxed);
-            self.revision.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -5326,7 +5336,6 @@ fn route_shared_with_api(
         has_dial_settings,
         dynamic,
         changed: AtomicBool::new(false),
-        revision: AtomicU64::new(0),
         closed: Outbound::Block(ferrox_core::blackhole::Response::None),
         self_weak: OnceLock::new(),
     });

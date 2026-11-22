@@ -797,11 +797,11 @@ fn round_trip(
     io.write_all(request.as_bytes())
         .map_err(|error| error.to_string())?;
     io.flush().map_err(|error| error.to_string())?;
-    let (head, end) = read_head(io)?;
+    let (head, start, end) = read_final_head(io)?;
     if !read_body || method != "GET" {
         return Ok(());
     }
-    let content = content_length(&head[..end]);
+    let content = content_length(&head[start..end]);
     let mut left = content.saturating_sub(head.len() - end);
     let mut buf = [0u8; 4096];
     while left > 0 {
@@ -820,25 +820,55 @@ fn round_trip(
     Ok(())
 }
 
-/// The answer's head and where it ends, one window at a time: the terminator scan resumes three octets before the octets that just arrived, so a head that drips in is walked once rather than once per window, and it reaches the tree's one `\r\n\r\n` scan rather than a second byte-window loop.
-fn read_head(io: &mut dyn Read) -> Result<(Vec<u8>, usize), String> {
+/// The final response head, skipping nonterminal informational heads. The returned start is where
+/// that head begins in the buffer, so a final head already read behind a `103` is not discarded.
+fn read_final_head(io: &mut dyn Read) -> Result<(Vec<u8>, usize, usize), String> {
     let mut head = Vec::with_capacity(1024);
-    let mut buf = [0u8; 4096];
+    let mut start = 0;
     loop {
+        let end = read_head(io, &mut head, start)?;
+        if status_code(&head[start..end])
+            .is_none_or(|status| !(100..200).contains(&status) || status == 101)
+        {
+            return Ok((head, start, end));
+        }
+        start = end;
+    }
+}
+
+/// One head's end, one window at a time: the scan resumes three octets before the octets that
+/// just arrived, so a head that drips in is walked once rather than once per window, and it
+/// reaches the tree's one `\r\n\r\n` scan rather than a second byte-window loop.
+fn read_head(io: &mut dyn Read, head: &mut Vec<u8>, start: usize) -> Result<usize, String> {
+    let mut buf = [0u8; 4096];
+    let mut scanned = start;
+    loop {
+        let from = scanned.saturating_sub(3);
+        if let Some(at) = ferrox_core::foxy::head_end(&head[from..]) {
+            let end = from + at + 4;
+            if end > start {
+                return Ok(end);
+            }
+        }
+        scanned = head.len();
         let read = io.read(&mut buf).map_err(|error| error.to_string())?;
         if read == 0 {
             return Err("the peer closed before a response head".to_owned());
         }
-        // A terminator straddles the seam at most three octets into what was already here.
-        let from = head.len().saturating_sub(3);
         head.extend_from_slice(&buf[..read]);
-        if let Some(at) = ferrox_core::foxy::head_end(&head[from..]) {
-            return Ok((head, from + at + 4));
-        }
         if head.len() > 65_536 {
             return Err("the response head is over 64 KiB".to_owned());
         }
     }
+}
+
+fn status_code(head: &[u8]) -> Option<u16> {
+    std::str::from_utf8(head.split(|byte| *byte == b'\n').next()?)
+        .ok()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
 }
 
 fn content_length(head: &[u8]) -> usize {
@@ -1025,6 +1055,35 @@ mod tests {
         }
     }
 
+    struct Canned<'a> {
+        parts: &'a [&'a [u8]],
+        at: usize,
+        reads: usize,
+    }
+
+    impl Read for Canned<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let Some(chunk) = self.parts.get(self.at) else {
+                return Ok(0);
+            };
+            self.at += 1;
+            self.reads += 1;
+            let take = chunk.len().min(out.len());
+            out[..take].copy_from_slice(&chunk[..take]);
+            Ok(take)
+        }
+    }
+
+    impl Write for Canned<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     /// A reader that hands over `window` octets a call, so a head arriving in pieces is the same reader every run.
     struct Trickle<'a> {
         bytes: &'a [u8],
@@ -1051,15 +1110,60 @@ mod tests {
             .expect("a terminator")
             + 4;
         for window in 1..=answer.len() {
-            let (head, at) = read_head(&mut Trickle {
-                bytes: answer,
-                window,
-            })
+            let mut head = Vec::new();
+            let at = read_head(
+                &mut Trickle {
+                    bytes: answer,
+                    window,
+                },
+                &mut head,
+                0,
+            )
             .unwrap_or_else(|error| panic!("window {window}: {error}"));
             assert_eq!(at, end, "window {window}");
             assert_eq!(head.as_slice(), &answer[..head.len()], "window {window}");
             assert_eq!(&head[end - 4..end], b"\r\n\r\n", "window {window}");
         }
+    }
+
+    #[test]
+    fn an_informational_head_is_skipped_until_the_final_response() {
+        let chunks: &[&[u8]] = &[
+            b"HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        ];
+        let mut io = Canned {
+            parts: chunks,
+            at: 0,
+            reads: 0,
+        };
+        let url = HttpUrl::parse("http://example.com/").expect("parses");
+        round_trip(&mut io, &url, "HEAD", false).expect("the final response answers");
+        assert_eq!(io.reads, 2);
+    }
+
+    #[test]
+    fn a_final_head_behind_an_informational_head_in_one_read_is_kept() {
+        let answer: &[u8] =
+            b"HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let mut io = Trickle {
+            bytes: answer,
+            window: answer.len(),
+        };
+        let (head, start, end) = read_final_head(&mut io).expect("a final head");
+        assert!(start > 0);
+        assert_eq!(status_code(&head[start..end]), Some(200));
+        assert_eq!(end, head.len());
+    }
+
+    #[test]
+    fn early_hints_without_a_final_head_are_an_error() {
+        let answer: &[u8] = b"HTTP/1.1 103 Early Hints\r\n\r\n";
+        let mut io = Trickle {
+            bytes: answer,
+            window: answer.len(),
+        };
+        assert!(read_final_head(&mut io).is_err());
     }
 
     /// An eight-kilobyte answer head that drips in as sixteen 512-octet windows, its terminator in the last four: the shape both scans below are read on.
@@ -1107,11 +1211,15 @@ mod tests {
         let joined = sixteen_windows().concat();
         let mut fold: u32 = 0;
         for _ in 0..64 {
-            let end = read_head(&mut Trickle {
-                bytes: &joined,
-                window: 512,
-            })
-            .map(|(_, end)| end)
+            let mut head = Vec::new();
+            let end = read_head(
+                &mut Trickle {
+                    bytes: &joined,
+                    window: 512,
+                },
+                &mut head,
+                0,
+            )
             .expect("a head");
             fold = fold
                 .wrapping_mul(31)

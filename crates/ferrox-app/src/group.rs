@@ -246,7 +246,6 @@ impl Group {
             return;
         }
         let next = AtomicUsize::new(0);
-        let results = Mutex::new(Vec::with_capacity(leaves.len()));
         let url = &self.url;
         std::thread::scope(|scope| {
             for _ in 0..leaves.len().min(FANOUT) {
@@ -255,33 +254,23 @@ impl Group {
                     let Some(leaf) = leaves.get(at) else {
                         break;
                     };
-                    let revision = route.revision();
-                    let delay = route
-                        .probe_target(leaf)
-                        .map(|target| {
-                            crate::observatory::probe(&target, url, "HEAD", PROBE_TIMEOUT, false)
-                        })
-                        .transpose()
-                        .ok()
-                        .flatten()
-                        .filter(|_| route.revision() == revision)
-                        .map(|delay| u16::try_from(delay.as_millis()).unwrap_or(u16::MAX));
-                    results
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push((leaf.clone(), delay));
+                    let revision = route.leaf_revision(leaf);
+                    let delay = route.probe_target(leaf).map(|target| {
+                        crate::observatory::probe(&target, url, "HEAD", PROBE_TIMEOUT, false)
+                            .ok()
+                            .map(|delay| u16::try_from(delay.as_millis()).unwrap_or(u16::MAX))
+                    });
+                    if route.leaf_revision(leaf) != revision {
+                        continue;
+                    }
+                    match delay {
+                        Some(Some(millis)) => self.history.store(leaf, millis),
+                        Some(None) => self.history.delete(leaf),
+                        None => {}
+                    }
                 });
             }
         });
-        for (leaf, delay) in results
-            .into_inner()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-        {
-            match delay {
-                Some(millis) => self.history.store(&leaf, millis),
-                None => self.history.delete(&leaf),
-            }
-        }
     }
 }
 
@@ -517,7 +506,10 @@ pub(crate) fn check_cycles(groups: &HashMap<String, Arc<Group>>) -> Result<(), S
 
 /// Start one probe loop per urltest group; a group that has been idle for its timeout is skipped
 /// until a flow touches it again.
-pub(crate) fn spawn(groups: &HashMap<String, Arc<Group>>, route: &Arc<RouteShared>) {
+pub(crate) fn spawn(
+    groups: &HashMap<String, Arc<Group>>,
+    route: &Arc<RouteShared>,
+) -> Result<(), String> {
     for group in groups.values() {
         if group.kind != Kind::UrlTest {
             continue;
@@ -525,7 +517,7 @@ pub(crate) fn spawn(groups: &HashMap<String, Arc<Group>>, route: &Arc<RouteShare
         let name = group.tag.clone();
         let group = Arc::clone(group);
         let route = Arc::clone(route);
-        if let Err(error) = std::thread::Builder::new()
+        std::thread::Builder::new()
             .name(format!("ferrox-urltest-{name}"))
             .spawn(move || {
                 group.probe(&route);
@@ -540,10 +532,9 @@ pub(crate) fn spawn(groups: &HashMap<String, Arc<Group>>, route: &Arc<RouteShare
                     }
                 }
             })
-        {
-            eprintln!("urltest `{name}` probe loop did not start: {error}");
-        }
+            .map_err(|error| format!("urltest `{name}` probe loop did not start: {error}"))?;
     }
+    Ok(())
 }
 
 impl Group {
