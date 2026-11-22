@@ -3249,8 +3249,8 @@ impl Picked<'_> {
         }
     }
 
-    /// The owned outbound and the identity of the table entry behind it. The dynamic identity
-    /// holds its `Arc`, so the allocator cannot hand the same address to a replacement.
+    /// The owned outbound and the identity of the table entry behind it. A dynamic identity is a
+    /// never-reused generation, so a replacement cannot match a cached lane.
     fn into_owned_with_id(self) -> (Outbound, LaneId) {
         match self {
             Self::Static(out) => (
@@ -3263,7 +3263,7 @@ impl Picked<'_> {
 }
 
 /// The table entry a cached lane was opened for. Static entries have a stable address; a dynamic
-/// entry keeps its `Arc` alive for the lane's life, so pointer reuse cannot forge a match.
+/// entry carries a never-reused generation, so pointer reuse cannot forge a match.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum LaneId {
     Static(usize),
@@ -88281,9 +88281,12 @@ mod reverse_tests {
     fn a_finished_lane_in_an_old_bucket_is_reaped() {
         let live_socket = UdpSocket::bind("127.0.0.1:0").expect("live socket");
         let live_address = live_socket.local_addr().expect("live address");
+        let (release, hold) = std::sync::mpsc::channel();
         let live = UdpLane {
             address: live_address,
-            handle: thread::spawn(|| thread::sleep(Duration::from_millis(10))),
+            handle: thread::spawn(move || {
+                let _ = hold.recv();
+            }),
             waker: live_socket.try_clone().expect("live waker"),
         };
         let finished_socket = UdpSocket::bind("127.0.0.1:0").expect("finished socket");
@@ -88313,6 +88316,153 @@ mod reverse_tests {
         assert!(lanes.contains_key(&LaneId::Static(2)));
         assert!(!replies.contains(&finished_address));
         assert!(replies.contains(&live_address));
+        let live = lanes
+            .remove(&LaneId::Static(2))
+            .expect("live bucket")
+            .remove("live")
+            .expect("live lane");
+        release.send(()).expect("releases live lane");
+        live.handle.join().expect("live lane joins");
+    }
+
+    fn socks_udp_recorder(
+        hold: std::sync::mpsc::Receiver<()>,
+    ) -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>, thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let server_addr = listener.local_addr().expect("addr");
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("relay");
+        relay
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let relay_addr = relay.local_addr().expect("relay addr");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_server = Arc::clone(&seen);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("timeout");
+            let mut greeting = [0u8; 3];
+            read_exact_bytes(&mut stream, &mut greeting);
+            assert_eq!(greeting, [5, 1, 0]);
+            stream.write_all(&[5, 0]).expect("greeting");
+            let mut head = [0u8; 4];
+            read_exact_bytes(&mut stream, &mut head);
+            assert_eq!(head, [5, 3, 0, 1]);
+            read_exact_bytes(&mut stream, &mut [0u8; 6]);
+            let mut reply = vec![5, 0, 0, 1];
+            let SocketAddr::V4(address) = relay_addr else {
+                panic!("the test relay is v4");
+            };
+            reply.extend_from_slice(&address.ip().octets());
+            reply.extend_from_slice(&relay_addr.port().to_be_bytes());
+            stream.write_all(&reply).expect("associate");
+            let mut frame = [0u8; 512];
+            let (n, src) = relay.recv_from(&mut frame).expect("udp");
+            seen_server
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(frame[..n].to_vec());
+            let _ = relay.send_to(b"ok", src);
+            let _ = hold.recv();
+        });
+        (server_addr, seen, server)
+    }
+
+    fn wait_for_probe(seen: &Arc<Mutex<Vec<Vec<u8>>>>) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_replacement_outbound_takes_datagrams_while_the_old_lane_is_active() {
+        let (first_release, first_hold) = std::sync::mpsc::channel();
+        let (second_release, second_hold) = std::sync::mpsc::channel();
+        let (first_server, first_seen, first_thread) = socks_udp_recorder(first_hold);
+        let (second_server, second_seen, second_thread) = socks_udp_recorder(second_hold);
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"default","protocol":"freedom"},{"tag":"alt","protocol":"freedom"}],"routing":{"rules":[{"type":"field","outboundTag":"alt","domain":["bridge.test"]}]}}"#,
+        )
+        .expect("parses");
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let portals = crate::reverse::Portals::default();
+        let shared = route_shared(&root, routing, &portals, None).expect("shared");
+        let outbound = |port| {
+            Outbound::Socks(SocksOut::new(
+                "127.0.0.1",
+                port,
+                "",
+                "",
+                crate::socks::Version::V5,
+            ))
+        };
+        shared.remove_outbound("alt");
+        shared
+            .add_outbound("alt", outbound(first_server.port()))
+            .expect("first lane");
+        let bridge = Arc::new(BridgeLane::with_inbound("bridge", Some(&shared), None));
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("relay");
+        let leg = relay_leg(relay.local_addr().expect("relay addr")).expect("leg");
+        let client = leg.local_addr().expect("client");
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let serving =
+            thread::spawn(move || serve_bridge_udp(&relay, &bridge, &thread_stop, client));
+        let name = "bridge.test";
+        let frame = |payload: &[u8]| {
+            let mut frame = vec![0, 0, 0, 3, name.len() as u8];
+            frame.extend_from_slice(name.as_bytes());
+            frame.extend_from_slice(&53u16.to_be_bytes());
+            frame.extend_from_slice(payload);
+            frame
+        };
+        leg.send(&frame(b"first")).expect("sends first");
+        wait_for_probe(&first_seen);
+        assert_eq!(
+            first_seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "the first lane receives"
+        );
+        shared.remove_outbound("alt");
+        shared
+            .add_outbound("alt", outbound(second_server.port()))
+            .expect("second lane");
+        leg.send(&frame(b"second")).expect("sends second");
+        wait_for_probe(&second_seen);
+        assert_eq!(
+            second_seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "the replacement lane receives"
+        );
+        assert_eq!(
+            first_seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "the old lane receives no second datagram"
+        );
+        stop.store(true, Ordering::Relaxed);
+        let _ = first_release.send(());
+        let _ = second_release.send(());
+        serving.join().expect("relay joins");
+        first_thread.join().expect("first server joins");
+        second_thread.join().expect("second server joins");
     }
 
     #[test]
