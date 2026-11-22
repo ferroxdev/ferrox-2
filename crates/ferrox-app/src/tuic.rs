@@ -423,7 +423,7 @@ impl TuicOut {
                     options.as_deref(),
                     source,
                 )?;
-                (quic::Datagram::plain(sock).with_gro(false), peer, local)
+                (quic::Datagram::plain(sock), peer, local)
             };
         let socket = socket.with_options(options).with_source(source);
         let mut config = self.client_config()?;
@@ -1615,7 +1615,7 @@ pub(crate) fn serve_inbound(
         eprintln!("unreadable tuic identity in {path}: serves nothing");
         return false;
     };
-    let Ok(socket) = quic::bind_datagram_plain(address) else {
+    let Ok(socket) = quic::bind_datagram(address) else {
         eprintln!("tuic inbound in {path} cannot bind {address}: serves nothing");
         return false;
     };
@@ -1668,7 +1668,7 @@ pub(crate) fn serve_inbound(
     let meter = proxy::inbound_meter(inbound);
     thread::spawn(move || {
         run(
-            Arc::new(Datagram::plain(socket).with_gro(false)),
+            Arc::new(Datagram::plain(socket)),
             local,
             users,
             template,
@@ -2925,7 +2925,7 @@ mod tests {
         let server = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let address = server.local_addr().expect("address");
         let server_thread = thread::spawn(move || {
-            let sock = Datagram::plain(server).with_gro(false);
+            let sock = Datagram::plain(server);
             let _ = quic::server_accept(&sock, address, &mut config);
         });
         let mut out = test_out(address, roots);
@@ -2949,7 +2949,7 @@ mod tests {
         let address = server.local_addr().expect("address");
         let (early, observed) = std::sync::mpsc::channel();
         let server_thread = thread::spawn(move || {
-            let sock = Datagram::plain(server).with_gro(false);
+            let sock = Datagram::plain(server);
             let mut buf = vec![0u8; 65535];
             let mut out = vec![0u8; 65535];
             let mut first = quic::server_accept(&sock, address, &mut config);

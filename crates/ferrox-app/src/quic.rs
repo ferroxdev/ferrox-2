@@ -3339,15 +3339,6 @@ impl Datagram {
         self.gso
     }
 
-    /// Keep the kernel from coalescing reads under a reader that takes one datagram per `recv_from`.
-    pub(crate) fn with_gro(mut self, gro: bool) -> Self {
-        if !gro {
-            clear_gro(&self.sock);
-        }
-        self.gro = gro;
-        self
-    }
-
     /// Stop coalescing writes when the config names `disableGSO`; a lane that no longer takes the
     /// batched read also stops GRO, so one wire datagram stays one read.
     pub(crate) fn with_gso(mut self, gso: bool) -> Self {
