@@ -57,8 +57,10 @@ graph TD
     D -. "one built config per trust bundle,<br/>not one per connection" .-> CF["quiche::Config, shared"]
     H(["server role"]) --> E{"decryption named?"}
     E -- yes --> ES["seal the stream, then<br/>TCP, UDP or mux"]
-    E -- no --> R["served when the config has freedom"]
-    ES --> R
+    ES --> R{"freedom or unbuilt outbound?"}
+    E -- no --> R
+    R -- yes --> R1["served when the config has freedom"]
+    R -- no --> R2["reverse command 4 served without freedom,<br/>forward streams closed"]
 ```
 
 ## Measured

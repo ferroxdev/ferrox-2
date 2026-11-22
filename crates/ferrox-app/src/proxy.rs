@@ -10301,9 +10301,12 @@ impl BridgeLane {
         }
     }
 
-    fn udp(&self, target: &MuxTarget) -> bool {
-        let asked = target.destination();
-        self.udp_route(&asked).is_some()
+    fn udp(&self, _target: &MuxTarget) -> bool {
+        match &self.plan {
+            // A plan picks per datagram, so the relay checks the outbound it actually selects.
+            Some(_) => true,
+            None => self.fixed.as_ref().is_some_and(udp_lane_supported),
+        }
     }
 
     /// A bridge with one fixed `freedom` outbound has no second lane to choose, so its datagrams
