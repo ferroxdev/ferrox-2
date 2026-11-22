@@ -86,6 +86,7 @@ pub(crate) struct DeadlineStream {
     read_wait: std::cell::Cell<Duration>,
     armed: std::cell::Cell<Duration>,
     landed: std::cell::Cell<bool>,
+    wrote: std::cell::Cell<bool>,
     read_tight: std::cell::Cell<bool>,
     write_tight: std::cell::Cell<bool>,
 }
@@ -98,6 +99,7 @@ impl DeadlineStream {
             read_wait: std::cell::Cell::new(HANDSHAKE),
             armed: std::cell::Cell::new(HANDSHAKE),
             landed: std::cell::Cell::new(false),
+            wrote: std::cell::Cell::new(false),
             read_tight: std::cell::Cell::new(false),
             write_tight: std::cell::Cell::new(false),
         }
@@ -133,8 +135,9 @@ impl DeadlineStream {
                 if self.read_tight.replace(false) {
                     self.io.set_read_until(None);
                 }
-                // A read that landed bytes is a burst: the stack's reply is one hop behind it, so the next read waits the tail rather than the idle wait.
-                let want = if self.landed.get() {
+                // A read that landed bytes, or a tunnel that has just written, has an answer one hop behind it: that park waits the tail rather than the idle wait, and the write's credit is spent here so a silent peer still returns to the idle wait.
+                let wrote = self.wrote.replace(false);
+                let want = if self.landed.get() || wrote {
                     self.read_wait.get().min(READ_TAIL)
                 } else {
                     self.read_wait.get()
@@ -196,7 +199,11 @@ impl Read for DeadlineStream {
 impl Write for DeadlineStream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.prepare_write()?;
-        self.io.write(buf)
+        let wrote = self.io.write(buf)?;
+        if wrote > 0 {
+            self.wrote.set(true);
+        }
+        Ok(wrote)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -2617,6 +2624,31 @@ mod tests {
             stream.armed(),
             READ_WAIT,
             "a timeout restores the idle wait"
+        );
+        let _ = peer.join();
+    }
+
+    #[test]
+    fn a_write_arms_the_tail_for_the_park_that_follows_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a listener");
+        let address = listener.local_addr().expect("an address");
+        let peer = std::thread::spawn(move || {
+            let stream = TcpStream::connect(address).expect("connects");
+            std::thread::sleep(Duration::from_millis(500));
+            drop(stream);
+        });
+        let (stream, _) = listener.accept().expect("accepts");
+        let mut stream = DeadlineStream::new(stream.into(), Deadline::default());
+        stream.set_read_timeout(Some(READ_WAIT));
+        stream.write_all(&[7; 4]).expect("writes");
+        let mut idle = [0u8; 4];
+        assert!(stream.read(&mut idle).is_err(), "the read timed out");
+        assert_eq!(stream.armed(), READ_TAIL, "a write's park waits the tail");
+        assert!(stream.read(&mut idle).is_err(), "the next read timed out");
+        assert_eq!(
+            stream.armed(),
+            READ_WAIT,
+            "with no write since, the idle wait returns"
         );
         let _ = peer.join();
     }
