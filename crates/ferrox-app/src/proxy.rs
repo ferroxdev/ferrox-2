@@ -311,10 +311,18 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, tes
     let freedom = has_protocol(root, "outbounds", "freedom");
     let configured = find_outbound_with(root, test)
         .unwrap_or_else(|reason| exit(&format!("bad config {label}: {reason}")));
-    // A loopback outbound names its inbound by tag, so it resolves only when no concrete dial won.
     let loopback = find_loopback_outbound(root);
+    let routing = routing_for(root)
+        .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")))
+        .or_else(|| {
+            geodata
+                .as_ref()
+                .filter(|geodata| !geodata.outbound().is_empty())
+                .map(|_| crate::router::Routing::empty())
+        });
+    // A loopback outbound names its inbound by tag, so it resolves only when no concrete dial or route table owns the default.
     let outbound = match configured.clone() {
-        Some(Outbound::Freedom(_)) | None if loopback.is_some() => {
+        Some(Outbound::Freedom(_)) | None if routing.is_none() && loopback.is_some() => {
             let tag = loopback.expect("guarded by is_some");
             Some(
                 resolve_loopback(root, &tag, freedom).unwrap_or_else(|reason| {
@@ -332,14 +340,6 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, tes
         (outbound.is_none() && !crate::group::is_present(root)).then(|| diagnose_outbounds(root));
     let portals =
         reverse_portals(root).unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
-    let routing = routing_for(root)
-        .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")))
-        .or_else(|| {
-            geodata
-                .as_ref()
-                .filter(|geodata| !geodata.outbound().is_empty())
-                .map(|_| crate::router::Routing::empty())
-        });
     let observatory = start_observatory(root, test)
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
     crate::metrics::set_observatory(observatory.clone());
@@ -31379,6 +31379,31 @@ fn serve_socks_udp_sniffed(mut client: Connection, out: &Outbound) {
 
 /// One lane for the whole association: every datagram reaches the same outbound.
 fn serve_socks_udp_lane(mut client: Connection, out: &Outbound) {
+    let (resolved, start) = if let Outbound::Group(group) = out {
+        let Some((leaf, member)) = group.resolve_bound(crate::router::Network::Udp) else {
+            let _ = client.write_all(&foxy_socks_reply(0x07));
+            return;
+        };
+        if matches!(member, Outbound::Block(_)) {
+            let _ = client.write_all(&foxy_socks_reply(0x07));
+            return;
+        }
+        let (source, sockopts, strategy) = group
+            .route_handle()
+            .map_or((None, None, None), |route| route.tag_dial_settings(&leaf));
+        (
+            Some(member),
+            Some(LaneStart {
+                tag: Some(leaf),
+                source,
+                sockopts,
+                strategy,
+            }),
+        )
+    } else {
+        (None, None)
+    };
+    let out = resolved.as_ref().unwrap_or(out);
     // A blackhole association is a refusal: a relay that drops every datagram reads as working.
     if matches!(out, Outbound::Block(_)) {
         let _ = client.write_all(&foxy_socks_reply(0x07));
@@ -31388,7 +31413,28 @@ fn serve_socks_udp_lane(mut client: Connection, out: &Outbound) {
         return;
     };
     let peer = control_peer(Some(&client));
-    serve_udp_lane(&relay, out, Some(&client), peer, None);
+    if let Some(start) = start {
+        let LaneStart {
+            tag,
+            source,
+            sockopts,
+            strategy,
+        } = start;
+        let _tag = OutboundTag::enter(tag.as_deref());
+        serve_udp_lane_with(
+            &relay,
+            out,
+            Some(&client),
+            peer,
+            source,
+            sockopts.as_ref(),
+            strategy,
+            None,
+            None,
+        );
+    } else {
+        serve_udp_lane(&relay, out, Some(&client), peer, None);
+    }
 }
 
 /// One outbound's datagram lane over a relay socket. `peer` is where the relay's datagrams must
@@ -31683,7 +31729,7 @@ fn serve_socks_udp_split(
         .map_or(std::net::IpAddr::V4([127, 0, 0, 1].into()), |addr| {
             addr.ip()
         });
-    let mut lanes: HashMap<String, UdpLane> = HashMap::new();
+    let mut lanes: HashMap<(String, u64), UdpLane> = HashMap::new();
     let mut default_lane: Option<UdpLane> = None;
     let mut replies: HashSet<SocketAddr> = HashSet::new();
     let peer = control_peer(Some(&client));
@@ -31774,6 +31820,9 @@ fn serve_socks_udp_split(
                         else {
                             continue;
                         };
+                        if matches!(member, Outbound::Block(_)) {
+                            continue;
+                        }
                         let (source, sockopts, strategy) = group
                             .route_handle()
                             .map_or((None, None, None), |route| route.tag_dial_settings(&leaf));
@@ -31789,7 +31838,11 @@ fn serve_socks_udp_split(
                 };
                 let lane_ref = lane_out.as_ref().unwrap_or(&*out);
                 let lane_address = if let Some(tag) = lane_key.as_deref() {
-                    if let Some(address) = retire_finished_lane(&mut lanes, &mut replies, tag) {
+                    let Some(revision) = plan.shared.leaf_revision(tag) else {
+                        continue;
+                    };
+                    let key = (tag.to_owned(), revision);
+                    if let Some(address) = retire_finished_lane(&mut lanes, &mut replies, &key) {
                         Some(address)
                     } else {
                         let spawned = match (lane_out.as_ref(), lane_start) {
@@ -31806,7 +31859,7 @@ fn serve_socks_udp_split(
                         spawned.map(|lane| {
                             replies.insert(lane.address);
                             let address = lane.address;
-                            lanes.insert(tag.to_owned(), lane);
+                            lanes.insert(key, lane);
                             address
                         })
                     }
@@ -31853,9 +31906,9 @@ fn udp_bind_for(relay: SocketAddr) -> SocketAddr {
 /// A lane's loop ends on its own idle or a refused upstream; the tag must not keep writing to the
 /// socket nobody reads, so a later datagram for it opens a fresh lane.
 fn retire_finished_lane(
-    lanes: &mut HashMap<String, UdpLane>,
+    lanes: &mut HashMap<(String, u64), UdpLane>,
     replies: &mut HashSet<SocketAddr>,
-    key: &str,
+    key: &(String, u64),
 ) -> Option<SocketAddr> {
     let lane = lanes.get(key)?;
     if !lane.handle.is_finished() {
@@ -84311,6 +84364,34 @@ end
         stop.store(true, Ordering::Relaxed);
         lane.handle.join().expect("lane joins");
         assert!(answered, "the lane followed the group's new reading");
+    }
+
+    /// A group that selects a blackhole refuses the association before the SOCKS success reply.
+    #[test]
+    fn a_group_udp_association_to_a_blackhole_is_refused() {
+        let config = r#"{"outbounds":[
+            {"tag":"pick","type":"selector","outbounds":["block","direct"],"default":"block"},
+            {"tag":"block","protocol":"blackhole"},
+            {"tag":"direct","protocol":"freedom"}
+        ],"routing":{"rules":[{"type":"field","port":1,"outboundTag":"block"}]}}"#;
+        let out = route_outbound(config, Some("in"), true);
+        let port = socks_front_with(out);
+        let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(
+            reply[1], 0x07,
+            "the selected blackhole is a refusal, not an empty success: {reply:?}"
+        );
     }
 
     /// A urltest keeps the selected member until another is faster by more than the tolerance.
