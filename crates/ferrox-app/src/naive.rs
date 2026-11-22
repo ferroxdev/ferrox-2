@@ -2611,10 +2611,10 @@ pub(crate) fn serve_inbound(
             stop: stop.cloned(),
         };
         left.fetch_add(1, Ordering::SeqCst);
-        let gate = Arc::clone(&gate);
+        let worker_gate = Arc::clone(&gate);
         match std::thread::Builder::new()
             .name("ferrox-naive-listen".to_owned())
-            .spawn(move || start(exit, gate))
+            .spawn(move || start(exit, worker_gate))
         {
             Ok(worker) => workers.push(worker),
             Err(error) => {
