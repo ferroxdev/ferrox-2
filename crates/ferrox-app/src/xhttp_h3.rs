@@ -1769,6 +1769,9 @@ fn h3_control_frames(
         if !*settings && kind != 0x4 {
             return Err(H3_MISSING_SETTINGS);
         }
+        if !*settings {
+            *settings = true;
+        }
         if end > control.len() {
             if kind != 0x7 {
                 let held = control.len().saturating_sub(at);
@@ -1776,9 +1779,6 @@ fn h3_control_frames(
                 *skip = (len - held) as u64;
             }
             break;
-        }
-        if !*settings {
-            *settings = true;
         }
         if kind == 0x7 {
             let mut cursor = at;
@@ -3046,6 +3046,28 @@ mod tests {
             Err(H3_MISSING_SETTINGS)
         );
         assert_eq!(goaway.load(Ordering::SeqCst), u64::MAX);
+    }
+
+    #[test]
+    fn settings_split_across_sweeps_keeps_the_first_frame() {
+        let mut control = vec![0x04, 0x02, 0x01];
+        let goaway = AtomicU64::new(u64::MAX);
+        let mut skip = 0;
+        let mut settings = false;
+        assert_eq!(
+            h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+            Ok(false)
+        );
+        assert!(
+            settings,
+            "the first SETTINGS frame is recognized while partial"
+        );
+        control.extend_from_slice(&[0x00, 0x07, 0x01, 0x04]);
+        assert_eq!(
+            h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+            Ok(true)
+        );
+        assert_eq!(goaway.load(Ordering::SeqCst), 4);
     }
 
     #[test]

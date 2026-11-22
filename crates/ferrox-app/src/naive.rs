@@ -1882,8 +1882,7 @@ impl NaiveOut {
         self.h2_ready.notify_all();
     }
 
-    fn h3_client(self: &Arc<Self>) -> Option<Arc<H3Client>> {
-        let deadline = Instant::now() + crate::budgets::handshake();
+    fn h3_client(self: &Arc<Self>, deadline: Instant) -> Option<Arc<H3Client>> {
         let mut pool = self.h3.lock().ok()?;
         loop {
             pool.retain(|client| client.reusable());
@@ -1893,17 +1892,21 @@ impl NaiveOut {
                 drop(pool);
                 let client = self.connect_h3();
                 let mut published = self.h3.lock();
+                let mut existing = None;
                 if let Ok(pool) = published.as_mut() {
                     if let Some(client) = &client {
                         if pool.len() < self.pool_limit {
                             pool.push(Arc::clone(client));
                         }
+                    } else if !pool.is_empty() {
+                        let at = self.h3_next.fetch_add(1, Ordering::Relaxed) % pool.len();
+                        existing = Some(Arc::clone(&pool[at]));
                     }
                 }
                 self.h3_inflight.fetch_sub(1, Ordering::Relaxed);
                 drop(published);
                 self.h3_ready.notify_all();
-                return client;
+                return client.or(existing);
             }
             if !pool.is_empty() {
                 let at = self.h3_next.fetch_add(1, Ordering::Relaxed) % pool.len();
@@ -1941,7 +1944,7 @@ impl NaiveOut {
         let deadline = Instant::now() + crate::budgets::handshake();
         let mut attempts = 0;
         while attempts < 2 {
-            let client = self.h3_client()?;
+            let client = self.h3_client(deadline)?;
             let block = self.h3_block(target);
             match client.open_block(&block, false) {
                 Ok((mut reader, out)) => {
@@ -2130,7 +2133,12 @@ fn header_pairs(node: &Json) -> Result<Option<Vec<(String, String)>>, String> {
         }
         if !header_value_ok(&value) {
             return Err(format!(
-                "naive extra_headers `{name}` carries a control byte"
+                "naive extra_headers `{name}` is not a valid HTTP field value"
+            ));
+        }
+        if name.eq_ignore_ascii_case("-connect-authority") {
+            return Err(format!(
+                "naive extra_headers `{name}` duplicates a generated CONNECT field"
             ));
         }
         if name.eq_ignore_ascii_case("te") && !value.eq_ignore_ascii_case("trailers") {
@@ -2166,9 +2174,19 @@ fn header_name_ok(name: &str) -> bool {
 }
 
 fn header_value_ok(value: &str) -> bool {
-    value
-        .bytes()
-        .all(|byte| byte == b'\t' || (0x20..=0x7e).contains(&byte) || byte >= 0x80)
+    let bytes = value.as_bytes();
+    if bytes
+        .first()
+        .is_some_and(|byte| *byte == b' ' || *byte == b'\t')
+        || bytes
+            .last()
+            .is_some_and(|byte| *byte == b' ' || *byte == b'\t')
+    {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|byte| *byte == b'\t' || (0x20..=0x7e).contains(byte) || *byte >= 0x80)
 }
 
 fn connection_specific(name: &str) -> bool {
@@ -2278,17 +2296,70 @@ fn outbound_tls(outbound: &Json, address: &str) -> Result<Arc<TlsConfig>, String
         .unwrap_or(address)
         .to_owned();
     let insecure = tls.get("insecure").and_then(Json::as_bool).unwrap_or(false);
-    let roots = if insecure {
-        Arc::from(Vec::new())
-    } else {
-        crate::quic::system_roots()
-    };
+    let roots = outbound_ca(tls, insecure)?;
     Ok(Arc::new(TlsConfig {
         server_name,
         insecure,
         roots,
         ..TlsConfig::default()
     }))
+}
+
+fn outbound_ca(tls: &Json, insecure: bool) -> Result<ferrox_core::tls::Anchors, String> {
+    if insecure {
+        return Ok(Arc::from(Vec::new()));
+    }
+    let mut pem = Vec::new();
+    let path = tls
+        .get("certificate_path")
+        .or_else(|| tls.get("certificatePath"))
+        .and_then(Json::as_str)
+        .filter(|path| !path.is_empty());
+    if let Some(path) = path {
+        let bytes = crate::config::read_cert_file(path)
+            .ok_or_else(|| format!("naive tls certificate_path `{path}` cannot be read"))?;
+        pem.extend_from_slice(&bytes);
+        if !pem.ends_with(b"\n") {
+            pem.push(b'\n');
+        }
+    }
+    if let Some(certificate) = tls.get("certificate") {
+        match certificate {
+            Json::Str(text) => {
+                if !text.is_empty() {
+                    pem.extend_from_slice(text.as_bytes());
+                    if !pem.ends_with(b"\n") {
+                        pem.push(b'\n');
+                    }
+                }
+            }
+            Json::Arr(items) => {
+                for item in items {
+                    let text = item
+                        .as_str()
+                        .ok_or("naive tls certificate list must hold strings")?;
+                    if text.is_empty() {
+                        continue;
+                    }
+                    pem.extend_from_slice(text.as_bytes());
+                    if !pem.ends_with(b"\n") {
+                        pem.push(b'\n');
+                    }
+                }
+            }
+            _ => {
+                return Err("naive tls certificate must be a string or list of strings".to_owned());
+            }
+        }
+    }
+    if pem.is_empty() {
+        return Ok(crate::quic::system_roots());
+    }
+    let roots = ferrox_core::tls::Anchors::from(crate::quic::parse_ca_pem(&pem));
+    if roots.is_empty() {
+        return Err("naive tls certificate carries no certificate authority".to_owned());
+    }
+    Ok(roots)
 }
 
 /// The same listener identity pinned to the one ALPN its transport serves: `h2` on TCP and `h3` on
@@ -2713,7 +2784,11 @@ fn start_workers(starts: Vec<Start>, path: &str, stop: Option<&Arc<proxy::Stop>>
     left.store(total, Ordering::SeqCst);
     committed.store(true, Ordering::SeqCst);
     gate.release(true);
-    total
+    listener_closures(total)
+}
+
+fn listener_closures(listeners: usize) -> usize {
+    usize::from(listeners > 0)
 }
 
 #[cfg(test)]
@@ -2759,7 +2834,7 @@ mod tests {
     #[test]
     fn a_committed_address_closes_only_after_both_listeners_exit() {
         let stop = Arc::new(proxy::Stop::new());
-        stop.expect_listeners(1);
+        stop.expect_listeners(listener_closures(2));
         let left = Arc::new(AtomicUsize::new(2));
         let committed = Arc::new(AtomicBool::new(true));
         drop(ListenerExit {
@@ -3174,6 +3249,18 @@ mod tests {
         assert!(header_pairs(&spaced).is_err());
         let control = crate::json::parse(r#"{"X-Custom": "ok\r\nInjected: yes"}"#).expect("parses");
         assert!(header_pairs(&control).is_err());
+        let authority =
+            crate::json::parse(r#"{"-connect-authority": "other.test:443"}"#).expect("parses");
+        assert!(header_pairs(&authority).is_err());
+        let trailing = crate::json::parse(r#"{"X-Trace": "enabled "}"#).expect("parses");
+        assert!(header_pairs(&trailing).is_err());
+        let leading = crate::json::parse(r#"{"X-Trace": " enabled"}"#).expect("parses");
+        assert!(header_pairs(&leading).is_err());
+        let interior = crate::json::parse(r#"{"X-Trace": "a b"}"#).expect("parses");
+        assert_eq!(
+            header_pairs(&interior).expect("reads"),
+            Some(vec![("x-trace".to_owned(), "a b".to_owned())])
+        );
     }
 
     #[test]
@@ -3253,6 +3340,45 @@ mod tests {
         .expect("parses");
         let parsed = outbound(&neither).expect("builds").expect("naive");
         assert_eq!(parsed.token, None);
+    }
+
+    #[test]
+    fn reference_tls_certificate_sets_the_trust_anchor() {
+        let minted = rcgen::generate_simple_self_signed(vec!["naive.test".to_owned()])
+            .expect("mints a certificate");
+        let der = minted.cert.der().as_ref().to_vec();
+        let escaped = minted
+            .cert
+            .pem()
+            .trim_end()
+            .replace('\r', "")
+            .replace('\n', "\\n");
+        let inline = crate::json::parse(&format!(
+            r#"{{"protocol":"naive","settings":{{"address":"a.test","port":443}},"tls":{{"enabled":true,"certificate":"{escaped}"}}}}"#
+        ))
+        .expect("parses");
+        let tls = outbound_tls(&inline, "a.test").expect("tls");
+        assert_eq!(tls.roots.as_ref(), &[der.clone()][..]);
+
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-naive-ca-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("creates");
+        let path = dir.join("ca.pem");
+        std::fs::write(&path, minted.cert.pem()).expect("writes");
+        let named = format!("{:?}", path.to_string_lossy());
+        let from_path = crate::json::parse(&format!(
+            r#"{{"protocol":"naive","settings":{{"address":"a.test","port":443}},"tls":{{"enabled":true,"certificate_path":{named}}}}}"#
+        ))
+        .expect("parses");
+        let tls = outbound_tls(&from_path, "a.test").expect("tls");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(tls.roots.as_ref(), &[der][..]);
     }
 
     #[test]
