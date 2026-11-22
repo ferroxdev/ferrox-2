@@ -668,6 +668,9 @@ carrier-hysteria udp-fragment-reassembly-allocations-per-datagram 0 ferrox-core-
 carrier-hysteria udp-fragment-reassembly-payload-passes 1 ferrox-core-hysteria::tests::a_fragmented_datagram_assembles_in_one_buffer_without_a_fresh_allocation
 carrier-hysteria udp-v1-fragment-reassembly-allocations-per-datagram 0 ferrox-core-hysteria_v1::tests::a_fragmented_v1_datagram_assembles_in_one_buffer_without_a_fresh_allocation
 carrier-hysteria udp-v1-fragment-reassembly-payload-passes 1 ferrox-core-hysteria_v1::tests::a_fragmented_v1_datagram_assembles_in_one_buffer_without_a_fresh_allocation
+carrier-hysteria udp-v1-reply-payload-copies 0 ferrox-app-hysteria_v1::tests::a_reply_is_the_socks_head_and_the_arenas_own_bytes
+carrier-hysteria udp-v1-reply-allocations 0 ferrox-app-hysteria_v1::tests::a_reply_costs_no_allocation
+carrier-hysteria udp-v1-queued-reply-allocations 0 ferrox-app-hysteria_v1::tests::a_drained_queue_keeps_the_room_a_steady_lane_needs
 carrier-hysteria gecko-message-reassembly-allocations-per-message 0 ferrox-app-quic::tests::a_gecko_message_reassembles_without_a_fresh_allocation
 carrier-hysteria gecko-message-copies-per-message 2 ferrox-app-quic::tests::a_gecko_message_reassembles_without_a_fresh_allocation
 carrier-hysteria gecko-table-walks-per-unexpired-datagram 0 ferrox-app-quic::tests::a_gecko_table_is_walked_only_when_a_message_can_expire

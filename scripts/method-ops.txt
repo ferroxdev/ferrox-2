@@ -194,6 +194,8 @@ carrier-hysteria  hysteria_v1::tests::the_v1_udp_decode_costs_the_bytes_and_noth
 carrier-hysteria  quic::tests::a_gecko_message_reassembles_without_a_fresh_allocation  ferrox_app::quic::tests::a_gecko_message_reassembles_without_a_fresh_allocation
 carrier-hysteria  quic::tests::a_gecko_table_is_walked_only_when_a_message_can_expire  ferrox_app::quic::tests::a_gecko_table_is_walked_only_when_a_message_can_expire
 carrier-hysteria  hysteria::tests::a_reply_costs_one_lock_and_the_body  ferrox_app::hysteria::tests::a_reply_costs_one_lock_and_the_body
+carrier-hysteria  hysteria_v1::tests::a_reply_costs_no_allocation  ferrox_app::hysteria_v1::tests::a_reply_costs_no_allocation
+carrier-hysteria  hysteria_v1::tests::a_drained_queue_keeps_the_room_a_steady_lane_needs  ferrox_app::hysteria_v1::tests::a_drained_queue_keeps_the_room_a_steady_lane_needs
 finalmask  finalmask::tests::a_hello_record_is_cut_into_records_of_the_configured_widths  ferrox_core::finalmask::Chain::write
 finalmask  finalmask::tests::a_hello_record_is_cut_into_records_of_the_configured_widths  ferrox_core::finalmask::Fragment::write_hello
 finalmask  finalmask::tests::a_delayed_piece_hands_the_body_over_where_it_lies  ferrox_core::finalmask::write_record

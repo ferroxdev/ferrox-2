@@ -502,7 +502,8 @@ fn open_udp_flow(session: &Session, host: &str, port: u16) -> Option<(Flow, u32)
 }
 
 fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpSocket) {
-    let mut reply = Vec::with_capacity(3 + 25 + UDP_TARGET_BUF);
+    // A reply's head is the longest socks head (22 bytes) and its body is the arena's slice: no 64 KiB buffer, no copy of the body.
+    let mut reply_head = Vec::with_capacity(22);
     // One reassembly buffer for the whole association: it is the arena the defrag hands back, so a reply does not open a fresh `Vec` per datagram.
     let mut assembled = Vec::new();
     loop {
@@ -536,11 +537,9 @@ fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpS
             let Some(src) = lane.client.get().copied() else {
                 continue;
             };
-            reply.clear();
-            reply.extend_from_slice(&[0, 0, 0]);
-            crate::proxy::push_socks_addr(&mut reply, &destination);
-            reply.extend_from_slice(payload);
-            let _ = relay.send_to(&reply, src);
+            let (front, tail) =
+                crate::proxy::socks_udp_parts(&mut reply_head, &destination, payload);
+            let _ = crate::proxy::send_to_two(relay, front, tail, src);
         }
     }
 }
@@ -574,9 +573,49 @@ struct Assoc {
     port: u16,
     dest: Option<SocketAddr>,
     defrag: Defrag,
-    waiting: Vec<Vec<u8>>,
+    waiting: Queue,
     resolving: bool,
     used: u64,
+}
+
+/// The arena room a drained queue keeps: a lane that queues a handful of datagrams reuses it, and a
+/// resolution that answered after a burst gives the rest of the burst back instead of pinning it.
+const QUEUED_ARENA_KEEP: usize = 8 * 1024;
+
+/// The datagrams a destination accumulated before its name resolved, in one arena: a payload is
+/// appended and its span recorded, so a queued reply costs no allocation once the arena has reached
+/// the size of the largest one. A drain keeps the room a steady lane needs and shrinks a burst.
+#[derive(Default)]
+struct Queue {
+    arena: Vec<u8>,
+    spans: Vec<(u32, u32)>,
+}
+
+impl Queue {
+    fn push(&mut self, payload: &[u8]) -> bool {
+        let (Ok(start), Ok(len)) = (
+            u32::try_from(self.arena.len()),
+            u32::try_from(payload.len()),
+        ) else {
+            return false;
+        };
+        self.arena.extend_from_slice(payload);
+        self.spans.push((start, len));
+        true
+    }
+
+    fn len(&self) -> usize {
+        self.spans.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.arena.clear();
+        self.spans.clear();
+    }
 }
 
 impl Assoc {
@@ -586,7 +625,7 @@ impl Assoc {
             port,
             dest: None,
             defrag: Defrag::new(),
-            waiting: Vec::new(),
+            waiting: Queue::default(),
             resolving: false,
             used,
         }
@@ -655,16 +694,23 @@ impl Assocs {
         Some(self.list.len() - 1)
     }
 
-    fn enqueue(&mut self, at: usize, payload: Vec<u8>) {
-        self.list[at].waiting.push(payload);
+    fn enqueue(&mut self, at: usize, payload: &[u8]) -> bool {
+        if !self.list[at].waiting.push(payload) {
+            return false;
+        }
         self.waiting += 1;
+        true
     }
 
     fn drain(&mut self, at: usize, mut send: impl FnMut(&[u8])) {
-        let assoc = &mut self.list[at];
-        let len = assoc.waiting.len();
-        for payload in assoc.waiting.drain(..) {
-            send(&payload);
+        let waiting = &mut self.list[at].waiting;
+        let len = waiting.spans.len();
+        for &(start, size) in &waiting.spans {
+            send(&waiting.arena[start as usize..(start + size) as usize]);
+        }
+        waiting.clear();
+        if waiting.arena.capacity() > QUEUED_ARENA_KEEP {
+            waiting.arena.shrink_to(QUEUED_ARENA_KEEP);
         }
         self.waiting = self.waiting.saturating_sub(len);
     }
@@ -1101,21 +1147,25 @@ fn relay_datagrams(
             forged = whole.is_err();
             match whole {
                 Ok(Some(message)) => {
-                    let assoc = &mut flow.assocs.list[at];
-                    let peer = assoc.dest.or_else(|| {
-                        host.parse::<IpAddr>()
-                            .ok()
-                            .map(|ip| SocketAddr::new(ip, port))
-                    });
+                    let peer = {
+                        let assoc = &mut flow.assocs.list[at];
+                        let peer = assoc.dest.or_else(|| {
+                            host.parse::<IpAddr>()
+                                .ok()
+                                .map(|ip| SocketAddr::new(ip, port))
+                        });
+                        if peer.is_some() {
+                            assoc.dest = peer;
+                        }
+                        peer
+                    };
                     if let Some(peer) = peer {
-                        assoc.dest = Some(peer);
                         flow.assocs.drain(at, |_| {});
                         let _ = flow
                             .target
                             .send_to(message.payload, target_addr(&flow.target, peer));
                     } else if flow.assocs.waiting < MAX_PENDING_DATAGRAMS {
-                        flow.assocs.enqueue(at, message.payload.to_vec());
-                        queued = true;
+                        queued = flow.assocs.enqueue(at, message.payload);
                     }
                 }
                 Ok(None) => {}
@@ -1185,7 +1235,7 @@ fn relay_datagrams(
             .feed(&message, &mut assembled);
         match whole {
             Ok(Some(message)) if pending.assocs.waiting < MAX_PENDING_DATAGRAMS => {
-                pending.assocs.enqueue(at, message.payload.to_vec());
+                pending.assocs.enqueue(at, message.payload);
             }
             Ok(_) => {}
             Err(_) => {
@@ -1763,6 +1813,122 @@ mod tests {
         );
     }
 
+    /// The reply the reader sends is the socks5 head over the arena's own bytes: the slice handed
+    /// to the send is the one the defrag returned, never a copy, and the framed bytes are the
+    /// reference frame for both address families.
+    #[test]
+    fn a_reply_is_the_socks_head_and_the_arenas_own_bytes() {
+        let payload: Vec<u8> = (0..1400).map(|i| (i % 251) as u8).collect();
+        for destination in [
+            "203.0.113.7:5353".parse::<SocketAddr>().expect("v4"),
+            "[2001:db8::7]:5353".parse::<SocketAddr>().expect("v6"),
+        ] {
+            for want in [1usize, 7, 1400] {
+                let message = UdpMessage {
+                    session: 3,
+                    host: "edge.example",
+                    port: 5353,
+                    packet: 9,
+                    frag: 0,
+                    frags: 1,
+                    payload: &payload[..want],
+                };
+                let mut defrag = Defrag::new();
+                let mut assembled = Vec::new();
+                let whole = defrag
+                    .feed(&message, &mut assembled)
+                    .expect("a whole datagram")
+                    .expect("nothing was missing");
+                let mut head = Vec::with_capacity(22);
+                let (front, tail) =
+                    crate::proxy::socks_udp_parts(&mut head, &destination, whole.payload);
+                assert_eq!(
+                    tail.as_ptr(),
+                    message.payload.as_ptr(),
+                    "a single fragment is the caller's own bytes"
+                );
+                let mut framed = front.to_vec();
+                framed.extend_from_slice(tail);
+                let mut reference = vec![0u8, 0, 0];
+                match destination {
+                    SocketAddr::V4(address) => {
+                        reference.push(1);
+                        reference.extend_from_slice(&address.ip().octets());
+                    }
+                    SocketAddr::V6(address) => {
+                        reference.push(4);
+                        reference.extend_from_slice(&address.ip().octets());
+                    }
+                }
+                reference.extend_from_slice(&destination.port().to_be_bytes());
+                reference.extend_from_slice(&payload[..want]);
+                assert_eq!(framed, reference, "the framed reply is the reference frame");
+            }
+
+            let mut defrag = Defrag::new();
+            let mut assembled = Vec::new();
+            let (first, second) = payload.split_at(700);
+            for (frag, chunk) in [(0u8, first), (1u8, second)] {
+                let message = UdpMessage {
+                    session: 3,
+                    host: "edge.example",
+                    port: 5353,
+                    packet: 9,
+                    frag,
+                    frags: 2,
+                    payload: chunk,
+                };
+                match defrag.feed(&message, &mut assembled).expect("a fragment") {
+                    None => assert_eq!(frag, 0, "the first fragment only waits"),
+                    Some(whole) => {
+                        assert_eq!(frag, 1, "only the second fragment completes it");
+                        assert_eq!(
+                            whole.payload,
+                            &payload[..],
+                            "the reassembled body is the bytes"
+                        );
+                        assert_eq!(
+                            whole.payload.as_ptr(),
+                            assembled.as_ptr(),
+                            "the arena holds it"
+                        );
+                    }
+                }
+            }
+            assert_eq!(assembled, payload, "the arena holds the whole datagram");
+            let armed = assembled.as_ptr();
+            let mut head = Vec::with_capacity(22);
+            let (_, tail) = crate::proxy::socks_udp_parts(&mut head, &destination, &assembled);
+            assert_eq!(
+                tail.as_ptr(),
+                armed,
+                "a reassembled reply is the arena's base"
+            );
+        }
+    }
+
+    /// A reply's head, however long the destination's address, is one write into the scratch and
+    /// nothing else: the payload never enters it.
+    #[test]
+    fn a_reply_costs_no_allocation() {
+        let destination: SocketAddr = "203.0.113.7:5353".parse().expect("addr");
+        let payload = [5u8; 1400];
+        let mut head = Vec::with_capacity(22);
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            for _ in 0..512 {
+                let (front, tail) =
+                    crate::proxy::socks_udp_parts(&mut head, &destination, &payload);
+                assert_eq!(tail.as_ptr(), payload.as_ptr(), "the body is not copied");
+                assert_eq!(front.len(), 10);
+            }
+        });
+        assert_eq!(
+            counts.allocs, 0,
+            "a reply's head is one write into the scratch and its body is the caller's"
+        );
+        assert!(head.capacity() >= 22, "the scratch held every head");
+    }
+
     #[test]
     fn an_insecure_v1_dial_accepts_an_untrusted_chain() {
         let dial = |insecure| Dial {
@@ -2159,7 +2325,7 @@ mod tests {
         for index in 0..MAX_UDP_ASSOCIATIONS {
             let host = format!("held{index}.test");
             let at = flow.assocs.insert(&host, 53, 0).expect("room");
-            flow.assocs.enqueue(at, vec![1]);
+            flow.assocs.enqueue(at, &[1]);
         }
         assert_eq!(flow.assocs.waiting, MAX_UDP_ASSOCIATIONS);
         assert!(
@@ -2188,7 +2354,7 @@ mod tests {
                 stop: Arc::new(AtomicBool::new(false)),
             };
             let at = flow.assocs.insert("queued.test", 53, 0).expect("room");
-            flow.assocs.enqueue(at, vec![1]);
+            flow.assocs.enqueue(at, &[1]);
             lane.flows.insert(session, flow);
         }
         assert_eq!(lane.resume_if(0, false), Vec::new());
@@ -2201,34 +2367,58 @@ mod tests {
         assert_eq!(walked, 1, "a due sweep walks one flow, not every flow");
     }
 
-    /// A drained queue keeps its buffer, so the next datagram for the same destination reuses it.
+    /// A queued reply is its bytes in the association's arena: a burst is handed back on the drain,
+    /// and a steady lane at the kept room then cycles without allocating or moving either buffer.
     #[test]
-    fn a_drained_queue_keeps_its_buffer_for_the_next_datagram() {
+    fn a_drained_queue_keeps_the_room_a_steady_lane_needs() {
         let mut assocs = Assocs::default();
         let at = assocs.insert("queued.test", 53, 0).expect("room");
-        assocs.enqueue(at, vec![1; 32]);
-        let cap = assocs.list[at].waiting.capacity();
+        let burst = [7u8; 1200];
+        for _ in 0..MAX_PENDING_DATAGRAMS {
+            assert!(assocs.enqueue(at, &burst));
+        }
+        let mut sent = 0usize;
+        let mut framed = Vec::new();
+        assocs.drain(at, |payload| {
+            sent += 1;
+            framed.extend_from_slice(payload);
+        });
+        assert_eq!(sent, MAX_PENDING_DATAGRAMS);
+        assert_eq!(
+            framed.len(),
+            MAX_PENDING_DATAGRAMS * burst.len(),
+            "every queued byte came back"
+        );
+        assert!(framed.chunks(burst.len()).all(|chunk| chunk == &burst[..]));
+        assert_eq!(assocs.waiting, 0);
+        assert_eq!(
+            assocs.list[at].waiting.arena.capacity(),
+            QUEUED_ARENA_KEEP,
+            "the drain gives the burst back"
+        );
+
+        let payload = [9u8; 1200];
+        let room = QUEUED_ARENA_KEEP / payload.len();
         let mut sent = 0usize;
         let ((), counts) = ferrox_core::alloc_count::measure(|| {
-            assocs.drain(at, |_| sent += 1);
+            for _ in 0..room {
+                assert!(assocs.enqueue(at, &payload));
+            }
+            assocs.drain(at, |body| {
+                assert_eq!(body, &payload[..], "the bytes came back");
+                sent += 1;
+            });
         });
-        assert_eq!(sent, 1);
-        assert_eq!(counts.allocs, 0, "draining a payload frees no queue buffer");
+        assert_eq!(sent, room);
         assert_eq!(
-            assocs.list[at].waiting.capacity(),
-            cap,
-            "the queue buffer stayed"
+            counts.allocs, 0,
+            "a steady lane at the kept room allocates nothing"
         );
-        let ((), counts) = ferrox_core::alloc_count::measure(|| {
-            assocs.enqueue(at, vec![2; 32]);
-            assocs.drain(at, |_| sent += 1);
-        });
-        assert_eq!(sent, 2);
-        assert_eq!(counts.allocs, 1, "only the next payload allocates");
+        assert_eq!(assocs.list[at].waiting.arena.capacity(), QUEUED_ARENA_KEEP);
         assert_eq!(
-            assocs.list[at].waiting.capacity(),
-            cap,
-            "still the same queue buffer"
+            assocs.list[at].waiting.spans.capacity(),
+            MAX_PENDING_DATAGRAMS,
+            "the span list is still the one the burst grew"
         );
         assert_eq!(assocs.waiting, 0);
     }
@@ -2299,15 +2489,15 @@ mod tests {
             before.allocs >= 8,
             "the old shape cloned the key to queue a datagram"
         );
-        assocs.list[at].waiting.reserve(8);
+        assocs.list[at].waiting.spans.reserve(8);
         let ((), counts) = ferrox_core::alloc_count::measure(|| {
             for _ in 0..8 {
-                assocs.enqueue(at, Vec::new());
+                assert!(assocs.enqueue(at, &[]));
             }
         });
         assert_eq!(
             counts.allocs, 0,
-            "a queued datagram costs its payload, not a key"
+            "a queued datagram costs no key and no span growth"
         );
         assert_eq!(assocs.waiting, 8);
     }
