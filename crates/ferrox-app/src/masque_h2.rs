@@ -120,6 +120,12 @@ impl DeadlineStream {
         Ok(())
     }
 
+    /// What the last read armed: the tail after a burst, the idle wait otherwise.
+    #[cfg(test)]
+    pub(crate) fn armed(&self) -> Duration {
+        self.armed.get()
+    }
+
     fn prepare_read(&self) -> std::io::Result<()> {
         match self.deadline.remaining() {
             None => {
@@ -2583,6 +2589,35 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_landed_read_arms_the_tail_and_a_timeout_restores_the_idle_wait() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a listener");
+        let address = listener.local_addr().expect("an address");
+        let peer = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).expect("connects");
+            stream.write_all(&[7; 4]).expect("writes");
+            std::thread::sleep(Duration::from_millis(500));
+        });
+        let (stream, _) = listener.accept().expect("accepts");
+        let mut stream = DeadlineStream::new(stream.into(), Deadline::default());
+        stream.set_read_timeout(Some(READ_WAIT));
+        let mut burst = [0u8; 4];
+        assert_eq!(stream.read(&mut burst).expect("the burst"), 4);
+        let mut idle = [0u8; 4];
+        assert!(
+            stream.read(&mut idle).is_err(),
+            "the burst's tail timed out"
+        );
+        assert_eq!(stream.armed(), READ_TAIL, "a burst parks on the tail");
+        assert!(stream.read(&mut idle).is_err(), "the idle read timed out");
+        assert_eq!(
+            stream.armed(),
+            READ_WAIT,
+            "a timeout restores the idle wait"
+        );
+        let _ = peer.join();
     }
 
     #[test]
