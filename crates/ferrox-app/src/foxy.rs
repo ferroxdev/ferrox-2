@@ -2859,6 +2859,7 @@ impl H3 {
             }
             frames::H3_GOAWAY => {
                 // RFC 9114 §7.2.6: a GOAWAY on a request stream is H3_FRAME_UNEXPECTED, so the tunnel ends as a protocol error rather than a clean end.
+                self.quic.cancel();
                 self.fin = true;
                 self.carried = self.filled;
                 Err(Failure::Stream)
@@ -3418,6 +3419,7 @@ impl H3 {
         }
         if frame.kind == frames::H3_GOAWAY {
             // RFC 9114 §7.2.6: a GOAWAY on a request stream is H3_FRAME_UNEXPECTED, so the tunnel ends as a protocol error rather than a clean end.
+            self.quic.cancel();
             self.fin = true;
             self.carried = self.filled;
             return Err(Failure::Stream);
@@ -8737,7 +8739,12 @@ pub(crate) mod loopback {
         lane.set_read_quantum(Duration::from_millis(20))
             .expect("arms the read");
         let mut packet = Vec::new();
-        for _ in 0..100 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lane.assigned().1 != [0, 16] {
+            assert!(
+                Instant::now() < deadline,
+                "the edge's second assignment never reached the lane"
+            );
             match lane.read(&mut packet) {
                 Ok(_) => {}
                 Err(error) => {
@@ -8750,7 +8757,6 @@ pub(crate) mod loopback {
                         ),
                         "the reassignment is behind a quiet quantum: {error}"
                     );
-                    break;
                 }
             }
         }
