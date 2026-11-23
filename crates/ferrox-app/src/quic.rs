@@ -3522,6 +3522,15 @@ impl Datagram {
         self.rebound.lock().ok()?.as_ref().cloned()
     }
 
+    /// The descriptor whose readiness a parked writer waits for: the ACK that reopens
+    /// the window lands on the same socket the driver reads.
+    pub(crate) fn wait_key(&self) -> crate::proxy::WaitFd {
+        if let Some(sock) = self.rebound() {
+            return crate::proxy::wait_key(sock.as_ref());
+        }
+        crate::proxy::wait_key(&self.sock)
+    }
+
     /// Move every write and read after this call to `sock`, which is bound to the
     /// new path: the old descriptor stays for a reply already in flight, and the
     /// flag keeps a lane that never roams on the direct path.
@@ -5009,7 +5018,11 @@ impl Write for QuicStream {
         if crate::proxy::relay_step_owns_poll() {
             let mut rest = bytes::Bytes::copy_from_slice(buf);
             return match self.send_once(&mut rest) {
-                Ok(0) => Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+                Ok(0) => {
+                    crate::proxy::note_wait_fd(self.sock.wait_key());
+                    crate::proxy::note_wait_idle(crate::budgets::RELAY_POLL);
+                    Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                }
                 Ok(n) => {
                     self.meter.write(n);
                     self.activity.touch();
