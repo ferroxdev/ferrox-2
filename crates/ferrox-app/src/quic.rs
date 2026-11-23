@@ -221,6 +221,7 @@ impl PooledStream {
             activity: Arc::clone(&self.activity),
             stop: Arc::new(AtomicBool::new(false)),
             stalled: Arc::new(AtomicBool::new(false)),
+            flushed: false,
             owner: None,
         }
     }
@@ -5001,6 +5002,8 @@ pub(crate) struct QuicStream {
     stop: Arc<AtomicBool>,
     /// A partial frame spent its send deadline: the next `write_all` retry fails instead of starting a second wait.
     stalled: Arc<AtomicBool>,
+    /// Bytes this handle queued have already left the socket, so the flush a relay pays after a write answers without a second send.
+    flushed: bool,
     /// The serving connection's identity, absent on a client-side handle whose sessions no listener owns.
     owner: Option<Arc<ConnectionToken>>,
 }
@@ -5013,6 +5016,10 @@ const SEND_POLL: Duration = Duration::from_micros(250);
 
 /// Between polls of quiche state, so a waiting read never holds the connection lock.
 const STREAM_POLL: Duration = Duration::from_millis(5);
+
+/// Handoff attempts a writer spends on the connection lock before it parks: a drive thread's batch
+/// turn is microseconds, so a spin reaches the drop a futex wakeup cannot.
+const SEND_SPINS: u32 = 64;
 
 impl Read for QuicStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -5106,6 +5113,7 @@ impl Write for QuicStream {
                     if Instant::now() >= deadline {
                         let sent = buf.len() - rest.len();
                         if sent > 0 {
+                            self.send_queued()?;
                             self.stalled.store(true, Ordering::Relaxed);
                             return Ok(sent);
                         }
@@ -5120,21 +5128,24 @@ impl Write for QuicStream {
                 Err(error) => {
                     let sent = buf.len() - rest.len();
                     if sent > 0 {
+                        self.send_queued()?;
                         return Ok(sent);
                     }
                     return Err(error);
                 }
             }
         }
+        // One send per write: the packets a write queued leave together instead of once per partial send.
+        self.send_queued()?;
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        let Ok(mut conn) = self.conn.lock() else {
-            return Err(std::io::Error::other("quic connection lock poisoned"));
-        };
-        flush_egress(&mut conn, &self.sock);
-        Ok(())
+        if self.flushed {
+            self.flushed = false;
+            return Ok(());
+        }
+        self.send_queued()
     }
 }
 
@@ -5176,6 +5187,7 @@ impl QuicStream {
             activity: Arc::new(Activity::new()),
             stop: Arc::new(AtomicBool::new(false)),
             stalled: Arc::new(AtomicBool::new(false)),
+            flushed: false,
             owner: None,
         }
     }
@@ -5220,19 +5232,46 @@ impl QuicStream {
         self
     }
 
+    /// Marks the packets a write queued as sent, so the flush behind it finds nothing to do.
+    fn send_queued(&mut self) -> std::io::Result<()> {
+        {
+            let mut conn = self.lock_send()?;
+            flush_egress(&mut conn, &self.sock);
+        }
+        self.flushed = true;
+        Ok(())
+    }
+
+    /// The connection lock, without paying a wakeup for a drive thread that is about to drop it: a
+    /// batch turn holds it for microseconds, so a bounded spin reaches the handoff a futex cannot.
+    fn lock_send(&self) -> std::io::Result<std::sync::MutexGuard<'_, QuicheConnection>> {
+        for _ in 0..SEND_SPINS {
+            match self.conn.try_lock() {
+                Ok(conn) => return Ok(conn),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(std::io::Error::other("quic connection lock poisoned"));
+                }
+                Err(std::sync::TryLockError::WouldBlock) => std::hint::spin_loop(),
+            }
+        }
+        self.conn
+            .lock()
+            .map_err(|_| std::io::Error::other("quic connection lock poisoned"))
+    }
+
     /// One send flight without holding the lock across the wait behind it.
     fn send_once(&mut self, rest: &mut bytes::Bytes) -> std::io::Result<usize> {
-        let Ok(mut conn) = self.conn.lock() else {
+        let Ok(mut conn) = self.lock_send() else {
             return Err(std::io::Error::other("quic connection lock poisoned"));
         };
         // A closed or draining connection cannot progress: fail the write instead of parking it for SEND_WAIT.
         if conn.is_closed() || conn.is_draining() {
             return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
         }
+        // The write's own flush carries these packets, so the send does not pay a second egress sweep.
         match conn.stream_send_zc(self.id, (*rest).clone(), false) {
             Ok((n, remainder)) => {
                 *rest = remainder.unwrap_or_default();
-                flush_egress(&mut conn, &self.sock);
                 Ok(n)
             }
             Err(quiche::Error::Done) if conn.is_closed() || conn.is_draining() => {
@@ -5837,6 +5876,7 @@ fn reap(
             activity: Arc::new(Activity::new()),
             stop,
             stalled: Arc::new(AtomicBool::new(false)),
+            flushed: false,
             owner: Some(owner),
         };
         let serve = Arc::clone(serve);
@@ -8204,6 +8244,7 @@ mod tests {
             activity: std::sync::Arc::new(Activity::new()),
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stalled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            flushed: false,
             owner: None,
         };
         let error = stream
@@ -8233,6 +8274,7 @@ mod tests {
             activity: std::sync::Arc::new(Activity::new()),
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stalled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            flushed: false,
             owner: None,
         };
         let _step = crate::proxy::RelayStep::enter();
@@ -8279,6 +8321,7 @@ mod tests {
             activity: std::sync::Arc::new(Activity::new()),
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stalled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            flushed: false,
             owner: None,
         };
         let started = Instant::now();
@@ -8329,6 +8372,7 @@ mod tests {
             activity: std::sync::Arc::new(Activity::new()),
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stalled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            flushed: false,
             owner: None,
         };
         let started = Instant::now();
@@ -8339,6 +8383,57 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "draining is answered at once, not after SEND_WAIT"
+        );
+    }
+
+    /// A relay pays one flush per buffer, not two: the write carries its own packets, and the
+    /// flush the relay follows it with finds the socket already swept.
+    #[test]
+    fn a_flush_behind_a_write_finds_the_socket_already_swept() {
+        let (client, mut server) = lane_pair();
+        let mut stream = QuicStream {
+            conn: std::sync::Arc::new(std::sync::Mutex::new(client.conn)),
+            sock: std::sync::Arc::new(client.sock),
+            id: 0,
+            meter: crate::stats::Meter::default(),
+            peer_fin: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fin_sent: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            prefaced: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            activity: std::sync::Arc::new(Activity::new()),
+            stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stalled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            flushed: false,
+            owner: None,
+        };
+        stream.write_all(b"payload").expect("writes");
+        assert!(
+            stream.flushed,
+            "the write left its own packets swept, so the flush behind it has nothing to send"
+        );
+        let mut buf = [0u8; 16];
+        let mut got = 0;
+        for _ in 0..64 {
+            for (mut bytes, peer) in drain_packets(&server.sock) {
+                let info = quiche::RecvInfo {
+                    from: peer,
+                    to: server.addr,
+                };
+                let _ = server.conn.recv(&mut bytes, info);
+            }
+            match server.conn.stream_recv(0, &mut buf) {
+                Ok((n, _)) => {
+                    got = n;
+                    break;
+                }
+                Err(quiche::Error::Done) => {}
+                Err(error) => panic!("reads the write: {error:?}"),
+            }
+        }
+        assert_eq!(&buf[..got], b"payload", "the write's own flush carried it");
+        stream.flush().expect("flushes");
+        assert!(
+            !stream.flushed,
+            "the flush answered the sweep instead of repeating it"
         );
     }
 
@@ -8360,6 +8455,7 @@ mod tests {
             activity: std::sync::Arc::new(Activity::new()),
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stalled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            flushed: false,
             owner: None,
         };
         let moved = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));
