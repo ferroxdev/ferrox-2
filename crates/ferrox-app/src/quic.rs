@@ -5070,7 +5070,8 @@ impl Read for QuicStream {
                     if n > 0 {
                         self.peer_fin.store(fin, Ordering::Relaxed);
                         self.activity.touch();
-                        if !relayed {
+                        // A short read is the window's tail: flush it now, because the idle driver will not carry the MAX_STREAM_DATA that lets the peer continue.
+                        if !relayed || n < buf.len() {
                             flush_egress(&mut conn, &self.sock);
                         }
                         self.meter.read(n);
