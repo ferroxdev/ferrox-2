@@ -36110,7 +36110,10 @@ pub(crate) mod lane_pool {
                             Ok(()) => break,
                             Err(parked) => lane = parked,
                         }
-                        park_with(pool, lane, quantum.unwrap_or(crate::budgets::RELAY_POLL));
+                        match quantum {
+                            Some(quantum) => park_with(pool, lane, quantum),
+                            None => park(pool, lane),
+                        }
                         break;
                     }
                     Ok(Next::Retry) => {
