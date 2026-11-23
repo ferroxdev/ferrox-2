@@ -14067,6 +14067,10 @@ fn spill_owed<W: Write>(to: &Half<W>, buffer: &mut RelayBuf, ended: &Arc<RelayFi
                 ended.mark_progress();
             }
             Err(error) if is_timeout(&error) => {
+                if buffer.spin() {
+                    std::thread::yield_now();
+                    continue;
+                }
                 note_wait_finish(ended);
                 return Next::Idle;
             }
@@ -35443,6 +35447,7 @@ pub(crate) struct RelayBuf {
     promote_to: usize,
     owed: usize,
     sent: usize,
+    spins: u8,
 }
 
 impl RelayBuf {
@@ -35468,6 +35473,7 @@ impl RelayBuf {
             promote_to: RELAY_BUFFER,
             owed: 0,
             sent: 0,
+            spins: 0,
         }
     }
 
@@ -35537,6 +35543,7 @@ impl RelayBuf {
         self.ensure();
         self.owed = n;
         self.sent = 0;
+        self.spins = 0;
         self.moved = self.moved.saturating_add(n);
         if self.window < self.promote_to && (n == self.window || self.moved >= self.promote_to) {
             self.window = self.promote_to;
@@ -35563,6 +35570,16 @@ impl RelayBuf {
     #[must_use]
     pub fn owes(&self) -> bool {
         self.sent < self.owed
+    }
+
+    /// A window that is still shut keeps the lane for one more yield, so an ack that lands inside
+    /// the step reopens it without paying the pool's timer; four yields later the lane parks.
+    fn spin(&mut self) -> bool {
+        if self.spins >= 4 {
+            return false;
+        }
+        self.spins += 1;
+        true
     }
 
     /// The part of the last read that has not reached the other half yet.
