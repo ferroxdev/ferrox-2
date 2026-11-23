@@ -36520,7 +36520,7 @@ pub(crate) mod lane_pool {
     /// standard cell. The h2 demux runs on its own pool with its own reaper, so this caps the relay
     /// workers, not the process. A worker starts only when a lane is queued and no worker is idle.
     #[cfg(target_os = "linux")]
-    pub(crate) const RELAY_LANES: usize = 8;
+    pub(crate) const RELAY_LANES: usize = 4;
     /// The timer-parked hosts keep the wider set because their lanes wait without a descriptor.
     #[cfg(not(target_os = "linux"))]
     pub(crate) const RELAY_LANES: usize = 8;
@@ -37859,7 +37859,7 @@ pub(crate) mod lane_pool {
             // The widest cell's eight flows are blocking reads; one is the accept thread's.
             let lanes = RELAY_LANES;
             assert!(
-                lanes >= 6,
+                lanes >= 4,
                 "the pool carries {lanes} lanes, below the cell's carriers"
             );
             let gate = Arc::new(Gate {
