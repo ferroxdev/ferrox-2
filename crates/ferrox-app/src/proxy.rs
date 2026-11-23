@@ -9179,6 +9179,19 @@ impl Write for FallbackPeer {
     }
 }
 
+impl LaneWrite for FallbackPeer {
+    fn push(&mut self, data: &[u8]) -> Push {
+        match self {
+            Self::Socket(stream) => stream.push(data),
+            Self::Udp(udp) => match udp.send(data) {
+                Ok(n) => Push::Took(n),
+                Err(error) if is_timeout(&error) => Push::Parked,
+                Err(_) => Push::Lost,
+            },
+        }
+    }
+}
+
 impl HalfShut for FallbackPeer {
     // A datagram peer's write half means no FIN; the stream one spills.
     fn spill(&self) {
@@ -14078,8 +14091,13 @@ fn relay_lanes_handoff<
     flow
 }
 
-#[derive(Clone)]
 struct HalfSink<W>(Arc<Half<W>>);
+
+impl<W> Clone for HalfSink<W> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
 
 impl<W: LaneWrite> CarrierSink for HalfSink<W> {
     fn send(&self, bytes: &[u8]) -> bool {
@@ -14170,7 +14188,7 @@ where
                 Next::Idle
             }
         }
-        Ok(_) | Err(_) => {
+        Err(_) => {
             ended.mark_failed();
             Next::Done
         }
@@ -39027,6 +39045,8 @@ pub(crate) trait LaneWrite: Write + Send {
 }
 
 impl LaneWrite for Vec<u8> {}
+
+impl LaneWrite for Box<dyn Write + Send> {}
 
 #[cfg(unix)]
 impl LaneWrite for std::os::unix::net::UnixStream {}

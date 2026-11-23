@@ -1211,6 +1211,24 @@ impl proxy::FrameWrite for BoxedWrite {
     }
 }
 
+impl proxy::LaneWrite for BoxedWrite {
+    fn push(&mut self, data: &[u8]) -> proxy::Push {
+        self.0.push(data)
+    }
+
+    fn settle(&mut self) -> proxy::Settle {
+        self.0.settle()
+    }
+
+    fn wait_room(&mut self, turn: Duration) {
+        self.0.wait_room(turn);
+    }
+
+    fn room(&self) -> u64 {
+        self.0.room()
+    }
+}
+
 fn basic_token(user: &str, password: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"))
 }
@@ -1542,10 +1560,10 @@ fn serve_h2_connection(
         if session.alpn() != Some(b"h2") {
             return;
         }
-        let Some(halves) = proxy::tls_server_halves(session) else {
+        let Some((reader, writer)) = proxy::tls_server_halves(session) else {
             return;
         };
-        halves
+        (reader, Box::new(writer))
     } else {
         let Ok(writer) = stream.try_clone() else {
             return;
@@ -2037,7 +2055,7 @@ impl NaiveOut {
         let (reader, writer) = proxy::tls_client_halves(session)?;
         H2Client::new_windowed(
             reader,
-            BoxedWrite(writer),
+            BoxedWrite(Box::new(writer)),
             Some(raw),
             Some(self.stream_window.unwrap_or(H2_RECEIVE_WINDOW)),
         )
