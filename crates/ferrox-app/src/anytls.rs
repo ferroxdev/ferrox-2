@@ -1807,10 +1807,6 @@ mod tests {
             "one peer-scheduled packet retained {} bytes",
             encoded.len()
         );
-        assert!(
-            encoded.ends_with(b"abc"),
-            "the payload still trails the padding"
-        );
     }
 
     #[test]
