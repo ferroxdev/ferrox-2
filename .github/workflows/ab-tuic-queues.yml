@@ -2,6 +2,9 @@ name: ab-tuic-queues
 
 on:
   workflow_dispatch:
+  push:
+    branches: [ab-tuic-queues]
+    paths: ['.github/workflows/ab-tuic-queues.yml']
 
 permissions:
   contents: read
