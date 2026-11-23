@@ -30,42 +30,7 @@ fn fakedns(root: &mut Json) -> Result<(), String> {
     if !in_use {
         return Ok(());
     }
-    let strategy = dns.get("queryStrategy").and_then(Json::as_str);
-    let (v4, v6) = if strategy.is_some_and(|strategy| {
-        spelled_as(
-            strategy,
-            &[
-                "useip4",
-                "useipv4",
-                "use_ip4",
-                "use_ipv4",
-                "use_ip_v4",
-                "use-ip4",
-                "use-ipv4",
-                "use-ip-v4",
-            ],
-        )
-    }) {
-        (true, false)
-    } else if strategy.is_some_and(|strategy| {
-        spelled_as(
-            strategy,
-            &[
-                "useip6",
-                "useipv6",
-                "use_ip6",
-                "use_ipv6",
-                "use_ip_v6",
-                "use-ip6",
-                "use-ipv6",
-                "use-ip-v6",
-            ],
-        )
-    }) {
-        (false, true)
-    } else {
-        (true, true)
-    };
+    let (v4, v6) = strategy_families(dns.get("queryStrategy").and_then(Json::as_str));
     if root
         .get("fakeDns")
         .is_none_or(|value| matches!(value, Json::Null))
@@ -91,6 +56,39 @@ fn fakedns(root: &mut Json) -> Result<(), String> {
 /// One spelling of a query strategy, matched without folding the config's text into a new string.
 fn spelled_as(text: &str, names: &[&str]) -> bool {
     names.iter().any(|name| text.eq_ignore_ascii_case(name))
+}
+
+const IPV4_STRATEGIES: &[&str] = &[
+    "useip4",
+    "useipv4",
+    "use_ip4",
+    "use_ipv4",
+    "use_ip_v4",
+    "use-ip4",
+    "use-ipv4",
+    "use-ip-v4",
+];
+
+const IPV6_STRATEGIES: &[&str] = &[
+    "useip6",
+    "useipv6",
+    "use_ip6",
+    "use_ipv6",
+    "use_ip_v6",
+    "use-ip6",
+    "use-ipv6",
+    "use-ip-v6",
+];
+
+/// The address families a `queryStrategy` spelling permits, the reference's three outcomes.
+fn strategy_families(strategy: Option<&str>) -> (bool, bool) {
+    if strategy.is_some_and(|strategy| spelled_as(strategy, IPV4_STRATEGIES)) {
+        (true, false)
+    } else if strategy.is_some_and(|strategy| spelled_as(strategy, IPV6_STRATEGIES)) {
+        (false, true)
+    } else {
+        (true, true)
+    }
 }
 
 fn names_fakedns(server: &Json) -> bool {
@@ -257,16 +255,26 @@ mod tests {
 
     #[test]
     fn a_strategy_spelling_costs_no_allocation() {
-        let mut upper = parsed(r#"{"dns":{"servers":["fakedns"],"queryStrategy":"UseIPv4"}}"#);
-        let mut lower = parsed(r#"{"dns":{"servers":["fakedns"],"queryStrategy":"useipv4"}}"#);
-        let (_, of_upper) = ferrox_core::alloc_count::measure(|| run(&mut upper));
-        let (_, of_lower) = ferrox_core::alloc_count::measure(|| run(&mut lower));
-        assert_eq!(
-            of_upper.allocs,
-            of_lower.allocs,
-            "the strategy's case added {} allocations",
-            of_upper.allocs - of_lower.allocs
-        );
+        for spelling in ["UseIPv4", "useipv4", "USE-IP-V4", "UseIPv6", "use_ip_v6"] {
+            let (families, counts) =
+                ferrox_core::alloc_count::measure(|| strategy_families(Some(spelling)));
+            assert_eq!(
+                families,
+                match spelling {
+                    "UseIPv6" | "use_ip_v6" => (false, true),
+                    _ => (true, false),
+                },
+                "{spelling}"
+            );
+            assert_eq!(
+                counts.allocs, 0,
+                "{spelling} allocated {} times",
+                counts.allocs
+            );
+            assert_eq!(counts.bytes, 0, "{spelling} copied {} bytes", counts.bytes);
+        }
+        assert_eq!(strategy_families(None), (true, true));
+        assert_eq!(strategy_families(Some("asymmetric")), (true, true));
     }
 
     #[test]
