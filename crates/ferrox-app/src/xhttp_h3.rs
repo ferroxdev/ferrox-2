@@ -15,6 +15,7 @@ use crate::xhttp::{XhttpMode, XhttpSettings};
 const TICK: Duration = Duration::from_millis(20);
 const POLL: Duration = Duration::from_millis(5);
 const READ_ROOM: usize = 16 * 1024;
+const H3_WRITE_CHUNK: usize = 16 * 1024;
 const H3_STREAM_CREATION_ERROR: u64 = 0x0103;
 const H3_CLOSED_CRITICAL_STREAM: u64 = 0x0104;
 const H3_FRAME_UNEXPECTED: u64 = 0x0105;
@@ -56,6 +57,13 @@ impl Write for Wire {
 }
 
 impl Wire {
+    fn try_write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Server(stream) => stream.try_write(buf),
+            Self::Client(stream) => stream.try_write(buf),
+        }
+    }
+
     fn activity(&self) -> Arc<Activity> {
         match self {
             Self::Server(stream) => stream.activity(),
@@ -627,6 +635,9 @@ pub(crate) struct H3Writer {
     wire: Wire,
     head: Vec<u8>,
     headed: bool,
+    pending: Vec<u8>,
+    at: usize,
+    input: usize,
 }
 
 impl H3Writer {
@@ -635,6 +646,9 @@ impl H3Writer {
             wire,
             head: Vec::new(),
             headed: false,
+            pending: Vec::new(),
+            at: 0,
+            input: 0,
         }
     }
 }
@@ -678,6 +692,114 @@ impl crate::proxy::FrameWrite for H3Writer {
     }
 }
 
+impl crate::proxy::LaneWrite for H3Writer {
+    fn push(&mut self, data: &[u8]) -> crate::proxy::Push {
+        if !self.pending.is_empty() {
+            match self.wire.try_write(&self.pending[self.at..]) {
+                Ok(0) => return crate::proxy::Push::Parked,
+                Ok(n) => self.at += n,
+                Err(error) if crate::proxy::is_timeout(&error) => {
+                    return crate::proxy::Push::Parked
+                }
+                Err(_) => {
+                    self.pending.clear();
+                    self.input = 0;
+                    return crate::proxy::Push::Lost;
+                }
+            }
+            if self.at < self.pending.len() {
+                return crate::proxy::Push::Parked;
+            }
+            let input = std::mem::take(&mut self.input);
+            self.pending.clear();
+            self.at = 0;
+            if data.len() < input {
+                return crate::proxy::Push::Lost;
+            }
+            if data.len() == input {
+                return crate::proxy::Push::Took(input);
+            }
+            return self.push(&data[input..]);
+        }
+        if !self.headed {
+            self.head.extend_from_slice(data);
+            let Some(at) = head_end(&self.head) else {
+                return crate::proxy::Push::Took(data.len());
+            };
+            let head = std::mem::take(&mut self.head);
+            let text = std::str::from_utf8(&head[..at]).unwrap_or_default();
+            let body = &head[at + 4..];
+            let fields = response_fields(text);
+            let refs: Vec<(&str, &str)> = fields
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect();
+            let mut block = Vec::new();
+            hpack::qpack_literal_many(&refs, &mut block);
+            let mut pending = Vec::with_capacity(block.len() + body.len() + 18);
+            frames::quic_varint(&mut pending, frames::H3_HEADERS);
+            frames::quic_varint(&mut pending, block.len() as u64);
+            pending.extend_from_slice(&block);
+            if !body.is_empty() {
+                frames::quic_varint(&mut pending, frames::H3_DATA);
+                frames::quic_varint(&mut pending, body.len() as u64);
+                pending.extend_from_slice(body);
+            }
+            self.pending = pending;
+            self.input = data.len();
+            self.at = 0;
+            self.headed = true;
+            match self.wire.try_write(&self.pending) {
+                Ok(0) => return crate::proxy::Push::Parked,
+                Ok(n) => self.at = n,
+                Err(error) if crate::proxy::is_timeout(&error) => {
+                    return crate::proxy::Push::Parked
+                }
+                Err(_) => {
+                    self.pending.clear();
+                    self.input = 0;
+                    return crate::proxy::Push::Lost;
+                }
+            }
+            if self.at < self.pending.len() {
+                return crate::proxy::Push::Parked;
+            }
+            self.pending.clear();
+            self.at = 0;
+            self.input = 0;
+            return crate::proxy::Push::Took(data.len());
+        }
+        if data.is_empty() {
+            return crate::proxy::Push::Took(0);
+        }
+        let take = data.len().min(H3_WRITE_CHUNK);
+        let mut pending = Vec::with_capacity(take + 9);
+        frames::quic_varint(&mut pending, frames::H3_DATA);
+        frames::quic_varint(&mut pending, take as u64);
+        pending.extend_from_slice(&data[..take]);
+        self.pending = pending;
+        self.input = take;
+        self.at = 0;
+        match self.wire.try_write(&self.pending) {
+            Ok(0) => return crate::proxy::Push::Parked,
+            Ok(n) => self.at = n,
+            Err(error) if crate::proxy::is_timeout(&error) => return crate::proxy::Push::Parked,
+            Err(_) => {
+                self.pending.clear();
+                self.input = 0;
+                return crate::proxy::Push::Lost;
+            }
+        }
+        if self.at < self.pending.len() {
+            return crate::proxy::Push::Parked;
+        }
+        self.pending.clear();
+        self.at = 0;
+        self.input = 0;
+        crate::proxy::Push::Took(take)
+    }
+}
+
 /// The stream a session writes through once its head is out; the dispatch keys on this instead of
 /// the H2 stream out, so the body stays raw on both HTTP/2 and HTTP/3.
 #[derive(Clone)]
@@ -700,6 +822,11 @@ impl H3StreamOut {
 
     pub(crate) fn data(&self, payload: &[u8]) -> bool {
         payload.is_empty() || send_data(&self.wire, payload)
+    }
+
+    pub(crate) fn try_write(&self, bytes: &[u8]) -> std::io::Result<usize> {
+        let mut wire = self.wire.clone();
+        wire.try_write(bytes)
     }
 
     /// The serving connection a session binds to; a client-side out answers for no listener.
@@ -1077,6 +1204,31 @@ impl Write for ClientStream {
 }
 
 impl ClientStream {
+    /// One non-blocking body send: no room answers zero, so a relay lane parks instead of a worker.
+    pub(crate) fn try_write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.owner.dead.load(Ordering::Relaxed) {
+            return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        }
+        let Ok(mut conn) = self.conn.lock() else {
+            return Err(std::io::Error::other("h3 connection lock poisoned"));
+        };
+        if self.owner.dead.load(Ordering::Relaxed) || self.owner.rejected(self.id) {
+            return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        }
+        match conn.stream_send_zc(self.id, bytes::Bytes::copy_from_slice(buf), false) {
+            Ok((0, _)) | Err(quiche::Error::Done) => Ok(0),
+            Ok((n, _)) => {
+                self.activity.touch();
+                quic::flush_egress(&mut conn, &self.sock);
+                Ok(n)
+            }
+            Err(error) => Err(std::io::Error::other(format!("h3 stream send: {error:?}"))),
+        }
+    }
+
     /// One non-blocking opening attempt: `StreamLimit` leaves the id unallocated, while a created
     /// stream may still be waiting for credit after this returns.
     fn opening_start(&mut self, buf: &[u8]) -> std::io::Result<usize> {

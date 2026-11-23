@@ -13864,6 +13864,35 @@ impl<T: Read> Half<T> {
     }
 }
 
+impl<T: LaneWrite> LaneWrite for Half<T> {
+    fn push(&mut self, data: &[u8]) -> Push {
+        match self.writer_lock() {
+            Ok(mut guard) => guard.push(data),
+            Err(_) => Push::Lost,
+        }
+    }
+
+    fn settle(&mut self) -> Settle {
+        match self.writer_lock() {
+            Ok(mut guard) => guard.settle(),
+            Err(_) => Settle::Lost,
+        }
+    }
+
+    fn wait_room(&mut self, turn: Duration) {
+        if let Ok(mut guard) = self.writer_lock() {
+            guard.wait_room(turn);
+        }
+    }
+
+    fn room(&self) -> u64 {
+        match self.writer_lock() {
+            Ok(guard) => guard.room(),
+            Err(_) => 0,
+        }
+    }
+}
+
 impl<T: Write> Half<T> {
     fn write_once(&self, buf: &[u8]) -> std::io::Result<()> {
         let Ok(mut guard) = self.writer_lock() else {
@@ -14011,8 +14040,8 @@ pub(crate) fn relay_quic_stream(
 }
 
 fn relay_lanes_shared<
-    A: Read + Write + Send + 'static + HalfShut,
-    B: Read + Write + Send + 'static + HalfShut,
+    A: Read + LaneWrite + Send + 'static + HalfShut,
+    B: Read + LaneWrite + Send + 'static + HalfShut,
 >(
     a: Half<A>,
     b: Half<B>,
@@ -14022,8 +14051,8 @@ fn relay_lanes_shared<
 }
 
 fn relay_lanes_handoff<
-    A: Read + Write + Send + 'static + HalfShut,
-    B: Read + Write + Send + 'static + HalfShut,
+    A: Read + LaneWrite + Send + 'static + HalfShut,
+    B: Read + LaneWrite + Send + 'static + HalfShut,
 >(
     a: Half<A>,
     b: Half<B>,
@@ -14034,37 +14063,102 @@ fn relay_lanes_handoff<
     let flow = RelayFinish::new(false, Arc::clone(close), None);
     let (up_a, up_b, up_flow) = (Arc::clone(&a), Arc::clone(&b), Arc::clone(&flow));
     let mut forward = RelayBuf::new();
+    let mut forward_at = Forward::new();
     lane_pool::submit(
-        Box::new(move || spill_lane_step(&up_a, &up_b, &mut forward, &up_flow)),
+        Box::new(move || spill_lane_step(&up_a, &up_b, &mut forward, &mut forward_at, &up_flow)),
         Box::new(stream_lane_done(&flow)),
     );
     let mut backward = RelayBuf::new();
+    let mut backward_at = Forward::new();
     let parked = Arc::clone(&flow);
     lane_pool::submit(
-        Box::new(move || spill_lane_step(&b, &a, &mut backward, &parked)),
+        Box::new(move || spill_lane_step(&b, &a, &mut backward, &mut backward_at, &parked)),
         Box::new(stream_lane_done(&flow)),
     );
     flow
 }
 
+#[derive(Clone)]
+struct HalfSink<W>(Arc<Half<W>>);
+
+impl<W: LaneWrite> CarrierSink for HalfSink<W> {
+    fn send(&self, bytes: &[u8]) -> bool {
+        self.0.write_once(bytes).is_ok()
+    }
+
+    fn push_ready(&self, bytes: &[u8]) -> Push {
+        match self.0.writer_lock() {
+            Ok(mut guard) => guard.push(bytes),
+            Err(_) => Push::Lost,
+        }
+    }
+
+    fn settle(&self) -> Settle {
+        match self.0.writer_lock() {
+            Ok(mut guard) => guard.settle(),
+            Err(_) => Settle::Lost,
+        }
+    }
+
+    fn wait_for_room(&self, turn: Duration) {
+        if let Ok(mut guard) = self.0.writer_lock() {
+            guard.wait_room(turn);
+        }
+    }
+
+    fn close(&self) {}
+}
+
+fn flush_lane(
+    buffer: &RelayBuf,
+    sink: &impl CarrierSink,
+    at: &mut Forward,
+    ended: &Arc<RelayFinish>,
+) -> Option<Next> {
+    let next = forward_flush(buffer, sink, at);
+    if at.moved {
+        at.moved = false;
+        ended.mark_progress();
+    }
+    if at.lost {
+        at.lost = false;
+        ended.mark_failed();
+    }
+    next
+}
+
 fn spill_lane_step<R, W>(
-    from: &Half<R>,
-    to: &Half<W>,
+    from: &Arc<Half<R>>,
+    to: &Arc<Half<W>>,
     buffer: &mut RelayBuf,
+    at: &mut Forward,
     ended: &Arc<RelayFinish>,
 ) -> Next
 where
     R: Read,
-    W: Write + HalfShut,
+    W: LaneWrite + HalfShut + 'static,
 {
+    let sink = HalfSink(Arc::clone(to));
+    if let Some(next) = settle_lane(&sink, at) {
+        if at.lost {
+            at.lost = false;
+            ended.mark_failed();
+        }
+        return next;
+    }
+    if let Some(next) = flush_lane(buffer, &sink, at, ended) {
+        return next;
+    }
     match from.read_once(buffer.as_mut()) {
         Ok(0) => {
             to.spill_write();
             Next::Done
         }
-        Ok(n) if to.write_once(buffer.filled(n)).is_ok() => {
-            ended.mark_progress();
-            Next::More
+        Ok(n) => {
+            at.pending = n;
+            at.sent = 0;
+            let _ = buffer.filled(n);
+            flush_lane(buffer, &sink, at, ended).unwrap_or(Next::More)
         }
         Err(error) if is_timeout(&error) => {
             if ended.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
@@ -38908,6 +39002,58 @@ pub(crate) enum Push {
     Lost,
 }
 
+/// A relay writer a lane can offer without waiting: a flow-control wait parks the lane, not the worker.
+pub(crate) trait LaneWrite: Write + Send {
+    fn push(&mut self, data: &[u8]) -> Push {
+        match self.write(data) {
+            Ok(0) => Push::Parked,
+            Ok(n) => Push::Took(n),
+            Err(error) if is_timeout(&error) => Push::Parked,
+            Err(_) => Push::Lost,
+        }
+    }
+
+    fn settle(&mut self) -> Settle {
+        Settle::Clear
+    }
+
+    fn wait_room(&mut self, turn: Duration) {
+        std::thread::sleep(turn);
+    }
+
+    fn room(&self) -> u64 {
+        u64::MAX
+    }
+}
+
+impl LaneWrite for Vec<u8> {}
+
+#[cfg(unix)]
+impl LaneWrite for std::os::unix::net::UnixStream {}
+
+impl LaneWrite for Connection {
+    fn push(&mut self, data: &[u8]) -> Push {
+        #[cfg(unix)]
+        {
+            match self.write_ready(&[data]) {
+                Ok(0) => Push::Parked,
+                Ok(n) => Push::Took(n),
+                Err(error) if is_timeout(&error) => Push::Parked,
+                Err(_) => Push::Lost,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            match <Connection as Write>::write(self, data) {
+                Ok(0) => Push::Parked,
+                Ok(n) => Push::Took(n),
+                Err(error) if is_timeout(&error) => Push::Parked,
+                Err(_) => Push::Lost,
+            }
+        }
+    }
+}
+
 pub(crate) trait CarrierSink: Clone + Send + 'static {
     fn send(&self, bytes: &[u8]) -> bool;
     /// A lane step must not wait for room a paced carrier frees later: a full queue parks the window instead of holding the worker the other flows need.
@@ -39351,6 +39497,8 @@ struct Forward {
     spins: u32,
     parked: Option<std::time::Instant>,
     stopped: Option<std::time::Instant>,
+    moved: bool,
+    lost: bool,
 }
 
 impl Forward {
@@ -39362,6 +39510,8 @@ impl Forward {
             spins: 0,
             parked: None,
             stopped: None,
+            moved: false,
+            lost: false,
         }
     }
 }
@@ -39393,6 +39543,7 @@ fn settle_lane(uplink: &impl CarrierSink, at: &mut Forward) -> Option<Next> {
             let now = std::time::Instant::now();
             let since = *at.parked.get_or_insert(now);
             if now.duration_since(since) >= crate::budgets::relay_stall() {
+                at.lost = true;
                 return Some(Next::Done);
             }
             at.spins += 1;
@@ -39402,7 +39553,10 @@ fn settle_lane(uplink: &impl CarrierSink, at: &mut Forward) -> Option<Next> {
             }
             Some(Next::Retry)
         }
-        Settle::Lost => Some(Next::Done),
+        Settle::Lost => {
+            at.lost = true;
+            Some(Next::Done)
+        }
     }
 }
 
@@ -39421,9 +39575,13 @@ fn forward_flush(buffer: &RelayBuf, uplink: &impl CarrierSink, at: &mut Forward)
                 at.sent += n;
                 at.spins = 0;
                 at.stopped = None;
+                at.moved = true;
             }
             // A carrier that takes nothing for the stall budget ends the leg, wherever the lane parks.
-            Push::Took(_) | Push::Parked if write_parked(at) => return Some(Next::Done),
+            Push::Took(_) | Push::Parked if write_parked(at) => {
+                at.lost = true;
+                return Some(Next::Done);
+            }
             // A full socket hands the lane to the reactor, while a full window rejoins the queue at once.
             Push::Took(_) | Push::Parked if crate::proxy::write_wait_pending() => {
                 return Some(Next::Idle);
@@ -39439,6 +39597,7 @@ fn forward_flush(buffer: &RelayBuf, uplink: &impl CarrierSink, at: &mut Forward)
             }
             Push::Lost => {
                 echo_trace("relay fwd send failed");
+                at.lost = true;
                 return Some(Next::Done);
             }
         }

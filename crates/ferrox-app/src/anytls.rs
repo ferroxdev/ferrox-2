@@ -733,6 +733,8 @@ impl Write for AnyTlsStream {
     }
 }
 
+impl proxy::LaneWrite for AnyTlsStream {}
+
 impl proxy::Duplicate for AnyTlsStream {
     fn duplicate(&self) -> Option<Self> {
         Some(self.clone())

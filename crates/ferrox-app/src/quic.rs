@@ -5049,6 +5049,17 @@ impl Write for QuicStream {
     }
 }
 
+impl crate::proxy::LaneWrite for QuicStream {
+    fn push(&mut self, data: &[u8]) -> crate::proxy::Push {
+        match self.try_write(data) {
+            Ok(0) => crate::proxy::Push::Parked,
+            Ok(n) => crate::proxy::Push::Took(n),
+            Err(error) if crate::proxy::is_timeout(&error) => crate::proxy::Push::Parked,
+            Err(_) => crate::proxy::Push::Lost,
+        }
+    }
+}
+
 impl crate::proxy::Duplicate for QuicStream {
     /// Two handles of one stream: the clone shares the connection and the id and costs no
     /// syscall, and neither half holds a lock across the wait the other direction wants.
@@ -5119,6 +5130,26 @@ impl QuicStream {
     pub(crate) fn with_meter(mut self, meter: crate::stats::Meter) -> Self {
         self.meter = self.meter.merged(meter);
         self
+    }
+
+    /// One non-blocking send flight: no room answers zero, so a relay lane parks instead of a worker.
+    pub(crate) fn try_write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.stop.load(Ordering::Relaxed) {
+            return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        }
+        if self.stalled.load(Ordering::Relaxed) {
+            return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        }
+        let mut rest = bytes::Bytes::copy_from_slice(buf);
+        let n = self.send_once(&mut rest)?;
+        if n > 0 {
+            self.meter.write(n);
+            self.activity.touch();
+        }
+        Ok(n)
     }
 
     /// One send flight without holding the lock across the wait behind it.

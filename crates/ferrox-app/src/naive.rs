@@ -3,13 +3,13 @@
 
 use crate::conn::Connection;
 use crate::json::Json;
-use crate::proxy::{self, Destination};
+use crate::proxy::{self, Destination, LaneWrite as _};
 use crate::xhttp_h2::{
     self, H2Client, H2Conn, H2OpenError, H2Service, H2StreamOut, H2StreamReader,
 };
 use crate::xhttp_h3::{H3Client, H3OpenError, H3Reader, H3StreamOut, H3Writer, Wire};
 use base64::Engine as _;
-use ferrox_core::foxy::hpack;
+use ferrox_core::foxy::{frames, hpack};
 use ferrox_core::hysteria::Congestion;
 use ferrox_core::tls::{TlsConfig, TlsProvider as _};
 use std::collections::{HashMap, VecDeque};
@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 const PADDING_COUNT: usize = 8;
 const MAX_PADDING_CHUNK: usize = 65_535;
+const H3_WRITE_CHUNK: usize = 16 * 1024;
 const MAX_UOT_LANES: usize = 256;
 /// Lane opens run off the receive loop, so each destination queues a bounded burst while dialed.
 const MAX_UOT_PENDING: usize = 32;
@@ -39,7 +40,7 @@ const QUIC_STREAM_WINDOW: u64 = 6 * 1024 * 1024;
 const QUIC_SESSION_WINDOW: u64 = 15 * 1024 * 1024;
 
 type Reader = Box<dyn Read + Send>;
-type Writer = Box<dyn Write + Send>;
+type Writer = Box<dyn crate::proxy::LaneWrite + Send>;
 type Users = Arc<Vec<(String, String)>>;
 
 fn random_u64() -> u64 {
@@ -130,33 +131,99 @@ impl PaddingRead {
 #[derive(Default)]
 struct PaddingWrite {
     written: usize,
+    pending: Vec<u8>,
+    at: usize,
+    input: usize,
 }
 
 impl PaddingWrite {
-    fn write(&mut self, writer: &mut dyn Write, data: &[u8]) -> std::io::Result<usize> {
-        if data.is_empty() {
-            return Ok(0);
+    fn push(&mut self, writer: &mut dyn proxy::LaneWrite, data: &[u8]) -> proxy::Push {
+        if data.is_empty() && self.pending.is_empty() {
+            return proxy::Push::Took(0);
+        }
+        let mut done = 0usize;
+        if !self.pending.is_empty() {
+            match writer.push(&self.pending[self.at..]) {
+                proxy::Push::Took(n) => self.at += n,
+                proxy::Push::Parked => return Self::progress(done),
+                proxy::Push::Lost => return proxy::Push::Lost,
+            }
+            if self.at < self.pending.len() {
+                return Self::progress(done);
+            }
+            let input = std::mem::take(&mut self.input);
+            self.pending.clear();
+            self.at = 0;
+            self.written += 1;
+            if data.len() < input {
+                return proxy::Push::Lost;
+            }
+            done = input;
         }
         if self.written >= PADDING_COUNT {
-            return writer.write(data);
+            return match writer.push(&data[done..]) {
+                proxy::Push::Took(n) => proxy::Push::Took(done + n),
+                proxy::Push::Parked => Self::progress(done),
+                proxy::Push::Lost => proxy::Push::Lost,
+            };
         }
-        let mut done = 0;
-        for chunk in data.chunks(MAX_PADDING_CHUNK) {
-            if self.written >= PADDING_COUNT {
-                write_all(writer, &data[done..])?;
-                return Ok(data.len());
-            }
+        while done < data.len() && self.written < PADDING_COUNT {
+            let take = (data.len() - done).min(MAX_PADDING_CHUNK);
             let padding = random_below(256) as u8;
-            let mut header = [0u8; 3];
-            header[..2].copy_from_slice(&(chunk.len() as u16).to_be_bytes());
-            header[2] = padding;
-            write_all(writer, &header)?;
-            write_all(writer, chunk)?;
-            write_zeros(writer, usize::from(padding))?;
+            let mut record = Vec::with_capacity(3 + take + usize::from(padding));
+            record.extend_from_slice(&(take as u16).to_be_bytes());
+            record.push(padding);
+            record.extend_from_slice(&data[done..done + take]);
+            record.resize(record.len() + usize::from(padding), 0);
+            self.pending = record;
+            self.at = 0;
+            self.input = take;
+            match writer.push(&self.pending) {
+                proxy::Push::Took(n) => self.at = n,
+                proxy::Push::Parked => return Self::progress(done),
+                proxy::Push::Lost => {
+                    self.pending.clear();
+                    self.input = 0;
+                    return proxy::Push::Lost;
+                }
+            }
+            if self.at < self.pending.len() {
+                return Self::progress(done);
+            }
+            self.pending.clear();
+            self.at = 0;
+            self.input = 0;
             self.written += 1;
-            done += chunk.len();
+            done += take;
         }
-        Ok(data.len())
+        Self::progress(done)
+    }
+
+    fn progress(done: usize) -> proxy::Push {
+        if done > 0 {
+            proxy::Push::Took(done)
+        } else {
+            proxy::Push::Parked
+        }
+    }
+
+    #[cfg(test)]
+    fn write(&mut self, writer: &mut dyn proxy::LaneWrite, data: &[u8]) -> std::io::Result<usize> {
+        let mut done = 0;
+        let deadline = Instant::now() + crate::budgets::relay_stall();
+        while done < data.len() {
+            match self.push(writer, &data[done..]) {
+                proxy::Push::Took(n) if n > 0 => done += n,
+                proxy::Push::Took(_) | proxy::Push::Parked => {
+                    if Instant::now() >= deadline {
+                        return Err(std::io::ErrorKind::BrokenPipe.into());
+                    }
+                    writer.wait_room(crate::budgets::RELAY_POLL);
+                }
+                proxy::Push::Lost => return Err(std::io::ErrorKind::BrokenPipe.into()),
+            }
+        }
+        Ok(done)
     }
 }
 
@@ -845,20 +912,21 @@ impl Read for NaiveStream {
 
 impl Write for NaiveStream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let mut writer = self
-            .inner
-            .writer
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if !self.inner.padded {
-            return writer.write(buf);
+        let mut done = 0;
+        let deadline = Instant::now() + crate::budgets::relay_stall();
+        while done < buf.len() {
+            match self.push(&buf[done..]) {
+                proxy::Push::Took(n) if n > 0 => done += n,
+                proxy::Push::Took(_) | proxy::Push::Parked => {
+                    if Instant::now() >= deadline {
+                        return Err(std::io::ErrorKind::BrokenPipe.into());
+                    }
+                    self.wait_room(crate::budgets::RELAY_POLL);
+                }
+                proxy::Push::Lost => return Err(std::io::ErrorKind::BrokenPipe.into()),
+            }
         }
-        let mut padding = self
-            .inner
-            .write_padding
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        padding.write(&mut **writer, buf)
+        Ok(done)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -867,6 +935,49 @@ impl Write for NaiveStream {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .flush()
+    }
+}
+
+impl proxy::LaneWrite for NaiveStream {
+    fn push(&mut self, data: &[u8]) -> proxy::Push {
+        let mut writer = self
+            .inner
+            .writer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !self.inner.padded {
+            return writer.push(data);
+        }
+        let mut padding = self
+            .inner
+            .write_padding
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        padding.push(&mut **writer, data)
+    }
+
+    fn settle(&mut self) -> proxy::Settle {
+        self.inner
+            .writer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .settle()
+    }
+
+    fn wait_room(&mut self, turn: Duration) {
+        self.inner
+            .writer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .wait_room(turn);
+    }
+
+    fn room(&self) -> u64 {
+        self.inner
+            .writer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .room()
     }
 }
 
@@ -935,6 +1046,37 @@ impl Write for H2OutWrite {
     }
 }
 
+impl proxy::LaneWrite for H2OutWrite {
+    fn push(&mut self, data: &[u8]) -> proxy::Push {
+        if data.is_empty() {
+            return proxy::Push::Took(0);
+        }
+        let room = usize::try_from(self.out.room()).unwrap_or(usize::MAX);
+        let take = data.len().min(room);
+        if take == 0 {
+            return proxy::Push::Parked;
+        }
+        let offer = &data[..take];
+        match self.out.try_batch_parts(&[&[offer]]) {
+            Some(true) => proxy::Push::Took(take),
+            Some(false) => proxy::Push::Lost,
+            None => proxy::Push::Parked,
+        }
+    }
+
+    fn settle(&mut self) -> proxy::Settle {
+        self.out.settle()
+    }
+
+    fn wait_room(&mut self, turn: Duration) {
+        self.out.wait_room(turn);
+    }
+
+    fn room(&self) -> u64 {
+        self.out.room()
+    }
+}
+
 struct H3ClientRead {
     inner: H3Reader,
 }
@@ -958,6 +1100,20 @@ impl Read for H3ClientRead {
 
 struct H3OutWrite {
     out: H3StreamOut,
+    pending: Vec<u8>,
+    at: usize,
+    input: usize,
+}
+
+impl H3OutWrite {
+    fn new(out: H3StreamOut) -> Self {
+        Self {
+            out,
+            pending: Vec::new(),
+            at: 0,
+            input: 0,
+        }
+    }
 }
 
 impl Write for H3OutWrite {
@@ -974,6 +1130,64 @@ impl Write for H3OutWrite {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+impl proxy::LaneWrite for H3OutWrite {
+    fn push(&mut self, data: &[u8]) -> proxy::Push {
+        if !self.pending.is_empty() {
+            match self.out.try_write(&self.pending[self.at..]) {
+                Ok(0) => return proxy::Push::Parked,
+                Ok(n) => self.at += n,
+                Err(error) if proxy::is_timeout(&error) => return proxy::Push::Parked,
+                Err(_) => {
+                    self.pending.clear();
+                    self.input = 0;
+                    return proxy::Push::Lost;
+                }
+            }
+            if self.at < self.pending.len() {
+                return proxy::Push::Parked;
+            }
+            let input = std::mem::take(&mut self.input);
+            self.pending.clear();
+            self.at = 0;
+            if data.len() < input {
+                return proxy::Push::Lost;
+            }
+            if data.len() == input {
+                return proxy::Push::Took(input);
+            }
+            return self.push(&data[input..]);
+        }
+        if data.is_empty() {
+            return proxy::Push::Took(0);
+        }
+        let take = data.len().min(H3_WRITE_CHUNK);
+        let mut frame = Vec::with_capacity(take + 9);
+        frames::quic_varint(&mut frame, frames::H3_DATA);
+        frames::quic_varint(&mut frame, take as u64);
+        frame.extend_from_slice(&data[..take]);
+        self.pending = frame;
+        self.input = take;
+        self.at = 0;
+        match self.out.try_write(&self.pending) {
+            Ok(0) => return proxy::Push::Parked,
+            Ok(n) => self.at = n,
+            Err(error) if proxy::is_timeout(&error) => return proxy::Push::Parked,
+            Err(_) => {
+                self.pending.clear();
+                self.input = 0;
+                return proxy::Push::Lost;
+            }
+        }
+        if self.at < self.pending.len() {
+            return proxy::Push::Parked;
+        }
+        self.pending.clear();
+        self.at = 0;
+        self.input = 0;
+        proxy::Push::Took(take)
     }
 }
 
@@ -1967,7 +2181,7 @@ impl NaiveOut {
                         return None;
                     }
                     let reader = H3ClientRead { inner: reader };
-                    let writer = H3OutWrite { out: out.clone() };
+                    let writer = H3OutWrite::new(out.clone());
                     return Some(NaiveStream::new(
                         Box::new(reader),
                         Box::new(writer),
@@ -2818,6 +3032,8 @@ mod tests {
             Ok(())
         }
     }
+
+    impl proxy::LaneWrite for Sink {}
 
     #[test]
     fn a_staged_listener_does_not_close_the_shared_stop() {
