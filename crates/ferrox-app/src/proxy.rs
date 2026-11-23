@@ -14149,6 +14149,26 @@ impl<T: Read> Half<T> {
 }
 
 impl<T: Write> Half<T> {
+    /// One offer to the writer, so a half that took only part of the window can keep the rest for the next lane step instead of sleeping in this one.
+    fn write_some(&self, buf: &[u8]) -> std::io::Result<usize> {
+        let Ok(mut guard) = self.writer_lock() else {
+            return Err(std::io::Error::other("relay half poisoned"));
+        };
+        let written = guard.write(buf)?;
+        if written == buf.len() {
+            guard.flush()?;
+        }
+        if written > 0 {
+            if let Self::Shared {
+                grain: Some(grain), ..
+            } = self
+            {
+                grain.moved();
+            }
+        }
+        Ok(written)
+    }
+
     fn write_once(&self, buf: &[u8]) -> std::io::Result<()> {
         let Ok(mut guard) = self.writer_lock() else {
             return Err(std::io::Error::other("relay half poisoned"));
@@ -14341,25 +14361,52 @@ where
     R: Read,
     W: Write + HalfShut,
 {
-    match from.read_once(buffer.as_mut()) {
-        Ok(0) => {
-            to.spill_write();
-            Next::Done
-        }
-        Ok(n) if to.write_once(buffer.filled(n)).is_ok() => {
-            ended.mark_progress();
-            Next::More
-        }
-        Err(error) if is_timeout(&error) => {
-            if ended.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
-                Next::Done
-            } else {
+    if !buffer.owes() {
+        match from.read_once(buffer.as_mut()) {
+            Ok(0) => {
+                to.spill_write();
+                return Next::Done;
+            }
+            Ok(n) => {
+                let _ = buffer.filled(n);
+            }
+            Err(error) if is_timeout(&error) => {
+                if ended.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
+                    return Next::Done;
+                }
                 note_wait_finish(ended);
                 buffer.release();
-                Next::Idle
+                return Next::Idle;
             }
+            Err(_) => return Next::Done,
         }
-        Ok(_) | Err(_) => Next::Done,
+    }
+    spill_owed(to, buffer, ended)
+}
+
+/// Hands a window the writer took only part of back to the lane: the rest stays here, so a
+/// flow-control wait parks the lane instead of sleeping a worker that another leg could use.
+fn spill_owed<W: Write>(to: &Half<W>, buffer: &mut RelayBuf, ended: &Arc<RelayFinish>) -> Next {
+    loop {
+        let outcome = {
+            let owed = buffer.owed();
+            if owed.is_empty() {
+                return Next::More;
+            }
+            to.write_some(owed)
+        };
+        match outcome {
+            Ok(0) => return Next::Done,
+            Ok(n) => {
+                buffer.advance(n);
+                ended.mark_progress();
+            }
+            Err(error) if is_timeout(&error) => {
+                note_wait_finish(ended);
+                return Next::Idle;
+            }
+            Err(_) => return Next::Done,
+        }
     }
 }
 
@@ -36029,6 +36076,8 @@ pub(crate) struct RelayBuf {
     limit: usize,
     moved: usize,
     promote_to: usize,
+    owed: usize,
+    sent: usize,
 }
 
 impl RelayBuf {
@@ -36052,6 +36101,8 @@ impl RelayBuf {
             limit: usize::MAX,
             moved: 0,
             promote_to: RELAY_BUFFER,
+            owed: 0,
+            sent: 0,
         }
     }
 
@@ -36119,6 +36170,8 @@ impl RelayBuf {
     #[must_use]
     pub fn filled(&mut self, n: usize) -> &[u8] {
         self.ensure();
+        self.owed = n;
+        self.sent = 0;
         self.moved = self.moved.saturating_add(n);
         if self.window < self.promote_to && (n == self.window || self.moved >= self.promote_to) {
             self.window = self.promote_to;
@@ -36139,6 +36192,27 @@ impl RelayBuf {
     #[must_use]
     pub fn prefix(&self, n: usize) -> &[u8] {
         &self.bytes[..n]
+    }
+
+    /// Whether a parked send still owes bytes from the last read.
+    #[must_use]
+    pub fn owes(&self) -> bool {
+        self.sent < self.owed
+    }
+
+    /// The part of the last read that has not reached the other half yet.
+    #[must_use]
+    pub fn owed(&self) -> &[u8] {
+        &self.bytes[self.sent..self.owed]
+    }
+
+    /// Account for bytes the other half took, clearing the read once the whole window is away.
+    pub fn advance(&mut self, n: usize) {
+        self.sent = (self.sent + n).min(self.owed);
+        if self.sent == self.owed {
+            self.sent = 0;
+            self.owed = 0;
+        }
     }
 
     #[cfg(test)]
@@ -50413,6 +50487,57 @@ mod tests {
             .recv_timeout(crate::budgets::RELAY_RESPONSE_IDLE + Duration::from_secs(5))
             .expect("the owned relay ended its idle sibling");
         relay.join().expect("the relay thread returns");
+    }
+
+    struct PartialWriter {
+        out: Vec<u8>,
+        room: usize,
+    }
+
+    impl Write for PartialWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.room == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            let n = buf.len().min(self.room);
+            self.out.extend_from_slice(&buf[..n]);
+            self.room -= n;
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl HalfShut for PartialWriter {
+        fn spill(&self) {}
+    }
+
+    #[test]
+    fn a_partial_lane_write_resumes_without_reading_again() {
+        let from = Half::shared(std::io::Cursor::new(b"hello".to_vec()));
+        let to = Half::shared(PartialWriter {
+            out: Vec::new(),
+            room: 2,
+        });
+        let ended = RelayFinish::new(false, Arc::new(|| {}), None);
+        let mut buffer = RelayBuf::new();
+        assert!(matches!(
+            spill_lane_step(&from, &to, &mut buffer, &ended),
+            Next::Idle
+        ));
+        assert!(buffer.owes());
+        let Half::Shared { inner, .. } = &to else {
+            panic!("the test writer is shared");
+        };
+        inner.lock().expect("the writer lock").room = 8;
+        assert!(matches!(
+            spill_lane_step(&from, &to, &mut buffer, &ended),
+            Next::More
+        ));
+        assert!(!buffer.owes());
+        assert_eq!(inner.lock().expect("the writer lock").out, b"hello");
     }
 
     #[test]
