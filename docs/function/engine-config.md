@@ -9,7 +9,7 @@ Row 178: the same configuration file xray-core reads is read here, whatever its 
 
 ## The reader
 
-`source_format` resolves an explicit `-format` first (`pb`/`protobuf`, `json`, `jsonc`, `json5`, `yaml`/`yml`, `toml`, `auto`), then the extension of the local path, URL path or socket target. JSON, JSONC and `.json5` all reach `strip_jsonc`, the reference's `infra/conf/json/reader.go` state machine: a double- or single-quoted string protects everything inside it from comment stripping (only double-quoted strings survive to the strict parser), a backslash copies the next byte outside a string, `#` and `//` run to the next LF or CR, and `/* ... */` runs to its close while keeping the newlines. Trailing commas are removed in a second pass; that is a superset, since the reference's reader rejects them. `.json5` is an alias for this reader, not full JSON5: unquoted keys, single-quoted values and extended numbers are refused by the strict parser, matching the references, none of which ships a JSON5 parser. `xray.json.strict` (or `XRAY_JSON_STRICT`) equal to `"true"` bypasses the reader and hands the bytes to the strict parser.
+`source_format` resolves an explicit `-format` first (`pb`/`protobuf`, `json`, `jsonc`, `json5`, `yaml`/`yml`, `toml`, `auto`), then the extension of the local path, URL path or socket target. JSON, JSONC and `.json5` all reach `strip_jsonc`, the reference's `infra/conf/json/reader.go` state machine: a double- or single-quoted string protects everything inside it from comment stripping (only double-quoted strings survive to the strict parser), a backslash copies the next byte outside a string, `#` and `//` run to the next LF or CR, and `/* ... */` runs to its close while keeping the newlines. Trailing commas are removed in a second pass; that is a superset, since the reference's reader rejects them. `.json5` is an alias for this reader, not full JSON5: unquoted keys, single-quoted values and extended numbers are refused by the strict parser, matching the references, none of which ships a JSON5 parser. `xray.json.strict` (or `XRAY_JSON_STRICT`) equal to `"true"` bypasses the reader and hands the bytes to the strict parser. A text with neither a comment nor a trailing comma is returned borrowed without a copy; a text that has one is copied once into a buffer the compaction then rewrites in place.
 
 YAML and TOML never reach that reader. `config_text` converts either to the same JSON tree with the one writer `json::write` uses, including YAML's `<<` merge keys and duplicate-key refusal, so every later stage sees one dialect. A protobuf source is not a JSON tree and keeps its own loader.
 
@@ -47,7 +47,7 @@ graph TD
 - **A late-file rule that could not run first.** `_priority` is read after the merge and removed from the tree, so a rule appended by a later file can be ordered ahead of an earlier one. Xray-core, sing-box and ZeroNet have no `_priority`; this is ferrox's addition.
 - **A `fakedns` nameserver with no pool.** The FakeDNS stage supplies Xray-core's defaults from `infra/conf/fakedns.go` by query strategy and warns when no inbound sniffs it, instead of starting with a nameserver that cannot answer. Sing-box has no equivalent lint stage, and ZeroNet's pool is its own range with settings that are not read here.
 
-What is **not** removed: the reader walks the text twice (comments, then trailing commas); every file is parsed into an owned tree and the merged tree is serialized again for `serve_json`; `_priority` is found by a name scan rather than carried beside the value; the FakeDNS stage reads the tree by key after the merge rather than during it; and `.json5` is the permissive JSONC reader, not a full JSON5 parser — unquoted keys, single-quoted values and extended numbers are refused by the strict parser. No instruction, syscall or copy count for this path is measured yet.
+What is **not** removed: a text that carries a comment or a trailing comma is walked twice (comments, then trailing commas) and copied once, while a clean one is only read, twice, and never copied; every file is parsed into an owned tree and the merged tree is serialized again for `serve_json`; `_priority` is found by a name scan rather than carried beside the value; the FakeDNS stage reads the tree by key after the merge rather than during it; and `.json5` is the permissive JSONC reader, not a full JSON5 parser — unquoted keys, single-quoted values and extended numbers are refused by the strict parser. No instruction, syscall or copy count for this path is measured yet.
 
 ## Time
 
@@ -59,6 +59,8 @@ Nothing here is timed by a local run — a contributor's tunnel would measure th
 | key | value | checked by |
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
+| clean-text-strip-allocations | 0 | ferrox-app-json::tests::a_clean_text_is_never_copied |
+| strategy-spelling-allocations | 0 | ferrox-app-lint::tests::a_strategy_spelling_costs_no_allocation |
 | syscalls-per-megabyte | UNBLESSED | scripts/count-ops.sh |
 | user-space-copies-per-megabyte | UNBLESSED | no copy checker yet |
 | seconds-per-megabyte | UNBLESSED | CI bench.yml (gate 3) |

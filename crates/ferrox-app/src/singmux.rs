@@ -1,7 +1,7 @@
 //! sing-mux's session layer: one carrier carries smux, yamux or HTTP/2 CONNECT streams.
 
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, Read, Write};
+use std::io::{self, IoSlice, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
@@ -495,6 +495,30 @@ fn defer_close(close: Arc<dyn Fn() + Send + Sync>) {
     }
 }
 
+/// A frame's head and body in one `write_vectored` where the layer below takes a vector, so a
+/// carrier write is one syscall instead of two; a layer that takes one slice per call (a TLS
+/// wrapper) walks the same bytes through the loop.
+fn write_two<W: Write + ?Sized>(write: &mut W, first: &[u8], second: &[u8]) -> io::Result<()> {
+    let mut head = first;
+    let mut tail = second;
+    loop {
+        let bufs = [IoSlice::new(head), IoSlice::new(tail)];
+        let written = match write.write_vectored(&bufs) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(written) => written,
+            Err(ref error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        let head_taken = written.min(head.len());
+        head = &head[head_taken..];
+        let tail_taken = (written - head_taken).min(tail.len());
+        tail = &tail[tail_taken..];
+        if head.is_empty() && tail.is_empty() {
+            return Ok(());
+        }
+    }
+}
+
 struct Inner {
     protocol: Protocol,
     role: Role,
@@ -750,8 +774,7 @@ impl Inner {
         {
             return false;
         }
-        let ok =
-            write.write_all(head).is_ok() && write.write_all(data).is_ok() && write.flush().is_ok();
+        let ok = write_two(&mut **write, head, data).is_ok() && write.flush().is_ok();
         if !ok {
             self.dead.store(true, Ordering::Relaxed);
         }
@@ -3019,6 +3042,90 @@ mod tests {
         assert_eq!(
             read_request(&mut input).expect("decode"),
             (Protocol::Yamux, true)
+        );
+    }
+
+    struct TapWrite {
+        written: Arc<Mutex<Vec<u8>>>,
+        writes: Arc<AtomicUsize>,
+        vectors: Arc<AtomicUsize>,
+        flushes: Arc<AtomicUsize>,
+    }
+
+    impl Write for TapWrite {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            self.written.lock().expect("tap").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+            self.vectors.fetch_add(1, Ordering::Relaxed);
+            let mut written = self.written.lock().expect("tap");
+            let mut len = 0;
+            for buf in bufs {
+                written.extend_from_slice(buf);
+                len += buf.len();
+            }
+            Ok(len)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_frame_reaches_the_carrier_in_one_vector() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let vectors = Arc::new(AtomicUsize::new(0));
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let (entered, reading) = channel();
+        let (release, wake) = channel();
+        let (done, reader_done) = channel();
+        let session = Inner::start(
+            Protocol::Smux,
+            Role::Client,
+            Box::new(StoppingReader {
+                entered,
+                wake,
+                done,
+            }),
+            Box::new(TapWrite {
+                written: Arc::clone(&written),
+                writes: Arc::clone(&writes),
+                vectors: Arc::clone(&vectors),
+                flushes: Arc::clone(&flushes),
+            }),
+            Arc::new(|| {}),
+        )
+        .expect("session");
+        assert_eq!(
+            reading.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(()),
+            "the reader is inside read before the frame is written"
+        );
+        assert!(session.write_frame(&[1, 2, 3], &[4, 5]));
+        assert_eq!(*written.lock().expect("tap"), [1, 2, 3, 4, 5]);
+        assert_eq!(
+            vectors.load(Ordering::Relaxed),
+            1,
+            "the head and body took {} vectors",
+            vectors.load(Ordering::Relaxed)
+        );
+        assert_eq!(
+            writes.load(Ordering::Relaxed),
+            0,
+            "a vector-capable carrier was handed one slice at a time"
+        );
+        assert_eq!(flushes.load(Ordering::Relaxed), 1);
+        release.send(()).expect("release");
+        assert_eq!(
+            reader_done.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(()),
+            "the reader thread ends with the test"
         );
     }
 }

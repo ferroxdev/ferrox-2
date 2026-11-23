@@ -1388,13 +1388,12 @@ fn resolve_dest(handle: Arc<Mutex<UdpLane>>, session: u32, host: String, port: u
 
 /// Read the binary hello off stream 0 and answer it; `None` when the connection should stop, either to wait for more bytes or because it was refused.
 fn authenticate(
-    routes: &mut HashMap<Vec<u8>, Inbound>,
+    inbound: &mut Inbound,
     auths: &[String],
-    dcid: &[u8],
     conn: &mut QuicheConnection,
     sock: &crate::quic::Datagram,
 ) -> Option<()> {
-    if routes.get(dcid).is_some_and(|inbound| inbound.authed) {
+    if inbound.authed {
         return Some(());
     }
     let mut room = Unfilled::<4096>::new();
@@ -1406,14 +1405,11 @@ fn authenticate(
                 break;
             }
             Ok((n, _)) => {
-                if let Some(inbound) = routes.get_mut(dcid) {
-                    inbound.auth_buf.extend_from_slice(&room.as_mut()[..n]);
-                }
+                inbound.auth_buf.extend_from_slice(&room.as_mut()[..n]);
             }
             Err(_) => break,
         }
     }
-    let inbound = routes.get_mut(dcid)?;
     if inbound.auth_buf.len() > HEAD_CAP {
         return None;
     }
@@ -1500,9 +1496,10 @@ impl Router<'_> {
             local,
             ..
         } = self;
-        let Some(shared) = routes.get(dcid).map(|i| Arc::clone(&i.conn)) else {
+        let Some(inbound) = routes.get_mut(dcid) else {
             return;
         };
+        let shared = Arc::clone(&inbound.conn);
         let info = quiche::RecvInfo { from, to: *local };
         {
             let Ok(mut conn) = shared.lock() else {
@@ -1512,13 +1509,11 @@ impl Router<'_> {
                 return;
             }
             crate::quic::flush_egress(&mut conn, sock);
-            if let Some(inbound) = routes.get(dcid) {
-                inbound.send.bump();
-            }
+            inbound.send.bump();
             if !conn.is_established() || conn.is_closed() {
                 return;
             }
-            if authenticate(routes, auths, dcid, &mut conn, sock).is_none() {
+            if authenticate(inbound, auths, &mut conn, sock).is_none() {
                 return;
             }
             let mut streams = Vec::new();
@@ -1527,9 +1522,6 @@ impl Router<'_> {
                 if id < FIRST_FLOW_STREAM || id % 4 != 0 {
                     continue;
                 }
-                let Some(inbound) = routes.get_mut(dcid) else {
-                    return;
-                };
                 if let Some(wake) = inbound.wakes.get(&id) {
                     wakes.push(Arc::clone(wake));
                 }
@@ -1571,9 +1563,7 @@ impl Router<'_> {
                     );
                 });
             }
-            if let Some(inbound) = routes.get(dcid) {
-                relay_datagrams(inbound, sock, &shared, &mut conn);
-            }
+            relay_datagrams(inbound, sock, &shared, &mut conn);
             crate::quic::flush_egress(&mut conn, sock);
         }
     }

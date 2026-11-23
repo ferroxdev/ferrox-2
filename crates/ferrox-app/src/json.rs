@@ -447,120 +447,321 @@ fn next_json_special_swar(bytes: &[u8]) -> Option<(usize, u8)> {
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
-/// JSONC (also `.json5`): `//`, `/* */` and `#` comments and trailing commas, stripped outside
-/// strings so the strict parser sees the JSON the reference's permissive reader would.
-#[allow(clippy::too_many_lines)]
-pub(crate) fn strip_jsonc(text: &str) -> std::borrow::Cow<'_, str> {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut at = 0;
+/// The first byte of `needles` at or after the front, two eight-byte words per turn: each lane
+/// whose byte equals a needle is marked once, and the earliest mark is always a real lane.
+#[inline]
+fn next_in(bytes: &[u8], needles: &[u8]) -> Option<(usize, u8)> {
+    const SPREAD: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    let mark = |word: u64| {
+        let mut marked = 0u64;
+        for &needle in needles {
+            let same = word ^ u64::from(needle).wrapping_mul(SPREAD);
+            marked |= same.wrapping_sub(SPREAD) & !same & HIGH;
+        }
+        marked
+    };
+    let mut at = 0usize;
+    while at + 16 <= bytes.len() {
+        let low = u64::from_le_bytes(bytes[at..at + 8].try_into().expect("one eight-byte block"));
+        let low_mark = mark(low);
+        if low_mark != 0 {
+            let found = at + low_mark.trailing_zeros() as usize / 8;
+            return Some((found, bytes[found]));
+        }
+        let high = u64::from_le_bytes(
+            bytes[at + 8..at + 16]
+                .try_into()
+                .expect("one eight-byte block"),
+        );
+        let high_mark = mark(high);
+        if high_mark != 0 {
+            let found = at + 8 + high_mark.trailing_zeros() as usize / 8;
+            return Some((found, bytes[found]));
+        }
+        at += 16;
+    }
+    while at < bytes.len() {
+        if needles.contains(&bytes[at]) {
+            return Some((at, bytes[at]));
+        }
+        at += 1;
+    }
+    None
+}
+
+/// Whether a comment sits outside a string: read-only, and it stops at the first one.
+fn has_comments(bytes: &[u8]) -> bool {
+    let mut at = 0usize;
     let mut quote = 0u8;
     let mut escaped = false;
-    let mut changed = false;
     while at < bytes.len() {
-        let byte = bytes[at];
         if quote != 0 {
-            out.push(byte);
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
+            let escape = escaped;
+            escaped = false;
+            let Some((offset, special)) = next_in(&bytes[at..], &[quote, b'\\']) else {
+                return false;
+            };
+            at += offset;
+            if escape && offset == 0 {
+                at += 1;
+                continue;
+            }
+            if special == b'\\' {
                 escaped = true;
-            } else if byte == quote {
+            } else {
                 quote = 0;
             }
             at += 1;
-        } else if byte == b'"' || byte == b'\'' {
-            quote = byte;
-            out.push(byte);
-            at += 1;
-        } else if byte == b'\\' {
-            out.push(byte);
-            if let Some(&next) = bytes.get(at + 1) {
-                out.push(next);
-                at += 2;
-            } else {
+            continue;
+        }
+        let Some((offset, special)) = next_in(&bytes[at..], b"\"'\\#/") else {
+            return false;
+        };
+        at += offset;
+        match special {
+            b'"' | b'\'' => {
+                quote = special;
                 at += 1;
             }
-        } else if byte == b'#' {
-            changed = true;
-            at += 1;
-            while at < bytes.len() && bytes[at] != b'\n' && bytes[at] != b'\r' {
-                at += 1;
-            }
-        } else if byte == b'/' && bytes.get(at + 1) == Some(&b'/') {
-            changed = true;
-            at += 2;
-            while at < bytes.len() && bytes[at] != b'\n' && bytes[at] != b'\r' {
-                at += 1;
-            }
-        } else if byte == b'/' && bytes.get(at + 1) == Some(&b'*') {
-            changed = true;
-            at += 2;
-            while at + 1 < bytes.len() && !(bytes[at] == b'*' && bytes[at + 1] == b'/') {
-                if bytes[at] == b'\n' {
-                    out.push(b'\n');
+            b'\\' => at = (at + 2).min(bytes.len()),
+            b'#' => return true,
+            _ => {
+                if matches!(bytes.get(at + 1), Some(b'/' | b'*')) {
+                    return true;
                 }
                 at += 1;
             }
-            at = (at + 2).min(bytes.len());
-        } else {
-            out.push(byte);
-            at += 1;
         }
     }
-    let comments = changed;
-    // The trailing-comma pass compacts into the buffer it reads: a dropped comma frees its byte.
-    let mut write = 0;
-    let mut at = 0;
+    false
+}
+
+/// Whether a comma outside a string is followed by the byte that closes its array or object. This
+/// is the trailing-comma pass's own quote rule, a backslash outside a string not escaping, so the
+/// answer is the one that pass acts on.
+fn has_trailing_comma(bytes: &[u8]) -> bool {
+    let mut at = 0usize;
     let mut quote = 0u8;
     let mut escaped = false;
-    let mut trimmed = false;
-    while at < out.len() {
-        let byte = out[at];
+    while at < bytes.len() {
         if quote != 0 {
-            out[write] = byte;
-            write += 1;
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
+            let escape = escaped;
+            escaped = false;
+            let Some((offset, special)) = next_in(&bytes[at..], &[quote, b'\\']) else {
+                return false;
+            };
+            at += offset;
+            if escape && offset == 0 {
+                at += 1;
+                continue;
+            }
+            if special == b'\\' {
                 escaped = true;
-            } else if byte == quote {
+            } else {
                 quote = 0;
             }
             at += 1;
             continue;
         }
-        if byte == b'"' || byte == b'\'' {
-            quote = byte;
-            out[write] = byte;
-            write += 1;
+        let Some((offset, special)) = next_in(&bytes[at..], b"\"',") else {
+            return false;
+        };
+        at += offset;
+        if special == b',' {
+            let mut next = at + 1;
+            while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+                next += 1;
+            }
+            if matches!(bytes.get(next), Some(b'}' | b']')) {
+                return true;
+            }
+            at += 1;
+        } else {
+            quote = special;
+            at += 1;
+        }
+    }
+    false
+}
+
+/// The text with its comments gone: every run between specials is copied whole, and a block
+/// comment keeps its newlines so the line shape the parser reports stays the file's.
+fn strip_comments(bytes: &[u8], out: &mut Vec<u8>) {
+    let mut at = 0usize;
+    let mut copy = 0usize;
+    let mut quote = 0u8;
+    let mut escaped = false;
+    while at < bytes.len() {
+        if quote != 0 {
+            let escape = escaped;
+            escaped = false;
+            let Some((offset, special)) = next_in(&bytes[at..], &[quote, b'\\']) else {
+                break;
+            };
+            at += offset;
+            if escape && offset == 0 {
+                at += 1;
+                continue;
+            }
+            if special == b'\\' {
+                escaped = true;
+            } else {
+                quote = 0;
+            }
             at += 1;
             continue;
         }
-        if byte == b',' {
-            let mut next = at + 1;
-            while next < out.len() && out[next].is_ascii_whitespace() {
-                next += 1;
-            }
-            let mut before = write;
-            while before > 0 && out[before - 1].is_ascii_whitespace() {
-                before -= 1;
-            }
-            let complete = before > 0 && !matches!(out[before - 1], b'[' | b'{' | b',' | b':');
-            if complete && matches!(out.get(next), Some(b'}' | b']')) {
+        let Some((offset, special)) = next_in(&bytes[at..], b"\"'\\#/") else {
+            break;
+        };
+        at += offset;
+        match special {
+            b'"' | b'\'' => {
+                quote = special;
                 at += 1;
-                trimmed = true;
+            }
+            b'\\' => at = (at + 2).min(bytes.len()),
+            b'#' => {
+                out.extend_from_slice(&bytes[copy..at]);
+                at += 1;
+                while at < bytes.len() && bytes[at] != b'\n' && bytes[at] != b'\r' {
+                    at += 1;
+                }
+                copy = at;
+            }
+            _ => match bytes.get(at + 1) {
+                Some(b'/') => {
+                    out.extend_from_slice(&bytes[copy..at]);
+                    at += 2;
+                    while at < bytes.len() && bytes[at] != b'\n' && bytes[at] != b'\r' {
+                        at += 1;
+                    }
+                    copy = at;
+                }
+                Some(b'*') => {
+                    out.extend_from_slice(&bytes[copy..at]);
+                    at += 2;
+                    while at + 1 < bytes.len() && !(bytes[at] == b'*' && bytes[at + 1] == b'/') {
+                        if bytes[at] == b'\n' {
+                            out.push(b'\n');
+                        }
+                        at += 1;
+                    }
+                    at = (at + 2).min(bytes.len());
+                    copy = at;
+                }
+                _ => at += 1,
+            },
+        }
+    }
+    out.extend_from_slice(&bytes[copy..]);
+}
+
+/// The trailing-comma pass compacts into the buffer it reads: a quoted run moves as one span and a
+/// dropped comma frees its byte.
+fn compact_trailing(out: &mut [u8]) -> usize {
+    let mut write = 0usize;
+    let mut at = 0usize;
+    let mut quote = 0u8;
+    let mut escaped = false;
+    while at < out.len() {
+        if quote != 0 {
+            let escape = escaped;
+            escaped = false;
+            let Some((offset, special)) = next_in(&out[at..], &[quote, b'\\']) else {
+                let rest = out.len() - at;
+                out.copy_within(at..at + rest, write);
+                return write + rest;
+            };
+            if escape && offset == 0 {
+                out[write] = out[at];
+                write += 1;
+                at += 1;
                 continue;
             }
+            if offset > 0 {
+                out.copy_within(at..at + offset, write);
+                write += offset;
+                at += offset;
+            }
+            if special == b'\\' {
+                out[write] = b'\\';
+                write += 1;
+                at += 1;
+                escaped = true;
+            } else {
+                out[write] = quote;
+                write += 1;
+                at += 1;
+                quote = 0;
+            }
+            continue;
         }
-        out[write] = byte;
-        write += 1;
-        at += 1;
+        let Some((offset, special)) = next_in(&out[at..], b"\"',\\") else {
+            let rest = out.len() - at;
+            out.copy_within(at..at + rest, write);
+            return write + rest;
+        };
+        if offset > 0 {
+            out.copy_within(at..at + offset, write);
+            write += offset;
+            at += offset;
+        }
+        match special {
+            b'"' | b'\'' => {
+                out[write] = special;
+                write += 1;
+                at += 1;
+                quote = special;
+            }
+            b',' => {
+                let mut next = at + 1;
+                while next < out.len() && out[next].is_ascii_whitespace() {
+                    next += 1;
+                }
+                let mut before = write;
+                while before > 0 && out[before - 1].is_ascii_whitespace() {
+                    before -= 1;
+                }
+                let complete = before > 0 && !matches!(out[before - 1], b'[' | b'{' | b',' | b':');
+                if complete && matches!(out.get(next), Some(b'}' | b']')) {
+                    at += 1;
+                } else {
+                    out[write] = b',';
+                    write += 1;
+                    at += 1;
+                }
+            }
+            _ => {
+                out[write] = b'\\';
+                write += 1;
+                at += 1;
+            }
+        }
     }
-    if !comments && !trimmed {
+    write
+}
+
+/// JSONC (also `.json5`): `//`, `/* */` and `#` comments and trailing commas, stripped outside
+/// strings so the strict parser sees the JSON the reference's permissive reader would. Two
+/// read-only walks find a comment and a comma that closes its array; a text with neither keeps its
+/// borrow, so an untouched config is allocated or copied zero times.
+pub(crate) fn strip_jsonc(text: &str) -> std::borrow::Cow<'_, str> {
+    let bytes = text.as_bytes();
+    let comments = has_comments(bytes);
+    if !comments && !has_trailing_comma(bytes) {
         return std::borrow::Cow::Borrowed(text);
     }
-    out.truncate(write);
+    let mut out = if comments {
+        let mut out = Vec::with_capacity(bytes.len());
+        strip_comments(bytes, &mut out);
+        out
+    } else {
+        bytes.to_vec()
+    };
+    let kept = compact_trailing(&mut out);
+    out.truncate(kept);
     std::borrow::Cow::Owned(
         String::from_utf8(out)
             .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned()),
@@ -573,12 +774,21 @@ pub(crate) fn order_by_priority(value: &mut Json) {
     match value {
         Json::Arr(items) => {
             if items.iter().any(|item| priority(item).is_some()) {
-                items.sort_by(|left, right| {
-                    priority(left)
-                        .unwrap_or(0.0)
-                        .partial_cmp(&priority(right).unwrap_or(0.0))
+                // Each element's key is read once, and the stable sort no longer walks every object's keys on every comparison.
+                let mut order: Vec<(f64, usize)> = items
+                    .iter()
+                    .enumerate()
+                    .map(|(at, item)| (priority(item).unwrap_or(0.0), at))
+                    .collect();
+                order.sort_by(|left, right| {
+                    left.0
+                        .partial_cmp(&right.0)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
+                let mut slots: Vec<Option<Json>> = items.drain(..).map(Some).collect();
+                for &(_, at) in &order {
+                    items.push(slots[at].take().expect("each element moves once"));
+                }
             }
             for item in items.iter_mut() {
                 if let Json::Obj(pairs) = item {
@@ -1122,6 +1332,186 @@ mod tests {
             "the strip copied its text {} times",
             counts.allocs
         );
+    }
+
+    #[test]
+    fn a_clean_text_is_never_copied() {
+        let text = r#"{"log":{"loglevel":"warning"},"inbounds":[{"port":1080,"protocol":"socks"}],"outbounds":[{"protocol":"freedom"}]}"#;
+        let (stripped, counts) = ferrox_core::alloc_count::measure(|| strip_jsonc(text));
+        assert!(matches!(stripped, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(stripped, text);
+        assert_eq!(
+            counts.allocs, 0,
+            "a clean config was allocated {} times",
+            counts.allocs
+        );
+        assert_eq!(
+            counts.bytes, 0,
+            "a clean config copied {} bytes",
+            counts.bytes
+        );
+    }
+
+    /// The byte walk this file carried before it scanned runs, so a sweep proves the spans copy
+    /// the same bytes the one-at-a-time loop did.
+    #[allow(clippy::too_many_lines)]
+    fn slow_strip(text: &str) -> String {
+        let bytes = text.as_bytes();
+        let mut out = Vec::new();
+        let mut at = 0;
+        let mut quote = 0u8;
+        let mut escaped = false;
+        while at < bytes.len() {
+            let byte = bytes[at];
+            if quote != 0 {
+                out.push(byte);
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == quote {
+                    quote = 0;
+                }
+                at += 1;
+            } else if byte == b'"' || byte == b'\'' {
+                quote = byte;
+                out.push(byte);
+                at += 1;
+            } else if byte == b'\\' {
+                out.push(byte);
+                if let Some(&next) = bytes.get(at + 1) {
+                    out.push(next);
+                    at += 2;
+                } else {
+                    at += 1;
+                }
+            } else if byte == b'#' {
+                at += 1;
+                while at < bytes.len() && bytes[at] != b'\n' && bytes[at] != b'\r' {
+                    at += 1;
+                }
+            } else if byte == b'/' && bytes.get(at + 1) == Some(&b'/') {
+                at += 2;
+                while at < bytes.len() && bytes[at] != b'\n' && bytes[at] != b'\r' {
+                    at += 1;
+                }
+            } else if byte == b'/' && bytes.get(at + 1) == Some(&b'*') {
+                at += 2;
+                while at + 1 < bytes.len() && !(bytes[at] == b'*' && bytes[at + 1] == b'/') {
+                    if bytes[at] == b'\n' {
+                        out.push(b'\n');
+                    }
+                    at += 1;
+                }
+                at = (at + 2).min(bytes.len());
+            } else {
+                out.push(byte);
+                at += 1;
+            }
+        }
+        let mut write = 0;
+        let mut at = 0;
+        let mut quote = 0u8;
+        let mut escaped = false;
+        while at < out.len() {
+            let byte = out[at];
+            if quote != 0 {
+                out[write] = byte;
+                write += 1;
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == quote {
+                    quote = 0;
+                }
+                at += 1;
+                continue;
+            }
+            if byte == b'"' || byte == b'\'' {
+                quote = byte;
+                out[write] = byte;
+                write += 1;
+                at += 1;
+                continue;
+            }
+            if byte == b',' {
+                let mut next = at + 1;
+                while next < out.len() && out[next].is_ascii_whitespace() {
+                    next += 1;
+                }
+                let mut before = write;
+                while before > 0 && out[before - 1].is_ascii_whitespace() {
+                    before -= 1;
+                }
+                let complete = before > 0 && !matches!(out[before - 1], b'[' | b'{' | b',' | b':');
+                if complete && matches!(out.get(next), Some(b'}' | b']')) {
+                    at += 1;
+                    continue;
+                }
+            }
+            out[write] = byte;
+            write += 1;
+            at += 1;
+        }
+        out.truncate(write);
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    #[test]
+    fn the_span_strip_is_the_byte_walk_on_every_shape() {
+        let shapes = [
+            "",
+            "{}",
+            "[]",
+            r#"{"a":[1,2,],}"#,
+            r#"{"a":[,]}"#,
+            r#"{"a":[1,,]}"#,
+            "{\n # one\n \"a\": 1 // two\n}",
+            r##"{"a":"#not a comment","b":"//nor this"}"##,
+            "{'a': '#x'}",
+            "{\r# one\r\"a\": 1\r}",
+            r#"{"a":"\\\"","b":"line\nbreak"}"#,
+            r#"{"a":1,/* x */"b":[2,],}"#,
+            "/*\n * a note\n */\n{}",
+            r#"{"u":"\u00e9","t":"a\\b"}"#,
+            r#"{"slashes":"a/b/c","hash":"a#b"}"#,
+            r#"{"weird":"unterminated"#,
+            r#"{"ends":"\\"#,
+            r#"{"x":[1,2,3] # tail"#,
+            "[*#b29/,\r:}1{*9b1\r ,2/\",\r2'\r\r/#.\"b '\\*.:\r,9 '1[],}'a'b/0/900\r{[*}0\r1}.\"",
+            r#"{"a":1\,}"#,
+            "\\\"a\\",
+            r#"{"a":[1,\/* x */]}"#,
+        ];
+        for shape in shapes {
+            assert_eq!(
+                strip_jsonc(shape).as_ref(),
+                slow_strip(shape),
+                "shape {shape:?}"
+            );
+        }
+        let alphabet = b"{},[]:\"'\\/#* \n\r0129ab.";
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for len in 0..2000usize {
+            let mut text = String::new();
+            for _ in 0..len {
+                text.push(char::from(
+                    alphabet[(next() % alphabet.len() as u64) as usize],
+                ));
+            }
+            assert_eq!(
+                strip_jsonc(&text).as_ref(),
+                slow_strip(&text),
+                "text {text:?}"
+            );
+        }
     }
 
     #[test]

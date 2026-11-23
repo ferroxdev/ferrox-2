@@ -40,6 +40,7 @@ graph TD
 | carrier-protocols-round-trip | 3 | ferrox-app-proxy::tests::a_vless_singmux_carries_a_tcp_stream_on_each_protocol |
 | absent-protocol-keeps-mux-cool | 1 | ferrox-app-proxy::tests::an_absent_mux_protocol_keeps_mux_cool_and_an_explicit_one_selects_singmux |
 | frame-buffer-allocations-per-frame | 0 | ferrox-app-singmux::tests::a_mux_frame_is_read_into_the_sessions_own_buffer |
+| carrier-writes-per-frame | 1 | ferrox-app-singmux::tests::a_frame_reaches_the_carrier_in_one_vector |
 | udp-packet-buffer-allocations-per-packet | 0 | ferrox-app-singmux::tests::a_mux_udp_packet_is_read_into_the_sessions_own_buffer |
 | udp-datagram-read-allocations-per-established-lane | 0 | ferrox-app-proxy::datagram_room_tests::a_datagram_read_reuses_one_room_over_a_stream |
 <!-- counts:end -->

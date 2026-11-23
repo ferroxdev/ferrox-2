@@ -30,20 +30,41 @@ fn fakedns(root: &mut Json) -> Result<(), String> {
     if !in_use {
         return Ok(());
     }
-    let strategy = dns
-        .get("queryStrategy")
-        .and_then(Json::as_str)
-        .map(str::to_ascii_lowercase);
-    let (v4, v6) = match strategy.as_deref() {
-        Some(
-            "useip4" | "useipv4" | "use_ip4" | "use_ipv4" | "use_ip_v4" | "use-ip4" | "use-ipv4"
-            | "use-ip-v4",
-        ) => (true, false),
-        Some(
-            "useip6" | "useipv6" | "use_ip6" | "use_ipv6" | "use_ip_v6" | "use-ip6" | "use-ipv6"
-            | "use-ip-v6",
-        ) => (false, true),
-        _ => (true, true),
+    let strategy = dns.get("queryStrategy").and_then(Json::as_str);
+    let (v4, v6) = if strategy.is_some_and(|strategy| {
+        spelled_as(
+            strategy,
+            &[
+                "useip4",
+                "useipv4",
+                "use_ip4",
+                "use_ipv4",
+                "use_ip_v4",
+                "use-ip4",
+                "use-ipv4",
+                "use-ip-v4",
+            ],
+        )
+    }) {
+        (true, false)
+    } else if strategy.is_some_and(|strategy| {
+        spelled_as(
+            strategy,
+            &[
+                "useip6",
+                "useipv6",
+                "use_ip6",
+                "use_ipv6",
+                "use_ip_v6",
+                "use-ip6",
+                "use-ipv6",
+                "use-ip-v6",
+            ],
+        )
+    }) {
+        (false, true)
+    } else {
+        (true, true)
     };
     if root
         .get("fakeDns")
@@ -65,6 +86,11 @@ fn fakedns(root: &mut Json) -> Result<(), String> {
         eprintln!("Defined FakeDNS but haven't enabled FakeDNS destOverride at any inbound.");
     }
     Ok(())
+}
+
+/// One spelling of a query strategy, matched without folding the config's text into a new string.
+fn spelled_as(text: &str, names: &[&str]) -> bool {
+    names.iter().any(|name| text.eq_ignore_ascii_case(name))
 }
 
 fn names_fakedns(server: &Json) -> bool {
@@ -227,6 +253,20 @@ mod tests {
         let mut twice = root.clone();
         run(&mut twice).expect("lint");
         assert_eq!(root, twice);
+    }
+
+    #[test]
+    fn a_strategy_spelling_costs_no_allocation() {
+        let mut upper = parsed(r#"{"dns":{"servers":["fakedns"],"queryStrategy":"UseIPv4"}}"#);
+        let mut lower = parsed(r#"{"dns":{"servers":["fakedns"],"queryStrategy":"useipv4"}}"#);
+        let (_, of_upper) = ferrox_core::alloc_count::measure(|| run(&mut upper));
+        let (_, of_lower) = ferrox_core::alloc_count::measure(|| run(&mut lower));
+        assert_eq!(
+            of_upper.allocs,
+            of_lower.allocs,
+            "the strategy's case added {} allocations",
+            of_upper.allocs - of_lower.allocs
+        );
     }
 
     #[test]
