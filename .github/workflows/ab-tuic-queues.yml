@@ -52,7 +52,7 @@ jobs:
           --tier standard
           --out /tmp/build
           --build-only
-          --engines ferrox,sing-box
+          --engines ferrox,sing-box,xray-core
       - name: run each cell on both binaries
         shell: bash
         env:
@@ -68,7 +68,7 @@ jobs:
                 --only "$cell" \
                 --repeats 5 \
                 --no-build \
-                --engines "ferrox=$bin,sing-box" || echo "$cell-$side exited $?"
+                --engines "ferrox=$bin,sing-box,xray-core" || echo "$cell-$side exited $?"
             done
           done
       - name: summarize
