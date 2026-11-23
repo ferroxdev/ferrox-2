@@ -5051,6 +5051,9 @@ impl Write for QuicStream {
 
 impl crate::proxy::LaneWrite for QuicStream {
     fn push(&mut self, data: &[u8]) -> crate::proxy::Push {
+        if !data.is_empty() && self.stalled.load(Ordering::Relaxed) {
+            return crate::proxy::Push::Lost;
+        }
         match self.try_write(data) {
             Ok(0) => crate::proxy::Push::Parked,
             Ok(n) => crate::proxy::Push::Took(n),

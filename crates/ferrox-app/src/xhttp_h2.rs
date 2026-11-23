@@ -3165,7 +3165,7 @@ impl H2Client {
             return Err(H2OpenError::Full);
         };
         // Admission is ordered with GOAWAY here; the HEADERS write must not hold the gate the read pump takes to publish SETTINGS or GOAWAY.
-        drop(_gate);
+        drop(gate);
         let flags = if end_request {
             F_END_HEADERS | F_END
         } else {

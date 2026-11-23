@@ -431,6 +431,71 @@ impl Shared {
         result
     }
 
+    fn encode_packet(&self, packet: &[u8]) -> Vec<u8> {
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let combined = pending.map(|mut pending| {
+            pending.extend_from_slice(packet);
+            pending
+        });
+        let packet = combined.as_deref().unwrap_or(packet);
+        if !self.send_padding.load(Ordering::Relaxed) {
+            return packet.to_vec();
+        }
+        let count = self.packet_count.fetch_add(1, Ordering::Relaxed) + 1;
+        let padding = {
+            let held = self.padding.lock().unwrap_or_else(PoisonError::into_inner);
+            Arc::clone(&held)
+        };
+        if count >= padding.stop {
+            self.send_padding.store(false, Ordering::Relaxed);
+            return packet.to_vec();
+        }
+        let mut out = Vec::new();
+        let mut data = packet;
+        for size in padding.steps(count) {
+            let size = match size {
+                PaddingSize::Check => {
+                    if data.is_empty() {
+                        break;
+                    }
+                    continue;
+                }
+                PaddingSize::Bytes(size) => size,
+            };
+            if data.len() > size {
+                out.extend_from_slice(&data[..size]);
+                data = &data[size..];
+                continue;
+            }
+            let records = size.div_ceil(MAX_FRAME);
+            let mut record = Vec::with_capacity(size + records * HEADER);
+            if data.is_empty() {
+                let mut remaining = size;
+                while remaining > 0 {
+                    let waste = remaining.min(MAX_FRAME);
+                    push_waste(&mut record, waste);
+                    remaining -= waste;
+                }
+            } else {
+                record.extend_from_slice(data);
+                data = &[];
+                let mut remaining = size.saturating_sub(record.len());
+                while remaining > HEADER {
+                    let waste = (remaining - HEADER).min(MAX_FRAME);
+                    push_waste(&mut record, waste);
+                    remaining -= HEADER + waste;
+                }
+            }
+            out.extend_from_slice(&record);
+        }
+        out.extend_from_slice(data);
+        out
+    }
+
     fn write_packet_locked(&self, packet: &[u8]) -> std::io::Result<()> {
         let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(writer) = writer.as_mut() else {
@@ -594,6 +659,8 @@ impl Session {
             fin_sent: Arc::new(AtomicBool::new(false)),
             closed: Arc::new(AtomicBool::new(false)),
             holders: Arc::new(AtomicUsize::new(1)),
+            pending: Vec::new(),
+            pending_input: 0,
         })
     }
 }
@@ -611,6 +678,8 @@ pub(crate) struct AnyTlsStream {
     fin_sent: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     holders: Arc<AtomicUsize>,
+    pending: Vec<u8>,
+    pending_input: usize,
 }
 
 impl Clone for AnyTlsStream {
@@ -623,6 +692,8 @@ impl Clone for AnyTlsStream {
             fin_sent: Arc::clone(&self.fin_sent),
             closed: Arc::clone(&self.closed),
             holders: Arc::clone(&self.holders),
+            pending: Vec::new(),
+            pending_input: 0,
         }
     }
 }
@@ -705,10 +776,7 @@ impl Write for AnyTlsStream {
         if buf.is_empty() {
             return Ok(0);
         }
-        let mut packet = Vec::with_capacity(buf.len() + HEADER);
-        for chunk in buf.chunks(MAX_FRAME) {
-            push_frame(&mut packet, PSH, self.id, chunk);
-        }
+        let packet = self.data_packet(buf);
         self.session.shared.write_packet(&packet)?;
         Ok(buf.len())
     }
@@ -733,7 +801,71 @@ impl Write for AnyTlsStream {
     }
 }
 
-impl proxy::LaneWrite for AnyTlsStream {}
+impl proxy::LaneWrite for AnyTlsStream {
+    fn push(&mut self, data: &[u8]) -> proxy::Push {
+        if data.is_empty() {
+            return proxy::Push::Took(0);
+        }
+        if !self.session.shared.alive() {
+            return proxy::Push::Lost;
+        }
+        if self.pending.is_empty() {
+            let packet = self.data_packet(data);
+            self.pending = self.session.shared.encode_packet(&packet);
+            self.pending_input = data.len();
+        }
+        self.flush_pending()
+    }
+}
+
+impl AnyTlsStream {
+    fn data_packet(&self, buf: &[u8]) -> Vec<u8> {
+        let mut packet = Vec::with_capacity(buf.len() + HEADER);
+        for chunk in buf.chunks(MAX_FRAME) {
+            push_frame(&mut packet, PSH, self.id, chunk);
+        }
+        packet
+    }
+
+    fn flush_pending(&mut self) -> proxy::Push {
+        let Ok(mut writer) = self.session.shared.writer.try_lock() else {
+            return proxy::Push::Parked;
+        };
+        let Some(writer) = writer.as_mut() else {
+            return proxy::Push::Lost;
+        };
+        let ready = writer.write_ready(&[&self.pending]);
+        match ready {
+            Some(Ok(n)) if n >= self.pending.len() => {
+                let input = std::mem::take(&mut self.pending_input);
+                self.pending.clear();
+                proxy::Push::Took(input)
+            }
+            Some(Ok(n)) if n > 0 => {
+                self.pending.drain(..n);
+                proxy::Push::Parked
+            }
+            Some(Ok(_)) => proxy::Push::Parked,
+            Some(Err(error)) if crate::proxy::is_timeout(&error) => proxy::Push::Parked,
+            Some(Err(_)) => {
+                self.session.shared.shutdown("anytls session write failed");
+                proxy::Push::Lost
+            }
+            None => {
+                let accepted = writer.offer_slices(&[&self.pending]);
+                match accepted {
+                    proxy::Accepted::All => {
+                        let input = std::mem::take(&mut self.pending_input);
+                        self.pending.clear();
+                        proxy::Push::Took(input)
+                    }
+                    proxy::Accepted::Full => proxy::Push::Parked,
+                    proxy::Accepted::Lost => proxy::Push::Lost,
+                }
+            }
+        }
+    }
+}
 
 impl proxy::Duplicate for AnyTlsStream {
     fn duplicate(&self) -> Option<Self> {
@@ -1130,6 +1262,8 @@ fn read_server(reader: &mut dyn Read, session: &Arc<Session>, context: &Arc<Serv
                     fin_sent: Arc::new(AtomicBool::new(false)),
                     closed: Arc::new(AtomicBool::new(false)),
                     holders: Arc::new(AtomicUsize::new(1)),
+                    pending: Vec::new(),
+                    pending_input: 0,
                 };
                 let context = Arc::clone(context);
                 std::thread::spawn(move || serve_stream(stream, &context));
@@ -1559,6 +1693,12 @@ mod tests {
         }
     }
 
+    impl crate::proxy::FrameWrite for Sink {
+        fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+            parts.iter().all(|part| self.write_all(part).is_ok())
+        }
+    }
+
     fn test_stream(shared: &Arc<Shared>, id: u32) -> AnyTlsStream {
         AnyTlsStream {
             session: Arc::new(Session {
@@ -1570,6 +1710,8 @@ mod tests {
             fin_sent: Arc::new(AtomicBool::new(false)),
             closed: Arc::new(AtomicBool::new(false)),
             holders: Arc::new(AtomicUsize::new(1)),
+            pending: Vec::new(),
+            pending_input: 0,
         }
     }
 
@@ -1598,6 +1740,11 @@ mod tests {
             }
             fn flush(&mut self) -> std::io::Result<()> {
                 Ok(())
+            }
+        }
+        impl crate::proxy::FrameWrite for Null {
+            fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+                parts.iter().all(|part| self.write_all(part).is_ok())
             }
         }
         fn cost(padding: Padding) -> ferrox_core::alloc_count::Counts {
@@ -1652,6 +1799,8 @@ mod tests {
             fin_sent: Arc::new(AtomicBool::new(false)),
             closed: Arc::new(AtomicBool::new(false)),
             holders: Arc::new(AtomicUsize::new(1)),
+            pending: Vec::new(),
+            pending_input: 0,
         };
         let duplicate = stream.clone();
         drop(stream);

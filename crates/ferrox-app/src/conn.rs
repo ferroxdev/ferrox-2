@@ -1237,6 +1237,43 @@ impl Connection {
     }
 }
 
+#[cfg(windows)]
+impl Connection {
+    /// The Windows arm toggles the socket for the call: `select` cannot promise a whole blocking
+    /// write, so the descriptor is nonblocking while the bytes are offered and restored after.
+    pub(crate) fn write_ready(&mut self, parts: &[&[u8]]) -> io::Result<usize> {
+        self.set_nonblocking(true)?;
+        let mut total = 0;
+        let mut outcome = None;
+        'parts: for part in parts {
+            let mut rest = *part;
+            while !rest.is_empty() {
+                match <Connection as std::io::Write>::write(self, rest) {
+                    Ok(0) => break 'parts,
+                    Ok(n) => {
+                        total += n;
+                        rest = &rest[n..];
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break 'parts,
+                    Err(error) => {
+                        outcome = Some(error);
+                        break 'parts;
+                    }
+                }
+            }
+        }
+        let restored = self.set_nonblocking(false);
+        if let Some(error) = outcome {
+            return Err(error);
+        }
+        restored?;
+        if total == 0 {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+        Ok(total)
+    }
+}
+
 /// `sendmsg` with `MSG_DONTWAIT`, the per-call form of a non-blocking write: the descriptor keeps the
 /// blocking shape every other arm writes through.
 #[cfg(unix)]

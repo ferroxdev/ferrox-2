@@ -717,10 +717,7 @@ impl crate::proxy::LaneWrite for H3Writer {
             if data.len() < input {
                 return crate::proxy::Push::Lost;
             }
-            if data.len() == input {
-                return crate::proxy::Push::Took(input);
-            }
-            return self.push(&data[input..]);
+            return crate::proxy::Push::Took(input);
         }
         if !self.headed {
             self.head.extend_from_slice(data);
@@ -1948,15 +1945,32 @@ fn h3_control_frames(
             control.clear();
             break;
         };
-        if *settings {
-            // GOAWAY, CANCEL_PUSH, MAX_PUSH_ID and PRIORITY_UPDATE belong here; DATA, HEADERS, PUSH_PROMISE and HTTP/2 reserved types are H3_FRAME_UNEXPECTED, unassigned types ignored.
-            if matches!(kind, 0x0 | 0x1 | 0x2 | 0x4 | 0x5 | 0x6 | 0x8 | 0x9) {
-                return Err(H3_FRAME_UNEXPECTED);
+        if !*settings {
+            if kind != 0x4 {
+                return Err(H3_MISSING_SETTINGS);
             }
-        } else if kind != 0x4 {
-            return Err(H3_MISSING_SETTINGS);
-        } else {
+            if end > control.len() {
+                break;
+            }
+            let mut cursor = at;
+            while cursor < end {
+                let Some(_id) = frames::quic_read(&control[..end], &mut cursor) else {
+                    return Err(H3_FRAME_ERROR);
+                };
+                let Some(_value) = frames::quic_read(&control[..end], &mut cursor) else {
+                    return Err(H3_FRAME_ERROR);
+                };
+            }
             *settings = true;
+            control.drain(..end);
+            continue;
+        }
+        // Server-to-client control frames: GOAWAY and PRIORITY_UPDATE belong here; DATA, HEADERS, CANCEL_PUSH, SETTINGS, PUSH_PROMISE, MAX_PUSH_ID and HTTP/2 reserved types are H3_FRAME_UNEXPECTED, unassigned types ignored.
+        if matches!(
+            kind,
+            0x0 | 0x1 | 0x2 | 0x3 | 0x4 | 0x5 | 0x6 | 0x8 | 0x9 | 0xd
+        ) {
+            return Err(H3_FRAME_UNEXPECTED);
         }
         if end > control.len() {
             if kind != 0x7 {
@@ -3306,7 +3320,7 @@ mod tests {
 
     #[test]
     fn http2_reserved_control_frames_are_unexpected() {
-        for kind in [0x2, 0x6, 0x8, 0x9] {
+        for kind in [0x2, 0x3, 0x6, 0x8, 0x9, 0xd] {
             let mut control = Vec::new();
             settings_frame(&mut control);
             frames::quic_varint(&mut control, kind);
@@ -3320,6 +3334,21 @@ mod tests {
                 "frame {kind:#x} is reserved by HTTP/2 and cannot ride a control stream"
             );
         }
+    }
+
+    #[test]
+    fn a_settings_payload_without_a_value_is_a_frame_error() {
+        let mut control = Vec::new();
+        frames::quic_varint(&mut control, 0x4);
+        frames::quic_varint(&mut control, 1);
+        frames::quic_varint(&mut control, 1);
+        let goaway = AtomicU64::new(u64::MAX);
+        let mut skip = 0;
+        let mut settings = false;
+        assert_eq!(
+            h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+            Err(H3_FRAME_ERROR)
+        );
     }
 
     #[test]

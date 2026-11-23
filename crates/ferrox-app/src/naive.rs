@@ -1132,10 +1132,7 @@ impl proxy::LaneWrite for H3OutWrite {
             if data.len() < input {
                 return proxy::Push::Lost;
             }
-            if data.len() == input {
-                return proxy::Push::Took(input);
-            }
-            return self.push(&data[input..]);
+            return proxy::Push::Took(input);
         }
         if data.is_empty() {
             return proxy::Push::Took(0);
@@ -2221,7 +2218,9 @@ impl NaiveOut {
         loop {
             pool.retain(|client| client.reusable());
             let inflight = self.h3_inflight.load(Ordering::Relaxed);
-            if fill && pool.len() + inflight < self.pool_limit {
+            if (fill || (pool.is_empty() && inflight == 0))
+                && pool.len() + inflight < self.pool_limit
+            {
                 self.h3_inflight.fetch_add(1, Ordering::Relaxed);
                 drop(pool);
                 let client = self.connect_h3(deadline);

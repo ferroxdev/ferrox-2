@@ -39081,16 +39081,13 @@ impl LaneWrite for Connection {
         }
         #[cfg(windows)]
         {
-            match self.writable(Duration::ZERO) {
-                Ok(false) => Push::Parked,
-                Ok(true) => {
-                    let take = data.len().min(RELAY_BUFFER);
-                    match <Connection as Write>::write(self, &data[..take]) {
-                        Ok(0) => Push::Parked,
-                        Ok(n) => Push::Took(n),
-                        Err(error) if is_timeout(&error) => Push::Parked,
-                        Err(_) => Push::Lost,
-                    }
+            match Connection::write_ready(self, &[data]) {
+                Ok(0) => Push::Parked,
+                Ok(n) => Push::Took(n),
+                Err(error)
+                    if is_timeout(&error) || error.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    Push::Parked
                 }
                 Err(_) => Push::Lost,
             }
@@ -39219,18 +39216,8 @@ impl FrameWrite for Connection {
     }
 
     #[cfg(windows)]
-    fn offer_slices(&mut self, parts: &[&[u8]]) -> Accepted {
-        match self.writable(Duration::ZERO) {
-            Ok(true) => {
-                if self.write_slices(parts) {
-                    Accepted::All
-                } else {
-                    Accepted::Lost
-                }
-            }
-            Ok(false) => Accepted::Full,
-            Err(_) => Accepted::Lost,
-        }
+    fn write_ready(&mut self, parts: &[&[u8]]) -> Option<std::io::Result<usize>> {
+        Some(Connection::write_ready(self, parts))
     }
 
     fn arm_write(&mut self, timeout: Duration) {
