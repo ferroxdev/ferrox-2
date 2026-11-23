@@ -1637,15 +1637,17 @@ impl H2Conn {
         };
         let total_signed = i64::try_from(total).unwrap_or(i64::MAX);
         {
-            let Ok(conn) = self.send_conn.try_lock() else {
+            let Ok(mut conn) = self.send_conn.try_lock() else {
                 return None;
             };
-            let Ok(window) = state.send_window.try_lock() else {
+            let Ok(mut window) = state.send_window.try_lock() else {
                 return None;
             };
             if *conn < total || *window < total_signed {
                 return None;
             }
+            *conn -= total;
+            *window -= total_signed;
         }
         let max = *self
             .max_frame
@@ -1662,18 +1664,16 @@ impl H2Conn {
             at = end;
         }
         match batch.flush_ready(self, &mut **write) {
-            crate::proxy::Accepted::All => {
-                let Ok(mut conn) = self.send_conn.lock() else {
-                    return Some(false);
-                };
-                *conn = conn.saturating_sub(total);
-                let Ok(mut window) = state.send_window.lock() else {
-                    return Some(false);
-                };
-                *window -= total_signed;
-                Some(true)
+            crate::proxy::Accepted::All => Some(true),
+            crate::proxy::Accepted::Full => {
+                if let Ok(mut conn) = self.send_conn.lock() {
+                    *conn = conn.saturating_add(total);
+                }
+                if let Ok(mut window) = state.send_window.lock() {
+                    *window = window.saturating_add(total_signed);
+                }
+                None
             }
-            crate::proxy::Accepted::Full => None,
             crate::proxy::Accepted::Lost => Some(false),
         }
     }

@@ -1811,11 +1811,11 @@ impl NaiveOut {
             return;
         };
         let connect = version == 2;
-        // The relay timeout keeps the stop flag observable even with no association to poll.
-        let _ = relay.set_read_timeout(Some(crate::budgets::RELAY_POLL));
+        // A 10 ms quiet poll keeps stop and opener pickup bounded without an idle association waking every millisecond.
+        let _ = relay.set_read_timeout(Some(crate::budgets::RELAY_IDLE));
         let associate = associate.and_then(|associate| {
             associate
-                .set_read_timeout(Some(crate::budgets::RELAY_POLL))
+                .set_read_timeout(Some(crate::budgets::RELAY_IDLE))
                 .ok()
                 .map(|()| associate)
         });
@@ -2088,20 +2088,14 @@ impl NaiveOut {
     fn h2_client(self: &Arc<Self>, deadline: Instant) -> Option<Arc<H2Client>> {
         let mut pool = self.h2.lock().ok()?;
         loop {
-            pool.retain(|client| {
+            // Settle a snapshot outside the pool lock: a transport read must not hold the mutex every other tunnel needs.
+            let snapshot: Vec<Arc<H2Client>> = pool.iter().map(Arc::clone).collect();
+            drop(pool);
+            for client in &snapshot {
                 client.settle();
-                client.reusable()
-            });
-            let len = pool.len();
-            if len > 0 {
-                let start = self.h2_next.fetch_add(1, Ordering::Relaxed);
-                for offset in 0..len {
-                    let at = start.wrapping_add(offset) % len;
-                    if pool[at].has_capacity() {
-                        return Some(Arc::clone(&pool[at]));
-                    }
-                }
             }
+            pool = self.h2.lock().ok()?;
+            pool.retain(|client| client.reusable());
             let inflight = self.h2_inflight.load(Ordering::Relaxed);
             if pool.len() + inflight < self.pool_limit {
                 self.h2_inflight.fetch_add(1, Ordering::Relaxed);
@@ -2132,6 +2126,16 @@ impl NaiveOut {
                 drop(published);
                 self.h2_ready.notify_all();
                 return client.or(existing);
+            }
+            let len = pool.len();
+            if len > 0 {
+                let start = self.h2_next.fetch_add(1, Ordering::Relaxed);
+                for offset in 0..len {
+                    let at = start.wrapping_add(offset) % len;
+                    if pool[at].has_capacity() {
+                        return Some(Arc::clone(&pool[at]));
+                    }
+                }
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {

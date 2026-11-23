@@ -672,6 +672,24 @@ impl Masked {
         }
     }
 
+    /// Drain the chain's retained output without waiting, so a lane can park on it instead of stranding it behind an idle read.
+    fn flush_chain(&self) -> io::Result<()> {
+        let Ok(mut chain) = self.chain.lock() else {
+            return Err(io::Error::other("the mask chain is gone"));
+        };
+        if chain.is_empty() {
+            return Ok(());
+        }
+        #[cfg(unix)]
+        {
+            chain.flush(&mut ReadyWire(&self.stream))
+        }
+        #[cfg(not(unix))]
+        {
+            chain.flush(&mut &self.stream)
+        }
+    }
+
     /// Put the chain's retained output on the wire before a wait for the peer's answer.
     fn flush(&self) -> io::Result<()> {
         if let Some(session) = self.xmc_session()? {
@@ -1204,6 +1222,20 @@ impl Connection {
     }
 }
 
+#[cfg(unix)]
+struct ReadyWire<'a>(&'a TcpStream);
+
+#[cfg(unix)]
+impl std::io::Write for ReadyWire<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        sendmsg_ready(self.0, &[buf])
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 impl Connection {
     /// One relay write that never waits: a socket with no room answers `WouldBlock` at once, and the
     /// lane parks on the descriptor's writability instead of spending the send clock in a worker.
@@ -1234,6 +1266,26 @@ impl Connection {
             crate::proxy::note_wait_fd_write(std::os::fd::AsRawFd::as_raw_fd(&*self));
         }
         result
+    }
+
+    /// A lane drains any retained mask output before it reads, so a peer waiting on that output is not held behind the source.
+    #[cfg(unix)]
+    pub(crate) fn flush_ready(&mut self) -> io::Result<()> {
+        match self {
+            Connection::Masked(masked) if !masked.is_plain() && masked.xmc.is_none() => {
+                masked.flush_chain()
+            }
+            Connection::Metered(metered) => metered.inner.flush_ready(),
+            Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
+                inner.flush_ready()
+            }
+            _ => Ok(()),
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    pub(crate) fn flush_ready(&mut self) -> io::Result<()> {
+        std::io::Write::flush(self)
     }
 }
 
@@ -1271,6 +1323,28 @@ impl Connection {
             return Err(io::Error::from(io::ErrorKind::WouldBlock));
         }
         Ok(total)
+    }
+
+    /// The same non-blocking window for the mask's retained output: the chain's flush parks on `WouldBlock` and keeps the rest for the next turn.
+    pub(crate) fn flush_ready(&mut self) -> io::Result<()> {
+        if matches!(self, Connection::Masked(masked) if !masked.is_plain() && masked.xmc.is_none())
+        {
+            self.set_nonblocking(true)?;
+            let result = match self {
+                Connection::Masked(masked) => masked.flush_chain(),
+                _ => Ok(()),
+            };
+            let restored = self.set_nonblocking(false);
+            restored?;
+            return result;
+        }
+        match self {
+            Connection::Metered(metered) => metered.inner.flush_ready(),
+            Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
+                inner.flush_ready()
+            }
+            _ => Ok(()),
+        }
     }
 }
 

@@ -21,6 +21,7 @@ const H3_CLOSED_CRITICAL_STREAM: u64 = 0x0104;
 const H3_FRAME_UNEXPECTED: u64 = 0x0105;
 const H3_FRAME_ERROR: u64 = 0x0106;
 const H3_ID_ERROR: u64 = 0x0108;
+const H3_SETTINGS_ERROR: u64 = 0x0109;
 const H3_MISSING_SETTINGS: u64 = 0x010a;
 
 /// One request stream's byte transport: a served stream on the QUIC driver, or one the client
@@ -1954,12 +1955,16 @@ fn h3_control_frames(
             }
             let mut cursor = at;
             while cursor < end {
-                let Some(_id) = frames::quic_read(&control[..end], &mut cursor) else {
+                let Some(id) = frames::quic_read(&control[..end], &mut cursor) else {
                     return Err(H3_FRAME_ERROR);
                 };
                 let Some(_value) = frames::quic_read(&control[..end], &mut cursor) else {
                     return Err(H3_FRAME_ERROR);
                 };
+                // RFC 9114 7.2.4: the HTTP/2 settings identifiers are reserved here, so a peer that sends one has broken SETTINGS, not sent an extension.
+                if (0x02..=0x05).contains(&id) {
+                    return Err(H3_SETTINGS_ERROR);
+                }
             }
             *settings = true;
             control.drain(..end);
@@ -3349,6 +3354,25 @@ mod tests {
             h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
             Err(H3_FRAME_ERROR)
         );
+    }
+
+    #[test]
+    fn http2_reserved_settings_identifiers_are_settings_errors() {
+        for id in [0x2, 0x3, 0x4, 0x5] {
+            let mut control = Vec::new();
+            frames::quic_varint(&mut control, 0x4);
+            frames::quic_varint(&mut control, 2);
+            frames::quic_varint(&mut control, id);
+            frames::quic_varint(&mut control, 0);
+            let goaway = AtomicU64::new(u64::MAX);
+            let mut skip = 0;
+            let mut settings = false;
+            assert_eq!(
+                h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+                Err(H3_SETTINGS_ERROR),
+                "setting {id:#x} is reserved by HTTP/2"
+            );
+        }
     }
 
     #[test]

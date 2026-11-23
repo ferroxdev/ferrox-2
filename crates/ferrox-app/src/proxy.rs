@@ -39102,6 +39102,14 @@ impl LaneWrite for Connection {
             }
         }
     }
+
+    fn settle(&mut self) -> Settle {
+        match self.flush_ready() {
+            Ok(()) => Settle::Clear,
+            Err(error) if is_timeout(&error) => Settle::Parked,
+            Err(_) => Settle::Lost,
+        }
+    }
 }
 
 pub(crate) trait CarrierSink: Clone + Send + 'static {
@@ -39218,6 +39226,14 @@ impl FrameWrite for Connection {
     #[cfg(windows)]
     fn write_ready(&mut self, parts: &[&[u8]]) -> Option<std::io::Result<usize>> {
         Some(Connection::write_ready(self, parts))
+    }
+
+    fn settle(&mut self) -> Settle {
+        match self.flush_ready() {
+            Ok(()) => Settle::Clear,
+            Err(error) if is_timeout(&error) => Settle::Parked,
+            Err(_) => Settle::Lost,
+        }
     }
 
     fn arm_write(&mut self, timeout: Duration) {
