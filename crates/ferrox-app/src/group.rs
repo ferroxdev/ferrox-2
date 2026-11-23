@@ -5,7 +5,7 @@ use crate::json::Json;
 use crate::proxy::{self, Outbound, RouteShared};
 use crate::router::Network;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -16,7 +16,7 @@ const DEFAULT_TOLERANCE: u16 = 50;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 type ResolvedMember = Option<(String, Outbound, Option<u64>)>;
-type ResolvedMembers = HashMap<String, ResolvedMember>;
+type ResolvedMembers = HashMap<usize, ResolvedMember>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kind {
@@ -69,11 +69,19 @@ struct Reading {
 #[derive(Debug, Default)]
 pub(crate) struct History {
     delays: Mutex<HashMap<String, Reading>>,
+    #[cfg(test)]
+    locks: AtomicUsize,
 }
 
 impl History {
-    fn load(&self, tag: &str, revision: u64) -> Option<u16> {
-        let delays = self.delays.lock().ok()?;
+    /// The shared map, one window at a time: a reading sweep takes it once for every member.
+    fn guard(&self) -> Option<std::sync::MutexGuard<'_, HashMap<String, Reading>>> {
+        #[cfg(test)]
+        self.locks.fetch_add(1, Ordering::Relaxed);
+        self.delays.lock().ok()
+    }
+
+    fn read(delays: &HashMap<String, Reading>, tag: &str, revision: u64) -> Option<u16> {
         let reading = delays.get(tag)?;
         (reading.revision == revision).then_some(reading.delay)
     }
@@ -98,24 +106,37 @@ impl History {
 
 #[derive(Debug, Default)]
 struct Selected {
-    tcp: Option<String>,
-    udp: Option<String>,
+    tcp: Option<usize>,
+    udp: Option<usize>,
 }
 
 impl Selected {
-    fn get(&self, network: Network) -> Option<&str> {
+    /// The member position a group dials on `network`, so a dial reads a slice rather than hashing a tag.
+    fn get(&self, network: Network) -> Option<usize> {
         match network {
-            Network::Udp => self.udp.as_deref(),
-            _ => self.tcp.as_deref(),
+            Network::Udp => self.udp,
+            _ => self.tcp,
         }
     }
 
-    fn set(&mut self, network: Network, tag: String) {
+    fn set(&mut self, network: Network, at: usize) {
         *match network {
             Network::Udp => &mut self.udp,
             _ => &mut self.tcp,
-        } = Some(tag);
+        } = Some(at);
     }
+}
+
+/// The clock every group's activity stamp counts from, so a touch is one relaxed store.
+static ACTIVITY_EPOCH: OnceLock<Instant> = OnceLock::new();
+
+fn activity_nanos() -> u64 {
+    ACTIVITY_EPOCH
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_nanos()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 #[derive(Debug)]
@@ -123,14 +144,14 @@ pub(crate) struct Group {
     tag: String,
     kind: Kind,
     members: Vec<String>,
-    default: Option<String>,
+    default: Option<usize>,
     selected: Mutex<Selected>,
     history: Arc<History>,
     url: String,
     interval: Duration,
     idle: Duration,
     tolerance: u16,
-    active: Mutex<Instant>,
+    active: AtomicU64,
     route: OnceLock<Weak<RouteShared>>,
 }
 
@@ -149,21 +170,14 @@ impl Group {
 
     fn touch(&self) {
         if self.kind == Kind::UrlTest {
-            if let Ok(mut active) = self.active.lock() {
-                *active = Instant::now();
-            }
+            self.active.fetch_max(activity_nanos(), Ordering::Relaxed);
         }
     }
 
-    /// The member a selector dials on `network`: its stored choice, its default, or its first
-    /// member.
-    pub(crate) fn selected_member(&self, network: Network) -> String {
-        self.selected
-            .lock()
-            .ok()
-            .and_then(|selected| selected.get(network).map(str::to_owned))
-            .or_else(|| self.default.clone())
-            .unwrap_or_else(|| self.members[0].clone())
+    /// Whether the group has been idle past its timeout; a dial stamps it again.
+    fn idle(&self) -> bool {
+        let idle = u64::try_from(self.idle.as_nanos()).unwrap_or(u64::MAX);
+        activity_nanos().saturating_sub(self.active.load(Ordering::Relaxed)) > idle
     }
 
     /// The lane this group dials on `network`, resolved through any nested group to the leaf its
@@ -177,25 +191,32 @@ impl Group {
             .map(|(leaf, out, _)| (leaf, out))
     }
 
+    /// The member position a selector dials on `network`: its stored choice, its default, or its
+    /// first member.
+    fn choice(&self, network: Network) -> usize {
+        self.selected
+            .lock()
+            .ok()
+            .and_then(|selected| selected.get(network))
+            .filter(|at| *at < self.members.len())
+            .or(self.default)
+            .unwrap_or(0)
+    }
+
     fn resolve_with(
         &self,
         route: &RouteShared,
         network: Network,
         resolved: &mut ResolvedMembers,
     ) -> Option<(String, Outbound, Option<u64>)> {
-        if let Some(done) = resolved.get(&self.tag) {
-            return done.clone();
-        }
         self.touch();
-        let done = match self.kind {
+        match self.kind {
             Kind::Selector => {
-                let tag = self.selected_member(network);
-                resolve_member(route, &tag, network, resolved)
+                let at = self.choice(network);
+                resolve_member(route, &self.members[at], network, resolved)
             }
             Kind::UrlTest => self.pick(route, network, resolved),
-        };
-        resolved.insert(self.tag.clone(), done.clone());
-        done
+        }
     }
 
     fn pick(
@@ -204,21 +225,15 @@ impl Group {
         network: Network,
         resolved: &mut ResolvedMembers,
     ) -> Option<(String, Outbound, Option<u64>)> {
-        let current = self
+        let stored = self
             .selected
             .lock()
             .ok()
-            .and_then(|selected| selected.get(network).map(str::to_owned))
-            .and_then(|member| {
-                let (leaf, out, revision) = resolve_member(route, &member, network, resolved)?;
-                carries(&out, network).then_some((member, leaf, out, revision))
-            });
-        let current_delay = current.as_ref().and_then(|(_, leaf, _, revision)| {
-            revision.and_then(|revision| self.history.load(leaf, revision))
-        });
-        let mut best: Option<(u16, String, String, Outbound, u64)> = None;
-        let mut fallback: Option<(String, String, Outbound, u64)> = None;
-        for member in &self.members {
+            .and_then(|selected| selected.get(network));
+        // Every member resolved once; the current one is found among them rather than resolved again.
+        let mut candidates: Vec<(usize, String, Outbound, u64)> =
+            Vec::with_capacity(self.members.len());
+        for (at, member) in self.members.iter().enumerate() {
             let Some((leaf, out, revision)) = resolve_member(route, member, network, resolved)
             else {
                 continue;
@@ -229,37 +244,55 @@ impl Group {
             let Some(revision) = revision else {
                 continue;
             };
-            fallback.get_or_insert_with(|| (member.clone(), leaf.clone(), out.clone(), revision));
-            let Some(delay) = self.history.load(&leaf, revision) else {
-                continue;
-            };
-            if best.as_ref().is_none_or(|(fastest, ..)| delay < *fastest) {
-                best = Some((delay, member.clone(), leaf, out, revision));
+            candidates.push((at, leaf, out, revision));
+        }
+        let current = stored.and_then(|at| candidates.iter().position(|slot| slot.0 == at));
+        // One lock for the whole sweep: the current member's reading is read beside every other's.
+        let (mut best, mut current_delay) = (None, None);
+        if let Some(delays) = self.history.guard() {
+            current_delay = current.and_then(|slot| {
+                let (_, leaf, _, revision) = &candidates[slot];
+                History::read(&delays, leaf, *revision)
+            });
+            for (at, (_, leaf, _, revision)) in candidates.iter().enumerate() {
+                let Some(delay) = History::read(&delays, leaf, *revision) else {
+                    continue;
+                };
+                if best.is_none_or(|(fastest, _)| delay < fastest) {
+                    best = Some((delay, at));
+                }
             }
         }
-        let takeover = match (&current, current_delay) {
-            (Some(_), Some(current_delay)) => best.as_ref().is_some_and(|(fastest, ..)| {
-                fastest.saturating_add(self.tolerance) < current_delay
-            }),
+        let takeover = match (current, current_delay) {
+            (Some(_), Some(current_delay)) => best
+                .is_some_and(|(fastest, _)| fastest.saturating_add(self.tolerance) < current_delay),
             _ => true,
         };
-        let fastest =
-            best.map(|(_, member, leaf, out, revision)| (member, leaf, out, Some(revision)));
-        let chosen = if takeover { fastest } else { current };
-        let chosen = chosen.or_else(|| {
-            fallback.map(|(member, leaf, out, revision)| (member, leaf, out, Some(revision)))
-        });
-        if let Some((member, _, _, _)) = &chosen {
+        let picked = if takeover {
+            best.map(|(_, slot)| slot)
+                .or_else(|| (!candidates.is_empty()).then_some(0))
+        } else {
+            current
+        }?;
+        if stored != Some(candidates[picked].0) {
             if let Ok(mut selected) = self.selected.lock() {
-                selected.set(network, member.clone());
+                selected.set(network, candidates[picked].0);
             }
         }
-        chosen.map(|(_, leaf, out, revision)| (leaf, out, revision))
+        let (_, leaf, out, revision) = candidates.swap_remove(picked);
+        Some((leaf, out, Some(revision)))
     }
 
     fn leaves(&self, route: &Arc<RouteShared>) -> Vec<String> {
         let mut leaves = Vec::with_capacity(self.members.len());
-        collect_leaves(route, &self.members, &mut leaves, &mut HashSet::new());
+        let mut seen = HashSet::with_capacity(self.members.len());
+        collect_leaves(
+            route,
+            &self.members,
+            &mut leaves,
+            &mut HashSet::new(),
+            &mut seen,
+        );
         leaves
     }
 
@@ -321,19 +354,18 @@ fn collect_leaves(
     members: &[String],
     leaves: &mut Vec<String>,
     visited: &mut HashSet<String>,
+    seen: &mut HashSet<String>,
 ) {
     for member in members {
         match route.member(member) {
             Some(Outbound::Group(group)) if group.kind == Kind::Selector => {
                 if visited.insert(member.clone()) {
-                    collect_leaves(route, group.members(), leaves, visited);
+                    collect_leaves(route, group.members(), leaves, visited, seen);
                 }
             }
             // A nested urltest keeps its own loop, url and interval; touching it keeps an idle branch sweeping.
             Some(Outbound::Group(group)) => group.touch(),
-            Some(out)
-                if carries(&out, Network::Tcp) && !leaves.iter().any(|leaf| leaf == member) =>
-            {
+            Some(out) if carries(&out, Network::Tcp) && seen.insert(member.clone()) => {
                 leaves.push(member.clone());
             }
             _ => {}
@@ -341,27 +373,29 @@ fn collect_leaves(
     }
 }
 
-/// The leaf one member tag resolves to, through any nested group; one lookup shares the answers
-/// so a diamond of nested groups is walked once, not once per path.
+/// The leaf one member tag resolves to, through any nested group. A url-test is the only group a
+/// walk can reach twice, so it is the only answer worth sharing; a selector names one member and is
+/// walked once.
 fn resolve_member(
     route: &RouteShared,
     tag: &str,
     network: Network,
     resolved: &mut ResolvedMembers,
 ) -> Option<(String, Outbound, Option<u64>)> {
-    if let Some(done) = resolved.get(tag) {
-        return done.clone();
-    }
-    let Some((out, revision)) = route.member_revision(tag) else {
-        resolved.insert(tag.to_owned(), None);
-        return None;
-    };
-    let done = match &out {
+    let (out, revision) = route.member_revision(tag)?;
+    match &out {
+        Outbound::Group(group) if group.kind == Kind::UrlTest => {
+            let key = Arc::as_ptr(group) as usize;
+            if let Some(done) = resolved.get(&key) {
+                return done.clone();
+            }
+            let done = group.resolve_with(route, network, resolved);
+            resolved.insert(key, done.clone());
+            done
+        }
         Outbound::Group(group) => group.resolve_with(route, network, resolved),
         _ => Some((tag.to_owned(), out, revision)),
-    };
-    resolved.insert(tag.to_owned(), done.clone());
-    done
+    }
 }
 
 fn members(config: &Json) -> Result<Vec<String>, String> {
@@ -379,12 +413,13 @@ fn members(config: &Json) -> Result<Vec<String>, String> {
         return Err("group has no outbounds".to_owned());
     }
     let mut tags = Vec::with_capacity(listed.len());
+    let mut seen = HashSet::with_capacity(listed.len());
     for item in listed {
         let tag = item
             .as_str()
             .filter(|tag| !tag.is_empty())
             .ok_or_else(|| "group outbounds carries a non-string or empty tag".to_owned())?;
-        if tags.iter().any(|have| have == tag) {
+        if !seen.insert(tag) {
             return Err(format!("group names `{tag}` twice"));
         }
         tags.push(tag.to_owned());
@@ -450,12 +485,15 @@ impl Group {
             Kind::Selector => {
                 if let Some(named) = text(config, "default", tag)? {
                     if !named.is_empty() {
-                        if !members.iter().any(|member| member == named) {
-                            return Err(format!(
-                                "selector `{tag}` default `{named}` is not one of its outbounds"
-                            ));
-                        }
-                        default = Some(named.to_owned());
+                        let at = members
+                            .iter()
+                            .position(|member| member == named)
+                            .ok_or_else(|| {
+                                format!(
+                                    "selector `{tag}` default `{named}` is not one of its outbounds"
+                                )
+                            })?;
+                        default = Some(at);
                     }
                 }
             }
@@ -489,9 +527,9 @@ impl Group {
                 }
             }
         }
-        let first = default.clone().unwrap_or_else(|| members[0].clone());
+        let first = default.unwrap_or(0);
         let mut selected = Selected::default();
-        selected.set(Network::Tcp, first.clone());
+        selected.set(Network::Tcp, first);
         selected.set(Network::Udp, first);
         Ok(Self {
             tag: tag.to_owned(),
@@ -504,7 +542,7 @@ impl Group {
             interval,
             idle,
             tolerance,
-            active: Mutex::new(Instant::now()),
+            active: AtomicU64::new(activity_nanos()),
             route: OnceLock::new(),
         })
     }
@@ -574,10 +612,7 @@ pub(crate) fn spawn(
                 group.probe(&route);
                 loop {
                     std::thread::sleep(group.interval);
-                    let idle = group
-                        .active
-                        .lock()
-                        .is_ok_and(|active| active.elapsed() > group.idle);
+                    let idle = group.idle();
                     if !idle {
                         group.probe(&route);
                     }
@@ -603,6 +638,11 @@ impl Group {
     pub(crate) fn record(&self, tag: &str, delay: u16) {
         self.history.store(tag, 0, delay);
     }
+
+    #[cfg(test)]
+    pub(crate) fn history_locks(&self) -> usize {
+        self.history.locks.load(Ordering::Relaxed)
+    }
 }
 
 #[cfg(test)]
@@ -624,11 +664,16 @@ mod tests {
     fn a_reading_only_names_the_revision_it_measured() {
         let history = History::default();
         history.store("a", 1, 10);
-        assert_eq!(history.load("a", 1), Some(10));
-        assert_eq!(history.load("a", 2), None);
+        let delays = history.guard().expect("map");
+        assert_eq!(History::read(&delays, "a", 1), Some(10));
+        assert_eq!(History::read(&delays, "a", 2), None);
+        drop(delays);
         history.delete("a", 2);
-        assert_eq!(history.load("a", 1), Some(10));
+        let delays = history.guard().expect("map");
+        assert_eq!(History::read(&delays, "a", 1), Some(10));
+        drop(delays);
         history.delete("a", 1);
-        assert_eq!(history.load("a", 1), None);
+        let delays = history.guard().expect("map");
+        assert_eq!(History::read(&delays, "a", 1), None);
     }
 }

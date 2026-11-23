@@ -509,7 +509,8 @@ pub(crate) fn strip_jsonc(text: &str) -> std::borrow::Cow<'_, str> {
         }
     }
     let comments = changed;
-    let mut kept = Vec::with_capacity(out.len());
+    // The trailing-comma pass compacts into the buffer it reads: a dropped comma frees its byte.
+    let mut write = 0;
     let mut at = 0;
     let mut quote = 0u8;
     let mut escaped = false;
@@ -517,7 +518,8 @@ pub(crate) fn strip_jsonc(text: &str) -> std::borrow::Cow<'_, str> {
     while at < out.len() {
         let byte = out[at];
         if quote != 0 {
-            kept.push(byte);
+            out[write] = byte;
+            write += 1;
             if escaped {
                 escaped = false;
             } else if byte == b'\\' {
@@ -530,7 +532,8 @@ pub(crate) fn strip_jsonc(text: &str) -> std::borrow::Cow<'_, str> {
         }
         if byte == b'"' || byte == b'\'' {
             quote = byte;
-            kept.push(byte);
+            out[write] = byte;
+            write += 1;
             at += 1;
             continue;
         }
@@ -539,7 +542,7 @@ pub(crate) fn strip_jsonc(text: &str) -> std::borrow::Cow<'_, str> {
             while next < out.len() && out[next].is_ascii_whitespace() {
                 next += 1;
             }
-            let mut before = at;
+            let mut before = write;
             while before > 0 && out[before - 1].is_ascii_whitespace() {
                 before -= 1;
             }
@@ -550,13 +553,18 @@ pub(crate) fn strip_jsonc(text: &str) -> std::borrow::Cow<'_, str> {
                 continue;
             }
         }
-        kept.push(byte);
+        out[write] = byte;
+        write += 1;
         at += 1;
     }
     if !comments && !trimmed {
         return std::borrow::Cow::Borrowed(text);
     }
-    std::borrow::Cow::Owned(String::from_utf8_lossy(&kept).into_owned())
+    out.truncate(write);
+    std::borrow::Cow::Owned(
+        String::from_utf8(out)
+            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned()),
+    )
 }
 
 /// A merged config's `_priority` order: every array whose elements carry the marker is sorted
@@ -1101,6 +1109,19 @@ mod tests {
         assert_eq!(strip_jsonc(r#"{"a":{}}"#), r#"{"a":{}}"#);
         let quoted = r#"{"a":",}"}"#;
         assert_eq!(strip_jsonc(quoted), quoted);
+    }
+
+    #[test]
+    fn a_strip_keeps_one_buffer() {
+        let text = r#"{"a":[1,2,],/* note */"b":3}"#;
+        let (stripped, counts) =
+            ferrox_core::alloc_count::measure(|| strip_jsonc(text).into_owned());
+        assert_eq!(stripped, r#"{"a":[1,2],"b":3}"#);
+        assert_eq!(
+            counts.allocs, 1,
+            "the strip copied its text {} times",
+            counts.allocs
+        );
     }
 
     #[test]

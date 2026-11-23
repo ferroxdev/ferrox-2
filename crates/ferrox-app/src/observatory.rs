@@ -605,7 +605,10 @@ impl Ring {
         if self.slots.is_empty() {
             return;
         }
-        self.index = (self.index + 1) % self.slots.len();
+        self.index += 1;
+        if self.index == self.slots.len() {
+            self.index = 0;
+        }
         self.slots[self.index] = Sample {
             at: Some(Instant::now()),
             value,
@@ -615,16 +618,17 @@ impl Ring {
     #[allow(clippy::cast_precision_loss)]
     fn stats(&self) -> HealthPing {
         let now = Instant::now();
+        let live = |sample: &Sample| {
+            sample.value != UNTESTED
+                && sample
+                    .at
+                    .is_none_or(|at| now.duration_since(at) <= self.validity)
+        };
         let mut fail = 0i64;
         let mut count = 0i64;
         let mut sum = 0i64;
-        let mut valid = Vec::with_capacity(self.slots.len());
         for sample in &self.slots {
-            if sample.value == UNTESTED
-                || sample
-                    .at
-                    .is_none_or(|at| now.duration_since(at) > self.validity)
-            {
+            if !live(sample) {
                 continue;
             }
             if sample.value == FAILED {
@@ -633,7 +637,6 @@ impl Ring {
             }
             count += 1;
             sum = sum.saturating_add(sample.value);
-            valid.push(sample.value);
         }
         let all = count + fail;
         if count == 0 {
@@ -647,10 +650,12 @@ impl Ring {
         let deviation = if count < 2 {
             average / 2
         } else {
-            let variance = valid
+            let variance = self
+                .slots
                 .iter()
-                .map(|value| {
-                    let delta = (value - average) as f64;
+                .filter(|sample| live(sample) && sample.value != FAILED)
+                .map(|sample| {
+                    let delta = (sample.value - average) as f64;
                     delta * delta
                 })
                 .sum::<f64>()

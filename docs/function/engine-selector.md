@@ -45,13 +45,15 @@ Each bullet names its comparison. Sing-box's `protocol/group` is the only one of
 - **A second HTTP client per probe.** The group calls the observatory's one `probe`, so there is no per-probe sing-box `http.Client`, pool, redirect machinery or cookie jar. Xray-core's balancer also has no such client, and ZeroNet's observatory has no group of its own to give one. The bytes are the same request the observatory already sends, and the connection is the member's own lane.
 - **A selected-outbound pointer per group.** The route table already holds one instance per tag; a group stores member tags and resolves through that table, so two groups naming the same leaf share its state rather than each building a private copy. Sing-box stores a selected outbound per group; Xray-core's balancer and ZeroNet's observatory have no group object to store one in.
 - **A per-flow history map.** One `Mutex<HashMap<String, u16>>` is shared by every group at startup, allocated once, not once per dial. A reading is a `u16` in the reference's milliseconds, and a failed probe removes exactly that leaf's entry. Sing-box keeps a per-outbound history in its URL-test group; Xray-core's observatory is the nearest status store, and ZeroNet's `zero-observatory` likewise publishes status rather than a group's private map.
+- **A tag String per dial, and its hash.** `Selected` held the member's tag and hashed it into the route table on every dial, and a url-test re-wrote it on every sweep even when the winner had not moved. It holds the member's position in the group's list, written only when the choice moves, so a dial reads a slice. Sing-box's selector stores the selected outbound's tag and looks the outbound up by name on each dial; Xray-core's balancer tracks its selection by index in a list, so no group here keeps a tag to hash.
+- **A history lock per member.** A url-test took the shared map once for the current member and once for every member in the sweep, four windows for three members; resolution now finishes first and the readings are read under one window. Sing-box's per-group history sits behind its own mutex, one hit per `Select`; Xray-core's observatory is the nearest status store and has no group sweep to take several.
 - **A group reached only through a rule.** `routing_for` builds the empty table when any group is configured, so a group that is the default outbound reaches the same route plan as a tagged rule target rather than needing a second dispatch path. Neither Xray-core's balancer nor ZeroNet's observatory is an outbound, so neither has this second dispatch path.
 
 What was not removed: one sleeping thread exists per `urltest` group for the life of the process; the idle loop keeps sleeping at the probe interval rather than stopping its thread, so an idle group costs a wake-up, not a probe; each collection walk visits a nested selector once, though different outer groups still collect separately; a selector has no runtime setter because the cache file and Clash API that drive one are outside this row; and `interrupt_exist_connections` is warned about rather than carried.
 
 ## Time
 
-No duration is claimed here. Benchmarks are CI-only, and a local probe measures this host's path to a connectivity URL, not the reference's. The operation-count gate needs valgrind, which does not exist for macOS/aarch64, so the ops and syscall rows are `UNBLESSED`. No selector test is wired to `count-ops.sh` yet; until one exists the only signal is the `ops.yml` artefact. The selection hysteresis and the cycle refusals are exact and are held by the in-tree tests. Copies are not counted: the probe request is formatted once per probe and the response head is read into a fixed window, but no checker observes copies yet.
+No duration is claimed here. Benchmarks are CI-only, and a local probe measures this host's path to a connectivity URL, not the reference's. The operation-count gate needs valgrind, which does not exist for macOS/aarch64, so the ops and syscall rows are `UNBLESSED`. No selector test is wired to `count-ops.sh` yet; until one exists the only signal is the `ops.yml` artefact. The selection hysteresis and the cycle refusals are exact and are held by the in-tree tests. `a_selector_dial_allocates_only_the_tag_it_returns` counts heap traffic around one dial through two chained selectors and requires exactly the one leaf tag the dial returns; `a_urltest_reads_its_history_under_one_lock` counts `History` lock windows around one three-member sweep and requires one. Memory copies are not counted yet: the probe request is formatted once per probe and the response head is read into a fixed window, but no checker observes copies.
 
 ## Measured
 
@@ -61,10 +63,12 @@ No duration is claimed here. Benchmarks are CI-only, and a local probe measures 
 | ops-retired-instructions | UNBLESSED | no selector workload yet |
 | syscalls-per-flow | UNBLESSED | no selector workload yet |
 | copies-per-flow | UNBLESSED | no copy checker yet |
+| dial-allocations | 1 | `ferrox-app-proxy::tests::a_selector_dial_allocates_only_the_tag_it_returns` |
+| sweep-lock-windows | 1 | `ferrox-app-proxy::tests::a_urltest_reads_its_history_under_one_lock` |
 | seconds-per-flow | UNBLESSED | CI bench.yml (no cell yet) |
 <!-- counts:end -->
 
-Every figure in this block is an open claim, not a measured number. `a_selector_dials_its_default_then_its_first_member` and `a_urltest_picks_the_fastest_history_and_keeps_it_inside_the_tolerance` hold the selection rules; `a_broken_group_is_refused_by_name` holds the missing-member, outside-default and cycle refusals.
+`dial-allocations` and `sweep-lock-windows` are measured by the two counting tests named beside them. The remaining four are open claims. `a_selector_dials_its_default_then_its_first_member` and `a_urltest_picks_the_fastest_history_and_keeps_it_inside_the_tolerance` hold the selection rules; `a_broken_group_is_refused_by_name` holds the missing-member, outside-default and cycle refusals.
 
 ## Pins
 

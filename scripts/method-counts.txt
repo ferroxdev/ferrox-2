@@ -1074,6 +1074,8 @@ engine-observatory default-burst-samples 10 ferrox-app-observatory::tests::burst
 engine-selector ops-retired-instructions UNBLESSED no selector workload yet
 engine-selector syscalls-per-flow UNBLESSED no selector workload yet
 engine-selector copies-per-flow UNBLESSED no copy checker yet
+engine-selector dial-allocations 1 ferrox-app-proxy::tests::a_selector_dial_allocates_only_the_tag_it_returns
+engine-selector sweep-lock-windows 1 ferrox-app-proxy::tests::a_urltest_reads_its_history_under_one_lock
 engine-selector seconds-per-flow UNBLESSED CI bench.yml (no cell yet)
 front-healthcheck ops-retired-instructions UNBLESSED scripts/count-ops.sh
 front-healthcheck syscalls-per-answer UNBLESSED scripts/count-ops.sh

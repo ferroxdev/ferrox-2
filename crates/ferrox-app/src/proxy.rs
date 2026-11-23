@@ -84977,6 +84977,63 @@ end
         assert_eq!(tag, "c");
     }
 
+    /// One tag is the whole allocation a selector dial makes: the leaf its chain names. Two
+    /// selectors and one leaf, one allocation, counted by the allocator rather than read off the code.
+    #[test]
+    fn a_selector_dial_allocates_only_the_tag_it_returns() {
+        let shared = group_route(
+            r#"{"outbounds":[
+                {"tag":"a","protocol":"freedom"},
+                {"tag":"b","protocol":"freedom"},
+                {"tag":"mid","type":"selector","outbounds":["a","b"],"default":"b"},
+                {"tag":"pick","type":"selector","outbounds":["mid","a"],"default":"mid"}
+            ],"routing":{}}"#,
+        );
+        let group = group_of(&shared, "pick");
+        let dial = || {
+            group
+                .resolve(&shared, crate::router::Network::Tcp)
+                .expect("picks")
+        };
+        // A flow is the dial after the process's one-time setup, so the gate takes a warm one.
+        let (warm_up, _) = ferrox_core::alloc_count::measure(dial);
+        assert_eq!(warm_up.0, "b");
+        let (picked, counts) = ferrox_core::alloc_count::measure(dial);
+        assert_eq!(picked.0, "b");
+        assert_eq!(
+            counts.allocs, 1,
+            "a dial through two selectors allocated {} times and {} bytes, not the one tag it names",
+            counts.allocs, counts.bytes
+        );
+    }
+
+    /// A url-test reading sweep takes the shared history lock once, not once per member.
+    #[test]
+    fn a_urltest_reads_its_history_under_one_lock() {
+        let shared = group_route(
+            r#"{"outbounds":[
+                {"tag":"a","protocol":"freedom"},
+                {"tag":"b","protocol":"freedom"},
+                {"tag":"c","protocol":"freedom"},
+                {"tag":"pick","type":"urltest","outbounds":["a","b","c"],"url":"http://127.0.0.1/204"}
+            ],"routing":{}}"#,
+        );
+        let group = group_of(&shared, "pick");
+        for (tag, delay) in [("a", 150u16), ("b", 40), ("c", 60)] {
+            group.record(tag, delay);
+        }
+        let before = group.history_locks();
+        let (tag, _) = group
+            .resolve(&shared, crate::router::Network::Tcp)
+            .expect("picks");
+        let windows = group.history_locks() - before;
+        assert_eq!(
+            windows, 1,
+            "a three-member sweep opened {windows} history windows"
+        );
+        assert_eq!(tag, "b");
+    }
+
     /// A UDP lookup does not retain a current member that cannot carry datagrams, even when its
     /// reading is the fastest.
     #[test]
