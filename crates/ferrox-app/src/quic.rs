@@ -5073,7 +5073,11 @@ impl Read for QuicStream {
                     return Err(std::io::Error::other("quic connection lock poisoned"));
                 }
             }
-            if relayed || Instant::now() >= deadline {
+            if relayed {
+                self.note_datagram_wait();
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            if Instant::now() >= deadline {
                 return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
             }
             let left = deadline.saturating_duration_since(Instant::now());
@@ -5143,6 +5147,16 @@ impl crate::proxy::Duplicate for QuicStream {
 }
 
 impl QuicStream {
+    /// The descriptor a relay step's empty read waits on. A stream's own readiness is invisible to
+    /// the kernel, so a lane parked on the clock re-reads it once a poll grain and caps a flow at
+    /// `window / grain`; the lane parked on the lane's datagram socket is woken by the batch that
+    /// filled the stream, and a wake meant for another stream costs one `stream_recv` that says done.
+    fn note_datagram_wait(&self) {
+        if let Some(sock) = self.sock.waits_here() {
+            crate::proxy::note_wait_fd(crate::proxy::wait_key(sock));
+        }
+    }
+
     /// A stream handle built by a carrier that owns its own ids: the caller opens the stream first
     /// and keeps it live until both directions end.
     pub(crate) fn new(
@@ -8196,6 +8210,39 @@ mod tests {
             .read(&mut [0u8; 8])
             .expect_err("a reset is not a clean end");
         assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+    }
+
+    /// An empty read inside a relay step parks the lane on the connection's datagram socket. The
+    /// stream's own readiness is invisible to the kernel, so a lane parked on the clock re-reads it
+    /// once a poll grain — a flow capped at `window / grain`; the socket wakes the lane with the
+    /// batch that filled the stream.
+    #[test]
+    fn an_empty_relay_read_waits_on_the_lane_socket() {
+        let (mut client, _server) = lane_pair();
+        client.conn.stream_send(0, b"", false).expect("opens");
+        let sock = std::sync::Arc::new(client.sock);
+        let waited = crate::proxy::wait_key(&*sock);
+        let mut stream = QuicStream {
+            conn: std::sync::Arc::new(std::sync::Mutex::new(client.conn)),
+            sock,
+            id: 0,
+            meter: crate::stats::Meter::default(),
+            peer_fin: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fin_sent: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            prefaced: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            activity: std::sync::Arc::new(Activity::new()),
+            stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stalled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            owner: None,
+        };
+        let _step = crate::proxy::RelayStep::enter();
+        let error = stream.read(&mut [0u8; 64]).expect_err("nothing arrived");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(
+            crate::proxy::take_wait_fd(),
+            Some(waited),
+            "the empty read left the lane on the clock instead of the socket"
+        );
     }
 
     /// A write on a connection the peer closed returns at once; waiting `SEND_WAIT` for a
