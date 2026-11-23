@@ -258,7 +258,7 @@ for entry in $engine_list; do
   source="${entry#*=}"
   [[ "$label" != "$entry" ]] || label="$source"
   if [[ "$label" == "ferrox" ]]; then
-    path="$ferrox_bin"
+    if [[ "$source" == /* ]]; then path="$source"; else path="$ferrox_bin"; fi
   elif [[ "$source" == /* ]]; then
     path="$source"
   else
