@@ -3259,8 +3259,8 @@ mod tests {
             Ok(false)
         );
         assert!(
-            settings,
-            "the first SETTINGS frame is recognized while partial"
+            !settings,
+            "the first SETTINGS frame is validated only once its payload is complete"
         );
         control.extend_from_slice(&[0x00, 0x07, 0x01, 0x04]);
         assert_eq!(
