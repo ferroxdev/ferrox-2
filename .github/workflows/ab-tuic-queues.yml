@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches: [ab-tuic-queues]
-    paths: ['.github/workflows/ab-tuic-queues.yml']
+    paths: ['.github/workflows/ab-tuic-queues.yml', 'scripts/run-benchmark-matrix.sh']
 
 permissions:
   contents: read
