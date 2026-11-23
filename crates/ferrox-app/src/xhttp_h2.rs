@@ -3151,7 +3151,7 @@ impl H2Client {
         owner: Option<Arc<ClientOwner>>,
         end_request: bool,
     ) -> Result<(H2StreamReader, H2StreamOut), H2OpenError> {
-        let Ok(_gate) = self.conn.open_gate.lock() else {
+        let Ok(gate) = self.conn.open_gate.lock() else {
             return Err(H2OpenError::Closed);
         };
         if self.conn.goaway.load(Ordering::SeqCst) {
