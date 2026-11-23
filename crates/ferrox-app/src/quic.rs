@@ -5054,7 +5054,9 @@ impl Read for QuicStream {
                     if n > 0 {
                         self.peer_fin.store(fin, Ordering::Relaxed);
                         self.activity.touch();
-                        flush_egress(&mut conn, &self.sock);
+                        if !relayed {
+                            flush_egress(&mut conn, &self.sock);
+                        }
                         self.meter.read(n);
                         return Ok(n);
                     }
