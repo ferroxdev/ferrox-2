@@ -693,6 +693,7 @@ impl crate::proxy::FrameWrite for H3Writer {
 }
 
 impl crate::proxy::LaneWrite for H3Writer {
+    #[allow(clippy::too_many_lines)]
     fn push(&mut self, data: &[u8]) -> crate::proxy::Push {
         if !self.pending.is_empty() {
             match self.wire.try_write(&self.pending[self.at..]) {

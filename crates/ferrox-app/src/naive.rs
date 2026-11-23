@@ -254,16 +254,6 @@ fn write_all(writer: &mut dyn Write, mut buf: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-fn write_zeros(writer: &mut dyn Write, mut left: usize) -> std::io::Result<()> {
-    let zeros = [0u8; 255];
-    while left > 0 {
-        let take = left.min(zeros.len());
-        write_all(writer, &zeros[..take])?;
-        left -= take;
-    }
-    Ok(())
-}
-
 const UOT_V2: &str = "sp.v2.udp-over-tcp.arpa";
 const UOT_V1: &str = "sp.udp-over-tcp.arpa";
 
@@ -971,14 +961,6 @@ impl proxy::LaneWrite for NaiveStream {
             .unwrap_or_else(PoisonError::into_inner)
             .wait_room(turn);
     }
-
-    fn room(&self) -> u64 {
-        self.inner
-            .writer
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .room()
-    }
 }
 
 impl proxy::Duplicate for NaiveStream {
@@ -1070,10 +1052,6 @@ impl proxy::LaneWrite for H2OutWrite {
 
     fn wait_room(&mut self, turn: Duration) {
         self.out.wait_room(turn);
-    }
-
-    fn room(&self) -> u64 {
-        self.out.room()
     }
 }
 
@@ -1222,10 +1200,6 @@ impl proxy::LaneWrite for BoxedWrite {
 
     fn wait_room(&mut self, turn: Duration) {
         self.0.wait_room(turn);
-    }
-
-    fn room(&self) -> u64 {
-        self.0.room()
     }
 }
 

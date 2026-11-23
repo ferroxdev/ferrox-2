@@ -13849,7 +13849,7 @@ impl<T: Read> Half<T> {
         match self {
             Self::Split { read, .. } => match read.lock() {
                 Ok(mut guard) => guard.read(buf),
-                Err(_) => Err(std::io::Error::other("relay half poisoned")),
+                Err(()) => Err(std::io::Error::other("relay half poisoned")),
             },
             Self::Shared {
                 inner,
@@ -13889,7 +13889,7 @@ impl<T: LaneWrite> Write for Half<T> {
     fn flush(&mut self) -> std::io::Result<()> {
         match self.writer_lock() {
             Ok(mut guard) => guard.flush(),
-            Err(_) => Err(std::io::Error::other("relay half poisoned")),
+            Err(()) => Err(std::io::Error::other("relay half poisoned")),
         }
     }
 }
@@ -13898,27 +13898,20 @@ impl<T: LaneWrite> LaneWrite for Half<T> {
     fn push(&mut self, data: &[u8]) -> Push {
         match self.writer_lock() {
             Ok(mut guard) => guard.push(data),
-            Err(_) => Push::Lost,
+            Err(()) => Push::Lost,
         }
     }
 
     fn settle(&mut self) -> Settle {
         match self.writer_lock() {
             Ok(mut guard) => guard.settle(),
-            Err(_) => Settle::Lost,
+            Err(()) => Settle::Lost,
         }
     }
 
     fn wait_room(&mut self, turn: Duration) {
         if let Ok(mut guard) = self.writer_lock() {
             guard.wait_room(turn);
-        }
-    }
-
-    fn room(&self) -> u64 {
-        match self.writer_lock() {
-            Ok(guard) => guard.room(),
-            Err(_) => 0,
         }
     }
 }
@@ -14124,14 +14117,14 @@ impl<W: LaneWrite + 'static> CarrierSink for HalfSink<W> {
     fn push_ready(&self, bytes: &[u8]) -> Push {
         match self.0.writer_lock() {
             Ok(mut guard) => guard.push(bytes),
-            Err(_) => Push::Lost,
+            Err(()) => Push::Lost,
         }
     }
 
     fn settle(&self) -> Settle {
         match self.0.writer_lock() {
             Ok(mut guard) => guard.settle(),
-            Err(_) => Settle::Lost,
+            Err(()) => Settle::Lost,
         }
     }
 
@@ -39054,10 +39047,6 @@ pub(crate) trait LaneWrite: Write + Send {
 
     fn wait_room(&mut self, turn: Duration) {
         std::thread::sleep(turn);
-    }
-
-    fn room(&self) -> u64 {
-        u64::MAX
     }
 }
 
