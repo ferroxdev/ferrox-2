@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -16,7 +17,9 @@ use ferrox_prompt::markdown::{
 use ferrox_prompt::render::{self, Options, Rendered};
 use ferrox_prompt::state::{Gap, MethodRow};
 use ferrox_prompt::worktree::Worktree;
-use ferrox_prompt::{clipboard, load_library, workspace_root};
+use ferrox_prompt::{
+    clipboard, load_library, path_tag, workspace_root, LEDGER_RELATIVE, LIBRARY_RELATIVE,
+};
 
 const USAGE: &str = "\
 ferrox-prompt — render the slice to work on next, from a Markdown library
@@ -244,7 +247,7 @@ fn main() -> ExitCode {
             {
                 eprintln!("warning: {}: {finding}", library.path.display());
             }
-            let root = workspace_root(&cwd);
+            let root = workspace_root_for(&args, &cwd);
             match command {
                 Command::List => run_list(&args, &library, &root),
                 Command::Next => run_next(&args, &library, &root),
@@ -494,7 +497,7 @@ fn run_check(args: &Args, cwd: &Path) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let root = workspace_root(cwd);
+    let root = workspace_root_for(args, cwd);
     // A library outside this repo has nothing local to check **Touches:** against; the canonicalised path decides.
     let inside = match args.library.as_deref() {
         None => true,
@@ -544,7 +547,7 @@ fn run_check(args: &Args, cwd: &Path) -> ExitCode {
 
 /// `list`: totals, served count and the status summary; per-prompt lines only when `--status`/`--effort` narrowed.
 fn run_list(args: &Args, library: &Library, root: &Path) -> ExitCode {
-    let ledger = load_ledger(root);
+    let ledger = load_ledger(ledger_path(root, library));
     let selected: Vec<&Prompt> = library
         .prompts
         .iter()
@@ -690,19 +693,49 @@ fn requested_values(args: &Args) -> Values {
     values
 }
 
-/// The values a handout may count as supplied: `--set`, plus every matrix blank when the matrix was readable.
-fn supplied_values(args: &Args, state: &ProjectState) -> Values {
-    let mut supplied = requested_values(args);
-    if state.has_matrix() {
-        let references = state.references();
-        for name in expand::FILLABLE {
-            if *name == "references" && references.is_empty() {
-                continue;
-            }
-            supplied.entry((*name).to_owned()).or_default();
+/// The nearest directory at or above `start` that carries the prompt library, without the manifest fallback.
+fn workspace_marker(start: &Path) -> Option<PathBuf> {
+    let mut cursor = Some(start);
+    while let Some(dir) = cursor {
+        if dir.join(LIBRARY_RELATIVE).is_file() {
+            return Some(dir.to_path_buf());
+        }
+        cursor = dir.parent();
+    }
+    None
+}
+
+/// The workspace an explicit library belongs to, so a retry reopens its matrix and ledger from there.
+fn workspace_root_for(args: &Args, cwd: &Path) -> PathBuf {
+    if let Some(library) = args.library.as_deref() {
+        let library = if library.is_absolute() {
+            library.to_path_buf()
+        } else {
+            std::fs::canonicalize(cwd.join(library)).unwrap_or_else(|_| cwd.join(library))
+        };
+        if let Some(root) = workspace_marker(library.parent().unwrap_or(&library)) {
+            return root;
         }
     }
-    supplied
+    workspace_root(cwd)
+}
+
+/// The absolute library the retry reopens, so moving to the slice's worktree does not change it.
+fn retry_library_path(args: &Args, library: &Library) -> Option<PathBuf> {
+    if library.source_path.to_str().is_some() {
+        return Some(library.source_path.clone());
+    }
+    let given = args.library.as_ref()?;
+    let alias = if given.is_absolute() {
+        given.clone()
+    } else {
+        std::env::current_dir().ok()?.join(given)
+    };
+    if alias.to_str().is_some() {
+        Some(alias)
+    } else {
+        None
+    }
 }
 
 /// A slice the advisor may hand over: the prompt plus, for a matrix template, the row it draws and that row's values.
@@ -717,6 +750,9 @@ fn build_offers<'p>(
     state: &'p ProjectState,
     ledger: &Ledger,
     named: Option<&'p MethodRow>,
+    supplied: &Values,
+    requested_addons: &[String],
+    allow_unfilled: bool,
 ) -> Vec<Offer<'p>> {
     handable
         .iter()
@@ -729,7 +765,16 @@ fn build_offers<'p>(
                 return Some((*prompt, Some((row, expand::fill(prompt, row, &state.pins)))));
             }
             if prompt.targets.is_matrix() {
-                target_for(prompt, state, ledger, None).map(|pair| (*prompt, Some(pair)))
+                target_for(
+                    prompt,
+                    state,
+                    ledger,
+                    None,
+                    supplied,
+                    requested_addons,
+                    allow_unfilled,
+                )
+                .map(|pair| (*prompt, Some(pair)))
             } else {
                 Some((*prompt, None))
             }
@@ -784,12 +829,12 @@ fn slice_worktree(
     if let Some(issue) = values.get("issue") {
         return Worktree::named(format!("bugfix-{issue}"), root);
     }
-    let label = values
-        .get("method")
-        .map(String::as_str)
-        .or_else(|| target.map(|(row, _)| row.method.as_str()))
+    let label = target
+        .map(|(row, _)| row.method.as_str())
+        .or_else(|| values.get("method").map(String::as_str))
         .unwrap_or(prompt.title.as_str());
-    Worktree::plan(prompt.id, label, root)
+    let row_key = target.map(|(row, _)| row.key());
+    Worktree::plan(prompt.id, label, row_key.as_deref(), root)
 }
 
 /// The `--json` shape for a `next` handout, so an agent drives the loop without parsing prose.
@@ -850,7 +895,10 @@ fn worktree_json(worktree: Option<&Worktree>) -> Value {
 fn missing_input_refusal(
     prompt: &Prompt,
     rendered: &render::Rendered,
+    supplied: &Values,
     args: &Args,
+    library: &Library,
+    row: Option<&str>,
 ) -> Option<ExitCode> {
     if rendered.missing.is_empty() || args.allow_unfilled {
         return None;
@@ -867,7 +915,16 @@ fn missing_input_refusal(
     );
     eprintln!(
         "{}",
-        render::suggested_command(prompt, &rendered.missing, &args.addons)
+        render::suggested_command(
+            prompt,
+            &rendered.missing,
+            supplied,
+            &rendered.addons,
+            &args.addons,
+            retry_library_path(args, library).as_deref(),
+            row,
+            !args.record
+        )
     );
     Some(ExitCode::from(2))
 }
@@ -893,7 +950,8 @@ fn reload_library(library: &Library) -> Result<Library, String> {
 /// `next`: fills a matrix template from its first unserved row, so repeat runs walk the matrix; `--set` still wins.
 #[allow(clippy::too_many_lines)]
 fn run_next(args: &Args, library: &Library, root: &Path) -> ExitCode {
-    let Ok(_lock) = lock_state(&Ledger::path_for(root)) else {
+    let ledger_path = ledger_path(root, library);
+    let Ok(_lock) = lock_if_recording(args.record, &ledger_path) else {
         return ExitCode::from(1);
     };
     let reloaded = match reload_library(library) {
@@ -904,7 +962,7 @@ fn run_next(args: &Args, library: &Library, root: &Path) -> ExitCode {
         }
     };
     let library = &reloaded;
-    let ledger = load_ledger(root);
+    let ledger = load_ledger(ledger_path);
     let state = ProjectState::load(root);
 
     // A named row is the work; the template that draws it is then the advisor's choice.
@@ -925,8 +983,8 @@ fn run_next(args: &Args, library: &Library, root: &Path) -> ExitCode {
         ledger.recent_ids(args.memory)
     };
 
-    // Matrix-filled names are not holes: FILLABLE counts as supplied when the matrix was readable.
-    let supplied = supplied_values(args, &state);
+    // Only an explicit value is supplied here; `handable` counts what this template's row and the pins can fill.
+    let supplied = requested_values(args);
 
     // Resolve the (template, row) pair: `forced` names one on purpose, else walk the handable set for a live target.
     let ((prompt, target), skipped) = match choose_slice(
@@ -945,14 +1003,6 @@ fn run_next(args: &Args, library: &Library, root: &Path) -> ExitCode {
         }
     };
 
-    // A forced matrix template whose class is spent has no row to fill, and a hole is worse than the reason.
-    if target.is_none()
-        && expand::is_fillable(prompt, &state)
-        && !state.candidates(prompt.targets).is_empty()
-    {
-        eprintln!("{}", class_spent(library, prompt, &state, &ledger));
-        return ExitCode::from(2);
-    }
     let addons = match render::resolve_addons(prompt, &args.addons) {
         Ok(addons) => addons,
         Err(reason) => {
@@ -960,42 +1010,57 @@ fn run_next(args: &Args, library: &Library, root: &Path) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // A forced matrix template with no row to fill says why: spent, parked, or an input no row supplies.
+    if target.is_none()
+        && expand::is_fillable(prompt, &state)
+        && !state.candidates(prompt.targets).is_empty()
+    {
+        eprintln!(
+            "{}",
+            no_target_reason(args, library, prompt, &state, &ledger, &addons, &supplied)
+        );
+        return ExitCode::from(2);
+    }
     // `--set` wins over the state-filled value, so an explicit row beats the first unserved candidate.
-    let values = merge_values(&requested_values(args), target.as_ref(), &state);
+    let values = merge_values(&supplied, target.as_ref(), &state);
     let worktree = slice_worktree(prompt, target.as_ref(), &values, root);
+    let target_key = target.as_ref().map(|(row, _)| row.key());
     let options = Options {
         allow_unfilled: args.allow_unfilled,
+        retry_library: retry_library_path(args, library),
+        retry_row: target_key.clone(),
+        retry_no_ledger: !args.record,
+        retry_values: Some(supplied.clone()),
+        retry_addons: args.addons.clone(),
         ..Options::default()
     };
     let rendered = render::render(library, prompt, &values, &addons, Some(&worktree), options);
-    if let Some(code) = missing_input_refusal(prompt, &rendered, args) {
+    if let Some(code) = missing_input_refusal(
+        prompt,
+        &rendered,
+        &supplied,
+        args,
+        library,
+        target_key.as_deref(),
+    ) {
         return code;
     }
-
-    let target_key = target.as_ref().map(|(row, _)| row.key());
     if args.output == Output::Json {
         let selection = selection_json(library, prompt, args, &suppressed, &skipped);
-        println!(
-            "{}",
-            next_json(
-                library,
-                prompt,
-                target.as_ref(),
-                &ledger,
-                &rendered,
-                selection
-            )
-        );
-    } else {
-        report_next(
+        let json = next_json(
             library,
             prompt,
+            target.as_ref(),
             &ledger,
-            &suppressed,
-            &skipped,
-            args,
-            &addons,
+            &rendered,
+            selection,
         );
+        if let Err(error) = emit_json(&json) {
+            eprintln!("could not write the handout: {error}");
+            return ExitCode::from(1);
+        }
+    } else {
+        report_next(library, prompt, root, &ledger, &skipped, args, &addons);
         report_target(target.as_ref(), &ledger, prompt);
         if let Some(worktree) = &rendered.worktree {
             println!("worktree    {}", worktree.brief());
@@ -1036,7 +1101,18 @@ fn choose_slice<'p>(
             }
         }
         return Ok((
-            (prompt, target_for(prompt, state, ledger, named)),
+            (
+                prompt,
+                target_for(
+                    prompt,
+                    state,
+                    ledger,
+                    named,
+                    supplied,
+                    &args.addons,
+                    args.allow_unfilled,
+                ),
+            ),
             Vec::new(),
         ));
     }
@@ -1045,21 +1121,22 @@ fn choose_slice<'p>(
         args.effort,
         suppressed,
         &args.addons,
-        supplied,
+        advisor::Inputs::new(supplied, named),
+        advisor::Context { state, ledger },
         args.allow_unfilled,
     );
-    let offers = build_offers(&handable, state, ledger, named);
+    let offers = build_offers(
+        &handable,
+        state,
+        ledger,
+        named,
+        supplied,
+        &args.addons,
+        args.allow_unfilled,
+    );
     if offers.is_empty() {
         return Err((
-            nothing_to_hand_over(
-                library,
-                args.effort,
-                suppressed,
-                &skipped,
-                state,
-                ledger,
-                named,
-            ),
+            nothing_to_hand_over(library, args, suppressed, &skipped, state, ledger, named),
             1,
         ));
     }
@@ -1097,6 +1174,9 @@ fn target_for<'p>(
     state: &'p ProjectState,
     ledger: &Ledger,
     named: Option<&'p MethodRow>,
+    supplied: &Values,
+    requested_addons: &[String],
+    allow_unfilled: bool,
 ) -> Option<(&'p MethodRow, Values)> {
     if let Some(row) = named {
         return Some((row, expand::fill(prompt, row, &state.pins)));
@@ -1104,7 +1184,15 @@ fn target_for<'p>(
     if !expand::is_fillable(prompt, state) {
         return None;
     }
-    expand::next_target(prompt, state, &ledger.targets_for(prompt.id))
+    let addons = render::resolve_addons(prompt, requested_addons).unwrap_or_default();
+    expand::next_target(
+        prompt,
+        state,
+        &ledger.targets_for(prompt.id),
+        &addons,
+        supplied,
+        allow_unfilled,
+    )
 }
 
 /// The row the user named, when this template may draw it.
@@ -1171,9 +1259,11 @@ fn render_prompt<'a>(args: &Args, library: &'a Library, id: u32) -> Result<&'a P
 }
 
 /// `render <id>`: a matrix template filled from its first unserved row, like `next`, not a page of holes.
+#[allow(clippy::too_many_lines)]
 fn run_render(args: &Args, library: &Library, root: &Path) -> ExitCode {
     let id = args.id.expect("parse requires an id for render");
-    let Ok(_lock) = lock_state(&Ledger::path_for(root)) else {
+    let ledger_path = ledger_path(root, library);
+    let Ok(_lock) = lock_if_recording(args.record, &ledger_path) else {
         return ExitCode::from(1);
     };
     let reloaded = match reload_library(library) {
@@ -1188,7 +1278,7 @@ fn run_render(args: &Args, library: &Library, root: &Path) -> ExitCode {
         Ok(prompt) => prompt,
         Err(code) => return code,
     };
-    let ledger = load_ledger(root);
+    let ledger = load_ledger(ledger_path);
     if let Some(message) = ledger_refusal(&ledger) {
         eprintln!("{message}");
         return ExitCode::from(1);
@@ -1204,15 +1294,16 @@ fn run_render(args: &Args, library: &Library, root: &Path) -> ExitCode {
         },
         None => None,
     };
-    let target = target_for(prompt, &state, &ledger, named);
-    // A matrix template whose class is spent has no row to fill, and a hole is worse than the reason.
-    if target.is_none()
-        && expand::is_fillable(prompt, &state)
-        && !state.candidates(prompt.targets).is_empty()
-    {
-        eprintln!("{}", class_spent(library, prompt, &state, &ledger));
-        return ExitCode::from(2);
-    }
+    let supplied = requested_values(args);
+    let target = target_for(
+        prompt,
+        &state,
+        &ledger,
+        named,
+        &supplied,
+        &args.addons,
+        args.allow_unfilled,
+    );
     let addons = match render::resolve_addons(prompt, &args.addons) {
         Ok(addons) => addons,
         Err(reason) => {
@@ -1220,17 +1311,40 @@ fn run_render(args: &Args, library: &Library, root: &Path) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let values = merge_values(&requested_values(args), target.as_ref(), &state);
+    // A matrix template with no row to fill says why: spent, parked, or an input no row supplies.
+    if target.is_none()
+        && expand::is_fillable(prompt, &state)
+        && !state.candidates(prompt.targets).is_empty()
+    {
+        eprintln!(
+            "{}",
+            no_target_reason(args, library, prompt, &state, &ledger, &addons, &supplied)
+        );
+        return ExitCode::from(2);
+    }
+    let values = merge_values(&supplied, target.as_ref(), &state);
     let worktree = slice_worktree(prompt, target.as_ref(), &values, root);
+    let target_key = target.as_ref().map(|(row, _)| row.key());
     let options = Options {
         allow_unfilled: args.allow_unfilled,
+        retry_library: retry_library_path(args, library),
+        retry_row: target_key.clone(),
+        retry_no_ledger: !args.record,
+        retry_values: Some(supplied.clone()),
+        retry_addons: args.addons.clone(),
         ..Options::default()
     };
     let rendered = render::render(library, prompt, &values, &addons, Some(&worktree), options);
-    if let Some(code) = missing_input_refusal(prompt, &rendered, args) {
+    if let Some(code) = missing_input_refusal(
+        prompt,
+        &rendered,
+        &supplied,
+        args,
+        library,
+        target_key.as_deref(),
+    ) {
         return code;
     }
-    let target_key = target.as_ref().map(|(row, _)| row.key());
     if args.output == Output::Json {
         let json = Value::object([
             ("tag", Value::text(library.tag())),
@@ -1246,6 +1360,10 @@ fn run_render(args: &Args, library: &Library, root: &Path) -> ExitCode {
             ("prompt", Value::text(rendered.text.clone())),
         ])
         .to_pretty();
+        if let Err(error) = emit_json(&json) {
+            eprintln!("could not write the handout: {error}");
+            return ExitCode::from(1);
+        }
         // Recorded like a `next` handout, so a by-id JSON render still advances the template's served rows.
         record(
             ledger,
@@ -1254,7 +1372,6 @@ fn run_render(args: &Args, library: &Library, root: &Path) -> ExitCode {
             target_key.as_deref(),
             args.record,
         );
-        println!("{json}");
         return ExitCode::SUCCESS;
     }
     deliver(&rendered, library, prompt.id, args.output.is_stdout());
@@ -1301,7 +1418,7 @@ fn issue_prompt(library: &Library) -> Result<&Prompt, String> {
     match matching.as_slice() {
         [only] => Ok(only),
         [] => Err(format!(
-            "{} has no template with an {{issue}} blank; add one, or name a template and pass --set issue=<number>",
+            "{} has no template with an {{issue}} blank; add one, or name a template and pass --issue <number>",
             library.path.display()
         )),
         many => Err(format!(
@@ -1319,7 +1436,7 @@ fn run_show(args: &Args, library: &Library, root: &Path) -> ExitCode {
         eprintln!("{}", unknown_prompt(library, id));
         return ExitCode::from(2);
     };
-    let ledger = load_ledger(root);
+    let ledger = load_ledger(ledger_path(root, library));
     let state = ProjectState::load(root);
     let named = match &args.row {
         Some(selector) => match named_row(prompt, &state, library, selector) {
@@ -1331,7 +1448,16 @@ fn run_show(args: &Args, library: &Library, root: &Path) -> ExitCode {
         },
         None => None,
     };
-    let target = target_for(prompt, &state, &ledger, named);
+    let supplied = requested_values(args);
+    let target = target_for(
+        prompt,
+        &state,
+        &ledger,
+        named,
+        &supplied,
+        &args.addons,
+        true,
+    );
     let addons = match render::resolve_addons(prompt, &args.addons) {
         Ok(addons) => addons,
         Err(reason) => {
@@ -1339,8 +1465,9 @@ fn run_show(args: &Args, library: &Library, root: &Path) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let values = merge_values(&requested_values(args), target.as_ref(), &state);
+    let values = merge_values(&supplied, target.as_ref(), &state);
     let worktree = slice_worktree(prompt, target.as_ref(), &values, root);
+    let target_key = target.as_ref().map(|(row, _)| row.key());
     let rendered = render::render(
         library,
         prompt,
@@ -1349,10 +1476,14 @@ fn run_show(args: &Args, library: &Library, root: &Path) -> ExitCode {
         Some(&worktree),
         Options {
             allow_unfilled: true,
+            retry_library: retry_library_path(args, library),
+            retry_row: target_key.clone(),
+            retry_no_ledger: !args.record,
+            retry_values: Some(supplied.clone()),
+            retry_addons: args.addons.clone(),
             ..Options::default()
         },
     );
-    let target_key = target.as_ref().map(|(row, _)| row.key());
     if args.output == Output::Json {
         println!(
             "{}",
@@ -1412,7 +1543,7 @@ fn report_metadata(
     if !prompt.touches.is_empty() {
         println!("  touches       {}", describe_touches(prompt, root));
     }
-    let overlaps = overlaps(library, prompt);
+    let overlaps = overlaps(library, prompt, root);
     if !overlaps.is_empty() {
         println!("  overlaps      {}", overlaps.join(", "));
     }
@@ -1437,9 +1568,27 @@ fn report_metadata(
     }
 }
 
+/// A custom library gets its own history, so the default roadmap does not inherit sentences for prompts it never had.
+fn ledger_path(root: &Path, library: &Library) -> PathBuf {
+    let default = root.join(LIBRARY_RELATIVE);
+    let identity =
+        std::fs::canonicalize(&library.source_path).unwrap_or_else(|_| library.source_path.clone());
+    let default_identity = std::fs::canonicalize(&default).unwrap_or_else(|_| default.clone());
+    let ordinary_default = identity == default_identity
+        && default
+            .symlink_metadata()
+            .is_ok_and(|metadata| !metadata.file_type().is_symlink());
+    if ordinary_default {
+        root.join(LEDGER_RELATIVE)
+    } else {
+        root.join(".ferrox")
+            .join(format!("slices-{}.log", path_tag(&identity)))
+    }
+}
+
 /// Read the handout ledger, saying when it exists but cannot be trusted rather than treating it as empty history.
-fn load_ledger(root: &Path) -> Ledger {
-    let ledger = Ledger::load(Ledger::path_for(root));
+fn load_ledger(path: PathBuf) -> Ledger {
+    let ledger = Ledger::load(path);
     if let Some(error) = &ledger.read_error {
         eprintln!("warning: {error}; the history is incomplete");
     }
@@ -1479,7 +1628,7 @@ fn run_set_status(args: &Args, library: &Library, root: &Path) -> ExitCode {
     let Ok(_source_lock) = lock_state(&library.source_path) else {
         return ExitCode::from(1);
     };
-    let Ok(_lock) = lock_state(&Ledger::path_for(root)) else {
+    let Ok(_lock) = lock_state(&ledger_path(root, library)) else {
         return ExitCode::from(1);
     };
     let current = match std::fs::read_to_string(&library.source_path) {
@@ -1502,6 +1651,20 @@ fn run_set_status(args: &Args, library: &Library, root: &Path) -> ExitCode {
     }
     match set_status_text(&current, id, to) {
         Ok(updated) => {
+            let reloaded = Library::parse(&library.path, &updated);
+            let status_problem = reloaded.diagnostics.iter().any(|diagnostic| {
+                diagnostic.severity == Severity::Error
+                    && diagnostic
+                        .message
+                        .starts_with(&format!("P{id}: **Status:**"))
+            });
+            if status_problem || reloaded.prompt(id).map(|prompt| prompt.status) != Some(to) {
+                eprintln!(
+                    "P{id} has a second **Status:** line, so rewriting the first would not change \
+                     the effective status; remove the duplicate first"
+                );
+                return ExitCode::from(2);
+            }
             if let Err(error) = replace_file(&library.source_path, &updated) {
                 eprintln!("could not write {}: {error}", library.source_path.display());
                 return ExitCode::from(1);
@@ -1552,9 +1715,8 @@ fn set_status_text(source: &str, id: u32, status: Status) -> Result<String, Stri
             fence = Some((marker, width));
         } else if let Some(body) = line.strip_prefix("## ") {
             current = section_id(body.trim_end());
-        } else if current == Some(id) && !replaced && line.trim_start().starts_with("**Status:**") {
-            let indent = &line[..line.len() - line.trim_start().len()];
-            out.push(format!("{indent}**Status:** {}{ending}", status.as_str()));
+        } else if current == Some(id) && !replaced && line.starts_with("**Status:**") {
+            out.push(format!("**Status:** {}{ending}", status.as_str()));
             replaced = true;
             continue;
         }
@@ -1611,14 +1773,14 @@ fn describe_history(ledger: &Ledger, id: u32) -> String {
 /// The empty-ready causes with their fixes — ledger withholding, unfilled inputs, a spent class, nothing open — reported separately, and two can hold at once.
 fn nothing_to_hand_over(
     library: &Library,
-    effort: Option<Effort>,
+    args: &Args,
     suppressed: &[u32],
     skipped: &[advisor::Skipped],
     state: &ProjectState,
     ledger: &Ledger,
     named: Option<&MethodRow>,
 ) -> String {
-    let withheld: Vec<u32> = advisor::ranked(library, effort)
+    let withheld: Vec<u32> = advisor::ranked(library, args.effort)
         .iter()
         .map(|&index| library.prompts[index].id)
         .filter(|id| suppressed.contains(id))
@@ -1654,22 +1816,11 @@ fn nothing_to_hand_over(
         );
     }
     if !skipped.is_empty() {
-        message.push_str("\n  waiting on a decision this tool will not make:");
-        for slice in skipped {
-            let missing = slice.missing.clone();
-            let prompt = library
-                .prompt(slice.id)
-                .expect("a skipped id is a prompt id");
-            let _ = writeln!(
-                message,
-                "\n    P{} needs {} — {}",
-                slice.id,
-                join_or(missing.iter().map(|name| format!("`{name}`"))),
-                render::suggested_command(prompt, &missing, &[])
-            );
-        }
+        message.push_str(&skipped_retries(
+            library, args, skipped, state, ledger, named,
+        ));
     }
-    let spent = spent_classes(library, effort, state, ledger);
+    let spent = spent_classes(library, args.effort, state, ledger);
     if !spent.is_empty() {
         let _ = writeln!(
             message,
@@ -1677,15 +1828,137 @@ fn nothing_to_hand_over(
             join_or(spent.iter().map(|id| format!("P{id}")))
         );
     }
-    if named.is_none() && withheld.is_empty() && skipped.is_empty() && spent.is_empty() {
-        return match advisor::next_index(library, effort, &[]) {
-            Err(reason) => reason,
-            Ok(_) => "no ready template draws an available row: every ready template's class \
-                      has no outstanding row, so name one with `--row <id>`"
-                .to_owned(),
+    let parked = if named.is_none() {
+        parked_override(library, args, state, ledger)
+    } else {
+        None
+    };
+    if let Some(guidance) = &parked {
+        let _ = writeln!(message, "\n  {guidance}");
+    }
+    if named.is_none()
+        && withheld.is_empty()
+        && skipped.is_empty()
+        && spent.is_empty()
+        && parked.is_none()
+    {
+        return if let Err(reason) = advisor::next_index(library, args.effort, &[]) {
+            reason
+        } else {
+            "no ready template draws an available row: every ready template's class \
+             has no outstanding row, so name one with `--row <id>`"
+                .to_owned()
         };
     }
     message
+}
+
+/// The parked override the automatic path would miss even when another prompt supplies its own reason.
+fn parked_override(
+    library: &Library,
+    args: &Args,
+    state: &ProjectState,
+    ledger: &Ledger,
+) -> Option<String> {
+    advisor::ranked(library, args.effort)
+        .into_iter()
+        .find_map(|index| {
+            let prompt = &library.prompts[index];
+            if !prompt.targets.is_matrix() {
+                return None;
+            }
+            let served = ledger.targets_for(prompt.id);
+            state
+                .candidates(prompt.targets)
+                .iter()
+                .any(|row| !row.gap.is_drawable() && !served.contains(&row.key()))
+                .then_some(no_retry_row(prompt, state, &served))
+        })
+}
+
+/// Each skipped slice with the command that fixes it, or the reason no drawable row is left.
+fn skipped_retries(
+    library: &Library,
+    args: &Args,
+    skipped: &[advisor::Skipped],
+    state: &ProjectState,
+    ledger: &Ledger,
+    named: Option<&MethodRow>,
+) -> String {
+    let values = requested_values(args);
+    let mut message = String::from("\n  waiting on a decision this tool will not make:");
+    for slice in skipped {
+        if let Some(problem) = &slice.problem {
+            let _ = writeln!(message, "\n    P{}: {problem}", slice.id);
+            continue;
+        }
+        let missing = slice.missing.clone();
+        let prompt = library
+            .prompt(slice.id)
+            .expect("a skipped id is a prompt id");
+        let served = ledger.targets_for(prompt.id);
+        let addons = render::resolve_addons(prompt, &args.addons).unwrap_or_default();
+        let row_key =
+            advisor::retry_row(prompt, state, &served, named, &addons, &values).map(MethodRow::key);
+        if prompt.targets.is_matrix()
+            && row_key.is_none()
+            && !state.candidates(prompt.targets).is_empty()
+        {
+            let _ = writeln!(
+                message,
+                "\n    P{} needs {} — {}",
+                slice.id,
+                join_or(missing.iter().map(|name| format!("`{name}`"))),
+                no_retry_row(prompt, state, &served)
+            );
+            continue;
+        }
+        let repeat = row_key.as_ref().is_some_and(|key| served.contains(key));
+        let _ = write!(
+            message,
+            "\n    P{} needs {} — {}",
+            slice.id,
+            join_or(missing.iter().map(|name| format!("`{name}`"))),
+            render::suggested_command(
+                prompt,
+                &missing,
+                &values,
+                &addons,
+                &args.addons,
+                retry_library_path(args, library).as_deref(),
+                row_key.as_deref(),
+                !args.record
+            )
+        );
+        if repeat {
+            let _ = write!(
+                message,
+                "\n      row {} was already served; naming it repeats that row",
+                row_key.as_deref().unwrap_or_default()
+            );
+        }
+        message.push('\n');
+    }
+    message
+}
+
+/// Why a skipped slice has no row to retry, naming a parked row the caller can still choose.
+fn no_retry_row(prompt: &Prompt, state: &ProjectState, served: &[String]) -> String {
+    let parked = state
+        .candidates(prompt.targets)
+        .iter()
+        .copied()
+        .find(|row| !row.gap.is_drawable() && !served.contains(&row.key()));
+    parked.map_or_else(
+        || format!("no {} row exists", prompt.targets.as_str()),
+        |row| {
+            format!(
+                "no drawable {} row remains; name one with `--row {}` if you mean it",
+                prompt.targets.as_str(),
+                row.key()
+            )
+        },
+    )
 }
 
 /// The templates whose class has no row left, so the advisor walks past them.
@@ -1706,11 +1979,65 @@ fn spent_classes(
         })
         .filter(|prompt| {
             // A class with no row at all is empty, not spent; only a class whose every row was served is spent.
-            !state.candidates(prompt.targets).is_empty()
-                && expand::next_target(prompt, state, &ledger.targets_for(prompt.id)).is_none()
+            let rows = state.candidates(prompt.targets);
+            let served = ledger.targets_for(prompt.id);
+            !rows.is_empty() && rows.iter().all(|row| served.contains(&row.key()))
         })
         .map(|prompt| prompt.id)
         .collect()
+}
+
+/// Why a matrix template has no row: every row was served, every unserved row is parked, or no row supplies the selected inputs.
+fn no_target_reason(
+    args: &Args,
+    library: &Library,
+    prompt: &Prompt,
+    state: &ProjectState,
+    ledger: &Ledger,
+    addons: &[Addon],
+    supplied: &Values,
+) -> String {
+    let rows = state.candidates(prompt.targets);
+    let served = ledger.targets_for(prompt.id);
+    if !rows.is_empty() && rows.iter().all(|row| served.contains(&row.key())) {
+        return class_spent(library, prompt, state, ledger);
+    }
+    let Some(row) = rows
+        .into_iter()
+        .find(|row| row.gap.is_drawable() && !served.contains(&row.key()))
+    else {
+        return no_retry_row(prompt, state, &served);
+    };
+    let missing = advisor::missing_inputs(
+        prompt,
+        addons,
+        advisor::Inputs::new(supplied, Some(row)),
+        state,
+        &served,
+    );
+    if missing.is_empty() {
+        return format!(
+            "P{} has no drawable {} row: the unserved rows are not scheduled",
+            prompt.id,
+            prompt.targets.as_str()
+        );
+    }
+    format!(
+        "P{} has an unserved {} row but needs {} — {}",
+        prompt.id,
+        prompt.targets.as_str(),
+        join_or(missing.iter().map(|name| format!("`{name}`"))),
+        render::suggested_command(
+            prompt,
+            &missing,
+            supplied,
+            addons,
+            &args.addons,
+            retry_library_path(args, library).as_deref(),
+            Some(row.key().as_str()),
+            !args.record
+        )
+    )
 }
 
 /// Every row of a template's class has been served to it; the way on is a row named by hand.
@@ -1743,16 +2070,39 @@ fn class_spent(
     )
 }
 
+/// One line per left-out slice: its add-on problem when it has one, else the inputs it still needs.
+fn skipped_reasons(skipped: &[advisor::Skipped]) -> String {
+    skipped
+        .iter()
+        .map(|slice| match &slice.problem {
+            Some(problem) => format!("P{}: {problem}", slice.id),
+            None => slice
+                .missing
+                .iter()
+                .map(|name| format!("{name} for P{}", slice.id))
+                .collect::<Vec<_>>()
+                .join(", "),
+        })
+        .filter(|reason| !reason.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The reasoning, printed above the prompt so it is read before it is obeyed.
 fn report_next(
     library: &Library,
     prompt: &Prompt,
+    root: &Path,
     ledger: &Ledger,
-    suppressed: &[u32],
     skipped: &[advisor::Skipped],
     args: &Args,
     addons: &[Addon],
 ) {
+    let suppressed = if args.row.is_some() {
+        Vec::new()
+    } else {
+        ledger.recent_ids(args.memory)
+    };
     let ready = advisor::ranked(library, args.effort);
     let place = ready
         .iter()
@@ -1786,7 +2136,7 @@ fn report_next(
                 .map(|id| format!("P{id}"))
         )
     );
-    let overlaps = overlaps(library, prompt);
+    let overlaps = overlaps(library, prompt, root);
     if !overlaps.is_empty() {
         println!("OVERLAPS    {}", overlaps.join(", "));
     }
@@ -1801,7 +2151,7 @@ fn report_next(
         if !suppressed.is_empty() {
             suppressed
                 .iter()
-                .map(|id| format!("P{id}"))
+                .map(|&id| format!("P{id}"))
                 .collect::<Vec<_>>()
                 .join(", ")
         } else if args.row.is_some() {
@@ -1818,16 +2168,7 @@ fn report_next(
                 .map(|slice| format!("P{}", slice.id))
                 .collect::<Vec<_>>()
                 .join(", "),
-            skipped
-                .iter()
-                .flat_map(|slice| {
-                    slice
-                        .missing
-                        .iter()
-                        .map(|name| format!("{name} for P{}", slice.id))
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
+            skipped_reasons(skipped)
         );
     }
     println!("LAST DRAWN  {}", describe_history(ledger, prompt.id));
@@ -1992,16 +2333,86 @@ fn deliver(rendered: &Rendered, library: &Library, id: u32, print: bool) {
     }
 }
 
+/// Write a finished document before recording it, so a closed pipe cannot leave a ledger entry for a handout nobody saw.
+fn emit_json(json: &str) -> std::io::Result<()> {
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    lock.write_all(json.as_bytes())?;
+    lock.write_all(b"\n")?;
+    lock.flush()
+}
+
+/// The lock beside the file it protects: every writer of this state, and only they, take the same lock.
+fn lock_path(path: &Path) -> PathBuf {
+    let path = lock_identity(path);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .map_or_else(|| "state".into(), std::ffi::OsStr::to_os_string);
+    let mut lock = std::ffi::OsString::from(".");
+    lock.push(name);
+    lock.push(".ferrox-lock");
+    parent.join(lock)
+}
+
+/// The path a lock names, following a final symlink even while it dangles, so creation cannot switch identities.
+fn lock_identity(path: &Path) -> PathBuf {
+    let mut current = path.to_path_buf();
+    for _ in 0..32 {
+        let Ok(target) = std::fs::read_link(&current) else {
+            break;
+        };
+        current = if target.is_absolute() {
+            target
+        } else {
+            current
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(target)
+        };
+    }
+    let parent = resolved(current.parent().unwrap_or_else(|| Path::new(".")));
+    current
+        .file_name()
+        .map_or(parent.clone(), |name| parent.join(name))
+}
+
+/// Canonicalize the part of a path that exists, so creating a missing directory cannot change its identity.
+fn resolved(path: &Path) -> PathBuf {
+    let mut existing = path;
+    let mut trailing = Vec::new();
+    while !existing.exists() {
+        let Some(name) = existing.file_name() else {
+            break;
+        };
+        trailing.push(name.to_os_string());
+        let Some(parent) = existing.parent() else {
+            break;
+        };
+        existing = parent;
+    }
+    let mut base = std::fs::canonicalize(existing).unwrap_or_else(|_| existing.to_path_buf());
+    for name in trailing.iter().rev() {
+        base.push(name);
+    }
+    base
+}
+
+/// A handout that is not recorded needs no write access to the ledger's directory.
+fn lock_if_recording(record: bool, path: &Path) -> Result<Option<std::fs::File>, ()> {
+    if !record {
+        return Ok(None);
+    }
+    lock_state(path).map(Some).map_err(|_| ())
+}
+
 /// Serialise writers to one state file, so two `next` runs cannot hand out the same row or a
 /// `set-status` cannot overwrite an update it read before the lock.
 fn lock_state(path: &Path) -> Result<std::fs::File, String> {
-    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in path.as_os_str().to_string_lossy().as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    let lock = lock_path(path);
+    if let Some(parent) = lock.parent() {
+        let _ = std::fs::create_dir_all(parent);
     }
-    let lock = std::env::temp_dir().join(format!("ferrox-prompt-{hash:016x}.lock"));
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -2040,61 +2451,350 @@ fn lock_state(path: &Path) -> Result<std::fs::File, String> {
     Err(message)
 }
 
-/// Replace a file by a same-directory rename, so a reader sees the old text or the new one, never
-/// a half-written file.
+/// Stage the new text beside the library, then replace it in one step, so a reader sees the old
+/// text or the new one, never a half-written file.
 fn replace_file(path: &Path, contents: &str) -> std::io::Result<()> {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
     let temp = path.with_extension(format!("tmp-{}-{stamp}", std::process::id()));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp)?;
-    let written = std::io::Write::write_all(&mut file, contents.as_bytes());
+    let backup = path.with_extension(format!("bak-{}-{stamp}", std::process::id()));
+    #[cfg(not(windows))]
+    let metadata = std::fs::metadata(path).ok();
+    #[cfg(not(windows))]
+    let mut file = {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        options.open(&temp)?
+    };
+    #[cfg(windows)]
+    let mut file = create_staged(&temp)?;
+    // Set the library's own owner, mode and ACL before any text lands, so an inherited grant cannot read it.
+    #[cfg(target_os = "linux")]
+    if let Some(metadata) = &metadata {
+        if let Err(error) = stage_permissions(metadata, path, &temp) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error);
+        }
+    }
+    #[cfg(all(not(windows), not(target_os = "linux")))]
+    if let Some(metadata) = &metadata {
+        if let Err(error) = preserve_owner(metadata, &temp) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error);
+        }
+        if let Err(error) = std::fs::set_permissions(&temp, metadata.permissions()) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if metadata.is_some() {
+        preserve_acl(path, &temp).map_err(|error| {
+            let _ = std::fs::remove_file(&temp);
+            error
+        })?;
+    }
+    let written = file
+        .write_all(contents.as_bytes())
+        .and_then(|()| file.sync_all());
     drop(file);
     if let Err(error) = written {
         let _ = std::fs::remove_file(&temp);
         return Err(error);
     }
-    #[cfg(not(windows))]
-    {
-        match std::fs::rename(&temp, path) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                let _ = std::fs::remove_file(&temp);
-                Err(error)
-            }
-        }
+    if let Err(error) = replace_path(&temp, path, &backup) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
     }
-    #[cfg(windows)]
-    {
-        if !path.exists() {
-            return match std::fs::rename(&temp, path) {
-                Ok(()) => Ok(()),
-                Err(error) => {
-                    let _ = std::fs::remove_file(&temp);
-                    Err(error)
-                }
-            };
-        }
-        let backup = path.with_extension(format!("bak-{}-{stamp}", std::process::id()));
-        if let Err(error) = std::fs::rename(path, &backup) {
-            let _ = std::fs::remove_file(&temp);
+    Ok(())
+}
+
+/// A staging file only its owner can open, created with that DACL in one step so an inherited
+/// write grant never reaches it.
+#[cfg(windows)]
+fn create_staged(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::io::FromRawHandle as _;
+    use std::ptr;
+
+    #[repr(C)]
+    struct SecurityAttributes {
+        length: u32,
+        descriptor: *mut c_void,
+        inherit: i32,
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl: *const u16,
+            revision: u32,
+            descriptor: *mut *mut c_void,
+            size: *mut u32,
+        ) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateFileW(
+            name: *const u16,
+            access: u32,
+            share: u32,
+            attributes: *const SecurityAttributes,
+            disposition: u32,
+            flags: u32,
+            template: *mut c_void,
+        ) -> *mut c_void;
+        fn LocalFree(memory: *mut c_void) -> *mut c_void;
+    }
+
+    let wide = |text: &str| -> Vec<u16> { text.encode_utf16().chain(std::iter::once(0)).collect() };
+    let name: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let sddl = wide("D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)");
+    let mut descriptor = ptr::null_mut();
+    // SAFETY: the SDDL and path are NUL-terminated wide strings; the descriptor is freed below.
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            1,
+            &mut descriptor,
+            ptr::null_mut(),
+        )
+    };
+    if converted == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let attributes = SecurityAttributes {
+        length: u32::try_from(std::mem::size_of::<SecurityAttributes>()).unwrap_or(u32::MAX),
+        descriptor,
+        inherit: 0,
+    };
+    // SAFETY: the descriptor and path outlive the call; CREATE_NEW refuses an existing name.
+    let handle = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            0x4000_0000,
+            0,
+            &attributes,
+            1,
+            0x80,
+            ptr::null_mut(),
+        )
+    };
+    // SAFETY: this is the same allocation ConvertString... returned.
+    unsafe {
+        LocalFree(descriptor);
+    }
+    if handle == -1isize as *mut c_void {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: CreateFileW returned an owned handle and File is the only owner.
+    Ok(unsafe { std::fs::File::from_raw_handle(handle) })
+}
+
+/// Keep the owner, group, mode and access ACL, so a staged update is not broader than the library.
+#[cfg(target_os = "linux")]
+fn stage_permissions(source: &std::fs::Metadata, from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::{c_char, c_int, c_void, CString};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::ptr;
+
+    const ACL: &[u8] = b"system.posix_acl_access\0";
+    const NO_DATA: i32 = 61;
+    const NOT_SUPPORTED: i32 = 95;
+
+    extern "C" {
+        fn getxattr(
+            path: *const c_char,
+            name: *const c_char,
+            value: *mut c_void,
+            size: usize,
+        ) -> isize;
+        fn setxattr(
+            path: *const c_char,
+            name: *const c_char,
+            value: *const c_void,
+            size: usize,
+            flags: c_int,
+        ) -> c_int;
+    }
+
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let to_name = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    preserve_owner(source, to)?;
+    // SAFETY: the path is NUL-terminated, and the ACL buffer is sized from the kernel's reply.
+    unsafe {
+        let size = getxattr(from.as_ptr(), ACL.as_ptr().cast(), ptr::null_mut(), 0);
+        if size < 0 {
+            let error = std::io::Error::last_os_error();
+            if matches!(error.raw_os_error(), Some(NO_DATA | NOT_SUPPORTED)) {
+                return std::fs::set_permissions(to, source.permissions());
+            }
             return Err(error);
         }
-        match std::fs::rename(&temp, path) {
-            Ok(()) => {
-                let _ = std::fs::remove_file(&backup);
-                Ok(())
-            }
-            Err(error) => {
-                let _ = std::fs::rename(&backup, path);
-                let _ = std::fs::remove_file(&temp);
-                Err(error)
-            }
+        let mut value = vec![0_u8; size as usize];
+        let read = getxattr(
+            from.as_ptr(),
+            ACL.as_ptr().cast(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+        );
+        if read != size {
+            return Err(if read < 0 {
+                std::io::Error::last_os_error()
+            } else {
+                std::io::Error::from(std::io::ErrorKind::InvalidData)
+            });
+        }
+        if setxattr(
+            to_name.as_ptr(),
+            ACL.as_ptr().cast(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        ) != 0
+        {
+            return Err(std::io::Error::last_os_error());
         }
     }
+    Ok(())
+}
+
+/// Copy the access ACL from the library to the staged file, so an inherited grant cannot read the update.
+#[cfg(target_os = "macos")]
+fn preserve_acl(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::{c_char, c_int, c_void, CString};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::ptr;
+
+    const COPYFILE_ACL: c_int = 1;
+
+    extern "C" {
+        fn copyfile(
+            from: *const c_char,
+            to: *const c_char,
+            state: *mut c_void,
+            flags: c_int,
+        ) -> c_int;
+    }
+
+    let from_name = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let to_name = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: both paths are NUL-terminated; a null state is accepted by copyfile.
+    if unsafe {
+        copyfile(
+            from_name.as_ptr(),
+            to_name.as_ptr(),
+            ptr::null_mut(),
+            COPYFILE_ACL,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Keep the owner and group of a staged update, so restoring the mode cannot widen access.
+#[cfg(unix)]
+fn preserve_owner(source: &std::fs::Metadata, to: &Path) -> std::io::Result<()> {
+    use std::ffi::{c_char, CString};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    extern "C" {
+        fn chown(path: *const c_char, owner: u32, group: u32) -> i32;
+    }
+
+    let to_name = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: the path is NUL-terminated and the ids come from the source file's metadata.
+    if unsafe { chown(to_name.as_ptr(), source.uid(), source.gid()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_path(from: &Path, to: &Path, _backup: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)
+}
+
+/// ReplaceFileW keeps the library's access rules while swapping in the staged text.
+#[cfg(windows)]
+fn replace_path(from: &Path, to: &Path, backup: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::ptr;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn ReplaceFileW(
+            replaced: *const u16,
+            replacement: *const u16,
+            backup: *const u16,
+            flags: u32,
+            exclude: *mut core::ffi::c_void,
+            reserved: *mut core::ffi::c_void,
+        ) -> i32;
+    }
+
+    let wide = |path: &Path| -> Vec<u16> {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    };
+    let replaced = wide(to);
+    let replacement = wide(from);
+    let backup_name = wide(backup);
+    // SAFETY: every name is a NUL-terminated wide string; the optional trailing pointers are null.
+    let replaced_ok = unsafe {
+        ReplaceFileW(
+            replaced.as_ptr(),
+            replacement.as_ptr(),
+            backup_name.as_ptr(),
+            0,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    if replaced_ok != 0 {
+        let _ = std::fs::remove_file(backup);
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if !to.exists() {
+        if let Err(restore) = std::fs::rename(backup, to) {
+            if backup.exists() {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "{error}; the original library is at {} ({restore})",
+                        backup.display()
+                    ),
+                ));
+            }
+            return Err(error);
+        }
+    } else {
+        let _ = std::fs::remove_file(backup);
+    }
+    Err(error)
 }
 
 /// Record the handout; an unwritable ledger is a warning, not a failure — the prompt was handed over.
@@ -2124,8 +2824,8 @@ fn how_asked(args: &Args) -> String {
 }
 
 /// Files another prompt the advisor could pick right now claims — same availability rule as `check`, so the line means "both in play".
-fn overlaps(library: &Library, prompt: &Prompt) -> Vec<String> {
-    check::contention(library, prompt)
+fn overlaps(library: &Library, prompt: &Prompt, root: &Path) -> Vec<String> {
+    check::contention(library, prompt, root)
         .iter()
         .map(|clash| {
             let others: Vec<String> = clash.also.iter().map(|id| format!("P{id}")).collect();
@@ -2217,7 +2917,12 @@ fn prompt_json(prompt: &Prompt, ledger: &Ledger) -> Value {
                 prompt
                     .touches
                     .iter()
-                    .map(|touch| Value::text(touch.path()))
+                    .map(|touch| {
+                        Value::text(match touch {
+                            Touch::Existing(path) => path.clone(),
+                            Touch::Created(path) => format!("+{path}"),
+                        })
+                    })
                     .collect(),
             ),
         ),
@@ -2287,6 +2992,7 @@ fn selection_json(
         .map_or(0, |at| at + 1);
     let count = |value: usize| Value::Number(i64::try_from(value).unwrap_or(i64::MAX));
     let shown = args.command == Command::Show;
+    let rotated = !shown && args.forced.is_none() && args.draw == Draw::Rotate;
     Value::object([
         (
             "reason",
@@ -2306,8 +3012,8 @@ fn selection_json(
         ("ready_count", count(ready.len())),
         (
             "seed",
-            if !shown && args.draw == Draw::Rotate {
-                Value::Number(i64::try_from(args.seed).unwrap_or(i64::MAX))
+            if rotated {
+                Value::Unsigned(args.seed)
             } else {
                 Value::Null
             },
@@ -2339,6 +3045,13 @@ fn selection_json(
                                         .collect(),
                                 ),
                             ),
+                            (
+                                "problem",
+                                slice
+                                    .problem
+                                    .as_ref()
+                                    .map_or(Value::Null, |problem| Value::text(problem.clone())),
+                            ),
                         ])
                     })
                     .collect(),
@@ -2368,6 +3081,116 @@ fn selection_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_absolute_library_names_its_own_workspace() {
+        let base = std::env::temp_dir().join(format!(
+            "ferrox-prompt-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let root = base.join("original");
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir_all(root.join(LIBRARY_RELATIVE).parent().expect("parent"))
+            .expect("root");
+        std::fs::write(root.join(LIBRARY_RELATIVE), "## P1 · One").expect("library");
+        std::fs::create_dir_all(&elsewhere).expect("elsewhere");
+        let given = root.join(LIBRARY_RELATIVE);
+        let args = parse_args(&["render", "P1", "--library", given.to_str().expect("utf8")]);
+        assert_eq!(workspace_root_for(&args, &elsewhere), root);
+
+        let relative = Path::new("..")
+            .join(root.strip_prefix(&base).expect("root under base"))
+            .join(LIBRARY_RELATIVE);
+        let args = parse_args(&[
+            "render",
+            "P1",
+            "--library",
+            relative.to_str().expect("utf8"),
+        ]);
+        assert_eq!(
+            std::fs::canonicalize(workspace_root_for(&args, &elsewhere)).expect("canonical root"),
+            std::fs::canonicalize(&root).expect("canonical expected root")
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn an_external_library_without_a_workspace_uses_the_cwd_workspace() {
+        let base = std::env::temp_dir().join(format!(
+            "ferrox-prompt-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let root = base.join("checkout");
+        let external = base.join("external");
+        std::fs::create_dir_all(root.join(LIBRARY_RELATIVE).parent().expect("parent"))
+            .expect("root");
+        std::fs::write(root.join(LIBRARY_RELATIVE), "## P1 · One").expect("library");
+        std::fs::create_dir_all(&external).expect("external");
+        let given = external.join("draft.md");
+        std::fs::write(&given, "## P1 · One").expect("draft");
+        let args = parse_args(&["render", "P1", "--library", given.to_str().expect("utf8")]);
+        assert_eq!(workspace_root_for(&args, &root), root);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn a_retry_reopens_the_library_at_its_resolved_absolute_path() {
+        let args = parse(&[
+            "render".to_owned(),
+            "P1".to_owned(),
+            "--library".to_owned(),
+            "draft.md".to_owned(),
+        ])
+        .unwrap();
+        let mut library = Library::parse(Path::new("prompts.md"), LIBRARY);
+        library.source_path = std::env::temp_dir().join("draft.md");
+        assert_eq!(
+            retry_library_path(&args, &library),
+            Some(std::env::temp_dir().join("draft.md"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_retry_keeps_the_utf8_alias_of_a_non_utf8_library() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-prompt-retry-alias-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let target = dir.join("real.md");
+        std::fs::write(&target, LIBRARY).expect("target");
+        let link = dir.join("alias.md");
+        symlink(&target, &link).expect("link");
+        let args = parse(&[
+            "render".to_owned(),
+            "P1".to_owned(),
+            "--library".to_owned(),
+            link.to_str().expect("utf8 alias").to_owned(),
+        ])
+        .unwrap();
+        let mut library = load_library(Some(&link), &dir).expect("loads");
+        // macOS cannot put invalid UTF-8 on disk, but a path from another mount still can.
+        library.source_path = dir.join(OsString::from_vec(b"real-\x80.md".to_vec()));
+        assert_eq!(retry_library_path(&args, &library), Some(link));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A library with one template per target class, so the class rules can be read off a row.
     const LIBRARY: &str = "\
@@ -2507,11 +3330,45 @@ fix issue #{issue} at {priority=P0 or P1} priority
         assert_eq!(prompt.id, 4);
         let values = requested_values(&parse_args(&["issue", "661"]));
         assert_eq!(values["issue"], "661");
-        let worktree = slice_worktree(prompt, None, &values, Path::new("/tmp/ferrox"));
+        let scratch = std::env::temp_dir().join(format!(
+            "ferrox-prompt-issue-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let root = scratch.join("ferrox");
+        std::fs::create_dir_all(&root).expect("scratch root");
+        let worktree = slice_worktree(prompt, None, &values, &root);
         assert_eq!(worktree.name, "bugfix-661");
         assert!(worktree
             .brief()
             .contains("./scripts/new-worktree.sh bugfix-661"));
+        std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    #[test]
+    fn a_method_override_does_not_rename_the_rows_worktree() {
+        let library = library();
+        let prompt = library.prompt(1).expect("P1");
+        let row = row('A', "13", "VLESS over QUIC", false);
+        let mut values = Values::new();
+        values.insert("method".to_owned(), "QUIC test".to_owned());
+        let target = Some((&row, values.clone()));
+        let scratch = std::env::temp_dir().join(format!(
+            "ferrox-prompt-row-name-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let root = scratch.join("ferrox");
+        std::fs::create_dir_all(&root).expect("scratch root");
+        let worktree = slice_worktree(prompt, target.as_ref(), &values, &root);
+        assert_eq!(worktree.name, "p1-vless-over-quic--a13");
+        std::fs::remove_dir_all(&scratch).ok();
     }
 
     #[test]
@@ -2583,6 +3440,80 @@ fix issue #{issue} at {priority=P0 or P1} priority
         // And the class is reported as spent, so the advisor's silence is explained.
         assert_eq!(spent_classes(&library, None, &state, &ledger), vec![1]);
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn an_unserved_row_missing_an_addon_input_is_not_a_spent_class() {
+        let library = Library::parse(
+            Path::new("prompts.md"),
+            "\
+## Shared protocol
+
+```text
+p
+```
+
+## P1 · Open row
+
+**When to use:** now
+**Status:** todo
+**Leverage:** 1
+**Effort:** small
+**Targets:** open
+**Gates:** `cargo test`
+
+```text
+ship {method}
+```
+
+**Add-on — Needs state:** uses {state}
+",
+        );
+        let prompt = library.prompt(1).expect("P1");
+        let mut row = row('A', "13", "VLESS", false);
+        row.state.clear();
+        let state = ProjectState {
+            methods: vec![row],
+            pins: Vec::new(),
+        };
+        let addons = render::resolve_addons(prompt, &["needs".to_owned()]).expect("add-on");
+        let args = parse_args(&["render", "P1", "--addon", "needs"]);
+        let reason = no_target_reason(
+            &args,
+            &library,
+            prompt,
+            &state,
+            &Ledger::default(),
+            &addons,
+            &Values::new(),
+        );
+        assert!(reason.contains("needs `state`"), "{reason}");
+        assert!(!reason.contains("`method`"), "{reason}");
+        assert!(!reason.contains("no open row left"), "{reason}");
+    }
+
+    #[test]
+    fn an_explicit_render_refusal_names_a_parked_row() {
+        let library = library();
+        let mut parked = row('A', "13", "VLESS", false);
+        parked.state = "not-scheduled".to_owned();
+        parked.gap = Gap::NotScheduled;
+        let state = ProjectState {
+            methods: vec![parked],
+            pins: Vec::new(),
+        };
+        let args = parse_args(&["render", "P1"]);
+        let reason = no_target_reason(
+            &args,
+            &library,
+            library.prompt(1).expect("P1"),
+            &state,
+            &Ledger::default(),
+            &[],
+            &Values::new(),
+        );
+        assert!(reason.contains("no drawable open row remains"), "{reason}");
+        assert!(reason.contains("--row A13"), "{reason}");
     }
 
     #[test]
@@ -2709,14 +3640,200 @@ fix issue #{issue} at {priority=P0 or P1} priority
     }
 
     #[test]
-    fn an_empty_pin_file_does_not_supply_references_to_next() {
-        let args = parse_args(&["next"]);
+    fn allow_unfilled_keeps_a_row_that_cannot_fill_the_template() {
+        let library = library();
+        let prompt = library.prompt(1).expect("P1");
+        let state = ProjectState {
+            methods: vec![row('A', "13", "", false)],
+            pins: Vec::new(),
+        };
+        let ledger = Ledger::default();
+        let supplied = Values::new();
+        assert!(target_for(prompt, &state, &ledger, None, &supplied, &[], false).is_none());
+        let (target, _) = target_for(prompt, &state, &ledger, None, &supplied, &[], true)
+            .expect("an unfilled row is still the work");
+        assert_eq!(target.key(), "A13");
+        let mixed = ProjectState {
+            methods: vec![row('A', "13", "", false), row('A', "14", "VLESS", false)],
+            pins: Vec::new(),
+        };
+        let (target, _) = target_for(prompt, &mixed, &ledger, None, &supplied, &[], true)
+            .expect("a fully supplied row is preferred");
+        assert_eq!(target.key(), "A14");
+    }
+
+    #[test]
+    fn only_the_blanks_this_template_can_fill_are_supplied() {
+        let library = library();
         let state = ProjectState {
             methods: vec![row('A', "13", "VLESS over QUIC", false)],
             pins: Vec::new(),
         };
-        let supplied = supplied_values(&args, &state);
-        assert!(!supplied.contains_key("references"));
+        assert_eq!(
+            advisor::missing_inputs(
+                library.prompt(1).unwrap(),
+                &[],
+                advisor::Inputs::new(&Values::new(), None),
+                &state,
+                &[]
+            )
+            .len(),
+            0
+        );
+        let mut parked = row('D', "2", "A parked row", false);
+        parked.state = "not-scheduled".to_owned();
+        parked.gap = Gap::NotScheduled;
+        let parked_state = ProjectState {
+            methods: vec![parked],
+            pins: Vec::new(),
+        };
+        assert!(
+            advisor::missing_inputs(
+                library.prompt(1).unwrap(),
+                &[],
+                advisor::Inputs::new(&Values::new(), None),
+                &parked_state,
+                &[]
+            )
+            .contains(&"method".to_owned()),
+            "a parked row cannot supply a matrix blank"
+        );
+        assert!(
+            advisor::missing_inputs(
+                library.prompt(1).unwrap(),
+                &[],
+                advisor::Inputs::new(&Values::new(), Some(&parked_state.methods[0])),
+                &parked_state,
+                &[]
+            )
+            .is_empty(),
+            "a row the user names may supply a matrix blank"
+        );
+        assert_eq!(
+            advisor::missing_inputs(
+                library.prompt(4).unwrap(),
+                &[],
+                advisor::Inputs::new(&Values::new(), Some(&parked_state.methods[0])),
+                &parked_state,
+                &[]
+            ),
+            vec!["issue"]
+        );
+        assert_eq!(
+            advisor::missing_inputs(
+                library.prompt(4).unwrap(),
+                &[],
+                advisor::Inputs::new(&Values::new(), None),
+                &state,
+                &[]
+            ),
+            vec!["issue"]
+        );
+
+        let references = Library::parse(
+            Path::new("prompts.md"),
+            "## Shared protocol\n\n```text\np\n```\n\n## P1 · Fixed\n\n**When to use:** now\n\
+             **Status:** todo\n**Leverage:** 1\n**Effort:** small\n**Targets:** none\n\
+             **Gates:** `cargo test`\n\n```text\nread {references}\n```\n",
+        );
+        assert_eq!(
+            advisor::missing_inputs(
+                references.prompt(1).unwrap(),
+                &[],
+                advisor::Inputs::new(&Values::new(), None),
+                &state,
+                &[]
+            ),
+            vec!["references"]
+        );
+    }
+
+    #[test]
+    fn a_served_retry_row_supplies_its_own_inputs_to_the_missing_list() {
+        let library = Library::parse(
+            Path::new("prompts.md"),
+            "\
+## Shared protocol
+
+```text
+p
+```
+
+## P1 · Open row
+
+**When to use:** now
+**Status:** todo
+**Leverage:** 1
+**Effort:** small
+**Targets:** open
+**Gates:** `cargo test`
+
+```text
+ship {method} for {state}
+```
+",
+        );
+        let mut served_row = row('A', "13", "VLESS", false);
+        served_row.state.clear();
+        let state = ProjectState {
+            methods: vec![served_row],
+            pins: Vec::new(),
+        };
+        let missing = advisor::missing_inputs(
+            library.prompt(1).unwrap(),
+            &[],
+            advisor::Inputs::new(&Values::new(), None),
+            &state,
+            &["A13".to_owned()],
+        );
+        assert_eq!(missing, vec!["state"]);
+    }
+
+    #[test]
+    fn a_custom_library_gets_its_own_ledger() {
+        let root = std::env::temp_dir().join(format!(
+            "ferrox-prompt-ledger-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let default = root.join(LIBRARY_RELATIVE);
+        std::fs::create_dir_all(default.parent().unwrap()).expect("dirs");
+        std::fs::write(&default, "## P1 · x\n").expect("default library");
+        let mut built_in = Library::parse(Path::new(LIBRARY_RELATIVE), "## P1 · x\n");
+        built_in.source_path = default.clone();
+        assert_eq!(ledger_path(&root, &built_in), root.join(LEDGER_RELATIVE));
+
+        let custom = root.join("draft-prompts.md");
+        std::fs::write(&custom, "## P1 · x\n").expect("custom library");
+        let mut other = Library::parse(Path::new("draft-prompts.md"), "## P1 · x\n");
+        other.source_path = custom.clone();
+        let path = ledger_path(&root, &other);
+        assert_ne!(path, root.join(LEDGER_RELATIVE));
+        assert_eq!(path.parent(), Some(root.join(".ferrox").as_path()));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let first = root.join("draft-a.md");
+            let second = root.join("draft-b.md");
+            std::fs::write(&first, "## P1 · x\n").expect("first draft");
+            std::fs::write(&second, "## P1 · x\n").expect("second draft");
+            std::fs::remove_file(&default).expect("replace default");
+            symlink(&first, &default).expect("first link");
+            let mut redirected = Library::parse(Path::new(LIBRARY_RELATIVE), "## P1 · x\n");
+            redirected.source_path = std::fs::canonicalize(&first).expect("first target");
+            let first_ledger = ledger_path(&root, &redirected);
+            assert_ne!(first_ledger, root.join(LEDGER_RELATIVE));
+            std::fs::remove_file(&default).expect("remove link");
+            symlink(&second, &default).expect("second link");
+            redirected.source_path = std::fs::canonicalize(&second).expect("second target");
+            let second_ledger = ledger_path(&root, &redirected);
+            assert_ne!(first_ledger, second_ledger);
+        }
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -2739,6 +3856,120 @@ fix issue #{issue} at {priority=P0 or P1} priority
         assert!(selection.contains("shown by id"), "{selection}");
         assert!(selection.contains("\"seed\": null"), "{selection}");
         assert!(selection.contains("\"suppressed\": []"), "{selection}");
+    }
+
+    #[test]
+    fn a_rotation_seed_is_reported_without_clamping() {
+        let library = library();
+        let prompt = library.prompt(1).expect("P1");
+        let args = parse_args(&[
+            "next",
+            "--json",
+            "--rotate",
+            "--seed",
+            "18446744073709551615",
+        ]);
+        let selection = selection_json(&library, prompt, &args, &[], &[]).to_pretty();
+        assert!(
+            selection.contains("\"seed\": 18446744073709551615"),
+            "{selection}"
+        );
+    }
+
+    #[test]
+    fn a_seed_is_not_reported_when_a_draw_did_not_run() {
+        let library = library();
+        let prompt = library.prompt(1).expect("P1");
+        for arguments in [
+            &["show", "1", "--json", "--rotate", "--seed", "7"][..],
+            &["next", "--id", "1", "--json", "--rotate", "--seed", "7"][..],
+        ] {
+            let args = parse_args(arguments);
+            let selection = selection_json(&library, prompt, &args, &[], &[]).to_pretty();
+            assert!(selection.contains("\"seed\": null"), "{selection}");
+        }
+    }
+
+    #[test]
+    fn json_touches_keep_the_create_marker() {
+        let library = Library::parse(
+            Path::new("prompts.md"),
+            &LIBRARY.replace(
+                "**Gates:** `cargo test`",
+                "**Gates:** `cargo test`\n**Touches:** docs/note.md, +docs/new.md",
+            ),
+        );
+        let prompt = library.prompt(1).expect("P1");
+        let json = prompt_json(prompt, &Ledger::default()).to_pretty();
+        assert!(json.contains("\"docs/note.md\""), "{json}");
+        assert!(json.contains("\"+docs/new.md\""), "{json}");
+    }
+
+    #[test]
+    fn a_handout_that_is_not_recorded_does_not_need_a_ledger_directory() {
+        let path = std::env::temp_dir()
+            .join(format!(
+                "ferrox-no-ledger-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ))
+            .join("missing")
+            .join("slices.log");
+        assert!(lock_if_recording(false, &path).expect("no lock").is_none());
+        assert!(!path.parent().expect("parent").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_ledger_symlink_keeps_one_lock_identity() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-prompt-lock-identity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let target = dir.join("slices.log");
+        let link = dir.join("ledger");
+        symlink(&target, &link).expect("link");
+        let before = lock_path(&link);
+        std::fs::write(&target, "").expect("target");
+        assert_eq!(lock_path(&link), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_a_library_keeps_its_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = std::env::temp_dir().join(format!(
+            "ferrox-prompt-permissions-{}-{}.md",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::write(&path, "old").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("mode");
+        replace_file(&path, "new").expect("replace");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "new");
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        std::fs::remove_file(path).ok();
     }
 
     #[test]
@@ -2800,6 +4031,18 @@ fix issue #{issue} at {priority=P0 or P1} priority
     }
 
     #[test]
+    fn set_status_skips_an_indented_status_example() {
+        let source =
+            "## P2 · Second\n\n    **Status:** doing\n\n**Status:** todo\n**Leverage:** 5\n";
+        let updated = set_status_text(source, 2, Status::Done).expect("the real field is there");
+        assert!(
+            updated.contains("    **Status:** doing"),
+            "the example must not change: {updated}"
+        );
+        assert!(updated.contains("**Status:** done"), "{updated}");
+    }
+
+    #[test]
     fn set_status_follows_the_parser_for_tilde_fences_and_example_headings() {
         let source = "## P1 · First\n\n~~~text\n## P2 · Example\n**Status:** todo\n~~~\n\n## P2 · Second\n\n**Status:** todo\n";
         let updated = set_status_text(source, 2, Status::Done).expect("the real P2 is there");
@@ -2808,12 +4051,398 @@ fix issue #{issue} at {priority=P0 or P1} priority
     }
 
     #[test]
+    fn a_left_out_problem_is_reported_not_only_its_missing_inputs() {
+        let skipped = vec![
+            advisor::Skipped {
+                id: 4,
+                missing: vec!["scope".to_owned()],
+                problem: None,
+            },
+            advisor::Skipped {
+                id: 5,
+                missing: Vec::new(),
+                problem: Some("no add-on matching `x`".to_owned()),
+            },
+        ];
+        let reasons = skipped_reasons(&skipped);
+        assert!(reasons.contains("scope for P4"), "{reasons}");
+        assert!(reasons.contains("P5: no add-on matching `x`"), "{reasons}");
+    }
+
+    #[test]
+    fn a_left_out_addon_input_gets_its_addon_in_the_recovery_command() {
+        let library = Library::parse(
+            Path::new("prompts.md"),
+            "\
+## Shared protocol
+
+```text
+p
+```
+
+## P1 · One
+
+**When to use:** first
+**Status:** todo
+**Leverage:** 1
+**Effort:** small
+**Targets:** none
+**Gates:** `cargo test`
+
+```text
+body {core}
+```
+
+**Add-on — Extra:** needs {extra}
+",
+        );
+        let skipped = vec![advisor::Skipped {
+            id: 1,
+            missing: vec!["core".to_owned(), "extra".to_owned()],
+            problem: None,
+        }];
+        let args = parse_args(&["next", "--addon", "extra"]);
+        let message = nothing_to_hand_over(
+            &library,
+            &args,
+            &[],
+            &skipped,
+            &ProjectState::default(),
+            &Ledger::default(),
+            None,
+        );
+        assert!(message.contains("--addon extra"), "{message}");
+    }
+
+    #[test]
+    fn a_served_row_is_named_when_it_is_the_only_way_to_retry() {
+        let library = Library::parse(
+            Path::new("prompts.md"),
+            "\
+## Shared protocol
+
+```text
+p
+```
+
+## P1 · Open row
+
+**When to use:** now
+**Status:** todo
+**Leverage:** 1
+**Effort:** small
+**Targets:** open
+**Gates:** `cargo test`
+
+```text
+ship it for {issue}
+```
+",
+        );
+        let state = ProjectState {
+            methods: vec![row('A', "13", "VLESS", false)],
+            pins: Vec::new(),
+        };
+        let skipped = vec![advisor::Skipped {
+            id: 1,
+            missing: vec!["issue".to_owned()],
+            problem: None,
+        }];
+        let ledger = Ledger {
+            entries: vec![advisor::Entry {
+                at: "2026-10-02T00:00:00Z".to_owned(),
+                id: 1,
+                how: "next".to_owned(),
+                target: Some("A13".to_owned()),
+            }],
+            ..Ledger::default()
+        };
+        let args = parse_args(&["next"]);
+        let message = nothing_to_hand_over(&library, &args, &[], &skipped, &state, &ledger, None);
+        assert!(message.contains("needs `issue`"), "{message}");
+        assert!(message.contains("--row A13"), "{message}");
+        assert!(message.contains("already served"), "{message}");
+    }
+
+    #[test]
+    fn a_skipped_slice_with_no_drawable_row_names_the_parked_row() {
+        let library = Library::parse(
+            Path::new("prompts.md"),
+            "\
+## Shared protocol
+
+```text
+p
+```
+
+## P1 · Open row
+
+**When to use:** now
+**Status:** todo
+**Leverage:** 1
+**Effort:** small
+**Targets:** open
+**Gates:** `cargo test`
+
+```text
+ship it for {state}
+```
+",
+        );
+        let mut parked = row('A', "13", "VLESS", false);
+        parked.state = "not-scheduled".to_owned();
+        parked.gap = Gap::NotScheduled;
+        let state = ProjectState {
+            methods: vec![parked],
+            pins: Vec::new(),
+        };
+        let skipped = vec![advisor::Skipped {
+            id: 1,
+            missing: vec!["state".to_owned()],
+            problem: None,
+        }];
+        let args = parse_args(&["next"]);
+        let message = nothing_to_hand_over(
+            &library,
+            &args,
+            &[],
+            &skipped,
+            &state,
+            &Ledger::default(),
+            None,
+        );
+        assert!(
+            message.contains("no drawable open row remains"),
+            "{message}"
+        );
+        assert!(message.contains("--row A13"), "{message}");
+        assert!(!message.contains("ferrox-prompt render"), "{message}");
+        let message =
+            nothing_to_hand_over(&library, &args, &[], &[], &state, &Ledger::default(), None);
+        assert!(
+            message.contains("no drawable open row remains"),
+            "{message}"
+        );
+        assert!(message.contains("--row A13"), "{message}");
+    }
+
+    #[test]
+    fn a_parked_override_is_named_alongside_another_slices_missing_input() {
+        let library = Library::parse(
+            Path::new("prompts.md"),
+            "\
+## Shared protocol
+
+```text
+p
+```
+
+## P1 · Parked row
+
+**When to use:** now
+**Status:** todo
+**Leverage:** 1
+**Effort:** small
+**Targets:** open
+**Gates:** `cargo test`
+
+```text
+ship {method}
+```
+
+## P2 · Needs issue
+
+**When to use:** now
+**Status:** todo
+**Leverage:** 1
+**Effort:** small
+**Targets:** open
+**Gates:** `cargo test`
+
+```text
+triage {issue}
+```
+",
+        );
+        let mut parked = row('A', "13", "VLESS", false);
+        parked.state = "not-scheduled".to_owned();
+        parked.gap = Gap::NotScheduled;
+        let state = ProjectState {
+            methods: vec![parked],
+            pins: Vec::new(),
+        };
+        let skipped = vec![advisor::Skipped {
+            id: 2,
+            missing: vec!["issue".to_owned()],
+            problem: None,
+        }];
+        let args = parse_args(&["next"]);
+        let message = nothing_to_hand_over(
+            &library,
+            &args,
+            &[],
+            &skipped,
+            &state,
+            &Ledger::default(),
+            None,
+        );
+        assert!(message.contains("needs `issue`"), "{message}");
+        assert!(message.contains("--row A13"), "{message}");
+    }
+
+    #[test]
+    fn an_empty_matrix_still_gets_a_manual_retry() {
+        let library = Library::parse(
+            Path::new("prompts.md"),
+            "\
+## Shared protocol
+
+```text
+p
+```
+
+## P1 · Open row
+
+**When to use:** now
+**Status:** todo
+**Leverage:** 1
+**Effort:** small
+**Targets:** open
+**Gates:** `cargo test`
+
+```text
+ship it for {method}
+```
+",
+        );
+        let skipped = vec![advisor::Skipped {
+            id: 1,
+            missing: vec!["method".to_owned()],
+            problem: None,
+        }];
+        let args = parse_args(&["next"]);
+        let message = nothing_to_hand_over(
+            &library,
+            &args,
+            &[],
+            &skipped,
+            &ProjectState::default(),
+            &Ledger::default(),
+            None,
+        );
+        assert!(message.contains("needs `method`"), "{message}");
+        assert!(message.contains("ferrox-prompt render P1"), "{message}");
+        assert!(message.contains("--set method="), "{message}");
+    }
+
+    #[test]
+    fn a_retry_names_the_row_that_fills_the_reported_inputs() {
+        let library = Library::parse(
+            Path::new("prompts.md"),
+            "\
+## Shared protocol
+
+```text
+p
+```
+
+## P1 · Open row
+
+**When to use:** now
+**Status:** todo
+**Leverage:** 1
+**Effort:** small
+**Targets:** open
+**Gates:** `cargo test`
+
+```text
+ship {state} for {issue}
+```
+",
+        );
+        let mut without_state = row('A', "13", "VLESS", false);
+        without_state.state = String::new();
+        let state = ProjectState {
+            methods: vec![without_state, row('A', "14", "VLESS", false)],
+            pins: Vec::new(),
+        };
+        let skipped = vec![advisor::Skipped {
+            id: 1,
+            missing: vec!["issue".to_owned()],
+            problem: None,
+        }];
+        let args = parse_args(&["next"]);
+        let message = nothing_to_hand_over(
+            &library,
+            &args,
+            &[],
+            &skipped,
+            &state,
+            &Ledger::default(),
+            None,
+        );
+        assert!(message.contains("--row A14"), "{message}");
+        assert!(!message.contains("--row A13"), "{message}");
+    }
+
+    #[test]
+    fn a_skipped_row_names_the_pending_row_and_only_its_missing_input() {
+        let library = Library::parse(
+            Path::new("prompts.md"),
+            "\
+## Shared protocol
+
+```text
+p
+```
+
+## P1 · Open row
+
+**When to use:** now
+**Status:** todo
+**Leverage:** 1
+**Effort:** small
+**Targets:** open
+**Gates:** `cargo test`
+
+```text
+ship {method}
+```
+
+**Add-on — Needs state:** uses {state}
+",
+        );
+        let state = ProjectState {
+            methods: vec![row('A', "13", "", false)],
+            pins: Vec::new(),
+        };
+        let skipped = vec![advisor::Skipped {
+            id: 1,
+            missing: vec!["state".to_owned()],
+            problem: None,
+        }];
+        let args = parse_args(&["next", "--addon", "needs"]);
+        let message = nothing_to_hand_over(
+            &library,
+            &args,
+            &[],
+            &skipped,
+            &state,
+            &Ledger::default(),
+            None,
+        );
+        assert!(message.contains("needs `state`"), "{message}");
+        assert!(!message.contains("`method`"), "{message}");
+        assert!(message.contains("--row A13"), "{message}");
+    }
+
+    #[test]
     fn set_status_keeps_crlf_line_endings() {
-        let source = "## P2 · Second\r\n\r\n  **Status:** todo\r\n**Leverage:** 5\r\n";
+        let source = "## P2 · Second\r\n\r\n**Status:** todo\r\n**Leverage:** 5\r\n";
         let updated = set_status_text(source, 2, Status::Done).expect("the field is there");
         assert_eq!(
             updated,
-            "## P2 · Second\r\n\r\n  **Status:** done\r\n**Leverage:** 5\r\n"
+            "## P2 · Second\r\n\r\n**Status:** done\r\n**Leverage:** 5\r\n"
         );
         assert!(!updated.replace("\r\n", "").contains('\n'));
     }

@@ -199,7 +199,8 @@ impl Addon {
 pub enum Touch {
     /// A file that must exist. `check` fails when it does not.
     Existing(String),
-    /// A file this prompt creates (`+path`); `check` fails when it exists — work done or misfiled.
+    /// A file this prompt creates (`+path`); an existing file conflicts with an open claim but is
+    /// allowed once the prompt is done, and an existing non-file is invalid either way.
     Created(String),
 }
 
@@ -279,12 +280,12 @@ impl Prompt {
         self.required_inputs_for(&self.addons)
     }
 
-    /// Required placeholders the selected add-ons actually reach, so an add-on that was not
+    /// Placeholders the body and the selected add-ons actually reach, so an add-on that was not
     /// chosen cannot keep a handout from being rendered.
-    pub fn required_inputs_for<'a>(
+    pub fn active_placeholders_for<'a>(
         &'a self,
         addons: &'a [Addon],
-    ) -> impl Iterator<Item = &'a str> + 'a {
+    ) -> impl Iterator<Item = &'a Placeholder> + 'a {
         let mut active = std::collections::BTreeSet::new();
         for text in std::iter::once(self.body.as_str())
             .chain(addons.iter().map(|addon| addon.body.as_str()))
@@ -293,12 +294,21 @@ impl Prompt {
         }
         self.placeholders
             .iter()
-            .filter(move |placeholder| {
+            .filter(move |placeholder| active.contains(&placeholder.name))
+    }
+
+    /// Required placeholders the selected add-ons actually reach, so an add-on that was not
+    /// chosen cannot keep a handout from being rendered.
+    pub fn required_inputs_for<'a>(
+        &'a self,
+        addons: &'a [Addon],
+    ) -> impl Iterator<Item = &'a str> + 'a {
+        self.active_placeholders_for(addons)
+            .filter(|placeholder| {
                 placeholder
                     .default
                     .as_deref()
                     .is_none_or(|default| default.trim().is_empty())
-                    && active.contains(&placeholder.name)
             })
             .map(|placeholder| placeholder.name.as_str())
     }
@@ -347,7 +357,16 @@ impl Library {
         let mut prompts: Vec<Prompt> = Vec::new();
 
         let mut index = 0;
+        let mut preamble_fence = None;
+        let mut preamble_open = None;
         while index < lines.len() {
+            if preamble_fence.is_none() && opens_fence(lines[index]).is_some() {
+                preamble_open = Some(index + 1);
+            }
+            if inside_fence(&mut preamble_fence, lines[index]) {
+                index += 1;
+                continue;
+            }
             let Some(heading) = heading_body(lines[index]) else {
                 index += 1;
                 continue;
@@ -358,8 +377,13 @@ impl Library {
 
             if is_shared_protocol(heading) {
                 if shared_line.is_none() {
-                    shared_protocol =
-                        single_fenced_block(section, line, "shared protocol", &mut diagnostics);
+                    shared_protocol = single_fenced_block(
+                        section,
+                        line,
+                        "shared protocol",
+                        "text",
+                        &mut diagnostics,
+                    );
                     shared_line = Some(line);
                 } else {
                     diagnostics.push(Diagnostic::error(
@@ -392,6 +416,12 @@ impl Library {
             index = end;
         }
 
+        if preamble_fence.is_some() {
+            diagnostics.push(Diagnostic::error(
+                preamble_open.unwrap_or(1),
+                "the fenced block before the first heading is never closed",
+            ));
+        }
         if shared_protocol.is_empty() && shared_line.is_none() {
             diagnostics.push(Diagnostic::error(
                 0,
@@ -612,6 +642,7 @@ fn single_fenced_block(
     section: &[&str],
     line: usize,
     what: &str,
+    expected_info: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> String {
     let mut open = None;
@@ -635,6 +666,19 @@ fn single_fenced_block(
                     ),
                 ));
                 return String::new();
+            }
+            let info = fence_body(section_line)
+                .map(|body| body[width..].trim())
+                .unwrap_or_default();
+            let info = info.split_whitespace().next().unwrap_or_default();
+            if !info.eq_ignore_ascii_case(expected_info) {
+                diagnostics.push(Diagnostic::error(
+                    line + offset + 1,
+                    format!(
+                        "the fenced block in the {what} section must open with ```{expected_info}; \
+                         a bare block is rendered as code, so the instructions never reach the reader"
+                    ),
+                ));
             }
             open = Some(offset);
             fence = Some((marker, width));
@@ -758,6 +802,68 @@ pub fn is_placeholder_name(name: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
+/// The index of the next backtick run at least `width` long, so a code span can hide its own semicolons.
+fn closing_backticks(bytes: &[u8], mut index: usize, width: usize) -> Option<usize> {
+    while index < bytes.len() {
+        if bytes[index] != b'`' {
+            index += 1;
+            continue;
+        }
+        let run = bytes[index..]
+            .iter()
+            .take_while(|byte| **byte == b'`')
+            .count();
+        if run == width {
+            return Some(index);
+        }
+        index += run;
+    }
+    None
+}
+
+/// An odd run of backslashes before `index` escapes the byte there.
+pub(crate) fn escaped(bytes: &[u8], index: usize) -> bool {
+    let mut backslashes = 0;
+    let mut before = index;
+    while before > 0 && bytes[before - 1] == b'\\' {
+        backslashes += 1;
+        before -= 1;
+    }
+    backslashes % 2 == 1
+}
+
+/// Split gates on semicolons outside code spans; a quoted shell command may contain its own.
+fn split_gates(value: &str) -> Vec<&str> {
+    let bytes = value.as_bytes();
+    let mut gates = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'`' {
+            if bytes[index] == b';' {
+                gates.push(value[start..index].trim());
+                start = index + 1;
+            }
+            index += 1;
+            continue;
+        }
+        if escaped(bytes, index) {
+            index += 1;
+            continue;
+        }
+        let width = bytes[index..]
+            .iter()
+            .take_while(|byte| **byte == b'`')
+            .count();
+        match closing_backticks(bytes, index + width, width) {
+            Some(close) => index = close + width,
+            None => index += width,
+        }
+    }
+    gates.push(value[start..].trim());
+    gates
+}
+
 /// The value written after the `=` in a placeholder body, if any.
 fn placeholder_default(body: &str) -> Option<String> {
     let (name, default) = body.split_once('=')?;
@@ -804,6 +910,7 @@ fn parse_prompt(
     }
 
     let mut fence = None;
+    let mut seen_status = false;
     for (offset, section_line) in section.iter().enumerate() {
         let field_line = line + offset + 1;
         if inside_fence(&mut fence, section_line) {
@@ -838,16 +945,23 @@ fn parse_prompt(
         };
         match key {
             "When to use" => value.clone_into(&mut prompt.when_to_use),
-            "Status" => match Status::parse(value) {
-                Some(status) => prompt.status = status,
-                None => diagnostics.push(Diagnostic::error(
-                    field_line,
-                    format!(
-                        "P{id}: **Status:** `{value}` is not one of {}",
-                        Status::NAMES.join(", ")
-                    ),
-                )),
-            },
+            "Status" if seen_status => diagnostics.push(Diagnostic::error(
+                field_line,
+                format!("P{id}: **Status:** is declared twice; exactly one decides whether the prompt runs"),
+            )),
+            "Status" => {
+                seen_status = true;
+                match Status::parse(value) {
+                    Some(status) => prompt.status = status,
+                    None => diagnostics.push(Diagnostic::error(
+                        field_line,
+                        format!(
+                            "P{id}: **Status:** `{value}` is not one of {}",
+                            Status::NAMES.join(", ")
+                        ),
+                    )),
+                }
+            }
             "Leverage" => match value.parse::<u8>() {
                 Ok(leverage @ 1..=5) => prompt.leverage = leverage,
                 _ => diagnostics.push(Diagnostic::error(
@@ -866,9 +980,8 @@ fn parse_prompt(
                 )),
             },
             "Gates" => {
-                prompt.gates = value
-                    .split(';')
-                    .map(str::trim)
+                prompt.gates = split_gates(value)
+                    .into_iter()
                     .filter(|gate| !gate.is_empty())
                     .map(str::to_owned)
                     .collect();
@@ -933,7 +1046,7 @@ fn parse_prompt(
         }
     }
 
-    prompt.body = single_fenced_block(section, line, &format!("P{id}"), diagnostics);
+    prompt.body = single_fenced_block(section, line, &format!("P{id}"), "text", diagnostics);
 
     for (name, why) in REQUIRED_FIELDS {
         if !section_has_field(section, name) {
@@ -1201,9 +1314,23 @@ do the second thing with {scope}
     }
 
     #[test]
-    fn an_unclosed_block_is_an_error() {
+    fn an_unclosed_block_is_an_error_at_the_opening_fence() {
         let library = load("## Shared protocol\n\n```text\nunterminated\n");
-        assert!(library.has_errors());
+        let error = library
+            .errors()
+            .find(|error| error.message.contains("never closed"))
+            .expect("the unclosed fence is named");
+        assert_eq!(error.line, 3);
+    }
+
+    #[test]
+    fn an_unclosed_preamble_fence_is_an_error_at_its_opening_fence() {
+        let library = load("preamble\n\n```text\nunterminated\n");
+        let error = library
+            .errors()
+            .find(|error| error.message.contains("before the first heading"))
+            .expect("the unclosed preamble fence is named");
+        assert_eq!(error.line, 3);
     }
 
     #[test]
@@ -1279,6 +1406,68 @@ b
     }
 
     #[test]
+    fn a_prompt_heading_inside_a_preamble_fence_is_code() {
+        let text = format!("```text\n## P9 · Example\n```\n{LIBRARY}");
+        let library = load(&text);
+        assert!(library.prompt(9).is_none());
+        assert!(!library
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("P9")));
+    }
+
+    #[test]
+    fn a_body_must_open_with_the_text_info_string() {
+        let library = load(&LIBRARY.replace(
+            "```text\ndo the first thing with {len=40}\n```",
+            "```\ndo the first thing with {len=40}\n```",
+        ));
+        assert!(library
+            .errors()
+            .any(|error| error.message.contains("must open with ```text")));
+    }
+
+    #[test]
+    fn a_longer_backtick_run_does_not_close_a_shorter_span() {
+        let library = load(&LIBRARY.replace(
+            "**Gates:** `cargo test`",
+            "**Gates:** ``printf '```;x'``; `cargo test`",
+        ));
+        let prompt = library.prompt(1).unwrap();
+        assert_eq!(prompt.gates, vec!["``printf '```;x'``", "`cargo test`"]);
+    }
+
+    #[test]
+    fn an_escaped_backtick_does_not_open_a_code_span() {
+        assert_eq!(
+            split_gates(r"\`a; b\`; `cargo test`"),
+            vec![r"\`a", r"b\`", "`cargo test`"]
+        );
+    }
+
+    #[test]
+    fn a_semicolon_inside_a_gate_command_does_not_split_it() {
+        let library = load(&LIBRARY.replace(
+            "**Gates:** `cargo test`",
+            "**Gates:** `sh -c 'a; b'`; `cargo clippy`",
+        ));
+        let prompt = library.prompt(1).unwrap();
+        assert_eq!(prompt.gates, vec!["`sh -c 'a; b'`", "`cargo clippy`"]);
+    }
+
+    #[test]
+    fn a_second_status_is_an_error_and_does_not_override_the_first() {
+        let text = LIBRARY
+            .replace("**Status:** done", "**Status:** todo")
+            .replace("**Effort:** small", "**Effort:** small\n**Status:** done");
+        let library = load(&text);
+        assert!(library
+            .errors()
+            .any(|error| error.message.contains("**Status:** is declared twice")));
+        assert_eq!(library.prompt(1).unwrap().status, Status::Todo);
+    }
+
+    #[test]
     fn a_heading_from_another_library_is_a_warning() {
         let library = load(&LIBRARY.replace("## P2 · Second", "## Prompt 2: Second"));
         let warning = library
@@ -1333,11 +1522,11 @@ b
 
     #[test]
     fn placeholders_may_have_defaults_that_contain_equals() {
-        let library = load(&LIBRARY.replace("{len=40}", "{cmd=cargo test --all}"));
+        let library = load(&LIBRARY.replace("{len=40}", "{cmd=RUSTFLAGS=-Dwarnings cargo test}"));
         let first = library.prompt(1).unwrap();
         assert_eq!(
             first.placeholders[0].default.as_deref(),
-            Some("cargo test --all")
+            Some("RUSTFLAGS=-Dwarnings cargo test")
         );
     }
 

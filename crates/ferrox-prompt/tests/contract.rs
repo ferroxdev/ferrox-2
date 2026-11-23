@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use ferrox_prompt::advisor::{self, Ledger};
+use ferrox_prompt::advisor;
 use ferrox_prompt::check;
 use ferrox_prompt::expand::{self, ProjectState};
 use ferrox_prompt::markdown::{Severity, Status, Targets};
@@ -177,16 +177,21 @@ fn every_add_on_resolves_and_renders() {
             let resolved = render::resolve_addons(prompt, std::slice::from_ref(&addon.slug))
                 .unwrap_or_else(|error| panic!("P{}: {error}", prompt.id));
             assert_eq!(resolved.len(), 1);
+            let values: BTreeMap<String, String> = prompt
+                .required_inputs_for(&resolved)
+                .map(|name| (name.to_owned(), "supplied-by-the-test".to_owned()))
+                .collect();
+            let expected = render::substitute(&addon.body, &values);
             let rendered = render::render(
                 &library,
                 prompt,
-                &BTreeMap::new(),
+                &values,
                 &resolved,
                 None,
                 Options::default(),
             );
             assert!(
-                rendered.text.contains(&addon.body),
+                rendered.text.contains(&expected),
                 "P{}: the add-on {addon_slug} rendered without its text",
                 prompt.id,
                 addon_slug = addon.slug
@@ -237,12 +242,20 @@ fn every_dependency_names_a_prompt_that_exists_and_done_waits_on_nothing_open() 
 #[test]
 fn the_advisor_always_has_a_justified_answer() {
     let library = library();
-    let root = manifest_root();
-    // A fresh, unwritten ledger, so the answer does not depend on this machine's history.
-    let empty = Ledger::load(root.join(".ferrox/does-not-exist.log"));
-    assert_eq!(empty.entries, []);
+    let state = ProjectState::load(&manifest_root());
 
-    let (handable, skipped) = advisor::handable(&library, None, &[], &[], &BTreeMap::new(), false);
+    let (handable, skipped) = advisor::handable(
+        &library,
+        None,
+        &[],
+        &[],
+        advisor::Inputs::new(&BTreeMap::new(), None),
+        advisor::Context {
+            state: &state,
+            ledger: &advisor::Ledger::default(),
+        },
+        false,
+    );
     let ranked = advisor::ranked(&library, None);
     assert_eq!(
         handable.len() + skipped.len(),
@@ -262,10 +275,11 @@ fn the_advisor_always_has_a_justified_answer() {
     }
 
     let top = handable[0];
-    let best_id = library.prompts[ranked[0]].id;
-    let best = library
-        .prompt(best_id)
-        .expect("a ranked index is a prompt index");
+    let best = ranked
+        .iter()
+        .map(|&index| &library.prompts[index])
+        .find(|prompt| handable.iter().any(|offered| offered.id == prompt.id))
+        .expect("a handable prompt is ranked and unskipped");
     assert_eq!(
         top.leverage, best.leverage,
         "the top handable slice should not be lower leverage than the best ready one, unless the \\
@@ -284,38 +298,163 @@ fn the_advisor_always_has_a_justified_answer() {
         );
     }
     // And the pick is reproducible.
-    let (again, _) = advisor::handable(&library, None, &[], &[], &BTreeMap::new(), false);
+    let (again, _) = advisor::handable(
+        &library,
+        None,
+        &[],
+        &[],
+        advisor::Inputs::new(&BTreeMap::new(), None),
+        advisor::Context {
+            state: &state,
+            ledger: &advisor::Ledger::default(),
+        },
+        false,
+    );
     assert_eq!(again[0].id, top.id);
 }
 
 #[test]
 fn a_prompt_with_a_required_input_is_only_offered_when_it_is_filled() {
     let library = library();
-    let (_, skipped) = advisor::handable(&library, None, &[], &[], &BTreeMap::new(), false);
-    for slice in &skipped {
-        let prompt = library
-            .prompt(slice.id)
-            .expect("a skipped id is a prompt id");
+    let state = ProjectState::load(&manifest_root());
+    let (_, skipped) = advisor::handable(
+        &library,
+        None,
+        &[],
+        &[],
+        advisor::Inputs::new(&BTreeMap::new(), None),
+        advisor::Context {
+            state: &state,
+            ledger: &advisor::Ledger::default(),
+        },
+        false,
+    );
+
+    let expected: Vec<advisor::Skipped> = advisor::ranked(&library, None)
+        .into_iter()
+        .filter_map(|index| {
+            let prompt = &library.prompts[index];
+            let addons = render::resolve_addons(prompt, &[]).expect("no add-ons requested");
+            let missing = advisor::missing_inputs(
+                prompt,
+                &addons,
+                advisor::Inputs::new(&BTreeMap::new(), None),
+                &state,
+                &[],
+            );
+            (!missing.is_empty()).then_some(advisor::Skipped {
+                id: prompt.id,
+                missing,
+                problem: None,
+            })
+        })
+        .collect();
+    assert_eq!(
+        skipped, expected,
+        "every hole is skipped for the right reason"
+    );
+
+    let supplied: BTreeMap<String, String> = expected
+        .iter()
+        .flat_map(|slice| slice.missing.iter())
+        .map(|name| (name.clone(), "a-value".to_owned()))
+        .collect();
+    let (ready, still_skipped) = advisor::handable(
+        &library,
+        None,
+        &[],
+        &[],
+        advisor::Inputs::new(&supplied, None),
+        advisor::Context {
+            state: &state,
+            ledger: &advisor::Ledger::default(),
+        },
+        false,
+    );
+    assert!(
+        still_skipped.is_empty(),
+        "supplying every missing input should readmit every prompt: {still_skipped:?}"
+    );
+    for slice in &expected {
         assert!(
-            !slice.missing.is_empty(),
-            "P{} was skipped for no stated reason",
+            ready.iter().any(|prompt| prompt.id == slice.id),
+            "P{} was not readmitted after its inputs were supplied",
             slice.id
         );
-        for name in &slice.missing {
-            assert!(
-                prompt.required_inputs().any(|required| required == name),
-                "P{} was skipped for {name}, which it does not actually require",
-                prompt.id
-            );
-        }
-        let supplied: BTreeMap<String, String> = slice
-            .missing
-            .iter()
-            .map(|name| (name.clone(), "a-value".to_owned()))
-            .collect();
-        let rendered = render::render(&library, prompt, &supplied, &[], None, Options::default());
-        assert!(rendered.missing.is_empty(), "P{}", prompt.id);
     }
+    for prompt in &ready {
+        let mut values = supplied.clone();
+        if let Some((_, fill)) = expand::next_target(prompt, &state, &[], &[], &supplied, false) {
+            for (name, value) in fill {
+                values.entry(name).or_insert(value);
+            }
+        }
+        let references = state.references();
+        if !references.is_empty() {
+            values.entry("references".to_owned()).or_insert(references);
+        }
+        let addons = render::resolve_addons(prompt, &[]).expect("no add-ons requested");
+        let rendered = render::render(&library, prompt, &values, &addons, None, Options::default());
+        assert!(
+            rendered.missing.is_empty(),
+            "P{} is offered but rendering still needs {:?}",
+            prompt.id,
+            rendered.missing
+        );
+    }
+}
+
+#[test]
+fn a_defaulted_input_is_not_reported_as_missing() {
+    let library = ferrox_prompt::Library::parse(
+        Path::new("prompts.md"),
+        "\
+## Shared protocol
+
+```text
+p
+```
+
+## P1 · One
+
+**When to use:** now
+**Status:** todo
+**Leverage:** 1
+**Effort:** small
+**Targets:** none
+**Gates:** `cargo test`
+
+```text
+use {needed} and {defaulted=value}
+```
+",
+    );
+    let state = ProjectState::default();
+    let missing = advisor::missing_inputs(
+        library.prompt(1).unwrap(),
+        &[],
+        advisor::Inputs::new(&BTreeMap::new(), None),
+        &state,
+        &[],
+    );
+    assert_eq!(missing, vec!["needed"]);
+
+    let mut supplied = BTreeMap::new();
+    supplied.insert("needed".to_owned(), "a-value".to_owned());
+    let (ready, skipped) = advisor::handable(
+        &library,
+        None,
+        &[],
+        &[],
+        advisor::Inputs::new(&supplied, None),
+        advisor::Context {
+            state: &state,
+            ledger: &advisor::Ledger::default(),
+        },
+        false,
+    );
+    assert!(skipped.is_empty(), "{skipped:?}");
+    assert!(ready.iter().any(|prompt| prompt.id == 1));
 }
 
 #[test]
@@ -449,8 +588,18 @@ fn the_issue_template_takes_a_number_and_names_the_bugfix_branch() {
         rendered.text.contains("P0 or P1"),
         "the default priority names the class the slice serves"
     );
-    assert_eq!(
-        render::suggested_command(prompt, &["issue".to_owned()], &[]),
-        "ferrox-prompt issue <number>"
-    );
+    assert!(render::suggested_command(
+        prompt,
+        &["issue".to_owned()],
+        &std::collections::BTreeMap::new(),
+        &[],
+        &[],
+        None,
+        None,
+        false,
+    )
+    .starts_with(&format!(
+        "ferrox-prompt render P{} --issue <number>",
+        prompt.id
+    )));
 }

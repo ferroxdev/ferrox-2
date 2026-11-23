@@ -2,12 +2,14 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 
 use crate::markdown::{is_placeholder_name, Addon, Library, Prompt};
 use crate::worktree::{Place, Worktree};
 
 /// What to include beyond the prompt itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
     /// Print the acceptance gates: a prompt with no acceptance section is a request, not a slice.
     pub gates: bool,
@@ -15,6 +17,16 @@ pub struct Options {
     pub provenance: bool,
     /// Render a prompt with unfilled required inputs, the gap stated at the top; `next` refuses instead.
     pub allow_unfilled: bool,
+    /// The library the caller named, so the recovery command can be retried against the same prompt.
+    pub retry_library: Option<PathBuf>,
+    /// The row the caller selected, so the recovery command does not rotate to another row.
+    pub retry_row: Option<String>,
+    /// Whether the caller asked not to record the handout, so the retry keeps that choice.
+    pub retry_no_ledger: bool,
+    /// What the caller actually supplied, so a retry leaves automatic row values to be refilled.
+    pub retry_values: Option<BTreeMap<String, String>>,
+    /// The add-on selectors the caller typed, so a retry cannot widen a unique selector.
+    pub retry_addons: Vec<String>,
 }
 
 impl Default for Options {
@@ -23,6 +35,11 @@ impl Default for Options {
             gates: true,
             provenance: false,
             allow_unfilled: false,
+            retry_library: None,
+            retry_row: None,
+            retry_no_ledger: false,
+            retry_values: None,
+            retry_addons: Vec::new(),
         }
     }
 }
@@ -43,6 +60,7 @@ pub struct Rendered {
 }
 
 /// Render `prompt`; a malformed library is `check`'s find, not something to re-detect here.
+#[allow(clippy::needless_pass_by_value)]
 pub fn render(
     library: &Library,
     prompt: &Prompt,
@@ -62,7 +80,16 @@ pub fn render(
         parts.push(header(library, prompt));
     }
     if !missing.is_empty() && options.allow_unfilled {
-        parts.push(unfilled_block(prompt, &missing));
+        parts.push(unfilled_block(
+            prompt,
+            &missing,
+            options.retry_values.as_ref().unwrap_or(values),
+            addons,
+            &options.retry_addons,
+            options.retry_library.as_deref(),
+            options.retry_row.as_deref(),
+            options.retry_no_ledger,
+        ));
     }
     if !library.shared_protocol.is_empty() {
         parts.push(library.shared_protocol.clone());
@@ -146,7 +173,17 @@ fn header(library: &Library, prompt: &Prompt) -> String {
 }
 
 /// The block that states an unfilled input instead of leaving a hole.
-fn unfilled_block(prompt: &Prompt, missing: &[String]) -> String {
+#[allow(clippy::too_many_arguments)]
+fn unfilled_block(
+    prompt: &Prompt,
+    missing: &[String],
+    values: &BTreeMap<String, String>,
+    addons: &[Addon],
+    addon_requests: &[String],
+    library: Option<&Path>,
+    row: Option<&str>,
+    no_ledger: bool,
+) -> String {
     let mut block = String::from(
         "## Inputs required before this slice can start\n\n\
          These were not supplied. Do not invent a value for any of them: each is a \
@@ -155,12 +192,34 @@ fn unfilled_block(prompt: &Prompt, missing: &[String]) -> String {
     for name in missing {
         let _ = write!(block, "\n- `{name}` — re-run with `--set {name}=<value>`.");
     }
-    let _ = write!(
-        block,
-        "\n\nFull command: `{}`",
-        suggested_command(prompt, missing, &[])
+    let command = suggested_command(
+        prompt,
+        missing,
+        values,
+        addons,
+        addon_requests,
+        library,
+        row,
+        no_ledger,
     );
+    let fence = fence_for(&command);
+    let _ = write!(block, "\n\nFull command:\n\n{fence}\n{command}\n{fence}");
     block
+}
+
+/// A fence longer than any backtick run in the command, so a quoted value cannot close it early.
+fn fence_for(text: &str) -> String {
+    let mut longest = 0;
+    let mut run = 0;
+    for byte in text.bytes() {
+        if byte == b'`' {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    "`".repeat(longest.max(2) + 1)
 }
 
 /// Where the slice runs: the script makes the worktree when there is none, and an existing one is updated to `main` before the first edit.
@@ -168,10 +227,11 @@ fn worktree_block(worktree: &Worktree) -> String {
     let mut line = String::new();
     match worktree.place {
         Place::Absent => {
+            let script_name = shell_quote(&worktree.name);
             let _ = write!(
                 line,
                 "No worktree for this slice yet: create it with \
-                 `./scripts/new-worktree.sh {name}` and work only there — never a hand-made \
+                 `./scripts/new-worktree.sh {script_name}` and work only there — never a hand-made \
                  `git worktree add`, since the script is what points the build at the shared \
                  `target-dir`, writes the hardware-crypto cfgs CI builds with into \
                  `.cargo/config.toml`, and links the `upstream/` reading copies. \
@@ -181,31 +241,51 @@ fn worktree_block(worktree: &Worktree) -> String {
             );
         }
         Place::Linked => {
+            let message = shell_quote(&format!("ferrox {}", worktree.name));
             let _ = write!(
                 line,
                 "Worktree `{name}` is at `{path}` — do this slice there, not in the \
-                 checkout this prompt came from. Put it on `main` before the first edit \
-                 (`git fetch origin main && git rebase origin/main`): `main` moves under a \
-                 worktree, and a stale base measures the wrong code. If it holds unmerged \
-                 work, read it and carry on.",
+                 checkout this prompt came from. Put it on `main` first \
+                 (`git fetch origin main:refs/remotes/origin/main && git rebase origin/main`). \
+                 If `git status --short` shows local changes, save them with \
+                 `git stash push -u -m {message}`, rebase, then \
+                 `git stash pop --index \"$(git stash list --format=%gd --grep={message} -1)\"`; \
+                 if it conflicts, keep the stash until the changes are recovered. `main` moves \
+                 under a worktree, and a stale base measures the wrong code.",
                 name = worktree.name,
                 path = worktree.path.display(),
             );
         }
         Place::Current => {
+            let message = shell_quote(&format!("ferrox {}", worktree.name));
             let _ = write!(
                 line,
                 "This slice's worktree `{name}` is the checkout this prompt came from \
-                 (`{path}`): put it on `main` first (`git fetch origin main && \
-                 git rebase origin/main`), then work here.",
+                 (`{path}`). Put it on `main` first \
+                 (`git fetch origin main:refs/remotes/origin/main && git rebase origin/main`). \
+                 If `git status --short` shows local changes, save them with \
+                 `git stash push -u -m {message}`, rebase, then \
+                 `git stash pop --index \"$(git stash list --format=%gd --grep={message} -1)\"`; \
+                 if it conflicts, keep the stash until the changes are recovered, and work here.",
+                name = worktree.name,
+                path = worktree.path.display(),
+            );
+        }
+        Place::Mismatch => {
+            let _ = write!(
+                line,
+                "`{path}` is a worktree for this row, but its `HEAD` is on another branch. \
+                 Switch it to `{name}` and use it, or move it aside and create the slice's \
+                 worktree — do not rebase the branch it is on.",
                 name = worktree.name,
                 path = worktree.path.display(),
             );
         }
         Place::Occupied => {
+            let script_name = shell_quote(&worktree.name);
             let _ = write!(
                 line,
-                "`{path}` exists but is not a worktree, so `./scripts/new-worktree.sh {name}` \
+                "`{path}` exists but is not a worktree, so `./scripts/new-worktree.sh {script_name}` \
                  refuses it. Move that directory aside, then create `{name}` with the script \
                  and work there.",
                 name = worktree.name,
@@ -382,26 +462,121 @@ pub fn resolve_addons(prompt: &Prompt, requests: &[String]) -> Result<Vec<Addon>
 }
 
 /// The command line that would render `prompt` with `missing` filled: one paste, not a dialog about four keys.
-pub fn suggested_command(prompt: &Prompt, missing: &[String], addons: &[String]) -> String {
-    if missing.len() == 1 && missing[0] == "issue" {
-        return "ferrox-prompt issue <number>".to_owned();
-    }
+#[allow(clippy::too_many_arguments)]
+pub fn suggested_command(
+    prompt: &Prompt,
+    missing: &[String],
+    values: &BTreeMap<String, String>,
+    addons: &[Addon],
+    addon_requests: &[String],
+    library: Option<&Path>,
+    row: Option<&str>,
+    no_ledger: bool,
+) -> String {
     let mut command = format!("ferrox-prompt render P{}", prompt.id);
+    if let Some(library) = library {
+        let _ = write!(
+            command,
+            " --library {}",
+            shell_quote(&library.to_string_lossy())
+        );
+    }
+    if let Some(row) = row {
+        let _ = write!(command, " --row {}", shell_quote(row));
+    }
+    if no_ledger {
+        command.push_str(" --no-ledger");
+    }
     for name in missing {
-        let _ = write!(command, " --set {name}=<value>");
+        if name == "issue" {
+            command.push_str(" --issue <number>");
+        } else {
+            let _ = write!(command, " --set {name}={}", suggested_value(name));
+        }
     }
-    for name in prompt
-        .placeholders
-        .iter()
+    for placeholder in prompt
+        .active_placeholders_for(addons)
         .filter(|placeholder| !missing.contains(&placeholder.name))
-        .map(|placeholder| &placeholder.name)
     {
-        let _ = write!(command, " --set {name}=<value>");
+        if let Some(value) = values.get(&placeholder.name) {
+            let _ = write!(
+                command,
+                " --set {}={}",
+                placeholder.name,
+                shell_quote(value)
+            );
+        }
     }
-    if !addons.is_empty() {
-        let _ = write!(command, " --addon {}", addons.join(","));
+    // These name the worktree even when the template does not render them, so the retry must carry them.
+    for name in ["issue", "method"] {
+        if missing.iter().any(|missing| missing == name)
+            || prompt
+                .active_placeholders_for(addons)
+                .any(|placeholder| placeholder.name == name)
+        {
+            continue;
+        }
+        if let Some(value) = values.get(name) {
+            let _ = write!(command, " --set {name}={}", shell_quote(value));
+        }
+    }
+    if addon_requests.is_empty() {
+        for addon in addons {
+            let _ = write!(
+                command,
+                " --addon {}",
+                shell_quote(&addon_selector(prompt, addon))
+            );
+        }
+    } else {
+        let mut seen = std::collections::HashSet::new();
+        for request in addon_requests {
+            let request = request.trim();
+            if !request.is_empty() && seen.insert(request) {
+                let _ = write!(command, " --addon {}", shell_quote(request));
+            }
+        }
     }
     command
+}
+
+/// The selector that names one add-on unambiguously, quoted for the shell.
+fn addon_selector(prompt: &Prompt, addon: &Addon) -> String {
+    for candidate in [&addon.slug, &addon.title] {
+        let request = [(*candidate).clone()];
+        let Ok(resolved) = resolve_addons(prompt, &request) else {
+            continue;
+        };
+        if resolved.len() == 1 && resolved[0].slug == addon.slug {
+            return (*candidate).clone();
+        }
+    }
+    addon.slug.clone()
+}
+
+/// One shell argument, quoted only when the path or selector needs it.
+fn shell_quote(value: &str) -> String {
+    let plain = value.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'/' | b'.' | b'-' | b'_' | b':' | b'+' | b'@' | b'%' | b','
+            )
+    });
+    if plain {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+/// The placeholder a suggested command shows: an issue is always a number, everything else is a value.
+fn suggested_value(name: &str) -> &'static str {
+    if name == "issue" {
+        "<number>"
+    } else {
+        "<value>"
+    }
 }
 
 #[cfg(test)]
@@ -532,6 +707,32 @@ with {target=core}
     }
 
     #[test]
+    fn a_worktree_name_with_a_quote_is_still_one_shell_word() {
+        let library = library();
+        let prompt = library.prompt(1).unwrap();
+        let odd = Worktree {
+            name: "p1-a'b".to_owned(),
+            path: PathBuf::from("/tmp/ferrox-p1-a'b"),
+            place: Place::Absent,
+        };
+        let rendered = render(
+            &library,
+            prompt,
+            &values(&[]),
+            &[],
+            Some(&odd),
+            Options::default(),
+        );
+        assert!(
+            rendered
+                .text
+                .contains("./scripts/new-worktree.sh 'p1-a'\\''b'"),
+            "{}",
+            rendered.text
+        );
+    }
+
+    #[test]
     fn an_existing_worktree_is_used_and_put_onto_main() {
         let library = library();
         let prompt = library.prompt(1).unwrap();
@@ -549,14 +750,54 @@ with {target=core}
                 "{place:?} renders without the update"
             );
             assert!(
+                rendered.text.contains("git stash pop --index"),
+                "{place:?} does not restore the staging state"
+            );
+            assert!(
                 rendered.text.contains("p1-one"),
                 "{place:?} renders without naming the worktree"
+            );
+            assert!(
+                rendered
+                    .text
+                    .contains("git stash push -u -m 'ferrox p1-one'"),
+                "{place:?} saves a named stash"
+            );
+            assert!(
+                rendered
+                    .text
+                    .contains("git stash list --format=%gd --grep='ferrox p1-one' -1"),
+                "{place:?} restores the named stash"
             );
             assert!(
                 !rendered.text.contains("./scripts/new-worktree.sh p1-one"),
                 "{place:?} tells the reader to make one that exists"
             );
         }
+    }
+
+    #[test]
+    fn a_worktree_on_another_branch_is_not_told_to_rebase() {
+        let library = library();
+        let prompt = library.prompt(1).unwrap();
+        let rendered = render(
+            &library,
+            prompt,
+            &values(&[]),
+            &[],
+            Some(&worktree(Place::Mismatch)),
+            Options::default(),
+        );
+        assert!(
+            rendered.text.contains("another branch"),
+            "{}",
+            rendered.text
+        );
+        assert!(
+            !rendered.text.contains("git rebase origin/main"),
+            "{}",
+            rendered.text
+        );
     }
 
     #[test]
@@ -668,11 +909,350 @@ with {target=core}
         assert!(gap < protocol, "the gap is the first thing read");
         assert!(rendered
             .text
-            .contains("ferrox-prompt render P1 --set scope=<value> --set len=<value>"));
+            .contains("ferrox-prompt render P1 --set scope=<value>"));
+        assert!(!rendered.text.contains("--set len="), "{}", rendered.text);
     }
 
     #[test]
-    fn a_missing_issue_points_at_the_short_command() {
+    fn the_retry_command_keeps_the_selected_add_ons() {
+        let library = library();
+        let prompt = library.prompt(1).unwrap();
+        let addons = resolve_addons(prompt, &["local-first".to_owned()]).unwrap();
+        let options = Options {
+            allow_unfilled: true,
+            ..Options::default()
+        };
+        let rendered = render(
+            &library,
+            prompt,
+            &values(&[("len", "40")]),
+            &addons,
+            None,
+            options,
+        );
+        assert!(
+            rendered.text.contains("--set len=40 --addon local-first"),
+            "{}",
+            rendered.text
+        );
+    }
+
+    #[test]
+    fn the_retry_command_keeps_a_planner_value_the_template_does_not_render() {
+        let library = library();
+        let prompt = library.prompt(1).unwrap();
+        let values = values(&[("method", "QUIC test")]);
+        assert_eq!(
+            suggested_command(
+                prompt,
+                &["scope".to_owned()],
+                &values,
+                &[],
+                &[],
+                None,
+                None,
+                false,
+            ),
+            "ferrox-prompt render P1 --set scope=<value> --set method='QUIC test'"
+        );
+    }
+
+    #[test]
+    fn a_retry_command_is_fenced_wider_than_its_backticks() {
+        let library = library();
+        let prompt = library.prompt(1).unwrap();
+        let rendered = render(
+            &library,
+            prompt,
+            &values(&[("len", "a```b")]),
+            &[],
+            None,
+            Options {
+                allow_unfilled: true,
+                ..Options::default()
+            },
+        );
+        assert!(
+            rendered
+                .text
+                .contains("Full command:\n\n````\nferrox-prompt render P1"),
+            "{}",
+            rendered.text
+        );
+    }
+
+    #[test]
+    fn the_retry_command_keeps_the_named_library_and_row() {
+        let library = library();
+        let prompt = library.prompt(1).unwrap();
+        let options = Options {
+            allow_unfilled: true,
+            retry_library: Some(PathBuf::from("draft.md")),
+            retry_row: Some("A13".to_owned()),
+            ..Options::default()
+        };
+        let rendered = render(&library, prompt, &values(&[]), &[], None, options);
+        assert!(
+            rendered
+                .text
+                .contains("render P1 --library draft.md --row A13 --set scope=<value>"),
+            "{}",
+            rendered.text
+        );
+    }
+
+    #[test]
+    fn a_retry_does_not_freeze_automatic_row_values() {
+        let library = Library::parse(
+            Path::new("prompts.md"),
+            "\
+## Shared protocol
+
+```text
+p
+```
+
+## P1 · One
+
+**When to use:** first
+**Status:** todo
+**Leverage:** 1
+**Effort:** small
+**Targets:** none
+**Gates:** `cargo test`
+
+```text
+run with {len=40} and {scope} and {state}
+```
+",
+        );
+        let prompt = library.prompt(1).unwrap();
+        let options = Options {
+            allow_unfilled: true,
+            retry_row: Some("A13".to_owned()),
+            retry_values: Some(values(&[("issue", "661")])),
+            ..Options::default()
+        };
+        let rendered = render(
+            &library,
+            prompt,
+            &values(&[("state", "planned")]),
+            &[],
+            None,
+            options,
+        );
+        assert!(
+            rendered
+                .text
+                .contains("--row A13 --set scope=<value> --set issue=661"),
+            "{}",
+            rendered.text
+        );
+        assert!(!rendered.text.contains("state="), "{}", rendered.text);
+    }
+
+    #[test]
+    fn an_unselected_addon_does_not_add_its_input_to_the_command() {
+        let library = Library::parse(
+            Path::new("prompts.md"),
+            "\
+## Shared protocol
+
+```text
+p
+```
+
+## P1 · One
+
+**When to use:** first
+**Status:** todo
+**Leverage:** 1
+**Effort:** small
+**Targets:** none
+**Gates:** `cargo test`
+
+```text
+body {core}
+```
+
+**Add-on — Extra:** needs {len=40}
+
+**Add-on — Second Pass:** adds no input
+",
+        );
+        let prompt = library.prompt(1).unwrap();
+        let missing = ["core".to_owned()];
+        let values = BTreeMap::from([("len".to_owned(), "40".to_owned())]);
+        assert_eq!(
+            suggested_command(prompt, &missing, &values, &[], &[], None, None, false),
+            "ferrox-prompt render P1 --set core=<value>"
+        );
+        for request in ["extra", "Extra", "EXTRA"] {
+            let addons = resolve_addons(prompt, &[request.to_owned()]).unwrap();
+            assert_eq!(
+                suggested_command(prompt, &missing, &values, &addons, &[], None, None, false),
+                "ferrox-prompt render P1 --set core=<value> --set len=40 --addon extra"
+            );
+        }
+        for request in ["all", "extra,second-pass"] {
+            let addons = resolve_addons(prompt, &[request.to_owned()]).unwrap();
+            assert_eq!(
+                suggested_command(prompt, &missing, &values, &addons, &[], None, None, false),
+                "ferrox-prompt render P1 --set core=<value> --set len=40 \
+                 --addon extra --addon second-pass"
+            );
+        }
+        let addons = resolve_addons(prompt, &["Second Pass".to_owned()]).unwrap();
+        assert_eq!(
+            suggested_command(prompt, &missing, &values, &addons, &[], None, None, false),
+            "ferrox-prompt render P1 --set core=<value> --addon second-pass"
+        );
+        assert_eq!(
+            suggested_command(prompt, &missing, &values, &addons, &[], None, None, true),
+            "ferrox-prompt render P1 --no-ledger --set core=<value> --addon second-pass"
+        );
+        assert_eq!(
+            suggested_command(
+                prompt,
+                &missing,
+                &values,
+                &addons,
+                &[],
+                Some(Path::new("/tmp/my prompts.md")),
+                Some("A13"),
+                false
+            ),
+            "ferrox-prompt render P1 --library '/tmp/my prompts.md' --row A13 \
+             --set core=<value> --addon second-pass"
+        );
+    }
+
+    #[test]
+    fn a_retry_keeps_explicit_values() {
+        let library = Library::parse(
+            Path::new("prompts.md"),
+            "\
+## Shared protocol
+
+```text
+p
+```
+
+## P1 · One
+
+**When to use:** first
+**Status:** todo
+**Leverage:** 1
+**Effort:** small
+**Targets:** none
+**Gates:** `cargo test`
+
+```text
+body {core}
+```
+",
+        );
+        let prompt = library.prompt(1).unwrap();
+        let values = BTreeMap::from([("core".to_owned(), "a b".to_owned())]);
+        assert_eq!(
+            suggested_command(prompt, &[], &values, &[], &[], None, None, false),
+            "ferrox-prompt render P1 --set core='a b'"
+        );
+    }
+
+    #[test]
+    fn an_addon_slugged_all_is_retried_by_an_unambiguous_selector() {
+        let library = Library::parse(
+            Path::new("prompts.md"),
+            "\
+## Shared protocol
+
+```text
+p
+```
+
+## P1 · One
+
+**When to use:** first
+**Status:** todo
+**Leverage:** 1
+**Effort:** small
+**Targets:** none
+**Gates:** `cargo test`
+
+```text
+body {core}
+```
+
+**Add-on — All!:** one add-on only
+
+**Add-on — Extra:** another add-on
+",
+        );
+        let prompt = library.prompt(1).unwrap();
+        let addons = resolve_addons(prompt, &["All!".to_owned()]).unwrap();
+        assert_eq!(addons.len(), 1);
+        assert_eq!(
+            suggested_command(
+                prompt,
+                &["core".to_owned()],
+                &BTreeMap::new(),
+                &addons,
+                &[],
+                None,
+                None,
+                false
+            ),
+            "ferrox-prompt render P1 --set core=<value> --addon 'All!'"
+        );
+
+        let library = Library::parse(
+            Path::new("prompts.md"),
+            "\
+## Shared protocol
+
+```text
+p
+```
+
+## P1 · One
+
+**When to use:** first
+**Status:** todo
+**Leverage:** 1
+**Effort:** small
+**Targets:** none
+**Gates:** `cargo test`
+
+```text
+body {core}
+```
+
+**Add-on — All:** one add-on only
+
+**Add-on — Extra:** another add-on
+",
+        );
+        let prompt = library.prompt(1).unwrap();
+        let addons = resolve_addons(prompt, &["al".to_owned()]).unwrap();
+        assert_eq!(addons.len(), 1);
+        assert_eq!(
+            suggested_command(
+                prompt,
+                &["core".to_owned()],
+                &BTreeMap::new(),
+                &addons,
+                &["al".to_owned()],
+                None,
+                None,
+                false
+            ),
+            "ferrox-prompt render P1 --set core=<value> --addon al"
+        );
+    }
+
+    #[test]
+    fn a_missing_issue_points_at_the_render_command() {
         let library = Library::parse(
             Path::new("prompts.md"),
             "\
@@ -698,8 +1278,17 @@ fix issue #{issue}
         );
         let prompt = library.prompt(1).unwrap();
         assert_eq!(
-            suggested_command(prompt, &["issue".to_owned()], &[]),
-            "ferrox-prompt issue <number>"
+            suggested_command(
+                prompt,
+                &["issue".to_owned()],
+                &BTreeMap::new(),
+                &[],
+                &[],
+                None,
+                None,
+                false
+            ),
+            "ferrox-prompt render P1 --issue <number>"
         );
     }
 

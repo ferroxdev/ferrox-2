@@ -29,7 +29,7 @@ A body is the single fenced `text` block in the section — a second fenced bloc
 | `{target}` | its key — `{section}{index}` |
 | `{references}` | the pins relevant to that row: the `always` set plus any whose `name` or `topics` keywords appear in the row's line |
 
-`next` picks the first row of the template's target class the ledger (`.ferrox/slices.log`) has not served to *this* template, records it, and renders the body. Calling `next` again moves on. For `open` templates the candidates are ordered nearness-to-done: a row that already links a method page goes before a `planned` greenfield one, because finishing the missing half of something already on the wire is the cheapest parity win. `implemented` and `all` templates are offered in plain matrix order.
+`next` picks the first eligible row of the template's target class the library's own ledger (`.ferrox/slices.log` for the ordinary default library, `.ferrox/slices-<tag>.log` for any other) has not served to *this* template, renders the body, delivers it, and then records the row unless `--no-ledger` is set; a missing-input refusal or a failed handout write records nothing. A row is eligible when it fills every required matrix input and selected add-on the caller has not supplied, so an empty cell can make it skip to a later row. Calling `next` again moves on; the default memory suppresses a template it just handed out, `--memory 0` forgets that window so the next call may continue the same template's rows, and `--rotate` draws by weight rather than rank. For `open` templates the candidates are ordered by gap rank, then high priority, then whether the row already links a method page; automatic selection skips `not-scheduled` rows, though `--row` still names one. `implemented` and `all` templates are offered in plain matrix order.
 
 A row can also be named by hand — `--row A13` for its key, `--row 13` for its number, `--row quic` for part of its method name — and `rows` lists the matrix. A template draws only a row of its own class, so an open template refuses a shipped row and names the templates that take it.
 
@@ -116,7 +116,7 @@ Move {method} — matrix row {index} of table {section}, state "{state}" — tow
 **Random weight:** 6
 
 ```text
-For {method} — matrix row {index} of table {section} — remove work that is generated and thrown away: a per-record buffer that could be reused, a second copy of a payload already in the caller's buffer, a zero-fill before a read that overwrites every byte, a `Vec` that reallocates under steady traffic. Gate the allocation claim on `capacity()` held steady over a push/drain cycle, and name the pass that got worse if there is one.
+For {method} — matrix row {index} of table {section} — remove work that is generated and thrown away: a per-record buffer that could be reused, a second copy of a payload already in the caller's buffer, a zero-fill before a read that overwrites every byte, a `Vec` that reallocates under steady traffic. Gate the allocation claim on the counting allocator asserting a steady allocation count over a push/drain cycle, and the buffer-growth claim on `capacity()` held steady over the same cycle; name the pass that got worse if there is one.
 ```
 
 **Add-on — pool-owner:** When one buffer is filled by one thread and drained by another, the pool lives in the object both touch; the parse order respects that single owner.

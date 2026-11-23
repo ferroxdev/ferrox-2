@@ -51,8 +51,39 @@ pub fn manifest_root() -> PathBuf {
 
 /// FNV-1a tag naming the exact library text: a tag, not a checksum — nothing about correctness depends on it.
 pub fn library_tag(text: &str) -> String {
+    tag_bytes(text.as_bytes())
+}
+
+/// The same tag over a native path's bytes, so two paths that render alike still get separate histories.
+pub fn path_tag(path: &Path) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        tag_bytes(path.as_os_str().as_bytes())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        match path.to_str() {
+            Some(text) => tag_bytes(text.as_bytes()),
+            None => {
+                let mut bytes = vec![0xff];
+                for unit in path.as_os_str().encode_wide() {
+                    bytes.extend_from_slice(&unit.to_le_bytes());
+                }
+                tag_bytes(&bytes)
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        tag_bytes(path.to_string_lossy().as_bytes())
+    }
+}
+
+fn tag_bytes(bytes: &[u8]) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in text.as_bytes() {
+    for byte in bytes {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
@@ -81,11 +112,13 @@ impl std::fmt::Display for Unreadable {
 
 impl std::error::Error for Unreadable {}
 
-/// Read and parse the library; `--library` wins over the search, and the recorded path stays root-relative so a diagnostic opens.
+/// Read and parse the library; `--library` wins over the search, a relative explicit path resolves against `cwd`, and the recorded path stays root-relative so a diagnostic opens.
 pub fn load_library(explicit: Option<&Path>, cwd: &Path) -> Result<Library, Unreadable> {
     let root = workspace_root(cwd);
+    let canonical_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
     let path = match explicit {
-        Some(path) => path.to_path_buf(),
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(path) => cwd.join(path),
         None => root.join(LIBRARY_RELATIVE),
     };
     let path = std::fs::canonicalize(&path).unwrap_or(path);
@@ -94,7 +127,7 @@ pub fn load_library(explicit: Option<&Path>, cwd: &Path) -> Result<Library, Unre
         message: source.to_string(),
     })?;
     let display = path
-        .strip_prefix(&root)
+        .strip_prefix(&canonical_root)
         .map_or_else(|_| path.clone(), Path::to_path_buf);
     let mut library = Library::parse(&display, &text);
     library.source_path = path;
@@ -129,12 +162,55 @@ mod tests {
     }
 
     #[test]
+    fn a_relative_explicit_library_resolves_against_the_given_working_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "ferrox-prompt-cwd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let library = root.join(LIBRARY_RELATIVE);
+        std::fs::create_dir_all(library.parent().unwrap()).expect("dirs");
+        std::fs::write(&library, "## P1 · x\n\n**Status:** todo\n").expect("library");
+        let loaded = load_library(Some(Path::new(LIBRARY_RELATIVE)), &root).expect("relative path");
+        assert_eq!(loaded.source_path, std::fs::canonicalize(&library).unwrap());
+        assert_eq!(loaded.path, Path::new(LIBRARY_RELATIVE));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_path_with_lone_surrogates_keeps_its_distinct_tag() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt as _;
+
+        let one = PathBuf::from(OsString::from_wide(&[0xD800]));
+        let two = PathBuf::from(OsString::from_wide(&[0xD801]));
+        assert_ne!(path_tag(&one), path_tag(&two));
+        assert_eq!(path_tag(Path::new("a")), library_tag("a"));
+    }
+
+    #[test]
     fn a_tag_is_stable_and_input_sensitive() {
         assert_eq!(library_tag("ferrox"), library_tag("ferrox"));
         assert_ne!(library_tag("ferrox"), library_tag("dovetai"));
         // A trailing newline changes the tag on purpose: it names the file, not its gist.
         assert_ne!(library_tag("ferrox\n"), library_tag("ferrox"));
         assert_eq!(library_tag("").len(), 16);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_tag_sees_bytes_a_lossy_path_does_not() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let one = Path::new(OsStr::from_bytes(b"/tmp/custom-\xff.md"));
+        let two = Path::new(OsStr::from_bytes(b"/tmp/custom-\xfe.md"));
+        assert_eq!(one.to_string_lossy(), two.to_string_lossy());
+        assert_ne!(path_tag(one), path_tag(two));
     }
 
     #[test]

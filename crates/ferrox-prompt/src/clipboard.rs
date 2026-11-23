@@ -2,6 +2,10 @@
 
 use std::io::{ErrorKind, Write};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// A clipboard helper that has not accepted the text by now is hung, not slow.
+const TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Why a copy did not happen.
 #[derive(Debug)]
@@ -60,24 +64,94 @@ pub fn copy(text: &str) -> Result<(), Unavailable> {
 
 /// Feed text to stdin; a `NotFound` spawn means absence, anything else a refusal.
 fn write(program: &str, args: &[&str], text: &str) -> std::io::Result<()> {
+    write_within(program, args, text, TIMEOUT)
+}
+
+/// The writer may block on a helper that never reads; the loop keeps both the pipe and the wait bounded.
+fn write_within(
+    program: &str,
+    args: &[&str],
+    text: &str,
+    timeout: Duration,
+) -> std::io::Result<()> {
     let mut child = Command::new(program)
         .args(args.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
-    if let Some(mut pipe) = child.stdin.take() {
-        if let Err(error) = pipe.write_all(text.as_bytes()) {
-            drop(pipe);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    match child.stdin.take() {
+        Some(mut pipe) => {
+            let text = text.as_bytes().to_vec();
+            if let Err(error) = std::thread::Builder::new().spawn(move || {
+                let _ = sender.send(pipe.write_all(&text));
+            }) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        }
+        None => {
+            let _ = sender.send(Ok(()));
+        }
+    }
+
+    let deadline = Instant::now() + timeout;
+    let mut writer_done = false;
+    let mut writer_error = None;
+    loop {
+        if !writer_done {
+            match receiver.try_recv() {
+                Ok(Err(error)) => writer_error = Some(error),
+                Ok(Ok(())) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    writer_done = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(error) = writer_error.take() {
             let _ = child.kill();
             let _ = child.wait();
             return Err(error);
         }
-    }
-    if child.wait()?.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!("{program} exited non-zero")))
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !writer_done {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    match receiver.recv_timeout(remaining) {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => return Err(error),
+                        Err(_) => {
+                            return Err(std::io::Error::new(
+                                ErrorKind::TimedOut,
+                                format!("{program} exited before reading the text"),
+                            ))
+                        }
+                    }
+                }
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::other(format!("{program} exited non-zero")))
+                };
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                format!("{program} did not accept the text in time"),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -97,6 +171,31 @@ mod tests {
         // `false` exists on every platform here and always exits 1 — what a broken clipboard program looks like.
         let error = write("false", &[], "text").unwrap_err();
         assert_ne!(error.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_helper_that_never_reads_is_killed_at_the_deadline() {
+        let started = Instant::now();
+        let error = write_within("sleep", &["5"], "text", Duration::from_millis(50)).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_full_pipe_is_killed_at_the_deadline() {
+        let started = Instant::now();
+        let text = "x".repeat(1024 * 1024);
+        let error = write_within(
+            "sh",
+            &["-c", "exec sleep 5"],
+            &text,
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

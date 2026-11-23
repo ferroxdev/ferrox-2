@@ -6,7 +6,9 @@ use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::expand::ProjectState;
 use crate::markdown::{Effort, Library, Prompt, Status};
+use crate::state::MethodRow;
 
 /// Whether the advisor may offer a prompt, and if not, why.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,19 +73,7 @@ pub fn next_index(
 ) -> Result<usize, String> {
     let ready = ranked(library, effort);
     if ready.is_empty() {
-        return Err(match effort {
-            Some(wanted) => format!(
-                "no prompt is ready at {} effort; the roadmap has {} open prompt(s) but none \
-                 are unblocked",
-                wanted.as_str(),
-                library
-                    .prompts
-                    .iter()
-                    .filter(|prompt| prompt.is_open())
-                    .count()
-            ),
-            None => "no prompt is ready: every open one is waiting on a dependency".to_owned(),
-        });
+        return Err(no_ready_reason(library));
     }
     let available: Vec<usize> = ready
         .iter()
@@ -105,6 +95,53 @@ pub fn next_index(
     }
 }
 
+/// Why `ranked` is empty: a dependency, a started slice, a filter, or a finished roadmap are different answers.
+fn no_ready_reason(library: &Library) -> String {
+    let open: Vec<&Prompt> = library
+        .prompts
+        .iter()
+        .filter(|prompt| prompt.is_open())
+        .collect();
+    let ready = ranked(library, None);
+    if open.is_empty() {
+        return "no prompt is ready: every prompt is done, so the roadmap has nothing left to \
+                hand over"
+            .to_owned();
+    }
+    let unblocked = ready.len();
+    if unblocked > 0 {
+        return format!(
+            "no prompt is ready at the requested effort; {unblocked} unblocked prompt(s) are at \
+             another effort, so drop --effort or ask for one of theirs"
+        );
+    }
+    let started = open
+        .iter()
+        .filter(|prompt| prompt.status == Status::Doing)
+        .count();
+    let blocked = open
+        .iter()
+        .filter(|prompt| prompt.status == Status::Blocked)
+        .count();
+    let waiting = open.len() - started - blocked;
+    if waiting == open.len() {
+        return "no prompt is ready: every open one is waiting on a dependency".to_owned();
+    }
+    if started == open.len() {
+        return "no prompt is ready: every open one is already started, so finish one before \
+                drawing another"
+            .to_owned();
+    }
+    if blocked == open.len() {
+        return "no prompt is ready: every open one is blocked on something outside the roadmap"
+            .to_owned();
+    }
+    format!(
+        "no prompt is ready: {waiting} waiting on a dependency, {started} already started and \
+         {blocked} blocked outside the roadmap"
+    )
+}
+
 /// A ready prompt the advisor left out, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skipped {
@@ -112,54 +149,157 @@ pub struct Skipped {
     pub id: u32,
     /// The inputs it needs and nobody supplied.
     pub missing: Vec<String>,
+    /// A requested add-on this prompt cannot resolve; `missing` is empty when this is set.
+    pub problem: Option<String>,
 }
 
-/// Ready prompts with every required input supplied; one with a hole is skipped, not handed over, unless `allow_unfilled`.
+/// What the caller supplied and the row it named, the two sources `missing_inputs` checks before a prompt is handed over.
+#[derive(Debug, Clone, Copy)]
+pub struct Inputs<'a> {
+    /// Values given with `--set`.
+    pub supplied: &'a BTreeMap<String, String>,
+    /// The row named with `--row`, which may supply a matrix blank even when parked.
+    pub named: Option<&'a MethodRow>,
+}
+
+impl<'a> Inputs<'a> {
+    /// Inputs from explicit values and an optional named row.
+    #[must_use]
+    pub const fn new(supplied: &'a BTreeMap<String, String>, named: Option<&'a MethodRow>) -> Self {
+        Self { supplied, named }
+    }
+}
+
+/// The matrix and history readiness reads together.
+#[derive(Debug, Clone, Copy)]
+pub struct Context<'a> {
+    /// The matrix rows a prompt can draw.
+    pub state: &'a ProjectState,
+    /// What this template has already been handed.
+    pub ledger: &'a Ledger,
+}
+
+/// Ready prompts with every required input supplied; one with a hole or an unknown add-on is skipped, not handed over.
 pub fn handable<'a>(
     library: &'a Library,
     effort: Option<Effort>,
     exclude: &[u32],
     requested_addons: &[String],
-    supplied: &BTreeMap<String, String>,
+    inputs: Inputs<'_>,
+    context: Context<'_>,
     allow_unfilled: bool,
 ) -> (Vec<&'a Prompt>, Vec<Skipped>) {
+    let state = context.state;
+    let ledger = context.ledger;
     let mut ready = Vec::new();
     let mut skipped = Vec::new();
-    let mut unresolved = Vec::new();
     for index in ranked(library, effort) {
         let prompt = &library.prompts[index];
         if exclude.contains(&prompt.id) {
             continue;
         }
+        if inputs
+            .named
+            .is_some_and(|row| !crate::expand::row_fits(row, prompt.targets))
+        {
+            continue;
+        }
+        let addons = match crate::render::resolve_addons(prompt, requested_addons) {
+            Ok(addons) => addons,
+            Err(problem) => {
+                skipped.push(Skipped {
+                    id: prompt.id,
+                    missing: Vec::new(),
+                    problem: Some(problem),
+                });
+                continue;
+            }
+        };
+        let served = ledger.targets_for(prompt.id);
         if !allow_unfilled {
-            let inputs: Vec<String> =
-                if let Ok(addons) = crate::render::resolve_addons(prompt, requested_addons) {
-                    prompt
-                        .required_inputs_for(&addons)
-                        .map(str::to_owned)
-                        .collect()
-                } else {
-                    unresolved.push(prompt);
-                    continue;
-                };
-            let missing: Vec<String> = inputs
-                .into_iter()
-                .filter(|name| !supplied.contains_key(name))
-                .collect();
+            let missing = missing_inputs(prompt, &addons, inputs, state, &served);
             if !missing.is_empty() {
                 skipped.push(Skipped {
                     id: prompt.id,
                     missing,
+                    problem: None,
                 });
                 continue;
             }
         }
+        // A named row is explicit retry guidance; automatic readiness must have a row `next` can draw.
+        if inputs.named.is_none()
+            && prompt.targets.is_matrix()
+            && crate::expand::next_target(
+                prompt,
+                state,
+                &served,
+                &addons,
+                inputs.supplied,
+                allow_unfilled,
+            )
+            .is_none()
+        {
+            continue;
+        }
         ready.push(prompt);
     }
-    if ready.is_empty() {
-        ready.append(&mut unresolved);
-    }
     (ready, skipped)
+}
+
+/// The inputs neither supplied nor already available from the row `next` would draw, or the pin file.
+pub fn missing_inputs(
+    prompt: &Prompt,
+    addons: &[crate::markdown::Addon],
+    inputs: Inputs<'_>,
+    state: &ProjectState,
+    served: &[String],
+) -> Vec<String> {
+    let fills = retry_row(prompt, state, served, inputs.named, addons, inputs.supplied)
+        .map(|row| crate::expand::fill(prompt, row, &state.pins));
+    let references = !state.references().is_empty();
+    prompt
+        .required_inputs_for(addons)
+        .filter(|name| !inputs.supplied.contains_key(*name))
+        .filter(|name| !(*name == "references" && references))
+        .filter(|name| {
+            !fills
+                .as_ref()
+                .is_some_and(|values| *name != "references" && values.contains_key(*name))
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The row a retry names: the asked-for row, else the next unserved drawable row, else a fallback to repeat.
+pub fn retry_row<'a>(
+    prompt: &Prompt,
+    state: &'a ProjectState,
+    served: &[String],
+    named: Option<&'a MethodRow>,
+    addons: &[crate::markdown::Addon],
+    supplied: &BTreeMap<String, String>,
+) -> Option<&'a MethodRow> {
+    let candidates = state.candidates(prompt.targets);
+    named
+        .filter(|row| crate::expand::row_fits(row, prompt.targets))
+        .or_else(|| {
+            crate::expand::next_target(prompt, state, served, addons, supplied, false)
+                .map(|(row, _)| row)
+        })
+        .or_else(|| {
+            candidates
+                .iter()
+                .copied()
+                .find(|row| row.gap.is_drawable() && !served.contains(&row.key()))
+        })
+        .or_else(|| {
+            candidates.iter().copied().find(|row| {
+                row.gap.is_drawable()
+                    && crate::expand::fills_required(prompt, row, &state.pins, addons, supplied)
+            })
+        })
+        .or_else(|| candidates.iter().copied().find(|row| row.gap.is_drawable()))
 }
 
 /// A prompt drawn from `candidates` at random by `**Random weight:**`, deterministic in `seed` so a draw reproduces.
@@ -234,6 +374,67 @@ fn split_mix(seed: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// The UTC timestamp shape `now_utc` emits; a framed record with anything else is corrupt history.
+fn valid_at(at: &str) -> bool {
+    let bytes = at.as_bytes();
+    if bytes.len() != 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'Z'
+    {
+        return false;
+    }
+    let digits = [0..4, 5..7, 8..10, 11..13, 14..16, 17..19]
+        .iter()
+        .all(|range| bytes[range.clone()].iter().all(u8::is_ascii_digit));
+    if !digits {
+        return false;
+    }
+    let number = |range: std::ops::Range<usize>| at[range].parse::<u32>().ok();
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
+        number(0..4),
+        number(5..7),
+        number(8..10),
+        number(11..13),
+        number(14..16),
+        number(17..19),
+    ) else {
+        return false;
+    };
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=days).contains(&day) && hour < 24 && minute < 60 && second < 60
+}
+
+/// A `how` field the framed form can carry without changing the record's meaning.
+fn valid_how(how: &str) -> bool {
+    !how.trim().is_empty()
+        && !how.contains('\n')
+        && !how.contains('\r')
+        && !how.contains(" t=")
+        && !how.contains('\u{1e}')
+}
+
+/// A matrix key the framed form can carry: a section letter and a numeric id, so `garbage` cannot suppress a real row.
+fn valid_target(key: &str) -> bool {
+    let mut chars = key.chars();
+    let Some(section) = chars.next() else {
+        return false;
+    };
+    section.is_ascii_uppercase()
+        && chars.next().is_some_and(|first| first.is_ascii_digit())
+        && chars.all(|character| character.is_ascii_alphanumeric())
+}
+
 /// One recorded handout: when, which slice, how it was asked for, and the matrix row it was served against.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -292,6 +493,21 @@ impl Ledger {
             if line.trim().is_empty() {
                 continue;
             }
+            let framed = line.starts_with('\u{1e}');
+            let line = match line.strip_prefix('\u{1e}') {
+                Some(rest) => {
+                    let Some(body) = rest.strip_suffix('\u{1e}') else {
+                        ledger.skipped += 1;
+                        continue;
+                    };
+                    body
+                }
+                None => line,
+            };
+            if line.contains('\u{1e}') {
+                ledger.skipped += 1;
+                continue;
+            }
             let mut fields = line.splitn(3, ' ');
             let (Some(at), Some(id)) = (fields.next(), fields.next()) else {
                 ledger.skipped += 1;
@@ -310,14 +526,16 @@ impl Ledger {
                 .strip_prefix('P')
                 .or_else(|| id.strip_prefix('p'))
                 .and_then(|rest| rest.parse::<u32>().ok());
-            match parsed {
-                Some(id) => ledger.entries.push(Entry {
+            let valid = target.as_deref().is_none_or(valid_target)
+                && (!framed || (valid_at(at) && valid_how(how)));
+            match (parsed, valid) {
+                (Some(id), true) => ledger.entries.push(Entry {
                     at: at.to_owned(),
                     id,
                     how: how.to_owned(),
                     target,
                 }),
-                None => ledger.skipped += 1,
+                _ => ledger.skipped += 1,
             }
         }
         ledger
@@ -325,6 +543,19 @@ impl Ledger {
 
     /// Append one handout; a ledger that cannot be written is worth a warning, not a lost prompt.
     pub fn record(&mut self, id: u32, how: &str, target: Option<&str>) -> std::io::Result<()> {
+        let invalid = |field: &str| std::io::Error::new(std::io::ErrorKind::InvalidInput, field);
+        if !valid_how(how) {
+            return Err(invalid(
+                "`how` must be non-empty and free of a line break, ` t=` and the frame delimiter",
+            ));
+        }
+        if let Some(key) = target {
+            if !valid_target(key) {
+                return Err(invalid(
+                    "a target key must be a section letter and a numeric id, like A13",
+                ));
+            }
+        }
         let entry = Entry {
             at: now_utc(),
             id,
@@ -335,8 +566,11 @@ impl Ledger {
             std::fs::create_dir_all(parent)?;
         }
         let line = match &entry.target {
-            Some(key) => format!("{} P{} {} t={key}\n", entry.at, entry.id, entry.how),
-            None => format!("{} P{} {}\n", entry.at, entry.id, entry.how),
+            Some(key) => format!(
+                "\u{1e}{} P{} {} t={key}\u{1e}\n",
+                entry.at, entry.id, entry.how
+            ),
+            None => format!("\u{1e}{} P{} {}\u{1e}\n", entry.at, entry.id, entry.how),
         };
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -344,15 +578,29 @@ impl Ledger {
             .read(true)
             .open(&self.path)?;
         let len = file.metadata()?.len();
-        if len != 0 {
-            file.seek(SeekFrom::End(-1))?;
-            let mut last = [0u8; 1];
-            file.read_exact(&mut last)?;
-            if last[0] != b'\n' {
-                file.write_all(b"\n")?;
+        let appended = (|| {
+            if len != 0 {
+                file.seek(SeekFrom::End(-1))?;
+                let mut last = [0u8; 1];
+                file.read_exact(&mut last)?;
+                if last[0] != b'\n' {
+                    file.write_all(b"\n")?;
+                }
             }
+            file.write_all(line.as_bytes())
+        })();
+        if let Err(error) = appended {
+            return Err(match file.set_len(len) {
+                Ok(()) => error,
+                Err(_) => std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "{error}; could not remove the partial frame from {} at byte {len}",
+                        self.path.display()
+                    ),
+                ),
+            });
         }
-        file.write_all(line.as_bytes())?;
         self.entries.push(entry);
         Ok(())
     }
@@ -441,9 +689,53 @@ mod tests {
 
     use super::*;
     use crate::markdown::Library;
+    use crate::state::Gap;
+
+    /// A directory of its own under the system temp dir, removed when the test ends.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "ferrox-prompt-ledger-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&path).expect("scratch");
+            Self(path)
+        }
+
+        fn path(&self, name: &str) -> std::path::PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
 
     fn load(text: &str) -> Library {
         Library::parse(Path::new("prompts.md"), text)
+    }
+
+    fn row(index: &str, state: &str) -> MethodRow {
+        MethodRow {
+            section: 'A',
+            index: index.to_owned(),
+            method: "m".to_owned(),
+            state: state.to_owned(),
+            implemented: false,
+            gap: Gap::Planned,
+            high_priority: false,
+            page: "docs/function/m.md".to_owned(),
+            real_page: false,
+            text: "m".to_owned(),
+        }
     }
 
     /// P1 done; P2, P3, P4 ready; P5 waiting on P3; P6 deferred.
@@ -576,6 +868,200 @@ b
     }
 
     #[test]
+    fn an_empty_ready_set_names_whether_work_is_started_blocked_or_finished() {
+        let started = load(
+            "## Shared protocol\n\n```text\np\n```\n\n## P1 · Started\n\n**When to use:** now\n\
+             **Status:** doing\n**Leverage:** 1\n**Effort:** small\n**Targets:** none\n\
+             **Gates:** `cargo test`\n\n```text\nb\n```\n",
+        );
+        let error = next_index(&started, None, &[]).unwrap_err();
+        assert!(error.contains("already started"), "{error}");
+        assert!(!error.contains("waiting on a dependency"), "{error}");
+
+        let blocked = load(
+            "## Shared protocol\n\n```text\np\n```\n\n## P1 · Blocked\n\n**When to use:** now\n\
+             **Status:** todo\n**Leverage:** 1\n**Effort:** small\n**Targets:** none\n\
+             **Gates:** `cargo test`\n**Depends on:** P9\n\n```text\nb\n```\n",
+        );
+        let error = next_index(&blocked, None, &[]).unwrap_err();
+        assert!(error.contains("waiting on a dependency"), "{error}");
+
+        let done = load(
+            "## Shared protocol\n\n```text\np\n```\n\n## P1 · Done\n\n**When to use:** now\n\
+             **Status:** done\n**Leverage:** 1\n**Effort:** small\n**Targets:** none\n\
+             **Gates:** `cargo test`\n\n```text\nb\n```\n",
+        );
+        let blocked = load(
+            "## Shared protocol\n\n```text\np\n```\n\n## P1 · Blocked\n\n**When to use:** now\n\
+             **Status:** blocked\n**Leverage:** 1\n**Effort:** small\n**Targets:** none\n\
+             **Gates:** `cargo test`\n\n```text\nb\n```\n",
+        );
+        let error = next_index(&blocked, None, &[]).unwrap_err();
+        assert!(
+            error.contains("blocked on something outside the roadmap"),
+            "{error}"
+        );
+        assert!(!error.contains("already started"), "{error}");
+
+        let error = next_index(&done, None, &[]).unwrap_err();
+        assert!(error.contains("nothing left"), "{error}");
+    }
+
+    #[test]
+    fn an_empty_state_cell_does_not_fill_a_required_state() {
+        let library = load(
+            "## Shared protocol\n\n```text\np\n```\n\n## P1 · Open row\n\n**When to use:** now\n\
+             **Status:** todo\n**Leverage:** 1\n**Effort:** small\n**Targets:** open\n\
+             **Gates:** `cargo test`\n\n```text\nship {state}\n```\n",
+        );
+        let prompt = library.prompt(1).unwrap();
+        let empty = ProjectState {
+            methods: vec![row("1", "")],
+            pins: Vec::new(),
+        };
+        let supplied = BTreeMap::new();
+        assert_eq!(
+            missing_inputs(prompt, &[], Inputs::new(&supplied, None), &empty, &[]),
+            ["state"]
+        );
+        let (ready, skipped) = handable(
+            &library,
+            None,
+            &[],
+            &[],
+            Inputs::new(&supplied, None),
+            Context {
+                state: &empty,
+                ledger: &Ledger::default(),
+            },
+            false,
+        );
+        assert!(ready.is_empty(), "{ready:?}");
+        assert_eq!(skipped[0].missing, ["state"]);
+
+        let filled = ProjectState {
+            methods: vec![row("1", "planned")],
+            pins: Vec::new(),
+        };
+        assert_eq!(
+            missing_inputs(prompt, &[], Inputs::new(&supplied, None), &filled, &[]),
+            Vec::<String>::new()
+        );
+
+        let mixed = ProjectState {
+            methods: vec![row("1", ""), row("2", "planned")],
+            pins: Vec::new(),
+        };
+        assert_eq!(
+            missing_inputs(prompt, &[], Inputs::new(&supplied, None), &mixed, &[]),
+            Vec::<String>::new()
+        );
+        let (target, _) =
+            crate::expand::next_target(prompt, &mixed, &[], &[], &BTreeMap::new(), false)
+                .expect("a usable row");
+        assert_eq!(target.state, "planned");
+
+        let served_usable = ProjectState {
+            methods: vec![row("1", "planned"), row("2", "")],
+            pins: Vec::new(),
+        };
+        assert_eq!(
+            missing_inputs(
+                prompt,
+                &[],
+                Inputs::new(&supplied, None),
+                &served_usable,
+                &["A1".to_owned()]
+            ),
+            ["state"]
+        );
+
+        let served_empty = ProjectState {
+            methods: vec![row("1", ""), row("2", "planned")],
+            pins: Vec::new(),
+        };
+        assert_eq!(
+            missing_inputs(
+                prompt,
+                &[],
+                Inputs::new(&supplied, None),
+                &served_empty,
+                &["A1".to_owned()]
+            ),
+            Vec::<String>::new()
+        );
+
+        let supplied_state = BTreeMap::from([("state".to_owned(), "planned".to_owned())]);
+        assert_eq!(
+            missing_inputs(prompt, &[], Inputs::new(&supplied_state, None), &empty, &[]),
+            Vec::<String>::new()
+        );
+        let (target, _) =
+            crate::expand::next_target(prompt, &empty, &[], &[], &supplied_state, false)
+                .expect("a supplied input makes the row eligible");
+        assert_eq!(target.state, "");
+    }
+
+    #[test]
+    fn a_served_only_row_does_not_make_a_prompt_handable() {
+        let library = load(
+            "## Shared protocol\n\n```text\np\n```\n\n## P1 · Open row\n\n**When to use:** now\n\
+             **Status:** todo\n**Leverage:** 1\n**Effort:** small\n**Targets:** open\n\
+             **Gates:** `cargo test`\n\n```text\nship {state}\n```\n",
+        );
+        let supplied = BTreeMap::new();
+        let only_served = ProjectState {
+            methods: vec![row("1", "planned")],
+            pins: Vec::new(),
+        };
+        let served_ledger = Ledger {
+            entries: vec![Entry {
+                at: "2026-10-02T00:00:00Z".to_owned(),
+                id: 1,
+                how: "next".to_owned(),
+                target: Some("A1".to_owned()),
+            }],
+            ..Ledger::default()
+        };
+        let (ready, _) = handable(
+            &library,
+            None,
+            &[],
+            &[],
+            Inputs::new(&supplied, None),
+            Context {
+                state: &only_served,
+                ledger: &served_ledger,
+            },
+            false,
+        );
+        assert!(ready.is_empty(), "{ready:?}");
+    }
+
+    #[test]
+    fn a_selected_addon_gates_row_eligibility() {
+        let library = load(
+            "## Shared protocol\n\n```text\np\n```\n\n## P1 · Open row\n\n**When to use:** now\n\
+             **Status:** todo\n**Leverage:** 1\n**Effort:** small\n**Targets:** open\n\
+             **Gates:** `cargo test`\n\n```text\nship {method}\n```\n\n\
+             **Add-on — Needs state:** {state}\n",
+        );
+        let prompt = library.prompt(1).unwrap();
+        let state = ProjectState {
+            methods: vec![row("1", ""), row("2", "planned")],
+            pins: Vec::new(),
+        };
+        let supplied = BTreeMap::new();
+        let (without, _) = crate::expand::next_target(prompt, &state, &[], &[], &supplied, false)
+            .expect("the base body only needs the method");
+        assert_eq!(without.index, "1");
+        let (with, _) =
+            crate::expand::next_target(prompt, &state, &[], &prompt.addons, &supplied, false)
+                .expect("the second row supplies the add-on state");
+        assert_eq!(with.index, "2");
+    }
+
+    #[test]
     fn rotation_is_deterministic_for_a_seed_and_respects_weights() {
         let library = library();
         // P2 has weight 0, so rotation never draws it even though it tops the ranking.
@@ -626,7 +1112,18 @@ run it
 ```
 ",
         );
-        let (ready, skipped) = handable(&library, None, &[], &[], &BTreeMap::new(), false);
+        let (ready, skipped) = handable(
+            &library,
+            None,
+            &[],
+            &[],
+            Inputs::new(&BTreeMap::new(), None),
+            Context {
+                state: &ProjectState::default(),
+                ledger: &Ledger::default(),
+            },
+            false,
+        );
         assert_eq!(
             ready.iter().map(|prompt| prompt.id).collect::<Vec<_>>(),
             vec![2]
@@ -635,20 +1132,100 @@ run it
             skipped,
             vec![Skipped {
                 id: 1,
-                missing: vec!["scope".to_owned()]
+                missing: vec!["scope".to_owned()],
+                problem: None
             }]
         );
         // With the value supplied it becomes the top pick again.
         let supplied = BTreeMap::from([("scope".to_owned(), "crates/**".to_owned())]);
-        let (ready, skipped) = handable(&library, None, &[], &[], &supplied, false);
+        let (ready, skipped) = handable(
+            &library,
+            None,
+            &[],
+            &[],
+            Inputs::new(&supplied, None),
+            Context {
+                state: &ProjectState::default(),
+                ledger: &Ledger::default(),
+            },
+            false,
+        );
         assert_eq!(
             ready.iter().map(|prompt| prompt.id).collect::<Vec<_>>(),
             vec![1, 2]
         );
         assert_eq!(skipped, Vec::<Skipped>::new());
         // And with `--allow-unfilled` it was never skipped at all.
-        let (ready, skipped) = handable(&library, None, &[], &[], &BTreeMap::new(), true);
+        let (ready, skipped) = handable(
+            &library,
+            None,
+            &[],
+            &[],
+            Inputs::new(&BTreeMap::new(), None),
+            Context {
+                state: &ProjectState::default(),
+                ledger: &Ledger::default(),
+            },
+            true,
+        );
         assert_eq!(ready.len(), 2);
+        assert_eq!(skipped, Vec::<Skipped>::new());
+    }
+
+    #[test]
+    fn a_named_row_does_not_skip_unrelated_templates() {
+        let library = load(
+            "\
+## Shared protocol
+
+```text
+p
+```
+
+## P1 · Fixed issue
+
+**When to use:** a regression
+**Status:** todo
+**Leverage:** 5
+**Effort:** small
+**Targets:** none
+**Gates:** `cargo test`
+
+```text
+fix {issue}
+```
+
+## P2 · Open row
+
+**When to use:** an open row
+**Status:** todo
+**Leverage:** 4
+**Effort:** small
+**Targets:** open
+**Gates:** `cargo test`
+
+```text
+ship it
+```
+",
+        );
+        let row = row("13", "planned");
+        let (ready, skipped) = handable(
+            &library,
+            None,
+            &[],
+            &[],
+            Inputs::new(&BTreeMap::new(), Some(&row)),
+            Context {
+                state: &ProjectState::default(),
+                ledger: &Ledger::default(),
+            },
+            false,
+        );
+        assert_eq!(
+            ready.iter().map(|prompt| prompt.id).collect::<Vec<_>>(),
+            vec![2]
+        );
         assert_eq!(skipped, Vec::<Skipped>::new());
     }
 
@@ -679,17 +1256,38 @@ run {core}
 ",
         );
         let supplied = BTreeMap::from([("core".to_owned(), "x".to_owned())]);
-        let (ready, skipped) = handable(&library, None, &[], &[], &supplied, false);
+        let (ready, skipped) = handable(
+            &library,
+            None,
+            &[],
+            &[],
+            Inputs::new(&supplied, None),
+            Context {
+                state: &ProjectState::default(),
+                ledger: &Ledger::default(),
+            },
+            false,
+        );
         assert_eq!(ready.len(), 1);
         assert_eq!(skipped, Vec::<Skipped>::new());
-        let (ready, skipped) =
-            handable(&library, None, &[], &["extra".to_owned()], &supplied, false);
+        let (ready, skipped) = handable(
+            &library,
+            None,
+            &[],
+            &["extra".to_owned()],
+            Inputs::new(&supplied, None),
+            Context {
+                state: &ProjectState::default(),
+                ledger: &Ledger::default(),
+            },
+            false,
+        );
         assert_eq!(ready.len(), 0);
         assert_eq!(skipped[0].missing, vec!["extra".to_owned()]);
     }
 
     #[test]
-    fn an_unknown_addon_reaches_the_addon_error_instead_of_an_empty_handout() {
+    fn an_unknown_addon_is_not_handed_over_just_to_fail_in_render() {
         let library = load(
             "\
 ## Shared protocol
@@ -719,12 +1317,19 @@ run {core}
             None,
             &[],
             &["nope".to_owned()],
-            &BTreeMap::new(),
+            Inputs::new(&BTreeMap::new(), None),
+            Context {
+                state: &ProjectState::default(),
+                ledger: &Ledger::default(),
+            },
             false,
         );
-        assert_eq!(ready.len(), 1);
-        assert_eq!(skipped, Vec::<Skipped>::new());
-        let error = crate::render::resolve_addons(ready[0], &["nope".to_owned()]).unwrap_err();
+        assert!(ready.is_empty());
+        assert_eq!(skipped.len(), 1);
+        let problem = skipped[0].problem.as_deref().expect("the add-on error");
+        assert!(problem.contains("no add-on matching `nope`"), "{problem}");
+        let error = crate::render::resolve_addons(library.prompt(1).unwrap(), &["nope".to_owned()])
+            .unwrap_err();
         assert!(error.contains("no add-on matching `nope`"), "{error}");
     }
 
@@ -767,7 +1372,18 @@ b
 ```
 ",
         );
-        let (ready, _) = handable(&library, None, &[], &[], &BTreeMap::new(), false);
+        let (ready, _) = handable(
+            &library,
+            None,
+            &[],
+            &[],
+            Inputs::new(&BTreeMap::new(), None),
+            Context {
+                state: &ProjectState::default(),
+                ledger: &Ledger::default(),
+            },
+            false,
+        );
         for seed in 0..30 {
             assert_eq!(rotate_among(&ready, seed).unwrap().id, 2);
         }
@@ -806,9 +1422,8 @@ b
 
     #[test]
     fn the_ledger_remembers_and_suppresses() {
-        let mut path = std::env::temp_dir();
-        path.push(format!("ferrox-ledger-{}.log", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let scratch = Scratch::new("memory");
+        let path = scratch.path("ledger.log");
         let mut ledger = Ledger::load(path.clone());
         assert_eq!(ledger.entries, []);
         ledger.record(2, "next", None).unwrap();
@@ -828,13 +1443,12 @@ b
         assert_eq!(reread.targets_for(3), vec!["A13"]);
         drop(ledger);
         drop(reread);
-        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
     fn an_unterminated_ledger_is_not_joined_by_the_next_record() {
-        let mut path = std::env::temp_dir();
-        path.push(format!("ferrox-ledger-open-{}.log", std::process::id()));
+        let scratch = Scratch::new("open");
+        let path = scratch.path("ledger.log");
         std::fs::write(&path, "2026-10-02T00:00:00Z P2 next").unwrap();
         let mut ledger = Ledger::load(path.clone());
         ledger.record(3, "next", Some("A13")).unwrap();
@@ -843,13 +1457,12 @@ b
         assert_eq!(reread.skipped, 0);
         assert_eq!(reread.targets_for(2), Vec::<String>::new());
         assert_eq!(reread.targets_for(3), vec!["A13"]);
-        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
     fn a_corrupt_ledger_line_is_counted_not_obeyed() {
-        let mut path = std::env::temp_dir();
-        path.push(format!("ferrox-ledger-bad-{}.log", std::process::id()));
+        let scratch = Scratch::new("bad");
+        let path = scratch.path("ledger.log");
         std::fs::write(
             &path,
             "2026-10-02T00:00:00Z P2 next\nnonsense\n\n2026-10-02T00:00:01Z Pthree render\n",
@@ -858,14 +1471,12 @@ b
         let ledger = Ledger::load(path.clone());
         assert_eq!(ledger.entries.len(), 1);
         assert_eq!(ledger.skipped, 2);
-        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
     fn the_ledger_keeps_the_whole_how_field() {
-        let mut path = std::env::temp_dir();
-        path.push(format!("ferrox-ledger-how-{}.log", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let scratch = Scratch::new("how");
+        let path = scratch.path("ledger.log");
         let mut ledger = Ledger::load(path.clone());
         ledger.record(2, "next --rotate", Some("A13")).unwrap();
         ledger.record(3, "render --row", None).unwrap();
@@ -873,20 +1484,114 @@ b
         assert_eq!(reread.entries[0].how, "next --rotate");
         assert_eq!(reread.entries[1].how, "render --row");
         assert_eq!(reread.targets_for(2), vec!["A13"]);
-        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_new_record_is_framed_and_a_truncated_frame_is_not_trusted() {
+        let scratch = Scratch::new("frame");
+        let path = scratch.path("ledger.log");
+        let mut ledger = Ledger::load(path.clone());
+        ledger.record(3, "next --rotate", Some("A13")).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.starts_with('\u{1e}') && text.contains("\u{1e}\n"),
+            "{text:?}"
+        );
+
+        std::fs::write(&path, format!("{text}\u{1e}2026-10-02T00:00:02Z P4 render")).unwrap();
+        let reread = Ledger::load(path.clone());
+        assert_eq!(reread.entries.len(), 1);
+        assert_eq!(reread.skipped, 1);
+    }
+
+    #[test]
+    fn a_framed_record_with_an_invalid_timestamp_is_not_history() {
+        let scratch = Scratch::new("bad-time");
+        let path = scratch.path("ledger.log");
+        std::fs::write(
+            &path,
+            "\u{1e}not-a-time P2 next\u{1e}\n\
+             \u{1e}2026-13-02T00:00:00Z P2 next\u{1e}\n\
+             \u{1e}2026-10-02T24:00:00Z P2 next\u{1e}\n",
+        )
+        .unwrap();
+        let ledger = Ledger::load(path);
+        assert_eq!(ledger.entries, Vec::<Entry>::new());
+        assert_eq!(ledger.skipped, 3);
+    }
+
+    #[test]
+    fn a_framed_record_with_an_empty_target_is_not_history() {
+        let scratch = Scratch::new("empty-target");
+        let path = scratch.path("ledger.log");
+        std::fs::write(&path, "\u{1e}2026-10-02T00:00:00Z P2 next t=\u{1e}\n").unwrap();
+        let ledger = Ledger::load(path.clone());
+        assert_eq!(ledger.entries, Vec::<Entry>::new());
+        assert_eq!(ledger.skipped, 1);
+    }
+
+    #[test]
+    fn a_framed_record_with_a_whitespace_action_is_not_history() {
+        let scratch = Scratch::new("blank-how");
+        let path = scratch.path("ledger.log");
+        std::fs::write(&path, "\u{1e}2026-10-02T00:00:00Z P2   \u{1e}\n").unwrap();
+        let ledger = Ledger::load(path.clone());
+        assert_eq!(ledger.entries, Vec::<Entry>::new());
+        assert_eq!(ledger.skipped, 1);
+    }
+
+    #[test]
+    fn a_framed_target_must_be_a_matrix_key() {
+        let scratch = Scratch::new("bad-target");
+        let path = scratch.path("ledger.log");
+        std::fs::write(
+            &path,
+            "\u{1e}2026-10-02T00:00:00Z P2 next t=garbage\u{1e}\n\
+             \u{1e}2026-10-02T00:00:01Z P2 next t=A61b\u{1e}\n\
+             \u{1e}2026-10-02T00:00:02Z P2 next t=A\u{1e}\n\
+             \u{1e}2026-10-02T00:00:03Z P2 next t=13A\u{1e}\n",
+        )
+        .unwrap();
+        let ledger = Ledger::load(path);
+        assert_eq!(ledger.entries.len(), 1);
+        assert_eq!(ledger.entries[0].target.as_deref(), Some("A61b"));
+        assert_eq!(ledger.skipped, 3);
+    }
+
+    #[test]
+    fn an_unframed_record_with_an_empty_target_is_not_history() {
+        let scratch = Scratch::new("legacy-empty-target");
+        let path = scratch.path("ledger.log");
+        std::fs::write(&path, "2026-10-02T00:00:00Z P2 next t=\n").unwrap();
+        let ledger = Ledger::load(path.clone());
+        assert_eq!(ledger.entries, Vec::<Entry>::new());
+        assert_eq!(ledger.skipped, 1);
+    }
+
+    #[test]
+    fn a_field_that_would_break_the_frame_is_refused() {
+        let scratch = Scratch::new("fields");
+        let path = scratch.path("ledger.log");
+        let mut ledger = Ledger::load(path.clone());
+        assert!(ledger.record(2, "next\nP3 render", None).is_err());
+        assert!(ledger.record(2, "next\u{1e}P3 render", None).is_err());
+        assert!(ledger.record(2, "next t=P3", None).is_err());
+        assert!(ledger.record(2, "   ", None).is_err());
+        assert!(ledger.record(2, "next", Some("A13\nP3")).is_err());
+        assert!(ledger.record(2, "next", Some("A 13")).is_err());
+        assert!(ledger.record(2, "next", Some("garbage")).is_err());
+        assert!(ledger.record(2, "next", Some("A61b")).is_ok());
     }
 
     #[test]
     fn an_unreadable_ledger_is_an_error_and_a_bad_line_is_counted() {
-        let mut dir = std::env::temp_dir();
-        dir.push(format!("ferrox-ledger-dir-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = Scratch::new("unreadable");
+        let dir = scratch.path("dir");
         std::fs::create_dir_all(&dir).unwrap();
         let blocked = Ledger::load(dir.clone());
         assert!(blocked.read_error.is_some(), "a directory is not history");
 
-        let mut path = std::env::temp_dir();
-        path.push(format!("ferrox-ledger-utf8-{}.log", std::process::id()));
+        let path = scratch.path("utf8.log");
         std::fs::write(
             &path,
             b"2026-10-02T00:00:00Z P2 next\n\xff\n2026-10-02T00:00:01Z P3 next --rotate\n",
@@ -897,8 +1602,6 @@ b
         assert_eq!(ledger.skipped, 1);
         assert!(ledger.read_error.is_none());
         assert_eq!(ledger.entries[1].how, "next --rotate");
-        std::fs::remove_file(&path).unwrap();
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
