@@ -13877,6 +13877,23 @@ impl<T: Read> Half<T> {
     }
 }
 
+impl<T: LaneWrite> Write for Half<T> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.push(buf) {
+            Push::Took(n) => Ok(n),
+            Push::Parked => Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+            Push::Lost => Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.writer_lock() {
+            Ok(mut guard) => guard.flush(),
+            Err(_) => Err(std::io::Error::other("relay half poisoned")),
+        }
+    }
+}
+
 impl<T: LaneWrite> LaneWrite for Half<T> {
     fn push(&mut self, data: &[u8]) -> Push {
         match self.writer_lock() {
@@ -14099,7 +14116,7 @@ impl<W> Clone for HalfSink<W> {
     }
 }
 
-impl<W: LaneWrite> CarrierSink for HalfSink<W> {
+impl<W: LaneWrite + 'static> CarrierSink for HalfSink<W> {
     fn send(&self, bytes: &[u8]) -> bool {
         self.0.write_once(bytes).is_ok()
     }
