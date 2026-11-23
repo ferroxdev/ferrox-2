@@ -1,0 +1,101 @@
+name: ab-tuic-queues
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: -D warnings --cfg aes_armv8 --cfg polyval_armv8
+
+jobs:
+  ab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: upstream/pins.toml
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: benchmark-matrix
+      - uses: actions/download-artifact@v4
+        with:
+          name: upstream-trees
+          path: upstream
+          run-id: 45196402597
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: matrix-ferrox-ubuntu-latest
+          path: /tmp/base
+          run-id: 45196402597
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: build this branch and sing-box
+        shell: bash
+        env:
+          FERROX_UPSTREAM_HANDOFF: "1"
+        run: >
+          ./scripts/run-benchmark-matrix.sh
+          --tier standard
+          --out /tmp/build
+          --build-only
+          --engines ferrox,sing-box
+      - name: run each cell on both binaries
+        shell: bash
+        env:
+          FERROX_UPSTREAM_HANDOFF: "1"
+        run: |
+          chmod +x /tmp/base/ferrox-app /tmp/base/ferrox-bench target/release/ferrox-app target/release/ferrox-bench
+          for cell in tuic-raw-down-8 tuic-raw-duplex-8 tuic-raw-up-1; do
+            for side in base cand; do
+              if [[ "$side" == base ]]; then bin=/tmp/base/ferrox-app; else bin=target/release/ferrox-app; fi
+              ./scripts/run-benchmark-matrix.sh \
+                --tier standard \
+                --out "/tmp/ab/$cell-$side" \
+                --only "$cell" \
+                --repeats 5 \
+                --no-build \
+                --engines "ferrox=$bin,sing-box" || echo "$cell-$side exited $?"
+            done
+          done
+      - name: summarize
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import glob, json, statistics
+          sides = {}
+          for f in sorted(glob.glob('/tmp/ab/*/cells/*/cell.json')):
+              d = json.load(open(f))
+              side = 'cand' if '/cand/' in f else 'base'
+              cell = f.split('/')[3].rsplit('-', 1)[0]
+              server = f.split('/')[-2].split('--srv-')[-1]
+              med = {e['name']: statistics.median([r['throughput_mib_s'] for r in e['runs']]) for e in d['engines'] if e['runs']}
+              sides.setdefault(cell, {}).setdefault(server, {})[side] = med
+          print('| cell | server | base | cand | cand/base | base/sing | cand/sing |')
+          print('| --- | --- | ---: | ---: | ---: | ---: | ---: |')
+          for cell in ('tuic-raw-down-8', 'tuic-raw-duplex-8', 'tuic-raw-up-1'):
+              for server in ('ferrox', 'sing-box'):
+                  s = sides.get(cell, {}).get(server, {})
+                  b, c = s.get('base', {}), s.get('cand', {})
+                  if not b or not c:
+                      continue
+                  print(f"| {cell} | {server} | {b['ferrox']:.1f} | {c['ferrox']:.1f} | {c['ferrox']/b['ferrox']:.2f} | {b['ferrox']/b['sing-box']:.2f} | {c['ferrox']/c['sing-box']:.2f} |")
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ab-tuic-queues
+          path: /tmp/ab/
+          retention-days: 1
+          if-no-files-found: error
