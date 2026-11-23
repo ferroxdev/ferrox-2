@@ -39104,8 +39104,10 @@ impl LaneWrite for Connection {
     }
 
     fn settle(&mut self) -> Settle {
-        match self.flush_ready() {
+        let (written, outcome) = self.flush_ready_outcome();
+        match outcome {
             Ok(()) => Settle::Clear,
+            Err(error) if is_timeout(&error) && written > 0 => Settle::Advanced,
             Err(error) if is_timeout(&error) => Settle::Parked,
             Err(_) => Settle::Lost,
         }
@@ -39157,9 +39159,11 @@ pub(crate) enum Accepted {
     Lost,
 }
 
-/// What a settle found: the paced tail is empty, it still owes the socket bytes, or the carrier died.
+/// What a settle found: the paced tail is empty, it shrank but still owes the socket bytes, it made
+/// no progress on the bytes it still owes, or the carrier died.
 pub(crate) enum Settle {
     Clear,
+    Advanced,
     Parked,
     Lost,
 }
@@ -39323,7 +39327,7 @@ impl<S: ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send
         if out.bytes.len() >= PACED_TAIL {
             match out.settle() {
                 Settle::Clear => {}
-                Settle::Parked => return Accepted::Full,
+                Settle::Advanced | Settle::Parked => return Accepted::Full,
                 Settle::Lost => return Accepted::Lost,
             }
         }
@@ -39609,6 +39613,11 @@ fn settle_lane(uplink: &impl CarrierSink, at: &mut Forward) -> Option<Next> {
         Settle::Clear => {
             at.parked = None;
             None
+        }
+        Settle::Advanced => {
+            at.parked = None;
+            at.spins = 0;
+            Some(Next::Retry)
         }
         Settle::Parked => {
             let now = std::time::Instant::now();

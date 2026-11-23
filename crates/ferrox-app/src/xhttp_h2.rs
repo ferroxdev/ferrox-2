@@ -1669,12 +1669,15 @@ impl H2Conn {
         match batch.flush_ready(self, &mut **write) {
             crate::proxy::Accepted::All => Some(true),
             crate::proxy::Accepted::Full => {
-                if let Ok(mut conn) = self.send_conn.lock() {
-                    *conn = conn.saturating_add(total);
-                }
+                let mut conn = self
+                    .send_conn
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                *conn = conn.saturating_add(total);
                 if let Ok(mut window) = state.send_window.lock() {
                     *window = window.saturating_add(total_signed);
                 }
+                self.wake.notify_all();
                 None
             }
             crate::proxy::Accepted::Lost => Some(false),

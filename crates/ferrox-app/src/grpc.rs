@@ -1300,6 +1300,7 @@ impl<'a> Gather<'a> {
             match settled {
                 Settle::Clear => return true,
                 Settle::Lost => return false,
+                Settle::Advanced => {}
                 Settle::Parked => {
                     if Instant::now() >= deadline {
                         return false;
@@ -3171,7 +3172,7 @@ impl crate::proxy::FrameWrite for Tail {
         if self.at < self.bytes.len() {
             match self.drain() {
                 Settle::Lost => return Accepted::Lost,
-                Settle::Clear | Settle::Parked => {}
+                Settle::Clear | Settle::Advanced | Settle::Parked => {}
             }
         }
         if self.at < self.bytes.len() {

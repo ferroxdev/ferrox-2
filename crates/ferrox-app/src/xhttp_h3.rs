@@ -1173,6 +1173,9 @@ impl Write for ClientStream {
         let deadline = Instant::now() + crate::budgets::relay_stall();
         let mut rest = bytes::Bytes::copy_from_slice(buf);
         while !rest.is_empty() {
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::other("h3 stream send timed out"));
+            }
             let Ok(mut conn) = self.conn.lock() else {
                 return Err(std::io::Error::other("h3 connection lock poisoned"));
             };
@@ -1275,6 +1278,9 @@ impl ClientStream {
         let mut rest = buf;
         let mut sent = sent;
         while !rest.is_empty() {
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::other("h3 stream send timed out"));
+            }
             let Ok(mut conn) = self.conn.lock() else {
                 return Err(std::io::Error::other("h3 connection lock poisoned"));
             };
@@ -1287,9 +1293,6 @@ impl ClientStream {
             match conn.stream_send(self.id, rest, false) {
                 Ok(0) | Err(quiche::Error::Done) => {
                     drop(conn);
-                    if Instant::now() >= deadline {
-                        return Err(std::io::Error::other("h3 stream send timed out"));
-                    }
                     std::thread::sleep(POLL);
                 }
                 Ok(n) => {
@@ -1597,6 +1600,7 @@ impl H3Client {
         frames::quic_varint(&mut frame, block.len() as u64);
         frame.extend_from_slice(block);
         let mut writer = wire.clone();
+        let expiry = deadline;
         let deadline = deadline.unwrap_or_else(|| Instant::now() + crate::budgets::relay_stall());
         let sent = match writer.opening_start(&frame) {
             Ok(sent) => {
@@ -1621,7 +1625,9 @@ impl H3Client {
             wire.fin();
         }
         let mut reader = H3Reader::new(wire.clone());
-        reader.deadline = Some(deadline);
+        if expiry.is_some() {
+            reader.deadline = Some(deadline);
+        }
         Ok((reader, H3StreamOut { wire, owner: None }))
     }
 

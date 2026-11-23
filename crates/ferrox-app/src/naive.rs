@@ -919,6 +919,7 @@ impl Write for NaiveStream {
         loop {
             match self.settle() {
                 proxy::Settle::Clear => return Ok(done),
+                proxy::Settle::Advanced => {}
                 proxy::Settle::Lost => return Err(std::io::ErrorKind::BrokenPipe.into()),
                 proxy::Settle::Parked if Instant::now() >= deadline => {
                     return Err(std::io::ErrorKind::BrokenPipe.into());
@@ -2521,7 +2522,15 @@ fn header_pairs(node: &Json) -> Result<Option<Vec<(String, String)>>, String> {
                 "naive extra_headers `{name}` is not a valid HTTP field value"
             ));
         }
-        if name.eq_ignore_ascii_case("-connect-authority") {
+        if [
+            "-connect-authority",
+            "proxy-authorization",
+            "padding",
+            "-force-quic",
+        ]
+        .iter()
+        .any(|generated| name.eq_ignore_ascii_case(generated))
+        {
             return Err(format!(
                 "naive extra_headers `{name}` duplicates a generated CONNECT field"
             ));
@@ -3639,6 +3648,18 @@ mod tests {
         let authority =
             crate::json::parse(r#"{"-connect-authority": "other.test:443"}"#).expect("parses");
         assert!(header_pairs(&authority).is_err());
+        for (name, value) in [
+            ("Proxy-Authorization", "Basic eA=="),
+            ("Padding", "4"),
+            ("-force-quic", "true"),
+        ] {
+            let json = format!("{{\"{name}\": \"{value}\"}}");
+            let duplicate = crate::json::parse(&json).expect("parses");
+            assert!(
+                header_pairs(&duplicate).is_err(),
+                "{name} shadows a generated CONNECT field"
+            );
+        }
         let trailing = crate::json::parse(r#"{"X-Trace": "enabled "}"#).expect("parses");
         assert!(header_pairs(&trailing).is_err());
         let leading = crate::json::parse(r#"{"X-Trace": " enabled"}"#).expect("parses");

@@ -268,4 +268,4 @@ tuic  tuic::tests::a_full_packet_fits_one_command  ferrox_core::tuic::parse_pack
 # the relay reads a byte. The test's syscall table counts the descriptors the
 # split duplicates.
 reality-tls  proxy::tests::socks_tls_over_raw_reaches_echo  proxy::session_halves
-naive  xhttp_h2::tests::the_h2_lane_offer_costs_the_frame_batch_and_nothing_else  ferrox_app::xhttp_h2::H2Conn::try_send_one_ready
+naive  naive::tests::eight_writes_are_framed_then_raw  ferrox_app::naive::PaddingWrite::push

@@ -673,21 +673,25 @@ impl Masked {
     }
 
     /// Drain the chain's retained output without waiting, so a lane can park on it instead of stranding it behind an idle read.
-    fn flush_chain(&self) -> io::Result<()> {
+    fn flush_chain(&self) -> (usize, io::Result<()>) {
         let Ok(mut chain) = self.chain.lock() else {
-            return Err(io::Error::other("the mask chain is gone"));
+            return (0, Err(io::Error::other("the mask chain is gone")));
         };
         if chain.is_empty() {
-            return Ok(());
+            return (0, Ok(()));
         }
         #[cfg(unix)]
-        {
-            chain.flush(&mut ReadyWire(&self.stream))
-        }
+        let mut wire = CountingWrite {
+            inner: ReadyWire(&self.stream),
+            written: 0,
+        };
         #[cfg(not(unix))]
-        {
-            chain.flush(&mut &self.stream)
-        }
+        let mut wire = CountingWrite {
+            inner: &self.stream,
+            written: 0,
+        };
+        let outcome = chain.flush(&mut wire);
+        (wire.written, outcome)
     }
 
     /// Put the chain's retained output on the wire before a wait for the peer's answer.
@@ -1236,6 +1240,30 @@ impl std::io::Write for ReadyWire<'_> {
     }
 }
 
+/// Counts the bytes a chain puts on the socket, so a settle can tell a draining peer from a stalled one.
+struct CountingWrite<W> {
+    inner: W,
+    written: usize,
+}
+
+impl<W: Write> Write for CountingWrite<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.written += written;
+        Ok(written)
+    }
+
+    fn write_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> io::Result<usize> {
+        let written = self.inner.write_vectored(bufs)?;
+        self.written += written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 impl Connection {
     /// One relay write that never waits: a socket with no room answers `WouldBlock` at once, and the
     /// lane parks on the descriptor's writability instead of spending the send clock in a worker.
@@ -1271,21 +1299,32 @@ impl Connection {
     /// A lane drains any retained mask output before it reads, so a peer waiting on that output is not held behind the source.
     #[cfg(unix)]
     pub(crate) fn flush_ready(&mut self) -> io::Result<()> {
+        self.flush_ready_outcome().1
+    }
+
+    /// The same drain with the bytes it accepted, so a settle can restart its stall clock on progress.
+    #[cfg(unix)]
+    pub(crate) fn flush_ready_outcome(&mut self) -> (usize, io::Result<()>) {
         match self {
             Connection::Masked(masked) if !masked.is_plain() && masked.xmc.is_none() => {
                 masked.flush_chain()
             }
-            Connection::Metered(metered) => metered.inner.flush_ready(),
+            Connection::Metered(metered) => (0, metered.inner.flush_ready()),
             Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
-                inner.flush_ready()
+                (0, inner.flush_ready())
             }
-            _ => Ok(()),
+            _ => (0, Ok(())),
         }
     }
 
     #[cfg(not(any(unix, windows)))]
     pub(crate) fn flush_ready(&mut self) -> io::Result<()> {
         std::io::Write::flush(self)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    pub(crate) fn flush_ready_outcome(&mut self) -> (usize, io::Result<()>) {
+        (0, std::io::Write::flush(self))
     }
 }
 
@@ -1327,23 +1366,29 @@ impl Connection {
 
     /// The same non-blocking window for the mask's retained output: the chain's flush parks on `WouldBlock` and keeps the rest for the next turn.
     pub(crate) fn flush_ready(&mut self) -> io::Result<()> {
+        self.flush_ready_outcome().1
+    }
+
+    /// The same drain with the bytes it accepted, so a settle can restart its stall clock on progress.
+    pub(crate) fn flush_ready_outcome(&mut self) -> (usize, io::Result<()>) {
         if matches!(self, Connection::Masked(masked) if !masked.is_plain() && masked.xmc.is_none())
         {
-            self.set_nonblocking(true)?;
-            let result = match self {
+            if let Err(error) = self.set_nonblocking(true) {
+                return (0, Err(error));
+            }
+            let (written, result) = match self {
                 Connection::Masked(masked) => masked.flush_chain(),
-                _ => Ok(()),
+                _ => (0, Ok(())),
             };
             let restored = self.set_nonblocking(false);
-            restored?;
-            return result;
+            return (written, result.and(restored));
         }
         match self {
-            Connection::Metered(metered) => metered.inner.flush_ready(),
+            Connection::Metered(metered) => (0, metered.inner.flush_ready()),
             Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
-                inner.flush_ready()
+                (0, inner.flush_ready())
             }
-            _ => Ok(()),
+            _ => (0, Ok(())),
         }
     }
 }
