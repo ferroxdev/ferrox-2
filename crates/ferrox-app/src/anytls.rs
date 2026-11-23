@@ -861,7 +861,9 @@ impl AnyTlsStream {
         if !complete {
             match writer.write_ready(&[&bytes]) {
                 Some(Ok(n)) if n >= bytes.len() => complete = true,
-                Some(Ok(n)) if n > 0 => bytes.drain(..n),
+                Some(Ok(n)) if n > 0 => {
+                    bytes.drain(..n);
+                }
                 Some(Ok(_)) => {}
                 Some(Err(error)) if crate::proxy::is_timeout(&error) => {}
                 Some(Err(_)) => failed = true,
@@ -1819,7 +1821,11 @@ mod tests {
             encoded.len()
         );
         let padding = Padding::new(b"stop=8\n1=1-1,1048576-1048576").expect("parses");
-        let shared = Shared::new(Box::new(Null), padding, false);
+        let shared = Shared::new(
+            Box::new(Sink(Arc::new(Mutex::new(Vec::new())))),
+            padding,
+            false,
+        );
         let encoded = shared.encode_packet(b"abc");
         assert!(
             encoded.ends_with(b"abc"),
