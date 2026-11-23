@@ -1,7 +1,7 @@
 //! The health observatory the balancers read: xray's legacy probe loop, its burst sampler,
 //! and the two URL shapes they speak through a configured outbound.
 
-use crate::conn::HttpUrl;
+use crate::conn::{Connection, HttpUrl};
 use crate::json::Json;
 use crate::proxy::{Destination, Outbound, ProbeTarget, RouteShared};
 use crate::router::{HealthPing, Observed};
@@ -666,19 +666,32 @@ impl Ring {
     }
 }
 
-fn probe(
+pub(crate) fn probe(
     outbound: &ProbeTarget,
     target: &str,
     method: &str,
     timeout: Duration,
     read_body: bool,
 ) -> Result<Duration, String> {
-    let url = HttpUrl::parse(target)?;
     let started = Instant::now();
+    let deadline = started + timeout;
+    let url = HttpUrl::parse(target)?;
     let destination = Destination::Name(url.host.clone(), url.port);
-    let stream = outbound
-        .probe_stream(&destination, timeout)
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(format!("cannot dial {target}: the probe deadline expired"));
+    }
+    let mut stream = outbound
+        .probe_stream(&destination, left)
         .ok_or_else(|| format!("cannot dial {target}"))?;
+    let mut io = DeadlineIo {
+        io: &mut stream,
+        deadline,
+        arm: &|stream: &Connection, left| {
+            let _ = stream.set_read_timeout(Some(left));
+            let _ = stream.set_write_timeout(Some(left));
+        },
+    };
     if url.tls {
         let config = ferrox_core::tls::TlsConfig {
             server_name: url.host.clone(),
@@ -700,15 +713,75 @@ fn probe(
             padding: None,
             ..Default::default()
         };
-        let mut session = ferrox_core::tls::RustlsProvider::connect(&config, stream)
+        let mut session = ferrox_core::tls::RustlsProvider::connect(&config, io)
             .map_err(|error| error.to_string())?;
         session.handshake().map_err(|error| error.to_string())?;
         round_trip(&mut session, &url, method, read_body)?;
     } else {
-        let mut stream = stream;
-        round_trip(&mut stream, &url, method, read_body)?;
+        round_trip(&mut io, &url, method, read_body)?;
     }
-    Ok(started.elapsed())
+    finish(started, deadline)
+}
+
+/// A probe that finishes at or after its deadline is late even when the final read returned a
+/// complete response; no later read would have checked the clock.
+fn finish(started: Instant, deadline: Instant) -> Result<Duration, String> {
+    finish_at(Instant::now(), started, deadline)
+}
+
+fn finish_at(now: Instant, started: Instant, deadline: Instant) -> Result<Duration, String> {
+    if now >= deadline {
+        return Err("the probe deadline expired".to_owned());
+    }
+    Ok(now.saturating_duration_since(started))
+}
+
+/// A probe's reads and writes share one absolute deadline: every call gets only the time left, so
+/// a head that drips one byte just under the socket timeout cannot extend the probe past it.
+struct DeadlineIo<'a, S> {
+    io: &'a mut S,
+    deadline: Instant,
+    arm: &'a dyn Fn(&S, Duration),
+}
+
+impl<S: Read> Read for DeadlineIo<'_, S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the probe deadline expired",
+            ));
+        }
+        (self.arm)(self.io, left);
+        self.io.read(buf)
+    }
+}
+
+impl<S: Write> Write for DeadlineIo<'_, S> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the probe deadline expired",
+            ));
+        }
+        (self.arm)(self.io, left);
+        self.io.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the probe deadline expired",
+            ));
+        }
+        (self.arm)(self.io, left);
+        self.io.flush()
+    }
 }
 
 fn round_trip(
@@ -724,11 +797,11 @@ fn round_trip(
     io.write_all(request.as_bytes())
         .map_err(|error| error.to_string())?;
     io.flush().map_err(|error| error.to_string())?;
-    let (head, end) = read_head(io)?;
+    let (head, start, end) = read_final_head(io)?;
     if !read_body || method != "GET" {
         return Ok(());
     }
-    let content = content_length(&head[..end]);
+    let content = content_length(&head[start..end]);
     let mut left = content.saturating_sub(head.len() - end);
     let mut buf = [0u8; 4096];
     while left > 0 {
@@ -747,25 +820,62 @@ fn round_trip(
     Ok(())
 }
 
-/// The answer's head and where it ends, one window at a time: the terminator scan resumes three octets before the octets that just arrived, so a head that drips in is walked once rather than once per window, and it reaches the tree's one `\r\n\r\n` scan rather than a second byte-window loop.
-fn read_head(io: &mut dyn Read) -> Result<(Vec<u8>, usize), String> {
+/// The final response head, skipping nonterminal informational heads. The returned start is where
+/// that head begins in the buffer, so a final head already read behind a `103` is not discarded.
+fn read_final_head(io: &mut dyn Read) -> Result<(Vec<u8>, usize, usize), String> {
     let mut head = Vec::with_capacity(1024);
-    let mut buf = [0u8; 4096];
+    let mut start = 0;
     loop {
+        let end = read_head(io, &mut head, start)?;
+        let status = status_code(&head[start..end])
+            .ok_or_else(|| "the response has no status code".to_owned())?;
+        if !(100..200).contains(&status) || status == 101 {
+            return Ok((head, start, end));
+        }
+        start = end;
+    }
+}
+
+/// One head's end, one window at a time: the scan resumes three octets before the octets that
+/// just arrived, so a head that drips in is walked once rather than once per window, and it
+/// reaches the tree's one `\r\n\r\n` scan rather than a second byte-window loop.
+fn read_head(io: &mut dyn Read, head: &mut Vec<u8>, start: usize) -> Result<usize, String> {
+    let mut buf = [0u8; 4096];
+    let mut scanned = start;
+    loop {
+        let from = scanned.saturating_sub(3);
+        if let Some(at) = ferrox_core::foxy::head_end(&head[from..]) {
+            let end = from + at + 4;
+            if end > start {
+                return Ok(end);
+            }
+        }
+        scanned = head.len();
         let read = io.read(&mut buf).map_err(|error| error.to_string())?;
         if read == 0 {
             return Err("the peer closed before a response head".to_owned());
         }
-        // A terminator straddles the seam at most three octets into what was already here.
-        let from = head.len().saturating_sub(3);
         head.extend_from_slice(&buf[..read]);
-        if let Some(at) = ferrox_core::foxy::head_end(&head[from..]) {
-            return Ok((head, from + at + 4));
-        }
         if head.len() > 65_536 {
             return Err("the response head is over 64 KiB".to_owned());
         }
     }
+}
+
+fn status_code(head: &[u8]) -> Option<u16> {
+    let mut fields = head
+        .split(|byte| *byte == b'\n')
+        .next()?
+        .split(u8::is_ascii_whitespace)
+        .filter(|field| !field.is_empty());
+    fields.next()?;
+    let code = fields.next()?;
+    if code.len() != 3 || !code.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    code.iter().try_fold(0u16, |value, digit| {
+        value.checked_mul(10)?.checked_add(u16::from(*digit - b'0'))
+    })
 }
 
 fn content_length(head: &[u8]) -> usize {
@@ -850,6 +960,56 @@ mod tests {
     }
 
     #[test]
+    fn a_late_result_is_not_a_healthy_reading() {
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(1);
+        assert!(
+            finish_at(started + Duration::from_secs(1), started, deadline).is_err(),
+            "a result after the deadline is rejected"
+        );
+    }
+
+    #[test]
+    fn a_result_records_the_timestamp_that_passed_the_check() {
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(2);
+        assert_eq!(
+            finish_at(started + Duration::from_secs(1), started, deadline),
+            Ok(Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn a_probe_read_cannot_outlive_its_deadline() {
+        struct Drip;
+        impl Read for Drip {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(2));
+                if buf.is_empty() {
+                    return Ok(0);
+                }
+                buf[0] = b'x';
+                Ok(1)
+            }
+        }
+        let mut drip = Drip;
+        let mut io = DeadlineIo {
+            io: &mut drip,
+            deadline: Instant::now() + Duration::from_millis(5),
+            arm: &|_: &Drip, _: Duration| {},
+        };
+        let mut byte = [0u8; 1];
+        let mut timed_out = false;
+        for _ in 0..10 {
+            if let Err(error) = io.read(&mut byte) {
+                timed_out = error.kind() == std::io::ErrorKind::TimedOut;
+                break;
+            }
+        }
+        assert!(timed_out, "a drip read stops at the probe deadline");
+    }
+
+    #[test]
     fn a_burst_without_a_ping_config_is_refused_like_the_json_build() {
         let error = Burst::parse(&Json::Obj(vec![(
             "subjectSelector".to_owned(),
@@ -912,6 +1072,35 @@ mod tests {
         }
     }
 
+    struct Canned<'a> {
+        parts: &'a [&'a [u8]],
+        at: usize,
+        reads: usize,
+    }
+
+    impl Read for Canned<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let Some(chunk) = self.parts.get(self.at) else {
+                return Ok(0);
+            };
+            self.at += 1;
+            self.reads += 1;
+            let take = chunk.len().min(out.len());
+            out[..take].copy_from_slice(&chunk[..take]);
+            Ok(take)
+        }
+    }
+
+    impl Write for Canned<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     /// A reader that hands over `window` octets a call, so a head arriving in pieces is the same reader every run.
     struct Trickle<'a> {
         bytes: &'a [u8],
@@ -938,15 +1127,77 @@ mod tests {
             .expect("a terminator")
             + 4;
         for window in 1..=answer.len() {
-            let (head, at) = read_head(&mut Trickle {
-                bytes: answer,
-                window,
-            })
+            let mut head = Vec::new();
+            let at = read_head(
+                &mut Trickle {
+                    bytes: answer,
+                    window,
+                },
+                &mut head,
+                0,
+            )
             .unwrap_or_else(|error| panic!("window {window}: {error}"));
             assert_eq!(at, end, "window {window}");
             assert_eq!(head.as_slice(), &answer[..head.len()], "window {window}");
             assert_eq!(&head[end - 4..end], b"\r\n\r\n", "window {window}");
         }
+    }
+
+    #[test]
+    fn an_informational_head_is_skipped_until_the_final_response() {
+        let chunks: &[&[u8]] = &[
+            b"HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        ];
+        let mut io = Canned {
+            parts: chunks,
+            at: 0,
+            reads: 0,
+        };
+        let url = HttpUrl::parse("http://example.com/").expect("parses");
+        round_trip(&mut io, &url, "HEAD", false).expect("the final response answers");
+        assert_eq!(io.reads, 2);
+    }
+
+    #[test]
+    fn a_final_head_behind_an_informational_head_in_one_read_is_kept() {
+        let answer: &[u8] =
+            b"HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let mut io = Trickle {
+            bytes: answer,
+            window: answer.len(),
+        };
+        let (head, start, end) = read_final_head(&mut io).expect("a final head");
+        assert!(start > 0);
+        assert_eq!(status_code(&head[start..end]), Some(200));
+        assert_eq!(end, head.len());
+    }
+
+    #[test]
+    fn a_malformed_status_is_not_a_healthy_head() {
+        let answer: &[u8] = b"HTTP/1.1 nope\r\n\r\n";
+        let mut io = Trickle {
+            bytes: answer,
+            window: answer.len(),
+        };
+        assert!(read_final_head(&mut io).is_err());
+    }
+
+    #[test]
+    fn a_reason_phrase_need_not_be_utf8() {
+        let head: &[u8] = b"HTTP/1.1 200 Caf\xe9\r\n\r\n";
+        assert_eq!(status_code(head), Some(200));
+        assert_eq!(status_code(b"HTTP/1.1 20x OK\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn early_hints_without_a_final_head_are_an_error() {
+        let answer: &[u8] = b"HTTP/1.1 103 Early Hints\r\n\r\n";
+        let mut io = Trickle {
+            bytes: answer,
+            window: answer.len(),
+        };
+        assert!(read_final_head(&mut io).is_err());
     }
 
     /// An eight-kilobyte answer head that drips in as sixteen 512-octet windows, its terminator in the last four: the shape both scans below are read on.
@@ -994,11 +1245,15 @@ mod tests {
         let joined = sixteen_windows().concat();
         let mut fold: u32 = 0;
         for _ in 0..64 {
-            let end = read_head(&mut Trickle {
-                bytes: &joined,
-                window: 512,
-            })
-            .map(|(_, end)| end)
+            let mut head = Vec::new();
+            let end = read_head(
+                &mut Trickle {
+                    bytes: &joined,
+                    window: 512,
+                },
+                &mut head,
+                0,
+            )
             .expect("a head");
             fold = fold
                 .wrapping_mul(31)

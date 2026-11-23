@@ -59,7 +59,7 @@ What runs against what: `xray-rust` interop (24 tests, seam `XRAY_VLESS_FULL_BIN
 | xray-core | ferrox state |
 | --- | --- |
 | DNS client: DoH, DoQ, local, cached, fakeDNS | `proxy/dns` outbound implemented (row 29); the resolver app implemented (row 126): UDP/TCP/DoT/DoH/DoQ, cache, hosts, FakeDNS, filters and parallel groups |
-| Router with rules, balancers (leastload/leastping/random), webhook | rules, selectors, geodata refresh and the `webhook` action partial (row 123); the four balancer strategies implemented, urltest and selector planned (row 125); rule sets and scripts partial (row 124) |
+| Router with rules, balancers (leastload/leastping/random), webhook | rules, selectors, geodata refresh and the `webhook` action partial (row 123); the four balancer strategies implemented, plus sing-box `urltest` and `selector` groups (row 125, [engine-selector](function/engine-selector.md)); rule sets and scripts partial (row 124) |
 | Observatory / burst probe | implemented (row 132): legacy and burst probes, `leastPing`/`leastLoad`, healthcheck front |
 | Reverse portal / bridge | implemented (row 127): modern VLESS reverse both roles over the stream transports it carries (raw, TLS, REALITY, WebSocket, gRPC, HTTPUpgrade, HTTPHeader, xHTTP, QUIC, KCP, hysteria, xdrive; MASQUE, plain HTTP and unknown networks are refused); TCP bridge flows leave through any routed outbound; UDP flows through any routed outbound that serves UDP |
 | Stats, metrics (Prometheus), policy manager | implemented (row 54): reference counters, an online map with source IPs and last-seen times, access log and policies |
