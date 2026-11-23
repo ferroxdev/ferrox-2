@@ -690,7 +690,7 @@ impl Masked {
             inner: &self.stream,
             written: 0,
         };
-        let outcome = chain.flush(&mut wire);
+        let outcome = chain.flush_ready(&mut wire);
         (wire.written, outcome)
     }
 

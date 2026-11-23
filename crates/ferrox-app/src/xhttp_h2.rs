@@ -2980,6 +2980,7 @@ pub(crate) enum H2OpenError {
 pub(crate) struct H2Client {
     conn: Arc<H2Conn>,
     next: AtomicU32,
+    open_order: Mutex<()>,
 }
 
 impl H2Client {
@@ -3063,6 +3064,7 @@ impl H2Client {
         Some(Arc::new(Self {
             conn,
             next: AtomicU32::new(1),
+            open_order: Mutex::new(()),
         }))
     }
 
@@ -3162,6 +3164,9 @@ impl H2Client {
         owner: Option<Arc<ClientOwner>>,
         end_request: bool,
     ) -> Result<(H2StreamReader, H2StreamOut), H2OpenError> {
+        let Ok(order) = self.open_order.lock() else {
+            return Err(H2OpenError::Closed);
+        };
         let Ok(gate) = self.conn.open_gate.lock() else {
             return Err(H2OpenError::Closed);
         };
@@ -3186,6 +3191,7 @@ impl H2Client {
             self.conn.fail_stream(sid);
             return Err(H2OpenError::Failed);
         }
+        drop(order);
         if end_request {
             self.conn.mark_request_ended(sid);
         }
@@ -6638,6 +6644,7 @@ mod tests {
         let client = super::H2Client {
             conn: Arc::clone(&conn),
             next: AtomicU32::new(1),
+            open_order: Mutex::new(()),
         };
         let (mut reader, mut writer) = client
             .open("example.org", &test_settings("stream-one"), "https", false)

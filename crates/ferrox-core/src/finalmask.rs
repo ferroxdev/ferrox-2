@@ -316,6 +316,11 @@ impl Fragment {
         else {
             return Ok(());
         };
+        if DRAINING.with(std::cell::Cell::get) {
+            // A nonblocking drain cannot wait: the spacing was already part of the write that retained these bytes.
+            let _ = raw.flush();
+            return Ok(());
+        }
         match raw.flush() {
             Ok(()) => std::thread::sleep(Duration::from_millis(ms as u64)),
             // The record before this delay is out; a full socket only costs the spacing.
@@ -889,6 +894,18 @@ fn between(ip: IpAddr, start: IpAddr, end: IpAddr) -> bool {
     }
 }
 
+thread_local! {
+    static DRAINING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct DrainFlag(bool);
+
+impl Drop for DrainFlag {
+    fn drop(&mut self) {
+        DRAINING.set(self.0);
+    }
+}
+
 /// The chain one TCP stream carries: the stages in config order, the first of which sees the
 /// session's whole and the last of which is nearest the socket.
 #[derive(Debug, Default, Clone)]
@@ -1068,6 +1085,13 @@ impl Chain {
 
     /// Put every retained piece on the wire, nearest the socket first.
     pub fn flush<W: Write>(&mut self, raw: &mut W) -> io::Result<()> {
+        flush_drive(&mut self.stages, raw)
+    }
+
+    /// The same drain without a stage's inter-record wait: a settle holds this chain's lock and
+    /// must return to the lane instead of sleeping under it.
+    pub fn flush_ready<W: Write>(&mut self, raw: &mut W) -> io::Result<()> {
+        let _draining = DrainFlag(DRAINING.replace(true));
         flush_drive(&mut self.stages, raw)
     }
 
@@ -1920,6 +1944,37 @@ mod tests {
         assert!(
             wire.wire.bytes.len() >= HEADER,
             "the record the delay separated left before the delay"
+        );
+    }
+
+    #[test]
+    fn a_ready_drain_does_not_wait_for_an_inner_stage() {
+        let sni = Fragment::new(
+            0,
+            1,
+            vec![range(3, 3)],
+            vec![range(1000, 1000)],
+            range(0, 0),
+        )
+        .expect("valid")
+        .sni();
+        let below =
+            Fragment::new(0, 1, vec![range(3, 3)], vec![range(0, 0)], range(0, 0)).expect("valid");
+        let mut chain = Chain::default();
+        chain.push(below);
+        let mut chain = chain.with_front(&sni);
+        let mut wire = RefuseOnce {
+            wire: Wire::default(),
+            left: 1,
+        };
+        let p = client_hello("retained.example");
+        assert_eq!(chain.write(&mut wire, &p).expect("writes"), p.len());
+        let began = std::time::Instant::now();
+        chain.flush_ready(&mut wire).expect("drains");
+        assert!(
+            began.elapsed() < std::time::Duration::from_millis(500),
+            "a settle slept in the chain for {:?}",
+            began.elapsed()
         );
     }
 

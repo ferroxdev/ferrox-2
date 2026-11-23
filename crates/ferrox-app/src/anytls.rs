@@ -433,16 +433,6 @@ impl Shared {
     }
 
     fn encode_packet(&self, packet: &[u8]) -> Vec<u8> {
-        let pending = self
-            .pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        let combined = pending.map(|mut pending| {
-            pending.extend_from_slice(packet);
-            pending
-        });
-        let packet = combined.as_deref().unwrap_or(packet);
         if !self.send_padding.load(Ordering::Relaxed) {
             return packet.to_vec();
         }
@@ -472,9 +462,10 @@ impl Shared {
                 data = &data[size..];
                 continue;
             }
+            let payload = data;
             let records = size.div_ceil(MAX_FRAME);
             let mut record = Vec::with_capacity(size + records * HEADER);
-            if data.is_empty() {
+            if payload.is_empty() {
                 let mut remaining = size;
                 while remaining > 0 {
                     let waste = remaining.min(MAX_FRAME);
@@ -482,8 +473,7 @@ impl Shared {
                     remaining -= waste;
                 }
             } else {
-                record.extend_from_slice(data);
-                data = &[];
+                record.extend_from_slice(payload);
                 let mut remaining = size.saturating_sub(record.len());
                 while remaining > HEADER {
                     let waste = (remaining - HEADER).min(MAX_FRAME);
@@ -493,9 +483,14 @@ impl Shared {
             }
             // A peer controls the step list, so one packet's retained padding is capped; the payload that follows is never dropped.
             if out.len().saturating_add(record.len()) > PADDING_LIMIT {
+                out.extend_from_slice(payload);
+                data = &[];
                 break;
             }
             out.extend_from_slice(&record);
+            if !payload.is_empty() {
+                data = &[];
+            }
         }
         out.extend_from_slice(data);
         out
@@ -814,7 +809,7 @@ impl proxy::LaneWrite for AnyTlsStream {
         if !self.session.shared.alive() {
             return proxy::Push::Lost;
         }
-        if self.pending.is_empty() {
+        if self.pending.is_empty() && self.pending_input == 0 {
             let packet = self.data_packet(data);
             self.pending = self.session.shared.encode_packet(&packet);
             self.pending_input = data.len();
@@ -843,42 +838,58 @@ impl AnyTlsStream {
     }
 
     fn flush_pending(&mut self) -> proxy::Push {
-        let Ok(mut writer) = self.session.shared.writer.try_lock() else {
+        let Ok(mut guard) = self.session.shared.writer.try_lock() else {
             return proxy::Push::Parked;
         };
-        let Some(writer) = writer.as_mut() else {
+        let Some(writer) = guard.as_mut() else {
             return proxy::Push::Lost;
         };
-        let ready = writer.write_ready(&[&self.pending]);
-        match ready {
-            Some(Ok(n)) if n >= self.pending.len() => {
-                let input = std::mem::take(&mut self.pending_input);
-                self.pending.clear();
-                proxy::Push::Took(input)
-            }
-            Some(Ok(n)) if n > 0 => {
-                self.pending.drain(..n);
-                proxy::Push::Parked
-            }
-            Some(Ok(_)) => proxy::Push::Parked,
-            Some(Err(error)) if crate::proxy::is_timeout(&error) => proxy::Push::Parked,
-            Some(Err(_)) => {
-                self.session.shared.shutdown("anytls session write failed");
-                proxy::Push::Lost
-            }
-            None => {
-                let accepted = writer.offer_slices(&[&self.pending]);
-                match accepted {
-                    proxy::Accepted::All => {
-                        let input = std::mem::take(&mut self.pending_input);
-                        self.pending.clear();
-                        proxy::Push::Took(input)
-                    }
-                    proxy::Accepted::Full => proxy::Push::Parked,
-                    proxy::Accepted::Lost => proxy::Push::Lost,
-                }
+        let mut bytes = self
+            .session
+            .shared
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            .unwrap_or_default();
+        if !self.pending.is_empty() {
+            bytes.extend_from_slice(&self.pending);
+            self.pending.clear();
+        }
+        let mut complete = bytes.is_empty();
+        let mut failed = false;
+        if !complete {
+            match writer.write_ready(&[&bytes]) {
+                Some(Ok(n)) if n >= bytes.len() => complete = true,
+                Some(Ok(n)) if n > 0 => bytes.drain(..n),
+                Some(Ok(_)) => {}
+                Some(Err(error)) if crate::proxy::is_timeout(&error) => {}
+                Some(Err(_)) => failed = true,
+                None => match writer.offer_slices(&[&bytes]) {
+                    proxy::Accepted::All => complete = true,
+                    proxy::Accepted::Full => {}
+                    proxy::Accepted::Lost => failed = true,
+                },
             }
         }
+        drop(guard);
+        if complete {
+            if self.pending_input == 0 {
+                return proxy::Push::Parked;
+            }
+            return proxy::Push::Took(std::mem::take(&mut self.pending_input));
+        }
+        if failed {
+            self.session.shared.shutdown("anytls session write failed");
+            return proxy::Push::Lost;
+        }
+        *self
+            .session
+            .shared
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(bytes);
+        proxy::Push::Parked
     }
 }
 
@@ -1806,6 +1817,13 @@ mod tests {
             encoded.len() <= PADDING_LIMIT + 3,
             "one peer-scheduled packet retained {} bytes",
             encoded.len()
+        );
+        let padding = Padding::new(b"stop=8\n1=1-1,1048576-1048576").expect("parses");
+        let shared = Shared::new(Box::new(Null), padding, false);
+        let encoded = shared.encode_packet(b"abc");
+        assert!(
+            encoded.ends_with(b"abc"),
+            "the rejected padding record dropped the payload: {encoded:?}"
         );
     }
 
