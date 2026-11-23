@@ -3441,6 +3441,16 @@ impl Datagram {
         })
     }
 
+    /// The descriptor a relay lane parks on: the socket this connection's driver reads.
+    pub(crate) fn wait_key(&self) -> crate::proxy::WaitFd {
+        if let Ok(rebound) = self.rebound.lock() {
+            if let Some(sock) = rebound.as_ref() {
+                return crate::proxy::wait_key(sock.as_ref());
+            }
+        }
+        crate::proxy::wait_key(&self.sock)
+    }
+
     /// Whether one read is one wire datagram: no connected proxy shim, no mask, gecko fragment, hop,
     /// obfuscation or relay frame rewrites the bytes or their destination.
     fn whole_datagrams(&self) -> bool {
@@ -4982,7 +4992,12 @@ impl Read for QuicStream {
                     return Err(std::io::Error::other("quic connection lock poisoned"));
                 }
             }
-            if relayed || Instant::now() >= deadline {
+            if relayed {
+                crate::proxy::note_wait_fd(self.sock.wait_key());
+                crate::proxy::note_wait_idle(crate::budgets::RELAY_POLL);
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            if Instant::now() >= deadline {
                 return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
             }
             let left = deadline.saturating_duration_since(Instant::now());
@@ -5003,6 +5018,22 @@ impl Write for QuicStream {
             return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
         }
         // The lock covers one send each: a flow-control wait must not hold it, or ACKs stop arriving.
+        if crate::proxy::relay_step_owns_poll() {
+            let mut rest = bytes::Bytes::copy_from_slice(buf);
+            return match self.send_once(&mut rest) {
+                Ok(0) => {
+                    crate::proxy::note_wait_fd(self.sock.wait_key());
+                    crate::proxy::note_wait_idle(crate::budgets::RELAY_POLL);
+                    Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                }
+                Ok(n) => {
+                    self.meter.write(n);
+                    self.activity.touch();
+                    Ok(n)
+                }
+                Err(error) => Err(error),
+            };
+        }
         let deadline = Instant::now() + SEND_WAIT;
         let mut rest = bytes::Bytes::copy_from_slice(buf);
         while !rest.is_empty() {
