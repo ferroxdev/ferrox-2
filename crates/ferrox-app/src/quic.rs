@@ -5110,6 +5110,9 @@ impl Write for QuicStream {
         while !rest.is_empty() {
             match self.send_once(&mut rest) {
                 Ok(0) => {
+                    // The window is shut, so nothing else pushes these until the driver's next
+                    // turn: send them now, or the ack that reopens it waits a poll.
+                    self.send_queued()?;
                     if Instant::now() >= deadline {
                         let sent = buf.len() - rest.len();
                         if sent > 0 {
