@@ -169,6 +169,8 @@ pub(crate) struct H3Reader {
     expect_request: bool,
     /// Only a CONNECT reads `Padding`; an ordinary answer leaves the field list unbuilt.
     padding_head: bool,
+    /// A CONNECT success ignores `Content-Length`, per RFC 9110 9.3.6.
+    connect: bool,
     idle_since: Option<Instant>,
     activity: Arc<Activity>,
     deadline: Option<Instant>,
@@ -195,6 +197,7 @@ impl H3Reader {
             head_seen: false,
             expect_request,
             padding_head: false,
+            connect: false,
             idle_since: None,
             activity,
             deadline: None,
@@ -447,13 +450,17 @@ impl H3Reader {
                             ));
                         };
                         if !self.expect_request {
-                            self.content_length =
-                                hpack::qpack_content_length(payload).map_err(|_| {
-                                    std::io::Error::new(
-                                        std::io::ErrorKind::InvalidData,
-                                        "h3 content-length is malformed",
-                                    )
-                                })?;
+                            let connect_ok = self.connect
+                                && status.is_some_and(|code| (200..300).contains(&code));
+                            if !connect_ok {
+                                self.content_length = hpack::qpack_content_length(payload)
+                                    .map_err(|_| {
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData,
+                                            "h3 content-length is malformed",
+                                        )
+                                    })?;
+                            }
                             if self.padding_head {
                                 self.padding = hpack::qpack_fields(payload).is_some_and(|fields| {
                                     fields.iter().any(|(name, value)| {
@@ -1538,7 +1545,7 @@ impl H3Client {
     }
 
     fn open(self: &Arc<Self>, block: &[u8], end_request: bool) -> Option<(H3Reader, H3StreamOut)> {
-        self.open_with(block, end_request, Arc::new(Activity::new()))
+        self.open_with(block, end_request, Arc::new(Activity::new()), None)
             .ok()
     }
 
@@ -1548,8 +1555,28 @@ impl H3Client {
         block: &[u8],
         end_request: bool,
     ) -> Result<(H3Reader, H3StreamOut), H3OpenError> {
-        let (mut reader, out) = self.open_with(block, end_request, Arc::new(Activity::new()))?;
+        self.open_block_until(
+            block,
+            end_request,
+            Instant::now() + crate::budgets::relay_stall(),
+        )
+    }
+
+    /// The same CONNECT with the caller's absolute handshake deadline carried through the opening write and the answer's first head.
+    pub(crate) fn open_block_until(
+        self: &Arc<Self>,
+        block: &[u8],
+        end_request: bool,
+        deadline: Instant,
+    ) -> Result<(H3Reader, H3StreamOut), H3OpenError> {
+        let (mut reader, out) = self.open_with(
+            block,
+            end_request,
+            Arc::new(Activity::new()),
+            Some(deadline),
+        )?;
         reader.padding_head = true;
+        reader.connect = true;
         Ok((reader, out))
     }
 
@@ -1558,6 +1585,7 @@ impl H3Client {
         block: &[u8],
         end_request: bool,
         activity: Arc<Activity>,
+        deadline: Option<Instant>,
     ) -> Result<(H3Reader, H3StreamOut), H3OpenError> {
         let Ok(opening) = self.opening.lock() else {
             return Err(H3OpenError::Closed);
@@ -1582,7 +1610,7 @@ impl H3Client {
         frames::quic_varint(&mut frame, block.len() as u64);
         frame.extend_from_slice(block);
         let mut writer = wire.clone();
-        let deadline = Instant::now() + crate::budgets::relay_stall();
+        let deadline = deadline.unwrap_or_else(|| Instant::now() + crate::budgets::relay_stall());
         let sent = match writer.opening_start(&frame) {
             Ok(sent) => {
                 self.next.store(id + 4, Ordering::SeqCst);
@@ -1605,10 +1633,9 @@ impl H3Client {
         if end_request {
             wire.fin();
         }
-        Ok((
-            H3Reader::new(wire.clone()),
-            H3StreamOut { wire, owner: None },
-        ))
+        let mut reader = H3Reader::new(wire.clone());
+        reader.deadline = Some(deadline);
+        Ok((reader, H3StreamOut { wire, owner: None }))
     }
 
     /// One plain HTTP/3 request and its answer: the head becomes HEADERS, the body DATA, and the reply's status and body come back without the xhttp framing.
@@ -1687,7 +1714,7 @@ impl H3Client {
         let (head, body) = crate::xhttp::packet_head(host, settings, session, seq, piece);
         let block = block_from_text(&head, host, "https");
         let deadline = Instant::now() + crate::budgets::relay_stall();
-        let Some((mut reader, out)) = self.open_with(&block, false, activity).ok() else {
+        let Some((mut reader, out)) = self.open_with(&block, false, activity, None).ok() else {
             return false;
         };
         reader.set_deadline(deadline);
@@ -1970,10 +1997,10 @@ fn h3_control_frames(
             control.drain(..end);
             continue;
         }
-        // Server-to-client control frames: GOAWAY and PRIORITY_UPDATE belong here; DATA, HEADERS, CANCEL_PUSH, SETTINGS, PUSH_PROMISE, MAX_PUSH_ID and HTTP/2 reserved types are H3_FRAME_UNEXPECTED, unassigned types ignored.
+        // Only GOAWAY belongs on the server control stream; DATA, HEADERS, CANCEL_PUSH, SETTINGS, PUSH_PROMISE, MAX_PUSH_ID, PRIORITY_UPDATE and the HTTP/2 reserved types are H3_FRAME_UNEXPECTED, unassigned types ignored.
         if matches!(
             kind,
-            0x0 | 0x1 | 0x2 | 0x3 | 0x4 | 0x5 | 0x6 | 0x8 | 0x9 | 0xd
+            0x0 | 0x1 | 0x2 | 0x3 | 0x4 | 0x5 | 0x6 | 0x8 | 0x9 | 0xd | 0xF0700 | 0xF0701
         ) {
             return Err(H3_FRAME_UNEXPECTED);
         }
@@ -2225,7 +2252,9 @@ pub(crate) fn connect_dual_split(
     let down = crate::xhttp::downlink_head(host, settings, &session);
     let block = block_from_text(&down, host, "https");
     let activity = Arc::new(Activity::new());
-    let (reader, _) = client.open_with(&block, true, Arc::clone(&activity)).ok()?;
+    let (reader, _) = client
+        .open_with(&block, true, Arc::clone(&activity), None)
+        .ok()?;
     let writer = if settings.mode == XhttpMode::PacketUp {
         crate::xhttp::XhttpWriter::packets_h3(
             Arc::clone(&client),
@@ -2237,7 +2266,7 @@ pub(crate) fn connect_dual_split(
     } else {
         let up = crate::xhttp::dial_head(host, settings, &session, None);
         let block = block_from_text(&up, host, "https");
-        let (_, out) = client.open_with(&block, false, activity).ok()?;
+        let (_, out) = client.open_with(&block, false, activity, None).ok()?;
         let writer = crate::xhttp::XhttpWriter::new(NullWrite);
         writer.set_stream(crate::xhttp::StreamOut::H3(out));
         writer
@@ -3337,6 +3366,24 @@ mod tests {
                 h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
                 Err(H3_FRAME_UNEXPECTED),
                 "frame {kind:#x} is reserved by HTTP/2 and cannot ride a control stream"
+            );
+        }
+    }
+
+    #[test]
+    fn priority_update_on_the_server_control_stream_is_unexpected() {
+        for kind in [0xf0700, 0xf0701] {
+            let mut control = Vec::new();
+            settings_frame(&mut control);
+            frames::quic_varint(&mut control, kind);
+            frames::quic_varint(&mut control, 0);
+            let goaway = AtomicU64::new(u64::MAX);
+            let mut skip = 0;
+            let mut settings = false;
+            assert_eq!(
+                h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+                Err(H3_FRAME_UNEXPECTED),
+                "frame {kind:#x} is server-to-client only"
             );
         }
     }

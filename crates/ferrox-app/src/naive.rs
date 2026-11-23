@@ -916,7 +916,16 @@ impl Write for NaiveStream {
                 proxy::Push::Lost => return Err(std::io::ErrorKind::BrokenPipe.into()),
             }
         }
-        Ok(done)
+        loop {
+            match self.settle() {
+                proxy::Settle::Clear => return Ok(done),
+                proxy::Settle::Lost => return Err(std::io::ErrorKind::BrokenPipe.into()),
+                proxy::Settle::Parked if Instant::now() >= deadline => {
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                proxy::Settle::Parked => self.wait_room(crate::budgets::RELAY_POLL),
+            }
+        }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -2097,7 +2106,7 @@ impl NaiveOut {
             pool = self.h2.lock().ok()?;
             pool.retain(|client| client.reusable());
             let inflight = self.h2_inflight.load(Ordering::Relaxed);
-            if pool.len() + inflight < self.pool_limit {
+            if pool.len() + inflight < self.pool_limit && Instant::now() < deadline {
                 self.h2_inflight.fetch_add(1, Ordering::Relaxed);
                 drop(pool);
                 let client = self.connect_h2();
@@ -2244,12 +2253,18 @@ impl NaiveOut {
                     } else if !pool.is_empty() {
                         let len = pool.len();
                         let start = self.h3_next.fetch_add(1, Ordering::Relaxed);
+                        let mut fallback = None;
                         for offset in 0..len {
                             let at = start.wrapping_add(offset) % len;
-                            if !skip(&pool[at]) {
-                                existing = Some(Arc::clone(&pool[at]));
-                                break;
+                            if skip(&pool[at]) {
+                                fallback.get_or_insert_with(|| Arc::clone(&pool[at]));
+                                continue;
                             }
+                            existing = Some(Arc::clone(&pool[at]));
+                            break;
+                        }
+                        if existing.is_none() {
+                            existing = fallback;
                         }
                     }
                 }
@@ -2261,13 +2276,16 @@ impl NaiveOut {
             if !pool.is_empty() {
                 let len = pool.len();
                 let start = self.h3_next.fetch_add(1, Ordering::Relaxed);
+                let mut fallback = None;
                 for offset in 0..len {
                     let at = start.wrapping_add(offset) % len;
-                    if !skip(&pool[at]) {
-                        return Some(Arc::clone(&pool[at]));
+                    if skip(&pool[at]) {
+                        fallback.get_or_insert_with(|| Arc::clone(&pool[at]));
+                        continue;
                     }
+                    return Some(Arc::clone(&pool[at]));
                 }
-                return None;
+                return fallback;
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -2310,7 +2328,7 @@ impl NaiveOut {
         while attempts < 2 {
             let client = self.h3_client(deadline, fill, skip.as_ref())?;
             let block = self.h3_block(target);
-            match client.open_block(&block, false) {
+            match client.open_block_until(&block, false, deadline) {
                 Ok((mut reader, out)) => {
                     attempts += 1;
                     let Ok(Some((status, padded))) = reader.read_response_head() else {

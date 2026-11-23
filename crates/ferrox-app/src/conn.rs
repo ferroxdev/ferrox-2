@@ -1315,14 +1315,14 @@ impl Connection {
             }
         }
         let restored = self.set_nonblocking(false);
+        if total > 0 {
+            return Ok(total);
+        }
+        restored?;
         if let Some(error) = outcome {
             return Err(error);
         }
-        restored?;
-        if total == 0 {
-            return Err(io::Error::from(io::ErrorKind::WouldBlock));
-        }
-        Ok(total)
+        Err(io::Error::from(io::ErrorKind::WouldBlock))
     }
 
     /// The same non-blocking window for the mask's retained output: the chain's flush parks on `WouldBlock` and keeps the rest for the next turn.

@@ -1654,6 +1654,9 @@ impl H2Conn {
             let Ok(mut conn) = self.send_conn.try_lock() else {
                 return None;
             };
+            if state.cancelled.load(Ordering::SeqCst) {
+                return Some(false);
+            }
             let Ok(mut window) = state.send_window.try_lock() else {
                 return None;
             };
