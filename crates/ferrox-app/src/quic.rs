@@ -3522,6 +3522,15 @@ impl Datagram {
         self.rebound.lock().ok()?.as_ref().cloned()
     }
 
+    /// The descriptor this lane's driver reads: the rebound path when a route move
+    /// installed one, so a parked relay lane wakes on the socket the packets land on.
+    pub(crate) fn wait_key(&self) -> crate::proxy::WaitFd {
+        if let Some(sock) = self.rebound() {
+            return crate::proxy::wait_key(sock.as_ref());
+        }
+        crate::proxy::wait_key(&self.sock)
+    }
+
     /// Move every write and read after this call to `sock`, which is bound to the
     /// new path: the old descriptor stays for a reply already in flight, and the
     /// flag keeps a lane that never roams on the direct path.
@@ -4983,6 +4992,8 @@ impl Read for QuicStream {
                 }
             }
             if relayed {
+                crate::proxy::note_wait_fd(self.sock.wait_key());
+                crate::proxy::note_wait_idle(crate::budgets::RELAY_POLL);
                 return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
             }
             if Instant::now() >= deadline {
