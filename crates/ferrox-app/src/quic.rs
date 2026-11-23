@@ -4943,43 +4943,53 @@ impl Read for QuicStream {
         };
         let deadline = Instant::now() + quantum;
         loop {
-            match self.conn.lock() {
-                Ok(mut conn) => {
-                    let (n, fin) = match conn.stream_recv(self.id, buf) {
-                        Ok(got) => got,
-                        Err(quiche::Error::Done) => (0, false),
-                        Err(quiche::Error::StreamReset(code)) => {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::ConnectionReset,
-                                format!("quic stream reset: {code}"),
-                            ));
-                        }
-                        Err(error) => {
-                            return Err(std::io::Error::other(format!(
-                                "quic stream read: {error:?}"
-                            )));
-                        }
-                    };
-                    if n > 0 {
-                        self.peer_fin.store(fin, Ordering::Relaxed);
-                        self.activity.touch();
-                        if !relayed {
-                            flush_egress(&mut conn, &self.sock);
-                        }
-                        self.meter.read(n);
-                        return Ok(n);
-                    }
-                    if fin {
-                        self.peer_fin.store(true, Ordering::Relaxed);
-                        return Ok(0);
-                    }
-                    if conn.is_closed() {
-                        return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
-                    }
+            let mut conn = match self.conn.try_lock() {
+                Ok(conn) => conn,
+                Err(std::sync::TryLockError::WouldBlock) if relayed => {
+                    return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
                 }
-                Err(_) => {
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+                    }
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    std::thread::sleep(STREAM_POLL.min(left));
+                    continue;
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
                     return Err(std::io::Error::other("quic connection lock poisoned"));
                 }
+            };
+            let (n, fin) = match conn.stream_recv(self.id, buf) {
+                Ok(got) => got,
+                Err(quiche::Error::Done) => (0, false),
+                Err(quiche::Error::StreamReset(code)) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        format!("quic stream reset: {code}"),
+                    ));
+                }
+                Err(error) => {
+                    return Err(std::io::Error::other(format!(
+                        "quic stream read: {error:?}"
+                    )));
+                }
+            };
+            if n > 0 {
+                self.peer_fin.store(fin, Ordering::Relaxed);
+                self.activity.touch();
+                if !relayed {
+                    flush_egress(&mut conn, &self.sock);
+                }
+                self.meter.read(n);
+                return Ok(n);
+            }
+            if fin {
+                self.peer_fin.store(true, Ordering::Relaxed);
+                return Ok(0);
+            }
+            if conn.is_closed() {
+                return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
             }
             if relayed {
                 return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
@@ -5131,8 +5141,12 @@ impl QuicStream {
 
     /// One send flight without holding the lock across the wait behind it.
     fn send_once(&mut self, rest: &mut bytes::Bytes) -> std::io::Result<usize> {
-        let Ok(mut conn) = self.conn.lock() else {
-            return Err(std::io::Error::other("quic connection lock poisoned"));
+        let mut conn = match self.conn.try_lock() {
+            Ok(conn) => conn,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(0),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(std::io::Error::other("quic connection lock poisoned"));
+            }
         };
         // A closed or draining connection cannot progress: fail the write instead of parking it for SEND_WAIT.
         if conn.is_closed() || conn.is_draining() {
