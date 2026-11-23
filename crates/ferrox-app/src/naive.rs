@@ -2145,6 +2145,7 @@ impl NaiveOut {
                     && existing.is_none()
                     && self.h2_inflight.load(Ordering::Relaxed) > 0
                 {
+                    pool = self.h2.lock().ok()?;
                     continue;
                 }
                 return client.or(existing);
