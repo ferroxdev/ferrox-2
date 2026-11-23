@@ -27,6 +27,7 @@ const SERVER_SETTINGS: u8 = 10;
 const VERSION: u32 = 2;
 const HEADER: usize = 7;
 const MAX_FRAME: usize = 0xffff;
+const PADDING_LIMIT: usize = 1 << 20;
 const PASSWORD_LEN: usize = 32;
 const POLL: Duration = Duration::from_millis(100);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -490,6 +491,10 @@ impl Shared {
                     remaining -= HEADER + waste;
                 }
             }
+            // A peer controls the step list, so one packet's retained padding is capped; the payload that follows is never dropped.
+            if out.len().saturating_add(record.len()) > PADDING_LIMIT {
+                break;
+            }
             out.extend_from_slice(&record);
         }
         out.extend_from_slice(data);
@@ -815,6 +820,16 @@ impl proxy::LaneWrite for AnyTlsStream {
             self.pending_input = data.len();
         }
         self.flush_pending()
+    }
+
+    fn settle(&mut self) -> proxy::Settle {
+        let Ok(mut writer) = self.session.shared.writer.try_lock() else {
+            return proxy::Settle::Parked;
+        };
+        let Some(writer) = writer.as_mut() else {
+            return proxy::Settle::Lost;
+        };
+        writer.settle()
     }
 }
 
@@ -1769,6 +1784,33 @@ mod tests {
         let small = cost(Padding::new(b"stop=8\n1=100-100").expect("parses"));
         assert_eq!(big.allocs, small.allocs, "the eight records cost no calls");
         assert_eq!(big.bytes, small.bytes, "the eight records cost no bytes");
+    }
+
+    #[test]
+    fn peer_padding_cannot_expand_one_packet_without_bound() {
+        let mut scheme = String::from("stop=8\n1=");
+        for step in 0..4_000 {
+            if step > 0 {
+                scheme.push(',');
+            }
+            scheme.push_str("1048576-1048576");
+        }
+        let padding = Padding::new(scheme.as_bytes()).expect("parses");
+        let shared = Shared::new(
+            Box::new(Sink(Arc::new(Mutex::new(Vec::new())))),
+            padding,
+            false,
+        );
+        let encoded = shared.encode_packet(b"abc");
+        assert!(
+            encoded.len() <= PADDING_LIMIT + 3,
+            "one peer-scheduled packet retained {} bytes",
+            encoded.len()
+        );
+        assert!(
+            encoded.ends_with(b"abc"),
+            "the payload still trails the padding"
+        );
     }
 
     #[test]

@@ -1636,19 +1636,6 @@ impl H2Conn {
             return None;
         };
         let total_signed = i64::try_from(total).unwrap_or(i64::MAX);
-        {
-            let Ok(mut conn) = self.send_conn.try_lock() else {
-                return None;
-            };
-            let Ok(mut window) = state.send_window.try_lock() else {
-                return None;
-            };
-            if *conn < total || *window < total_signed {
-                return None;
-            }
-            *conn -= total;
-            *window -= total_signed;
-        }
         let max = *self
             .max_frame
             .lock()
@@ -1662,6 +1649,19 @@ impl H2Conn {
             let end = (at + max).min(data.len());
             batch.add(stream, &data[at..end]);
             at = end;
+        }
+        {
+            let Ok(mut conn) = self.send_conn.try_lock() else {
+                return None;
+            };
+            let Ok(mut window) = state.send_window.try_lock() else {
+                return None;
+            };
+            if *conn < total || *window < total_signed {
+                return None;
+            }
+            *conn -= total;
+            *window -= total_signed;
         }
         match batch.flush_ready(self, &mut **write) {
             crate::proxy::Accepted::All => Some(true),
@@ -2905,6 +2905,11 @@ fn client_headers(conn: &H2Conn, sid: u32, block: &[u8], end_stream: bool) -> bo
         conn.compression_error();
         return false;
     };
+    if status.is_some_and(|status| !(100..=999).contains(&status)) {
+        conn.fail_stream(sid);
+        conn.compression_error();
+        return false;
+    }
     if status.is_some_and(|status| (100..200).contains(&status)) {
         return true;
     }

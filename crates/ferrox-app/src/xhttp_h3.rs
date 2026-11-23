@@ -1115,12 +1115,12 @@ impl Read for ClientStream {
         }
         let deadline = Instant::now() + crate::budgets::RELAY_POLL;
         loop {
-            if self.owner.dead.load(Ordering::Relaxed) || self.owner.rejected(self.id) {
-                return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
-            }
             let Ok(mut conn) = self.conn.lock() else {
                 return Err(std::io::Error::other("h3 connection lock poisoned"));
             };
+            if self.owner.dead.load(Ordering::Relaxed) || self.owner.rejected(self.id) {
+                return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+            }
             match conn.stream_recv(self.id, buf) {
                 Ok((0, true)) => {
                     self.peer_fin.store(true, Ordering::Relaxed);

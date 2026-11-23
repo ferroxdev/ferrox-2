@@ -2217,10 +2217,16 @@ impl NaiveOut {
         self.h2_ready.notify_all();
     }
 
-    fn h3_client(self: &Arc<Self>, deadline: Instant, fill: bool) -> Option<Arc<H3Client>> {
+    fn h3_client(
+        self: &Arc<Self>,
+        deadline: Instant,
+        fill: bool,
+        exclude: Option<&Arc<H3Client>>,
+    ) -> Option<Arc<H3Client>> {
         let mut pool = self.h3.lock().ok()?;
         loop {
             pool.retain(|client| client.reusable());
+            let skip = |client: &Arc<H3Client>| exclude.is_some_and(|bad| Arc::ptr_eq(client, bad));
             let inflight = self.h3_inflight.load(Ordering::Relaxed);
             if (fill || (pool.is_empty() && inflight == 0))
                 && pool.len() + inflight < self.pool_limit
@@ -2236,8 +2242,15 @@ impl NaiveOut {
                             pool.push(Arc::clone(client));
                         }
                     } else if !pool.is_empty() {
-                        let at = self.h3_next.fetch_add(1, Ordering::Relaxed) % pool.len();
-                        existing = Some(Arc::clone(&pool[at]));
+                        let len = pool.len();
+                        let start = self.h3_next.fetch_add(1, Ordering::Relaxed);
+                        for offset in 0..len {
+                            let at = start.wrapping_add(offset) % len;
+                            if !skip(&pool[at]) {
+                                existing = Some(Arc::clone(&pool[at]));
+                                break;
+                            }
+                        }
                     }
                 }
                 self.h3_inflight.fetch_sub(1, Ordering::Relaxed);
@@ -2246,8 +2259,15 @@ impl NaiveOut {
                 return client.or(existing);
             }
             if !pool.is_empty() {
-                let at = self.h3_next.fetch_add(1, Ordering::Relaxed) % pool.len();
-                return Some(Arc::clone(&pool[at]));
+                let len = pool.len();
+                let start = self.h3_next.fetch_add(1, Ordering::Relaxed);
+                for offset in 0..len {
+                    let at = start.wrapping_add(offset) % len;
+                    if !skip(&pool[at]) {
+                        return Some(Arc::clone(&pool[at]));
+                    }
+                }
+                return None;
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -2286,8 +2306,9 @@ impl NaiveOut {
         let deadline = Instant::now() + crate::budgets::handshake();
         let mut attempts = 0;
         let mut fill = true;
+        let mut skip: Option<Arc<H3Client>> = None;
         while attempts < 2 {
-            let client = self.h3_client(deadline, fill)?;
+            let client = self.h3_client(deadline, fill, skip.as_ref())?;
             let block = self.h3_block(target);
             match client.open_block(&block, false) {
                 Ok((mut reader, out)) => {
@@ -2324,6 +2345,7 @@ impl NaiveOut {
                     self.discard_h3(&client);
                     attempts += 1;
                     fill = true;
+                    skip = Some(client);
                 }
             }
         }
