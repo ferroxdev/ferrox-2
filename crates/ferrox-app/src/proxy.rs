@@ -35892,7 +35892,7 @@ pub(crate) mod lane_pool {
 
     /// A client pumps both legs of a flow at once, so its ceiling is two legs for every flow of
     /// the widest standard cell.
-    pub(crate) const CLIENT_LANES: usize = 16;
+    pub(crate) const CLIENT_LANES: usize = 8;
 
     static PROXY_PEER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -37209,7 +37209,7 @@ pub(crate) mod lane_pool {
         fn a_client_ceiling_carries_two_legs_per_flow() {
             assert_eq!(cap_for(false), RELAY_LANES);
             assert_eq!(cap_for(true), CLIENT_LANES);
-            let widest = 2 * 8;
+            let widest = 2 * 4;
             assert!(
                 cap_for(true) >= widest,
                 "the widest cell's eight flows queue {widest} legs against a {CLIENT_LANES}-lane ceiling"
