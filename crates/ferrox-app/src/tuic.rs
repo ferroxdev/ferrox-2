@@ -41,7 +41,15 @@ const RETRY_TOKEN_TAG: usize = 32;
 const MAX_ASSOCIATIONS_PER_SESSION: usize = 256;
 const MAX_UDP_SOCKETS: usize = 2048;
 const MAX_TUIC_LANES: usize = 64;
-const LANES_PER_KEY: usize = 8;
+
+/// One connection per core, so a four-core runner does not pay eight handshakes, eight drivers and
+/// eight sockets to move the same eight flows.
+fn lanes_per_key() -> usize {
+    static LANES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LANES.get_or_init(|| {
+        std::thread::available_parallelism().map_or(8, |cores| cores.get().clamp(1, 8))
+    })
+}
 const MAX_RESOLVING_PER_SESSION: usize = 32;
 const MAX_RESOLVE_PAYLOADS: usize = 4;
 const RESOLVE_QUEUE: usize = 256;
@@ -390,7 +398,7 @@ impl TuicOut {
             lane.leases.fetch_add(1, Ordering::AcqRel);
             return Some(LaneLease(Arc::clone(lane)));
         }
-        if pool.len() < LANES_PER_KEY {
+        if pool.len() < lanes_per_key() {
             let lane = self.connect_lane(source, options)?;
             lane.leases.fetch_add(1, Ordering::AcqRel);
             pool.push(Arc::clone(&lane));
