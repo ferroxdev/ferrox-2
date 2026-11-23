@@ -511,6 +511,7 @@ impl TuicOut {
             quic::quiche_config_alpn(roots, self.cc.as_deref(), &[wire::ALPN])?
         };
         quic::tune_transport(&mut config);
+        let _ = config.set_cc_algorithm_name("bbr");
         config.enable_dgram(true, quic::MAX_DATAGRAM, DGRAM_SEND_QUEUE);
         if self.zero_rtt {
             config.enable_early_data();
@@ -1626,6 +1627,7 @@ pub(crate) fn serve_inbound(
         eprintln!("tuic inbound in {path} cannot build its tls: serves nothing");
         return false;
     };
+    let _ = template.set_cc_algorithm_name("bbr");
     if !quic::tune(&mut template, wire::ALPN) {
         return false;
     }
