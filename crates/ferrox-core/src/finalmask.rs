@@ -322,7 +322,11 @@ impl Fragment {
             return Ok(());
         }
         match raw.flush() {
-            Ok(()) => std::thread::sleep(Duration::from_millis(ms as u64)),
+            Ok(()) => {
+                #[cfg(test)]
+                SLEEPS.with(|count| count.set(count.get() + 1));
+                std::thread::sleep(Duration::from_millis(ms as u64));
+            }
             // The record before this delay is out; a full socket only costs the spacing.
             Err(error)
                 if matches!(
@@ -896,6 +900,16 @@ fn between(ip: IpAddr, start: IpAddr, end: IpAddr) -> bool {
 
 thread_local! {
     static DRAINING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static SLEEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn sleeps() -> usize {
+    SLEEPS.with(std::cell::Cell::get)
 }
 
 struct DrainFlag(bool);
@@ -1969,12 +1983,12 @@ mod tests {
         };
         let p = client_hello("retained.example");
         assert_eq!(chain.write(&mut wire, &p).expect("writes"), p.len());
-        let began = std::time::Instant::now();
+        let before = sleeps();
         chain.flush_ready(&mut wire).expect("drains");
-        assert!(
-            began.elapsed() < std::time::Duration::from_millis(500),
-            "a settle slept in the chain for {:?}",
-            began.elapsed()
+        assert_eq!(
+            sleeps(),
+            before,
+            "a settle slept for a delay it cannot honour"
         );
     }
 
