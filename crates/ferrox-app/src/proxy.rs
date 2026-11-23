@@ -11974,11 +11974,9 @@ fn serve_vless_xhttp(
         }
         return serve_session_xhttp(chained, stream, settings, users, freedom, None, None);
     }
+    chained.arm_relay_poll();
     #[cfg(test)]
-    if let Ok(mut paths) = H2_DIAL_WITNESS.lock() {
-        paths.push(settings.path.clone());
-    }
-    let _ = stream.set_read_timeout(Some(RELAY_POLL));
+    let dialed = settings.path.clone();
     let mut step = crate::xhttp_h2::h2_xhttp_lane(chained, stream, settings, users, freedom, None);
     let sniffing = crate::sniff::current();
     let access = crate::accesslog::snapshot();
@@ -11990,6 +11988,10 @@ fn serve_vless_xhttp(
         }),
         Box::new(|| {}),
     );
+    #[cfg(test)]
+    if let Ok(mut paths) = H2_DIAL_WITNESS.lock() {
+        paths.push(dialed);
+    }
 }
 
 pub(crate) fn serve_session_xhttp_with<R: crate::proxy::WindowRead + Send + 'static>(
@@ -48742,17 +48744,19 @@ mod tests {
     /// A plaintext xHTTP connection that sends the H2 preface and no stream hands its demux to a
     /// lane: the setup workers that took the first eight still reach the ninth handshake.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn a_plaintext_h2_preface_releases_its_setup_worker() {
         if !crate::conn::in_a_quiet_process(
             "proxy::tests::a_plaintext_h2_preface_releases_its_setup_worker",
         ) {
             return;
         }
+        let path = "/h2-lane-witness";
         let id = [0x2Bu8; 16];
         let users: Arc<[VlessUser]> = Arc::from(one_vless_user(&id));
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = front.local_addr().expect("addr");
-        let settings = xhttp_settings("/p");
+        let settings = xhttp_settings(path);
         let queued = Arc::new(AtomicUsize::new(0));
         let accepting = {
             let users = Arc::clone(&users);
@@ -48794,6 +48798,40 @@ mod tests {
             queued.load(Ordering::SeqCst),
             8,
             "the accept loop did not hand every connection to a setup lane"
+        );
+        let enqueued = || {
+            H2_DIAL_WITNESS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|seen| seen.as_str() == path)
+                .count()
+        };
+        let until = Instant::now() + crate::budgets::handshake() + Duration::from_secs(5);
+        while enqueued() < 8 && Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            enqueued(),
+            8,
+            "fewer than eight demux lanes were queued, so the relay witness would run ahead of them"
+        );
+        let relayed = Arc::new(AtomicBool::new(false));
+        let ran_relay = Arc::clone(&relayed);
+        lane_pool::submit(
+            Box::new(move || {
+                ran_relay.store(true, Ordering::SeqCst);
+                lane_pool::Next::Done
+            }),
+            Box::new(|| {}),
+        );
+        let until = Instant::now() + crate::budgets::handshake() + Duration::from_secs(5);
+        while !relayed.load(Ordering::SeqCst) && Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            relayed.load(Ordering::SeqCst),
+            "eight idle H2 demux lanes held every relay worker: a relay lane never ran"
         );
         let ran = Arc::new(AtomicBool::new(false));
         let witness = Arc::clone(&ran);
