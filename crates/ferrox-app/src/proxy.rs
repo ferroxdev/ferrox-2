@@ -60994,15 +60994,14 @@ mod tests {
         thread::spawn(move || serve_udp_lane(&relay, &out, None, None, None));
         let source = UdpSocket::bind("127.0.0.1:0").expect("binds");
         source
-            .set_read_timeout(Some(Duration::from_secs(30)))
+            .set_read_timeout(Some(Duration::from_millis(250)))
             .expect("timeout");
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let mut datagram = vec![0u8, 0, 0];
         push_socks_addr(&mut datagram, &target);
         datagram.extend_from_slice(b"xudp-ping");
-        source.send_to(&datagram, relay_addr).expect("sends");
         let mut back = vec![0u8; UDP_BUF];
-        let (n, _) = source.recv_from(&mut back).expect("echoes");
+        let n = udp_echo_answer(&source, relay_addr, &datagram, &mut back);
         let (from, payload) = parse_socks_udp(&back[..n]).expect("splits");
         assert_eq!(from, target, "{tag}");
         assert_eq!(payload, b"xudp-ping", "{tag}");
@@ -61093,15 +61092,14 @@ mod tests {
         thread::spawn(move || serve_udp_lane(&relay, &out, None, None, None));
         let source = UdpSocket::bind("127.0.0.1:0").expect("binds");
         source
-            .set_read_timeout(Some(Duration::from_secs(30)))
+            .set_read_timeout(Some(Duration::from_millis(250)))
             .expect("timeout");
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let mut datagram = vec![0u8, 0, 0];
         push_socks_addr(&mut datagram, &target);
         datagram.extend_from_slice(b"xudp-ping");
-        source.send_to(&datagram, relay_addr).expect("sends");
         let mut back = vec![0u8; UDP_BUF];
-        let (n, _) = source.recv_from(&mut back).expect("echoes");
+        let n = udp_echo_answer(&source, relay_addr, &datagram, &mut back);
         let (from, payload) = parse_socks_udp(&back[..n]).expect("splits");
         assert_eq!(from, target);
         assert_eq!(payload, b"xudp-ping");
@@ -70733,15 +70731,7 @@ mod tests {
         push_socks_addr(&mut datagram, &target);
         datagram.extend_from_slice(b"vmess-quic-association-ping");
         let mut back = vec![0u8; UDP_BUF];
-        let deadline = std::time::Instant::now() + QUIC_TEST_TIMEOUT;
-        let answer = loop {
-            let _ = udp.send_to(&datagram, relay);
-            match udp.recv_from(&mut back) {
-                Ok((n, _)) => break n,
-                Err(_) if std::time::Instant::now() < deadline => {}
-                Err(error) => panic!("echo never returns: {error}"),
-            }
-        };
+        let answer = udp_echo_answer(&udp, relay, &datagram, &mut back);
         let (source, payload) = parse_socks_udp(&back[..answer]).expect("splits");
         assert_eq!(source, target);
         assert_eq!(payload, b"vmess-quic-association-ping");
@@ -74568,15 +74558,7 @@ mod tests {
         push_socks_addr(&mut datagram, &target);
         datagram.extend_from_slice(b"association-ping");
         let mut back = vec![0u8; UDP_BUF];
-        let deadline = std::time::Instant::now() + QUIC_TEST_TIMEOUT;
-        let answer = loop {
-            let _ = udp.send_to(&datagram, relay);
-            match udp.recv_from(&mut back) {
-                Ok((n, _)) => break n,
-                Err(_) if std::time::Instant::now() < deadline => {}
-                Err(error) => panic!("echo never returns: {error}"),
-            }
-        };
+        let answer = udp_echo_answer(&udp, relay, &datagram, &mut back);
         let (source, payload) = parse_socks_udp(&back[..answer]).expect("splits");
         assert_eq!(source, target);
         assert_eq!(payload, b"association-ping");
@@ -74799,15 +74781,7 @@ mod tests {
         push_socks_addr(&mut datagram, &target);
         datagram.extend_from_slice(b"vmess-association-ping");
         let mut back = vec![0u8; UDP_BUF];
-        let deadline = std::time::Instant::now() + QUIC_TEST_TIMEOUT;
-        let answer = loop {
-            let _ = udp.send_to(&datagram, relay);
-            match udp.recv_from(&mut back) {
-                Ok((n, _)) => break n,
-                Err(_) if std::time::Instant::now() < deadline => {}
-                Err(error) => panic!("echo never returns: {error}"),
-            }
-        };
+        let answer = udp_echo_answer(&udp, relay, &datagram, &mut back);
         let (source, payload) = parse_socks_udp(&back[..answer]).expect("splits");
         assert_eq!(source, target);
         assert_eq!(payload, b"vmess-association-ping");
@@ -75992,15 +75966,7 @@ mod tests {
         push_socks_addr(&mut datagram, &target);
         datagram.extend_from_slice(b"association-ping");
         let mut back = vec![0u8; UDP_BUF];
-        let deadline = std::time::Instant::now() + QUIC_TEST_TIMEOUT;
-        let answer = loop {
-            let _ = udp.send_to(&datagram, relay);
-            match udp.recv_from(&mut back) {
-                Ok((n, _)) => break n,
-                Err(_) if std::time::Instant::now() < deadline => {}
-                Err(error) => panic!("echo never returns: {error}"),
-            }
-        };
+        let answer = udp_echo_answer(&udp, relay, &datagram, &mut back);
         let (source, payload) = parse_socks_udp(&back[..answer]).expect("splits");
         assert_eq!(source, target);
         assert_eq!(payload, b"association-ping");
@@ -76329,6 +76295,24 @@ mod tests {
         assert_eq!(&read_echo(&mut client), b"ping");
     }
 
+    /// One socks UDP answer, sending again until it comes: a lane may lose the datagram that opened it.
+    fn udp_echo_answer(
+        udp: &UdpSocket,
+        relay: SocketAddr,
+        datagram: &[u8],
+        back: &mut [u8],
+    ) -> usize {
+        let deadline = Instant::now() + QUIC_TEST_TIMEOUT;
+        loop {
+            let _ = udp.send_to(datagram, relay);
+            match udp.recv_from(back) {
+                Ok((n, _)) => return n,
+                Err(_) if Instant::now() < deadline => {}
+                Err(error) => panic!("echo never returns: {error}"),
+            }
+        }
+    }
+
     fn xudp_association_once(out: Outbound, tag: &str) {
         let echo_port = udp_echo_loop();
         let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
@@ -76337,15 +76321,14 @@ mod tests {
         thread::spawn(move || serve_udp_lane(&relay, &out, None, None, None));
         let source = UdpSocket::bind("127.0.0.1:0").expect("binds");
         source
-            .set_read_timeout(Some(Duration::from_secs(30)))
+            .set_read_timeout(Some(Duration::from_millis(250)))
             .expect("timeout");
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let mut datagram = vec![0u8, 0, 0];
         push_socks_addr(&mut datagram, &target);
         datagram.extend_from_slice(b"xudp-ping");
-        source.send_to(&datagram, relay_addr).expect("sends");
         let mut back = vec![0u8; UDP_BUF];
-        let (n, _) = source.recv_from(&mut back).expect("echoes");
+        let n = udp_echo_answer(&source, relay_addr, &datagram, &mut back);
         let (from, payload) = parse_socks_udp(&back[..n]).expect("splits");
         assert_eq!(from, target, "{tag}");
         assert_eq!(payload, b"xudp-ping", "{tag}");
@@ -76392,15 +76375,14 @@ mod tests {
         thread::spawn(move || serve_udp_lane(&relay, &out, None, None, None));
         let source = UdpSocket::bind("127.0.0.1:0").expect("binds");
         source
-            .set_read_timeout(Some(Duration::from_secs(30)))
+            .set_read_timeout(Some(Duration::from_millis(250)))
             .expect("timeout");
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let mut datagram = vec![0u8, 0, 0];
         push_socks_addr(&mut datagram, &target);
         datagram.extend_from_slice(b"xudp-ping");
-        source.send_to(&datagram, relay_addr).expect("sends");
         let mut back = vec![0u8; UDP_BUF];
-        let (n, _) = source.recv_from(&mut back).expect("echoes");
+        let n = udp_echo_answer(&source, relay_addr, &datagram, &mut back);
         let (from, payload) = parse_socks_udp(&back[..n]).expect("splits");
         assert_eq!(from, target);
         assert_eq!(payload, b"xudp-ping");
