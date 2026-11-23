@@ -1548,7 +1548,17 @@ impl H3Client {
                 pump_dead.store(true, Ordering::Relaxed);
             })
             .ok()?;
-        Some(Arc::new(Self {
+        Some(Self::assemble(conn, sock, dead, draining, goaway))
+    }
+
+    fn assemble(
+        conn: Arc<Mutex<QuicheConnection>>,
+        sock: Arc<Datagram>,
+        dead: Arc<AtomicBool>,
+        draining: Arc<AtomicBool>,
+        goaway: Arc<AtomicU64>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
             conn,
             sock,
             next: AtomicU64::new(0),
@@ -1558,7 +1568,7 @@ impl H3Client {
             goaway,
             #[cfg(test)]
             credit_waits: std::sync::atomic::AtomicUsize::new(0),
-        }))
+        })
     }
 
     fn open(self: &Arc<Self>, block: &[u8], end_request: bool) -> Option<(H3Reader, H3StreamOut)> {

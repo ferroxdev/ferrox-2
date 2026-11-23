@@ -2921,7 +2921,9 @@ fn inbound_networks(inbound: &Json, settings: Option<&Json>) -> Result<(bool, bo
     Ok((tcp, udp))
 }
 
-fn inbound_config(inbound: &Json) -> Result<(Users, (bool, bool), Option<Congestion>), String> {
+type InboundConfig = (Users, (bool, bool), Option<Congestion>);
+
+fn inbound_config(inbound: &Json) -> Result<InboundConfig, String> {
     let settings = inbound.get("settings");
     let users = inbound_users(inbound, settings)?;
     if users.is_empty() {
