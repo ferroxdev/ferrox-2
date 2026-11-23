@@ -14167,7 +14167,7 @@ where
     W: LaneWrite + HalfShut + 'static,
 {
     let sink = HalfSink(Arc::clone(to));
-    if let Some(next) = settle_lane(&sink, at) {
+    if let Some(next) = settle_lane(&sink, at, ended) {
         if at.lost {
             at.lost = false;
             ended.mark_failed();
@@ -39608,7 +39608,11 @@ impl Upload {
 
 /// A paced carrier may still owe bytes no caller offered again: drain them before a read that would
 /// otherwise park the only lane able to hand the peer the grant the parked write waits for.
-fn settle_lane(uplink: &impl CarrierSink, at: &mut Forward) -> Option<Next> {
+fn settle_lane(
+    uplink: &impl CarrierSink,
+    at: &mut Forward,
+    ended: &Arc<RelayFinish>,
+) -> Option<Next> {
     match uplink.settle() {
         Settle::Clear => {
             at.parked = None;
@@ -39617,6 +39621,7 @@ fn settle_lane(uplink: &impl CarrierSink, at: &mut Forward) -> Option<Next> {
         Settle::Advanced => {
             at.parked = None;
             at.spins = 0;
+            ended.mark_progress();
             Some(Next::Retry)
         }
         Settle::Parked => {
@@ -39800,7 +39805,7 @@ where
     let mut at = Forward::new();
     lane_pool::submit(
         Box::new(move || {
-            if let Some(next) = settle_lane(&uplink, &mut at) {
+            if let Some(next) = settle_lane(&uplink, &mut at, &forward_flow) {
                 return next;
             }
             if let Some(next) = forward_flush(&buffer, &uplink, &mut at) {

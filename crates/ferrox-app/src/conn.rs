@@ -1309,9 +1309,9 @@ impl Connection {
             Connection::Masked(masked) if !masked.is_plain() && masked.xmc.is_none() => {
                 masked.flush_chain()
             }
-            Connection::Metered(metered) => (0, metered.inner.flush_ready()),
+            Connection::Metered(metered) => metered.inner.flush_ready_outcome(),
             Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
-                (0, inner.flush_ready())
+                inner.flush_ready_outcome()
             }
             _ => (0, Ok(())),
         }
@@ -1384,9 +1384,9 @@ impl Connection {
             return (written, result.and(restored));
         }
         match self {
-            Connection::Metered(metered) => (0, metered.inner.flush_ready()),
+            Connection::Metered(metered) => metered.inner.flush_ready_outcome(),
             Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
-                (0, inner.flush_ready())
+                inner.flush_ready_outcome()
             }
             _ => (0, Ok(())),
         }

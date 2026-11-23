@@ -1823,12 +1823,18 @@ impl NaiveOut {
         let connect = version == 2;
         // A 10 ms quiet poll keeps stop and opener pickup bounded without an idle association waking every millisecond.
         let _ = relay.set_read_timeout(Some(crate::budgets::RELAY_IDLE));
-        let associate = associate.and_then(|associate| {
-            associate
-                .set_read_timeout(Some(crate::budgets::RELAY_IDLE))
-                .ok()
-                .map(|()| associate)
-        });
+        let associate = match associate {
+            Some(associate) => {
+                if associate
+                    .set_read_timeout(Some(crate::budgets::RELAY_IDLE))
+                    .is_err()
+                {
+                    return;
+                }
+                Some(associate)
+            }
+            None => None,
+        };
         let dial = proxy::FlowDial::capture();
         let mut lanes: HashMap<(String, SocketAddr), UotLane> = HashMap::new();
         let mut pending: HashMap<(String, SocketAddr), PendingUot> = HashMap::new();
@@ -2135,6 +2141,12 @@ impl NaiveOut {
                 self.h2_inflight.fetch_sub(1, Ordering::Relaxed);
                 drop(published);
                 self.h2_ready.notify_all();
+                if client.is_none()
+                    && existing.is_none()
+                    && self.h2_inflight.load(Ordering::Relaxed) > 0
+                {
+                    continue;
+                }
                 return client.or(existing);
             }
             let len = pool.len();
@@ -2354,6 +2366,7 @@ impl NaiveOut {
                 }
                 Err(H3OpenError::Full) => {
                     fill = false;
+                    skip = None;
                     let left = deadline.saturating_duration_since(Instant::now());
                     if left.is_zero() {
                         return None;
@@ -2452,7 +2465,7 @@ pub(crate) fn outbound(root: &Json) -> Result<Option<NaiveOut>, String> {
         (!username.is_empty() || !password.is_empty()).then(|| basic_token(username, password));
     let tls = outbound_tls(first, address)?;
     let quic = field("quic").and_then(Json::as_bool).unwrap_or(false);
-    let uot = uot_option(field("udp_over_tcp").or_else(|| field("udpOverTcp")));
+    let uot = uot_option(field("udp_over_tcp").or_else(|| field("udpOverTcp")))?;
     let stream_window = memory_bytes(field("stream_receive_window")).filter(|window| *window > 0);
     let session_window =
         memory_bytes(field("quic_session_receive_window")).filter(|window| *window > 0);
@@ -2491,7 +2504,7 @@ pub(crate) fn outbound(root: &Json) -> Result<Option<NaiveOut>, String> {
 
 fn header_pairs(node: &Json) -> Result<Option<Vec<(String, String)>>, String> {
     let Json::Obj(pairs) = node else {
-        return Ok(None);
+        return Err("naive extra_headers must be an object".to_owned());
     };
     let mut headers = Vec::with_capacity(pairs.len());
     for (name, value) in pairs {
@@ -2506,11 +2519,22 @@ fn header_pairs(node: &Json) -> Result<Option<Vec<(String, String)>>, String> {
         let value = match value {
             Json::Str(text) => text.clone(),
             Json::Arr(items) if items.is_empty() => continue,
-            Json::Arr(items) => match items.first().and_then(Json::as_str) {
-                Some(text) => text.to_owned(),
-                None => continue,
-            },
-            _ => continue,
+            Json::Arr(items) => {
+                if !items.iter().all(|item| item.as_str().is_some()) {
+                    return Err(format!(
+                        "naive extra_headers `{name}` must be a string or a string array"
+                    ));
+                }
+                match items.first().and_then(Json::as_str) {
+                    Some(text) => text.to_owned(),
+                    None => continue,
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "naive extra_headers `{name}` must be a string or a string array"
+                ));
+            }
         };
         if !header_name_ok(name) {
             return Err(format!(
@@ -2595,21 +2619,30 @@ fn connection_specific(name: &str) -> bool {
     .any(|field| name.eq_ignore_ascii_case(field))
 }
 
-fn uot_option(node: Option<&Json>) -> Option<u8> {
-    match node? {
-        Json::Bool(true) => Some(2),
+fn uot_option(node: Option<&Json>) -> Result<Option<u8>, String> {
+    let Some(node) = node else {
+        return Ok(None);
+    };
+    match node {
+        Json::Bool(true) => Ok(Some(2)),
+        Json::Bool(false) => Ok(None),
         Json::Obj(_) => {
-            let node = node?;
             if !node.get("enabled").and_then(Json::as_bool).unwrap_or(false) {
-                return None;
+                return Ok(None);
             }
-            match node.get("version").and_then(Json::as_u32) {
-                None | Some(0 | 2) => Some(2),
-                Some(1) => Some(1),
-                Some(_) => None,
+            match node.get("version") {
+                None => Ok(Some(2)),
+                Some(version) => match version.as_u32() {
+                    Some(0 | 2) => Ok(Some(2)),
+                    Some(1) => Ok(Some(1)),
+                    Some(other) => Err(format!(
+                        "naive udp_over_tcp version {other} is not supported"
+                    )),
+                    None => Err("naive udp_over_tcp version must be a number".to_owned()),
+                },
             }
         }
-        _ => None,
+        _ => Err("naive udp_over_tcp must be a boolean or an object".to_owned()),
     }
 }
 
@@ -2699,50 +2732,60 @@ fn outbound_tls(outbound: &Json, address: &str) -> Result<Arc<TlsConfig>, String
     }))
 }
 
+fn inline_ca(certificate: &Json) -> Result<Vec<u8>, String> {
+    let mut pem = Vec::new();
+    match certificate {
+        Json::Str(text) => {
+            if !text.is_empty() {
+                pem.extend_from_slice(text.as_bytes());
+            }
+        }
+        Json::Arr(items) => {
+            for item in items {
+                let text = item
+                    .as_str()
+                    .ok_or("naive tls certificate list must hold strings")?;
+                if text.is_empty() {
+                    continue;
+                }
+                pem.extend_from_slice(text.as_bytes());
+                if !pem.ends_with(b"\n") {
+                    pem.push(b'\n');
+                }
+            }
+        }
+        _ => {
+            return Err("naive tls certificate must be a string or list of strings".to_owned());
+        }
+    }
+    if pem.ends_with(b"\n") {
+        return Ok(pem);
+    }
+    if !pem.is_empty() {
+        pem.push(b'\n');
+    }
+    Ok(pem)
+}
+
 fn outbound_ca(tls: &Json, insecure: bool) -> Result<ferrox_core::tls::Anchors, String> {
     if insecure {
         return Ok(Arc::from(Vec::new()));
     }
-    let mut pem = Vec::new();
-    let path = tls
-        .get("certificate_path")
-        .or_else(|| tls.get("certificatePath"))
-        .and_then(Json::as_str)
-        .filter(|path| !path.is_empty());
-    if let Some(path) = path {
-        let bytes = crate::config::read_cert_file(path)
-            .ok_or_else(|| format!("naive tls certificate_path `{path}` cannot be read"))?;
-        pem.extend_from_slice(&bytes);
-        if !pem.ends_with(b"\n") {
-            pem.push(b'\n');
-        }
-    }
-    if let Some(certificate) = tls.get("certificate") {
-        match certificate {
-            Json::Str(text) => {
-                if !text.is_empty() {
-                    pem.extend_from_slice(text.as_bytes());
-                    if !pem.ends_with(b"\n") {
-                        pem.push(b'\n');
-                    }
-                }
-            }
-            Json::Arr(items) => {
-                for item in items {
-                    let text = item
-                        .as_str()
-                        .ok_or("naive tls certificate list must hold strings")?;
-                    if text.is_empty() {
-                        continue;
-                    }
-                    pem.extend_from_slice(text.as_bytes());
-                    if !pem.ends_with(b"\n") {
-                        pem.push(b'\n');
-                    }
-                }
-            }
-            _ => {
-                return Err("naive tls certificate must be a string or list of strings".to_owned());
+    let mut pem = match tls.get("certificate") {
+        Some(certificate) => inline_ca(certificate)?,
+        None => Vec::new(),
+    };
+    if pem.is_empty() {
+        let path = tls
+            .get("certificate_path")
+            .or_else(|| tls.get("certificatePath"))
+            .and_then(Json::as_str)
+            .filter(|path| !path.is_empty());
+        if let Some(path) = path {
+            pem = crate::config::read_cert_file(path)
+                .ok_or_else(|| format!("naive tls certificate_path `{path}` cannot be read"))?;
+            if !pem.ends_with(b"\n") {
+                pem.push(b'\n');
             }
         }
     }
@@ -2877,7 +2920,7 @@ fn inbound_networks(inbound: &Json, settings: Option<&Json>) -> Result<(bool, bo
     Ok((tcp, udp))
 }
 
-fn inbound_config(inbound: &Json) -> Result<(Users, (bool, bool)), String> {
+fn inbound_config(inbound: &Json) -> Result<(Users, (bool, bool), Option<Congestion>), String> {
     let settings = inbound.get("settings");
     let users = inbound_users(inbound, settings)?;
     if users.is_empty() {
@@ -2893,7 +2936,12 @@ fn inbound_config(inbound: &Json) -> Result<(Users, (bool, bool)), String> {
     if udp && !tcp && security != "tls" {
         return Err("naive inbound asks for QUIC without TLS: serves nothing".to_owned());
     }
-    Ok((users, (tcp, udp)))
+    let congestion = inbound_congestion_option(
+        settings
+            .and_then(|settings| settings.get("quic_congestion_control"))
+            .or_else(|| inbound.get("quic_congestion_control")),
+    )?;
+    Ok((users, (tcp, udp), congestion))
 }
 
 pub(crate) fn validate_inbound(inbound: &Json) -> Result<(), String> {
@@ -3055,8 +3103,7 @@ pub(crate) fn serve_inbound(
     freedom: bool,
     stop: Option<&Arc<proxy::Stop>>,
 ) -> usize {
-    let settings = inbound.get("settings");
-    let (users, (tcp, mut udp)) = match inbound_config(inbound) {
+    let (users, (tcp, mut udp), congestion) = match inbound_config(inbound) {
         Ok(config) => config,
         Err(error) => {
             eprintln!("naive inbound in {path}: {error}");
@@ -3082,17 +3129,7 @@ pub(crate) fn serve_inbound(
     let quic_identity = identity
         .as_ref()
         .map(|identity| Arc::new(identity_with_alpn(identity, b"h3")));
-    let congestion = match inbound_congestion_option(
-        settings
-            .and_then(|settings| settings.get("quic_congestion_control"))
-            .or_else(|| inbound.get("quic_congestion_control")),
-    ) {
-        Ok(congestion) => congestion.or(Some(Congestion::Bbr)),
-        Err(error) => {
-            eprintln!("naive inbound in {path}: {error}");
-            return 0;
-        }
-    };
+    let congestion = congestion.or(Some(Congestion::Bbr));
     if identity.is_none() {
         if !tcp {
             eprintln!("naive inbound in {path} asks for QUIC without TLS: serves nothing");
@@ -3641,6 +3678,12 @@ mod tests {
         let forbidden = crate::json::parse(r#"{"X-Custom": "ok", "Connection": "keep-alive"}"#)
             .expect("parses");
         assert!(header_pairs(&forbidden).is_err());
+        let numeric = crate::json::parse(r#"{"X-Custom": 42}"#).expect("parses");
+        assert!(header_pairs(&numeric).is_err());
+        let mixed = crate::json::parse(r#"{"X-Custom": ["ok", 42]}"#).expect("parses");
+        assert!(header_pairs(&mixed).is_err());
+        let scalar = crate::json::parse(r#""X-Custom: ok""#).expect("parses");
+        assert!(header_pairs(&scalar).is_err());
         let spaced = crate::json::parse(r#"{"X Trace": "enabled"}"#).expect("parses");
         assert!(header_pairs(&spaced).is_err());
         let control = crate::json::parse(r#"{"X-Custom": "ok\r\nInjected: yes"}"#).expect("parses");
@@ -3699,13 +3742,21 @@ mod tests {
 
     #[test]
     fn uot_accepts_both_the_boolean_and_the_version_object() {
-        assert_eq!(uot_option(Some(&Json::Bool(true))), Some(2));
-        assert_eq!(uot_option(Some(&Json::Bool(false))), None);
+        assert_eq!(uot_option(Some(&Json::Bool(true))).expect("reads"), Some(2));
+        assert_eq!(uot_option(Some(&Json::Bool(false))).expect("reads"), None);
         let object = |text: &str| uot_option(Some(&crate::json::parse(text).expect("parses")));
-        assert_eq!(object(r#"{"enabled": true}"#), Some(2));
-        assert_eq!(object(r#"{"enabled": true, "version": 1}"#), Some(1));
-        assert_eq!(object(r#"{"enabled": true, "version": 0}"#), Some(2));
-        assert_eq!(object(r#"{"version": 1}"#), None);
+        assert_eq!(object(r#"{"enabled": true}"#).expect("reads"), Some(2));
+        assert_eq!(
+            object(r#"{"enabled": true, "version": 1}"#).expect("reads"),
+            Some(1)
+        );
+        assert_eq!(
+            object(r#"{"enabled": true, "version": 0}"#).expect("reads"),
+            Some(2)
+        );
+        assert_eq!(object(r#"{"version": 1}"#).expect("reads"), None);
+        assert!(object(r#"{"enabled": true, "version": 3}"#).is_err());
+        assert!(object(r#"{"enabled": true, "version": "1"}"#).is_err());
     }
 
     #[test]
@@ -3766,6 +3817,13 @@ mod tests {
         ))
         .expect("parses");
         let tls = outbound_tls(&inline, "a.test").expect("tls");
+        assert_eq!(tls.roots.as_ref(), &[der.clone()][..]);
+
+        let both = crate::json::parse(&format!(
+            r#"{{"protocol":"naive","settings":{{"address":"a.test","port":443}},"tls":{{"enabled":true,"certificate":"{escaped}","certificate_path":"/nonexistent/ferrox-ca.pem"}}}}"#
+        ))
+        .expect("parses");
+        let tls = outbound_tls(&both, "a.test").expect("inline wins");
         assert_eq!(tls.roots.as_ref(), &[der.clone()][..]);
 
         let dir = std::env::temp_dir().join(format!(
@@ -3918,6 +3976,12 @@ mod tests {
         .expect("parses");
         assert!(inbound_users(&colon, colon.get("settings")).is_err());
         assert!(validate_inbound(&colon).is_err());
+
+        let controller = crate::json::parse(
+            r#"{"protocol": "naive", "settings": {"users": [{"username": "u", "password": "p"}], "network": ["tcp", "udp"], "quic_congestion_control": "bogus"}}"#,
+        )
+        .expect("parses");
+        assert!(validate_inbound(&controller).is_err());
     }
 
     #[test]

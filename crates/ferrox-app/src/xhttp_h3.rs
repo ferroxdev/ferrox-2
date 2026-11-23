@@ -72,10 +72,10 @@ impl Wire {
         }
     }
 
-    fn opening_start(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    fn opening_start(&mut self, buf: &[u8], deadline: Option<Instant>) -> std::io::Result<usize> {
         match self {
             Self::Server(stream) => stream.write(buf),
-            Self::Client(stream) => stream.opening_start(buf),
+            Self::Client(stream) => stream.opening_start(buf, deadline),
         }
     }
 
@@ -1240,13 +1240,16 @@ impl ClientStream {
 
     /// One non-blocking opening attempt: `StreamLimit` leaves the id unallocated, while a created
     /// stream may still be waiting for credit after this returns.
-    fn opening_start(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    fn opening_start(&mut self, buf: &[u8], deadline: Option<Instant>) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
         let Ok(mut conn) = self.conn.lock() else {
             return Err(std::io::Error::other("h3 connection lock poisoned"));
         };
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        }
         if self.owner.dead.load(Ordering::Relaxed)
             || self.owner.rejected(self.id)
             || self.owner.draining.load(Ordering::Relaxed)
@@ -1293,6 +1296,8 @@ impl ClientStream {
             match conn.stream_send(self.id, rest, false) {
                 Ok(0) | Err(quiche::Error::Done) => {
                     drop(conn);
+                    #[cfg(test)]
+                    self.owner.credit_waits.fetch_add(1, Ordering::Relaxed);
                     std::thread::sleep(POLL);
                 }
                 Ok(n) => {
@@ -1357,6 +1362,8 @@ pub(crate) struct H3Client {
     dead: Arc<AtomicBool>,
     draining: Arc<AtomicBool>,
     goaway: Arc<AtomicU64>,
+    #[cfg(test)]
+    credit_waits: std::sync::atomic::AtomicUsize,
 }
 
 impl Drop for H3Client {
@@ -1374,6 +1381,11 @@ impl H3Client {
     /// connection closes, and a pooled client that fails this is dropped rather than reused.
     pub(crate) fn reusable(&self) -> bool {
         !self.dead.load(Ordering::Relaxed) && !self.draining.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn waited_for_credit(&self) -> bool {
+        self.credit_waits.load(Ordering::Relaxed) > 0
     }
 
     fn rejected(&self, id: u64) -> bool {
@@ -1544,6 +1556,8 @@ impl H3Client {
             dead,
             draining,
             goaway,
+            #[cfg(test)]
+            credit_waits: std::sync::atomic::AtomicUsize::new(0),
         }))
     }
 
@@ -1577,6 +1591,8 @@ impl H3Client {
         activity: Arc<Activity>,
         deadline: Option<Instant>,
     ) -> Result<(H3Reader, H3StreamOut), H3OpenError> {
+        let expiry = deadline;
+        let deadline = deadline.unwrap_or_else(|| Instant::now() + crate::budgets::relay_stall());
         let Ok(opening) = self.opening.lock() else {
             return Err(H3OpenError::Closed);
         };
@@ -1600,15 +1616,17 @@ impl H3Client {
         frames::quic_varint(&mut frame, block.len() as u64);
         frame.extend_from_slice(block);
         let mut writer = wire.clone();
-        let expiry = deadline;
-        let deadline = deadline.unwrap_or_else(|| Instant::now() + crate::budgets::relay_stall());
-        let sent = match writer.opening_start(&frame) {
+        let sent = match writer.opening_start(&frame, expiry) {
             Ok(sent) => {
                 self.next.store(id + 4, Ordering::SeqCst);
                 sent
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 return Err(H3OpenError::Full);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                wire.close();
+                return Err(H3OpenError::Closed);
             }
             Err(_) => {
                 self.next.store(id + 4, Ordering::SeqCst);
@@ -2534,10 +2552,10 @@ mod tests {
             )
         });
         let started = Instant::now();
-        while client.next.load(Ordering::SeqCst) == 0 {
+        while client.next.load(Ordering::SeqCst) == 0 || !client.waited_for_credit() {
             assert!(
                 started.elapsed() < Duration::from_secs(5),
-                "the first open never started"
+                "the first open never waited for credit"
             );
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -2563,6 +2581,10 @@ mod tests {
         assert!(
             second.is_ok(),
             "the second open completed while the first waited"
+        );
+        assert!(
+            !first.is_finished(),
+            "the first open finished instead of waiting for credit"
         );
         stop.store(true, Ordering::Relaxed);
         client.dead.store(true, Ordering::Relaxed);
