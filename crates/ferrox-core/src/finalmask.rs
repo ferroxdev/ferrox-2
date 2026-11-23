@@ -799,7 +799,9 @@ fn flush_gathered<W: Write>(raw: &mut W, gathered: &mut Gathered) -> io::Result<
         }
         if let Some((_, wait)) = gathered.parks.first().copied() {
             gathered.parks.remove(0);
-            if wait > 0 {
+            if wait > 0 && !DRAINING.with(std::cell::Cell::get) {
+                #[cfg(test)]
+                SLEEPS.with(|count| count.set(count.get() + 1));
                 std::thread::sleep(Duration::from_millis(wait as u64));
             }
         }
