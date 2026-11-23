@@ -4920,6 +4920,10 @@ const STREAM_QUANTUM: Duration = Duration::from_millis(100);
 /// What a flow-control-blocked writer waits before it asks quiche again: the window reopens on an ack that lands in microseconds, and a quantum of 5 ms caps a stream at window/quantum.
 const SEND_POLL: Duration = Duration::from_micros(250);
 
+/// What a relay lane waits before it asks quiche for bytes again: a request/response flow lands its
+/// next frame inside a round trip, so the lane's first empty round is shorter than the relay grain.
+const QUIC_RELAY_POLL: Duration = Duration::from_micros(100);
+
 /// Between polls of quiche state, so a waiting read never holds the connection lock.
 const STREAM_POLL: Duration = Duration::from_millis(5);
 
@@ -4983,6 +4987,7 @@ impl Read for QuicStream {
                 }
             }
             if relayed {
+                crate::proxy::note_wait_idle(QUIC_RELAY_POLL);
                 return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
             }
             if Instant::now() >= deadline {
@@ -5009,7 +5014,10 @@ impl Write for QuicStream {
         if crate::proxy::relay_step_owns_poll() {
             let mut rest = bytes::Bytes::copy_from_slice(buf);
             return match self.send_once(&mut rest) {
-                Ok(0) => Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+                Ok(0) => {
+                    crate::proxy::note_wait_idle(QUIC_RELAY_POLL);
+                    Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                }
                 Ok(n) => {
                     self.meter.write(n);
                     self.activity.touch();

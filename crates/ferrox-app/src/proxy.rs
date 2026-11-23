@@ -36105,11 +36105,12 @@ pub(crate) mod lane_pool {
                     }
                     Ok(Next::Idle) => {
                         lane.idle = lane.idle.saturating_add(1);
+                        let quantum = crate::proxy::take_wait_idle();
                         match park_ready(pool, lane) {
                             Ok(()) => break,
                             Err(parked) => lane = parked,
                         }
-                        park(pool, lane);
+                        park_with(pool, lane, quantum.unwrap_or(crate::budgets::RELAY_POLL));
                         break;
                     }
                     Ok(Next::Retry) => {
