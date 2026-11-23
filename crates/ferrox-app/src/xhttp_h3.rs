@@ -1549,20 +1549,7 @@ impl H3Client {
             .ok()
     }
 
-    /// A `NaiveProxy` CONNECT block: the caller frames its own tunnel, so no xHTTP writer is built.
-    pub(crate) fn open_block(
-        self: &Arc<Self>,
-        block: &[u8],
-        end_request: bool,
-    ) -> Result<(H3Reader, H3StreamOut), H3OpenError> {
-        self.open_block_until(
-            block,
-            end_request,
-            Instant::now() + crate::budgets::relay_stall(),
-        )
-    }
-
-    /// The same CONNECT with the caller's absolute handshake deadline carried through the opening write and the answer's first head.
+    /// A `NaiveProxy` CONNECT block: the caller frames its own tunnel, so no xHTTP writer is built, and its absolute handshake deadline carries through the opening write and the answer's first head.
     pub(crate) fn open_block_until(
         self: &Arc<Self>,
         block: &[u8],
@@ -2508,10 +2495,18 @@ mod tests {
         let head = "POST /o HTTP/1.1\r\nHost: localhost\r\n\r\n";
         let block = block_from_text(head, "localhost", "https");
         let _first = client
-            .open_block(&block, false)
+            .open_block_until(
+                &block,
+                false,
+                Instant::now() + crate::budgets::relay_stall(),
+            )
             .expect("the first h3 stream opens");
         assert!(matches!(
-            client.open_block(&block, false),
+            client.open_block_until(
+                &block,
+                false,
+                Instant::now() + crate::budgets::relay_stall()
+            ),
             Err(H3OpenError::Full)
         ));
         assert_eq!(client.next.load(Ordering::SeqCst), 4);
@@ -2525,7 +2520,13 @@ mod tests {
         let large = vec![b'x'; 200];
         let small = vec![b'y'; 20];
         let first_client = Arc::clone(&client);
-        let first = std::thread::spawn(move || first_client.open_block(&large, false));
+        let first = std::thread::spawn(move || {
+            first_client.open_block_until(
+                &large,
+                false,
+                Instant::now() + crate::budgets::relay_stall(),
+            )
+        });
         let started = Instant::now();
         while client.next.load(Ordering::SeqCst) == 0 {
             assert!(
@@ -2548,7 +2549,11 @@ mod tests {
                 }
             })
         };
-        let second = client.open_block(&small, false);
+        let second = client.open_block_until(
+            &small,
+            false,
+            Instant::now() + crate::budgets::relay_stall(),
+        );
         assert!(
             second.is_ok(),
             "the second open completed while the first waited"
