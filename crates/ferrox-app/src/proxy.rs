@@ -13849,7 +13849,7 @@ impl<T: Read> Half<T> {
         match self {
             Self::Split { read, .. } => match read.lock() {
                 Ok(mut guard) => guard.read(buf),
-                Err(()) => Err(std::io::Error::other("relay half poisoned")),
+                Err(_) => Err(std::io::Error::other("relay half poisoned")),
             },
             Self::Shared {
                 inner,
