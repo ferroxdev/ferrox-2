@@ -738,9 +738,9 @@ impl<R: Read> GrpcReader<R> {
                         }
                     }
                 }
-                Err(_) => {
+                Err(error) => {
                     self.msg.truncate(from + *filled);
-                    return Ok(false);
+                    return Err(error);
                 }
             }
         }
@@ -781,9 +781,9 @@ impl<R: Read> GrpcReader<R> {
                     }
                     None => std::thread::sleep(crate::budgets::RELAY_POLL),
                 },
-                Err(_) => {
+                Err(error) => {
                     self.frame.truncate(*filled);
-                    return Ok(false);
+                    return Err(error);
                 }
             }
         }
@@ -810,7 +810,7 @@ impl<R: Read> GrpcReader<R> {
                     None if crate::proxy::relay_step_owns_poll() => return Err(error),
                     None => std::thread::sleep(crate::budgets::RELAY_POLL),
                 },
-                Err(_) => return Ok(false),
+                Err(error) => return Err(error),
             }
         }
         Ok(true)
@@ -4325,6 +4325,61 @@ mod tests {
         .expect("dials");
         drop(writer);
         reader
+    }
+
+    /// A carrier read that failed is an error, not the end of the download: reported as `Ok(0)`, it
+    /// let the relay half-close the peer while bytes were still owed, and the client saw a truncated
+    /// body as `UnexpectedEof` with nothing naming the leg that broke.
+    #[test]
+    fn a_carrier_read_error_is_not_an_end() {
+        struct Fails {
+            wire: std::io::Cursor<Vec<u8>>,
+            error: Option<std::io::ErrorKind>,
+        }
+
+        impl Read for Fails {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.wire.read(buf)?;
+                if n == 0 {
+                    if let Some(kind) = self.error.take() {
+                        return Err(std::io::Error::from(kind));
+                    }
+                }
+                Ok(n)
+            }
+        }
+
+        let mut body = frame(T_DATA, 0, 1, &message(b"ping"));
+        let head = body.drain(..9).collect::<Vec<u8>>();
+        for (name, wire, kind) in [
+            (
+                "a frame head",
+                Vec::new(),
+                std::io::ErrorKind::ConnectionAborted,
+            ),
+            ("a data body", head, std::io::ErrorKind::ConnectionReset),
+        ] {
+            let mut reader = new_reader(
+                Fails {
+                    wire: std::io::Cursor::new(wire),
+                    error: Some(kind),
+                },
+                new_shared(Box::new(NullSink)),
+                true,
+                "",
+                "",
+                1,
+                CREDIT_AT,
+            );
+            reader.answered = true;
+            match reader.read_window() {
+                Ok(window) => panic!(
+                    "{name}: the error came back as the end of the stream ({:?})",
+                    window.bytes()
+                ),
+                Err(error) => assert_eq!(error.kind(), kind, "{name}"),
+            }
+        }
     }
 
     /// The witness for `carrier-grpc payload-staging-copies-per-byte-read 0`: a body is read onto the end of the buffer the caller is served from, over the three shapes a body can arrive in.
