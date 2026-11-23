@@ -42,6 +42,7 @@ const MAX_ASSOCIATIONS_PER_SESSION: usize = 256;
 const MAX_UDP_SOCKETS: usize = 2048;
 const MAX_TUIC_LANES: usize = 64;
 const LANES_PER_KEY: usize = 8;
+const SERVER_FANOUT: usize = 4;
 const MAX_RESOLVING_PER_SESSION: usize = 32;
 const MAX_RESOLVE_PAYLOADS: usize = 4;
 const RESOLVE_QUEUE: usize = 256;
@@ -1615,20 +1616,15 @@ pub(crate) fn serve_inbound(
         eprintln!("unreadable tuic identity in {path}: serves nothing");
         return false;
     };
-    let Ok(socket) = quic::bind_datagram(address) else {
+    let sockets = quic::bind_datagram_fanout(address, SERVER_FANOUT)
+        .or_else(|_| quic::bind_datagram(address).map(|socket| vec![socket]));
+    let Ok(sockets) = sockets else {
         eprintln!("tuic inbound in {path} cannot bind {address}: serves nothing");
         return false;
     };
-    let Ok(local) = socket.local_addr() else {
+    let Ok(local) = sockets[0].local_addr() else {
         return false;
     };
-    let Some(mut template) = quic::tls_config(&identity) else {
-        eprintln!("tuic inbound in {path} cannot build its tls: serves nothing");
-        return false;
-    };
-    if !quic::tune(&mut template, wire::ALPN) {
-        return false;
-    }
     let setting = |name: &str| {
         inbound
             .get("settings")
@@ -1640,45 +1636,70 @@ pub(crate) fn serve_inbound(
     let heartbeat = setting("heartbeat").unwrap_or(HEARTBEAT);
     let auth_timeout = setting("auth_timeout").unwrap_or(AUTH_TIMEOUT);
     let udp_timeout = setting("udp_timeout").unwrap_or(UDP_IDLE);
-    if let Some(name) = inbound
+    let congestion = inbound
         .get("settings")
         .and_then(|node| {
             node.get("congestion_control")
                 .or_else(|| node.get("congestionControl"))
         })
         .and_then(Json::as_str)
-        .filter(|value| !value.is_empty())
-    {
+        .filter(|value| !value.is_empty());
+    if let Some(name) = congestion {
         if !matches!(name, "cubic" | "new_reno" | "reno" | "bbr") {
             eprintln!("tuic congestion_control `{name}` is not carried");
             return false;
         }
-        if template.set_cc_algorithm_name(quiche_cc(name)).is_err() {
-            eprintln!("tuic congestion_control `{name}` is not carried");
+    }
+    let early = inbound.get("settings").is_some_and(|node| {
+        bool_field(node, "zero_rtt_handshake") || bool_field(node, "zeroRttHandshake")
+    });
+    let mut templates = Vec::with_capacity(sockets.len());
+    for _ in 0..sockets.len() {
+        let Some(mut template) = quic::tls_config(&identity) else {
+            eprintln!("tuic inbound in {path} cannot build its tls: serves nothing");
+            return false;
+        };
+        if !quic::tune(&mut template, wire::ALPN) {
             return false;
         }
-    }
-    template.enable_dgram(true, quic::MAX_DATAGRAM, DGRAM_SEND_QUEUE);
-    if inbound.get("settings").is_some_and(|node| {
-        bool_field(node, "zero_rtt_handshake") || bool_field(node, "zeroRttHandshake")
-    }) {
-        template.enable_early_data();
+        if let Some(name) = congestion {
+            if template.set_cc_algorithm_name(quiche_cc(name)).is_err() {
+                eprintln!("tuic congestion_control `{name}` is not carried");
+                return false;
+            }
+        }
+        template.enable_dgram(true, quic::MAX_DATAGRAM, DGRAM_SEND_QUEUE);
+        if early {
+            template.enable_early_data();
+        }
+        templates.push(template);
     }
     let signal = stop.as_ref().map(|stop| stop.shared());
     let meter = proxy::inbound_meter(inbound);
+    let mut handles = Vec::with_capacity(sockets.len());
+    for (socket, template) in sockets.into_iter().zip(templates) {
+        let users = users.clone();
+        let signal = signal.clone();
+        let meter = meter.clone();
+        handles.push(thread::spawn(move || {
+            run(
+                Arc::new(Datagram::plain(socket)),
+                local,
+                users,
+                template,
+                freedom,
+                heartbeat,
+                auth_timeout,
+                udp_timeout,
+                meter,
+                signal,
+            );
+        }));
+    }
     thread::spawn(move || {
-        run(
-            Arc::new(Datagram::plain(socket)),
-            local,
-            users,
-            template,
-            freedom,
-            heartbeat,
-            auth_timeout,
-            udp_timeout,
-            meter,
-            signal,
-        );
+        for handle in handles {
+            let _ = handle.join();
+        }
         if let Some(stop) = stop {
             stop.mark_closed();
         }

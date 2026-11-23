@@ -721,6 +721,59 @@ pub(crate) fn bind_datagram_at(
     Ok(UdpSocket::from(socket))
 }
 
+/// Bind `lanes` datagram sockets to one address so the kernel can hash each four-tuple to a reader.
+pub(crate) fn bind_datagram_fanout(
+    options: Option<&SocketOptions>,
+    address: &str,
+    lanes: usize,
+) -> io::Result<Vec<UdpSocket>> {
+    #[cfg(unix)]
+    {
+        let lanes = lanes.max(1);
+        let mut refused = None;
+        for addr in address.to_socket_addrs()? {
+            match bind_datagram_at_fanout(options, addr, lanes) {
+                Ok(sockets) => return Ok(sockets),
+                Err(error) => refused = Some(error),
+            }
+        }
+        Err(refused.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{address} resolves to nothing"),
+            )
+        }))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = lanes;
+        Ok(vec![bind_datagram(options, address)?])
+    }
+}
+
+#[cfg(unix)]
+fn bind_datagram_at_fanout(
+    options: Option<&SocketOptions>,
+    addr: SocketAddr,
+    lanes: usize,
+) -> io::Result<Vec<UdpSocket>> {
+    let mut sockets = Vec::with_capacity(lanes);
+    let mut bound = addr;
+    for _ in 0..lanes {
+        let socket = Socket::new(domain_of(addr), Type::DGRAM, Some(Protocol::UDP))?;
+        if let Some(options) = options {
+            options.apply_to_datagram(&socket, addr)?;
+        }
+        socket.set_reuse_port(true)?;
+        socket.bind(&SockAddr::from(bound))?;
+        if bound.port() == 0 {
+            bound = socket.local_addr()?.as_socket().unwrap_or(bound);
+        }
+        sockets.push(UdpSocket::from(socket));
+    }
+    Ok(sockets)
+}
+
 fn domain_of(addr: SocketAddr) -> Domain {
     if addr.is_ipv4() {
         Domain::IPV4
@@ -1183,5 +1236,20 @@ mod tests {
         };
         assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
         value
+    }
+}
+
+#[cfg(all(test, unix))]
+mod fanout_tests {
+    use super::*;
+
+    #[test]
+    fn fanout_sockets_share_the_first_port() {
+        let sockets = bind_datagram_fanout(None, "127.0.0.1:0", 4).expect("binds");
+        let first = sockets[0].local_addr().expect("bound");
+        assert_eq!(sockets.len(), 4);
+        assert!(sockets
+            .iter()
+            .all(|socket| socket.local_addr().is_ok_and(|addr| addr == first)));
     }
 }

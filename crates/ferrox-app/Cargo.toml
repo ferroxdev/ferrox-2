@@ -42,7 +42,7 @@ shake = "0.1"
 sha2 = { version = "0.11" }
 x25519-dalek = "3"
 zeroize = "1"
-socket2 = "0.6"
+socket2 = { version = "0.6", features = ["all"] }
 route_manager = "0.2"
 smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-tcp-cubic", "iface-max-addr-count-8"] }
 tun-rs = "2.8.18"

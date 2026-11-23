@@ -2050,6 +2050,18 @@ pub(crate) fn bind_datagram(address: &str) -> std::io::Result<UdpSocket> {
     bind_datagram_gro(address, true)
 }
 
+/// A server's listen address split over `lanes` sockets: the kernel hashes each client's
+/// four-tuple to one reader, so independent connections turn out of different threads.
+pub(crate) fn bind_datagram_fanout(address: &str, lanes: usize) -> std::io::Result<Vec<UdpSocket>> {
+    let flow = crate::proxy::flow_sockopts();
+    Ok(
+        crate::sockopt::bind_datagram_fanout(flow.as_deref(), address, lanes)?
+            .into_iter()
+            .map(|socket| armed_lane(socket, true))
+            .collect(),
+    )
+}
+
 /// A socket for a lane that reads one datagram per `recv_from`: GRO stays off, because a
 /// coalesced burst would be truncated to the caller's buffer.
 pub(crate) fn bind_datagram_plain(address: &str) -> std::io::Result<UdpSocket> {
