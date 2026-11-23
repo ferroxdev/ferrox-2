@@ -491,6 +491,36 @@ impl<'a> DataBatch<'a> {
         }
         true
     }
+
+    /// The non-blocking form: the writer takes the batch into its own paced tail or parks the
+    /// lane, so a full transport never holds a shared relay worker.
+    fn flush_ready(
+        &mut self,
+        conn: &H2Conn,
+        write: &mut (dyn crate::proxy::FrameWrite + Send),
+    ) -> crate::proxy::Accepted {
+        if self.used == 0 {
+            return crate::proxy::Accepted::All;
+        }
+        let mut parts: [&[u8]; 5 * DATA_FRAMES_PER_WRITE] = [NO_PART; 5 * DATA_FRAMES_PER_WRITE];
+        let mut pieces = 0;
+        for at in 0..self.used {
+            parts[pieces] = &self.heads[at];
+            pieces += 1;
+            for body in &self.bodies[at][..self.counts[at] as usize] {
+                if !body.is_empty() {
+                    parts[pieces] = body;
+                    pieces += 1;
+                }
+            }
+        }
+        self.used = 0;
+        let accepted = write.offer_slices(&parts[..pieces]);
+        if matches!(accepted, crate::proxy::Accepted::Lost) {
+            conn.dead.store(true, Ordering::SeqCst);
+        }
+        accepted
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -538,6 +568,16 @@ impl H2StreamOut {
     /// instead of holding the worker the peer's credit is read on.
     pub(crate) fn try_batch_parts(&self, groups: &[&[&[u8]]]) -> Option<bool> {
         self.conn.try_send_grouped(self.stream, groups)
+    }
+
+    /// One relay offer that never blocks: the writer either takes the whole batch into its paced
+    /// tail, parks the lane, or reports the connection gone.
+    pub(crate) fn try_data_ready(&self, data: &[u8]) -> Option<bool> {
+        self.conn.try_send_one_ready(self.stream, data)
+    }
+
+    pub(crate) fn frame_batch_capacity(&self) -> usize {
+        self.conn.frame_batch_capacity()
     }
 
     pub(crate) fn room(&self) -> u64 {
@@ -1562,6 +1602,82 @@ impl H2Conn {
         batch.flush(self)
     }
 
+    fn frame_batch_capacity(&self) -> usize {
+        let max = *self
+            .max_frame
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        max.saturating_mul(DATA_FRAMES_PER_WRITE)
+    }
+
+    /// One group offered through the writer's non-blocking path: the batch is accepted whole or
+    /// not at all, so a partial socket write cannot make the next offer repeat a written prefix.
+    fn try_send_one_ready(&self, stream: u32, data: &[u8]) -> Option<bool> {
+        let Some(state) = self
+            .streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&stream)
+            .cloned()
+        else {
+            return Some(false);
+        };
+        if self.dead.load(Ordering::SeqCst) || state.gone() {
+            return Some(false);
+        }
+        let total = data.len() as u64;
+        if total == 0 {
+            return Some(true);
+        }
+        let Ok(_gate) = self.batch_gate.try_lock() else {
+            return None;
+        };
+        let Ok(mut write) = self.write.try_lock() else {
+            return None;
+        };
+        let total_signed = i64::try_from(total).unwrap_or(i64::MAX);
+        {
+            let Ok(conn) = self.send_conn.try_lock() else {
+                return None;
+            };
+            let Ok(window) = state.send_window.try_lock() else {
+                return None;
+            };
+            if *conn < total || *window < total_signed {
+                return None;
+            }
+        }
+        let max = *self
+            .max_frame
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut batch = DataBatch::new();
+        let mut at = 0;
+        while at < data.len() {
+            if batch.full() {
+                return None;
+            }
+            let end = (at + max).min(data.len());
+            batch.add(stream, &data[at..end]);
+            at = end;
+        }
+        match batch.flush_ready(self, &mut **write) {
+            crate::proxy::Accepted::All => {
+                let Ok(mut conn) = self.send_conn.lock() else {
+                    return Some(false);
+                };
+                *conn = conn.saturating_sub(total);
+                let Ok(mut window) = state.send_window.lock() else {
+                    return Some(false);
+                };
+                *window -= total_signed;
+                Some(true)
+            }
+            crate::proxy::Accepted::Full => None,
+            crate::proxy::Accepted::Lost => Some(false),
+        }
+    }
+
     /// The whole batch off the two windows or none of it: a lane that offered bytes no window
     /// covers parks and retries, so a blocked sender never holds the worker its peer's credit runs on.
     fn try_send_grouped(&self, stream: u32, groups: &[&[&[u8]]]) -> Option<bool> {
@@ -2030,6 +2146,10 @@ impl H2Conn {
         if pending > 0 {
             self.replenish_connection(pending as usize);
         }
+        let consumed = self.conn_credit.swap(0, Ordering::SeqCst);
+        if consumed > 0 {
+            self.replenish_connection(consumed);
+        }
     }
 
     fn end_stream(&self, stream: u32) {
@@ -2070,6 +2190,10 @@ impl H2Conn {
             };
             if pending > 0 {
                 self.replenish_connection(pending as usize);
+            }
+            let consumed = self.conn_credit.swap(0, Ordering::SeqCst);
+            if consumed > 0 {
+                self.replenish_connection(consumed);
             }
             self.forget_upload(stream);
             self.end_session_of(stream);
@@ -2123,6 +2247,10 @@ impl H2Conn {
         drop(credit);
         if pending > 0 {
             self.replenish_connection(pending as usize);
+        }
+        let consumed = self.conn_credit.swap(0, Ordering::SeqCst);
+        if consumed > 0 {
+            self.replenish_connection(consumed);
         }
         // Queued: a refusal is the demux's answer, so it must not wait on a write the peer has not read.
         let _ = self.send_control(T_RST, 0, stream, &E_REFUSED.to_be_bytes());
@@ -3036,6 +3164,8 @@ impl H2Client {
         let Some(state) = self.conn.attach_stream(sid, false) else {
             return Err(H2OpenError::Full);
         };
+        // Admission is ordered with GOAWAY here; the HEADERS write must not hold the gate the read pump takes to publish SETTINGS or GOAWAY.
+        drop(_gate);
         let flags = if end_request {
             F_END_HEADERS | F_END
         } else {
@@ -7260,6 +7390,32 @@ mod tests {
             false,
         );
         (conn, written, slices)
+    }
+
+    #[test]
+    fn the_h2_lane_offer_costs_the_frame_batch_and_nothing_else() {
+        let slices = Arc::new(AtomicUsize::new(0));
+        let conn = conn_with(
+            Box::new(Counted {
+                written: Arc::new(Mutex::new(Vec::new())),
+                slices: Arc::clone(&slices),
+            }),
+            false,
+        );
+        let state = conn.attach_stream(1, false).expect("stream");
+        let data = [0u8; 16 * 1024];
+        for _ in 0..64 {
+            *conn
+                .send_conn
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = 65_535;
+            *state
+                .send_window
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = 65_535;
+            assert_eq!(conn.try_send_one_ready(1, &data), Some(true));
+        }
+        assert_eq!(slices.load(Ordering::SeqCst), 64);
     }
 
     /// A SETTINGS payload whose length is not a multiple of six is a connection error

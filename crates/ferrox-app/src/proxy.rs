@@ -23319,7 +23319,7 @@ pub(crate) fn anytls_dial_session(
 
 pub(crate) fn tls_client_halves(
     session: ferrox_core::tls::ClientSession<Connection>,
-) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
+) -> Option<(Box<dyn Read + Send>, Box<dyn FrameWrite + Send>)> {
     let raw = session.get_ref().try_clone().ok()?;
     let (reader, writer) = session_halves(session, raw);
     Some((Box::new(reader), Box::new(writer)))
@@ -23327,7 +23327,7 @@ pub(crate) fn tls_client_halves(
 
 pub(crate) fn tls_server_halves(
     session: AnyTlsServerSession,
-) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
+) -> Option<(Box<dyn Read + Send>, Box<dyn FrameWrite + Send>)> {
     let raw = session.get_ref().get_ref().try_clone().ok()?;
     let (reader, writer) = session_halves(session, raw);
     Some((Box::new(reader), Box::new(writer)))
@@ -23910,11 +23910,15 @@ impl Sealed {
         if !self.paced {
             return Ok(());
         }
-        let deadline = Instant::now() + crate::budgets::relay_stall();
+        let mut deadline = Instant::now() + crate::budgets::relay_stall();
         while self.bytes.len() > keep {
+            let before = self.bytes.len();
             self.send()?;
             if self.bytes.len() <= keep {
                 return Ok(());
+            }
+            if self.bytes.len() < before {
+                deadline = Instant::now() + crate::budgets::relay_stall();
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -39057,6 +39061,13 @@ impl LaneWrite for Box<dyn Write + Send> {}
 #[cfg(unix)]
 impl LaneWrite for std::os::unix::net::UnixStream {}
 
+#[cfg(unix)]
+impl FrameWrite for std::os::unix::net::UnixStream {
+    fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+        parts.iter().all(|part| self.write_all(part).is_ok())
+    }
+}
+
 impl LaneWrite for Connection {
     fn push(&mut self, data: &[u8]) -> Push {
         #[cfg(unix)]
@@ -39068,7 +39079,23 @@ impl LaneWrite for Connection {
                 Err(_) => Push::Lost,
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            match self.writable(Duration::ZERO) {
+                Ok(false) => Push::Parked,
+                Ok(true) => {
+                    let take = data.len().min(RELAY_BUFFER);
+                    match <Connection as Write>::write(self, &data[..take]) {
+                        Ok(0) => Push::Parked,
+                        Ok(n) => Push::Took(n),
+                        Err(error) if is_timeout(&error) => Push::Parked,
+                        Err(_) => Push::Lost,
+                    }
+                }
+                Err(_) => Push::Lost,
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             match <Connection as Write>::write(self, data) {
                 Ok(0) => Push::Parked,
@@ -39189,6 +39216,21 @@ impl FrameWrite for Connection {
             return None;
         }
         Some(Connection::write_ready(self, parts))
+    }
+
+    #[cfg(windows)]
+    fn offer_slices(&mut self, parts: &[&[u8]]) -> Accepted {
+        match self.writable(Duration::ZERO) {
+            Ok(true) => {
+                if self.write_slices(parts) {
+                    Accepted::All
+                } else {
+                    Accepted::Lost
+                }
+            }
+            Ok(false) => Accepted::Full,
+            Err(_) => Accepted::Lost,
+        }
     }
 
     fn arm_write(&mut self, timeout: Duration) {

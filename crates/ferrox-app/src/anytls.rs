@@ -45,7 +45,7 @@ const DEFAULT_PADDING: &[u8] = b"stop=8
 7=500-1000";
 
 type Reader = Box<dyn Read + Send>;
-type Writer = Box<dyn Write + Send>;
+type Writer = Box<dyn crate::proxy::FrameWrite + Send>;
 
 #[derive(Clone)]
 enum PaddingStep {

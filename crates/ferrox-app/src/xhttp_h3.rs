@@ -1949,7 +1949,8 @@ fn h3_control_frames(
             break;
         };
         if *settings {
-            if matches!(kind, 0x0 | 0x1 | 0x4 | 0x5 | 0xe) {
+            // GOAWAY, CANCEL_PUSH, MAX_PUSH_ID and PRIORITY_UPDATE belong here; DATA, HEADERS, PUSH_PROMISE and HTTP/2 reserved types are H3_FRAME_UNEXPECTED, unassigned types ignored.
+            if matches!(kind, 0x0 | 0x1 | 0x2 | 0x4 | 0x5 | 0x6 | 0x8 | 0x9) {
                 return Err(H3_FRAME_UNEXPECTED);
             }
         } else if kind != 0x4 {
@@ -3301,6 +3302,40 @@ mod tests {
             h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
             Err(H3_FRAME_UNEXPECTED)
         );
+    }
+
+    #[test]
+    fn http2_reserved_control_frames_are_unexpected() {
+        for kind in [0x2, 0x6, 0x8, 0x9] {
+            let mut control = Vec::new();
+            settings_frame(&mut control);
+            frames::quic_varint(&mut control, kind);
+            frames::quic_varint(&mut control, 0);
+            let goaway = AtomicU64::new(u64::MAX);
+            let mut skip = 0;
+            let mut settings = false;
+            assert_eq!(
+                h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+                Err(H3_FRAME_UNEXPECTED),
+                "frame {kind:#x} is reserved by HTTP/2 and cannot ride a control stream"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unassigned_control_frame_is_ignored() {
+        let mut control = Vec::new();
+        settings_frame(&mut control);
+        frames::quic_varint(&mut control, 0xe);
+        frames::quic_varint(&mut control, 0);
+        let goaway = AtomicU64::new(u64::MAX);
+        let mut skip = 0;
+        let mut settings = false;
+        assert_eq!(
+            h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+            Ok(false)
+        );
+        assert_eq!(control, [] as [u8; 0]);
     }
 
     #[test]

@@ -1034,12 +1034,11 @@ impl proxy::LaneWrite for H2OutWrite {
             return proxy::Push::Took(0);
         }
         let room = usize::try_from(self.out.room()).unwrap_or(usize::MAX);
-        let take = data.len().min(room);
+        let take = data.len().min(room).min(self.out.frame_batch_capacity());
         if take == 0 {
             return proxy::Push::Parked;
         }
-        let offer = &data[..take];
-        match self.out.try_batch_parts(&[&[offer]]) {
+        match self.out.try_data_ready(&data[..take]) {
             Some(true) => proxy::Push::Took(take),
             Some(false) => proxy::Push::Lost,
             None => proxy::Push::Parked,
@@ -1169,37 +1168,152 @@ impl proxy::LaneWrite for H3OutWrite {
     }
 }
 
-struct BoxedWrite(Writer);
+struct BoxedWrite {
+    inner: Box<dyn proxy::FrameWrite + Send>,
+    pending: Vec<u8>,
+}
+
+impl BoxedWrite {
+    fn new(inner: Box<dyn proxy::FrameWrite + Send>) -> Self {
+        Self {
+            inner,
+            pending: Vec::new(),
+        }
+    }
+
+    fn flush_pending(&mut self) -> bool {
+        if self.pending.is_empty() {
+            return true;
+        }
+        if !self.inner.write_slices(&[&self.pending]) {
+            return false;
+        }
+        self.pending.clear();
+        true
+    }
+
+    fn offer_pending(&mut self) -> proxy::Accepted {
+        if self.pending.is_empty() {
+            return proxy::Accepted::All;
+        }
+        let result = self.inner.write_ready(&[&self.pending]);
+        match result {
+            Some(Ok(n)) if n >= self.pending.len() => {
+                self.pending.clear();
+                proxy::Accepted::All
+            }
+            Some(Ok(n)) if n > 0 => {
+                self.pending.drain(..n);
+                proxy::Accepted::Full
+            }
+            Some(Ok(_)) => proxy::Accepted::Full,
+            Some(Err(error)) if proxy::is_timeout(&error) => proxy::Accepted::Full,
+            Some(Err(_)) => proxy::Accepted::Lost,
+            None => {
+                let accepted = self.inner.offer_slices(&[&self.pending]);
+                match accepted {
+                    proxy::Accepted::All => {
+                        self.pending.clear();
+                        proxy::Accepted::All
+                    }
+                    other => other,
+                }
+            }
+        }
+    }
+
+    fn retain(&mut self, parts: &[&[u8]], skip: usize) {
+        self.pending.clear();
+        let mut left = skip;
+        for part in parts {
+            if left >= part.len() {
+                left -= part.len();
+                continue;
+            }
+            self.pending.extend_from_slice(&part[left..]);
+            left = 0;
+        }
+    }
+}
 
 impl Write for BoxedWrite {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.write(buf)
+        if !self.flush_pending() {
+            return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        }
+        self.inner.write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.0.flush()
+        if !self.flush_pending() {
+            return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        }
+        self.inner.flush()
     }
 }
 
 impl proxy::FrameWrite for BoxedWrite {
     fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
-        parts
-            .iter()
-            .all(|part| write_all(&mut *self.0, part).is_ok())
+        self.flush_pending() && self.inner.write_slices(parts)
     }
-}
 
-impl proxy::LaneWrite for BoxedWrite {
-    fn push(&mut self, data: &[u8]) -> proxy::Push {
-        self.0.push(data)
+    fn write_ready(&mut self, parts: &[&[u8]]) -> Option<std::io::Result<usize>> {
+        if !self.pending.is_empty() {
+            return None;
+        }
+        self.inner.write_ready(parts)
+    }
+
+    fn offer_slices(&mut self, parts: &[&[u8]]) -> proxy::Accepted {
+        match self.offer_pending() {
+            proxy::Accepted::All => {}
+            other => return other,
+        }
+        let total: usize = parts.iter().map(|part| part.len()).sum();
+        if total == 0 {
+            return proxy::Accepted::All;
+        }
+        match self.inner.write_ready(parts) {
+            Some(Ok(n)) if n >= total => proxy::Accepted::All,
+            Some(Ok(n)) => {
+                self.retain(parts, n);
+                proxy::Accepted::All
+            }
+            Some(Err(error)) if proxy::is_timeout(&error) => proxy::Accepted::Full,
+            Some(Err(_)) => proxy::Accepted::Lost,
+            None => self.inner.offer_slices(parts),
+        }
+    }
+
+    fn room(&self) -> u64 {
+        self.inner.room()
+    }
+
+    fn wait_room(&self, turn: Duration) {
+        self.inner.wait_room(turn);
     }
 
     fn settle(&mut self) -> proxy::Settle {
-        self.0.settle()
+        if !self.pending.is_empty() {
+            match self.offer_pending() {
+                proxy::Accepted::All => {}
+                proxy::Accepted::Full => return proxy::Settle::Parked,
+                proxy::Accepted::Lost => return proxy::Settle::Lost,
+            }
+        }
+        self.inner.settle()
     }
 
-    fn wait_room(&mut self, turn: Duration) {
-        self.0.wait_room(turn);
+    fn arm_write(&mut self, timeout: Duration) {
+        self.inner.arm_write(timeout);
+    }
+
+    fn clear_write_timeout(&mut self) {
+        self.inner.clear_write_timeout();
+    }
+
+    fn shutdown_both(&mut self) {
+        self.inner.shutdown_both();
     }
 }
 
@@ -1524,7 +1638,8 @@ fn serve_h2_connection(
     {
         return;
     }
-    let (reader, writer): (Reader, Writer) = if let Some(identity) = tls {
+    let (reader, writer): (Reader, Box<dyn proxy::FrameWrite + Send>) = if let Some(identity) = tls
+    {
         let Ok(mut session) = ferrox_core::tls::accept(identity.as_ref(), stream) else {
             return;
         };
@@ -1537,7 +1652,7 @@ fn serve_h2_connection(
         let Some((reader, writer)) = proxy::tls_server_halves(session) else {
             return;
         };
-        (reader, Box::new(writer))
+        (reader, writer)
     } else {
         let Ok(writer) = stream.try_clone() else {
             return;
@@ -1545,7 +1660,7 @@ fn serve_h2_connection(
         (Box::new(stream), Box::new(writer))
     };
     let service = NaiveH2Service { users, freedom };
-    xhttp_h2::serve_h2_service_open(reader, BoxedWrite(writer), &service, None, move || {
+    xhttp_h2::serve_h2_service_open(reader, BoxedWrite::new(writer), &service, None, move || {
         let _ = raw.set_read_timeout(None);
     });
 }
@@ -1996,17 +2111,30 @@ impl NaiveOut {
                 drop(pool);
                 let client = self.connect_h2();
                 let mut published = self.h2.lock();
+                let mut existing = None;
                 if let Ok(pool) = published.as_mut() {
                     if let Some(client) = &client {
                         if pool.len() < self.pool_limit {
                             pool.push(Arc::clone(client));
+                        }
+                    } else {
+                        let len = pool.len();
+                        if len > 0 {
+                            let start = self.h2_next.fetch_add(1, Ordering::Relaxed);
+                            for offset in 0..len {
+                                let at = start.wrapping_add(offset) % len;
+                                if pool[at].has_capacity() {
+                                    existing = Some(Arc::clone(&pool[at]));
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
                 self.h2_inflight.fetch_sub(1, Ordering::Relaxed);
                 drop(published);
                 self.h2_ready.notify_all();
-                return client;
+                return client.or(existing);
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -2029,7 +2157,7 @@ impl NaiveOut {
         let (reader, writer) = proxy::tls_client_halves(session)?;
         H2Client::new_windowed(
             reader,
-            BoxedWrite(Box::new(writer)),
+            BoxedWrite::new(writer),
             Some(raw),
             Some(self.stream_window.unwrap_or(H2_RECEIVE_WINDOW)),
         )
@@ -3341,7 +3469,7 @@ mod tests {
         std::thread::spawn(move || {
             crate::xhttp_h2::serve_h2_service(
                 server_read,
-                BoxedWrite(Box::new(server_write)),
+                BoxedWrite::new(Box::new(server_write)),
                 &service,
                 None,
             );
@@ -3349,8 +3477,8 @@ mod tests {
 
         let client_read = client.try_clone().expect("clone");
         let client_write = client.try_clone().expect("clone");
-        let h2 =
-            H2Client::new(client_read, BoxedWrite(Box::new(client_write)), None).expect("client");
+        let h2 = H2Client::new(client_read, BoxedWrite::new(Box::new(client_write)), None)
+            .expect("client");
         let block = crate::h2::block_encode(&[
             (":method", "CONNECT"),
             (":authority", "example.test:443"),
