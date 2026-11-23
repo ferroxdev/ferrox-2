@@ -13963,6 +13963,8 @@ pub(crate) fn relay_quic_stream(
     let stall = Some(crate::budgets::relay_stall());
     let _ = client.set_write_timeout(stall);
     let _ = upstream.set_write_timeout(stall);
+    // The flow parks its lane on the target socket's readiness instead of sleeping out a read timeout.
+    let _ = upstream.set_nonblocking(true);
     let cancel = stream.clone();
     let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
     let flow = relay_lanes_handoff(Half::socket(upstream), Half::socket(stream), &close);
