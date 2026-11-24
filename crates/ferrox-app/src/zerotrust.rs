@@ -215,15 +215,29 @@ fn now() -> u64 {
 
 fn extract_jwt_from_html(html: &str) -> Option<String> {
     let marker = "token=";
-    let start = html.find(marker)? + marker.len();
-    let rest = &html[start..];
-    let end = rest
-        .find(|c: char| {
-            c == '"' || c == '\'' || c == '&' || c == '<' || c == '>' || c.is_whitespace()
-        })
-        .unwrap_or(rest.len());
-    let candidate = rest[..end].trim();
-    looks_like_jwt(candidate).then(|| candidate.to_owned())
+    let mut search = html;
+    while let Some(at) = search.find(marker) {
+        let start = at + marker.len();
+        let boundary = at == 0
+            || !search[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+        let rest = &search[start..];
+        if boundary {
+            let end = rest
+                .find(|c: char| {
+                    c == '"' || c == '\'' || c == '&' || c == '<' || c == '>' || c.is_whitespace()
+                })
+                .unwrap_or(rest.len());
+            let candidate = rest[..end].trim();
+            if looks_like_jwt(candidate) {
+                return Some(candidate.to_owned());
+            }
+        }
+        search = rest;
+    }
+    None
 }
 
 fn extract_jwt_from_cookie(header: &str) -> Option<String> {
@@ -2125,6 +2139,24 @@ mod tests {
             "<html><meta http-equiv=\"refresh\" content=\"0;url=https://x/cdn-cgi/access/callback?token={token}\"></html>"
         );
         assert_eq!(extract_jwt_from_html(&page), Some(token));
+    }
+
+    #[test]
+    fn a_csrf_token_does_not_hide_the_enrollment_token() {
+        let token = jwt("{\"exp\":4102444800}");
+        let page = format!(
+            "<input name=\"csrf_token\" value=\"not-a-jwt\"><meta token={token}>"
+        );
+        assert_eq!(extract_jwt_from_html(&page), Some(token));
+    }
+
+    #[test]
+    fn a_token_marker_needs_a_parameter_boundary() {
+        let token = jwt("{\"exp\":4102444800}");
+        assert_eq!(
+            extract_jwt_from_html(&format!("<meta data-token={token}>")),
+            None
+        );
     }
 
     #[test]

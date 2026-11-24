@@ -2998,11 +2998,20 @@ impl WarpOut {
             self.serve_lane(client, asked, prefix);
             return;
         }
-        let answered = local.set_write_timeout(Some(budget)).and_then(|()| {
-            (&local)
-                .write_all(&request)
-                .and_then(|()| read_connect_head(&local, deadline))
-        });
+        if local.set_write_timeout(Some(budget)).is_err() {
+            self.serve_lane(client, asked, prefix);
+            return;
+        }
+        let answered = match (&local).write(&request) {
+            Ok(0) | Err(_) => {
+                self.serve_lane(client, asked, prefix);
+                return;
+            }
+            Ok(written) if written < request.len() => (&local)
+                .write_all(&request[written..])
+                .and_then(|()| read_connect_head(&local, deadline)),
+            Ok(_) => read_connect_head(&local, deadline),
+        };
         let (accepted, extra) = match answered {
             Ok(head) => head,
             Err(reason) => {
@@ -3625,13 +3634,12 @@ struct PlannedSlot {
     slot: Slot,
     path: PathBuf,
     identity: Identity,
-    replace: bool,
     saved: bool,
 }
 
 /// Load or make every identity the kind names. A slot with no file is saved as
-/// soon as it is made so a later failure does not orphan it; a replacement is
-/// held until every slot is ready, so a failed registration leaves the old keys.
+/// soon as it is made so a later failure does not orphan it, and a replacement
+/// is saved before the next slot so a refusal cannot be registered twice.
 fn provision_kind(
     spec: &WarpSpec,
     kind: KeyKind,
@@ -3664,7 +3672,7 @@ fn provision_kind_with(
     }
     let mut ready = Vec::new();
     for (slot, path) in planned {
-        let (identity, replace, saved) = if path.is_file() {
+        let (identity, saved) = if path.is_file() {
             match Identity::load(&path) {
                 Ok(saved) => {
                     ensure_saved_team(
@@ -3673,14 +3681,16 @@ fn provision_kind_with(
                         &path,
                     )?;
                     match refresh_identity(spec, &saved) {
-                        Ok(fresh) => (fresh, false, false),
+                        Ok(fresh) => (fresh, false),
                         Err(error) if error.refused && reprovision_enabled() => {
                             eprintln!(
                             "warp-register: the saved {} identity was refused: {}; registering a fresh one",
                             slot.label(),
                             error.reason
                         );
-                            (register_identity(spec, slot.enrolls_masque())?, true, false)
+                            let identity = register_identity(spec, slot.enrolls_masque())?;
+                            identity.save(&path)?;
+                            (identity, true)
                         }
                         Err(error) => {
                             eprintln!(
@@ -3688,7 +3698,7 @@ fn provision_kind_with(
                                 slot.label(),
                                 error.reason
                             );
-                            (saved, false, false)
+                            (saved, false)
                         }
                     }
                 }
@@ -3698,20 +3708,21 @@ fn provision_kind_with(
                         error.into_message(),
                         slot.label()
                     );
-                    (register_identity(spec, slot.enrolls_masque())?, true, false)
+                    let identity = register_identity(spec, slot.enrolls_masque())?;
+                    identity.save(&path)?;
+                    (identity, true)
                 }
                 Err(error) => return Err(error.into_message()),
             }
         } else {
             let identity = register_identity(spec, slot.enrolls_masque())?;
             identity.save(&path)?;
-            (identity, false, true)
+            (identity, true)
         };
         ready.push(PlannedSlot {
             slot,
             path,
             identity,
-            replace,
             saved,
         });
     }
@@ -4212,9 +4223,6 @@ pub(crate) fn register_command(args: &mut std::iter::Skip<std::env::Args>, usage
             match provision_kind(&spec, kind, &paths).and_then(|planned| {
                 for planned in &planned {
                     if !planned.saved {
-                        if planned.replace {
-                            quarantine(&planned.path);
-                        }
                         planned.identity.save(&planned.path)?;
                     }
                     println!(
@@ -4743,6 +4751,49 @@ mod tests {
             "no missing slot registered before the mismatch was seen"
         );
         assert!(!base.exists(), "nothing was saved");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_refused_identity_is_saved_before_a_later_slot_fails() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-warp-replacement-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+        let base = dir.join("identity.json");
+        let masque = dir.join("identity-masque.json");
+        let paths = KeyPaths::new(&base, None, Some(&masque));
+        let first = Slot::Masque.allocation(&paths);
+        sample_identity().save(&first).expect("the saved identity");
+        let spec = WarpSpec {
+            mode: Mode::Gool,
+            identity_file: Some(base.clone()),
+            masque_identity_file: Some(masque.clone()),
+            ..sample_spec()
+        };
+        let registrations = std::cell::Cell::new(0u32);
+        let register = |_: &WarpSpec, _: bool| {
+            registrations.set(registrations.get() + 1);
+            if registrations.get() == 1 {
+                let mut replacement = sample_identity();
+                replacement.device_id = "replacement".to_owned();
+                Ok(replacement)
+            } else {
+                Err("the later slot is down".to_owned())
+            }
+        };
+        let refused = |_: &WarpSpec, _: &Identity| Err(RegisterError::refused("refused"));
+        let error = provision_kind_with(&spec, KeyKind::Gool, &paths, &register, &refused)
+            .expect_err("the later slot fails");
+        assert!(error.contains("later slot"), "{error}");
+        assert_eq!(
+            Identity::load(&first).expect("the replacement").device_id,
+            "replacement"
+        );
+        assert_eq!(registrations.get(), 2);
         std::fs::remove_dir_all(&dir).ok();
     }
 

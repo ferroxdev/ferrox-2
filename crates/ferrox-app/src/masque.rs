@@ -6245,6 +6245,30 @@ mod tests {
     }
 
     #[test]
+    fn a_queued_flow_that_cannot_be_set_up_reports_failure() {
+        let (_inbound, port) = serve("127.0.0.1:9");
+        let masque = MasqueOut::new(&outbound(port)).expect("outbound");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("pair");
+        let tun = std::net::TcpStream::connect(listener.local_addr().expect("pair address"))
+            .expect("connect");
+        let (_app, _) = listener.accept().expect("accept");
+        let target: SocketAddr = "192.0.2.1:0".parse().expect("a target");
+        let (ready, wait) = std::sync::mpsc::sync_channel(1);
+        assert!(masque.serve_tcp(
+            Connection::from(tun),
+            &Destination::Address(target),
+            &[],
+            Some(ready),
+        ));
+        assert!(
+            !wait
+                .recv_timeout(Duration::from_secs(20))
+                .expect("the setup result"),
+            "the queued flow reported a failed setup as ready"
+        );
+    }
+
+    #[test]
     fn a_tcp_flow_crosses_the_tunnel_over_ipv6() {
         use std::io::{Read as _, Write as _};
         let Ok(echo) = std::net::TcpListener::bind("[::1]:0") else {
