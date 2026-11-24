@@ -3060,17 +3060,17 @@ impl WarpOut {
             }
             Lane::Gool => {
                 if let Some(gool) = &self.gool {
-                    gool.inner.serve_tcp(client, asked, prefix, None);
+                    gool.inner.serve_tcp(client, asked, prefix);
                 }
             }
             Lane::GoolClassic => {
                 if let Some(classic) = &self.gool_classic {
-                    classic.inner.serve_tcp(client, asked, prefix, None);
+                    classic.inner.serve_tcp(client, asked, prefix);
                 }
             }
             Lane::Mim => {
                 if let Some(mim) = &self.mim {
-                    mim.inner.serve_tcp(client, asked, prefix, None);
+                    mim.inner.serve_tcp(client, asked, prefix);
                 }
             }
         }
@@ -5780,7 +5780,6 @@ mod tests {
             crate::conn::Connection::from(tun),
             &crate::proxy::Destination::Address(echo_address),
             b"head",
-            None,
         );
         app.write_all(b"hello")?;
         let mut answer = [0u8; 9];
@@ -5893,7 +5892,6 @@ mod tests {
             crate::conn::Connection::from(tun),
             &crate::proxy::Destination::Address(echo_address),
             b"head",
-            None,
         );
         app.write_all(b"hello").expect("write");
         let mut answer = [0u8; 9];
@@ -6136,7 +6134,6 @@ mod tests {
             crate::conn::Connection::from(tun),
             &crate::proxy::Destination::Address(echo_address),
             b"head",
-            None,
         );
         crate::proxy::echo_trace("wiw: serving");
         // Resend the trigger only after a read timeout, within the same budget, so a slow inner handshake does not fail the test.
