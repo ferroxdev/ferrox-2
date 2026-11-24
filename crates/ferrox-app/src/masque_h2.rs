@@ -38,6 +38,10 @@ const FRAME_HEAD: usize = 9;
 /// The largest body written head-and-body in one call, control or small DATA; a larger one keeps two writes.
 const INLINE_ROOM: usize = 512;
 const QUEUED_CAP: usize = 64;
+/// How many packets one turn pulls from the origin before yielding to the read side.
+/// The peer's flow-control window is the real bound; a per-turn cap of `QUEUED_CAP`
+/// throttled a download to one 86 KiB burst per wake no matter how open the window was.
+const PULL_CAP: usize = masque::QUEUE;
 /// h2's default `SETTINGS_MAX_FRAME_SIZE`: a DATA body past it is a connection error for a peer that keeps the default.
 const MAX_FRAME_BODY: usize = 16 * 1024;
 /// The capsules one downlink DATA frame carries, half the frame limit so one capsule's overshoot still fits.
@@ -1840,7 +1844,7 @@ impl Session {
         };
         frame.clear();
         frame.resize(FRAME_HEAD, 0);
-        while pulled < QUEUED_CAP {
+        while pulled < PULL_CAP {
             // A full queue stops the pull instead of ending the session: the origin then blocks on its channel and the peer's window update resumes it.
             if wire.closed || self.end || self.queued.len() >= QUEUED_CAP {
                 break;
