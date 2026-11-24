@@ -1913,6 +1913,7 @@ struct ServerStack {
     cli_wscale: u8,
     win_min: u32,
     win_max: u32,
+    flight: HashMap<u16, (u32, u32)>,
     congestion: CongestionControl,
 }
 
@@ -1986,6 +1987,7 @@ impl ServerStack {
             cli_wscale: 0,
             win_min: 0,
             win_max: 0,
+            flight: HashMap::new(),
             congestion: CongestionControl::Cubic,
         }
     }
@@ -2008,12 +2010,18 @@ impl ServerStack {
                 }
             }
         }
+        let inflight: u64 = self
+            .flight
+            .values()
+            .map(|&(end, ack)| u64::from(end.wrapping_sub(ack)))
+            .sum();
         eprintln!(
-            "wgdiag est={est} flows={} queued={queued} recv={recv} can={can} cli=[{}..{}] ws={} tx={} rx={}",
+            "wgdiag est={est} flows={} queued={queued} recv={recv} can={can} cli=[{}..{}] ws={} inflight={inflight} links={} tx={} rx={}",
             self.flows.len(),
             self.win_min,
             self.win_max,
             self.cli_wscale,
+            self.flight.len(),
             self.device.tx.len(),
             self.device.rx.len()
         );
@@ -2038,16 +2046,17 @@ impl ServerStack {
         let protocol = inner_protocol(&bytes[at..]);
         match protocol {
             Some(PROTOCOL_TCP) => {
-                if let Some((raw, flags, shift)) = tcp_window(&bytes, at) {
-                    if let Some(shift) = shift {
+                if let Some(probe) = tcp_probe(&bytes, at) {
+                    if let Some(shift) = probe.shift {
                         self.cli_wscale = shift;
                     }
-                    if flags & 0x10 != 0 && flags & 0x02 == 0 {
-                        let eff = u32::from(raw) << self.cli_wscale;
+                    if probe.flags & 0x10 != 0 && probe.flags & 0x02 == 0 {
+                        let eff = u32::from(probe.window) << self.cli_wscale;
                         if eff > 0 {
                             self.win_min = if self.win_min == 0 { eff } else { self.win_min.min(eff) };
                             self.win_max = self.win_max.max(eff);
                         }
+                        self.flight.entry(probe.dst).or_insert((probe.ack, probe.ack)).1 = probe.ack;
                     }
                 }
                 lower_syn_mss(&mut bytes, at, self.mtu);
@@ -2153,6 +2162,13 @@ impl ServerStack {
             let Some(mut packet) = self.device.tx.pop_front() else {
                 break;
             };
+            if let Some(probe) = tcp_probe(&packet, self.headroom) {
+                if probe.payload > 0 {
+                    let end = probe.seq.wrapping_add(probe.payload as u32);
+                    let entry = self.flight.entry(probe.src).or_insert((end, end));
+                    entry.0 = end;
+                }
+            }
             lower_syn_ack_mss(&mut packet, self.headroom, self.mtu);
             if !send_packet(&self.to_tunnel, packet, self.headroom, self.fragment) {
                 return moved;
@@ -2554,18 +2570,44 @@ fn tcp_syn_port(packet: &[u8]) -> Option<u16> {
 /// Whether an inner packet carries TCP, which the stack takes, or UDP, which
 /// the datagram lane takes.
 /// The peer's TCP window field and, on a SYN, its window-scale shift.
-fn tcp_window(packet: &[u8], at: usize) -> Option<(u16, u8, Option<u8>)> {
+struct TcpProbe {
+    src: u16,
+    dst: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    payload: usize,
+    shift: Option<u8>,
+}
+
+/// The TCP header fields the server reads to log the peer's window and the bytes still in flight.
+fn tcp_probe(packet: &[u8], at: usize) -> Option<TcpProbe> {
     let ip = packet.get(at..)?;
-    let header = match ip.first()? >> 4 {
-        4 => usize::from(ip[0] & 0x0f) * 4,
-        6 => IPV6_HEADER,
+    let (header, total) = match ip.first()? >> 4 {
+        4 => (
+            usize::from(ip[0] & 0x0f) * 4,
+            usize::from(u16::from_be_bytes([*ip.get(2)?, *ip.get(3)?])),
+        ),
+        6 => (
+            IPV6_HEADER,
+            IPV6_HEADER + usize::from(u16::from_be_bytes([*ip.get(4)?, *ip.get(5)?])),
+        ),
         _ => return None,
     };
     let tcp = ip.get(header..)?;
+    let src = u16::from_be_bytes([*tcp.first()?, *tcp.get(1)?]);
+    let dst = u16::from_be_bytes([*tcp.get(2)?, *tcp.get(3)?]);
+    let seq = u32::from_be_bytes(tcp.get(4..8)?.try_into().ok()?);
+    let ack = u32::from_be_bytes(tcp.get(8..12)?.try_into().ok()?);
     let flags = *tcp.get(13)?;
     let window = u16::from_be_bytes([*tcp.get(14)?, *tcp.get(15)?]);
+    let tcp_header = usize::from(*tcp.get(12)? >> 4) * 4;
+    let payload = total
+        .saturating_sub(header + tcp_header)
+        .min(tcp.len().saturating_sub(tcp_header));
     let shift = if flags & 0x02 != 0 {
-        let data = usize::from(*tcp.get(12)? >> 4) * 4;
+        let data = tcp_header;
         let mut i = 20;
         let mut shift = None;
         while i + 1 < data && i + 1 < tcp.len() {
@@ -2588,7 +2630,7 @@ fn tcp_window(packet: &[u8], at: usize) -> Option<(u16, u8, Option<u8>)> {
     } else {
         None
     };
-    Some((window, flags, shift))
+    Some(TcpProbe { src, dst, seq, ack, flags, window, payload, shift })
 }
 
 pub(crate) fn inner_protocol(packet: &[u8]) -> Option<u8> {
