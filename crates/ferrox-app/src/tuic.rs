@@ -401,13 +401,16 @@ impl TuicOut {
                     .lock()
                     .is_ok_and(|conn| lane_established(&conn, lane))
         };
-        let select = |held: &HashMap<LaneKey, Vec<Arc<Lane>>>| -> Option<LaneLease> {
+        let select = |held: &HashMap<LaneKey, Vec<Arc<Lane>>>, shared: bool| -> Option<LaneLease> {
             if let Some(lane) = held.get(&key).and_then(|pool| {
                 pool.iter()
                     .find(|lane| lane.leases.load(Ordering::Acquire) == 0 && live(lane))
             }) {
                 lane.leases.fetch_add(1, Ordering::AcqRel);
                 return Some(LaneLease(Arc::clone(lane)));
+            }
+            if !shared {
+                return None;
             }
             let lane = held
                 .get(&key)?
@@ -419,17 +422,17 @@ impl TuicOut {
         };
         let mut held = self.lanes.lock().ok()?;
         prune_lanes(&mut held);
-        if let Some(lease) = select(&held) {
+        if let Some(lease) = select(&held, false) {
             return Some(lease);
         }
         if held.get(&key).map_or(0, Vec::len) >= LANES_PER_KEY || !lane_room(&held) {
-            return None;
+            return select(&held, true);
         }
         drop(held);
         let Some(lane) = self.connect_lane(source, options) else {
             let mut held = self.lanes.lock().ok()?;
             prune_lanes(&mut held);
-            return select(&held);
+            return select(&held, true);
         };
         let mut held = self.lanes.lock().ok()?;
         prune_lanes(&mut held);
@@ -439,7 +442,7 @@ impl TuicOut {
             return Some(LaneLease(lane));
         }
         drop(lane);
-        select(&held)
+        select(&held, true)
     }
 
     fn connect_lane(
