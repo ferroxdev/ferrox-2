@@ -23,7 +23,7 @@ const STREAM_POLL: Duration = Duration::from_millis(5);
 
 const ROUTE_POLL: Duration = Duration::from_millis(100);
 
-const HEAD_CAP: usize = 16 * 1024;
+const HEAD_CAP: usize = ferrox_core::hysteria_v1::MAX_AUTH + 19;
 
 const UDP_POLL: Duration = Duration::from_secs(1);
 
@@ -1794,7 +1794,7 @@ mod tests {
 
     #[test]
     fn a_hello_chunk_is_kept_to_the_cap_and_a_late_one_is_dropped() {
-        assert_eq!(HEAD_CAP, 16_384, "the documented cap");
+        assert_eq!(HEAD_CAP, u16::MAX as usize + 19, "the documented cap");
         let mut header = Vec::new();
         wire::encode_client_hello(
             &wire::ClientHello {
