@@ -14027,6 +14027,35 @@ fn owed_parked() -> Next {
     Next::Idle
 }
 
+/// Drains a tail an earlier turn owed before the step reads again, since the source holds no copy of
+/// it; `None` means the writer took all of it and the step may read.
+fn owe_out<W: Write>(
+    to: &Half<W>,
+    buffer: &mut RelayBuf,
+    ended: &Arc<RelayFinish>,
+) -> Option<Next> {
+    while buffer.owed() {
+        match to.write_some(buffer.owed_tail()) {
+            Ok(n) if n > 0 => {
+                buffer.owed_take(n);
+                ended.mark_progress();
+            }
+            Ok(_) if ended.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) => {
+                return Some(Next::Done)
+            }
+            Ok(_) => return Some(owed_parked()),
+            Err(error) if is_timeout(&error) => {
+                if ended.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
+                    return Some(Next::Done);
+                }
+                return Some(owed_parked());
+            }
+            Err(_) => return Some(Next::Done),
+        }
+    }
+    None
+}
+
 fn spill_lane_step<R, W>(
     from: &Half<R>,
     to: &Half<W>,
@@ -14037,26 +14066,8 @@ where
     R: Read,
     W: Write + HalfShut,
 {
-    // A tail the last turn's write left owed goes out before another read: the source has no copy of it.
-    while buffer.owed() {
-        match to.write_some(buffer.owed_tail()) {
-            Ok(n) if n > 0 => {
-                buffer.owed_take(n);
-                ended.mark_progress();
-            }
-            // The lane is woken by the packet that reopens the window, and by a poll clock behind it: that packet can land between this refusal and the park's arm.
-            Ok(_) if ended.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) => {
-                return Next::Done
-            }
-            Ok(_) => return owed_parked(),
-            Err(error) if is_timeout(&error) => {
-                if ended.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
-                    return Next::Done;
-                }
-                return owed_parked();
-            }
-            Err(_) => return Next::Done,
-        }
+    if let Some(next) = owe_out(to, buffer, ended) {
+        return next;
     }
     match from.read_once(buffer.as_mut()) {
         Ok(0) => {
@@ -14066,22 +14077,9 @@ where
         Ok(n) => {
             let _ = buffer.filled(n);
             buffer.owe(n);
-            match to.write_some(buffer.owed_tail()) {
-                Ok(taken) if taken > 0 => {
-                    buffer.owed_take(taken);
-                    ended.mark_progress();
-                    Next::More
-                }
-                Ok(_) if ended.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) => Next::Done,
-                Ok(_) => owed_parked(),
-                Err(error) if is_timeout(&error) => {
-                    if ended.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
-                        Next::Done
-                    } else {
-                        owed_parked()
-                    }
-                }
-                Err(_) => Next::Done,
+            match owe_out(to, buffer, ended) {
+                Some(next) => next,
+                None => Next::More,
             }
         }
         Err(error) if is_timeout(&error) => {
@@ -38392,9 +38390,19 @@ where
     R: Read,
     W: Write,
 {
+    if let Some(next) = owe_out(to, buffer, ended) {
+        return next;
+    }
     match from.read_once(buffer.as_mut()) {
         Ok(0) => Next::Done,
-        Ok(n) if to.write_once(buffer.filled(n)).is_ok() => Next::More,
+        Ok(n) => {
+            let _ = buffer.filled(n);
+            buffer.owe(n);
+            match owe_out(to, buffer, ended) {
+                Some(next) => next,
+                None => Next::More,
+            }
+        }
         // A record still arriving has progress behind it, so the step already spent its turn: the lane requeues rather than reading the yield as an idle peer.
         Err(error) if is_driven_yield(&error) => Next::Retry,
         Err(error) if is_timeout(&error) => {
@@ -38406,7 +38414,7 @@ where
                 Next::Idle
             }
         }
-        Ok(_) | Err(_) => Next::Done,
+        Err(_) => Next::Done,
     }
 }
 
@@ -45674,36 +45682,33 @@ mod tests {
             fn spill(&self) {}
         }
 
-        let room = Arc::new(std::sync::atomic::AtomicUsize::new(3));
-        let got = Arc::new(Mutex::new(Vec::new()));
-        let from = Half::shared(Frame(Some(b"abcdefgh".to_vec())));
-        let to = Half::shared(Window {
-            room: Arc::clone(&room),
-            got: Arc::clone(&got),
-        });
-        let flow = RelayFinish::new(true, Arc::new(|| {}), None);
-        let mut buffer = RelayBuf::new();
-        assert!(matches!(
-            spill_lane_step(&from, &to, &mut buffer, &flow),
-            Next::More
-        ));
-        assert_eq!(&*got.lock().expect("got"), b"abc", "the window took 3");
-        assert!(buffer.owed(), "the refused tail stays in the window");
-        assert!(matches!(
-            spill_lane_step(&from, &to, &mut buffer, &flow),
-            Next::Idle
-        ));
-        assert!(buffer.owed(), "a park keeps the bytes it could not send");
-        room.store(64, std::sync::atomic::Ordering::Relaxed);
-        assert!(matches!(
-            spill_lane_step(&from, &to, &mut buffer, &flow),
-            Next::Done
-        ));
-        assert_eq!(
-            &*got.lock().expect("got"),
-            b"abcdefgh",
-            "the tail went out before the next read"
-        );
+        // Every relayed direction owes a refused tail, so both step shapes are held to it.
+        let steps: [fn(&Half<Frame>, &Half<Window>, &mut RelayBuf, &Arc<RelayFinish>) -> Next; 2] =
+            [spill_lane_step, stream_lane_step];
+        for step in steps {
+            let room = Arc::new(std::sync::atomic::AtomicUsize::new(3));
+            let got = Arc::new(Mutex::new(Vec::new()));
+            let from = Half::shared(Frame(Some(b"abcdefgh".to_vec())));
+            let to = Half::shared(Window {
+                room: Arc::clone(&room),
+                got: Arc::clone(&got),
+            });
+            let flow = RelayFinish::new(true, Arc::new(|| {}), None);
+            let mut buffer = RelayBuf::new();
+            assert!(
+                matches!(step(&from, &to, &mut buffer, &flow), Next::Idle),
+                "a shut window hands the lane back"
+            );
+            assert_eq!(&*got.lock().expect("got"), b"abc", "the window took 3");
+            assert!(buffer.owed(), "the refused tail stays in the window");
+            room.store(64, std::sync::atomic::Ordering::Relaxed);
+            assert!(matches!(step(&from, &to, &mut buffer, &flow), Next::Done));
+            assert_eq!(
+                &*got.lock().expect("got"),
+                b"abcdefgh",
+                "the tail went out before the next read"
+            );
+        }
     }
 
     /// A bridge datagram borrows the configured outbound and its tag; the clone belongs to the
