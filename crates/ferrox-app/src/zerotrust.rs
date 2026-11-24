@@ -490,8 +490,90 @@ fn default_cookie_path(path: &str) -> String {
     }
 }
 
+fn http_date(value: &str) -> Option<u64> {
+    let parts: Vec<&str> = value.split_whitespace().collect();
+    let (year, month, day, clock) = match parts.as_slice() {
+        [_weekday, day, month, year, clock, "GMT"] => (
+            year.parse::<i64>().ok()?,
+            month_number(month)?,
+            day.parse::<u32>().ok()?,
+            *clock,
+        ),
+        [_weekday, date, clock, "GMT"] => {
+            let mut date = date.split('-');
+            let day = date.next()?.parse::<u32>().ok()?;
+            let month = month_number(date.next()?)?;
+            let year = date.next()?;
+            let year = if year.len() == 2 {
+                let short = year.parse::<i64>().ok()?;
+                if short >= 70 {
+                    1900 + short
+                } else {
+                    2000 + short
+                }
+            } else {
+                year.parse::<i64>().ok()?
+            };
+            (year, month, day, *clock)
+        }
+        [_weekday, month, day, clock, year] => (
+            year.parse::<i64>().ok()?,
+            month_number(month)?,
+            day.parse::<u32>().ok()?,
+            *clock,
+        ),
+        _ => return None,
+    };
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let (hour, minute, second) = parse_clock(clock)?;
+    let seconds = days_from_civil(year, month, day)
+        .checked_mul(86_400)?
+        .checked_add(i64::from(hour * 3600 + minute * 60 + second))?;
+    u64::try_from(seconds).ok()
+}
+
+fn parse_clock(clock: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = clock.split(':');
+    let hour = parts.next()?.parse().ok()?;
+    let minute = parts.next()?.parse().ok()?;
+    let second = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    Some((hour, minute, second))
+}
+
+fn month_number(month: &str) -> Option<u32> {
+    match month.get(..3)?.to_ascii_lowercase().as_str() {
+        "jan" => Some(1),
+        "feb" => Some(2),
+        "mar" => Some(3),
+        "apr" => Some(4),
+        "may" => Some(5),
+        "jun" => Some(6),
+        "jul" => Some(7),
+        "aug" => Some(8),
+        "sep" => Some(9),
+        "oct" => Some(10),
+        "nov" => Some(11),
+        "dec" => Some(12),
+        _ => None,
+    }
+}
+
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month = i64::from(month);
+    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
 fn resolve_url(base: &str, location: &str) -> Option<String> {
-    let location = decode_entities(location);
     let location = location.trim();
     let (scheme, authority) = url_origin(base)?;
     if location.is_empty() {
@@ -674,14 +756,17 @@ impl Session {
             .iter()
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect();
+        let trusted = self.trusts(url);
         let mut jar = String::new();
-        for cookie in self.cookies.iter().filter(|cookie| cookie.matches(url)) {
-            if !jar.is_empty() {
-                jar.push_str("; ");
+        if trusted {
+            for cookie in self.cookies.iter().filter(|cookie| cookie.matches(url)) {
+                if !jar.is_empty() {
+                    jar.push_str("; ");
+                }
+                jar.push_str(&cookie.name);
+                jar.push('=');
+                jar.push_str(&cookie.value);
             }
-            jar.push_str(&cookie.name);
-            jar.push('=');
-            jar.push_str(&cookie.value);
         }
         if !jar.is_empty() {
             owned.push(("Cookie".to_owned(), jar));
@@ -691,7 +776,7 @@ impl Session {
             .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect();
         let reply = exchange(method, url, &borrowed, body)?;
-        if self.trusts(url) {
+        if trusted {
             self.absorb(url, &reply);
         }
         Ok(reply)
@@ -721,6 +806,7 @@ impl Session {
             let mut path = None;
             let mut secure = false;
             let mut max_age = None;
+            let mut expires = None;
             for attribute in parts {
                 let attribute = attribute.trim();
                 if attribute.eq_ignore_ascii_case("secure") {
@@ -744,6 +830,7 @@ impl Session {
                         }
                     }
                     "max-age" => max_age = value.trim().parse::<i64>().ok(),
+                    "expires" => expires = Some(value.trim().to_owned()),
                     _ => {}
                 }
             }
@@ -758,13 +845,15 @@ impl Session {
                 None => (host.clone(), true),
             };
             let path = path.unwrap_or_else(|| default_cookie_path(request_path));
-            let expires_at = max_age.map(|seconds| {
-                if seconds <= 0 {
-                    0
-                } else {
-                    now().saturating_add(u64::try_from(seconds).unwrap_or(u64::MAX))
-                }
-            });
+            let expires_at = max_age
+                .map(|seconds| {
+                    if seconds <= 0 {
+                        0
+                    } else {
+                        now().saturating_add(u64::try_from(seconds).unwrap_or(u64::MAX))
+                    }
+                })
+                .or_else(|| expires.as_deref().and_then(http_date));
             if expires_at.is_some_and(|at| at <= now()) {
                 self.cookies.retain(|cookie| {
                     !(cookie.name == key && cookie.domain == domain && cookie.path == path)
@@ -1070,11 +1159,11 @@ pub(crate) fn https_exchange(
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> Result<Reply, String> {
-    let (origin, target) =
-        https_target(url).ok_or_else(|| format!("warp access: `{url}` is not an https URL"))?;
+    let (origin, target) = https_target(url)
+        .ok_or_else(|| "warp access: the redirect target is not an https URL".to_owned())?;
     let authority = origin.strip_prefix("https://").unwrap_or(&origin);
     let mut endpoint = Endpoint::parse(&origin, crate::quic::system_roots())
-        .ok_or_else(|| format!("warp access: `{url}` is not an https URL"))?;
+        .ok_or_else(|| "warp access: the redirect target is not an https URL".to_owned())?;
     if endpoint.port != 443 {
         endpoint.host_header = Some(authority.to_owned());
     }
@@ -1110,14 +1199,18 @@ pub(crate) fn resolve_token(
         }
     }
     let token = sign_in(settings, now, &https_exchange, prompt)?;
-    let issued = now;
+    let issued = now();
+    if !jwt_expiry(&token).is_some_and(|expiry| issued < expiry) {
+        return Err(format!(
+            "warp: access returned a device token for team {} that is already expired; sign in again",
+            settings.team
+        ));
+    }
     let mut cached = match CACHED.lock() {
         Ok(cached) => cached,
         Err(poisoned) => poisoned.into_inner(),
     };
-    *cached = jwt_expiry(&token)
-        .filter(|expiry| issued < *expiry)
-        .map(|_| (settings.team.clone(), token.clone()));
+    *cached = Some((settings.team.clone(), token.clone()));
     Ok(token)
 }
 
@@ -1294,6 +1387,18 @@ mod tests {
     }
 
     #[test]
+    fn a_redirect_location_keeps_its_query_entities() {
+        assert_eq!(
+            resolve_url(
+                "https://acme.cloudflareaccess.com/cdn-cgi/access/verify",
+                "/cdn-cgi/access/callback?a=1&amp;b=2",
+            )
+            .as_deref(),
+            Some("https://acme.cloudflareaccess.com/cdn-cgi/access/callback?a=1&amp;b=2")
+        );
+    }
+
+    #[test]
     fn a_redirect_away_from_https_is_refused() {
         let error = resolve_redirect(
             "https://acme.cloudflareaccess.com/cdn-cgi/access/verify",
@@ -1375,6 +1480,78 @@ mod tests {
             )
             .expect("a foreign request");
         assert!(!leaked.get());
+    }
+
+    #[test]
+    fn a_parent_domain_cookie_is_not_sent_to_a_sibling_origin() {
+        let mut session = Session::for_origin("https://acme.cloudflareaccess.com");
+        session.absorb(
+            "https://acme.cloudflareaccess.com/cdn-cgi/access/verify",
+            &reply(
+                200,
+                vec![(
+                    "Set-Cookie".to_owned(),
+                    "CF_Authorization=a-token; Domain=cloudflareaccess.com; Path=/; Secure"
+                        .to_owned(),
+                )],
+                "",
+            ),
+        );
+        let sent = std::cell::Cell::new(false);
+        session
+            .exchange(
+                "GET",
+                "https://other.cloudflareaccess.com/cdn-cgi/access/callback",
+                &[],
+                &[],
+                &|_, _, headers, _| {
+                    sent.set(
+                        headers
+                            .iter()
+                            .any(|(key, _)| key.eq_ignore_ascii_case("cookie")),
+                    );
+                    Ok(reply(200, Vec::new(), ""))
+                },
+            )
+            .expect("a sibling request");
+        assert!(!sent.get());
+    }
+
+    #[test]
+    fn a_past_expires_date_deletes_a_cookie() {
+        let mut session = Session::new();
+        session.absorb(
+            "https://acme.cloudflareaccess.com/cdn-cgi/access/verify",
+            &reply(
+                200,
+                vec![(
+                    "Set-Cookie".to_owned(),
+                    "CF_Authorization=a-token; Path=/; Secure".to_owned(),
+                )],
+                "",
+            ),
+        );
+        assert_eq!(session.cookies.len(), 1);
+        session.absorb(
+            "https://acme.cloudflareaccess.com/cdn-cgi/access/verify",
+            &reply(
+                200,
+                vec![(
+                    "Set-Cookie".to_owned(),
+                    "CF_Authorization=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Secure"
+                        .to_owned(),
+                )],
+                "",
+            ),
+        );
+        assert!(session.cookies.is_empty());
+    }
+
+    #[test]
+    fn http_dates_parse_the_three_http_forms() {
+        assert_eq!(http_date("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
+        assert_eq!(http_date("Thursday, 01-Jan-70 00:00:00 GMT"), Some(0));
+        assert_eq!(http_date("Thu Jan  1 00:00:00 1970"), Some(0));
     }
 
     #[test]

@@ -503,7 +503,11 @@ impl WarpSpec {
             MimSettings::default()
         };
         let team = crate::zerotrust::TeamSettings::from_settings(settings)?;
-        let gateway = matches!(settings.get("gateway"), Some(crate::json::Json::Bool(true)));
+        let gateway = match settings.get("gateway") {
+            Some(crate::json::Json::Bool(value)) => *value,
+            Some(_) => return Err("warp: `gateway` must be a boolean".to_owned()),
+            None => false,
+        };
         Ok(Self {
             mode,
             register,
@@ -2501,6 +2505,21 @@ fn connect_status(head: &[u8]) -> Option<u16> {
     std::str::from_utf8(status).ok()?.parse().ok()
 }
 
+fn connect_head_end(head: &[u8]) -> Option<usize> {
+    let crlf = head
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|at| at + 4);
+    let lf = head
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|at| at + 2);
+    match (crlf, lf) {
+        (Some(crlf), Some(lf)) => Some(crlf.min(lf)),
+        (crlf, lf) => crlf.or(lf),
+    }
+}
+
 fn read_connect_head(
     stream: &crate::conn::Connection,
     deadline: Instant,
@@ -2508,11 +2527,7 @@ fn read_connect_head(
     let mut head = Vec::new();
     let mut buf = [0u8; 512];
     loop {
-        if let Some(at) = head
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .map(|at| at + 4)
-        {
+        if let Some(at) = connect_head_end(&head) {
             if at > GATEWAY_MAX_HEAD {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -6207,6 +6222,23 @@ mod tests {
         );
         assert_eq!(connect_status(b"HTTP/1.1 200 \xff\r\n\r\n"), Some(200));
         assert_eq!(connect_status(b"HTTP/1.1 200 a\x01b\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn a_bare_lf_connect_head_ends_at_the_validated_boundary() {
+        let head = b"HTTP/1.1 200 OK\nX-Test: yes\n\nnext";
+        let end = head.len() - 4;
+        assert_eq!(connect_head_end(head), Some(end));
+        assert_eq!(connect_status(&head[..end]), Some(200));
+    }
+
+    #[test]
+    fn a_string_gateway_setting_is_refused() {
+        let reason = WarpSpec::from(
+            &crate::json::parse(r#"{"register":true,"gateway":"true"}"#).expect("settings"),
+        )
+        .expect_err("a string gateway");
+        assert!(reason.contains("gateway"), "{reason}");
     }
 
     #[test]

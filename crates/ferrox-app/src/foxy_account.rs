@@ -1035,6 +1035,26 @@ impl Endpoint {
         &self,
         cfg: &TlsConfig,
     ) -> Result<ferrox_core::tls::ClientSession<Connection>, String> {
+        let stream = self.connect_stream(cfg)?;
+        self.handshake(cfg, stream)
+    }
+
+    fn connect_within(
+        &self,
+        cfg: &TlsConfig,
+        deadline: Instant,
+    ) -> Result<ferrox_core::tls::ClientSession<DeadlineConnection>, String> {
+        let stream = self.connect_stream(cfg)?;
+        self.handshake(
+            cfg,
+            DeadlineConnection {
+                inner: stream,
+                deadline,
+            },
+        )
+    }
+
+    fn connect_stream(&self, cfg: &TlsConfig) -> Result<Connection, String> {
         let edge = self.dial_edge();
         let stream = if let Some(proxy) = &self.upstream {
             crate::foxy::tcp_via(proxy, &edge.0, edge.1)
@@ -1057,12 +1077,74 @@ impl Endpoint {
             .fragment
             .as_ref()
             .map(|fragment| ferrox_core::finalmask::Chain::default().with_front(fragment));
-        let stream = stream.with_mask(cut.as_ref());
+        Ok(stream.with_mask(cut.as_ref()))
+    }
+
+    fn handshake<S>(
+        &self,
+        cfg: &TlsConfig,
+        stream: S,
+    ) -> Result<ferrox_core::tls::ClientSession<S>, String>
+    where
+        S: ferrox_core::tls::Stream + ferrox_core::tls::RecordAlignment,
+    {
         let mut tls = ferrox_core::tls::connect(cfg, stream)
             .map_err(|why| format!("tls {}: {why}", self.host))?;
         tls.handshake()
             .map_err(|why| format!("handshake {}: {why}", self.host))?;
         Ok(tls)
+    }
+}
+
+struct DeadlineConnection {
+    inner: Connection,
+    deadline: Instant,
+}
+
+impl DeadlineConnection {
+    fn remaining(&self) -> std::io::Result<Duration> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the request deadline passed",
+            ));
+        }
+        Ok(left.max(Duration::from_millis(1)))
+    }
+}
+
+impl Read for DeadlineConnection {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.set_read_until(Some(self.deadline));
+        self.inner.set_read_timeout(Some(self.remaining()?))?;
+        self.inner.read(buf)
+    }
+}
+
+impl Write for DeadlineConnection {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.set_write_timeout(Some(self.remaining()?))?;
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.set_write_timeout(Some(self.remaining()?))?;
+        self.inner.flush()
+    }
+}
+
+impl ferrox_core::tls::RecordAlignment for DeadlineConnection {
+    fn engage_record_alignment(&mut self) {
+        ferrox_core::tls::RecordAlignment::engage_record_alignment(&mut self.inner);
+    }
+
+    fn disarm_record_alignment(&mut self) {
+        ferrox_core::tls::RecordAlignment::disarm_record_alignment(&mut self.inner);
+    }
+
+    fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
+        ferrox_core::tls::RecordAlignment::write_all_slices(&mut self.inner, parts)
     }
 }
 
@@ -1356,48 +1438,19 @@ fn ask_limited_within(
     budget: Duration,
 ) -> Result<Reply, String> {
     let deadline = Instant::now() + budget;
-    let mut tls = endpoint.connect()?;
-    let left = deadline.saturating_duration_since(Instant::now());
-    if left.is_zero() {
+    let diagnostic = url.split(|c| c == '?' || c == '#').next().unwrap_or(url);
+    let mut tls = endpoint.connect_within(&endpoint.tls(), deadline)?;
+    if deadline.saturating_duration_since(Instant::now()).is_zero() {
         return Err(format!(
-            "reading {} {url}: the request deadline passed before the connection opened",
+            "reading {} {diagnostic}: the request deadline passed before the connection opened",
             endpoint.host
         ));
     }
-    let _ = tls
-        .get_ref()
-        .set_write_timeout(Some(left.max(Duration::from_millis(1))));
     tls.write_all(&request(method, endpoint.host_header(), url, headers, body))
         .and_then(|()| tls.flush())
-        .map_err(|why| format!("writing {} {url}: {why}", endpoint.host))?;
-    let mut io = DeadlineRead {
-        tls: &mut tls,
-        deadline,
-    };
-    read_reply_limited(&mut io, DEFAULT_READ_CHUNK, max_body)
-        .map_err(|why| format!("reading {} {url}: {why}", endpoint.host))
-}
-
-struct DeadlineRead<'a> {
-    tls: &'a mut ferrox_core::tls::ClientSession<Connection>,
-    deadline: Instant,
-}
-
-impl Read for DeadlineRead<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let left = self.deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "the request deadline passed",
-            ));
-        }
-        let _ = self
-            .tls
-            .get_ref()
-            .set_read_timeout(Some(left.max(Duration::from_millis(1))));
-        self.tls.read(buf)
-    }
+        .map_err(|why| format!("writing {} {diagnostic}: {why}", endpoint.host))?;
+    read_reply_limited(&mut tls, DEFAULT_READ_CHUNK, max_body)
+        .map_err(|why| format!("reading {} {diagnostic}: {why}", endpoint.host))
 }
 
 /// One GET whose body is written to a file, so an interrupted transfer leaves what arrived for the next Range request.
