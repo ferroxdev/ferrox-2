@@ -29244,19 +29244,26 @@ enum TargetPick {
 /// The address the reference's outbound handler sends instead of a name, or the refusal a forced
 /// strategy owes a name that answered no address of its family.
 fn resolve_target(asked: &Destination, strategy: FreedomDomain) -> TargetPick {
+    let picked = resolve_target_quiet(asked, strategy);
+    if let (TargetPick::Refuse, Destination::Name(host, _)) = (&picked, asked) {
+        eprintln!(
+            "targetStrategy: {host} did not resolve, and {} forces an address",
+            strategy_name(strategy)
+        );
+    }
+    picked
+}
+
+/// The same resolution without the miss line, for a datagram loop where one admitted peer would
+/// otherwise write that line once per packet.
+fn resolve_target_quiet(asked: &Destination, strategy: FreedomDomain) -> TargetPick {
     let Destination::Name(host, port) = asked else {
         return TargetPick::Keep;
     };
     let picked = freedom_lookup(host, *port).and_then(|ips| strategy.pick(&ips));
     match picked {
         Some(ip) => TargetPick::Address(Destination::Address(SocketAddr::new(ip, *port))),
-        None if strategy.forces() => {
-            eprintln!(
-                "targetStrategy: {host} did not resolve, and {} forces an address",
-                strategy_name(strategy)
-            );
-            TargetPick::Refuse
-        }
+        None if strategy.forces() => TargetPick::Refuse,
         None => TargetPick::Keep,
     }
 }
@@ -34196,7 +34203,7 @@ pub(crate) fn socks_udp_parts<'a>(
 /// name is resolved, so a forced family refuses a name no strategy could carry.
 fn pool_dest(dest: Destination) -> Option<SocketAddr> {
     if let Some(strategy) = TARGET_STRATEGY.with(std::cell::Cell::get) {
-        match resolve_target(&dest, strategy) {
+        match resolve_target_quiet(&dest, strategy) {
             TargetPick::Address(Destination::Address(address)) => return Some(address),
             TargetPick::Refuse => return None,
             _ => {}
