@@ -77,7 +77,8 @@ fn trim_frame<'a>(
     count: u8,
     skip: usize,
 ) -> ([u8; 9], [&'a [u8]; 4], u8) {
-    let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+    let len =
+        usize::try_from(u32::from_be_bytes([0, head[0], head[1], head[2]])).unwrap_or(usize::MAX);
     let id = u32::from_be_bytes([head[5], head[6], head[7], head[8]]);
     let mut left = skip;
     let mut kept = [NO_PART; 4];
@@ -339,7 +340,8 @@ impl<'a> DataBatch<'a> {
         let mut included = 0;
         for at in 0..self.used {
             let head = &self.heads[at];
-            let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+            let len = usize::try_from(u32::from_be_bytes([0, head[0], head[1], head[2]]))
+                .unwrap_or(usize::MAX);
             let id = u32::from_be_bytes([head[5], head[6], head[7], head[8]]);
             let slot = budgets[..streams]
                 .iter_mut()
@@ -465,10 +467,11 @@ impl<'a> DataBatch<'a> {
     /// Whether a reserved frame is wider than the peer's latest limit, so the batch must be split
     /// before it reaches the wire.
     fn exceeds(&self, max: usize) -> bool {
-        self.heads
-            .iter()
-            .take(self.used)
-            .any(|head| u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize > max)
+        self.heads.iter().take(self.used).any(|head| {
+            usize::try_from(u32::from_be_bytes([0, head[0], head[1], head[2]]))
+                .unwrap_or(usize::MAX)
+                > max
+        })
     }
 
     /// Emit a batch whose frames were sized under an older, larger limit as DATA frames no wider
@@ -485,7 +488,8 @@ impl<'a> DataBatch<'a> {
             let id = u32::from_be_bytes([head[5], head[6], head[7], head[8]]);
             let mut body = 0;
             let mut offset = 0;
-            let mut left = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+            let mut left = usize::try_from(u32::from_be_bytes([0, head[0], head[1], head[2]]))
+                .unwrap_or(usize::MAX);
             while left > 0 {
                 let take = left.min(max);
                 let split = frame_head(take, T_DATA, 0, id);

@@ -1974,6 +1974,7 @@ fn check_encoder_capacity(
 /// The server's HTTP/3 control stream: its type, SETTINGS, then a GOAWAY that ends new requests but
 /// not the tunnels already open. The stream is found by its type, and a partial frame stays
 /// buffered until the next read completes it.
+#[allow(clippy::too_many_lines)]
 fn h3_control_goaway(
     conn: &mut QuicheConnection,
     control: &mut ControlState,
