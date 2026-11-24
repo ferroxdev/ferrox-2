@@ -722,25 +722,23 @@ fn serve_uot_stream(stream: &NaiveStream, version: u8) {
             (None, Some(send))
         }
         None => {
-            let send4 = match udp4.as_ref() {
-                Some(socket) => match socket.try_clone() {
-                    Ok(send) => Some(send),
-                    Err(_) => {
-                        stream.abort();
-                        return;
-                    }
-                },
-                None => None,
+            let send4 = if let Some(socket) = udp4.as_ref() {
+                let Some(send) = socket.try_clone().ok() else {
+                    stream.abort();
+                    return;
+                };
+                Some(send)
+            } else {
+                None
             };
-            let send6 = match udp6.as_ref() {
-                Some(socket) => match socket.try_clone() {
-                    Ok(send) => Some(send),
-                    Err(_) => {
-                        stream.abort();
-                        return;
-                    }
-                },
-                None => None,
+            let send6 = if let Some(socket) = udp6.as_ref() {
+                let Some(send) = socket.try_clone().ok() else {
+                    stream.abort();
+                    return;
+                };
+                Some(send)
+            } else {
+                None
             };
             (send4, send6)
         }

@@ -3200,10 +3200,10 @@ pub(crate) enum H2OpenError {
     Failed,
 }
 
-fn lock_until<'a, T>(
-    lock: &'a Mutex<T>,
+fn lock_until<T>(
+    lock: &Mutex<T>,
     deadline: Option<Instant>,
-) -> Option<std::sync::MutexGuard<'a, T>> {
+) -> Option<std::sync::MutexGuard<'_, T>> {
     let Some(deadline) = deadline else {
         return lock.lock().ok();
     };
