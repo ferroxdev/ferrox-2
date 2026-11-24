@@ -314,14 +314,18 @@ impl Group {
                     Some((current_at, leaf, out, revision, _)) if current_at == at => {
                         (at, leaf, out, revision)
                     }
-                    _ => {
-                        let (leaf, out, revision) =
-                            resolve_member(route, &self.members[at], network, resolved, readings)?;
-                        // The sweep's check was for the handler as it was then; this one is now.
-                        if !carries(&out, network) {
-                            return None;
+                    // The sweep checked the stored member; it answers when the fresh lookup cannot.
+                    retained => {
+                        match resolve_member(route, &self.members[at], network, resolved, readings)
+                        {
+                            Some((leaf, out, Some(revision))) if carries(&out, network) => {
+                                (at, leaf, out, revision)
+                            }
+                            _ => {
+                                let (stored_at, leaf, out, revision, _) = retained?;
+                                (stored_at, leaf, out, revision)
+                            }
                         }
-                        (at, leaf, out, revision?)
                     }
                 }
             }
