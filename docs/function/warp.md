@@ -49,10 +49,9 @@ graph TD
     B --> C["derive each slot path<br/>base / -masque / -secondary / -gool"]
     C --> D{"file exists?"}
     D -- no --> E["sign in: token / service / email<br/>POST /reg<br/>curve25519 key"]
-    D -- yes --> F["GET /reg/id<br/>refresh peer, endpoint, addresses"]
-    F --> V{"saved team matches?"}
+    D -- yes --> V{"saved team matches?"}
     V -- no --> XF["fail, choose another path"]
-    V -- yes --> H
+    V -- yes --> F["GET /reg/id<br/>refresh peer, endpoint, addresses"]
     F -- "401/404/410" --> G{"AETHER_REPROVISION=0?"}
     G -- no --> E
     G -- yes --> H["keep saved identity"]

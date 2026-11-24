@@ -556,13 +556,7 @@ impl WarpSpec {
                 "warp: `register: true` needs an `identityFile` to save the account".into(),
             );
         };
-        let identity = self.identity_at_in(path, false, test)?;
-        ensure_saved_team(
-            self.team.as_ref().map(|team| team.team.as_str()),
-            identity.team.as_deref(),
-            path,
-        )?;
-        Ok(identity)
+        self.identity_at_in(path, false, test)
     }
 
     /// The identity files this spec names, in the same shape the register command plans.
@@ -653,6 +647,11 @@ impl WarpSpec {
                 }
                 Err(error) => return Err(error.into_message()),
             };
+            ensure_saved_team(
+                self.team.as_ref().map(|team| team.team.as_str()),
+                saved.team.as_deref(),
+                path,
+            )?;
             if test {
                 return Ok(saved);
             }
@@ -2451,7 +2450,8 @@ fn connect_request(asked: &crate::proxy::Destination) -> Option<Vec<u8>> {
 
 fn connect_status(head: &[u8]) -> Option<u16> {
     let text = std::str::from_utf8(head).ok()?;
-    let line = text.split("\r\n").next()?;
+    let mut lines = text.split("\r\n");
+    let line = lines.next()?;
     let mut parts = line.split_whitespace();
     let version = parts.next()?.strip_prefix("HTTP/")?;
     let (major, minor) = version.split_once('.')?;
@@ -2465,6 +2465,19 @@ fn connect_status(head: &[u8]) -> Option<u16> {
     let status = parts.next()?;
     if status.len() != 3 || !status.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
+    }
+    for field in lines {
+        if field.is_empty() {
+            break;
+        }
+        let (name, _) = field.split_once(':')?;
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+        {
+            return None;
+        }
     }
     status.parse().ok()
 }
@@ -3495,6 +3508,20 @@ fn provision_kind_with(
     refresh_identity: &dyn Fn(&WarpSpec, &Identity) -> Result<Identity, RegisterError>,
 ) -> Result<Vec<PlannedSlot>, String> {
     let planned = planned_slots(kind, paths)?;
+    // Every existing slot is checked before a missing one can mint and save a device.
+    for (_, path) in &planned {
+        if path.is_file() {
+            match Identity::load(path) {
+                Ok(saved) => ensure_saved_team(
+                    spec.team.as_ref().map(|team| team.team.as_str()),
+                    saved.team.as_deref(),
+                    path,
+                )?,
+                Err(error) if error.corrupt() => {}
+                Err(error) => return Err(error.into_message()),
+            }
+        }
+    }
     let mut ready = Vec::new();
     for (slot, path) in planned {
         let (identity, replace, saved) = if path.is_file() {
@@ -4449,6 +4476,77 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600, "the identity is owner-only");
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_saved_identity_for_another_team_is_refused_before_read_back() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-warp-team-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+        let path = dir.join("identity.json");
+        let mut identity = sample_identity();
+        identity.team = Some("other".to_owned());
+        identity.save(&path).expect("saves");
+        let spec = WarpSpec {
+            identity_file: Some(path.clone()),
+            team: Some(crate::zerotrust::TeamSettings {
+                team: "acme".to_owned(),
+                ..crate::zerotrust::TeamSettings::default()
+            }),
+            ..sample_spec()
+        };
+        let error = spec
+            .identity_in(true)
+            .expect_err("another team's file is refused");
+        assert!(error.contains("other"), "{error}");
+        assert!(error.contains("acme"), "{error}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_team_mismatch_is_found_before_any_missing_slot_registers() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-warp-preflight-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+        let base = dir.join("identity.json");
+        let paths = KeyPaths::new(&base, None, None);
+        let mut inner = sample_identity();
+        inner.team = Some("other".to_owned());
+        inner
+            .save(&derive_sibling_path(&base, "secondary"))
+            .expect("saves the inner identity");
+        let spec = WarpSpec {
+            identity_file: Some(base.clone()),
+            team: Some(crate::zerotrust::TeamSettings {
+                team: "acme".to_owned(),
+                ..crate::zerotrust::TeamSettings::default()
+            }),
+            ..sample_spec()
+        };
+        let registrations = std::cell::Cell::new(0u32);
+        let counting = |_: &WarpSpec, _: bool| {
+            registrations.set(registrations.get() + 1);
+            Ok(sample_identity())
+        };
+        let fresh = |_: &WarpSpec, saved: &Identity| Ok(saved.clone());
+        let Err(error) = provision_kind_with(&spec, KeyKind::All, &paths, &counting, &fresh) else {
+            panic!("the inner slot belongs to another team");
+        };
+        assert!(error.contains("other"), "{error}");
+        assert_eq!(
+            registrations.get(),
+            0,
+            "no missing slot registered before the mismatch was seen"
+        );
+        assert!(!base.exists(), "nothing was saved");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -5994,6 +6092,18 @@ mod tests {
         );
         assert_eq!(connect_status(b"HTTP/1.1 403 Forbidden\r\n\r\n"), Some(403));
         assert_eq!(connect_status(b"not http"), None);
+        assert_eq!(
+            connect_status(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"),
+            Some(200)
+        );
+        assert_eq!(
+            connect_status(b"HTTP/1.1 200 OK\r\nnot-a-header\r\n\r\n"),
+            None
+        );
+        assert_eq!(
+            connect_status(b"HTTP/1.1 200 OK\r\n: empty name\r\n\r\n"),
+            None
+        );
     }
 
     #[test]

@@ -196,6 +196,14 @@ fn extract_jwt_from_cookie(header: &str) -> Option<String> {
     None
 }
 
+fn issued_token(reply: &Reply) -> Option<String> {
+    reply
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
+        .find_map(|(_, value)| extract_jwt_from_cookie(value))
+}
+
 fn extract_totp_form_action(html: &str) -> Option<String> {
     let anchor = html.find("id=\"totp-form\"")?;
     let head = &html[..anchor];
@@ -368,9 +376,8 @@ fn origin(url: &str) -> Option<String> {
 fn url_host(url: &str) -> Option<&str> {
     let (_, authority) = url_origin(url)?;
     if let Some(rest) = authority.strip_prefix('[') {
-        rest.split(']')
-            .next()
-            .map(|host| &authority[..host.len() + 2])
+        rest.split_once(']')
+            .map(|(host, _)| &authority[..host.len() + 2])
     } else {
         authority.split(':').next()
     }
@@ -433,7 +440,11 @@ fn resolve_redirect(current: &str, location: &str) -> Result<String, String> {
     if !next.to_ascii_lowercase().starts_with("https://") {
         return Err("warp access: refusing a redirect away from https".to_owned());
     }
-    Ok(next)
+    if next.starts_with("https://") {
+        return Ok(next);
+    }
+    let rest = next.split_once("://").map_or("", |(_, rest)| rest);
+    Ok(format!("https://{rest}"))
 }
 
 struct Cookie {
@@ -443,10 +454,14 @@ struct Cookie {
     host_only: bool,
     path: String,
     secure: bool,
+    expires_at: Option<u64>,
 }
 
 impl Cookie {
     fn matches(&self, url: &str) -> bool {
+        if self.expires_at.is_some_and(|at| at <= now()) {
+            return false;
+        }
         let Some(host) = url_host(url) else {
             return false;
         };
@@ -539,6 +554,7 @@ impl Session {
             let mut domain = None;
             let mut path = None;
             let mut secure = false;
+            let mut max_age = None;
             for attribute in parts {
                 let attribute = attribute.trim();
                 if attribute.eq_ignore_ascii_case("secure") {
@@ -561,6 +577,7 @@ impl Session {
                             path = Some(value.to_owned());
                         }
                     }
+                    "max-age" => max_age = value.trim().parse::<i64>().ok(),
                     _ => {}
                 }
             }
@@ -575,6 +592,19 @@ impl Session {
                 None => (host.clone(), true),
             };
             let path = path.unwrap_or_else(|| default_cookie_path(request_path));
+            let expires_at = max_age.map(|seconds| {
+                if seconds <= 0 {
+                    0
+                } else {
+                    now().saturating_add(u64::try_from(seconds).unwrap_or(u64::MAX))
+                }
+            });
+            if expires_at.is_some_and(|at| at <= now()) {
+                self.cookies.retain(|cookie| {
+                    !(cookie.name == key && cookie.domain == domain && cookie.path == path)
+                });
+                continue;
+            }
             if let Some(existing) = self
                 .cookies
                 .iter_mut()
@@ -583,6 +613,7 @@ impl Session {
                 value.trim().clone_into(&mut existing.value);
                 existing.secure = secure;
                 existing.host_only = host_only;
+                existing.expires_at = expires_at;
             } else {
                 self.cookies.push(Cookie {
                     name: key.to_owned(),
@@ -591,6 +622,7 @@ impl Session {
                     host_only,
                     path,
                     secure,
+                    expires_at,
                 });
             }
         }
@@ -650,7 +682,10 @@ impl Session {
                 });
             };
             let next = resolve_redirect(&current, &location)?;
-            if matches!(reply.status, 307 | 308) && origin(&current) != origin(&next) {
+            if matches!(reply.status, 307 | 308)
+                && body.is_some()
+                && origin(&current) != origin(&next)
+            {
                 return Err(
                     "warp access: refusing to resend the login form to another origin".to_owned(),
                 );
@@ -718,13 +753,9 @@ fn with_service_token(settings: &TeamSettings, exchange: &Exchange<'_>) -> Resul
         ("User-Agent", UA_REGISTER),
     ];
     let reply = exchange("GET", &url, &headers, &[])?;
-    for (name, value) in &reply.headers {
-        if name.eq_ignore_ascii_case("set-cookie") {
-            if let Some(token) = extract_jwt_from_cookie(value) {
-                eprintln!("[+] access issued a device enrolment token");
-                return Ok(token);
-            }
-        }
+    if let Some(token) = issued_token(&reply) {
+        eprintln!("[+] access issued a device enrolment token");
+        return Ok(token);
     }
     if let Some(token) = extract_jwt_from_html(&String::from_utf8_lossy(&reply.body)) {
         eprintln!("[+] access issued a device enrolment token");
@@ -795,18 +826,8 @@ fn with_email_code(
                 page.reply.status
             ));
         }
-        let token =
-            extract_jwt_from_html(&String::from_utf8_lossy(&page.reply.body)).or_else(|| {
-                session
-                    .cookies
-                    .iter()
-                    .rev()
-                    .find(|cookie| {
-                        cookie.name.eq_ignore_ascii_case("CF_Authorization")
-                            && looks_like_jwt(&cookie.value)
-                    })
-                    .map(|cookie| cookie.value.clone())
-            });
+        let token = extract_jwt_from_html(&String::from_utf8_lossy(&page.reply.body))
+            .or_else(|| issued_token(&page.reply));
         if let Some(token) = token {
             eprintln!(
                 "[+] signed in to team {} with the email code",
@@ -972,6 +993,27 @@ mod tests {
     }
 
     #[test]
+    fn an_uppercase_https_redirect_is_normalized_before_the_exchange() {
+        assert_eq!(
+            resolve_redirect(
+                "https://acme.cloudflareaccess.com/cdn-cgi/access/verify",
+                "HTTPS://acme.cloudflareaccess.com/cdn-cgi/access/callback",
+            )
+            .expect("a usable uppercase scheme"),
+            "https://acme.cloudflareaccess.com/cdn-cgi/access/callback"
+        );
+    }
+
+    #[test]
+    fn an_unclosed_bracketed_host_does_not_panic() {
+        assert_eq!(url_host("https://[2606:4700::1"), None);
+        assert_eq!(
+            url_host("https://[2606:4700::1]:443/callback"),
+            Some("[2606:4700::1]")
+        );
+    }
+
+    #[test]
     fn a_cookie_is_scoped_to_its_issuing_host_and_path() {
         let mut session = Session::new();
         session.absorb(
@@ -1025,6 +1067,53 @@ mod tests {
     }
 
     #[test]
+    fn a_cookie_the_server_deletes_is_not_sent_again() {
+        let mut session = Session::new();
+        session.absorb(
+            "https://acme.cloudflareaccess.com/cdn-cgi/access/verify",
+            &reply(
+                200,
+                vec![(
+                    "Set-Cookie".to_owned(),
+                    "CF_Authorization=a-token; Path=/; Secure".to_owned(),
+                )],
+                "",
+            ),
+        );
+        assert_eq!(session.cookies.len(), 1);
+        session.absorb(
+            "https://acme.cloudflareaccess.com/cdn-cgi/access/verify",
+            &reply(
+                200,
+                vec![(
+                    "Set-Cookie".to_owned(),
+                    "CF_Authorization=; Path=/; Max-Age=0; Secure".to_owned(),
+                )],
+                "",
+            ),
+        );
+        assert!(session.cookies.is_empty(), "the deleted cookie is gone");
+        let sent = std::cell::Cell::new(false);
+        session
+            .exchange(
+                "GET",
+                "https://acme.cloudflareaccess.com/cdn-cgi/access/callback",
+                &[],
+                &[],
+                &|_, _, headers, _| {
+                    sent.set(
+                        headers
+                            .iter()
+                            .any(|(key, _)| key.eq_ignore_ascii_case("cookie")),
+                    );
+                    Ok(reply(200, Vec::new(), ""))
+                },
+            )
+            .expect("the next request");
+        assert!(!sent.get());
+    }
+
+    #[test]
     fn a_cross_origin_307_does_not_replay_the_code() {
         let calls = std::cell::Cell::new(0);
         let error = Session::new()
@@ -1047,6 +1136,44 @@ mod tests {
             .expect("a cross-origin rerun");
         assert!(error.contains("another origin"));
         assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn a_cross_origin_307_after_the_form_is_spent_is_followed() {
+        let calls = std::cell::Cell::new(0);
+        let page = Session::new()
+            .post_form(
+                "https://acme.cloudflareaccess.com/cdn-cgi/access/callback",
+                &[("code", "123456")],
+                &|method, url, _, body| {
+                    calls.set(calls.get() + 1);
+                    if method == "POST" {
+                        assert_ne!(body, []);
+                        return Ok(reply(
+                            302,
+                            vec![(
+                                "Location".to_owned(),
+                                "https://acme.cloudflareaccess.com/next".to_owned(),
+                            )],
+                            "",
+                        ));
+                    }
+                    if url.ends_with("/next") {
+                        return Ok(reply(
+                            307,
+                            vec![(
+                                "Location".to_owned(),
+                                "https://elsewhere.example/final".to_owned(),
+                            )],
+                            "",
+                        ));
+                    }
+                    Ok(reply(200, Vec::new(), "done"))
+                },
+            )
+            .expect("the GET after the form is spent may move");
+        assert_eq!(page.url, "https://elsewhere.example/final");
+        assert_eq!(calls.get(), 3);
     }
 
     #[test]
@@ -1131,6 +1258,60 @@ mod tests {
         assert!(error.contains("did not answer the login code check"));
         assert_eq!(prompted, 1);
         assert_eq!(posts.get(), 1);
+    }
+
+    #[test]
+    fn a_pre_verify_cookie_is_not_proof_the_callback_worked() {
+        let settings = TeamSettings {
+            team: "acme".to_owned(),
+            email: Some("user@example.com".to_owned()),
+            ..TeamSettings::default()
+        };
+        let stale = jwt("{\"exp\":4102444800}");
+        let mut prompted = 0;
+        let error = sign_in(
+            &settings,
+            now(),
+            &|method, url, _, _| {
+                if method == "GET" && url.ends_with("/warp") {
+                    return Ok(reply(
+                        200,
+                        Vec::new(),
+                        "<form action=\"https://acme.cloudflareaccess.com/cdn-cgi/access/verify\"><input id=\"totp-form\"></form>",
+                    ));
+                }
+                if method == "POST" && url.ends_with("/verify") {
+                    return Ok(reply(
+                        302,
+                        vec![
+                            (
+                                "Location".to_owned(),
+                                "https://acme.cloudflareaccess.com/verify?nonce=abc".to_owned(),
+                            ),
+                            (
+                                "Set-Cookie".to_owned(),
+                                format!("CF_Authorization={stale}; Path=/verify; Secure"),
+                            ),
+                        ],
+                        "",
+                    ));
+                }
+                if method == "GET" && url.contains("nonce=abc") {
+                    return Ok(reply(200, Vec::new(), ""));
+                }
+                if method == "POST" && url.ends_with("/cdn-cgi/access/callback") {
+                    return Ok(reply(403, Vec::new(), ""));
+                }
+                Err(format!("unexpected {method} {url}"))
+            },
+            &mut |_, _| {
+                prompted += 1;
+                Some("123456".to_owned())
+            },
+        )
+        .expect_err("the stale cookie is not a token");
+        assert!(error.contains("was not accepted"), "{error}");
+        assert_eq!(prompted, 3);
     }
 
     #[test]
