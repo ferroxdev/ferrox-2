@@ -36306,6 +36306,9 @@ pub(crate) mod lane_pool {
         reaper: Mutex<Option<std::thread::JoinHandle<()>>>,
         /// Slots whose sibling ended, named so the reaper drops them without scanning the parked set.
         retired: Mutex<Vec<u64>>,
+        /// Descriptors a pump drained: a datagram read by the connection's own thread never reaches the
+        /// descriptor wait a lane armed on the same socket, so the reader names the wake instead.
+        drained: Mutex<Vec<WaitFd>>,
         next_slot: std::sync::atomic::AtomicU64,
         /// Which park branch a lane took: a readiness park is a descriptor wait, a timer park is the clock.
         #[cfg(test)]
@@ -36560,6 +36563,23 @@ pub(crate) mod lane_pool {
     /// shorter than the read clock it would otherwise hide behind.
     const LANE_STREAK: usize = 8;
 
+    /// The datagrams a pump just took are inside the connection, not on the socket: the lanes parked
+    /// on that socket are handed back here, since their descriptor will never report the read.
+    pub(crate) fn note_drained(key: WaitFd) {
+        for pool in [POOL.get(), DEMUX_POOL.get()].into_iter().flatten() {
+            if pool.wake.is_none() {
+                continue;
+            }
+            pool.drained
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(key);
+            if let Some(wake) = pool.wake.as_ref() {
+                wake.post();
+            }
+        }
+    }
+
     fn pool() -> std::sync::Arc<Pool> {
         std::sync::Arc::clone(POOL.get_or_init(spawn_pool))
     }
@@ -36602,6 +36622,7 @@ pub(crate) mod lane_pool {
             wake: WakePipe::new(),
             reaper: Mutex::new(None),
             retired: Mutex::new(Vec::new()),
+            drained: Mutex::new(Vec::new()),
             next_slot: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             ready_parks: std::sync::atomic::AtomicUsize::new(0),
@@ -37498,6 +37519,19 @@ pub(crate) mod lane_pool {
                     flow.unwatch_park(&slot);
                 }
                 ready.push(lane);
+            }
+            // After the fresh slots are in, so a datagram drained before its lane parked still names it.
+            let drained =
+                std::mem::take(&mut *pool.drained.lock().unwrap_or_else(PoisonError::into_inner));
+            for fd in drained {
+                reactor.wake(
+                    fd,
+                    Ready {
+                        read: true,
+                        write: true,
+                    },
+                    &mut ready,
+                );
             }
             let now = std::time::Instant::now();
             // Only a slot that has left is stale; a parked one keeps its deadline or the lane waits forever.
