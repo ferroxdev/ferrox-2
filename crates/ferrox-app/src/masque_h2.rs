@@ -1344,6 +1344,8 @@ struct Session {
     udp_quiet: Option<Instant>,
     fed: bool,
     diag_at: Instant,
+    ping_at: Option<Instant>,
+    next_ping: Instant,
     end: bool,
 }
 
@@ -1374,6 +1376,8 @@ impl Session {
             udp_quiet: None,
             fed: false,
             diag_at: Instant::now(),
+            ping_at: None,
+            next_ping: Instant::now() + Duration::from_secs(1),
             end: false,
         }
     }
@@ -1456,6 +1460,12 @@ impl Session {
                 self.end = true;
                 break;
             }
+            if self.request.is_some() && self.ping_at.is_none() && Instant::now() >= self.next_ping {
+                if wire.send(h2::T_PING, 0, 0, &[0u8; 8]) {
+                    self.ping_at = Some(Instant::now());
+                    self.next_ping = Instant::now() + Duration::from_secs(1);
+                }
+            }
             self.flush(wire);
             if wire.closed || self.end {
                 break;
@@ -1499,6 +1509,11 @@ impl Session {
             }
             h2::T_PING if flags & h2::F_ACK == 0 => {
                 wire.send(h2::T_PING, h2::F_ACK, 0, body);
+            }
+            h2::T_PING => {
+                if let Some(at) = self.ping_at.take() {
+                    eprintln!("h2ping rtt_us={}", at.elapsed().as_micros());
+                }
             }
             h2::T_HEADERS => self.headers(wire, flags, id, body),
             h2::T_CONT => {
