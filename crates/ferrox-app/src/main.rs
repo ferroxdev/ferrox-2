@@ -158,7 +158,7 @@ fn usage() -> ! {
         "        [--team NAME] [--access-id ID] [--access-secret SECRET] [--access-token JWT] [--access-email ADDR] [--gateway]"
     );
     eprintln!(
-        "                                with --register, make the kind's identities and print them; without it, register one device, save the identity (0600 on Unix), print the outbound. --team enrols a managed device (name, subdomain of cloudflareaccess.com; sign-in from these flags or AETHER_* env). --gateway sends http and https through the organization proxy when --register is omitted; a registered slot enables it with `team: "<team>"` and `gateway: true` in the outbound"
+        "                                with --register, make the kind's identities and print them; without it, register one device, save the identity (0600 on Unix), print the outbound. --team enrols a managed device (name, subdomain of cloudflareaccess.com; sign-in from these flags or AETHER_* env). --gateway sends http and https through the organization proxy when --register is omitted; a registered slot enables it with `team: \"<team>\"` and `gateway: true` in the outbound"
     );
     eprintln!(
         "  ferrox-app browser-login --email ADDR --token-file PATH [--code CODE] [--no-open]"
