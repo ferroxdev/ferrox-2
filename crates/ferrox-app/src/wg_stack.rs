@@ -1428,6 +1428,7 @@ fn retire(
 
 /// Run the server stack until its inbound is dropped.
 #[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn server(
     config: DeviceConfig,
     to_tunnel: impl Into<ToTunnel>,
@@ -1436,8 +1437,12 @@ pub(crate) fn server(
     headroom: usize,
     recycle: Option<Sender<Vec<u8>>>,
     stop: Option<Arc<AtomicBool>>,
+    inner_congestion: bool,
 ) {
     let mut stack = ServerStack::new(&config, to_tunnel, out, headroom);
+    if !inner_congestion {
+        stack.set_congestion(CongestionControl::None);
+    }
     stack.device.recycle = recycle;
     loop {
         if stop
@@ -1908,9 +1913,16 @@ struct ServerStack {
     cli_wscale: u8,
     win_min: u32,
     win_max: u32,
+    congestion: CongestionControl,
 }
 
 impl ServerStack {
+    /// The inner TCP's congestion controller. A reliable outer transport already
+    /// gates the network, so its inner CC only caps a window the tunnel has room for.
+    fn set_congestion(&mut self, congestion: CongestionControl) {
+        self.congestion = congestion;
+    }
+
     /// Build the server's interface, sockets and routes over a device that reserves its headroom.
     fn new(
         config: &DeviceConfig,
@@ -1974,6 +1986,7 @@ impl ServerStack {
             cli_wscale: 0,
             win_min: 0,
             win_max: 0,
+            congestion: CongestionControl::Cubic,
         }
     }
 
@@ -2206,7 +2219,7 @@ impl ServerStack {
         );
         socket.set_nagle_enabled(false);
         socket.set_ack_delay(None);
-        socket.set_congestion_control(CongestionControl::Cubic);
+        socket.set_congestion_control(self.congestion);
         if socket.listen(IpListenEndpoint { addr: None, port }).is_ok() {
             let handle = self.sockets.add(socket);
             listeners.push(Listener {
