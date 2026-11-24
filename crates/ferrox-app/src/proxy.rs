@@ -14129,6 +14129,13 @@ impl<W: LaneWrite + 'static> CarrierSink for HalfSink<W> {
         }
     }
 
+    fn progress(&self) -> bool {
+        match self.0.writer_lock() {
+            Ok(mut guard) => guard.progress(),
+            Err(()) => false,
+        }
+    }
+
     fn wait_for_room(&self, turn: Duration) {
         if let Ok(mut guard) = self.0.writer_lock() {
             guard.wait_room(turn);
@@ -39140,6 +39147,10 @@ pub(crate) trait CarrierSink: Clone + Send + 'static {
     fn settle(&self) -> Settle {
         Settle::Clear
     }
+    /// Wire progress this carrier made without consuming a plaintext byte.
+    fn progress(&self) -> bool {
+        false
+    }
     /// The most bytes one relay read should hand this carrier, so a write stays one framed message
     /// the peer's window can pay for; `None` keeps the relay's own window.
     fn read_window(&self) -> Option<usize> {
@@ -39662,6 +39673,10 @@ fn write_parked(at: &mut Forward) -> bool {
 /// Offers the bytes a parked window still owes; `Some` ends or parks the lane, `None` means the window is clear and the leg may read again.
 fn forward_flush(buffer: &RelayBuf, uplink: &impl CarrierSink, at: &mut Forward) -> Option<Next> {
     while at.sent < at.pending {
+        if uplink.progress() {
+            at.stopped = None;
+            at.spins = 0;
+        }
         match uplink.push_ready(&buffer.prefix(at.pending)[at.sent..]) {
             Push::Took(n) if n > 0 => {
                 at.sent += n;

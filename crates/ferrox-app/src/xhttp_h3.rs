@@ -959,7 +959,8 @@ fn synth_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Option<Vec<u8>> {
     };
     let method = field(b":method")?;
     let target = if method == b"CONNECT" {
-        if field(b":path").is_some() || field(b":scheme").is_some() {
+        if field(b":path").is_some() || field(b":scheme").is_some() || field(b":protocol").is_some()
+        {
             return None;
         }
         field(b":authority")?

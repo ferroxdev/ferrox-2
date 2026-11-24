@@ -373,11 +373,10 @@ impl<'a> DataBatch<'a> {
         heads: &[[u8; 9]; DATA_FRAMES_PER_WRITE],
         included: usize,
     ) -> bool {
-        let max_frame = conn
-            .max_frame
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let max = *max_frame;
+        let Ok(mut write) = conn.write.lock() else {
+            return false;
+        };
+        let max = conn.max_frame.load(Ordering::SeqCst);
         let mut capped = [[0u8; 9]; DATA_FRAMES_PER_WRITE];
         let mut take = [0usize; DATA_FRAMES_PER_WRITE];
         for at in 0..included {
@@ -409,15 +408,11 @@ impl<'a> DataBatch<'a> {
         if pieces == 0 {
             return false;
         }
-        let Ok(mut write) = conn.write.lock() else {
-            return false;
-        };
         if !write.write_slices(&parts[..pieces]) {
             conn.dead.store(true, Ordering::SeqCst);
             return false;
         }
         drop(write);
-        drop(max_frame);
         let mut new_heads = self.heads;
         let mut new_bodies = self.bodies;
         let mut new_counts = self.counts;
@@ -491,7 +486,7 @@ impl<'a> DataBatch<'a> {
     }
 
     /// Emit a batch whose frames were sized under an older, larger limit as DATA frames no wider
-    /// than the current one. The frame-size lock is held by the caller across the write.
+    /// than the current one. The caller holds the write lock, so the peer's ACK cannot precede it.
     fn flush_split_locked(
         &mut self,
         conn: &H2Conn,
@@ -546,12 +541,8 @@ impl<'a> DataBatch<'a> {
         if self.used == 0 {
             return true;
         }
-        let max = conn
-            .max_frame
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if self.exceeds(*max) {
-            let max = *max;
+        let max = conn.max_frame.load(Ordering::SeqCst);
+        if self.exceeds(max) {
             return self.flush_split_locked(conn, write, max);
         }
         let mut parts: [&[u8]; 5 * DATA_FRAMES_PER_WRITE] = [NO_PART; 5 * DATA_FRAMES_PER_WRITE];
@@ -584,12 +575,8 @@ impl<'a> DataBatch<'a> {
         if self.used == 0 {
             return crate::proxy::Accepted::All;
         }
-        let max = conn
-            .max_frame
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if self.exceeds(*max) {
-            drop(max);
+        let max = conn.max_frame.load(Ordering::SeqCst);
+        if self.exceeds(max) {
             self.used = 0;
             return crate::proxy::Accepted::Full;
         }
@@ -945,7 +932,7 @@ pub(crate) struct H2Conn {
     batch_gate: Mutex<()>,
     wake: Condvar,
     decoder: Mutex<Decoder>,
-    max_frame: Mutex<usize>,
+    max_frame: AtomicUsize,
     peer_initial: Mutex<u64>,
     peer_max: AtomicUsize,
     /// The stream window this end advertises, and the connection credit it opens with: a carrier
@@ -1044,6 +1031,7 @@ impl H2StreamReader {
                     .unwrap_or_else(PoisonError::into_inner);
                 if st.dead
                     || self.conn.dead.load(Ordering::SeqCst)
+                    || self.unprocessed()
                     || (st.status.is_none() && st.read_ended())
                 {
                     return None;
@@ -1077,7 +1065,7 @@ impl H2StreamReader {
                     .state
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
-                st.status.is_some() || st.dead || st.read_ended()
+                st.status.is_some() || st.dead || st.read_ended() || self.unprocessed()
             },
             false,
             Some(deadline),
@@ -1497,13 +1485,10 @@ impl H2Conn {
         end_stream: bool,
         cancelled: Option<&AtomicBool>,
     ) -> bool {
-        let max = *self
-            .max_frame
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
         let Ok(mut write) = self.write.lock() else {
             return false;
         };
+        let max = self.max_frame.load(Ordering::SeqCst);
         if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::SeqCst)) {
             return false;
         }
@@ -1575,10 +1560,7 @@ impl H2Conn {
         else {
             return false;
         };
-        let max = *self
-            .max_frame
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let max = self.max_frame.load(Ordering::SeqCst);
         let mut batch = DataBatch::new();
         while !payload.is_empty() {
             if batch.full() && !batch.flush(self) {
@@ -1608,10 +1590,7 @@ impl H2Conn {
         else {
             return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
         };
-        let max = *self
-            .max_frame
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let max = self.max_frame.load(Ordering::SeqCst);
         let mut batch = DataBatch::new();
         let mut sent = 0;
         while !payload.is_empty() {
@@ -1657,10 +1636,7 @@ impl H2Conn {
         else {
             return false;
         };
-        let max = *self
-            .max_frame
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let max = self.max_frame.load(Ordering::SeqCst);
         let mut batch = DataBatch::new();
         for group in groups {
             let mut need: usize = group.iter().map(|part| part.len()).sum();
@@ -1703,10 +1679,7 @@ impl H2Conn {
     }
 
     fn frame_batch_capacity(&self) -> usize {
-        let max = *self
-            .max_frame
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let max = self.max_frame.load(Ordering::SeqCst);
         max.saturating_mul(DATA_FRAMES_PER_WRITE)
     }
 
@@ -1736,10 +1709,7 @@ impl H2Conn {
             return None;
         };
         let total_signed = i64::try_from(total).unwrap_or(i64::MAX);
-        let max = *self
-            .max_frame
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let max = self.max_frame.load(Ordering::SeqCst);
         let mut batch = DataBatch::new();
         let mut at = 0;
         while at < data.len() {
@@ -1830,10 +1800,7 @@ impl H2Conn {
             *conn -= total;
             *window -= total_signed;
         }
-        let max = *self
-            .max_frame
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let max = self.max_frame.load(Ordering::SeqCst);
         let mut batch = DataBatch::new();
         for group in groups {
             let mut need: usize = group.iter().map(|part| part.len()).sum();
@@ -2576,13 +2543,12 @@ impl H2Conn {
                 u32::from_be_bytes([body[at + 2], body[at + 3], body[at + 4], body[at + 5]]);
             at += 6;
             if id == S_MAX_FRAME {
-                let mut max = self
-                    .max_frame
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                *max = usize::try_from(value)
-                    .unwrap_or(crate::h2::FRAME_CAP)
-                    .clamp(16_384, 16_777_215);
+                self.max_frame.store(
+                    usize::try_from(value)
+                        .unwrap_or(crate::h2::FRAME_CAP)
+                        .clamp(16_384, 16_777_215),
+                    Ordering::SeqCst,
+                );
             } else if id == S_MAX_CONCURRENT {
                 let _gate = self
                     .open_gate
@@ -3150,7 +3116,7 @@ impl H2Client {
             batch_gate: Mutex::new(()),
             wake: Condvar::new(),
             decoder: Mutex::new(Decoder::default()),
-            max_frame: Mutex::new(16_384),
+            max_frame: AtomicUsize::new(16_384),
             peer_initial: Mutex::new(65_535),
             peer_max: AtomicUsize::new(usize::MAX),
             recv_window,
@@ -3631,10 +3597,7 @@ impl H2Conn {
     }
 
     pub(crate) fn max_frame_now(&self) -> usize {
-        *self
-            .max_frame
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        self.max_frame.load(Ordering::SeqCst)
     }
 
     pub(crate) fn peer_window(&self) -> u64 {
@@ -4182,7 +4145,7 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
                     batch_gate: Mutex::new(()),
                     wake: Condvar::new(),
                     decoder: Mutex::new(Decoder::default()),
-                    max_frame: Mutex::new(16_384),
+                    max_frame: AtomicUsize::new(16_384),
                     peer_initial: Mutex::new(65_535),
                     peer_max: AtomicUsize::new(usize::MAX),
                     recv_window: WINDOW,
@@ -6989,7 +6952,7 @@ mod tests {
             batch_gate: Mutex::new(()),
             wake: Condvar::new(),
             decoder: Mutex::new(Decoder::default()),
-            max_frame: Mutex::new(16_384),
+            max_frame: AtomicUsize::new(16_384),
             peer_initial: Mutex::new(65_535),
             peer_max: AtomicUsize::new(usize::MAX),
             recv_window: WINDOW,
@@ -7555,7 +7518,7 @@ mod tests {
             batch_gate: Mutex::new(()),
             wake: Condvar::new(),
             decoder: Mutex::new(Decoder::default()),
-            max_frame: Mutex::new(16_384),
+            max_frame: AtomicUsize::new(16_384),
             peer_initial: Mutex::new(65_535),
             peer_max: AtomicUsize::new(usize::MAX),
             recv_window: WINDOW,

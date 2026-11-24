@@ -2665,14 +2665,8 @@ fn sendto_flags(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        // Darwin ignores `MSG_DONTWAIT` on a full buffer, so the flag is armed for the one call.
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-            return -1;
-        }
-        let sent = unsafe { libc::sendto(fd, buf.as_ptr().cast(), buf.len(), 0, name, name_len) };
-        unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
-        sent
+        // No per-call flag here: the lane's one-millisecond write timeout bounds a full buffer.
+        unsafe { libc::sendto(fd, buf.as_ptr().cast(), buf.len(), 0, name, name_len) }
     }
 }
 
@@ -2691,13 +2685,7 @@ fn send_flags(fd: std::os::fd::RawFd, buf: &[u8]) -> isize {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-            return -1;
-        }
-        let sent = unsafe { libc::send(fd, buf.as_ptr().cast(), buf.len(), 0) };
-        unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
-        sent
+        unsafe { libc::send(fd, buf.as_ptr().cast(), buf.len(), 0) }
     }
 }
 
@@ -2993,6 +2981,16 @@ const GECKO_MAX_PER_SOURCE: usize = 8;
 /// fragment is built in is big enough for any padded frame the plan can ask for.
 const GECKO_BUFFER: usize = ferrox_core::hysteria::Gecko::MAX_BUFFER as usize;
 
+/// The fragments a refused gecko write still owes, so a retry resumes the same message id
+/// and chunk sequence instead of starting a second partial message.
+struct FragmentState {
+    msg_id: u8,
+    total: usize,
+    next: usize,
+    buf: Vec<u8>,
+    to: SocketAddr,
+}
+
 /// One message mid-reassembly: its chunk count, the payloads landed so far indexed
 /// by chunk, and when it expires.
 struct GeckoMessage {
@@ -3018,6 +3016,7 @@ pub(crate) struct Gecko {
     min: usize,
     max: usize,
     msg: AtomicU64,
+    fragment: Mutex<Option<FragmentState>>,
     reassembly: Mutex<HashMap<(IpAddr, u8), GeckoMessage>>,
 }
 
@@ -3034,6 +3033,7 @@ impl Gecko {
             min: usize::from(window.min_pkt),
             max: usize::from(window.max_pkt),
             msg: AtomicU64::new(0),
+            fragment: Mutex::new(None),
             reassembly: Mutex::new(HashMap::new()),
         }
     }
@@ -3051,6 +3051,7 @@ impl Gecko {
             min: usize::from(window.min_pkt),
             max: usize::from(window.max_pkt),
             msg: AtomicU64::new(0),
+            fragment: Mutex::new(None),
             reassembly: Mutex::new(HashMap::new()),
         })
     }
@@ -3085,16 +3086,37 @@ impl Gecko {
     /// window and masked as its own datagram. The message id is one draw for the whole
     /// packet; the chunk count and each pad are drawn per write.
     fn send_fragmented(&self, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
-        let total = ferrox_core::hysteria::GECKO_MIN_CHUNKS
-            + (entropy()
-                % (ferrox_core::hysteria::GECKO_MAX_CHUNKS
-                    - ferrox_core::hysteria::GECKO_MIN_CHUNKS
-                    + 1) as u64) as usize;
-        let msg_id = self.msg.fetch_add(1, Ordering::Relaxed) as u8;
+        let mut fragment = self
+            .fragment
+            .lock()
+            .map_err(|_| std::io::Error::other("gecko fragment lock poisoned"))?;
+        let resume = fragment
+            .as_ref()
+            .filter(|state| state.buf == buf && state.to == to)
+            .map(|state| (state.msg_id, state.total, state.next));
+        let (msg_id, total, start) = match resume {
+            Some((msg_id, total, next)) => (msg_id, total, next),
+            None => {
+                let total = ferrox_core::hysteria::GECKO_MIN_CHUNKS
+                    + (entropy()
+                        % (ferrox_core::hysteria::GECKO_MAX_CHUNKS
+                            - ferrox_core::hysteria::GECKO_MIN_CHUNKS
+                            + 1) as u64) as usize;
+                let msg_id = self.msg.fetch_add(1, Ordering::Relaxed) as u8;
+                *fragment = Some(FragmentState {
+                    msg_id,
+                    total,
+                    next: 0,
+                    buf: buf.to_vec(),
+                    to,
+                });
+                (msg_id, total, 0)
+            }
+        };
         let mut pad = [0u8; GECKO_BUFFER];
         let mut frame = Unfilled::<GECKO_BUFFER>::new();
         let mut wire = Unfilled::<{ GECKO_BUFFER + SALAMANDER_SALT }>::new();
-        for idx in 0..total {
+        for idx in start..total {
             let (start, end) = ferrox_core::hysteria::gecko_chunk_range(buf.len(), idx, total)
                 .ok_or(invalid(std::io::ErrorKind::InvalidInput))?;
             let chunk = &buf[start..end];
@@ -3127,8 +3149,17 @@ impl Gecko {
                 .obfs
                 .seal_into(&frame.as_mut()[..written], wire.as_mut())
                 .ok_or(invalid(std::io::ErrorKind::InvalidInput))?;
-            self.send_wire(&wire.as_mut()[..sealed], to)?;
+            match self.send_wire(&wire.as_mut()[..sealed], to) {
+                Ok(0) => return Err(std::io::ErrorKind::WouldBlock.into()),
+                Ok(_) => {
+                    if let Some(state) = fragment.as_mut() {
+                        state.next = idx + 1;
+                    }
+                }
+                Err(error) => return Err(error),
+            }
         }
+        *fragment = None;
         Ok(buf.len())
     }
 

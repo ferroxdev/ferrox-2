@@ -219,6 +219,37 @@ impl PaddingWrite {
         }
     }
 
+    /// Drive a record already accepted before settling: a `Clear` only when no partial record remains.
+    fn settle(&mut self, writer: &mut dyn proxy::LaneWrite) -> Option<proxy::Settle> {
+        if self.lost {
+            return Some(proxy::Settle::Lost);
+        }
+        if self.pending.is_empty() {
+            return None;
+        }
+        let before = self.at;
+        match writer.push(&self.pending[self.at..]) {
+            proxy::Push::Took(n) => self.at += n,
+            proxy::Push::Parked => {}
+            proxy::Push::Lost => {
+                self.lost = true;
+                return Some(proxy::Settle::Lost);
+            }
+        }
+        if self.at < self.pending.len() {
+            return Some(if self.at > before {
+                proxy::Settle::Advanced
+            } else {
+                proxy::Settle::Parked
+            });
+        }
+        self.pending.clear();
+        self.at = 0;
+        self.input = 0;
+        self.written += 1;
+        None
+    }
+
     #[cfg(test)]
     fn write(&mut self, writer: &mut dyn proxy::LaneWrite, data: &[u8]) -> std::io::Result<usize> {
         let mut done = 0;
@@ -1027,21 +1058,30 @@ impl proxy::LaneWrite for NaiveStream {
     }
 
     fn settle(&mut self) -> proxy::Settle {
-        if self.inner.padded
-            && self
+        let mut writer = self
+            .inner
+            .writer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if self.inner.padded {
+            let mut padding = self
                 .inner
                 .write_padding
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .lost
-        {
-            return proxy::Settle::Lost;
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(outcome) = padding.settle(&mut **writer) {
+                return outcome;
+            }
         }
+        writer.settle()
+    }
+
+    fn progress(&mut self) -> bool {
         self.inner
             .writer
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .settle()
+            .progress()
     }
 
     fn wait_room(&mut self, turn: Duration) {
