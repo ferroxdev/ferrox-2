@@ -4,6 +4,10 @@
 
 `mode: mim` carries one MASQUE conversation inside another: the outer identity is the enrolled WARP one, the inner comes from `mimIdentity`/`mimIdentityFile` or `<identity>-masque-secondary.json`, and `mimOuter`/`mimInner` (or `AETHER_MIM_OUTER_PEER`/`AETHER_MIM_INNER_PEER`) name the hops. `mode: gool-classic` is the older form: the outer half is a WireGuard tunnel and the inner identity comes from `goolIdentity`/`goolIdentityFile` or `<identity>-secondary.json`; `wiwOuter`/`wiwInner` name the two edges, and with `scan` on each hop is verified with its own key and the inner sweep rejects the outer edge's IP. `WireGuardOut::udp_forwarder` moves the inner peer to a loopback socket and carries its datagrams through the outer WireGuard tunnel, reserving the WireGuard header's headroom; the inner MTU is capped at 1200. Its server side is an outer `wireguard` inbound whose freedom redirect carries the inner UDP flow to the inner `wireguard` listener (`wireguard_rides_inside_wireguard`).
 
+A `team`/`--team` name (or `AETHER_TEAM` when the flag is omitted) enrols a managed device instead. The name is normalised from a bare subdomain, a full `<team>.cloudflareaccess.com` domain or an enrolment URL, and the sign-in order is the reference's: a supplied JWT (`accessToken`/`--access-token`/`AETHER_ACCESS_TOKEN`, checked for shape and `exp`), then a service token (`accessClientId`+`accessClientSecret`/`--access-id`+`--access-secret`, read from the `CF_Authorization` cookie or the page's `token=`), then an emailed one-time code (`accessEmail`/`--access-email`, three attempts). The access flow follows up to ten redirects, keeps its cookies, resolves relative `Location`s, reads `action=` from the TOTP form, and takes the nonce from the verify reply's URL. One JWT is cached per process, so `--register all` asks once. The JWT is sent only on `POST /reg` as `CF-Access-Jwt-Assertion`; the enrollment, enable and read-back carry the device bearer alone. A team registration posts `key`, `install_id`, `fcm_token`, `tos`, `model`, `name`, `serial_number` and `locale`, with `name` and `serial_number` the 22-character install id, and no `key_type`, `tunnel_type` or `os_version`. The team identity is saved beside the personal one, `<base>-team-<team>` (or its slot siblings), unless `-o`/`--config`/`--identity`/`--out` names a path.
+
+`gateway`/`--gateway` sends HTTP and HTTPS through the organization's `config.services.http_proxy`, saved as `gatewayProxy` in the identity. For each 80/443 flow the tunnel opens the proxy, writes `CONNECT <authority> HTTP/1.1` with the reference's `WARP for Android` agent, waits up to 5 s for a complete head, and requires a 2xx before forwarding the client's buffered bytes; the first refusal, timeout, closed socket or malformed head retires the proxy for the life of the process and that flow goes straight through the tunnel. A saved proxy with `gateway` absent prints the address without using it; `gateway: true` with no published proxy says so and carries direct. Every other port, and every UDP flow, ignores the gateway.
+
 The identity comes from an inline `identity` block, a saved `identityFile`, or `register: true`, which registers once and saves into `identityFile`; a restart reuses the file and never creates a second device. A saved file is read back from the API before use: the peer, endpoint, reserved bytes and addresses are refreshed in place, so a device whose edge moved keeps working. `ferrox-app warp-register [--register masque|wg|gool|gool-classic|mim|all] ...` is the form, and `--noize`/`--no-profile-retry`/`--no-quic-v2` are copied into the outbound it prints. Without `--register` it registers one combined device (both halves), saves the identity owner-only (0600 on Unix), and writes the config.
 
 Registration is the three calls the pinned clients make: `POST /v0a4471/reg` with a fresh clamped Curve25519 key, `PATCH /reg/{id}` enrolling a P-256 SPKI for a MASQUE identity, and `PATCH /reg/{id}` with `{"warp_enabled":true}`. A WireGuard-only identity skips the enrollment and makes two calls. The API hosts are tried in order (`api.devices.cloudflare.com`, then `api.cloudflareclient.com`); a failure before the device exists moves to the next host, a failure after it does not retry the POST, so a flaky plane cannot mint two accounts. The enable call must answer 2xx; the identity is saved only once WARP is enabled. A read-back answering 401 or 410, or a 404 in Cloudflare's own error envelope, is a refusal of that identity, not an outage; a 404 page from a front that knows only the other API name is not, and the next name is tried. Any other failure keeps the saved identity and says it was not checked. `--api-address` moves where the API is dialled while the TLS name and HTTP `Host` stay the origin's: an IP, a bracketed IPv6, or a domain, with or without a port (443 when absent).
@@ -30,7 +34,7 @@ The WireGuard sweep starts from five seeds and samples the documented `/24`s, th
 
 The race asks `one.one.one.one` through each half's own tunnel DNS and takes the first `true`. A `false` does not end the race: the other half may still carry, and the wait runs to the 8 s deadline; two failures or a silent pair fall back to WireGuard. The choice is made once per outbound under one lock, so concurrent flows wait for the first flow's answer. `endpoint`, `mtu` (1280), `keepAlive` (25), `probe`, `probePort`, `dns`, `apiAddress` and a `masque` block override the WARP defaults, so the identity file is the whole config. In gool the inner endpoint is the forwarder's loopback socket and its MTU is `min(mtu, 1200)`; in gool-classic the same cap keeps the inner packet inside the outer hop; in mim the inner QUIC payload is capped by the outer MTU's budget.
 
-Against the references: ZeroNet's `warp.rs` races whole tunnels with a registry of keep-alive stacks and re-races on staleness; this races once per process and keeps the winner, because the carriers already reconnect. Aether keeps one TOML identity per transport and re-registers a refused one; the layout here is the same (base, `-masque`, `-secondary`, `-gool`) in JSON, because `ferrox-app` has no TOML reader, and the read-back is the same `GET /reg/{id}`. PattNG stages a renewal and keeps the old keys until the new ones answer; here that is the in-memory plan plus the temp-and-rename save. Removed: the second registration on a stale tunnel, the rejected identity saved for a later resume, and the async runtime — the race is two probe threads and a channel, and gool's forwarder is one thread per tunnel. Not removed: registration is still sequential HTTPS calls, the per-slot read-back is one more call per existing file, and the losing probe thread runs to its own timeout, detached not cancelled. Every scan candidate is IPv4; only `ironclad` sends HTTP, while the others trust a DNS answer; a cooldown lives for this startup, not across restarts; `stale` bounds discovery, not a running tunnel; exit-location gating is row 204. Gool registers the inner identity the same way (two calls, no MASQUE enrollment), rebuilds the inner peer's endpoint to the forwarder, and caps the inner MTU at 1200, but takes `goolPeer` or the identity's one endpoint instead of scanning and remembering the answer (row 198).
+Against the references: ZeroNet's `warp.rs` races whole tunnels with a registry of keep-alive stacks and re-races on staleness; this races once per process and keeps the winner, because the carriers already reconnect. Aether keeps one TOML identity per transport and re-registers a refused one; the layout here is the same (base, `-masque`, `-secondary`, `-gool`) in JSON, because `ferrox-app` has no TOML reader, and the read-back is the same `GET /reg/{id}`. PattNG stages a renewal and keeps the old keys until the new ones answer; here that is the in-memory plan plus the temp-and-rename save. Removed: the second registration on a stale tunnel, the rejected identity saved for a later resume, and the async runtime — the race is two probe threads and a channel, and gool's forwarder is one thread per tunnel. Not removed: registration is still sequential HTTPS calls, the per-slot read-back is one more call per existing file, and the losing probe thread runs to its own timeout, detached not cancelled. Every scan candidate is IPv4; only `ironclad` sends HTTP, while the others trust a DNS answer; a cooldown lives for this startup, not across restarts; `stale` bounds discovery, not a running tunnel; exit-location gating is row 204. Gool registers the inner identity the same way (two calls, no MASQUE enrollment), rebuilds the inner peer's endpoint to the forwarder, and caps the inner MTU at 1200, but takes `goolPeer` or the identity's one endpoint instead of scanning and remembering the answer (row 198). Aether's Zero Trust sign-in disables certificate verification; here the access and API planes verify against the system roots, and a service token is read from the cookie or the body the same way. Aether opens the gateway on its existing session; this hands the HTTP flow to the tunnel over one loopback pair per flow, so a hundred HTTP flows hold a hundred local pairs until they close, the same count a SOCKS accept already holds. The Aether pin has `test_enabled = false`, so `conformance.yml` has no Zero Trust flow to run; the unit checks are the seam instead.
 
 The checks are unit races rather than a network comparison: `noize::tests::six_wireguard_profiles_keep_six_shapes` and `four_masque_profiles_keep_four_shapes` count the distinct shapes, `a_scan_retries_the_fallback_profiles_once_each` pins the retry order, and `wireguard_signatures_are_sent_in_the_reference_order` and `masque_signatures_follow_the_reference_order` pin the datagram order. The carriers' own pages own their data-path copies; the profile adds no payload copy once the handshake is up.
 
@@ -38,7 +42,11 @@ The checks are unit races rather than a network comparison: `noize::tests::six_w
 
 ```mermaid
 graph TD
-    A["warp-register --register kind"] --> B["KeyKind -> slots"]
+    A["warp-register --register kind"] --> T{"team named?"}
+    T -- yes --> T1["normalize team<br/>sign in: token / service / email"]
+    T1 --> T2["base = &lt;base&gt;-team-&lt;team&gt;<br/>unless a path was given"]
+    T2 --> B["KeyKind -> slots"]
+    T -- no --> B
     B --> C["derive each slot path<br/>base / -masque / -secondary / -gool"]
     C --> D{"file exists?"}
     D -- no --> E["POST /reg<br/>curve25519 key"]
@@ -81,6 +89,11 @@ graph TD
     Q -- "first true" --> R["chosen lane (once)"]
     P -- "fixed" --> R
     R --> S["serve_tcp / serve_udp<br/>on the winning half"]
+    S --> GW{"gateway active<br/>and port 80/443?"}
+    GW -- yes --> GW1["loopback -> serve_lane(proxy)<br/>CONNECT authority"]
+    GW1 -- "2xx" --> GW2["forward prefix, relay"]
+    GW1 -- "refused / timeout" --> GWR["retire proxy<br/>direct tunnel egress"]
+    GW -- no --> GWR
 ```
 
 ## Ops
@@ -123,6 +136,12 @@ graph TD
 | noize-retry-candidates | 4 | noize::tests::a_scan_retries_the_fallback_profiles_once_each |
 | quic-v2-bait-bytes | 1200 | ferrox-app-masque::tests::the_bait_is_a_v2_versioned_long_header_of_the_minimum_size |
 | quic-v2-bait-answer | consumed | ferrox-app-masque::tests::the_bait_triggers_a_version_negotiation_from_a_v1_only_server |
+| team-code-attempts | 3 | zerotrust::tests::a_rejected_code_is_tried_three_times |
+| team-install-id-length | 22 | zerotrust::tests::an_install_id_is_twenty_two_alphanumerics |
+| team-registration-fields | 8 | warp::tests::a_team_registration_posts_the_managed_shape |
+| gateway-ports | 2 | warp::tests::only_http_and_https_use_the_gateway |
+| gateway-connect-status | 200 | warp::tests::a_connect_status_line_is_read_not_guessed |
+| gateway-proxy-key | gatewayProxy | warp::tests::a_team_identity_keeps_the_gateway_across_a_save |
 <!-- counts:end -->
 
 ## Syscalls
@@ -141,7 +160,7 @@ No local duration is quoted: every contributor dials through a VPN, so a local r
 What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md). The dial-side of the row is this page's own unit races, and the throughput comparison is the matrix's WARP rows (`warp-masque-*`, `warp-gool-*`, `warp-gool-classic-*`, `warp-mim-*`): ferrox's warp outbound against Aether in the same cell, which runs only in CI because everything beyond loopback is.
 
 <!-- scope:begin -->
-- paths: crates/ferrox-app/src/warp.rs, crates/ferrox-app/src/warp_scan.rs, crates/ferrox-app/src/noize.rs
+- paths: crates/ferrox-app/src/warp.rs, crates/ferrox-app/src/zerotrust.rs, crates/ferrox-app/src/warp_scan.rs, crates/ferrox-app/src/noize.rs
 - symbols: find_warp_outbound
 - scenarios: warp-masque, warp-gool, warp-gool-classic, warp-mim
 - engines: xray-core, aether, zeronet

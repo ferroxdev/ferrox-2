@@ -112,6 +112,7 @@ mod xhttp_h2;
 mod xhttp_h3;
 mod xmux;
 mod xray_pb;
+mod zerotrust;
 
 use ferrox_core::policy::UnsafeOptIn;
 use ferrox_core::transport::Support;
@@ -154,7 +155,10 @@ fn usage() -> ! {
     eprintln!("        [--mode auto|wireguard|masque|gool|gool-classic|mim] [--gool-classic] [--wiw-outer ADDR] [--wiw-inner ADDR] [--mim-outer ADDR] [--mim-inner ADDR] [--noize off|light|firewall|balanced|gfw|aggressive] [--no-profile-retry] [--no-quic-v2]");
     eprintln!("        [--fragment] [--fragment-size N|A-B] [--fragment-delay N|A-B] [--tls-ciphers LIST] [--tls-groups LIST] [--disable-grease] [--ech auto|BASE64] [--ech-dns URL] [--ech-domain NAME] [--masque-sni NAME]");
     eprintln!(
-        "                                with --register, make the kind's identities and print them; without it, register one device, save the identity (0600 on Unix), print the outbound"
+        "        [--team NAME] [--access-id ID] [--access-secret SECRET] [--access-token JWT] [--access-email ADDR] [--gateway]"
+    );
+    eprintln!(
+        "                                with --register, make the kind's identities and print them; without it, register one device, save the identity (0600 on Unix), print the outbound. --team enrols a managed device (name, subdomain of cloudflareaccess.com; sign-in from these flags or AETHER_* env), and --gateway sends http and https through the organization proxy"
     );
     eprintln!(
         "  ferrox-app browser-login --email ADDR --token-file PATH [--code CODE] [--no-open]"
