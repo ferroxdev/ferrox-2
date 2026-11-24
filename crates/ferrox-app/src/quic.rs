@@ -5197,6 +5197,39 @@ pub(crate) fn pump_stream(
     queue: &StreamQueue,
     buf: &mut [u8],
 ) {
+    let Ok(mut out) = queue.out.lock() else {
+        return;
+    };
+    while !out.is_empty() {
+        let (front, back) = out.as_slices();
+        let chunk = if front.is_empty() { back } else { front };
+        match conn.stream_send(id, chunk, false) {
+            Ok(0) | Err(quiche::Error::Done) => break,
+            Ok(n) => {
+                out.drain(..n);
+            }
+            Err(_) => {
+                queue.close();
+                return;
+            }
+        }
+    }
+    if out.is_empty() && queue.fin.load(Ordering::Relaxed) && !queue.fin_done.load(Ordering::Relaxed)
+    {
+        match conn.stream_send(id, &[], true) {
+            Ok(_) => {
+                queue.fin_done.store(true, Ordering::Relaxed);
+                queue.wake.notify_all();
+            }
+            Err(quiche::Error::Done) => {}
+            Err(_) => {
+                queue.close();
+                return;
+            }
+        }
+    }
+    drop(out);
+    queue.wake.notify_all();
     loop {
         let want = queue.free().min(buf.len());
         if want == 0 {
@@ -5220,39 +5253,16 @@ pub(crate) fn pump_stream(
                 }
             }
             Err(quiche::Error::Done) => break,
-            Err(_) => {
+            Err(quiche::Error::StreamReset(_)) => {
                 queue.finish();
                 break;
             }
-        }
-    }
-    let Ok(mut out) = queue.out.lock() else {
-        return;
-    };
-    while !out.is_empty() {
-        let (front, back) = out.as_slices();
-        let chunk = if front.is_empty() { back } else { front };
-        match conn.stream_send(id, chunk, false) {
-            Ok(0) | Err(quiche::Error::Done) => break,
-            Ok(n) => {
-                out.drain(..n);
-            }
             Err(_) => {
-                queue.close();
-                return;
+                if conn.is_closed() || conn.is_draining() {
+                    queue.close();
+                }
+                break;
             }
-        }
-    }
-    queue.wake.notify_all();
-    if out.is_empty() && queue.fin.load(Ordering::Relaxed) && !queue.fin_done.load(Ordering::Relaxed)
-    {
-        match conn.stream_send(id, &[], true) {
-            Ok(_) => {
-                queue.fin_done.store(true, Ordering::Relaxed);
-                queue.wake.notify_all();
-            }
-            Err(quiche::Error::Done) => {}
-            Err(_) => queue.close(),
         }
     }
 }
