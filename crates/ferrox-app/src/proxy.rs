@@ -3350,6 +3350,9 @@ pub(crate) struct Lane {
     source: Option<SendThrough>,
     sockopts: Option<Arc<crate::sockopt::SocketOptions>>,
     strategy: Option<FreedomDomain>,
+    /// The group hop `device_dial` already took, so the fallback starts where `serve_connect_at`
+    /// would have after resolving that group itself.
+    depth: u8,
 }
 
 impl Lane {
@@ -28720,11 +28723,11 @@ pub(crate) fn serve_device_flow(
 ) -> std::io::Result<()> {
     if let Some(lane) = carried {
         let _settings = lane.enter();
-        return serve_lane(client, dest, &lane.out, lane.tag.as_deref());
+        return serve_lane(client, dest, &lane.out, lane.tag.as_deref(), lane.depth);
     }
     let (dial, picked, tag) = sniff_lane(out, dest, &client, None, None);
     let dest = dial.as_ref().unwrap_or(dest);
-    serve_lane(client, dest, &picked, tag.as_deref())
+    serve_lane(client, dest, &picked, tag.as_deref(), 0)
 }
 
 fn serve_lane(
@@ -28732,9 +28735,10 @@ fn serve_lane(
     dest: &Destination,
     lane: &Outbound,
     tag: Option<&str>,
+    depth: u8,
 ) -> std::io::Result<()> {
     let ((), dial_report) = observe_dial(|| {
-        serve_connect(
+        serve_connect_at(
             client,
             lane,
             dest,
@@ -28742,6 +28746,7 @@ fn serve_lane(
             &[],
             tag,
             FlowFacts::default(),
+            depth,
         );
     });
     match dial_report {
@@ -28792,9 +28797,9 @@ pub(crate) fn device_dial(out: &Outbound) -> crate::tun::Dial {
                 None => crate::tun::DialOutcome::Refused,
             };
         }
-        let (lane, tag) = match front_group_lane(&lane) {
-            Some((member, leaf)) => (member, Some(leaf)),
-            None => (lane, tag.map(std::borrow::Cow::into_owned)),
+        let (lane, tag, depth) = match front_group_lane(&lane) {
+            Some((member, leaf)) => (member, Some(leaf), 1),
+            None => (lane, tag.map(std::borrow::Cow::into_owned), 0),
         };
         crate::tun::DialOutcome::Fallback(Lane {
             out: std::sync::Arc::new(lane),
@@ -28802,6 +28807,7 @@ pub(crate) fn device_dial(out: &Outbound) -> crate::tun::Dial {
             source: SEND_THROUGH.with(std::cell::Cell::take),
             sockopts: DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take()),
             strategy: TARGET_STRATEGY.with(std::cell::Cell::take),
+            depth,
         })
     })
 }
