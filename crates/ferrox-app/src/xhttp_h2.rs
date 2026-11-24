@@ -373,10 +373,11 @@ impl<'a> DataBatch<'a> {
         heads: &[[u8; 9]; DATA_FRAMES_PER_WRITE],
         included: usize,
     ) -> bool {
-        let max = *conn
+        let max_frame = conn
             .max_frame
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        let max = *max_frame;
         let mut capped = [[0u8; 9]; DATA_FRAMES_PER_WRITE];
         let mut take = [0usize; DATA_FRAMES_PER_WRITE];
         for at in 0..included {
@@ -413,7 +414,7 @@ impl<'a> DataBatch<'a> {
             return false;
         }
         drop(write);
-        drop(max);
+        drop(max_frame);
         let mut new_heads = self.heads;
         let mut new_bodies = self.bodies;
         let mut new_counts = self.counts;

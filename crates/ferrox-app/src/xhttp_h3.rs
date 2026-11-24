@@ -1898,7 +1898,7 @@ fn drain_stream(conn: &mut QuicheConnection, id: u64) {
 
 enum EncoderHead {
     Pending,
-    Capacity(u64),
+    Capacity,
     Invalid,
 }
 
@@ -1918,7 +1918,7 @@ fn read_qpack_capacity(conn: &mut QuicheConnection, id: u64, prefix: &mut Vec<u8
             }
             let mut value = u64::from(first & 0x1f);
             if value < 0x1f {
-                return EncoderHead::Capacity(value);
+                return EncoderHead::Capacity;
             }
             let mut shift = 0u32;
             for byte in &prefix[1..] {
@@ -1927,7 +1927,7 @@ fn read_qpack_capacity(conn: &mut QuicheConnection, id: u64, prefix: &mut Vec<u8
                 }
                 value = value.saturating_add(u64::from(byte & 0x7f) << shift);
                 if byte & 0x80 == 0 {
-                    return EncoderHead::Capacity(value);
+                    return EncoderHead::Capacity;
                 }
                 shift += 7;
             }
@@ -1956,7 +1956,7 @@ fn check_encoder_capacity(
     }
     match read_qpack_capacity(conn, id, &mut control.encoder_prefix) {
         EncoderHead::Pending => EncoderCheck::Pending,
-        EncoderHead::Capacity(_) | EncoderHead::Invalid => {
+        EncoderHead::Capacity | EncoderHead::Invalid => {
             let _ = conn.close(
                 true,
                 QPACK_ENCODER_STREAM_ERROR,
