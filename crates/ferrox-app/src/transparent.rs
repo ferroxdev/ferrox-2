@@ -15,6 +15,20 @@ pub(crate) const REDIRECT: bool = cfg!(any(
 /// Whether a transparent listener can receive traffic addressed to another host.
 pub(crate) const TPROXY: bool = cfg!(any(target_os = "linux", target_os = "freebsd"));
 
+/// Whether a transparent listener can read a datagram's original destination and answer from it.
+pub(crate) const UDP: bool = cfg!(target_os = "linux");
+
+/// Whether a redirect lookup can open the kernel's NAT table, which root gates on macOS and FreeBSD.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+pub(crate) fn redirect_ready() -> bool {
+    std::fs::File::open("/dev/pf").is_ok()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+pub(crate) const fn redirect_ready() -> bool {
+    true
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{
     bind_udp, original_destination, receive_original, reply_socket, set_transparent,

@@ -74,6 +74,6 @@ graph TD
 
 <!-- scope:begin -->
 - paths: crates/ferrox-app/src/singmux.rs
-- symbols: singmux, serve_singmux_tunnel, spawn_singmux_halves, spawn_singmux_connection, tcp_pool, udp_pool, mux_pool_downlink, PooledFlow, PooledReplies, relay_pool_flow, Mux
+- symbols: singmux, serve_singmux_tunnel, spawn_singmux_halves, serve_direct_singmux_tunnel, spawn_direct_singmux_connection, tcp_pool, udp_pool, mux_pool_downlink, PooledFlow, PooledReplies, relay_pool_flow, Mux
 - go: ./common/mux/...
 <!-- scope:end -->
