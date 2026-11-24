@@ -637,19 +637,13 @@ impl Fragment {
     }
 
     /// Retain the SNI records after a deferred park, with the waits that follow each one.
-    fn retain_sni_after(
-        &mut self,
-        p: &[u8],
-        cuts: &[usize],
-        start: usize,
-        record_len: usize,
-    ) {
+    fn retain_sni_after(&mut self, p: &[u8], cuts: &[usize], start: usize, record_len: usize) {
         let mut bytes = Vec::new();
         let mut parks = Vec::new();
         let mut from = if start == 0 { HEADER } else { cuts[start - 1] };
         for (segment, to) in cuts.iter().enumerate().skip(start) {
-            let wait = (segment + 1 < cuts.len())
-                .then(|| self.delay_at(segment).pick_from(&mut self.ent));
+            let wait =
+                (segment + 1 < cuts.len()).then(|| self.delay_at(segment).pick_from(&mut self.ent));
             bytes.extend_from_slice(&head_of(p, to - from));
             bytes.extend_from_slice(&p[from..*to]);
             if let Some(wait) = wait {

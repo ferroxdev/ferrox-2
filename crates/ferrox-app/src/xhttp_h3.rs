@@ -2104,14 +2104,8 @@ fn h3_control_goaway(
                 }
             }
             if Some(id) != control.id {
-                if Some(id) == control.decoder
-                    && !check_decoder_stream(conn, control, id)
-                {
-                    let _ = conn.close(
-                        true,
-                        QPACK_DECODER_STREAM_ERROR,
-                        b"qpack decoder input",
-                    );
+                if Some(id) == control.decoder && !check_decoder_stream(conn, control, id) {
+                    let _ = conn.close(true, QPACK_DECODER_STREAM_ERROR, b"qpack decoder input");
                     return None;
                 }
                 match check_encoder_capacity(conn, control, id) {

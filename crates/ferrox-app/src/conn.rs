@@ -1364,7 +1364,9 @@ impl Connection {
             }
         }
         #[cfg(windows)]
-        let _mode = READY_MODE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _mode = READY_MODE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.set_nonblocking(true)?;
         let _ready = ferrox_core::finalmask::ready_write();
         let mut total = 0;
@@ -1416,7 +1418,9 @@ impl Connection {
         if matches!(self, Connection::Masked(masked) if !masked.is_plain() && masked.xmc.is_none())
         {
             #[cfg(windows)]
-            let _mode = READY_MODE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _mode = READY_MODE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Err(error) = self.set_nonblocking(true) {
                 return (0, Err(error));
             }
