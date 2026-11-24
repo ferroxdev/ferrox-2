@@ -1405,13 +1405,14 @@ fn authenticate(
                 break;
             }
             Ok((n, _)) => {
-                inbound.auth_buf.extend_from_slice(&room.as_mut()[..n]);
+                if !keep_chunk(&mut inbound.auth_buf, &room.as_mut()[..n]) {
+                    let _ = conn.close(false, 1, b"protocol error");
+                    crate::quic::flush_egress(conn, sock);
+                    return None;
+                }
             }
             Err(_) => break,
         }
-    }
-    if inbound.auth_buf.len() > HEAD_CAP {
-        return None;
     }
     let hello = match wire::decode_client_hello(&inbound.auth_buf) {
         Ok((hello, _)) => hello,
@@ -1432,6 +1433,16 @@ fn authenticate(
         return None;
     }
     Some(())
+}
+
+/// Append one hello chunk; a hello past `HEAD_CAP` is refused and what was kept is dropped, so a peer cannot grow the retained buffer past the cap one chunk at a time.
+fn keep_chunk(buf: &mut Vec<u8>, chunk: &[u8]) -> bool {
+    if buf.len() + chunk.len() > HEAD_CAP {
+        *buf = Vec::new();
+        return false;
+    }
+    buf.extend_from_slice(chunk);
+    true
 }
 
 struct Router<'a> {
@@ -1780,6 +1791,26 @@ fn route_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hello_chunk_is_kept_to_the_cap_and_a_late_one_is_dropped() {
+        let mut buf = Vec::new();
+        let almost = vec![1u8; HEAD_CAP - 1];
+        assert!(keep_chunk(&mut buf, &almost));
+        assert!(keep_chunk(&mut buf, &[2u8]));
+        assert_eq!(buf.len(), HEAD_CAP, "a hello of exactly the cap is kept");
+        assert!(
+            !keep_chunk(&mut buf, &[3u8]),
+            "a hello past the cap is refused"
+        );
+        assert!(buf.is_empty(), "the refused hello leaves no buffer behind");
+        let over = vec![4u8; HEAD_CAP + 1];
+        assert!(
+            !keep_chunk(&mut buf, &over),
+            "one chunk past the cap is refused"
+        );
+        assert_eq!(buf.len(), 0);
+    }
 
     #[test]
     fn a_v1_session_carries_a_tcp_echo() {

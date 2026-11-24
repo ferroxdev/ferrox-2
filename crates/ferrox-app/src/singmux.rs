@@ -3076,8 +3076,27 @@ mod tests {
         }
     }
 
+    struct SliceWrite {
+        written: Arc<Mutex<Vec<u8>>>,
+        writes: Arc<AtomicUsize>,
+        flushes: Arc<AtomicUsize>,
+    }
+
+    impl Write for SliceWrite {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            self.written.lock().expect("tap").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
     #[test]
-    fn a_frame_reaches_the_carrier_in_one_vector() {
+    fn a_frame_reaches_a_vectored_carrier_in_one_call() {
         let written = Arc::new(Mutex::new(Vec::new()));
         let writes = Arc::new(AtomicUsize::new(0));
         let vectors = Arc::new(AtomicUsize::new(0));
@@ -3119,6 +3138,52 @@ mod tests {
             writes.load(Ordering::Relaxed),
             0,
             "a vector-capable carrier was handed one slice at a time"
+        );
+        assert_eq!(flushes.load(Ordering::Relaxed), 1);
+        release.send(()).expect("release");
+        assert_eq!(
+            reader_done.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(()),
+            "the reader thread ends with the test"
+        );
+
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let (entered, reading) = channel();
+        let (release, wake) = channel();
+        let (done, reader_done) = channel();
+        let session = Inner::start(
+            Protocol::Smux,
+            Role::Client,
+            Box::new(StoppingReader {
+                entered,
+                wake,
+                done,
+            }),
+            Box::new(SliceWrite {
+                written: Arc::clone(&written),
+                writes: Arc::clone(&writes),
+                flushes: Arc::clone(&flushes),
+            }),
+            Arc::new(|| {}),
+        )
+        .expect("session");
+        assert_eq!(
+            reading.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(()),
+            "the reader is inside read before the frame is written"
+        );
+        assert!(session.write_frame(&[1, 2, 3], &[4, 5]));
+        assert_eq!(
+            *written.lock().expect("tap"),
+            [1, 2, 3, 4, 5],
+            "both slices arrive in order through a writer with the trait's own vector"
+        );
+        assert_eq!(
+            writes.load(Ordering::Relaxed),
+            2,
+            "a writer that takes only the first slice is handed the head and the body apart"
         );
         assert_eq!(flushes.load(Ordering::Relaxed), 1);
         release.send(()).expect("release");

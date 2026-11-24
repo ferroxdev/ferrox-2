@@ -140,6 +140,7 @@ graph TD
 | waiting-list-scans-per-unqueued-datagram | 0 | ferrox-app-hysteria_v1::tests::a_datagram_that_queued_nothing_does_not_walk_the_waiting_lists |
 | waiting-list-flows-per-queued-datagram | 1 | ferrox-app-hysteria_v1::tests::a_datagram_that_queued_nothing_does_not_walk_the_waiting_lists |
 | queue-buffer-allocations-after-the-first | 0 | ferrox-app-hysteria_v1::tests::a_drained_queue_keeps_its_buffer_for_the_next_datagram |
+| hello-cap-bytes | 16384 | ferrox-app-hysteria_v1::tests::a_hello_chunk_is_kept_to_the_cap_and_a_late_one_is_dropped |
 <!-- counts:end -->
 
 ## Ops
@@ -202,6 +203,7 @@ Up-1 clears both legs: 455 against 368 MiB/s behind the xray server and 694 agai
 
 - **The Initial route walk and the per-packet route probes.** `Router` keeps `by_client_cid` and `by_initial_dcid` reverse maps filled on `accept` and dropped in `idle`, so `initial_route` is a hash probe (`a_retransmitted_initial_reuses_its_lane_without_a_second_route`, `an_idle_reap_drops_a_closed_routes_reverse_names`). `Router::drive` looks the route up once and carries `&mut Inbound` through the turn; an unauthenticated lane returns before the datagram loop. `Driver::claim` reports whether the stream is new, retiring the served set beside `wakes` (`a_stream_is_claimed_by_the_turn_that_serves_it`). `drive` also reports whether a route carried the packet, so the serve turn hashes the DCID once on a hit. One route probe per packet, one claim probe per readable stream, quiche's own `readable()` walk and a cloned CID per route remain; an invalid packet naming two routes prefers the DCID.
 
+- **The v1 hello buffer's bound is checked per chunk, not after the drain.** `keep_chunk` refuses the chunk that would take stream 0's hello past `HEAD_CAP` (16 KiB), closes with `protocol error` and drops what was kept, so an unauthenticated peer cannot grow the retained hello one chunk at a time; a hello of exactly the cap still decodes (`hello-cap-bytes` 16384, `a_hello_chunk_is_kept_to_the_cap_and_a_late_one_is_dropped`).
 - **`idle`'s two passes and the per-packet SETTINGS drain.** One `retain` pass with one lock per route, and a `settings_done` latch retires the per-packet `stream_recv` on stream 2.
 
 - **The turn's one datagram, the narrow masked rooms and the server's per-datagram receive.** A turn takes the queue behind the datagram it waited for: one `recvmmsg` batch of `RECV_SLOTS` (16) on the wire's own read, or 16 single reads behind a 1 ms tail where a mask or relay frame rewrites each datagram (`datagrams-per-turn-witnessed` 16, `a_turn_takes_the_datagrams_queued_behind_its_first`). `pump` and the v1 `serve_loop` use `RECV_ROOM`, so `masked_read` no longer copies every plaintext datagram back. On Linux the server turn is one `recv_batch` of 16, each datagram routed from the batch's own slot; an obfuscated lane keeps the per-datagram `recv_from` and the 100 ms `ROUTE_POLL`. Each datagram still pays one `conn.recv` and quiche processing; a full batch that runs dry pays the tail arm; a masked lane is still one `recv_from` per datagram.

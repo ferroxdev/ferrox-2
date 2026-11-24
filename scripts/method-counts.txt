@@ -219,7 +219,7 @@ mux-variants packet-addr-protocols-round-trip 3 ferrox-app-singmux::tests::packe
 mux-variants carrier-protocols-round-trip 3 ferrox-app-proxy::tests::a_vless_singmux_carries_a_tcp_stream_on_each_protocol
 mux-variants absent-protocol-keeps-mux-cool 1 ferrox-app-proxy::tests::an_absent_mux_protocol_keeps_mux_cool_and_an_explicit_one_selects_singmux
 mux-variants frame-buffer-allocations-per-frame 0 ferrox-app-singmux::tests::a_mux_frame_is_read_into_the_sessions_own_buffer
-mux-variants carrier-writes-per-frame 1 ferrox-app-singmux::tests::a_frame_reaches_the_carrier_in_one_vector
+mux-variants carrier-writes-per-frame 1 ferrox-app-singmux::tests::a_frame_reaches_a_vectored_carrier_in_one_call
 mux-variants udp-packet-buffer-allocations-per-packet 0 ferrox-app-singmux::tests::a_mux_udp_packet_is_read_into_the_sessions_own_buffer
 
 # --- carriers ---------------------------------------------------------------
@@ -1314,6 +1314,7 @@ carrier-hysteria evicted-association-hint-answers 0 ferrox-app-hysteria_v1::test
 carrier-hysteria waiting-list-scans-per-unqueued-datagram 0 ferrox-app-hysteria_v1::tests::a_datagram_that_queued_nothing_does_not_walk_the_waiting_lists
 carrier-hysteria waiting-list-flows-per-queued-datagram 1 ferrox-app-hysteria_v1::tests::a_datagram_that_queued_nothing_does_not_walk_the_waiting_lists
 carrier-hysteria queue-buffer-allocations-after-the-first 0 ferrox-app-hysteria_v1::tests::a_drained_queue_keeps_its_buffer_for_the_next_datagram
+carrier-hysteria hello-cap-bytes 16384 ferrox-app-hysteria_v1::tests::a_hello_chunk_is_kept_to_the_cap_and_a_late_one_is_dropped
 socks reply-head-allocations-per-reply-datagram 0 ferrox-app-proxy::tests::a_reply_head_is_written_without_a_buffer
 socks reply-ns-per-reply 2.3 .github/workflows/bench.yml
 shadowsocks-2022 udp-session-body-key-derivations-per-session 1 ferrox-app-shadowsocks2022::tests::a_datagram_costs_one_derivation_one_clock_and_one_window

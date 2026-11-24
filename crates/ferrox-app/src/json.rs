@@ -773,13 +773,21 @@ pub(crate) fn strip_jsonc(text: &str) -> std::borrow::Cow<'_, str> {
 pub(crate) fn order_by_priority(value: &mut Json) {
     match value {
         Json::Arr(items) => {
-            if items.iter().any(|item| priority(item).is_some()) {
-                // Each element's key is read once, and the stable sort no longer walks every object's keys on every comparison.
-                let mut order: Vec<(f64, usize)> = items
-                    .iter()
-                    .enumerate()
-                    .map(|(at, item)| (priority(item).unwrap_or(0.0), at))
-                    .collect();
+            // One walk reads every key: an unmarked element costs nothing, and the recording starts at the first marker, whose predecessors are all unmarked and therefore key 0.
+            let mut order: Vec<(f64, usize)> = Vec::new();
+            for (at, item) in items.iter().enumerate() {
+                let key = priority(item);
+                if order.is_empty() {
+                    let Some(key) = key else { continue };
+                    order.reserve(items.len());
+                    order.extend((0..at).map(|before| (0.0, before)));
+                    order.push((key, at));
+                } else {
+                    order.push((key.unwrap_or(0.0), at));
+                }
+            }
+            if !order.is_empty() {
+                // The stable sort keeps file order among equal keys, and the drain moves each element once.
                 order.sort_by(|left, right| {
                     left.0
                         .partial_cmp(&right.0)
@@ -1481,6 +1489,8 @@ mod tests {
             r#"{"x":[1,2,3] # tail"#,
             "[*#b29/,\r:}1{*9b1\r ,2/\",\r2'\r\r/#.\"b '\\*.:\r,9 '1[],}'a'b/0/900\r{[*}0\r1}.\"",
             r#"{"a":1\,}"#,
+            r#"{"a":"\n",}"#,
+            r#"{/*x*/"a":"\n","b":",}"}"#,
             "\\\"a\\",
             r#"{"a":[1,\/* x */]}"#,
         ];
@@ -1552,6 +1562,96 @@ mod tests {
             Some("a")
         );
         assert!(rules.iter().all(|rule| rule.get("_priority").is_none()));
+    }
+
+    fn reference_order(mut items: Vec<Json>) -> Vec<Json> {
+        let mut order: Vec<(f64, usize)> = items
+            .iter()
+            .enumerate()
+            .map(|(at, item)| (priority(item).unwrap_or(0.0), at))
+            .collect();
+        order.sort_by(|left, right| {
+            left.0
+                .partial_cmp(&right.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut slots: Vec<Option<Json>> = items.drain(..).map(Some).collect();
+        for &(_, at) in &order {
+            items.push(slots[at].take().expect("each element moves once"));
+        }
+        items
+    }
+
+    fn tagged(items: &[Json]) -> Vec<i64> {
+        items
+            .iter()
+            .map(|item| item.get("tag").and_then(Json::as_i64).expect("tag"))
+            .collect()
+    }
+
+    #[test]
+    fn the_priority_order_is_the_reference_sort_on_every_shape() {
+        let keys = [
+            None,
+            Some(-2.0),
+            Some(-1.0),
+            Some(0.0),
+            Some(0.0),
+            Some(0.5),
+            Some(1.0),
+            Some(1.0),
+            Some(2.0),
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for len in 0..12u32 {
+            for round in 0..6 {
+                let items: Vec<Json> = (0..len)
+                    .map(|tag| {
+                        let mut pairs = vec![("tag".to_owned(), Json::Num(f64::from(tag)))];
+                        let key = if round == 0 {
+                            None
+                        } else {
+                            keys[(next() % keys.len() as u64) as usize]
+                        };
+                        if let Some(key) = key {
+                            pairs.push(("_priority".to_owned(), Json::Num(key)));
+                        }
+                        Json::Obj(pairs)
+                    })
+                    .collect();
+                let expected = tagged(&reference_order(items.clone()));
+                let mut shaped = Json::Arr(items);
+                order_by_priority(&mut shaped);
+                let Json::Arr(ordered) = &shaped else {
+                    panic!("an array stays an array")
+                };
+                assert_eq!(tagged(ordered), expected, "length {len}, round {round}");
+                assert!(
+                    ordered.iter().all(|item| item.get("_priority").is_none()),
+                    "every marker is dropped"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_unmarked_array_orders_without_the_heap() {
+        let mut doc = Json::Obj(vec![(
+            "rules".to_owned(),
+            Json::Arr(vec![
+                Json::Obj(vec![("outboundTag".to_owned(), Json::Str("a".to_owned()))]),
+                Json::Obj(vec![("outboundTag".to_owned(), Json::Str("b".to_owned()))]),
+            ]),
+        )]);
+        let ((), counts) = ferrox_core::alloc_count::measure(|| order_by_priority(&mut doc));
+        assert_eq!(counts.allocs, 0, "an array with no marker allocated");
+        assert_eq!(counts.bytes, 0, "an array with no marker copied");
     }
 
     #[test]
