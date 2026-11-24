@@ -1994,6 +1994,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_ready_drain_does_not_wait_for_a_gathered_park() {
+        let sni = Fragment::new(
+            0,
+            1,
+            vec![range(3, 3)],
+            vec![range(1000, 1000)],
+            range(0, 0),
+        )
+        .expect("valid")
+        .sni();
+        let mut chain = Chain::default();
+        chain.push(sni);
+        let mut wire = RefuseOnce {
+            wire: Wire::default(),
+            left: 1,
+        };
+        let p = client_hello("retained.example");
+        assert_eq!(chain.write(&mut wire, &p).expect("writes"), p.len());
+        let before = sleeps();
+        chain.flush_ready(&mut wire).expect("drains");
+        assert_eq!(
+            sleeps(),
+            before,
+            "a settle slept for a gathered park it cannot honour"
+        );
+    }
+
     /// A wire that refuses the first write with `WouldBlock`, so a stage below retains it.
     struct RefuseOnce {
         wire: Wire,

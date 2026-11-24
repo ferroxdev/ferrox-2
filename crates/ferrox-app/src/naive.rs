@@ -2178,7 +2178,8 @@ impl NaiveOut {
         tls.alpn = Arc::from(vec![b"h2".to_vec()]);
         let session = proxy::dial_tls_session(&server, &tls, None)?;
         let raw = Arc::new(session.get_ref().try_clone().ok()?);
-        let (reader, writer) = proxy::tls_client_halves(session)?;
+        let (reader, mut writer) = proxy::tls_client_halves(session)?;
+        writer.arm_write(crate::budgets::RELAY_POLL);
         H2Client::new_windowed(
             reader,
             BoxedWrite::new(writer),
@@ -2285,6 +2286,14 @@ impl NaiveOut {
                 self.h3_inflight.fetch_sub(1, Ordering::Relaxed);
                 drop(published);
                 self.h3_ready.notify_all();
+                if client.is_none()
+                    && existing.is_none()
+                    && self.h3_inflight.load(Ordering::Relaxed) > 0
+                    && Instant::now() < deadline
+                {
+                    pool = self.h3.lock().ok()?;
+                    continue;
+                }
                 return client.or(existing);
             }
             if !pool.is_empty() {

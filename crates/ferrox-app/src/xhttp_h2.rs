@@ -2800,10 +2800,8 @@ impl H2Conn {
             if attached {
                 return;
             }
-            let readable = self.raw.as_ref().is_some_and(|raw| {
-                matches!(raw.wait_readable(std::time::Duration::ZERO), Ok(true))
-            });
-            if !readable || !matches!(self.pump_read(|| false, true, None), Pumped::Alive) {
+            let deadline = Some(std::time::Instant::now() + crate::budgets::RELAY_POLL);
+            if !matches!(self.pump_read(|| false, true, deadline), Pumped::Alive) {
                 return;
             }
         }
@@ -3105,7 +3103,7 @@ impl H2Client {
     /// the pool a healthy transport while a `GOAWAY` it carries still retires it.
     #[cfg(any(unix, windows))]
     pub(crate) fn settle(&self) {
-        if self.pending() {
+        if self.pending() || !self.has_capacity() {
             self.conn.settle_idle();
         }
     }
@@ -4612,6 +4610,28 @@ mod tests {
             client.next.load(Ordering::SeqCst),
             1,
             "a capacity refusal does not consume a stream id or send CONNECT"
+        );
+    }
+
+    #[test]
+    fn an_idle_settle_pumps_a_capacity_increase_buffered_beside_a_zero() {
+        let mut frames = Vec::new();
+        let mut zero = Vec::new();
+        zero.extend_from_slice(&S_MAX_CONCURRENT.to_be_bytes());
+        zero.extend_from_slice(&0u32.to_be_bytes());
+        write_frame(&mut frames, T_SETTINGS, 0, 0, &zero);
+        let mut open = Vec::new();
+        open.extend_from_slice(&S_MAX_CONCURRENT.to_be_bytes());
+        open.extend_from_slice(&2u32.to_be_bytes());
+        write_frame(&mut frames, T_SETTINGS, 0, 0, &open);
+        let client =
+            super::H2Client::new(std::io::Cursor::new(frames), NullWrite, None).expect("client");
+        client.conn.peer_max.store(0, Ordering::SeqCst);
+        assert!(!client.has_capacity());
+        client.settle();
+        assert!(
+            client.has_capacity(),
+            "the increase buffered behind the zero limit was not pumped"
         );
     }
 

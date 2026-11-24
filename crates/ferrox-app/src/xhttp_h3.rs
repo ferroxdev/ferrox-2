@@ -266,6 +266,12 @@ impl H3Reader {
         loop {
             self.parse()?;
             if let Some(status) = self.status {
+                if self
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+                }
                 self.deadline = None;
                 return Ok(Some((status, self.padding)));
             }
@@ -1287,6 +1293,9 @@ impl ClientStream {
             let Ok(mut conn) = self.conn.lock() else {
                 return Err(std::io::Error::other("h3 connection lock poisoned"));
             };
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::other("h3 stream send timed out"));
+            }
             if self.owner.dead.load(Ordering::Relaxed)
                 || self.owner.rejected(self.id)
                 || (sent == 0 && self.owner.draining.load(Ordering::Relaxed))

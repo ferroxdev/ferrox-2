@@ -1291,7 +1291,7 @@ impl<'a> Gather<'a> {
     /// Waits out a paced tail for the blocking writer: the framed relay never takes this path, so the
     /// wait costs a lane only when a caller asked for every byte before it returned.
     fn settle_blocking(shared: &Shared) -> bool {
-        let deadline = Instant::now() + crate::budgets::relay_stall();
+        let mut deadline = Instant::now() + crate::budgets::relay_stall();
         loop {
             let settled = match shared.stream.lock() {
                 Ok(mut stream) => stream.settle(),
@@ -1300,7 +1300,7 @@ impl<'a> Gather<'a> {
             match settled {
                 Settle::Clear => return true,
                 Settle::Lost => return false,
-                Settle::Advanced => {}
+                Settle::Advanced => deadline = Instant::now() + crate::budgets::relay_stall(),
                 Settle::Parked => {
                     if Instant::now() >= deadline {
                         return false;
@@ -1314,13 +1314,12 @@ impl<'a> Gather<'a> {
     /// The same offer for a caller that may wait: a refused batch drains the paced tail and takes
     /// its window again before the next try.
     fn flush_blocking(&mut self, shared: &Arc<Shared>) -> bool {
-        let deadline = Instant::now() + crate::budgets::relay_stall();
         loop {
             match self.flush(shared) {
                 Accepted::All => return true,
                 Accepted::Lost => return false,
                 Accepted::Full => {
-                    if Instant::now() >= deadline || !Self::settle_blocking(shared) {
+                    if !Self::settle_blocking(shared) {
                         return false;
                     }
                     if self.credit > 0 && !take_window(shared, self.credit, true) {
