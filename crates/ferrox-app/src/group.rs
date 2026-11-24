@@ -17,7 +17,31 @@ const DEFAULT_TOLERANCE: u16 = 50;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 type ResolvedMember = Option<(String, Outbound, Option<u64>)>;
-type ResolvedMembers = HashMap<usize, ResolvedMember>;
+
+/// The nested url-tests one sweep has already resolved. One nested group is the common case, so the
+/// first entry lives inline and only a second one reaches for a map.
+#[derive(Default)]
+struct ResolvedMembers {
+    first: Option<(usize, ResolvedMember)>,
+    rest: Option<HashMap<usize, ResolvedMember>>,
+}
+
+impl ResolvedMembers {
+    fn get(&self, key: usize) -> Option<&ResolvedMember> {
+        match &self.first {
+            Some((at, done)) if *at == key => Some(done),
+            _ => self.rest.as_ref()?.get(&key),
+        }
+    }
+
+    fn insert(&mut self, key: usize, done: ResolvedMember) {
+        if self.first.is_none() {
+            self.first = Some((key, done));
+            return;
+        }
+        self.rest.get_or_insert_with(HashMap::new).insert(key, done);
+    }
+}
 type Fastest<'a> = (u16, usize, Cow<'a, str>, Outbound, u64);
 type Stored<'a> = (usize, Cow<'a, str>, Outbound, u64, Option<u16>);
 
@@ -199,7 +223,7 @@ impl Group {
         route: &'a RouteShared,
         network: Network,
     ) -> Option<(Cow<'a, str>, Outbound)> {
-        self.resolve_with(route, network, &mut HashMap::new(), None)
+        self.resolve_with(route, network, &mut ResolvedMembers::default(), None)
             .map(|(leaf, out, _)| (leaf, out))
     }
 
@@ -412,7 +436,7 @@ fn resolve_member<'a>(
         // A nested group's leaf crosses this call's `Arc` clone, so it is owned; a top-level member borrows.
         Outbound::Group(group) if group.kind == Kind::UrlTest => {
             let key = Arc::as_ptr(group) as usize;
-            if let Some(done) = resolved.get(&key) {
+            if let Some(done) = resolved.get(key) {
                 return done
                     .clone()
                     .map(|(leaf, out, revision)| (Cow::Owned(leaf), out, revision));

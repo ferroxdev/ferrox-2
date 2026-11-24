@@ -85102,10 +85102,10 @@ end
         );
     }
 
-    /// A fallback dial adds nothing to a nested tag: the slot keeps the member's position and
-    /// reuses the stored member rather than resolving it a second time.
+    /// A nested dial owns the tag it returns and the sweep's one cached copy, and a fallback dial
+    /// adds nothing: the slot keeps the member's position and reuses the stored member.
     #[test]
-    fn a_fallback_dial_adds_no_allocation_to_a_nested_tag() {
+    fn a_nested_dial_allocates_only_its_tag_and_the_sweeps_copy() {
         let shared = group_route(
             r#"{"outbounds":[
                 {"tag":"a","protocol":"freedom"},
@@ -85129,6 +85129,11 @@ end
         group.record("a", 10);
         let (picked, takeover) = ferrox_core::alloc_count::measure(dial);
         assert_eq!(picked.0, "a");
+        assert_eq!(
+            takeover.allocs, 2,
+            "a nested dial allocated {} times for the tag it returns and the sweep's one cached copy",
+            takeover.allocs
+        );
         assert_eq!(
             fallback.allocs, takeover.allocs,
             "a fallback dial allocated {} times where the takeover dial allocated {} for the same nested tag",
