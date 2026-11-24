@@ -6364,6 +6364,54 @@ mod tests {
     }
 
     #[test]
+    fn a_gateway_setup_failure_leaves_the_proxy_healthy() {
+        let masque_inbound = crate::json::parse(
+            r#"{"settings":{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/24"]},"streamSettings":{"network":"masque","security":"none"}}"#,
+        )
+        .expect("a masque inbound");
+        let masque_port = crate::masque::serve_inbound(
+            &masque_inbound,
+            &freedom_outbound(None),
+            "127.0.0.1:0",
+            None,
+        )
+        .expect("the masque server serves");
+        let outbound = crate::json::parse(&format!(
+            r#"{{"settings":{{"address":"127.0.0.1","port":{masque_port}}},"streamSettings":{{"network":"masque","security":"none","masqueSettings":{{"headers":{{"Authorization":"Basic dUBleGFtcGxlLmNvbTpw"}}}}}}}}"#
+        ))
+        .expect("a masque outbound");
+        let masque = crate::masque::MasqueOut::new(&outbound).expect("the carrier");
+        let out = WarpOut {
+            mode: Mode::Masque,
+            wireguard: None,
+            masque: Some(Arc::new(masque)),
+            gool: None,
+            gool_classic: None,
+            mim: None,
+            chosen: Mutex::new(None),
+            gateway: Some(Gateway {
+                proxy: "192.0.2.1:0".parse().expect("a proxy"),
+                healthy: AtomicBool::new(true),
+            }),
+            probe_host: String::new(),
+            probe_port: 0,
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("pair");
+        let tun = std::net::TcpStream::connect(listener.local_addr().expect("pair address"))
+            .expect("connect");
+        let (_app, _) = listener.accept().expect("accept");
+        out.serve_tcp(
+            crate::conn::Connection::from(tun),
+            &crate::proxy::Destination::Address("127.0.0.1:80".parse().expect("a target")),
+            b"",
+        );
+        assert!(
+            out.gateway.as_ref().expect("a gateway").healthy.load(Ordering::Relaxed),
+            "a local setup failure retired the gateway"
+        );
+    }
+
+    #[test]
     fn only_http_and_https_use_the_gateway() {
         let gateway = Gateway {
             proxy: "192.0.2.7:8080".parse().expect("an address"),
