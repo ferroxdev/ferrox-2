@@ -84988,9 +84988,6 @@ end
         assert_eq!(tag, "c");
     }
 
-    /// One tag is the whole allocation a selector dial makes: the leaf its chain names. Two
-    /// selectors and one leaf, one allocation, counted by the allocator rather than read off the code.
-    #[test]
     /// Marks one selector dial's work for the `ops.yml` report: the loop keeps the choice visible to valgrind.
     #[test]
     fn a_selector_dial_costs_the_choice() {
@@ -85013,6 +85010,8 @@ end
         std::hint::black_box(total);
     }
 
+    /// One tag is the whole allocation a selector dial makes: the leaf its chain names. Two
+    /// selectors and one leaf, one allocation, counted by the allocator rather than read off the code.
     #[test]
     fn a_selector_dial_allocates_only_the_tag_it_returns() {
         let shared = group_route(
