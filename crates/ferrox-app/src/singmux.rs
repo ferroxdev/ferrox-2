@@ -3113,10 +3113,20 @@ mod tests {
         }
 
         fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-            let Some(buf) = bufs.iter().find(|buf| !buf.is_empty()) else {
-                return Ok(0);
-            };
-            self.write(buf)
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let mut room = self.budget;
+            let mut taken = 0;
+            let mut written = self.written.lock().expect("tap");
+            for buf in bufs {
+                let take = buf.len().min(room);
+                written.extend_from_slice(&buf[..take]);
+                taken += take;
+                room -= take;
+                if room == 0 {
+                    break;
+                }
+            }
+            Ok(taken)
         }
 
         fn flush(&mut self) -> io::Result<()> {
@@ -3206,17 +3216,17 @@ mod tests {
         assert!(frame_through(Box::new(PartWrite {
             written: Arc::clone(&written),
             calls: Arc::clone(&calls),
-            budget: 2,
+            budget: 4,
         })));
         assert_eq!(
             *written.lock().expect("tap"),
             [1, 2, 3, 4, 5],
-            "a short accept is retried with the remainder, losing and repeating nothing"
+            "a short accept spanning the head and the body is retried with the remainder"
         );
         assert_eq!(
             calls.load(Ordering::Relaxed),
-            3,
-            "five bytes through a two-byte accept is three calls"
+            2,
+            "four bytes across the boundary and one after it is two calls"
         );
     }
 }
