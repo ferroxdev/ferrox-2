@@ -4786,8 +4786,10 @@ mod tests {
             }
         };
         let refused = |_: &WarpSpec, _: &Identity| Err(RegisterError::refused("refused"));
-        let error = provision_kind_with(&spec, KeyKind::Gool, &paths, &register, &refused)
-            .expect_err("the later slot fails");
+        let Err(error) = provision_kind_with(&spec, KeyKind::Gool, &paths, &register, &refused)
+        else {
+            panic!("the later slot fails");
+        };
         assert!(error.contains("later slot"), "{error}");
         assert_eq!(
             Identity::load(&first).expect("the replacement").device_id,
