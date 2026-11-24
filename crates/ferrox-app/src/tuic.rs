@@ -347,6 +347,41 @@ impl Drop for Lane {
     }
 }
 
+fn prune_lanes(held: &mut HashMap<LaneKey, Vec<Arc<Lane>>>) {
+    for pool in held.values_mut() {
+        pool.retain(|lane| {
+            lane.leases.load(Ordering::Acquire) > 0
+                || !(lane.stop.load(Ordering::Relaxed)
+                    || lane.conn.lock().is_ok_and(|conn| conn.is_closed()))
+        });
+    }
+    held.retain(|_, pool| !pool.is_empty());
+}
+
+fn lane_room(held: &HashMap<LaneKey, Vec<Arc<Lane>>>) -> bool {
+    held.values().map(Vec::len).sum::<usize>() < MAX_TUIC_LANES
+        || held
+            .values()
+            .flatten()
+            .any(|lane| lane.leases.load(Ordering::Acquire) == 0)
+}
+
+fn make_lane_room(held: &mut HashMap<LaneKey, Vec<Arc<Lane>>>) -> bool {
+    while held.values().map(Vec::len).sum::<usize>() >= MAX_TUIC_LANES {
+        let Some((key, at)) = held.iter().find_map(|(key, pool)| {
+            pool.iter()
+                .position(|lane| lane.leases.load(Ordering::Acquire) == 0)
+                .map(|at| (key.clone(), at))
+        }) else {
+            return false;
+        };
+        if let Some(pool) = held.get_mut(&key) {
+            pool.remove(at);
+        }
+    }
+    true
+}
+
 impl TuicOut {
     pub(crate) fn edge(&self) -> Option<SocketAddr> {
         proxy::resolve_outbound(&self.address, self.port)
@@ -356,15 +391,6 @@ impl TuicOut {
         let options = proxy::dial_options();
         let source = proxy::flow_source().ok()?;
         let key = (source, options.clone());
-        let mut held = self.lanes.lock().ok()?;
-        for pool in held.values_mut() {
-            pool.retain(|lane| {
-                lane.leases.load(Ordering::Acquire) > 0
-                    || !(lane.stop.load(Ordering::Relaxed)
-                        || lane.conn.lock().is_ok_and(|conn| conn.is_closed()))
-            });
-        }
-        held.retain(|_, pool| !pool.is_empty());
         let live = |lane: &Arc<Lane>| {
             !lane.stop.load(Ordering::Relaxed)
                 && lane
@@ -372,42 +398,45 @@ impl TuicOut {
                     .lock()
                     .is_ok_and(|conn| lane_established(&conn, lane))
         };
-        if let Some(lane) = held.get(&key).and_then(|pool| {
-            pool.iter()
-                .find(|lane| lane.leases.load(Ordering::Acquire) == 0 && live(lane))
-        }) {
-            lane.leases.fetch_add(1, Ordering::AcqRel);
-            return Some(LaneLease(Arc::clone(lane)));
-        }
-        if held.get(&key).map_or(0, Vec::len) < LANES_PER_KEY {
-            let mut room = true;
-            while held.values().map(Vec::len).sum::<usize>() >= MAX_TUIC_LANES {
-                let Some((evict, at)) = held.iter().find_map(|(key, pool)| {
-                    pool.iter()
-                        .position(|lane| lane.leases.load(Ordering::Acquire) == 0)
-                        .map(|at| (key.clone(), at))
-                }) else {
-                    room = false;
-                    break;
-                };
-                if let Some(pool) = held.get_mut(&evict) {
-                    pool.remove(at);
-                }
-            }
-            if room {
-                let lane = self.connect_lane(source, options)?;
+        let select = |held: &HashMap<LaneKey, Vec<Arc<Lane>>>| -> Option<LaneLease> {
+            if let Some(lane) = held.get(&key).and_then(|pool| {
+                pool.iter()
+                    .find(|lane| lane.leases.load(Ordering::Acquire) == 0 && live(lane))
+            }) {
                 lane.leases.fetch_add(1, Ordering::AcqRel);
-                held.entry(key).or_default().push(Arc::clone(&lane));
-                return Some(LaneLease(lane));
+                return Some(LaneLease(Arc::clone(lane)));
             }
+            let lane = held
+                .get(&key)?
+                .iter()
+                .filter(|lane| live(lane))
+                .min_by_key(|lane| lane.leases.load(Ordering::Acquire))?;
+            lane.leases.fetch_add(1, Ordering::AcqRel);
+            Some(LaneLease(Arc::clone(lane)))
+        };
+        let mut held = self.lanes.lock().ok()?;
+        prune_lanes(&mut held);
+        if let Some(lease) = select(&held) {
+            return Some(lease);
         }
-        let lane = held
-            .get(&key)?
-            .iter()
-            .filter(|lane| live(lane))
-            .min_by_key(|lane| lane.leases.load(Ordering::Acquire))?;
-        lane.leases.fetch_add(1, Ordering::AcqRel);
-        Some(LaneLease(Arc::clone(lane)))
+        if held.get(&key).map_or(0, Vec::len) >= LANES_PER_KEY || !lane_room(&held) {
+            return None;
+        }
+        drop(held);
+        let Some(lane) = self.connect_lane(source, options) else {
+            let mut held = self.lanes.lock().ok()?;
+            prune_lanes(&mut held);
+            return select(&held);
+        };
+        let mut held = self.lanes.lock().ok()?;
+        prune_lanes(&mut held);
+        if held.get(&key).map_or(0, Vec::len) < LANES_PER_KEY && make_lane_room(&mut held) {
+            lane.leases.fetch_add(1, Ordering::AcqRel);
+            held.entry(key.clone()).or_default().push(Arc::clone(&lane));
+            return Some(LaneLease(lane));
+        }
+        drop(lane);
+        select(&held)
     }
 
     fn connect_lane(
