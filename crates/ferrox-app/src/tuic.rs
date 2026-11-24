@@ -1075,6 +1075,7 @@ fn drive_client(weak: &std::sync::Weak<Lane>) {
                         );
                     }
                 }
+                quic::drained_lanes(&lane.sock);
                 lane.finish_handshake() && {
                     let turned = match lane.conn.lock() {
                         Ok(mut conn) => {
@@ -1107,6 +1108,7 @@ fn drive_client(weak: &std::sync::Weak<Lane>) {
                         },
                     );
                     drop(conn);
+                    quic::drained_lanes(&lane.sock);
                     lane.finish_handshake() && {
                         let turned = match lane.conn.lock() {
                             Ok(mut conn) => client_turn(

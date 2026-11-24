@@ -1676,6 +1676,9 @@ pub(crate) fn pump_once(
             Drain::Empty => {
                 conn.on_timeout();
                 flush_egress(conn, sock);
+                if taken > 0 {
+                    drained_lanes(sock);
+                }
                 return true;
             }
             Drain::Unbatchable => {}
@@ -1703,13 +1706,26 @@ pub(crate) fn pump_once(
             {
                 conn.on_timeout();
                 flush_egress(conn, sock);
+                if taken > 0 {
+                    drained_lanes(sock);
+                }
                 return true;
             }
             Err(_) => return false,
         }
     }
     flush_egress(conn, sock);
+    if taken > 0 {
+        drained_lanes(sock);
+    }
     true
+}
+
+/// A datagram this pump took cannot fire the descriptor wait a lane armed on the same socket.
+pub(crate) fn drained_lanes(sock: &Datagram) {
+    if let Some(here) = sock.waits_here() {
+        crate::proxy::lane_pool::note_drained(crate::proxy::wait_key(here));
+    }
 }
 
 pub(crate) fn drive_handshake(
