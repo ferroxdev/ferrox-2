@@ -191,7 +191,7 @@ impl Group {
         route: &'a RouteShared,
         network: Network,
     ) -> Option<(Cow<'a, str>, Outbound)> {
-        self.resolve_with(route, network, &mut HashMap::new())
+        self.resolve_with(route, network, &mut HashMap::new(), None)
             .map(|(leaf, out, _)| (leaf, out))
     }
 
@@ -212,14 +212,15 @@ impl Group {
         route: &'a RouteShared,
         network: Network,
         resolved: &mut ResolvedMembers,
+        readings: Option<&HashMap<String, Reading>>,
     ) -> Option<(Cow<'a, str>, Outbound, Option<u64>)> {
         self.touch();
         match self.kind {
             Kind::Selector => {
                 let at = self.choice(network);
-                resolve_member(route, &self.members[at], network, resolved)
+                resolve_member(route, &self.members[at], network, resolved, readings)
             }
-            Kind::UrlTest => self.pick(route, network, resolved),
+            Kind::UrlTest => self.pick(route, network, resolved, readings),
         }
     }
 
@@ -228,6 +229,7 @@ impl Group {
         route: &'a RouteShared,
         network: Network,
         resolved: &mut ResolvedMembers,
+        readings: Option<&HashMap<String, Reading>>,
     ) -> Option<(Cow<'a, str>, Outbound, Option<u64>)> {
         let stored = self
             .selected
@@ -238,9 +240,15 @@ impl Group {
         let mut current: Option<Stored<'a>> = None;
         let mut best: Option<Fastest<'a>> = None;
         let mut first: Option<Candidate<'a>> = None;
-        let delays = self.history.guard();
+        // One window for the whole tree: a nested group shares this map and is handed it, not locked again.
+        let guard = match readings {
+            Some(_) => None,
+            None => self.history.guard(),
+        };
+        let readings = readings.or(guard.as_deref());
         for (at, member) in self.members.iter().enumerate() {
-            let Some((leaf, out, revision)) = resolve_member(route, member, network, resolved)
+            let Some((leaf, out, revision)) =
+                resolve_member(route, member, network, resolved, readings)
             else {
                 continue;
             };
@@ -253,9 +261,7 @@ impl Group {
             if first.is_none() {
                 first = Some((at, leaf.clone(), out.clone(), revision));
             }
-            let delay = delays
-                .as_ref()
-                .and_then(|delays| History::read(delays, &leaf, revision));
+            let delay = readings.and_then(|readings| History::read(readings, &leaf, revision));
             if stored == Some(at) {
                 current = Some((at, leaf, out, revision, delay));
             } else if let Some(delay) = delay {
@@ -387,6 +393,7 @@ fn resolve_member<'a>(
     tag: &'a str,
     network: Network,
     resolved: &mut ResolvedMembers,
+    readings: Option<&HashMap<String, Reading>>,
 ) -> Option<(Cow<'a, str>, Outbound, Option<u64>)> {
     let (out, revision) = route.member_revision(tag)?;
     match &out {
@@ -398,13 +405,13 @@ fn resolve_member<'a>(
                     .clone()
                     .map(|(leaf, out, revision)| (Cow::Owned(leaf), out, revision));
             }
-            let done = group.resolve_with(route, network, resolved)?;
+            let done = group.resolve_with(route, network, resolved, readings)?;
             let owned = (done.0.into_owned(), done.1.clone(), done.2);
             resolved.insert(key, Some(owned.clone()));
             Some((Cow::Owned(owned.0), owned.1, owned.2))
         }
         Outbound::Group(group) => group
-            .resolve_with(route, network, resolved)
+            .resolve_with(route, network, resolved, readings)
             .map(|(leaf, out, revision)| (Cow::Owned(leaf.into_owned()), out, revision)),
         _ => Some((Cow::Borrowed(tag), out, revision)),
     }

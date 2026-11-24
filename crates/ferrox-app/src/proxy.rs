@@ -85087,6 +85087,32 @@ end
         assert_eq!(tag, "b");
     }
 
+    /// One history window covers the whole tree: a nested url-test reads the map its outer sweep
+    /// already holds instead of locking it again on the same thread.
+    #[test]
+    fn a_nested_urltest_reads_under_the_outer_window() {
+        let shared = group_route(
+            r#"{"outbounds":[
+                {"tag":"a","protocol":"freedom"},
+                {"tag":"b","protocol":"freedom"},
+                {"tag":"inner","type":"urltest","outbounds":["a","b"],"tolerance":10,"url":"http://127.0.0.1/204"},
+                {"tag":"outer","type":"urltest","outbounds":["inner"],"tolerance":500,"url":"http://127.0.0.1/204"}
+            ],"routing":{}}"#,
+        );
+        let group = group_of(&shared, "outer");
+        group.record("a", 100);
+        group.record("b", 10);
+        let before = group.history_locks();
+        group
+            .resolve(&shared, crate::router::Network::Tcp)
+            .expect("picks");
+        let windows = group.history_locks() - before;
+        assert_eq!(
+            windows, 1,
+            "a nested sweep opened {windows} history windows"
+        );
+    }
+
     /// A UDP lookup does not retain a current member that cannot carry datagrams, even when its
     /// reading is the fastest.
     #[test]
