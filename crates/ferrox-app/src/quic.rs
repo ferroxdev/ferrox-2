@@ -3172,9 +3172,22 @@ impl Gecko {
     }
 
     fn send(&self, buf: &[u8], to: SocketAddr, key: &[u8]) -> std::io::Result<usize> {
-        if buf
-            .first()
-            .is_some_and(|b| b & ferrox_core::hysteria::GECKO_FLAG != 0)
+        let resuming = self
+            .fragment
+            .lock()
+            .ok()
+            .and_then(|state| {
+                state.as_ref().map(|state| {
+                    state.key == key
+                        && state.to == to
+                        && state.started.elapsed() < GECKO_TTL
+                })
+            })
+            .unwrap_or(false);
+        if resuming
+            || key
+                .first()
+                .is_some_and(|b| b & ferrox_core::hysteria::GECKO_FLAG != 0)
         {
             return self.send_fragmented(buf, to, key);
         }

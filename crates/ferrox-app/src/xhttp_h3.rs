@@ -667,6 +667,7 @@ pub(crate) struct H3Writer {
     pending: Vec<u8>,
     at: usize,
     input: usize,
+    moved: bool,
 }
 
 impl H3Writer {
@@ -678,6 +679,7 @@ impl H3Writer {
             pending: Vec::new(),
             at: 0,
             input: 0,
+            moved: false,
         }
     }
 }
@@ -727,7 +729,10 @@ impl crate::proxy::LaneWrite for H3Writer {
         if !self.pending.is_empty() {
             match self.wire.try_write(&self.pending[self.at..]) {
                 Ok(0) => return crate::proxy::Push::Parked,
-                Ok(n) => self.at += n,
+                Ok(n) => {
+                    self.at += n;
+                    self.moved = true;
+                }
                 Err(error) if crate::proxy::is_timeout(&error) => {
                     return crate::proxy::Push::Parked
                 }
@@ -778,7 +783,10 @@ impl crate::proxy::LaneWrite for H3Writer {
             self.headed = true;
             match self.wire.try_write(&self.pending) {
                 Ok(0) => return crate::proxy::Push::Parked,
-                Ok(n) => self.at = n,
+                Ok(n) => {
+                    self.at = n;
+                    self.moved = true;
+                }
                 Err(error) if crate::proxy::is_timeout(&error) => {
                     return crate::proxy::Push::Parked
                 }
@@ -809,7 +817,10 @@ impl crate::proxy::LaneWrite for H3Writer {
         self.at = 0;
         match self.wire.try_write(&self.pending) {
             Ok(0) => return crate::proxy::Push::Parked,
-            Ok(n) => self.at = n,
+            Ok(n) => {
+                self.at = n;
+                self.moved = true;
+            }
             Err(error) if crate::proxy::is_timeout(&error) => return crate::proxy::Push::Parked,
             Err(_) => {
                 self.pending.clear();
@@ -824,6 +835,10 @@ impl crate::proxy::LaneWrite for H3Writer {
         self.at = 0;
         self.input = 0;
         crate::proxy::Push::Took(take)
+    }
+
+    fn progress(&mut self) -> bool {
+        std::mem::take(&mut self.moved)
     }
 }
 

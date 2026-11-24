@@ -827,6 +827,15 @@ impl proxy::LaneWrite for AnyTlsStream {
             return proxy::Push::Lost;
         }
         if self.pending.is_empty() && self.pending_input == 0 {
+            if self.session.shared.pending_len() > 0 {
+                let (push, _) = self.flush_pending();
+                if matches!(push, proxy::Push::Lost) {
+                    return proxy::Push::Lost;
+                }
+                if self.session.shared.pending_len() > 0 {
+                    return proxy::Push::Parked;
+                }
+            }
             let packet = self.data_packet(data);
             self.pending = self.session.shared.encode_packet(&packet);
             self.pending_input = data.len();
@@ -879,43 +888,51 @@ impl AnyTlsStream {
         let Some(writer) = guard.as_mut() else {
             return (proxy::Push::Lost, false);
         };
-        let mut at = 0;
-        let mut bytes = self
+        let mut moved = false;
+        let pending = self
             .session
             .shared
             .pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .take()
-            .map(|pending| {
-                at = pending.at;
-                pending.bytes
-            })
-            .unwrap_or_default();
-        if !self.pending.is_empty() {
-            bytes.extend_from_slice(&self.pending);
-            self.pending.clear();
-        }
-        let start = at;
-        let mut complete = at == bytes.len();
-        let mut failed = false;
-        let mut moved = false;
-        if !complete {
-            match writer.write_ready(&[&bytes[at..]]) {
-                Some(Ok(n)) if at + n >= bytes.len() => complete = true,
-                Some(Ok(n)) if n > 0 => at += n,
-                Some(Ok(_)) => {}
-                Some(Err(error)) if crate::proxy::is_timeout(&error) => {}
-                Some(Err(_)) => failed = true,
-                None => match writer.offer_slices(&[&bytes[at..]]) {
-                    proxy::Accepted::All => complete = true,
-                    proxy::Accepted::Full => {}
-                    proxy::Accepted::Lost => failed = true,
-                },
+            .take();
+        if let Some(mut pending) = pending {
+            let start = pending.at;
+            let (complete, failed) = Self::drain_pending(writer, &pending.bytes, &mut pending.at);
+            moved = pending.at > start || (complete && start < pending.bytes.len());
+            if failed {
+                drop(guard);
+                self.session.shared.shutdown("anytls session write failed");
+                return (proxy::Push::Lost, moved);
             }
-            moved = at > start || (complete && start < bytes.len());
+            if !complete {
+                *self
+                    .session
+                    .shared
+                    .pending
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(pending);
+                return (proxy::Push::Parked, moved);
+            }
         }
-        drop(guard);
+        if self.pending.is_empty() {
+            if self.pending_input == 0 {
+                return (proxy::Push::Parked, moved);
+            }
+            return (
+                proxy::Push::Took(std::mem::take(&mut self.pending_input)),
+                moved,
+            );
+        }
+        let mut bytes = std::mem::take(&mut self.pending);
+        let mut at = 0;
+        let (complete, failed) = Self::drain_pending(writer, &bytes, &mut at);
+        moved |= at > 0 || (complete && !bytes.is_empty());
+        if failed {
+            drop(guard);
+            self.session.shared.shutdown("anytls session write failed");
+            return (proxy::Push::Lost, moved);
+        }
         if complete {
             if self.pending_input == 0 {
                 return (proxy::Push::Parked, moved);
@@ -925,10 +942,6 @@ impl AnyTlsStream {
                 moved,
             );
         }
-        if failed {
-            self.session.shared.shutdown("anytls session write failed");
-            return (proxy::Push::Lost, moved);
-        }
         *self
             .session
             .shared
@@ -936,6 +949,26 @@ impl AnyTlsStream {
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(Pending { bytes, at });
         (proxy::Push::Parked, moved)
+    }
+
+    fn drain_pending(writer: &mut Writer, bytes: &[u8], at: &mut usize) -> (bool, bool) {
+        let mut complete = *at == bytes.len();
+        let mut failed = false;
+        if !complete {
+            match writer.write_ready(&[&bytes[*at..]]) {
+                Some(Ok(n)) if *at + n >= bytes.len() => complete = true,
+                Some(Ok(n)) if n > 0 => *at += n,
+                Some(Ok(_)) => {}
+                Some(Err(error)) if crate::proxy::is_timeout(&error) => {}
+                Some(Err(_)) => failed = true,
+                None => match writer.offer_slices(&[&bytes[*at..]]) {
+                    proxy::Accepted::All => complete = true,
+                    proxy::Accepted::Full => {}
+                    proxy::Accepted::Lost => failed = true,
+                },
+            }
+        }
+        (complete, failed)
     }
 }
 
@@ -1841,6 +1874,56 @@ mod tests {
             crate::proxy::LaneWrite::settle(&mut stream),
             crate::proxy::Settle::Advanced
         ));
+    }
+
+    struct Stalled;
+
+    impl Write for Stalled {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl crate::proxy::FrameWrite for Stalled {
+        fn write_slices(&mut self, _: &[&[u8]]) -> bool {
+            false
+        }
+
+        fn write_ready(&mut self, _: &[&[u8]]) -> Option<std::io::Result<usize>> {
+            Some(Ok(0))
+        }
+    }
+
+    #[test]
+    fn a_stalled_carrier_does_not_admit_a_second_suffix() {
+        let padding = Padding::new(b"stop=0\n").expect("parses");
+        let shared = Arc::new(Shared::new(Box::new(Stalled), padding, false));
+        let mut first = test_stream(&shared, 1);
+        assert!(matches!(
+            crate::proxy::LaneWrite::push(&mut first, b"aaaa"),
+            crate::proxy::Push::Parked
+        ));
+        let queued = shared.pending_len();
+        assert!(queued > 0, "the first packet is retained for its retry");
+        let mut second = test_stream(&shared, 2);
+        assert!(matches!(
+            crate::proxy::LaneWrite::push(&mut second, b"bbbb"),
+            crate::proxy::Push::Parked
+        ));
+        assert_eq!(
+            shared.pending_len(),
+            queued,
+            "a blocked suffix is drained before another packet is admitted"
+        );
+        assert!(
+            second.pending.is_empty(),
+            "the second input stays with its caller"
+        );
+        assert_eq!(second.pending_input, 0);
     }
 
     #[test]

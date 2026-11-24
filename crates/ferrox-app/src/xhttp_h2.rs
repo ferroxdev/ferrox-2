@@ -2132,7 +2132,7 @@ impl H2Conn {
             });
         if let Ok(previous) = outcome {
             let total = previous.saturating_add(n);
-            if total >= batch {
+            if total >= batch || (self.client_read.is_some() && self.read_busy()) {
                 self.replenish_connection(total);
             }
             let streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
@@ -7183,6 +7183,70 @@ mod tests {
             .unwrap_or_else(PoisonError::into_inner)
             .insert(1, Arc::clone(&state));
         (conn, state, written)
+    }
+
+    struct Blocking {
+        entered: Arc<(Mutex<bool>, Condvar)>,
+        released: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl Read for Blocking {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            let (entered, signal) = &*self.entered;
+            *entered.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            signal.notify_all();
+            let (released, wake) = &*self.released;
+            let mut released = released.lock().unwrap_or_else(PoisonError::into_inner);
+            while !*released {
+                released = wake
+                    .wait(released)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn a_pumping_client_reader_gets_sub_batch_connection_credit() {
+        let entered = Arc::new((Mutex::new(false), Condvar::new()));
+        let released = Arc::new((Mutex::new(false), Condvar::new()));
+        let (conn, _state, written) = reading_conn(Box::new(Blocking {
+            entered: Arc::clone(&entered),
+            released: Arc::clone(&released),
+        }));
+        let pump = {
+            let conn = Arc::clone(&conn);
+            thread::spawn(move || {
+                let _ = conn.pump_read(|| false, false, None);
+            })
+        };
+        {
+            let (started, signal) = &*entered;
+            let mut started = started.lock().unwrap_or_else(PoisonError::into_inner);
+            while !*started {
+                started = signal
+                    .wait(started)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+        }
+        conn.credit_connection(100, 65_535);
+        {
+            let bytes = written.lock().unwrap_or_else(PoisonError::into_inner);
+            assert!(
+                bytes.len() >= 13,
+                "the waiting pump needs the credit returned before it polls again"
+            );
+            assert_eq!(
+                u32::from_be_bytes([bytes[9], bytes[10], bytes[11], bytes[12]]),
+                100
+            );
+        }
+        *released
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = true;
+        released.1.notify_all();
+        pump.join().expect("the pump ends");
     }
 
     /// A response head split across `HEADERS` and `CONTINUATION` decodes its `:status` once the

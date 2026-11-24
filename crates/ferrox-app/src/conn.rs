@@ -1351,6 +1351,10 @@ impl Connection {
             }
             _ => {}
         }
+        #[cfg(windows)]
+        let _mode = READY_MODE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Connection::Masked(masked) = self {
             let mut until = masked
                 .ready_until
@@ -1363,10 +1367,6 @@ impl Connection {
                 *until = None;
             }
         }
-        #[cfg(windows)]
-        let _mode = READY_MODE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.set_nonblocking(true)?;
         let _ready = ferrox_core::finalmask::ready_write();
         let mut total = 0;

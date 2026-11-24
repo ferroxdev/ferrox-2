@@ -176,7 +176,11 @@ impl PaddingWrite {
                 proxy::Push::Parked => Self::progress(done),
                 proxy::Push::Lost => {
                     self.lost = true;
-                    Self::progress(done)
+                    if done == 0 {
+                        proxy::Push::Lost
+                    } else {
+                        Self::progress(done)
+                    }
                 }
             };
         }
@@ -198,7 +202,11 @@ impl PaddingWrite {
                     self.pending.clear();
                     self.input = 0;
                     self.lost = true;
-                    return Self::progress(done);
+                    return if done == 0 {
+                        proxy::Push::Lost
+                    } else {
+                        Self::progress(done)
+                    };
                 }
             }
             if self.at < self.pending.len() {
@@ -1170,6 +1178,7 @@ impl Read for H2ClientRead {
 
 struct H2OutWrite {
     out: H2StreamOut,
+    moved: bool,
 }
 
 impl Write for H2OutWrite {
@@ -1209,7 +1218,10 @@ impl proxy::LaneWrite for H2OutWrite {
             return proxy::Push::Parked;
         }
         match self.out.try_data_ready(&data[..take]) {
-            Some(true) => proxy::Push::Took(take),
+            Some(true) => {
+                self.moved = true;
+                proxy::Push::Took(take)
+            }
             Some(false) => proxy::Push::Lost,
             None => proxy::Push::Parked,
         }
@@ -1217,6 +1229,10 @@ impl proxy::LaneWrite for H2OutWrite {
 
     fn settle(&mut self) -> proxy::Settle {
         self.out.settle()
+    }
+
+    fn progress(&mut self) -> bool {
+        std::mem::take(&mut self.moved)
     }
 
     fn wait_room(&mut self, turn: Duration) {
@@ -1692,7 +1708,10 @@ impl H2Service for NaiveH2Service {
                 return false;
             }
             out.mark_tunnel();
-            let writer = H2OutWrite { out: out.clone() };
+            let writer = H2OutWrite {
+                out: out.clone(),
+                moved: false,
+            };
             let stream = NaiveStream::new(Box::new(reader), Box::new(writer), End::H2(out), true);
             let reset = stream.clone();
             let spawned = std::thread::Builder::new()
@@ -1722,6 +1741,7 @@ impl H2Service for NaiveH2Service {
                 dial_out.mark_tunnel();
                 let writer = H2OutWrite {
                     out: dial_out.clone(),
+                    moved: false,
                 };
                 let stream =
                     NaiveStream::new(Box::new(reader), Box::new(writer), End::H2(dial_out), true);
@@ -2461,7 +2481,10 @@ impl NaiveOut {
                     }
                     let reader = H2ClientRead { inner: reader };
                     out.mark_tunnel();
-                    let writer = H2OutWrite { out: out.clone() };
+                    let writer = H2OutWrite {
+                        out: out.clone(),
+                        moved: false,
+                    };
                     return Some(NaiveStream::new(
                         Box::new(reader),
                         Box::new(writer),
@@ -2738,16 +2761,21 @@ pub(crate) fn outbound(root: &Json) -> Result<Option<NaiveOut>, String> {
         (!username.is_empty() || !password.is_empty()).then(|| basic_token(username, password));
     let tls = outbound_tls(first, address)?;
     let quic = field("quic").and_then(Json::as_bool).unwrap_or(false);
-    if quic
-        && first
-            .get("streamSettings")
-            .and_then(|settings| settings.get("sockopt"))
-            .and_then(|sockopt| sockopt.get("dialerProxy"))
-            .is_some()
-    {
+    let hop = first
+        .get("streamSettings")
+        .and_then(|settings| settings.get("sockopt"))
+        .and_then(|sockopt| sockopt.get("dialerProxy"))
+        .and_then(Json::as_str)
+        .filter(|tag| !tag.is_empty())
+        .or_else(|| {
+            first
+                .get("detour")
+                .and_then(Json::as_str)
+                .filter(|tag| !tag.is_empty())
+        });
+    if quic && hop.is_some() {
         return Err(
-            "naive quic outbound cannot use dialerProxy; the QUIC dial does not traverse the hop"
-                .to_owned(),
+            "naive quic outbound cannot use a hop; the QUIC dial does not traverse it".to_owned(),
         );
     }
     let uot = uot_option(field("udp_over_tcp").or_else(|| field("udpOverTcp")))?;
@@ -3344,7 +3372,14 @@ fn tcp_start(
                 };
                 let users = Arc::clone(&users);
                 let identity = identity.clone();
-                let session = stop.as_ref().and_then(|stop| stop.track_session(&stream));
+                let session = match stop.as_ref() {
+                    None => None,
+                    Some(stop) => match stop.track_session(&stream) {
+                        Some(session) => Some(session),
+                        None if stop.tracks_sessions() => continue,
+                        None => None,
+                    },
+                };
                 let _ = std::thread::Builder::new()
                     .name("ferrox-naive-h2".to_owned())
                     .spawn(move || {
@@ -3469,7 +3504,7 @@ pub(crate) fn serve_inbound(
             return 0;
         };
         let Some(start) = quic_start(
-            address,
+            if tcp { wake.as_str() } else { address },
             path,
             Arc::clone(&users),
             identity.as_ref(),

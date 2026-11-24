@@ -1511,6 +1511,10 @@ impl Stop {
         self.track_sessions.store(false, Ordering::Relaxed);
     }
 
+    pub(crate) fn tracks_sessions(&self) -> bool {
+        self.track_sessions.load(Ordering::Relaxed)
+    }
+
     /// Registers an accepted stream so rollback can shut it down and wait for its work to leave.
     pub(crate) fn track_session(self: &Arc<Self>, stream: &Connection) -> Option<TrackedSession> {
         if !self.track_sessions.load(Ordering::Relaxed) {

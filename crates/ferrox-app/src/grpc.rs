@@ -1332,7 +1332,9 @@ impl<'a> Gather<'a> {
                     if !Self::settle_blocking(shared, &mut deadline) {
                         return false;
                     }
-                    if self.credit > 0 && !take_window(shared, self.credit, true) {
+                    if self.credit > 0
+                        && !take_window_until(shared, self.credit, Some(deadline))
+                    {
                         return false;
                     }
                     if let Ok(stream) = shared.stream.lock() {
@@ -1909,10 +1911,10 @@ impl GrpcWriter {
             {
                 return false;
             }
-            if !reserved && !self.credit(batch, total as u64) {
+            if batch.full() && !batch.flush_blocking(&self.shared) {
                 return false;
             }
-            if batch.full() && !batch.flush_blocking(&self.shared) {
+            if !reserved && !self.credit(batch, total as u64) {
                 return false;
             }
             batch.add(
@@ -1927,10 +1929,10 @@ impl GrpcWriter {
         while at < total {
             let n = (total - at).min(max);
             let last = at + n == total;
-            if !reserved && !self.credit(batch, n as u64) {
+            if batch.full() && !batch.flush_blocking(&self.shared) {
                 return false;
             }
-            if batch.full() && !batch.flush_blocking(&self.shared) {
+            if !reserved && !self.credit(batch, n as u64) {
                 return false;
             }
             let flags = if last && end { F_END } else { 0 };

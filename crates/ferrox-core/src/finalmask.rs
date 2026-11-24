@@ -223,6 +223,10 @@ impl Fragment {
                 return Ok(0);
             }
         }
+        if matches!(self.piece_resume, Some((len, _)) if len == p.len()) {
+            return self.write_pieces(raw, p);
+        }
+        self.piece_resume = None;
         self.count += 1;
         if self.packets_from == 0 && self.packets_to == 1 {
             if self.hello_done {
@@ -777,6 +781,7 @@ impl Fragment {
     /// widths, each advance measured by what the socket actually took.
     fn write_pieces<W: Write>(&mut self, raw: &mut W, p: &[u8]) -> io::Result<usize> {
         if p.is_empty() {
+            self.piece_resume = None;
             return Ok(0);
         }
         let Some(bound) = self.max_split.pick_from(&mut self.ent) else {
@@ -788,24 +793,59 @@ impl Fragment {
             0
         };
         let mut from = 0usize;
-        let mut segment = match self.piece_resume.take() {
+        let mut segment = match self.piece_resume {
             Some((len, segment)) if len == p.len() => segment,
-            _ => 0,
+            _ => {
+                self.piece_resume = None;
+                0
+            }
         };
         loop {
             if READY.with(std::cell::Cell::get) && READY_WAIT.with(std::cell::Cell::get) > 0 {
                 self.piece_resume = Some((p.len() - from, segment));
-                return Ok(from);
+                return if from == 0 {
+                    Err(io::ErrorKind::WouldBlock.into())
+                } else {
+                    Ok(from)
+                };
             }
             let Some(to) = self.cut(segment, from, p.len(), bound) else {
-                return write_progress(raw, &p[from..]).map(|written| from + written);
+                return match write_progress(raw, &p[from..]) {
+                    Ok(written) => {
+                        let total = from + written;
+                        if total >= p.len() {
+                            self.piece_resume = None;
+                        } else {
+                            self.piece_resume = Some((p.len() - total, segment));
+                        }
+                        Ok(total)
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        self.piece_resume = Some((p.len() - from, segment));
+                        if from > 0 {
+                            Ok(from)
+                        } else {
+                            Err(error)
+                        }
+                    }
+                    Err(error) => Err(error),
+                };
             };
             if from == to {
                 self.park_after(raw, segment)?;
                 segment += 1;
                 if READY.with(std::cell::Cell::get) && READY_WAIT.with(std::cell::Cell::get) > 0 {
                     self.piece_resume = Some((p.len() - from, segment));
-                    return Ok(from);
+                    return if from == 0 {
+                        Err(io::ErrorKind::WouldBlock.into())
+                    } else {
+                        Ok(from)
+                    };
                 }
                 continue;
             }
@@ -823,12 +863,23 @@ impl Fragment {
                     self.piece_resume = Some((p.len() - from, segment));
                     return Ok(from);
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    if from == 0
+                        && matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        )
+                    {
+                        self.piece_resume = Some((p.len(), segment));
+                    }
+                    return Err(error);
+                }
             };
             from += written;
             self.park_after(raw, segment)?;
             segment += 1;
             if from >= p.len() {
+                self.piece_resume = None;
                 return Ok(from);
             }
         }
@@ -2137,6 +2188,79 @@ mod tests {
         assert!(
             wire.calls <= 3,
             "positive progress resumes the next segment instead of repeating the first"
+        );
+    }
+
+    #[test]
+    fn a_zero_byte_refusal_keeps_the_piece_resume_cursor() {
+        let mut mask = Fragment::new(
+            0,
+            2,
+            vec![range(1, 1), range(65_535, 65_535)],
+            vec![range(1, 1)],
+            range(0, 0),
+        )
+        .expect("valid");
+        let p = vec![0x33; 64];
+        let mut first = Wire::default();
+        let _ready = ready_write();
+        assert_eq!(mask.write(&mut first, &p).expect("writes"), 1);
+        let _ = take_ready_wait();
+        let mut retry = RefuseOnce {
+            wire: Wire::default(),
+            left: 1,
+        };
+        let error = mask
+            .write(&mut retry, &p[1..])
+            .expect_err("the retry is refused");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        let n = mask.write(&mut retry, &p[1..]).expect("the retry resumes");
+        assert_eq!(n, p.len() - 1, "the saved segment is retried whole");
+        assert_eq!(retry.wire.bytes, p[1..]);
+    }
+
+    #[test]
+    fn a_piece_continuation_runs_before_a_new_packet_is_counted() {
+        let mut mask = Fragment::new(
+            1,
+            1,
+            vec![range(1, 1), range(4, 4)],
+            vec![range(1, 1)],
+            range(0, 0),
+        )
+        .expect("valid");
+        let p = vec![0x44; 20];
+        let mut wire = Wire::default();
+        let _ready = ready_write();
+        let first = mask.write(&mut wire, &p).expect("writes");
+        assert_eq!(first, 1);
+        assert!(take_ready_wait().is_some(), "the first segment parks");
+        let second = mask.write(&mut wire, &p[first..]).expect("resumes");
+        assert_eq!(second, 4, "the saved four-byte segment runs again");
+        assert_eq!(wire.widths, vec![1, 4], "the selected packet is not bypassed");
+    }
+
+    #[test]
+    fn a_deferred_zero_width_piece_reports_backpressure() {
+        let mut mask = Fragment::new(
+            0,
+            1,
+            vec![range(0, 0), range(4, 4)],
+            vec![range(1, 1)],
+            range(0, 0),
+        )
+        .expect("valid");
+        let mut wire = Wire::default();
+        let _ready = ready_write();
+        let error = mask
+            .write(&mut wire, b"abcde")
+            .expect_err("a zero-width step defers the write");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(wire.bytes.is_empty(), "the refused write sent nothing");
+        assert_eq!(
+            mask.piece_resume,
+            Some((5, 1)),
+            "the deferred segment is kept for the retry"
         );
     }
 
