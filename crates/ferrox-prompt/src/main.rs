@@ -1034,7 +1034,7 @@ fn run_next(args: &Args, library: &Library, root: &Path) -> ExitCode {
         retry_addons: args.addons.clone(),
         ..Options::default()
     };
-    let rendered = render::render(library, prompt, &values, &addons, Some(&worktree), options);
+    let rendered = render::render(library, prompt, &values, &addons, Some(&worktree), &options);
     if let Some(code) = missing_input_refusal(
         prompt,
         &rendered,
@@ -1334,7 +1334,7 @@ fn run_render(args: &Args, library: &Library, root: &Path) -> ExitCode {
         retry_addons: args.addons.clone(),
         ..Options::default()
     };
-    let rendered = render::render(library, prompt, &values, &addons, Some(&worktree), options);
+    let rendered = render::render(library, prompt, &values, &addons, Some(&worktree), &options);
     if let Some(code) = missing_input_refusal(
         prompt,
         &rendered,
@@ -1474,7 +1474,7 @@ fn run_show(args: &Args, library: &Library, root: &Path) -> ExitCode {
         &values,
         &addons,
         Some(&worktree),
-        Options {
+        &Options {
             allow_unfilled: true,
             retry_library: retry_library_path(args, library),
             retry_row: target_key.clone(),
@@ -3635,7 +3635,7 @@ ship {method}
         assert!(!values.contains_key("method"));
         let library = library();
         let prompt = library.prompt(1).expect("P1");
-        let rendered = render::render(&library, prompt, &values, &[], None, Options::default());
+        let rendered = render::render(&library, prompt, &values, &[], None, &Options::default());
         assert!(rendered.missing.iter().any(|name| name == "method"));
     }
 
