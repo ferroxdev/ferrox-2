@@ -317,6 +317,10 @@ impl Group {
                     _ => {
                         let (leaf, out, revision) =
                             resolve_member(route, &self.members[at], network, resolved, readings)?;
+                        // The sweep's check was for the handler as it was then; this one is now.
+                        if !carries(&out, network) {
+                            return None;
+                        }
                         (at, leaf, out, revision?)
                     }
                 }
