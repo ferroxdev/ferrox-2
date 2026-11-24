@@ -1,5 +1,6 @@
 // xHTTP over HTTP/3: one QUIC connection carries the same request streams the H2 lane does, so stream-one, stream-up and packet-up keep their shapes and only the framing under them changes.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -14,6 +15,17 @@ use crate::xhttp::{XhttpMode, XhttpSettings};
 const TICK: Duration = Duration::from_millis(20);
 const POLL: Duration = Duration::from_millis(5);
 const READ_ROOM: usize = 16 * 1024;
+const H3_WRITE_CHUNK: usize = 16 * 1024;
+const H3_STREAM_CREATION_ERROR: u64 = 0x0103;
+const H3_CLOSED_CRITICAL_STREAM: u64 = 0x0104;
+const H3_FRAME_UNEXPECTED: u64 = 0x0105;
+const H3_FRAME_ERROR: u64 = 0x0106;
+const H3_ID_ERROR: u64 = 0x0108;
+const H3_SETTINGS_ERROR: u64 = 0x0109;
+const QPACK_ENCODER_STREAM_ERROR: u64 = 0x0201;
+const QPACK_DECODER_STREAM_ERROR: u64 = 0x0202;
+const H3_MISSING_SETTINGS: u64 = 0x010a;
+const H3_REQUEST_REJECTED: u64 = 0x010b;
 
 /// One request stream's byte transport: a served stream on the QUIC driver, or one the client
 /// opened on its own connection. Both clones share the connection, never the buffered bytes.
@@ -49,10 +61,50 @@ impl Write for Wire {
 }
 
 impl Wire {
+    fn try_write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Server(stream) => stream.try_write(buf),
+            Self::Client(stream) => stream.try_write(buf),
+        }
+    }
+
     fn activity(&self) -> Arc<Activity> {
         match self {
             Self::Server(stream) => stream.activity(),
             Self::Client(stream) => Arc::clone(&stream.activity),
+        }
+    }
+
+    fn rejected(&self) -> bool {
+        match self {
+            Self::Server(_) => false,
+            Self::Client(stream) => stream.owner.rejected(stream.id),
+        }
+    }
+
+    fn request_rejected(&self) -> bool {
+        match self {
+            Self::Server(_) => false,
+            Self::Client(stream) => stream.reset.load(Ordering::Relaxed) == H3_REQUEST_REJECTED,
+        }
+    }
+
+    fn opening_start(&mut self, buf: &[u8], deadline: Option<Instant>) -> std::io::Result<usize> {
+        match self {
+            Self::Server(stream) => stream.write(buf),
+            Self::Client(stream) => stream.opening_start(buf, deadline),
+        }
+    }
+
+    fn opening_rest(
+        &mut self,
+        buf: &[u8],
+        sent: usize,
+        deadline: Instant,
+    ) -> std::io::Result<usize> {
+        match self {
+            Self::Server(stream) => stream.write(buf),
+            Self::Client(stream) => stream.opening_rest(buf, sent, deadline),
         }
     }
 
@@ -126,11 +178,16 @@ pub(crate) struct H3Reader {
     buf_at: usize,
     head: Option<Vec<u8>>,
     status: Option<u16>,
+    padding: bool,
     content_length: Option<usize>,
     frame_left: usize,
     ended: bool,
     head_seen: bool,
     expect_request: bool,
+    /// Only a CONNECT reads `Padding`; an ordinary answer leaves the field list unbuilt.
+    padding_head: bool,
+    /// A CONNECT success ignores `Content-Length`, per RFC 9110 9.3.6.
+    connect: bool,
     idle_since: Option<Instant>,
     activity: Arc<Activity>,
     deadline: Option<Instant>,
@@ -150,11 +207,14 @@ impl H3Reader {
             buf_at: 0,
             head: None,
             status: None,
+            padding: false,
             content_length: None,
             frame_left: 0,
             ended: false,
             head_seen: false,
             expect_request,
+            padding_head: false,
+            connect: false,
             idle_since: None,
             activity,
             deadline: None,
@@ -166,6 +226,11 @@ impl H3Reader {
 
     pub(crate) fn status(&self) -> Option<u16> {
         self.status
+    }
+
+    /// Whether the peer rejected this request before its answer arrived, so the request is safe to retry.
+    pub(crate) fn rejected(&self) -> bool {
+        self.wire.rejected() || (!self.head_seen && self.wire.request_rejected())
     }
 
     fn content_length(&self) -> Option<usize> {
@@ -213,6 +278,31 @@ impl H3Reader {
             }
         }
         Ok(self.head.take())
+    }
+
+    /// Wait for the final response HEADERS on a client stream and report its status and whether it
+    /// carried a nonempty `Padding` field, leaving any DATA that followed buffered for the tunnel.
+    pub(crate) fn read_response_head(&mut self) -> std::io::Result<Option<(u16, bool)>> {
+        self.deadline
+            .get_or_insert_with(|| Instant::now() + crate::budgets::relay_stall());
+        loop {
+            self.parse()?;
+            if let Some(status) = self.status {
+                if self
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+                }
+                self.deadline = None;
+                return Ok(Some((status, self.padding)));
+            }
+            if self.ended {
+                self.deadline = None;
+                return Ok(None);
+            }
+            self.fill_room()?;
+        }
     }
 
     /// The buffered bytes an open DATA frame can hand out without a copy.
@@ -388,13 +478,24 @@ impl H3Reader {
                             ));
                         };
                         if !self.expect_request {
-                            self.content_length =
-                                hpack::qpack_content_length(payload).map_err(|_| {
-                                    std::io::Error::new(
-                                        std::io::ErrorKind::InvalidData,
-                                        "h3 content-length is malformed",
-                                    )
-                                })?;
+                            let connect_ok = self.connect
+                                && status.is_some_and(|code| (200..300).contains(&code));
+                            if !connect_ok {
+                                self.content_length = hpack::qpack_content_length(payload)
+                                    .map_err(|_| {
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData,
+                                            "h3 content-length is malformed",
+                                        )
+                                    })?;
+                            }
+                            if self.padding_head {
+                                self.padding = hpack::qpack_fields(payload).is_some_and(|fields| {
+                                    fields.iter().any(|(name, value)| {
+                                        name.eq_ignore_ascii_case(b"padding") && !value.is_empty()
+                                    })
+                                });
+                            }
                         }
                         self.head = head;
                         self.status = status;
@@ -570,6 +671,10 @@ pub(crate) struct H3Writer {
     wire: Wire,
     head: Vec<u8>,
     headed: bool,
+    pending: Vec<u8>,
+    at: usize,
+    input: usize,
+    moved: bool,
 }
 
 impl H3Writer {
@@ -578,6 +683,10 @@ impl H3Writer {
             wire,
             head: Vec::new(),
             headed: false,
+            pending: Vec::new(),
+            at: 0,
+            input: 0,
+            moved: false,
         }
     }
 }
@@ -621,6 +730,125 @@ impl crate::proxy::FrameWrite for H3Writer {
     }
 }
 
+impl crate::proxy::LaneWrite for H3Writer {
+    #[allow(clippy::too_many_lines)]
+    fn push(&mut self, data: &[u8]) -> crate::proxy::Push {
+        if !self.pending.is_empty() {
+            match self.wire.try_write(&self.pending[self.at..]) {
+                Ok(0) => return crate::proxy::Push::Parked,
+                Ok(n) => {
+                    self.at += n;
+                    self.moved = true;
+                }
+                Err(error) if crate::proxy::is_timeout(&error) => {
+                    return crate::proxy::Push::Parked
+                }
+                Err(_) => {
+                    self.pending.clear();
+                    self.input = 0;
+                    return crate::proxy::Push::Lost;
+                }
+            }
+            if self.at < self.pending.len() {
+                return crate::proxy::Push::Parked;
+            }
+            let input = std::mem::take(&mut self.input);
+            self.pending.clear();
+            self.at = 0;
+            if data.len() < input {
+                return crate::proxy::Push::Lost;
+            }
+            return crate::proxy::Push::Took(input);
+        }
+        if !self.headed {
+            self.head.extend_from_slice(data);
+            let Some(at) = head_end(&self.head) else {
+                return crate::proxy::Push::Took(data.len());
+            };
+            let head = std::mem::take(&mut self.head);
+            let text = std::str::from_utf8(&head[..at]).unwrap_or_default();
+            let body = &head[at + 4..];
+            let fields = response_fields(text);
+            let refs: Vec<(&str, &str)> = fields
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect();
+            let mut block = Vec::new();
+            hpack::qpack_literal_many(&refs, &mut block);
+            let mut pending = Vec::with_capacity(block.len() + body.len() + 18);
+            frames::quic_varint(&mut pending, frames::H3_HEADERS);
+            frames::quic_varint(&mut pending, block.len() as u64);
+            pending.extend_from_slice(&block);
+            if !body.is_empty() {
+                frames::quic_varint(&mut pending, frames::H3_DATA);
+                frames::quic_varint(&mut pending, body.len() as u64);
+                pending.extend_from_slice(body);
+            }
+            self.pending = pending;
+            self.input = data.len();
+            self.at = 0;
+            self.headed = true;
+            match self.wire.try_write(&self.pending) {
+                Ok(0) => return crate::proxy::Push::Parked,
+                Ok(n) => {
+                    self.at = n;
+                    self.moved = true;
+                }
+                Err(error) if crate::proxy::is_timeout(&error) => {
+                    return crate::proxy::Push::Parked
+                }
+                Err(_) => {
+                    self.pending.clear();
+                    self.input = 0;
+                    return crate::proxy::Push::Lost;
+                }
+            }
+            if self.at < self.pending.len() {
+                return crate::proxy::Push::Parked;
+            }
+            self.pending.clear();
+            self.at = 0;
+            self.input = 0;
+            return crate::proxy::Push::Took(data.len());
+        }
+        if data.is_empty() {
+            return crate::proxy::Push::Took(0);
+        }
+        let take = data.len().min(H3_WRITE_CHUNK);
+        let mut pending = Vec::with_capacity(take + 9);
+        frames::quic_varint(&mut pending, frames::H3_DATA);
+        frames::quic_varint(&mut pending, take as u64);
+        pending.extend_from_slice(&data[..take]);
+        self.pending = pending;
+        self.input = take;
+        self.at = 0;
+        match self.wire.try_write(&self.pending) {
+            Ok(0) => return crate::proxy::Push::Parked,
+            Ok(n) => {
+                self.at = n;
+                self.moved = true;
+            }
+            Err(error) if crate::proxy::is_timeout(&error) => return crate::proxy::Push::Parked,
+            Err(_) => {
+                self.pending.clear();
+                self.input = 0;
+                return crate::proxy::Push::Lost;
+            }
+        }
+        if self.at < self.pending.len() {
+            return crate::proxy::Push::Parked;
+        }
+        self.pending.clear();
+        self.at = 0;
+        self.input = 0;
+        crate::proxy::Push::Took(take)
+    }
+
+    fn progress(&mut self) -> bool {
+        std::mem::take(&mut self.moved)
+    }
+}
+
 /// The stream a session writes through once its head is out; the dispatch keys on this instead of
 /// the H2 stream out, so the body stays raw on both HTTP/2 and HTTP/3.
 #[derive(Clone)]
@@ -637,8 +865,17 @@ impl std::fmt::Debug for H3StreamOut {
 }
 
 impl H3StreamOut {
+    pub(crate) fn new(wire: Wire, owner: Option<Arc<quic::ConnectionToken>>) -> Self {
+        Self { wire, owner }
+    }
+
     pub(crate) fn data(&self, payload: &[u8]) -> bool {
         payload.is_empty() || send_data(&self.wire, payload)
+    }
+
+    pub(crate) fn try_write(&self, bytes: &[u8]) -> std::io::Result<usize> {
+        let mut wire = self.wire.clone();
+        wire.try_write(bytes)
     }
 
     /// The serving connection a session binds to; a client-side out answers for no listener.
@@ -744,7 +981,15 @@ fn synth_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Option<Vec<u8>> {
             .map(|(_, value)| value.as_slice())
     };
     let method = field(b":method")?;
-    let target = field(b":path")?;
+    let target = if method == b"CONNECT" {
+        if field(b":path").is_some() || field(b":scheme").is_some() || field(b":protocol").is_some()
+        {
+            return None;
+        }
+        field(b":authority")?
+    } else {
+        field(b":path")?
+    };
     if !h1_token(method) || !h1_token(target) {
         return None;
     }
@@ -900,11 +1145,12 @@ fn serve_one(stream: &quic::QuicStream, settings: &XhttpSettings, service: &Arc<
 /// One client request stream on the connection the session dialled.
 #[derive(Clone)]
 pub(crate) struct ClientStream {
-    _owner: Arc<H3Client>,
+    owner: Arc<H3Client>,
     conn: Arc<Mutex<QuicheConnection>>,
     sock: Arc<Datagram>,
     id: u64,
     peer_fin: Arc<AtomicBool>,
+    reset: Arc<AtomicU64>,
     activity: Arc<Activity>,
 }
 
@@ -921,6 +1167,9 @@ impl Read for ClientStream {
             let Ok(mut conn) = self.conn.lock() else {
                 return Err(std::io::Error::other("h3 connection lock poisoned"));
             };
+            if self.owner.rejected(self.id) {
+                return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+            }
             match conn.stream_recv(self.id, buf) {
                 Ok((0, true)) => {
                     self.peer_fin.store(true, Ordering::Relaxed);
@@ -935,14 +1184,18 @@ impl Read for ClientStream {
                     }
                 }
                 Err(quiche::Error::Done) => {}
-                Err(quiche::Error::StreamReset(_)) => {
+                Err(quiche::Error::StreamReset(code)) => {
+                    self.reset.store(code, Ordering::Relaxed);
                     return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
                 }
                 Err(error) => {
+                    if self.owner.dead.load(Ordering::Relaxed) {
+                        return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+                    }
                     return Err(std::io::Error::other(format!("h3 stream read: {error:?}")));
                 }
             }
-            if conn.is_closed() {
+            if self.owner.dead.load(Ordering::Relaxed) || conn.is_closed() {
                 return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
             }
             drop(conn);
@@ -960,12 +1213,25 @@ impl Write for ClientStream {
         if buf.is_empty() {
             return Ok(0);
         }
+        if self.owner.dead.load(Ordering::Relaxed) {
+            return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        }
         let deadline = Instant::now() + crate::budgets::relay_stall();
         let mut rest = bytes::Bytes::copy_from_slice(buf);
         while !rest.is_empty() {
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::other("h3 stream send timed out"));
+            }
             let Ok(mut conn) = self.conn.lock() else {
                 return Err(std::io::Error::other("h3 connection lock poisoned"));
             };
+            if self.owner.dead.load(Ordering::Relaxed)
+                || self.owner.rejected(self.id)
+                || conn.is_draining()
+                || conn.is_closed()
+            {
+                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+            }
             match conn.stream_send_zc(self.id, rest.clone(), false) {
                 Ok((0, _)) | Err(quiche::Error::Done) => {
                     drop(conn);
@@ -997,6 +1263,125 @@ impl Write for ClientStream {
 }
 
 impl ClientStream {
+    /// One non-blocking body send: no room answers zero, so a relay lane parks instead of a worker.
+    pub(crate) fn try_write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.owner.dead.load(Ordering::Relaxed) {
+            return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        }
+        let mut conn = match self.conn.try_lock() {
+            Ok(conn) => conn,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(0),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(std::io::Error::other("h3 connection lock poisoned"));
+            }
+        };
+        if self.owner.dead.load(Ordering::Relaxed)
+            || self.owner.rejected(self.id)
+            || conn.is_draining()
+            || conn.is_closed()
+        {
+            return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        }
+        match conn.stream_send_zc(self.id, bytes::Bytes::copy_from_slice(buf), false) {
+            Ok((0, _)) | Err(quiche::Error::Done) => Ok(0),
+            Ok((n, _)) => {
+                self.activity.touch();
+                quic::flush_egress(&mut conn, &self.sock);
+                Ok(n)
+            }
+            Err(error) => Err(std::io::Error::other(format!("h3 stream send: {error:?}"))),
+        }
+    }
+
+    /// One non-blocking opening attempt: `StreamLimit` leaves the id unallocated, while a created
+    /// stream may still be waiting for credit after this returns.
+    fn opening_start(&mut self, buf: &[u8], deadline: Option<Instant>) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let Ok(mut conn) = self.conn.lock() else {
+            return Err(std::io::Error::other("h3 connection lock poisoned"));
+        };
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        }
+        if self.owner.dead.load(Ordering::Relaxed)
+            || self.owner.rejected(self.id)
+            || self.owner.draining.load(Ordering::Relaxed)
+            || conn.is_draining()
+            || conn.is_closed()
+        {
+            return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        }
+        match conn.stream_send(self.id, buf, false) {
+            Ok(sent) => {
+                self.activity.touch();
+                quic::flush_egress(&mut conn, &self.sock);
+                Ok(sent)
+            }
+            Err(quiche::Error::Done) => Ok(0),
+            Err(quiche::Error::StreamLimit) => {
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            }
+            Err(error) => Err(std::io::Error::other(format!("h3 stream send: {error:?}"))),
+        }
+    }
+
+    /// Finish HEADERS once the stream exists, waiting for credit without the opening lock; the
+    /// drain flag only gates the first attempt, so a stream below a GOAWAY cutoff can finish.
+    fn opening_rest(
+        &mut self,
+        buf: &[u8],
+        sent: usize,
+        deadline: Instant,
+    ) -> std::io::Result<usize> {
+        let mut rest = buf;
+        let mut sent = sent;
+        while !rest.is_empty() {
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::other("h3 stream send timed out"));
+            }
+            let Ok(mut conn) = self.conn.lock() else {
+                return Err(std::io::Error::other("h3 connection lock poisoned"));
+            };
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::other("h3 stream send timed out"));
+            }
+            if self.owner.dead.load(Ordering::Relaxed)
+                || self.owner.rejected(self.id)
+                || (sent == 0 && self.owner.draining.load(Ordering::Relaxed))
+                || conn.is_draining()
+                || conn.is_closed()
+            {
+                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+            }
+            match conn.stream_send(self.id, rest, false) {
+                Ok(0) | Err(quiche::Error::Done) => {
+                    drop(conn);
+                    #[cfg(test)]
+                    self.owner.credit_waits.fetch_add(1, Ordering::Relaxed);
+                    std::thread::sleep(POLL);
+                }
+                Ok(n) => {
+                    sent += n;
+                    self.activity.touch();
+                    quic::flush_egress(&mut conn, &self.sock);
+                    rest = &rest[n..];
+                }
+                Err(quiche::Error::StreamLimit) => {
+                    return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+                }
+                Err(error) => {
+                    return Err(std::io::Error::other(format!("h3 stream send: {error:?}")));
+                }
+            }
+        }
+        Ok(buf.len())
+    }
+
     fn fin(&self) {
         let Ok(mut conn) = self.conn.lock() else {
             return;
@@ -1024,13 +1409,26 @@ impl ClientStream {
     }
 }
 
+/// Why an H3 stream did not open: the peer's stream limit is temporary, while a dead or draining
+/// connection is not.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum H3OpenError {
+    Full,
+    Closed,
+}
+
 /// The client side of one H3 connection: streams open on the shared connection and one pump reads
 /// its socket, so an upload waits on credit without stopping the downlink's datagrams.
 pub(crate) struct H3Client {
     conn: Arc<Mutex<QuicheConnection>>,
     sock: Arc<Datagram>,
     next: AtomicU64,
+    opening: Mutex<()>,
     dead: Arc<AtomicBool>,
+    draining: Arc<AtomicBool>,
+    goaway: Arc<AtomicU64>,
+    #[cfg(test)]
+    credit_waits: std::sync::atomic::AtomicUsize,
 }
 
 impl Drop for H3Client {
@@ -1044,6 +1442,21 @@ impl Drop for H3Client {
 }
 
 impl H3Client {
+    /// Whether the shared connection can still open a stream: the pump clears this once the
+    /// connection closes, and a pooled client that fails this is dropped rather than reused.
+    pub(crate) fn reusable(&self) -> bool {
+        !self.dead.load(Ordering::Relaxed) && !self.draining.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn waited_for_credit(&self) -> bool {
+        self.credit_waits.load(Ordering::Relaxed) > 0
+    }
+
+    fn rejected(&self, id: u64) -> bool {
+        id >= self.goaway.load(Ordering::SeqCst)
+    }
+
     pub(crate) fn connect(
         peer: SocketAddr,
         server_name: &str,
@@ -1058,6 +1471,56 @@ impl H3Client {
         tls: &ferrox_core::tls::TlsConfig,
         quic_params: Option<&ferrox_core::hysteria::QuicParams>,
         default_bbr: bool,
+    ) -> Option<Arc<Self>> {
+        Self::connect_windowed(
+            peer,
+            server_name,
+            tls,
+            quic_params,
+            default_bbr,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// The reference's `stream_receive_window` and `quic_session_receive_window` on one dial: the
+    /// stream window bounds a CONNECT's downlink, the session window bounds the whole connection.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn connect_windowed(
+        peer: SocketAddr,
+        server_name: &str,
+        tls: &ferrox_core::tls::TlsConfig,
+        quic_params: Option<&ferrox_core::hysteria::QuicParams>,
+        default_bbr: bool,
+        cc: Option<ferrox_core::hysteria::Congestion>,
+        stream_window: Option<u64>,
+        session_window: Option<u64>,
+    ) -> Option<Arc<Self>> {
+        Self::connect_windowed_by(
+            peer,
+            server_name,
+            tls,
+            quic_params,
+            default_bbr,
+            cc,
+            stream_window,
+            session_window,
+            crate::budgets::handshake(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn connect_windowed_by(
+        peer: SocketAddr,
+        server_name: &str,
+        tls: &ferrox_core::tls::TlsConfig,
+        quic_params: Option<&ferrox_core::hysteria::QuicParams>,
+        default_bbr: bool,
+        cc: Option<ferrox_core::hysteria::Congestion>,
+        stream_window: Option<u64>,
+        session_window: Option<u64>,
+        budget: Duration,
     ) -> Option<Arc<Self>> {
         let mut config = if tls.insecure || !tls.cert_pins.is_empty() {
             let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).ok()?;
@@ -1076,7 +1539,20 @@ impl H3Client {
             }
             quic::apply_hysteria_quic(&mut config, params, false);
         }
-        let cc = quic::lane_controller(quic_params.and_then(|params| params.cc), default_bbr);
+        if let Some(window) = stream_window {
+            let window = window.max(9);
+            config.set_initial_max_stream_data_bidi_local(window);
+            config.set_initial_max_stream_data_bidi_remote(window);
+            config.set_max_stream_window(window);
+        }
+        if let Some(window) = session_window {
+            let window = window.max(2);
+            config.set_initial_max_data(window);
+            config.set_max_connection_window(window);
+        }
+        let cc = cc.or_else(|| {
+            quic::lane_controller(quic_params.and_then(|params| params.cc), default_bbr)
+        });
         quic::apply_lane_congestion(&mut config, cc, quic_params)?;
         let sock = if peer.is_ipv6() {
             quic::bind_datagram("[::]:0").ok()?
@@ -1101,7 +1577,7 @@ impl H3Client {
         if let Some(list) = &tls.ech_config_list {
             conn.as_mut().set_ech_config_list(list).ok()?;
         }
-        quic::drive_handshake_by(&mut conn, &sock, local, crate::budgets::handshake())?;
+        quic::drive_handshake_by(&mut conn, &sock, local, budget)?;
         if !tls.cert_pins.is_empty() {
             let chain: Vec<Vec<u8>> = match conn.peer_cert_chain() {
                 Some(chain) => chain.iter().map(|cert| cert.to_vec()).collect(),
@@ -1117,23 +1593,70 @@ impl H3Client {
         quic::send_h3_opening(&mut conn, &sock);
         let conn = Arc::new(Mutex::new(conn));
         let dead = Arc::new(AtomicBool::new(false));
-        let pump = Arc::clone(&conn);
-        let pump_sock = Arc::clone(&sock);
-        let pump_dead = Arc::clone(&dead);
+        let draining = Arc::new(AtomicBool::new(false));
+        let goaway = Arc::new(AtomicU64::new(u64::MAX));
+        let (pump, pump_sock) = (Arc::clone(&conn), Arc::clone(&sock));
+        let (pump_dead, pump_draining) = (Arc::clone(&dead), Arc::clone(&draining));
+        let pump_goaway = Arc::clone(&goaway);
         std::thread::Builder::new()
             .name("xhttp-h3-pump".to_owned())
-            .spawn(move || pump_connection(&pump, &pump_sock, local, peer, net, &pump_dead))
+            .spawn(move || {
+                pump_connection(
+                    &pump,
+                    &pump_sock,
+                    local,
+                    peer,
+                    net,
+                    &pump_draining,
+                    &pump_goaway,
+                );
+                pump_dead.store(true, Ordering::Relaxed);
+            })
             .ok()?;
-        Some(Arc::new(Self {
+        Some(Self::assemble(conn, sock, dead, draining, goaway))
+    }
+
+    fn assemble(
+        conn: Arc<Mutex<QuicheConnection>>,
+        sock: Arc<Datagram>,
+        dead: Arc<AtomicBool>,
+        draining: Arc<AtomicBool>,
+        goaway: Arc<AtomicU64>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
             conn,
             sock,
             next: AtomicU64::new(0),
+            opening: Mutex::new(()),
             dead,
-        }))
+            draining,
+            goaway,
+            #[cfg(test)]
+            credit_waits: std::sync::atomic::AtomicUsize::new(0),
+        })
     }
 
     fn open(self: &Arc<Self>, block: &[u8], end_request: bool) -> Option<(H3Reader, H3StreamOut)> {
-        self.open_with(block, end_request, Arc::new(Activity::new()))
+        self.open_with(block, end_request, Arc::new(Activity::new()), None)
+            .ok()
+    }
+
+    /// A `NaiveProxy` CONNECT block: the caller frames its own tunnel, so no xHTTP writer is built, and its absolute handshake deadline carries through the opening write and the answer's first head.
+    pub(crate) fn open_block_until(
+        self: &Arc<Self>,
+        block: &[u8],
+        end_request: bool,
+        deadline: Instant,
+    ) -> Result<(H3Reader, H3StreamOut), H3OpenError> {
+        let (mut reader, out) = self.open_with(
+            block,
+            end_request,
+            Arc::new(Activity::new()),
+            Some(deadline),
+        )?;
+        reader.padding_head = true;
+        reader.connect = true;
+        Ok((reader, out))
     }
 
     fn open_with(
@@ -1141,17 +1664,27 @@ impl H3Client {
         block: &[u8],
         end_request: bool,
         activity: Arc<Activity>,
-    ) -> Option<(H3Reader, H3StreamOut)> {
-        if self.dead.load(Ordering::Relaxed) {
-            return None;
+        deadline: Option<Instant>,
+    ) -> Result<(H3Reader, H3StreamOut), H3OpenError> {
+        let expiry = deadline;
+        let deadline = deadline.unwrap_or_else(|| Instant::now() + crate::budgets::relay_stall());
+        let Ok(opening) = self.opening.lock() else {
+            return Err(H3OpenError::Closed);
+        };
+        if self.dead.load(Ordering::Relaxed) || self.draining.load(Ordering::Relaxed) {
+            return Err(H3OpenError::Closed);
         }
-        let id = self.next.fetch_add(4, Ordering::SeqCst);
+        let id = self.next.load(Ordering::SeqCst);
+        if self.rejected(id) {
+            return Err(H3OpenError::Closed);
+        }
         let wire = Wire::Client(ClientStream {
-            _owner: Arc::clone(self),
+            owner: Arc::clone(self),
             conn: Arc::clone(&self.conn),
             sock: Arc::clone(&self.sock),
             id,
             peer_fin: Arc::new(AtomicBool::new(false)),
+            reset: Arc::new(AtomicU64::new(0)),
             activity,
         });
         let mut frame = Vec::with_capacity(block.len() + 9);
@@ -1159,16 +1692,37 @@ impl H3Client {
         frames::quic_varint(&mut frame, block.len() as u64);
         frame.extend_from_slice(block);
         let mut writer = wire.clone();
-        if writer.write_all(&frame).is_err() {
-            return None;
+        let sent = match writer.opening_start(&frame, expiry) {
+            Ok(sent) => {
+                self.next.store(id + 4, Ordering::SeqCst);
+                sent
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(H3OpenError::Full);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                wire.close();
+                return Err(H3OpenError::Closed);
+            }
+            Err(_) => {
+                self.next.store(id + 4, Ordering::SeqCst);
+                wire.close();
+                return Err(H3OpenError::Closed);
+            }
+        };
+        drop(opening);
+        if sent < frame.len() && writer.opening_rest(&frame[sent..], sent, deadline).is_err() {
+            wire.close();
+            return Err(H3OpenError::Closed);
         }
         if end_request {
             wire.fin();
         }
-        Some((
-            H3Reader::new(wire.clone()),
-            H3StreamOut { wire, owner: None },
-        ))
+        let mut reader = H3Reader::new(wire.clone());
+        if expiry.is_some() {
+            reader.deadline = Some(deadline);
+        }
+        Ok((reader, H3StreamOut { wire, owner: None }))
     }
 
     /// One plain HTTP/3 request and its answer: the head becomes HEADERS, the body DATA, and the reply's status and body come back without the xhttp framing.
@@ -1247,7 +1801,7 @@ impl H3Client {
         let (head, body) = crate::xhttp::packet_head(host, settings, session, seq, piece);
         let block = block_from_text(&head, host, "https");
         let deadline = Instant::now() + crate::budgets::relay_stall();
-        let Some((mut reader, out)) = self.open_with(&block, false, activity) else {
+        let Some((mut reader, out)) = self.open_with(&block, false, activity, None).ok() else {
             return false;
         };
         reader.set_deadline(deadline);
@@ -1308,12 +1862,36 @@ fn drain_batch(
     true
 }
 
+/// The server control stream's identity and buffered frames, shared by the drain and idle sweeps.
+#[derive(Default)]
+struct ControlState {
+    buf: Vec<u8>,
+    id: Option<u64>,
+    skipped: Vec<u64>,
+    /// Peer QPACK encoder and decoder streams: critical, so their payload is drained but never stopped.
+    critical: Vec<u64>,
+    encoder: Option<u64>,
+    encoder_prefix: Vec<u8>,
+    encoder_checked: bool,
+    decoder: Option<u64>,
+    decoder_prefix: Vec<u8>,
+    skip: u64,
+    /// Whether the control stream's first frame was SETTINGS, as RFC 9114 requires.
+    settings: bool,
+    /// The stream-type bytes seen so far per unidirectional stream, so a varint split across reads
+    /// is not mistaken for an unknown stream and stopped.
+    types: HashMap<u64, Vec<u8>>,
+}
+
 /// Run the connection's timers and answer what they queued, once the sock has nothing left to read.
 fn sweep(
     conn: &Arc<Mutex<QuicheConnection>>,
     sock: &Datagram,
     local: SocketAddr,
     moved: bool,
+    control: &mut ControlState,
+    draining: &Arc<AtomicBool>,
+    goaway: &AtomicU64,
 ) -> bool {
     let Ok(mut conn) = conn.lock() else {
         return false;
@@ -1321,27 +1899,456 @@ fn sweep(
     if conn.is_closed() {
         return false;
     }
+    if conn.is_draining() {
+        draining.store(true, Ordering::Relaxed);
+    }
     conn.on_timeout();
     quic::flush_egress(&mut conn, sock);
     if moved && quic::path_failed(&mut conn, local) {
         let _ = conn.close(false, 0, b"rebind");
         return false;
     }
+    match h3_control_goaway(&mut conn, control, goaway) {
+        Some(true) => draining.store(true, Ordering::Relaxed),
+        Some(false) => {}
+        None => {
+            quic::flush_egress(&mut conn, sock);
+            return false;
+        }
+    }
     true
 }
 
+fn drain_stream(conn: &mut QuicheConnection, id: u64) {
+    let mut chunk = [0u8; 1024];
+    while let Ok((n, _)) = conn.stream_recv(id, &mut chunk) {
+        if n == 0 {
+            break;
+        }
+    }
+}
+
+/// Drain the peer's QPACK decoder stream, rejecting the Insert Count Increments and Section
+/// Acknowledgments a static-only encoder never produced. An empty stream is valid; a partial
+/// instruction waits.
+fn check_decoder_stream(conn: &mut QuicheConnection, control: &mut ControlState, id: u64) -> bool {
+    let mut chunk = [0u8; 1024];
+    while let Ok((n, _)) = conn.stream_recv(id, &mut chunk) {
+        if n == 0 {
+            break;
+        }
+        control.decoder_prefix.extend_from_slice(&chunk[..n]);
+    }
+    let mut at = 0;
+    while at < control.decoder_prefix.len() {
+        let first = control.decoder_prefix[at];
+        let prefix = if first & 0x80 != 0 { 7 } else { 6 };
+        let used = match decode_prefixed(&control.decoder_prefix, at, prefix) {
+            Prefix::Complete(used) => used,
+            Prefix::Incomplete => break,
+            Prefix::Invalid => return false,
+        };
+        if first & 0x80 != 0 || first & 0xc0 == 0 {
+            return false;
+        }
+        at += used;
+    }
+    control.decoder_prefix.drain(..at);
+    true
+}
+
+enum Prefix {
+    Complete(usize),
+    Incomplete,
+    Invalid,
+}
+
+/// The prefix integer at `at`, distinguishing bytes that can still complete from an integer that
+/// exceeds the decoder's bound.
+fn decode_prefixed(buf: &[u8], at: usize, prefix: u8) -> Prefix {
+    let mask = (1u8 << prefix) - 1;
+    let mut value = u64::from(buf[at] & mask);
+    let mut used = 1;
+    if u64::from(buf[at] & mask) < u64::from(mask) {
+        return Prefix::Complete(used);
+    }
+    let mut shift = 0u32;
+    while at + used < buf.len() {
+        let byte = buf[at + used];
+        used += 1;
+        if shift > 56 {
+            return Prefix::Invalid;
+        }
+        let Some(next) = value.checked_add(u64::from(byte & 0x7f) << shift) else {
+            return Prefix::Invalid;
+        };
+        value = next;
+        if byte & 0x80 == 0 {
+            return Prefix::Complete(used);
+        }
+        shift += 7;
+    }
+    Prefix::Incomplete
+}
+
+enum EncoderHead {
+    Pending,
+    Capacity,
+    Invalid,
+}
+
+enum EncoderCheck {
+    Pending,
+    Ok,
+    Fatal,
+}
+
+/// Read the QPACK encoder stream's mandatory first instruction, Set Dynamic Table Capacity. The
+/// client advertises zero, so a positive value is a stream error.
+fn read_qpack_capacity(conn: &mut QuicheConnection, id: u64, prefix: &mut Vec<u8>) -> EncoderHead {
+    loop {
+        if let Some(first) = prefix.first().copied() {
+            if first & 0xe0 != 0x20 {
+                return EncoderHead::Invalid;
+            }
+            let mut value = u64::from(first & 0x1f);
+            if value < 0x1f {
+                return EncoderHead::Capacity;
+            }
+            let mut shift = 0u32;
+            for byte in &prefix[1..] {
+                if shift > 56 {
+                    return EncoderHead::Invalid;
+                }
+                value = value.saturating_add(u64::from(byte & 0x7f) << shift);
+                if byte & 0x80 == 0 {
+                    return EncoderHead::Capacity;
+                }
+                shift += 7;
+            }
+        }
+        let mut byte = [0u8; 1];
+        match conn.stream_recv(id, &mut byte) {
+            Ok((1, fin)) => {
+                prefix.push(byte[0]);
+                if fin {
+                    return EncoderHead::Invalid;
+                }
+            }
+            Ok((_, _)) | Err(quiche::Error::Done) => return EncoderHead::Pending,
+            Err(_) => return EncoderHead::Invalid,
+        }
+    }
+}
+
+fn check_encoder_capacity(
+    conn: &mut QuicheConnection,
+    control: &mut ControlState,
+    id: u64,
+) -> EncoderCheck {
+    if control.encoder != Some(id) || control.encoder_checked {
+        return EncoderCheck::Ok;
+    }
+    match read_qpack_capacity(conn, id, &mut control.encoder_prefix) {
+        EncoderHead::Pending => EncoderCheck::Pending,
+        EncoderHead::Capacity | EncoderHead::Invalid => {
+            let _ = conn.close(
+                true,
+                QPACK_ENCODER_STREAM_ERROR,
+                b"encoder input at the advertised zero capacity",
+            );
+            EncoderCheck::Fatal
+        }
+    }
+}
+
+/// The server's HTTP/3 control stream: its type, SETTINGS, then a GOAWAY that ends new requests but
+/// not the tunnels already open. The stream is found by its type, and a partial frame stays
+/// buffered until the next read completes it.
+#[allow(clippy::too_many_lines)]
+fn h3_control_goaway(
+    conn: &mut QuicheConnection,
+    control: &mut ControlState,
+    goaway: &AtomicU64,
+) -> Option<bool> {
+    if control.id.is_some_and(|id| conn.stream_finished(id))
+        || control.critical.iter().any(|id| conn.stream_finished(*id))
+    {
+        let _ = conn.close(true, H3_CLOSED_CRITICAL_STREAM, b"critical stream closed");
+        return None;
+    }
+    if conn.readable().any(|id| id % 4 == 1) {
+        let _ = conn.close(
+            true,
+            H3_STREAM_CREATION_ERROR,
+            b"server-initiated bidirectional stream",
+        );
+        return None;
+    }
+    let ids: Vec<u64> = conn
+        .readable()
+        .filter(|id| *id % 4 == 3 && !control.skipped.contains(id))
+        .collect();
+    for id in ids {
+        if Some(id) != control.id {
+            if !control.critical.contains(&id) {
+                let Some(kind) = read_stream_varint(conn, id, &mut control.types) else {
+                    continue;
+                };
+                match kind {
+                    0 => {
+                        if control.id.is_some() {
+                            let _ = conn.close(
+                                true,
+                                H3_STREAM_CREATION_ERROR,
+                                b"duplicate control stream",
+                            );
+                            return None;
+                        }
+                        control.id = Some(id);
+                    }
+                    2 => {
+                        if control.encoder.is_some() {
+                            let _ = conn.close(
+                                true,
+                                H3_STREAM_CREATION_ERROR,
+                                b"duplicate qpack encoder",
+                            );
+                            return None;
+                        }
+                        // RFC 9204: QPACK encoder and decoder streams are critical; never STOP_SENDING them.
+                        control.encoder = Some(id);
+                        control.critical.push(id);
+                    }
+                    3 => {
+                        if control.decoder.is_some() {
+                            let _ = conn.close(
+                                true,
+                                H3_STREAM_CREATION_ERROR,
+                                b"duplicate qpack decoder",
+                            );
+                            return None;
+                        }
+                        control.decoder = Some(id);
+                        control.critical.push(id);
+                    }
+                    1 => {
+                        let _ = conn.close(true, H3_ID_ERROR, b"push stream without max push id");
+                        return None;
+                    }
+                    _ => {
+                        // An unknown stream has no reader here, so stop its payload holding credit.
+                        if conn.stream_shutdown(id, quiche::Shutdown::Read, 0).is_err() {
+                            control.skipped.push(id);
+                        }
+                        continue;
+                    }
+                }
+            }
+            if Some(id) != control.id {
+                if Some(id) == control.decoder && !check_decoder_stream(conn, control, id) {
+                    let _ = conn.close(true, QPACK_DECODER_STREAM_ERROR, b"qpack decoder input");
+                    return None;
+                }
+                match check_encoder_capacity(conn, control, id) {
+                    EncoderCheck::Pending => continue,
+                    EncoderCheck::Fatal => return None,
+                    EncoderCheck::Ok => {}
+                }
+                drain_stream(conn, id);
+                if control.critical.contains(&id) && conn.stream_finished(id) {
+                    let _ = conn.close(true, H3_CLOSED_CRITICAL_STREAM, b"critical stream closed");
+                    return None;
+                }
+                continue;
+            }
+        }
+        let mut chunk = [0u8; 1024];
+        while let Ok((n, _)) = conn.stream_recv(id, &mut chunk) {
+            control.buf.extend_from_slice(&chunk[..n]);
+        }
+        if conn.stream_finished(id) {
+            let _ = conn.close(true, H3_CLOSED_CRITICAL_STREAM, b"critical stream closed");
+            return None;
+        }
+    }
+    match h3_control_frames(
+        &mut control.buf,
+        &mut control.skip,
+        &mut control.settings,
+        goaway,
+    ) {
+        Ok(drain) => Some(drain),
+        Err(code) => {
+            let _ = conn.close(true, code, b"invalid control frame");
+            None
+        }
+    }
+}
+
+/// Consume buffered control frames, skipping an unknown payload as it arrives so the next frame
+/// still starts on its own boundary; a GOAWAY after a large frame is not lost with the payload.
+fn h3_control_frames(
+    control: &mut Vec<u8>,
+    skip: &mut u64,
+    settings: &mut bool,
+    goaway: &AtomicU64,
+) -> Result<bool, u64> {
+    if *skip > 0 {
+        let drop = (*skip).min(control.len() as u64) as usize;
+        control.drain(..drop);
+        *skip -= drop as u64;
+        if *skip > 0 {
+            return Ok(false);
+        }
+    }
+    let mut draining = false;
+    loop {
+        let mut at = 0;
+        let Some(kind) = frames::quic_read(&control[..], &mut at) else {
+            break;
+        };
+        let Some(len) = frames::quic_read(&control[..], &mut at) else {
+            break;
+        };
+        let Ok(len) = usize::try_from(len) else {
+            control.clear();
+            break;
+        };
+        if kind == 0x7 && !(1..=8).contains(&len) {
+            return Err(H3_FRAME_ERROR);
+        }
+        let Some(end) = at.checked_add(len) else {
+            control.clear();
+            break;
+        };
+        if !*settings {
+            if kind != 0x4 {
+                return Err(H3_MISSING_SETTINGS);
+            }
+            if end > control.len() {
+                break;
+            }
+            let mut cursor = at;
+            while cursor < end {
+                let Some(id) = frames::quic_read(&control[..end], &mut cursor) else {
+                    return Err(H3_FRAME_ERROR);
+                };
+                let Some(_value) = frames::quic_read(&control[..end], &mut cursor) else {
+                    return Err(H3_FRAME_ERROR);
+                };
+                // RFC 9114 7.2.4: the HTTP/2 settings identifiers are reserved here, so a peer that sends one has broken SETTINGS, not sent an extension.
+                if (0x02..=0x05).contains(&id) {
+                    return Err(H3_SETTINGS_ERROR);
+                }
+            }
+            *settings = true;
+            control.drain(..end);
+            continue;
+        }
+        // Only GOAWAY belongs on the server control stream; DATA, HEADERS, CANCEL_PUSH, SETTINGS, PUSH_PROMISE, MAX_PUSH_ID, PRIORITY_UPDATE and the HTTP/2 reserved types are H3_FRAME_UNEXPECTED, unassigned types ignored.
+        if matches!(
+            kind,
+            0x0 | 0x1 | 0x2 | 0x3 | 0x4 | 0x5 | 0x6 | 0x8 | 0x9 | 0xd | 0xF0700 | 0xF0701
+        ) {
+            return Err(H3_FRAME_UNEXPECTED);
+        }
+        if end > control.len() {
+            if kind != 0x7 {
+                let held = control.len().saturating_sub(at);
+                control.drain(..control.len());
+                *skip = (len - held) as u64;
+            }
+            break;
+        }
+        if kind == 0x7 {
+            let mut cursor = at;
+            let Some(cutoff) = frames::quic_read(&control[..end], &mut cursor) else {
+                return Err(H3_FRAME_ERROR);
+            };
+            if cursor != end {
+                return Err(H3_FRAME_ERROR);
+            }
+            if cutoff % 4 != 0 || cutoff > goaway.load(Ordering::SeqCst) {
+                return Err(H3_ID_ERROR);
+            }
+            goaway.fetch_min(cutoff, Ordering::SeqCst);
+            control.drain(..end);
+            draining = true;
+            continue;
+        }
+        control.drain(..end);
+    }
+    if *skip == 0 && control.len() > 64 * 1024 {
+        control.clear();
+    }
+    Ok(draining)
+}
+
+/// Read just the stream-type varint from a unidirectional stream, leaving its frames unread and
+/// keeping a partial varint until the next read completes it.
+fn read_stream_varint(
+    conn: &mut QuicheConnection,
+    id: u64,
+    types: &mut HashMap<u64, Vec<u8>>,
+) -> Option<u64> {
+    loop {
+        let (kind, len) = {
+            let bytes = types.entry(id).or_default();
+            let mut at = 0;
+            (frames::quic_read(bytes, &mut at), bytes.len())
+        };
+        if let Some(kind) = kind {
+            types.remove(&id);
+            return Some(kind);
+        }
+        if len >= 8 {
+            types.remove(&id);
+            return None;
+        }
+        let mut byte = [0u8; 1];
+        match conn.stream_recv(id, &mut byte) {
+            Ok((1, fin)) => {
+                types.entry(id).or_default().push(byte[0]);
+                if fin {
+                    let kind = types.get(&id).and_then(|bytes| {
+                        let mut at = 0;
+                        frames::quic_read(bytes, &mut at)
+                    });
+                    types.remove(&id);
+                    return kind;
+                }
+            }
+            Ok((_, fin)) => {
+                if fin {
+                    types.remove(&id);
+                }
+                return None;
+            }
+            Err(quiche::Error::Done) => return None,
+            Err(_) => {
+                types.remove(&id);
+                return None;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 fn pump_connection(
     conn: &Arc<Mutex<QuicheConnection>>,
     sock: &Arc<Datagram>,
     local: SocketAddr,
     peer: SocketAddr,
     generation: u64,
-    dead: &Arc<AtomicBool>,
+    draining: &Arc<AtomicBool>,
+    goaway: &AtomicU64,
 ) {
     let mut local = local;
     let mut generation = generation;
     let mut moved = false;
     let mut buf = vec![0u8; 65535];
+    let mut control = ControlState::default();
     #[cfg(target_os = "linux")]
     let mut batch = quic::Batch::new();
     loop {
@@ -1378,13 +2385,15 @@ fn pump_connection(
             }
             match quic::recv_batch(sock, &mut batch) {
                 quic::Drain::Read => {
-                    if drain_batch(conn, sock, local, &mut batch, moved) {
+                    if drain_batch(conn, sock, local, &mut batch, moved)
+                        && sweep(conn, sock, local, moved, &mut control, draining, goaway)
+                    {
                         continue;
                     }
                     break;
                 }
                 quic::Drain::Empty => {
-                    if sweep(conn, sock, local, moved) {
+                    if sweep(conn, sock, local, moved, &mut control, draining, goaway) {
                         continue;
                     }
                     break;
@@ -1407,11 +2416,10 @@ fn pump_connection(
                 ) => {}
             Err(_) => break,
         }
-        if !sweep(conn, sock, local, moved) {
+        if !sweep(conn, sock, local, moved, &mut control, draining, goaway) {
             break;
         }
     }
-    dead.store(true, Ordering::Relaxed);
 }
 
 struct H3Post {
@@ -1493,7 +2501,9 @@ pub(crate) fn connect_dual_split(
     let down = crate::xhttp::downlink_head(host, settings, &session);
     let block = block_from_text(&down, host, "https");
     let activity = Arc::new(Activity::new());
-    let (reader, _) = client.open_with(&block, true, Arc::clone(&activity))?;
+    let (reader, _) = client
+        .open_with(&block, true, Arc::clone(&activity), None)
+        .ok()?;
     let writer = if settings.mode == XhttpMode::PacketUp {
         crate::xhttp::XhttpWriter::packets_h3(
             Arc::clone(&client),
@@ -1505,7 +2515,7 @@ pub(crate) fn connect_dual_split(
     } else {
         let up = crate::xhttp::dial_head(host, settings, &session, None);
         let block = block_from_text(&up, host, "https");
-        let (_, out) = client.open_with(&block, false, activity)?;
+        let (_, out) = client.open_with(&block, false, activity, None).ok()?;
         let writer = crate::xhttp::XhttpWriter::new(NullWrite);
         writer.set_stream(crate::xhttp::StreamOut::H3(out));
         writer
@@ -1534,6 +2544,13 @@ pub(crate) fn packets(
 mod tests {
     use super::*;
     use crate::proxy::WindowRead;
+
+    #[test]
+    fn an_overlong_decoder_integer_is_invalid_not_incomplete() {
+        let mut buf = vec![0x7f];
+        buf.extend_from_slice(&[0xff; 10]);
+        assert!(matches!(decode_prefixed(&buf, 0, 6), Prefix::Invalid));
+    }
 
     struct Recorder(Arc<std::sync::Mutex<Option<std::io::ErrorKind>>>);
 
@@ -1613,7 +2630,18 @@ mod tests {
         identity: &ferrox_core::tls::TlsServerConfig,
         script: impl Fn(&Wire) + Send + Sync + 'static,
     ) -> u16 {
-        let config = quic::serve_config(identity).expect("the h3 server config");
+        serve_scripted_with_streams(identity, None, script)
+    }
+
+    fn serve_scripted_with_streams(
+        identity: &ferrox_core::tls::TlsServerConfig,
+        streams: Option<u64>,
+        script: impl Fn(&Wire) + Send + Sync + 'static,
+    ) -> u16 {
+        let mut config = quic::serve_config(identity).expect("the h3 server config");
+        if let Some(streams) = streams {
+            config.set_initial_max_streams_bidi(streams);
+        }
         let sock = quic::bind_datagram_plain("127.0.0.1:0").expect("the h3 server binds");
         let port = sock.local_addr().expect("the h3 server address").port();
         let serve: quic::Serve = Arc::new(move |stream| {
@@ -1635,6 +2663,32 @@ mod tests {
                 );
             })
             .expect("the h3 answer thread");
+        port
+    }
+
+    fn serve_ignored_with_streams(
+        identity: &ferrox_core::tls::TlsServerConfig,
+        streams: u64,
+        stream_window: u64,
+    ) -> u16 {
+        let mut config = quic::serve_config(identity).expect("the h3 server config");
+        config.set_initial_max_streams_bidi(streams);
+        config.set_initial_max_stream_data_bidi_remote(stream_window);
+        config.set_initial_max_data(1 << 20);
+        let sock = quic::bind_datagram_plain("127.0.0.1:0").expect("the h3 server binds");
+        let port = sock.local_addr().expect("the h3 server address").port();
+        let serve: quic::Serve = Arc::new(|_| {});
+        std::thread::Builder::new()
+            .name("xhttp-h3-ignored".to_owned())
+            .spawn(move || {
+                quic::serve_loop(
+                    Datagram::plain(sock),
+                    &Arc::new(Mutex::new(config)),
+                    &serve,
+                    &Arc::new(AtomicBool::new(false)),
+                );
+            })
+            .expect("the h3 ignored thread");
         port
     }
 
@@ -1703,6 +2757,87 @@ mod tests {
     }
 
     #[test]
+    fn a_full_h3_open_does_not_consume_a_stream_id() {
+        let (identity, roots) = minted_identity("localhost");
+        let port = serve_scripted_with_streams(&identity, Some(1), |_| {});
+        let client = client(port, roots);
+        let head = "POST /o HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let block = block_from_text(head, "localhost", "https");
+        let _first = client
+            .open_block_until(
+                &block,
+                false,
+                Instant::now() + crate::budgets::relay_stall(),
+            )
+            .expect("the first h3 stream opens");
+        assert!(matches!(
+            client.open_block_until(
+                &block,
+                false,
+                Instant::now() + crate::budgets::relay_stall()
+            ),
+            Err(H3OpenError::Full)
+        ));
+        assert_eq!(client.next.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn a_second_h3_open_completes_while_the_first_waits_for_credit() {
+        let (identity, roots) = minted_identity("localhost");
+        let port = serve_ignored_with_streams(&identity, 4, 100);
+        let client = client(port, roots);
+        let large = vec![b'x'; 200];
+        let small = vec![b'y'; 20];
+        let first_client = Arc::clone(&client);
+        let first = std::thread::spawn(move || {
+            first_client.open_block_until(
+                &large,
+                false,
+                Instant::now() + crate::budgets::relay_stall(),
+            )
+        });
+        let started = Instant::now();
+        while client.next.load(Ordering::SeqCst) == 0 || !client.waited_for_credit() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the first open never waited for credit"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let watchdog = {
+            let client = Arc::clone(&client);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                if !stop.load(Ordering::Relaxed) {
+                    client.dead.store(true, Ordering::Relaxed);
+                }
+            })
+        };
+        let second = client.open_block_until(
+            &small,
+            false,
+            Instant::now() + crate::budgets::relay_stall(),
+        );
+        assert!(
+            second.is_ok(),
+            "the second open completed while the first waited"
+        );
+        assert!(
+            !first.is_finished(),
+            "the first open finished instead of waiting for credit"
+        );
+        stop.store(true, Ordering::Relaxed);
+        client.dead.store(true, Ordering::Relaxed);
+        let _ = first.join();
+        let _ = watchdog.join();
+    }
+
+    #[test]
     fn an_h3_alpn_is_case_sensitive() {
         assert!(is_h3(&[b"h3".to_vec()]));
         assert!(!is_h3(&[b"H3".to_vec()]));
@@ -1710,15 +2845,35 @@ mod tests {
     }
 
     fn raw_stream(client: &Arc<H3Client>) -> Wire {
+        let _opening = client.opening.lock().expect("h3 opening lock");
         let id = client.next.fetch_add(4, Ordering::SeqCst);
         Wire::Client(ClientStream {
-            _owner: Arc::clone(client),
+            owner: Arc::clone(client),
             conn: Arc::clone(&client.conn),
             sock: Arc::clone(&client.sock),
             id,
             peer_fin: Arc::new(AtomicBool::new(false)),
+            reset: Arc::new(AtomicU64::new(0)),
             activity: Arc::new(Activity::new()),
         })
+    }
+
+    #[test]
+    fn a_dead_h3_client_fails_its_attached_streams() {
+        let (identity, roots) = minted_identity("localhost");
+        let port = serve_answer(&identity, "200", b"");
+        let client = client(port, roots);
+        let mut wire = raw_stream(&client);
+        client.dead.store(true, Ordering::Relaxed);
+        let mut room = [0u8; 1];
+        assert_eq!(
+            wire.read(&mut room).unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionReset
+        );
+        assert_eq!(
+            wire.write(b"x").unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
     }
 
     fn send_frame(wire: &Wire, kind: u64, payload: &[u8]) {
@@ -2317,5 +3472,291 @@ mod tests {
             .is_none(),
             "brutal is a Hysteria sender, not an h3 service controller"
         );
+    }
+
+    fn settings_frame(wire: &mut Vec<u8>) {
+        frames::quic_varint(wire, 0x4);
+        frames::quic_varint(wire, 0);
+    }
+
+    #[test]
+    fn a_large_control_frame_keeps_the_goaway_after_it() {
+        let mut wire = Vec::new();
+        settings_frame(&mut wire);
+        frames::quic_varint(&mut wire, 0x21);
+        frames::quic_varint(&mut wire, 65_536);
+        wire.extend(std::iter::repeat_n(0u8, 65_536));
+        frames::quic_varint(&mut wire, 0x7);
+        frames::quic_varint(&mut wire, 1);
+        frames::quic_varint(&mut wire, 4);
+        let split = 50_000;
+        let mut control = wire[..split].to_vec();
+        let mut skip = 0;
+        let mut settings = false;
+        let goaway = AtomicU64::new(u64::MAX);
+        assert_eq!(
+            h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+            Ok(false)
+        );
+        assert!(skip > 0, "the unknown payload is skipped incrementally");
+        control.extend_from_slice(&wire[split..]);
+        assert_eq!(
+            h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+            Ok(true)
+        );
+        assert_eq!(skip, 0);
+        assert_eq!(goaway.load(Ordering::SeqCst), 4);
+        assert_eq!(control, [] as [u8; 0]);
+    }
+
+    #[test]
+    fn a_goaway_that_increases_its_cutoff_is_an_error() {
+        let mut control = Vec::new();
+        settings_frame(&mut control);
+        frames::quic_varint(&mut control, 0x7);
+        frames::quic_varint(&mut control, 1);
+        frames::quic_varint(&mut control, 12);
+        let goaway = AtomicU64::new(8);
+        let mut skip = 0;
+        let mut settings = false;
+        assert_eq!(
+            h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+            Err(H3_ID_ERROR),
+            "RFC 9114 rejects a cutoff above the one already accepted"
+        );
+        assert_eq!(goaway.load(Ordering::SeqCst), 8);
+    }
+
+    #[test]
+    fn a_goaway_must_name_a_client_bidirectional_stream() {
+        let mut control = Vec::new();
+        settings_frame(&mut control);
+        frames::quic_varint(&mut control, 0x7);
+        frames::quic_varint(&mut control, 1);
+        frames::quic_varint(&mut control, 1);
+        let goaway = AtomicU64::new(u64::MAX);
+        let mut skip = 0;
+        let mut settings = false;
+        assert_eq!(
+            h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+            Err(H3_ID_ERROR),
+            "a server stream is not a client request cutoff"
+        );
+        assert_eq!(goaway.load(Ordering::SeqCst), u64::MAX);
+    }
+
+    #[test]
+    fn a_control_stream_must_start_with_settings() {
+        let mut control = Vec::new();
+        frames::quic_varint(&mut control, 0x7);
+        frames::quic_varint(&mut control, 1);
+        frames::quic_varint(&mut control, 4);
+        let goaway = AtomicU64::new(u64::MAX);
+        let mut skip = 0;
+        let mut settings = false;
+        assert_eq!(
+            h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+            Err(H3_MISSING_SETTINGS)
+        );
+        assert_eq!(goaway.load(Ordering::SeqCst), u64::MAX);
+    }
+
+    #[test]
+    fn settings_split_across_sweeps_keeps_the_first_frame() {
+        let mut control = vec![0x04, 0x02, 0x01];
+        let goaway = AtomicU64::new(u64::MAX);
+        let mut skip = 0;
+        let mut settings = false;
+        assert_eq!(
+            h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+            Ok(false)
+        );
+        assert!(
+            !settings,
+            "the first SETTINGS frame is validated only once its payload is complete"
+        );
+        control.extend_from_slice(&[0x00, 0x07, 0x01, 0x04]);
+        assert_eq!(
+            h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+            Ok(true)
+        );
+        assert_eq!(goaway.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn a_goaway_with_trailing_bytes_is_a_frame_error() {
+        let mut control = Vec::new();
+        settings_frame(&mut control);
+        frames::quic_varint(&mut control, 0x7);
+        frames::quic_varint(&mut control, 2);
+        frames::quic_varint(&mut control, 4);
+        control.push(0);
+        let goaway = AtomicU64::new(u64::MAX);
+        let mut skip = 0;
+        let mut settings = false;
+        assert_eq!(
+            h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+            Err(H3_FRAME_ERROR)
+        );
+        assert_eq!(goaway.load(Ordering::SeqCst), u64::MAX);
+    }
+
+    #[test]
+    fn a_second_settings_is_a_frame_error() {
+        let mut control = Vec::new();
+        settings_frame(&mut control);
+        settings_frame(&mut control);
+        let goaway = AtomicU64::new(u64::MAX);
+        let mut skip = 0;
+        let mut settings = false;
+        assert_eq!(
+            h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+            Err(H3_FRAME_UNEXPECTED)
+        );
+    }
+
+    #[test]
+    fn data_on_the_control_stream_is_a_frame_error() {
+        let mut control = Vec::new();
+        settings_frame(&mut control);
+        frames::quic_varint(&mut control, 0x0);
+        frames::quic_varint(&mut control, 1);
+        control.push(0);
+        let goaway = AtomicU64::new(u64::MAX);
+        let mut skip = 0;
+        let mut settings = false;
+        assert_eq!(
+            h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+            Err(H3_FRAME_UNEXPECTED)
+        );
+    }
+
+    #[test]
+    fn http2_reserved_control_frames_are_unexpected() {
+        for kind in [0x2, 0x3, 0x6, 0x8, 0x9, 0xd] {
+            let mut control = Vec::new();
+            settings_frame(&mut control);
+            frames::quic_varint(&mut control, kind);
+            frames::quic_varint(&mut control, 0);
+            let goaway = AtomicU64::new(u64::MAX);
+            let mut skip = 0;
+            let mut settings = false;
+            assert_eq!(
+                h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+                Err(H3_FRAME_UNEXPECTED),
+                "frame {kind:#x} is reserved by HTTP/2 and cannot ride a control stream"
+            );
+        }
+    }
+
+    #[test]
+    fn priority_update_on_the_server_control_stream_is_unexpected() {
+        for kind in [0xf0700, 0xf0701] {
+            let mut control = Vec::new();
+            settings_frame(&mut control);
+            frames::quic_varint(&mut control, kind);
+            frames::quic_varint(&mut control, 0);
+            let goaway = AtomicU64::new(u64::MAX);
+            let mut skip = 0;
+            let mut settings = false;
+            assert_eq!(
+                h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+                Err(H3_FRAME_UNEXPECTED),
+                "frame {kind:#x} is server-to-client only"
+            );
+        }
+    }
+
+    #[test]
+    fn a_settings_payload_without_a_value_is_a_frame_error() {
+        let mut control = Vec::new();
+        frames::quic_varint(&mut control, 0x4);
+        frames::quic_varint(&mut control, 1);
+        frames::quic_varint(&mut control, 1);
+        let goaway = AtomicU64::new(u64::MAX);
+        let mut skip = 0;
+        let mut settings = false;
+        assert_eq!(
+            h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+            Err(H3_FRAME_ERROR)
+        );
+    }
+
+    #[test]
+    fn http2_reserved_settings_identifiers_are_settings_errors() {
+        for id in [0x2, 0x3, 0x4, 0x5] {
+            let mut control = Vec::new();
+            frames::quic_varint(&mut control, 0x4);
+            frames::quic_varint(&mut control, 2);
+            frames::quic_varint(&mut control, id);
+            frames::quic_varint(&mut control, 0);
+            let goaway = AtomicU64::new(u64::MAX);
+            let mut skip = 0;
+            let mut settings = false;
+            assert_eq!(
+                h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+                Err(H3_SETTINGS_ERROR),
+                "setting {id:#x} is reserved by HTTP/2"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unassigned_control_frame_is_ignored() {
+        let mut control = Vec::new();
+        settings_frame(&mut control);
+        frames::quic_varint(&mut control, 0xe);
+        frames::quic_varint(&mut control, 0);
+        let goaway = AtomicU64::new(u64::MAX);
+        let mut skip = 0;
+        let mut settings = false;
+        assert_eq!(
+            h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+            Ok(false)
+        );
+        assert_eq!(control, [] as [u8; 0]);
+    }
+
+    #[test]
+    fn a_goaway_length_outside_one_to_eight_is_a_frame_error() {
+        for len in [0, 9] {
+            let mut control = Vec::new();
+            settings_frame(&mut control);
+            frames::quic_varint(&mut control, 0x7);
+            frames::quic_varint(&mut control, len);
+            let goaway = AtomicU64::new(u64::MAX);
+            let mut skip = 0;
+            let mut settings = false;
+            assert_eq!(
+                h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+                Err(H3_FRAME_ERROR),
+                "a GOAWAY payload is one varint, so length {len} cannot be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn every_complete_goaway_in_one_sweep_applies() {
+        let mut control = Vec::new();
+        settings_frame(&mut control);
+        frames::quic_varint(&mut control, 0x7);
+        frames::quic_varint(&mut control, 1);
+        frames::quic_varint(&mut control, 8);
+        frames::quic_varint(&mut control, 0x7);
+        frames::quic_varint(&mut control, 1);
+        frames::quic_varint(&mut control, 4);
+        let goaway = AtomicU64::new(u64::MAX);
+        let mut skip = 0;
+        let mut settings = false;
+        assert_eq!(
+            h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+            Ok(true)
+        );
+        assert_eq!(
+            goaway.load(Ordering::SeqCst),
+            4,
+            "the later complete GOAWAY lowers the cutoff before the lock is released"
+        );
+        assert_eq!(control, [] as [u8; 0]);
     }
 }

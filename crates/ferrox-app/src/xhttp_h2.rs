@@ -4,24 +4,35 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::h2::{
-    block_encode, frame_head, write_frame, Decoder, E_COMPRESSION, E_FRAME_SIZE, E_PROTOCOL,
-    E_REFUSED, F_ACK, F_END, F_END_HEADERS, F_PADDED, F_PRIORITY, HEAD_CAP, MAGIC, S_MAX_FRAME,
-    S_WINDOW, T_CONT, T_DATA, T_GOAWAY, T_HEADERS, T_PING, T_RST, T_SETTINGS, T_WINDOW, WINDOW,
+    block_encode, frame_head, write_frame, Decoder, E_CANCEL, E_COMPRESSION, E_FRAME_SIZE,
+    E_PROTOCOL, E_REFUSED, F_ACK, F_END, F_END_HEADERS, F_PADDED, F_PRIORITY, HEAD_CAP, MAGIC,
+    S_MAX_CONCURRENT, S_MAX_FRAME, S_WINDOW, T_CONT, T_DATA, T_GOAWAY, T_HEADERS, T_PING, T_RST,
+    T_SETTINGS, T_WINDOW, WINDOW, WINDOW_MAX,
 };
 use crate::proxy::{VlessUser, VlessUsers};
 use crate::xhttp::XhttpSettings;
 
 const CONN_WINDOW_TOP_UP: u32 = 16 * 1024 * 1024 - 65_535;
+/// The status word keeps the decoded code and whether the response carried a `Padding` header.
+const PADDING_BIT: u16 = 1 << 15;
 const MAX_STREAMS: u32 = 100;
 /// The default `SETTINGS_MAX_FRAME_SIZE` (RFC 7540 6.5.2): the largest inbound frame we accept because we never advertise a larger one.
 const MAX_RECV_FRAME: usize = 16_384;
-/// The queued body one stream may hold before it is reset: the stream window plus one in-flight frame. A peer that keeps sending past its window is refused here rather than growing the queue.
-const BODY_CAP: usize = WINDOW as usize + MAX_RECV_FRAME;
-/// The queued chunks one stream may hold before it is reset: a peer that sends one byte per frame spends a walk over every frame on each arrival unless the count is bounded too.
+/// The floor of the queued chunks one stream may hold before it is reset: a peer that sends one
+/// byte per frame spends a walk over every frame on each arrival unless the count is bounded too.
 const BODY_CHUNKS: usize = 4096;
+/// The frame size the chunk floor is scaled against: a full advertised window of 4 KiB DATA
+/// frames must queue without a reset, while the byte bound still caps the memory retained.
+const BODY_CHUNK_BYTES: usize = 4096;
+
+fn body_chunk_limit(window: u32) -> usize {
+    (window as usize)
+        .div_ceil(BODY_CHUNK_BYTES)
+        .max(BODY_CHUNKS)
+}
 /// The two `WINDOW_UPDATE` frames one credit grants differ only by stream id, so twenty of their twenty-six bytes are constant; the connection frame keeps the first slot because that is the order it was written in.
 const CREDIT_TEMPLATE: [u8; 26] = {
     let mut out = [0u8; 26];
@@ -57,6 +68,7 @@ struct DataBatch<'a> {
     bodies: [[&'a [u8]; 4]; DATA_FRAMES_PER_WRITE],
     counts: [u8; DATA_FRAMES_PER_WRITE],
     used: usize,
+    completed: usize,
 }
 
 /// The suffix of a frame after the first `skip` bytes, with its head length and part count corrected.
@@ -66,7 +78,8 @@ fn trim_frame<'a>(
     count: u8,
     skip: usize,
 ) -> ([u8; 9], [&'a [u8]; 4], u8) {
-    let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+    let len =
+        usize::try_from(u32::from_be_bytes([0, head[0], head[1], head[2]])).unwrap_or(usize::MAX);
     let id = u32::from_be_bytes([head[5], head[6], head[7], head[8]]);
     let mut left = skip;
     let mut kept = [NO_PART; 4];
@@ -90,6 +103,7 @@ impl<'a> DataBatch<'a> {
             bodies: [[NO_PART; 4]; DATA_FRAMES_PER_WRITE],
             counts: [0; DATA_FRAMES_PER_WRITE],
             used: 0,
+            completed: 0,
         }
     }
 
@@ -174,6 +188,7 @@ impl<'a> DataBatch<'a> {
                 None => {
                     drop(credit);
                     self.refund_reserved(conn);
+                    self.used = 0;
                     return false;
                 }
             }
@@ -181,6 +196,7 @@ impl<'a> DataBatch<'a> {
             if left.is_zero() {
                 drop(credit);
                 self.refund_reserved(conn);
+                self.used = 0;
                 return false;
             }
             drop(gate);
@@ -192,6 +208,7 @@ impl<'a> DataBatch<'a> {
                             || self.fitting_prefix(conn)
                     },
                     crate::proxy::relay_step_owns_poll(),
+                    None,
                 );
                 gate = conn
                     .batch_gate
@@ -200,6 +217,7 @@ impl<'a> DataBatch<'a> {
                 match pumped {
                     Pumped::Dead => {
                         self.refund_reserved(conn);
+                        self.used = 0;
                         return false;
                     }
                     Pumped::Yield => pump = false,
@@ -221,6 +239,7 @@ impl<'a> DataBatch<'a> {
             pump = true;
             if timed_out {
                 self.refund_reserved(conn);
+                self.used = 0;
                 return false;
             }
         }
@@ -327,7 +346,8 @@ impl<'a> DataBatch<'a> {
         let mut included = 0;
         for at in 0..self.used {
             let head = &self.heads[at];
-            let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+            let len = usize::try_from(u32::from_be_bytes([0, head[0], head[1], head[2]]))
+                .unwrap_or(usize::MAX);
             let id = u32::from_be_bytes([head[5], head[6], head[7], head[8]]);
             let slot = budgets[..streams]
                 .iter_mut()
@@ -359,12 +379,26 @@ impl<'a> DataBatch<'a> {
         heads: &[[u8; 9]; DATA_FRAMES_PER_WRITE],
         included: usize,
     ) -> bool {
+        let Ok(mut write) = conn.write.lock() else {
+            return false;
+        };
+        let max = conn.max_frame.load(Ordering::SeqCst);
+        let mut capped = [[0u8; 9]; DATA_FRAMES_PER_WRITE];
+        let mut take = [0usize; DATA_FRAMES_PER_WRITE];
+        for at in 0..included {
+            let id = u32::from_be_bytes([heads[at][5], heads[at][6], heads[at][7], heads[at][8]]);
+            take[at] = fit[at].min(max);
+            capped[at] = frame_head(take[at], T_DATA, 0, id);
+        }
+        let written = (0..included)
+            .find(|&at| take[at] < fit[at])
+            .map_or(included, |at| at + 1);
         let mut parts: [&[u8]; 5 * DATA_FRAMES_PER_WRITE] = [NO_PART; 5 * DATA_FRAMES_PER_WRITE];
         let mut pieces = 0;
-        for at in 0..included {
-            parts[pieces] = &heads[at];
+        for at in 0..written {
+            parts[pieces] = &capped[at];
             pieces += 1;
-            let mut left = fit[at];
+            let mut left = take[at];
             for body in &self.bodies[at][..self.counts[at] as usize] {
                 if left == 0 {
                     break;
@@ -380,33 +414,31 @@ impl<'a> DataBatch<'a> {
         if pieces == 0 {
             return false;
         }
-        let Ok(mut write) = conn.write.lock() else {
-            return false;
-        };
         if !write.write_slices(&parts[..pieces]) {
             conn.dead.store(true, Ordering::SeqCst);
             return false;
         }
         drop(write);
+        self.completed += take[..written].iter().sum::<usize>();
         let mut new_heads = self.heads;
         let mut new_bodies = self.bodies;
         let mut new_counts = self.counts;
         let mut used = 0;
-        for at in 0..included {
+        for at in 0..written {
             let len =
                 u32::from_be_bytes([0, self.heads[at][0], self.heads[at][1], self.heads[at][2]])
                     as usize;
-            if fit[at] == len {
+            if take[at] == len {
                 continue;
             }
             let (head, bodies, count) =
-                trim_frame(&self.heads[at], &self.bodies[at], self.counts[at], fit[at]);
+                trim_frame(&self.heads[at], &self.bodies[at], self.counts[at], take[at]);
             new_heads[used] = head;
             new_bodies[used] = bodies;
             new_counts[used] = count;
             used += 1;
         }
-        for at in included..self.used {
+        for at in written..self.used {
             new_heads[used] = self.heads[at];
             new_bodies[used] = self.bodies[at];
             new_counts[used] = self.counts[at];
@@ -417,6 +449,16 @@ impl<'a> DataBatch<'a> {
         self.counts = new_counts;
         self.used = used;
         true
+    }
+
+    /// The prefix already on the wire, with the unsent reservation returned to the connection.
+    fn short(&mut self, conn: &H2Conn) -> std::io::Result<usize> {
+        self.refund_reserved(conn);
+        if self.completed == 0 {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        } else {
+            Ok(self.completed)
+        }
     }
 
     /// Return the credit a batch that will never be written took from the connection and its stream.
@@ -450,6 +492,63 @@ impl<'a> DataBatch<'a> {
         conn.wake.notify_all();
     }
 
+    /// Whether a reserved frame is wider than the peer's latest limit, so the batch must be split
+    /// before it reaches the wire.
+    fn exceeds(&self, max: usize) -> bool {
+        self.heads.iter().take(self.used).any(|head| {
+            usize::try_from(u32::from_be_bytes([0, head[0], head[1], head[2]]))
+                .unwrap_or(usize::MAX)
+                > max
+        })
+    }
+
+    /// Emit a batch whose frames were sized under an older, larger limit as DATA frames no wider
+    /// than the current one. The caller holds the write lock, so the peer's ACK cannot precede it.
+    fn flush_split_locked(
+        &mut self,
+        conn: &H2Conn,
+        write: &mut (dyn crate::proxy::FrameWrite + Send),
+        max: usize,
+    ) -> bool {
+        let used = std::mem::take(&mut self.used);
+        for at in 0..used {
+            let head = self.heads[at];
+            let id = u32::from_be_bytes([head[5], head[6], head[7], head[8]]);
+            let mut body = 0;
+            let mut offset = 0;
+            let mut left = usize::try_from(u32::from_be_bytes([0, head[0], head[1], head[2]]))
+                .unwrap_or(usize::MAX);
+            while left > 0 {
+                let take = left.min(max);
+                let split = frame_head(take, T_DATA, 0, id);
+                let mut parts: [&[u8]; 5] = [NO_PART; 5];
+                parts[0] = &split;
+                let mut pieces = 1;
+                let mut need = take;
+                while need > 0 {
+                    let part = &self.bodies[at][body];
+                    if offset == part.len() {
+                        body += 1;
+                        offset = 0;
+                        continue;
+                    }
+                    let fit = (part.len() - offset).min(need);
+                    parts[pieces] = &part[offset..offset + fit];
+                    pieces += 1;
+                    need -= fit;
+                    left -= fit;
+                    offset += fit;
+                }
+                if !write.write_slices(&parts[..pieces]) {
+                    conn.dead.store(true, Ordering::SeqCst);
+                    return false;
+                }
+                self.completed += take;
+            }
+        }
+        true
+    }
+
     /// The same bytes into a write half the caller already holds: a lane takes the lock without
     /// waiting, so a busy writer parks the lane instead of stacking workers behind the mutex.
     fn flush_locked(
@@ -459,6 +558,52 @@ impl<'a> DataBatch<'a> {
     ) -> bool {
         if self.used == 0 {
             return true;
+        }
+        let max = conn.max_frame.load(Ordering::SeqCst);
+        if self.exceeds(max) {
+            return self.flush_split_locked(conn, write, max);
+        }
+        let mut parts: [&[u8]; 5 * DATA_FRAMES_PER_WRITE] = [NO_PART; 5 * DATA_FRAMES_PER_WRITE];
+        let mut pieces = 0;
+        for at in 0..self.used {
+            parts[pieces] = &self.heads[at];
+            pieces += 1;
+            for body in &self.bodies[at][..self.counts[at] as usize] {
+                if !body.is_empty() {
+                    parts[pieces] = body;
+                    pieces += 1;
+                }
+            }
+        }
+        let total: usize = self
+            .heads
+            .iter()
+            .take(self.used)
+            .map(|head| u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize)
+            .sum();
+        self.used = 0;
+        if !write.write_slices(&parts[..pieces]) {
+            conn.dead.store(true, Ordering::SeqCst);
+            return false;
+        }
+        self.completed += total;
+        true
+    }
+
+    /// The non-blocking form: the writer takes the batch into its own paced tail or parks the
+    /// lane, so a full transport never holds a shared relay worker.
+    fn flush_ready(
+        &mut self,
+        conn: &H2Conn,
+        write: &mut (dyn crate::proxy::FrameWrite + Send),
+    ) -> crate::proxy::Accepted {
+        if self.used == 0 {
+            return crate::proxy::Accepted::All;
+        }
+        let max = conn.max_frame.load(Ordering::SeqCst);
+        if self.exceeds(max) {
+            self.used = 0;
+            return crate::proxy::Accepted::Full;
         }
         let mut parts: [&[u8]; 5 * DATA_FRAMES_PER_WRITE] = [NO_PART; 5 * DATA_FRAMES_PER_WRITE];
         let mut pieces = 0;
@@ -473,11 +618,11 @@ impl<'a> DataBatch<'a> {
             }
         }
         self.used = 0;
-        if !write.write_slices(&parts[..pieces]) {
+        let accepted = write.offer_slices(&parts[..pieces]);
+        if matches!(accepted, crate::proxy::Accepted::Lost) {
             conn.dead.store(true, Ordering::SeqCst);
-            return false;
         }
-        true
+        accepted
     }
 }
 
@@ -511,6 +656,11 @@ impl H2StreamOut {
         self.conn.send_data(self.stream, payload)
     }
 
+    /// Exact progress, with `WouldBlock` only when no byte of this offer was sent.
+    pub(crate) fn data_progress(&self, payload: &[u8]) -> std::io::Result<usize> {
+        self.conn.send_data_progress(self.stream, payload)
+    }
+
     /// The same offer for bodies built from several slices: each group is one frame, its parts
     /// written side by side, so a gRPC envelope and its payload stay one message in one frame.
     pub(crate) fn batch_parts(&self, groups: &[&[&[u8]]]) -> bool {
@@ -523,12 +673,27 @@ impl H2StreamOut {
         self.conn.try_send_grouped(self.stream, groups)
     }
 
+    /// One relay offer that never blocks: the writer either takes the whole batch into its paced
+    /// tail, parks the lane, or reports the connection gone.
+    pub(crate) fn try_data_ready(&self, data: &[u8]) -> Option<bool> {
+        self.conn.try_send_one_ready(self.stream, data)
+    }
+
+    pub(crate) fn frame_batch_capacity(&self) -> usize {
+        self.conn.frame_batch_capacity()
+    }
+
     pub(crate) fn room(&self) -> u64 {
         self.conn.room(self.stream)
     }
 
     pub(crate) fn wait_room(&self, turn: std::time::Duration) {
         self.conn.wait_room(self.stream, turn);
+    }
+
+    /// Wait when the transport refused an offer despite both windows having room.
+    pub(crate) fn wait_transport(&self, turn: std::time::Duration) {
+        self.conn.wait_transport(self.stream, turn);
     }
 
     pub(crate) fn settle(&self) -> crate::proxy::Settle {
@@ -557,10 +722,15 @@ impl H2StreamOut {
         self.conn.respond_trailers(self.stream, block)
     }
 
+    /// A CONNECT stream keeps its download open when the upload half ends.
+    pub(crate) fn mark_tunnel(&self) {
+        self.conn.mark_tunnel(self.stream);
+    }
+
     /// The request is refused with its body unread: an `RST_STREAM` frees the stream and the credit
     /// it would otherwise keep granting a body nobody drains.
     pub(crate) fn reset(&self) {
-        self.conn.reset(self.stream);
+        self.conn.reset_or_cancel(self.stream);
     }
 }
 
@@ -569,6 +739,7 @@ pub(crate) struct H2Stream {
     cv: Condvar,
     send_window: Mutex<i64>,
     responded: AtomicBool,
+    cancelled: AtomicBool,
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -583,6 +754,8 @@ struct StreamState {
     finished: bool,
     /// The request half ended locally: the peer still owes the response, so it does not end the read.
     request_ended: bool,
+    /// A CONNECT tunnel's request half is the upload: its `END_STREAM` does not end the download.
+    tunnel: bool,
     /// The upload reader left at a finished response while the client still holds the request open.
     abandoned: bool,
     /// The session ended under the reader, so later DATA is discarded instead of queued for an answer already owed.
@@ -599,7 +772,7 @@ impl StreamState {
     /// ending on the side that reads requests. A client's request half ending still expects an
     /// answer on the same stream.
     fn read_ended(&self) -> bool {
-        self.ended || (self.finished && !self.request_ended)
+        self.ended || (self.finished && !self.request_ended && !self.tunnel)
     }
 
     /// Both halves are done, so the stream can retire: the peer's `END_STREAM` and the half this
@@ -791,14 +964,30 @@ pub(crate) struct H2Conn {
     /// Serializes bind, release and the dead-connection drain of the three maps above.
     session_gate: Mutex<()>,
     send_conn: Mutex<u64>,
+    conn_credit: AtomicUsize,
+    /// Readers parked on a stream body, so held connection credit wakes one instead of waiting out
+    /// its timeout while a sibling's bytes sit below the batch threshold.
+    waiting: AtomicUsize,
     /// Held across a reserved batch write so a SETTINGS window change cannot land before it.
     batch_gate: Mutex<()>,
     wake: Condvar,
     decoder: Mutex<Decoder>,
-    max_frame: Mutex<usize>,
+    max_frame: AtomicUsize,
     peer_initial: Mutex<u64>,
+    peer_max: AtomicUsize,
+    /// The stream window this end advertises, and the connection credit it opens with: a carrier
+    /// that names its own receive window sets both, a plain xHTTP connection keeps the defaults.
+    recv_window: u32,
+    conn_top_up: u32,
+    /// The queued-chunk ceiling for this connection's advertised stream window.
+    body_chunks: usize,
     dead: Arc<AtomicBool>,
+    /// Serializes a new stream's HEADERS with GOAWAY publication, so a selected client that has
+    /// just been told to stop cannot still admit a request.
+    open_gate: Mutex<()>,
     goaway: AtomicBool,
+    /// The peer's GOAWAY cutoff: requests above it were explicitly not processed.
+    goaway_last: AtomicU32,
     refused: AtomicBool,
     /// The client half's transport: a client pumps frames on demand from its reader or a writer
     /// waiting for credit, so one thread owns the session and no parser thread outlives it.
@@ -854,7 +1043,26 @@ impl H2StreamReader {
     pub(crate) fn reset_handle(&self) -> impl FnOnce() + Send + 'static {
         let conn = Arc::clone(&self.conn);
         let id = self.id;
-        move || conn.reset(id)
+        move || conn.reset_or_cancel(id)
+    }
+
+    fn wait<'a>(
+        &self,
+        st: std::sync::MutexGuard<'a, StreamState>,
+        turn: Duration,
+    ) -> (std::sync::MutexGuard<'a, StreamState>, bool) {
+        self.conn.waiting.fetch_add(1, Ordering::SeqCst);
+        if self.conn.conn_credit.load(Ordering::SeqCst) > 0 {
+            self.conn.waiting.fetch_sub(1, Ordering::SeqCst);
+            return (st, false);
+        }
+        let (st, out) = self
+            .stream
+            .cv
+            .wait_timeout(st, turn)
+            .unwrap_or_else(PoisonError::into_inner);
+        self.conn.waiting.fetch_sub(1, Ordering::SeqCst);
+        (st, out.timed_out())
     }
 
     /// The response status decoded for a client stream, once its head has arrived.
@@ -864,6 +1072,62 @@ impl H2StreamReader {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .status
+            .map(|status| status & !PADDING_BIT)
+    }
+
+    /// Pump until the response head lands, then report its status and whether it carried `Padding`.
+    pub(crate) fn wait_head(&self, deadline: std::time::Instant) -> Option<(u16, bool)> {
+        loop {
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            {
+                let st = self
+                    .stream
+                    .state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if st.dead
+                    || self.conn.dead.load(Ordering::SeqCst)
+                    || self.unprocessed()
+                    || (st.status.is_none() && st.read_ended())
+                {
+                    return None;
+                }
+                if let Some(status) = st.status {
+                    return Some((status & !PADDING_BIT, status & PADDING_BIT != 0));
+                }
+            }
+            match self.pump_head(deadline) {
+                Pumped::Alive => {}
+                Pumped::Yield => std::thread::sleep(crate::budgets::RELAY_POLL),
+                Pumped::Dead => return None,
+            }
+        }
+    }
+
+    /// Whether the peer's GOAWAY cutoff explicitly excluded this request, the only failed outcome
+    /// that is safe to replay.
+    pub(crate) fn unprocessed(&self) -> bool {
+        self.conn.goaway.load(Ordering::SeqCst)
+            && self.id > self.conn.goaway_last.load(Ordering::SeqCst)
+    }
+
+    /// A head wait returns as soon as the status is decoded, even while another stream's reader
+    /// holds the transport read lock: only the body predicate has to wait for a frame.
+    fn pump_head(&self, deadline: std::time::Instant) -> Pumped {
+        self.conn.pump_read(
+            || {
+                let st = self
+                    .stream
+                    .state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                st.status.is_some() || st.dead || st.read_ended() || self.unprocessed()
+            },
+            false,
+            Some(deadline),
+        )
     }
 }
 
@@ -908,6 +1172,7 @@ impl H2StreamReader {
                 !st.body.is_empty() || st.read_ended() || st.dead
             },
             yieldable,
+            None,
         )
     }
 }
@@ -979,6 +1244,7 @@ impl Read for H2StreamReader {
             }
             if self.conn.client_read.is_some() {
                 drop(st);
+                self.conn.flush_connection_credit();
                 match self.pump(crate::proxy::relay_step_owns_poll()) {
                     Pumped::Alive => {}
                     Pumped::Yield => {
@@ -994,30 +1260,50 @@ impl Read for H2StreamReader {
             // A lane step owns its thread for one poll; a body idle for the whole stall still ends.
             if crate::proxy::relay_step_owns_poll() {
                 let since = *self.idle_since.get_or_insert_with(std::time::Instant::now);
-                if since.elapsed() >= crate::budgets::relay_stall() {
+                let left = crate::budgets::relay_stall().saturating_sub(since.elapsed());
+                if left.is_zero() {
                     drop(st);
                     self.conn.forget_upload(self.id);
                     return Err(std::io::Error::other("h2 body stalled"));
                 }
-                let (_guard, wait) = self
+                drop(st);
+                self.conn.flush_connection_credit();
+                st = self
                     .stream
-                    .cv
-                    .wait_timeout(st, crate::budgets::RELAY_POLL)
+                    .state
+                    .lock()
                     .unwrap_or_else(PoisonError::into_inner);
-                if wait.timed_out() {
+                if !st.body.is_empty() || st.read_ended() || st.dead {
+                    continue;
+                }
+                let (_guard, wait) = self.wait(st, crate::budgets::RELAY_POLL.min(left));
+                if wait {
                     return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
                 }
                 continue;
             }
             // A body read carries its arrival deadline, so a withheld DATA frame ends there instead of at the stall.
-            let (wait_for, deadline_bounded) = body_wait(crate::budgets::relay_stall());
-            let (next, wait) = self
+            drop(st);
+            self.conn.flush_connection_credit();
+            st = self
                 .stream
-                .cv
-                .wait_timeout(st, wait_for)
+                .state
+                .lock()
                 .unwrap_or_else(PoisonError::into_inner);
+            if !st.body.is_empty() || st.read_ended() || st.dead {
+                continue;
+            }
+            let since = *self.idle_since.get_or_insert_with(std::time::Instant::now);
+            let left = crate::budgets::relay_stall().saturating_sub(since.elapsed());
+            if left.is_zero() {
+                drop(st);
+                self.conn.forget_upload(self.id);
+                return Err(std::io::Error::other("h2 body stalled"));
+            }
+            let (wait_for, deadline_bounded) = body_wait(left);
+            let (next, wait) = self.wait(st, wait_for);
             st = next;
-            if wait.timed_out() {
+            if wait {
                 drop(st);
                 self.conn.forget_upload(self.id);
                 return Err(if deadline_bounded {
@@ -1031,6 +1317,7 @@ impl Read for H2StreamReader {
 }
 
 impl crate::proxy::WindowRead for H2StreamReader {
+    #[allow(clippy::too_many_lines)]
     fn read_window(&mut self) -> std::io::Result<crate::proxy::Window<'_>> {
         loop {
             if self.at < self.cur.len() {
@@ -1072,6 +1359,7 @@ impl crate::proxy::WindowRead for H2StreamReader {
             }
             if self.conn.client_read.is_some() {
                 drop(st);
+                self.conn.flush_connection_credit();
                 match self.conn.pump_read(
                     || {
                         let st = self
@@ -1082,6 +1370,7 @@ impl crate::proxy::WindowRead for H2StreamReader {
                         !st.body.is_empty() || st.read_ended() || st.dead
                     },
                     crate::proxy::relay_step_owns_poll(),
+                    None,
                 ) {
                     Pumped::Alive => {}
                     Pumped::Yield => {
@@ -1096,28 +1385,48 @@ impl crate::proxy::WindowRead for H2StreamReader {
             }
             if crate::proxy::relay_step_owns_poll() {
                 let since = *self.idle_since.get_or_insert_with(std::time::Instant::now);
-                if since.elapsed() >= crate::budgets::relay_stall() {
+                let left = crate::budgets::relay_stall().saturating_sub(since.elapsed());
+                if left.is_zero() {
                     drop(st);
                     self.conn.forget_upload(self.id);
                     return Err(std::io::Error::other("h2 body stalled"));
                 }
-                let (_guard, wait) = self
+                drop(st);
+                self.conn.flush_connection_credit();
+                st = self
                     .stream
-                    .cv
-                    .wait_timeout(st, crate::budgets::RELAY_POLL)
+                    .state
+                    .lock()
                     .unwrap_or_else(PoisonError::into_inner);
-                if wait.timed_out() {
+                if !st.body.is_empty() || st.read_ended() || st.dead {
+                    continue;
+                }
+                let (_guard, wait) = self.wait(st, crate::budgets::RELAY_POLL.min(left));
+                if wait {
                     return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
                 }
                 continue;
             }
-            let (next, wait) = self
+            drop(st);
+            self.conn.flush_connection_credit();
+            st = self
                 .stream
-                .cv
-                .wait_timeout(st, crate::budgets::relay_stall())
+                .state
+                .lock()
                 .unwrap_or_else(PoisonError::into_inner);
+            if !st.body.is_empty() || st.read_ended() || st.dead {
+                continue;
+            }
+            let since = *self.idle_since.get_or_insert_with(std::time::Instant::now);
+            let left = crate::budgets::relay_stall().saturating_sub(since.elapsed());
+            if left.is_zero() {
+                drop(st);
+                self.conn.forget_upload(self.id);
+                return Err(std::io::Error::other("h2 body stalled"));
+            }
+            let (next, wait) = self.wait(st, left);
             st = next;
-            if wait.timed_out() {
+            if wait {
                 drop(st);
                 self.conn.forget_upload(self.id);
                 return Err(std::io::Error::other("h2 body stalled"));
@@ -1202,7 +1511,7 @@ impl H2StreamWriter {
         let text = std::str::from_utf8(head).unwrap_or_default();
         let headers = response_fields(text);
         let block = block_encode(&headers);
-        if !self.conn.header_block(self.stream, &block, false) {
+        if !self.conn.header_block(self.stream, &block, false, None) {
             return false;
         }
         self.headed = true;
@@ -1270,14 +1579,20 @@ impl H2Conn {
     }
 
     /// One header block, its fragments kept contiguous: a control frame cannot slip between HEADERS and its CONTINUATION.
-    fn header_block(&self, id: u32, block: &[u8], end_stream: bool) -> bool {
-        let max = *self
-            .max_frame
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+    fn header_block(
+        &self,
+        id: u32,
+        block: &[u8],
+        end_stream: bool,
+        cancelled: Option<&AtomicBool>,
+    ) -> bool {
         let Ok(mut write) = self.write.lock() else {
             return false;
         };
+        let max = self.max_frame.load(Ordering::SeqCst);
+        if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::SeqCst)) {
+            return false;
+        }
         let mut at = 0;
         loop {
             let end = (at + max).min(block.len());
@@ -1328,6 +1643,11 @@ impl H2Conn {
         let _ = self.send_control(T_GOAWAY, 0, 0, &goaway);
     }
 
+    /// A shared HPACK decoder that fails cannot be trusted for another stream (RFC 9113 4.3).
+    pub(crate) fn compression_error(&self) {
+        self.refuse(E_COMPRESSION);
+    }
+
     fn send_data(&self, stream: u32, mut payload: &[u8]) -> bool {
         if payload.is_empty() {
             return true;
@@ -1341,10 +1661,7 @@ impl H2Conn {
         else {
             return false;
         };
-        let max = *self
-            .max_frame
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let max = self.max_frame.load(Ordering::SeqCst);
         let mut batch = DataBatch::new();
         while !payload.is_empty() {
             if batch.full() && !batch.flush(self) {
@@ -1360,6 +1677,54 @@ impl H2Conn {
         batch.flush(self)
     }
 
+    /// The non-blocking offer reports accepted bytes, so a normal wait is never read as a break.
+    fn send_data_progress(&self, stream: u32, mut payload: &[u8]) -> std::io::Result<usize> {
+        if payload.is_empty() {
+            return Ok(0);
+        }
+        let Some(state) = self
+            .streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&stream)
+            .cloned()
+        else {
+            return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        };
+        let max = self.max_frame.load(Ordering::SeqCst);
+        let mut batch = DataBatch::new();
+        let mut sent = 0;
+        while !payload.is_empty() {
+            if self.dead.load(Ordering::SeqCst) || state.gone() {
+                return batch.short(self);
+            }
+            if batch.full() && !batch.flush(self) {
+                return batch.short(self);
+            }
+            let fit = payload.len().min(max);
+            let Some(chunk) = self.take_send_window(&state, fit as u64, false) else {
+                if self.dead.load(Ordering::SeqCst) || state.gone() {
+                    return batch.short(self);
+                }
+                if !batch.flush(self) {
+                    return batch.short(self);
+                }
+                return if sent == 0 {
+                    Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                } else {
+                    Ok(sent)
+                };
+            };
+            batch.add(stream, &payload[..chunk]);
+            payload = &payload[chunk..];
+            sent += chunk;
+        }
+        if !batch.flush(self) {
+            return batch.short(self);
+        }
+        Ok(sent)
+    }
+
     fn send_grouped(&self, stream: u32, groups: &[&[&[u8]]]) -> bool {
         let Some(state) = self
             .streams
@@ -1370,10 +1735,7 @@ impl H2Conn {
         else {
             return false;
         };
-        let max = *self
-            .max_frame
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let max = self.max_frame.load(Ordering::SeqCst);
         let mut batch = DataBatch::new();
         for group in groups {
             let mut need: usize = group.iter().map(|part| part.len()).sum();
@@ -1413,6 +1775,82 @@ impl H2Conn {
             }
         }
         batch.flush(self)
+    }
+
+    fn frame_batch_capacity(&self) -> usize {
+        let max = self.max_frame.load(Ordering::SeqCst);
+        max.saturating_mul(DATA_FRAMES_PER_WRITE)
+    }
+
+    /// One group offered through the writer's non-blocking path: the batch is accepted whole or
+    /// not at all, so a partial socket write cannot make the next offer repeat a written prefix.
+    fn try_send_one_ready(&self, stream: u32, data: &[u8]) -> Option<bool> {
+        let Some(state) = self
+            .streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&stream)
+            .cloned()
+        else {
+            return Some(false);
+        };
+        if self.dead.load(Ordering::SeqCst) || state.gone() {
+            return Some(false);
+        }
+        let total = data.len() as u64;
+        if total == 0 {
+            return Some(true);
+        }
+        let Ok(_gate) = self.batch_gate.try_lock() else {
+            return None;
+        };
+        let Ok(mut write) = self.write.try_lock() else {
+            return None;
+        };
+        let total_signed = i64::try_from(total).unwrap_or(i64::MAX);
+        let max = self.max_frame.load(Ordering::SeqCst);
+        let mut batch = DataBatch::new();
+        let mut at = 0;
+        while at < data.len() {
+            if batch.full() {
+                return None;
+            }
+            let end = (at + max).min(data.len());
+            batch.add(stream, &data[at..end]);
+            at = end;
+        }
+        {
+            let Ok(mut conn) = self.send_conn.try_lock() else {
+                return None;
+            };
+            if state.cancelled.load(Ordering::SeqCst) {
+                return Some(false);
+            }
+            let Ok(mut window) = state.send_window.try_lock() else {
+                return None;
+            };
+            if *conn < total || *window < total_signed {
+                return None;
+            }
+            *conn -= total;
+            *window -= total_signed;
+        }
+        match batch.flush_ready(self, &mut **write) {
+            crate::proxy::Accepted::All => Some(true),
+            crate::proxy::Accepted::Full => {
+                let mut conn = self
+                    .send_conn
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                *conn = conn.saturating_add(total);
+                if let Ok(mut window) = state.send_window.lock() {
+                    *window = window.saturating_add(total_signed);
+                }
+                self.wake.notify_all();
+                None
+            }
+            crate::proxy::Accepted::Lost => Some(false),
+        }
     }
 
     /// The whole batch off the two windows or none of it: a lane that offered bytes no window
@@ -1461,10 +1899,7 @@ impl H2Conn {
             *conn -= total;
             *window -= total_signed;
         }
-        let max = *self
-            .max_frame
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let max = self.max_frame.load(Ordering::SeqCst);
         let mut batch = DataBatch::new();
         for group in groups {
             let mut need: usize = group.iter().map(|part| part.len()).sum();
@@ -1539,7 +1974,41 @@ impl H2Conn {
     fn wait_room(&self, stream: u32, turn: std::time::Duration) {
         if self.client_read.is_some() && self.room(stream) == 0 {
             // A client shares its transport with the frame reader: a lane waiting for credit reads the grant itself.
-            let _ = self.pump_read(|| false, true);
+            let _ = self.pump_read(|| false, true, None);
+        }
+        let conn = self
+            .send_conn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let state = self
+            .streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&stream)
+            .cloned();
+        let Some(state) = state else {
+            return;
+        };
+        {
+            let window = *state
+                .send_window
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if *conn > 0 && window > 0 {
+                return;
+            }
+        }
+        let _ = self.wake.wait_timeout(conn, turn);
+    }
+
+    /// The transport refused an offer while both windows had room: drain any paced tail, then wait a
+    /// bounded turn so the lane parks instead of retrying in place.
+    fn wait_transport(&self, stream: u32, turn: std::time::Duration) {
+        if matches!(
+            self.settle(),
+            crate::proxy::Settle::Advanced | crate::proxy::Settle::Lost
+        ) {
+            return;
         }
         let conn = self
             .send_conn
@@ -1624,6 +2093,7 @@ impl H2Conn {
                             *conn > 0 && *window > 0
                         },
                         crate::proxy::relay_step_owns_poll(),
+                        None,
                     ),
                     Pumped::Alive
                 ) {
@@ -1646,16 +2116,17 @@ impl H2Conn {
         }
     }
 
-    /// Credit for a body chunk the reader has taken: batched until the stream ends, the connection is inline, or the batch reaches `CREDIT_BATCH_BYTES`.
+    /// Credit for a body chunk the reader has taken: per-stream credit stays batched, while the
+    /// shared connection window is returned on its own threshold so several streams cannot exhaust it.
     fn credit_read(&self, stream: u32, wire: u32) {
         if wire == 0 {
             return;
         }
+        let batch = (self.recv_window as usize).clamp(1, CREDIT_BATCH_BYTES);
+        self.credit_connection(wire as usize, batch);
         let pending = {
             let streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
             let Some(state) = streams.get(&stream).cloned() else {
-                drop(streams);
-                self.replenish_connection(wire as usize);
                 return;
             };
             drop(streams);
@@ -1664,7 +2135,7 @@ impl H2Conn {
             let flush = (st.read_ended() && st.body.is_empty())
                 || st.dead
                 || matches!(self.control, Control::Inline)
-                || pending as usize >= CREDIT_BATCH_BYTES;
+                || pending as usize >= batch;
             if flush {
                 st.pending_credit = 0;
                 pending
@@ -1674,12 +2145,50 @@ impl H2Conn {
             }
         };
         if pending > 0 {
-            self.replenish(stream, pending as usize);
+            self.replenish_stream(stream, pending as usize);
+        }
+    }
+
+    /// Return the shared window a reader's consumed bytes are holding while it has no body left,
+    /// so a peer that exhausted the connection window can send the DATA the reader is waiting for.
+    fn flush_connection_credit(&self) {
+        let take = self.conn_credit.swap(0, Ordering::SeqCst);
+        if take > 0 {
+            self.replenish_connection(take);
+        }
+    }
+
+    fn credit_connection(&self, n: usize, batch: usize) {
+        let busy = self.client_read.is_some() && self.read_busy();
+        let outcome = self
+            .conn_credit
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |pending| {
+                let pending = pending.saturating_add(n);
+                if pending >= batch || busy {
+                    Some(0)
+                } else {
+                    Some(pending)
+                }
+            });
+        if let Ok(previous) = outcome {
+            let total = previous.saturating_add(n);
+            if total >= batch || busy {
+                self.replenish_connection(total);
+            }
+            let streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
+            for state in streams.values() {
+                let _held = state.state.lock().unwrap_or_else(PoisonError::into_inner);
+                state.cv.notify_all();
+            }
         }
     }
 
     /// Returns the consumed credit held below the batch threshold when the reader has no more body.
     fn flush_read_credit(&self, stream: u32) {
+        let take = self.conn_credit.swap(0, Ordering::SeqCst);
+        if take > 0 {
+            self.replenish_connection(take);
+        }
         let pending = {
             let streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
             let Some(state) = streams.get(&stream).cloned() else {
@@ -1690,17 +2199,16 @@ impl H2Conn {
             std::mem::take(&mut st.pending_credit)
         };
         if pending > 0 {
-            self.replenish(stream, pending as usize);
+            self.replenish_stream(stream, pending as usize);
         }
     }
 
-    fn replenish(&self, stream: u32, n: usize) {
+    fn replenish_stream(&self, stream: u32, n: usize) {
         if n == 0 || n > u32::MAX as usize {
             return;
         }
         let increment = (n as u32).to_be_bytes();
         let mut out = CREDIT_TEMPLATE;
-        out[9..13].copy_from_slice(&increment);
         out[18..22].copy_from_slice(&stream.to_be_bytes());
         out[22..26].copy_from_slice(&increment);
         // Consuming inbound bytes grants the peer more credit; our own send windows rise only from the peer's WINDOW_UPDATE, so crediting them here would let a bulk send outrun the window the peer gave and trip its flow control.
@@ -1709,12 +2217,14 @@ impl H2Conn {
                 let Ok(mut write) = self.write.lock() else {
                     return;
                 };
-                if !write.write_slices(&[&out]) {
+                if !write.write_slices(&[&out[13..26]]) {
                     self.dead.store(true, Ordering::SeqCst);
                 }
             }
             Control::Threaded(_) => {
-                if !self.control.send(CREDIT_FRAME, out) {
+                let mut frame = [0u8; CREDIT_FRAME];
+                frame[..13].copy_from_slice(&out[13..26]);
+                if !self.control.send(13, frame) {
                     self.dead.store(true, Ordering::SeqCst);
                 }
             }
@@ -1768,17 +2278,20 @@ impl H2Conn {
         }
     }
 
-    /// The status a response HEADERS block carries: decoded on the client's reader so the table stays
-    /// in wire order, and `None` when the block does not decode.
-    fn response_status(&self, block: &[u8]) -> Option<u16> {
+    /// The status and `Padding` presence a response HEADERS block carries: decoded on the client's
+    /// reader so the table stays in wire order, and `None` when the block does not decode.
+    fn response_head(&self, block: &[u8]) -> Option<(Option<u16>, bool)> {
         let mut status = None;
+        let mut padding = false;
         let mut decoder = self.decoder.lock().ok()?;
         decoder.decode(block, &mut |name, value| {
             if name == b":status" {
                 status = std::str::from_utf8(value).ok().and_then(|s| s.parse().ok());
+            } else if name == b"padding" {
+                padding = !value.is_empty();
             }
         })?;
-        status
+        Some((status, padding))
     }
 
     /// The client's request body ends on its own stream while the response keeps reading: an RST
@@ -1810,6 +2323,15 @@ impl H2Conn {
 
     /// A reset from the peer kills only its stream: the connection may still serve the others.
     fn fail_stream(&self, stream: u32) {
+        if let Some(state) = self
+            .streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&stream)
+            .cloned()
+        {
+            state.cancelled.store(true, Ordering::SeqCst);
+        }
         // The credit lock orders the death with a writer's check-then-wait, so the wake cannot be lost.
         let credit = self
             .send_conn
@@ -1819,15 +2341,23 @@ impl H2Conn {
             .streams
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(&stream);
+            .get(&stream)
+            .cloned();
         let pending = if let Some(state) = state {
-            let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
-            st.dead = true;
-            let pending = take_unread_credit(&mut st);
-            st.body.clear();
-            st.credit.clear();
-            st.queued_bytes = 0;
-            state.cv.notify_all();
+            let pending = {
+                let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
+                st.dead = true;
+                let pending = take_unread_credit(&mut st);
+                st.body.clear();
+                st.credit.clear();
+                st.queued_bytes = 0;
+                state.cv.notify_all();
+                pending
+            };
+            self.streams
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&stream);
             pending
         } else {
             0
@@ -1836,6 +2366,10 @@ impl H2Conn {
         drop(credit);
         if pending > 0 {
             self.replenish_connection(pending as usize);
+        }
+        let consumed = self.conn_credit.swap(0, Ordering::SeqCst);
+        if consumed > 0 {
+            self.replenish_connection(consumed);
         }
     }
 
@@ -1878,12 +2412,55 @@ impl H2Conn {
             if pending > 0 {
                 self.replenish_connection(pending as usize);
             }
+            let consumed = self.conn_credit.swap(0, Ordering::SeqCst);
+            if consumed > 0 {
+                self.replenish_connection(consumed);
+            }
             self.forget_upload(stream);
             self.end_session_of(stream);
         }
     }
 
+    fn mark_tunnel(&self, stream: u32) {
+        if let Some(state) = self
+            .streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&stream)
+        {
+            state
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .tunnel = true;
+        }
+    }
+
     fn reset_stream(&self, stream: u32) {
+        self.reset_stream_code(stream, E_REFUSED);
+    }
+
+    /// A local abandon after the response is on the wire is a cancellation, not a refusal the peer may retry.
+    fn reset_or_cancel(&self, stream: u32) {
+        let responded = self
+            .streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&stream)
+            .is_some_and(|state| state.responded.load(Ordering::SeqCst));
+        self.reset_stream_code(stream, if responded { E_CANCEL } else { E_REFUSED });
+    }
+
+    fn reset_stream_code(&self, stream: u32, code: u32) {
+        if let Some(state) = self
+            .streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&stream)
+            .cloned()
+        {
+            state.cancelled.store(true, Ordering::SeqCst);
+        }
         self.reset_session(stream);
         // The credit lock orders the death with a writer's check-then-wait, so the wake cannot be lost.
         let credit = self
@@ -1891,15 +2468,27 @@ impl H2Conn {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let pending = {
-            let mut streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(state) = streams.remove(&stream) {
-                let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
-                st.dead = true;
-                let pending = take_unread_credit(&mut st);
-                st.body.clear();
-                st.credit.clear();
-                st.queued_bytes = 0;
-                state.cv.notify_all();
+            let state = self
+                .streams
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&stream)
+                .cloned();
+            if let Some(state) = state {
+                let pending = {
+                    let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
+                    st.dead = true;
+                    let pending = take_unread_credit(&mut st);
+                    st.body.clear();
+                    st.credit.clear();
+                    st.queued_bytes = 0;
+                    state.cv.notify_all();
+                    pending
+                };
+                self.streams
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&stream);
                 pending
             } else {
                 0
@@ -1910,8 +2499,12 @@ impl H2Conn {
         if pending > 0 {
             self.replenish_connection(pending as usize);
         }
+        let consumed = self.conn_credit.swap(0, Ordering::SeqCst);
+        if consumed > 0 {
+            self.replenish_connection(consumed);
+        }
         // Queued: a refusal is the demux's answer, so it must not wait on a write the peer has not read.
-        let _ = self.send_control(T_RST, 0, stream, &E_REFUSED.to_be_bytes());
+        let _ = self.send_control(T_RST, 0, stream, &code.to_be_bytes());
     }
 
     /// A reset ends both local halves at once: unlike a finished upload, an aborted POST has no
@@ -2128,13 +2721,21 @@ impl H2Conn {
                 u32::from_be_bytes([body[at + 2], body[at + 3], body[at + 4], body[at + 5]]);
             at += 6;
             if id == S_MAX_FRAME {
-                let mut max = self
-                    .max_frame
+                self.max_frame.store(
+                    usize::try_from(value)
+                        .unwrap_or(crate::h2::FRAME_CAP)
+                        .clamp(16_384, 16_777_215),
+                    Ordering::SeqCst,
+                );
+            } else if id == S_MAX_CONCURRENT {
+                let _gate = self
+                    .open_gate
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
-                *max = usize::try_from(value)
-                    .unwrap_or(crate::h2::FRAME_CAP)
-                    .clamp(16_384, 16_777_215);
+                self.peer_max.store(
+                    usize::try_from(value).unwrap_or(usize::MAX),
+                    Ordering::SeqCst,
+                );
             } else if id == S_WINDOW {
                 let value = u64::from(value.min((1 << 31) - 1));
                 // A sender holds the batch gate across its write and the connection window while it decides to wait.
@@ -2191,6 +2792,7 @@ impl H2Conn {
                 ended: end_stream,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -2200,6 +2802,7 @@ impl H2Conn {
             cv: Condvar::new(),
             send_window: Mutex::new(i64::try_from(initial).unwrap_or(i64::MAX)),
             responded: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
         });
         streams.insert(sid, Arc::clone(&state));
         Some(state)
@@ -2235,12 +2838,19 @@ fn fill_frame(
     at: &mut usize,
     since: std::time::Instant,
     yieldable: bool,
+    deadline: Option<std::time::Instant>,
 ) -> Option<bool> {
     while *at < buf.len() {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Some(false);
+        }
         match stream.read(&mut buf[*at..]) {
             Ok(0) => return None,
             Ok(n) => *at += n,
             Err(error) if crate::proxy::is_timeout(&error) => {
+                if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                    return Some(false);
+                }
                 if since.elapsed() >= crate::budgets::relay_stall() {
                     return None;
                 }
@@ -2288,22 +2898,62 @@ impl H2Conn {
             .is_some_and(|read| read.try_lock().is_err())
     }
 
+    fn acquire_read<'a>(
+        read: &'a Mutex<Box<dyn Read + Send>>,
+        ready: &impl Fn() -> bool,
+        yieldable: bool,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<std::sync::MutexGuard<'a, Box<dyn Read + Send>>, Pumped> {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Err(Pumped::Yield);
+        }
+        if yieldable {
+            return match read.try_lock() {
+                Ok(read) => Ok(read),
+                // A lane that cannot take the pump yields the poll: the reader that holds it is the one making progress.
+                Err(std::sync::TryLockError::WouldBlock) => Err(if ready() {
+                    Pumped::Alive
+                } else {
+                    Pumped::Yield
+                }),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner()),
+            };
+        }
+        loop {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                return Err(Pumped::Yield);
+            }
+            if ready() {
+                return Err(Pumped::Alive);
+            }
+            match read.try_lock() {
+                Ok(read) => return Ok(read),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    std::thread::sleep(crate::budgets::RELAY_POLL);
+                }
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    return Ok(poisoned.into_inner());
+                }
+            }
+        }
+    }
+
     /// A client's frames arrive on the same transport its reader consumes: one frame is parsed on
     /// demand, so a read and a credit-starved write both make progress without a parser thread.
     /// A lane step that cannot finish the frame yields the poll instead of sleeping in it.
-    fn pump_read(&self, ready: impl FnOnce() -> bool, yieldable: bool) -> Pumped {
+    fn pump_read(
+        &self,
+        ready: impl Fn() -> bool,
+        yieldable: bool,
+        deadline: Option<std::time::Instant>,
+    ) -> Pumped {
         let Some(read) = self.client_read.as_ref() else {
             return Pumped::Dead;
         };
-        let mut read = if yieldable {
-            match read.try_lock() {
-                Ok(read) => read,
-                // A lane that cannot take the pump yields the poll: the reader that holds it is the one making progress.
-                Err(std::sync::TryLockError::WouldBlock) => return Pumped::Yield,
-                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            }
-        } else {
-            read.lock().unwrap_or_else(PoisonError::into_inner)
+        // Recheck readiness while waiting so a queued reply never waits on another stream's read.
+        let mut read = match Self::acquire_read(read, &ready, yieldable, deadline) {
+            Ok(read) => read,
+            Err(pumped) => return pumped,
         };
         if ready() {
             return Pumped::Alive;
@@ -2313,6 +2963,7 @@ impl H2Conn {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let since = *partial.since.get_or_insert_with(std::time::Instant::now);
+        let before = partial.head_len + partial.body_len;
         let frame = {
             let partial = &mut *partial;
             if partial.frame.is_none() {
@@ -2322,9 +2973,18 @@ impl H2Conn {
                     &mut partial.head_len,
                     since,
                     yieldable,
+                    deadline,
                 ) {
                     Some(true) => {}
-                    Some(false) => return Pumped::Yield,
+                    Some(false) => {
+                        if yieldable
+                            && deadline.is_some()
+                            && partial.head_len + partial.body_len == before
+                        {
+                            partial.since = None;
+                        }
+                        return Pumped::Yield;
+                    }
                     None => {
                         self.dead.store(true, Ordering::SeqCst);
                         return Pumped::Dead;
@@ -2350,9 +3010,18 @@ impl H2Conn {
                 &mut partial.body_len,
                 since,
                 yieldable,
+                deadline,
             ) {
                 Some(true) => {}
-                Some(false) => return Pumped::Yield,
+                Some(false) => {
+                    if yieldable
+                        && deadline.is_some()
+                        && partial.head_len + partial.body_len == before
+                    {
+                        partial.since = None;
+                    }
+                    return Pumped::Yield;
+                }
                 None => {
                     self.dead.store(true, Ordering::SeqCst);
                     return Pumped::Dead;
@@ -2393,10 +3062,8 @@ impl H2Conn {
             if attached {
                 return;
             }
-            let readable = self.raw.as_ref().is_some_and(|raw| {
-                matches!(raw.wait_readable(std::time::Duration::ZERO), Ok(true))
-            });
-            if !readable || !matches!(self.pump_read(|| false, true), Pumped::Alive) {
+            let deadline = Some(std::time::Instant::now() + crate::budgets::RELAY_POLL);
+            if !matches!(self.pump_read(|| false, true, deadline), Pumped::Alive) {
                 return;
             }
         }
@@ -2438,14 +3105,14 @@ fn client_frame(conn: &H2Conn, kind: u8, flags: u8, sid: u32, body: Vec<u8>) -> 
                     .client_head
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner) = None;
-                client_headers(conn, sid, &block, end_stream);
+                client_headers(conn, sid, &block, end_stream)
             } else {
                 *conn
                     .client_head
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner) = Some((sid, block, end_stream));
+                true
             }
-            true
         }
         T_CONT => {
             let pending = conn
@@ -2470,14 +3137,14 @@ fn client_frame(conn: &H2Conn, kind: u8, flags: u8, sid: u32, body: Vec<u8>) -> 
             }
             gathered.extend_from_slice(&body);
             if flags & F_END_HEADERS != 0 {
-                client_headers(conn, sid, &gathered, end_stream);
+                client_headers(conn, sid, &gathered, end_stream)
             } else {
                 *conn
                     .client_head
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner) = Some((sid, gathered, end_stream));
+                true
             }
-            true
         }
         T_DATA => queue_data(conn, flags, sid, body),
         T_RST => {
@@ -2485,6 +3152,18 @@ fn client_frame(conn: &H2Conn, kind: u8, flags: u8, sid: u32, body: Vec<u8>) -> 
             true
         }
         T_GOAWAY => {
+            if sid != 0 {
+                conn.refuse(E_PROTOCOL);
+                return false;
+            }
+            let _gate = conn
+                .open_gate
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if body.len() >= 8 {
+                let last = u32::from_be_bytes([body[0], body[1], body[2], body[3]]) & 0x7FFF_FFFF;
+                conn.goaway_last.fetch_min(last, Ordering::SeqCst);
+            }
             conn.goaway.store(true, Ordering::SeqCst);
             true
         }
@@ -2494,8 +3173,24 @@ fn client_frame(conn: &H2Conn, kind: u8, flags: u8, sid: u32, body: Vec<u8>) -> 
 
 /// A complete response head: decode its `:status`, retire the stream when the peer's `END_STREAM`
 /// already rode the head, and wake a reader parked on the answer.
-fn client_headers(conn: &H2Conn, sid: u32, block: &[u8], end_stream: bool) {
-    let status = conn.response_status(block);
+fn client_headers(conn: &H2Conn, sid: u32, block: &[u8], end_stream: bool) -> bool {
+    let Some((status, padding)) = conn.response_head(block) else {
+        conn.fail_stream(sid);
+        conn.compression_error();
+        return false;
+    };
+    if status.is_some_and(|status| !(100..=999).contains(&status)) {
+        conn.reset_stream_code(sid, E_PROTOCOL);
+        return true;
+    }
+    if status.is_some_and(|status| (100..200).contains(&status)) {
+        if end_stream {
+            conn.reset_stream_code(sid, E_PROTOCOL);
+            return true;
+        }
+        return true;
+    }
+    let status = status.map(|status| status | if padding { PADDING_BIT } else { 0 });
     let state = conn
         .streams
         .lock()
@@ -2519,6 +3214,7 @@ fn client_headers(conn: &H2Conn, sid: u32, block: &[u8], end_stream: bool) {
             conn.retire(sid);
         }
     }
+    true
 }
 
 struct NullWrite;
@@ -2539,6 +3235,37 @@ impl crate::proxy::FrameWrite for NullWrite {
     }
 }
 
+/// Why a request head did not open: a full stream table is temporary capacity, while a closed
+/// connection or a failed frame write retires it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum H2OpenError {
+    Full,
+    Closed,
+    Failed,
+}
+
+fn lock_until<T>(
+    lock: &Mutex<T>,
+    deadline: Option<Instant>,
+) -> Option<std::sync::MutexGuard<'_, T>> {
+    let Some(deadline) = deadline else {
+        return lock.lock().ok();
+    };
+    loop {
+        match lock.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(std::sync::TryLockError::Poisoned(_)) => return None,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return None;
+                }
+                std::thread::sleep(left.min(Duration::from_millis(2)));
+            }
+        }
+    }
+}
+
 /// One client connection, one stream: the reference opens a stream per session and keeps the
 /// connection for the pool, so a stream ending must not close what a later session can reuse.
 /// One client connection: the reference opens a stream per session and keeps the connection for
@@ -2546,6 +3273,7 @@ impl crate::proxy::FrameWrite for NullWrite {
 pub(crate) struct H2Client {
     conn: Arc<H2Conn>,
     next: AtomicU32,
+    open_order: Mutex<()>,
 }
 
 impl H2Client {
@@ -2554,6 +3282,34 @@ impl H2Client {
         write: W,
         raw: Option<Arc<crate::conn::Connection>>,
     ) -> Option<Arc<Self>> {
+        Self::new_windowed(read, write, raw, None)
+    }
+
+    /// A client that advertises the connection window its carrier named and half of it as the
+    /// stream window, the order Cronet's `SetHTTP2Options(session, initial)` takes. `None` keeps
+    /// the tree's own defaults.
+    pub(crate) fn new_windowed<
+        R: Read + Send + 'static,
+        W: crate::proxy::FrameWrite + Send + 'static,
+    >(
+        read: R,
+        write: W,
+        raw: Option<Arc<crate::conn::Connection>>,
+        window: Option<u64>,
+    ) -> Option<Arc<Self>> {
+        let (recv_window, conn_top_up) = match window {
+            Some(window) => {
+                let connection = window.clamp(u64::from(u16::MAX), WINDOW_MAX);
+                (
+                    (window / 2).clamp(1, WINDOW_MAX) as u32,
+                    (connection - u64::from(u16::MAX)) as u32,
+                )
+            }
+            None => (WINDOW, CONN_WINDOW_TOP_UP),
+        };
+        if let Some(raw) = &raw {
+            let _ = raw.set_read_timeout(Some(crate::budgets::RELAY_POLL));
+        }
         let dead = Arc::new(AtomicBool::new(false));
         let write: SharedWriter = Arc::new(Mutex::new(Box::new(write)));
         let conn = Arc::new(H2Conn {
@@ -2565,13 +3321,21 @@ impl H2Client {
             upload_of: Mutex::new(HashMap::new()),
             session_gate: Mutex::new(()),
             send_conn: Mutex::new(65_535),
+            conn_credit: AtomicUsize::new(0),
+            waiting: AtomicUsize::new(0),
             batch_gate: Mutex::new(()),
             wake: Condvar::new(),
             decoder: Mutex::new(Decoder::default()),
-            max_frame: Mutex::new(16_384),
+            max_frame: AtomicUsize::new(16_384),
             peer_initial: Mutex::new(65_535),
+            peer_max: AtomicUsize::new(usize::MAX),
+            recv_window,
+            conn_top_up,
+            body_chunks: body_chunk_limit(recv_window),
             dead,
+            open_gate: Mutex::new(()),
             goaway: AtomicBool::new(false),
+            goaway_last: AtomicU32::new(u32::MAX),
             refused: AtomicBool::new(false),
             client_read: Some(Mutex::new(Box::new(read))),
             client_partial: Mutex::new(PartialFrame::default()),
@@ -2588,16 +3352,17 @@ impl H2Client {
         }
         let mut initial = Vec::with_capacity(12);
         initial.extend_from_slice(&S_WINDOW.to_be_bytes());
-        initial.extend_from_slice(&WINDOW.to_be_bytes());
+        initial.extend_from_slice(&conn.recv_window.to_be_bytes());
         if !conn.frame(T_SETTINGS, 0, 0, &initial) {
             return None;
         }
-        if !conn.frame(T_WINDOW, 0, 0, &CONN_WINDOW_TOP_UP.to_be_bytes()) {
+        if conn.conn_top_up > 0 && !conn.frame(T_WINDOW, 0, 0, &conn.conn_top_up.to_be_bytes()) {
             return None;
         }
         Some(Arc::new(Self {
             conn,
             next: AtomicU32::new(1),
+            open_order: Mutex::new(()),
         }))
     }
 
@@ -2607,10 +3372,19 @@ impl H2Client {
         self.conn.close_client();
     }
 
-    /// The pool may hand this connection to another session only while both halves are alive and
-    /// the peer has not asked for the connection to end.
+    /// Whether the transport can still carry a stream at all; a full stream table is capacity, not
+    /// a reason to retire a connection that still counts against the pool limit.
     pub(crate) fn reusable(&self) -> bool {
         !self.conn.dead.load(Ordering::SeqCst) && !self.conn.goaway.load(Ordering::SeqCst)
+    }
+
+    /// Whether one more stream fits in this connection's table.
+    pub(crate) fn has_capacity(&self) -> bool {
+        let peer_max = self.conn.peer_max.load(Ordering::SeqCst);
+        self.conn
+            .streams
+            .lock()
+            .is_ok_and(|streams| streams.len() < MAX_STREAMS as usize && streams.len() < peer_max)
     }
 
     /// Whether the socket has bytes nobody on the entry is reading: with no session on it, that
@@ -2629,7 +3403,7 @@ impl H2Client {
     /// the pool a healthy transport while a `GOAWAY` it carries still retires it.
     #[cfg(any(unix, windows))]
     pub(crate) fn settle(&self) {
-        if self.pending() {
+        if self.pending() || !self.has_capacity() {
             self.conn.settle_idle();
         }
     }
@@ -2661,6 +3435,17 @@ impl H2Client {
         Some((reader, writer))
     }
 
+    /// A pooled `NaiveProxy` CONNECT: the caller owns the connection, so the stream carries no
+    /// `ClientOwner` and a closing stream leaves the connection for the next tunnel.
+    pub(crate) fn open_naive_result(
+        &self,
+        block: &[u8],
+        end_request: bool,
+        deadline: Instant,
+    ) -> Result<(H2StreamReader, H2StreamOut), H2OpenError> {
+        self.open_headers_result(block, None, end_request, Some(deadline))
+    }
+
     /// Sends one request head on a fresh stream. `end_request` marks a bodyless request (the GET
     /// downlink) so the response's own `END_STREAM` retires the stream.
     fn open_headers(
@@ -2669,8 +3454,42 @@ impl H2Client {
         owner: Option<Arc<ClientOwner>>,
         end_request: bool,
     ) -> Option<(H2StreamReader, H2StreamOut)> {
+        self.open_headers_result(block, owner, end_request, None)
+            .ok()
+    }
+
+    fn open_headers_result(
+        &self,
+        block: &[u8],
+        owner: Option<Arc<ClientOwner>>,
+        end_request: bool,
+        deadline: Option<Instant>,
+    ) -> Result<(H2StreamReader, H2StreamOut), H2OpenError> {
+        let Some(order) = lock_until(&self.open_order, deadline) else {
+            return Err(H2OpenError::Failed);
+        };
+        let Some(gate) = lock_until(&self.conn.open_gate, deadline) else {
+            return Err(H2OpenError::Failed);
+        };
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(H2OpenError::Failed);
+        }
+        if self.conn.goaway.load(Ordering::SeqCst) || self.conn.dead.load(Ordering::SeqCst) {
+            return Err(H2OpenError::Closed);
+        }
+        if !self.has_capacity() {
+            return Err(H2OpenError::Full);
+        }
         let sid = self.next.fetch_add(2, Ordering::SeqCst);
-        let state = self.conn.attach_stream(sid, false)?;
+        let Some(state) = self.conn.attach_stream(sid, false) else {
+            return Err(H2OpenError::Full);
+        };
+        // Admission is ordered with GOAWAY here; the HEADERS write must not hold the gate the read pump takes to publish SETTINGS or GOAWAY.
+        drop(gate);
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            self.conn.fail_stream(sid);
+            return Err(H2OpenError::Failed);
+        }
         let flags = if end_request {
             F_END_HEADERS | F_END
         } else {
@@ -2678,8 +3497,9 @@ impl H2Client {
         };
         if !self.conn.frame(T_HEADERS, flags, sid, block) {
             self.conn.fail_stream(sid);
-            return None;
+            return Err(H2OpenError::Failed);
         }
+        drop(order);
         if end_request {
             self.conn.mark_request_ended(sid);
         }
@@ -2698,7 +3518,7 @@ impl H2Client {
             _owner: owner,
             client: true,
         };
-        Some((reader, out))
+        Ok((reader, out))
     }
 
     /// One packet-up POST: its own stream, the packet in the body, the answer drained before the
@@ -2938,18 +3758,27 @@ impl H2Conn {
     }
 
     pub(crate) fn respond(&self, sid: u32, fields: &[(&str, &str)]) -> bool {
-        let block = block_encode(fields);
-        if !self.header_block(sid, &block, false) {
-            return false;
-        }
-        if let Some(state) = self
+        let Some(state) = self
             .streams
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(&sid)
+            .cloned()
+        else {
+            return false;
+        };
+        // `header_block` rechecks `cancelled` under the write lock, so a reset wins without waiting on this write.
         {
-            state.responded.store(true, Ordering::SeqCst);
+            let st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if st.dead || st.finished {
+                return false;
+            }
         }
+        let block = block_encode(fields);
+        if !self.header_block(sid, &block, false, Some(&state.cancelled)) {
+            return false;
+        }
+        state.responded.store(true, Ordering::SeqCst);
         true
     }
 
@@ -2970,7 +3799,7 @@ impl H2Conn {
                 return false;
             }
         }
-        if !self.header_block(sid, block, true) {
+        if !self.header_block(sid, block, true, Some(&state.cancelled)) {
             return false;
         }
         state.responded.store(true, Ordering::SeqCst);
@@ -2988,10 +3817,7 @@ impl H2Conn {
     }
 
     pub(crate) fn max_frame_now(&self) -> usize {
-        *self
-            .max_frame
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        self.max_frame.load(Ordering::SeqCst)
     }
 
     pub(crate) fn peer_window(&self) -> u64 {
@@ -3313,10 +4139,33 @@ pub(crate) fn serve_h2_service<
     service: &S,
     decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
 ) {
+    serve_h2_service_open(read, write, service, decryption, || {});
+}
+
+/// The same demux, but `on_open` runs once the first request is decoded: the naive inbound uses it to
+/// drop the admission timeout while a peer that never sends HEADERS still ends at the handshake clock.
+pub(crate) fn serve_h2_service_open<
+    R: Read + Send + 'static,
+    W: crate::proxy::FrameWrite + Send + 'static,
+    S: H2Service,
+>(
+    read: R,
+    write: W,
+    service: &S,
+    decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
+    on_open: impl FnOnce() + 'static,
+) {
     // A peer that offers the preface and no request ends at the handshake clock; the first HEADERS puts it away.
     let until = std::time::Instant::now() + crate::budgets::handshake();
     let opened = Arc::new(AtomicBool::new(false));
-    serve_h2_service_until(read, write, service, decryption, Some((until, opened)));
+    serve_h2_service_until(
+        read,
+        write,
+        service,
+        decryption,
+        Some((until, Arc::clone(&opened))),
+        Some(Box::new(on_open)),
+    );
 }
 
 /// What one call of `Frames::step` settled on: another frame is ready, the socket is quiet until the
@@ -3512,13 +4361,21 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
                     upload_of: Mutex::new(HashMap::new()),
                     session_gate: Mutex::new(()),
                     send_conn: Mutex::new(65_535),
+                    conn_credit: AtomicUsize::new(0),
+                    waiting: AtomicUsize::new(0),
                     batch_gate: Mutex::new(()),
                     wake: Condvar::new(),
                     decoder: Mutex::new(Decoder::default()),
-                    max_frame: Mutex::new(16_384),
+                    max_frame: AtomicUsize::new(16_384),
                     peer_initial: Mutex::new(65_535),
+                    peer_max: AtomicUsize::new(usize::MAX),
+                    recv_window: WINDOW,
+                    conn_top_up: CONN_WINDOW_TOP_UP,
+                    body_chunks: body_chunk_limit(WINDOW),
                     dead,
+                    open_gate: Mutex::new(()),
                     goaway: AtomicBool::new(false),
+                    goaway_last: AtomicU32::new(u32::MAX),
                     refused: AtomicBool::new(false),
                     client_read: None,
                     client_partial: Mutex::new(PartialFrame::default()),
@@ -3529,12 +4386,12 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
                 });
                 let mut initial = Vec::with_capacity(12);
                 initial.extend_from_slice(&S_WINDOW.to_be_bytes());
-                initial.extend_from_slice(&WINDOW.to_be_bytes());
+                initial.extend_from_slice(&conn.recv_window.to_be_bytes());
                 if !conn.frame(T_SETTINGS, 0, 0, &initial) {
                     self.conn = Some(conn);
                     return self.end();
                 }
-                conn.frame(T_WINDOW, 0, 0, &CONN_WINDOW_TOP_UP.to_be_bytes());
+                conn.frame(T_WINDOW, 0, 0, &conn.conn_top_up.to_be_bytes());
                 self.conn = Some(conn);
                 self.head_have = 0;
                 self.phase = Phase::Head;
@@ -3624,9 +4481,25 @@ pub(crate) fn serve_h2_service_until<
     service: &S,
     decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
     until: Option<(std::time::Instant, Arc<std::sync::atomic::AtomicBool>)>,
+    on_open: Option<Box<dyn FnOnce()>>,
 ) {
+    let opened = until.as_ref().map(|(_, opened)| Arc::clone(opened));
+    let mut on_open = on_open;
     let mut frames = Frames::new(read, write, decryption, until, false);
-    while !matches!(frames.step(service, true), Stepped::Done) {}
+    loop {
+        if matches!(frames.step(service, true), Stepped::Done) {
+            break;
+        }
+        if on_open.is_some()
+            && opened
+                .as_ref()
+                .is_some_and(|opened| opened.load(Ordering::Relaxed))
+        {
+            if let Some(callback) = on_open.take() {
+                callback();
+            }
+        }
+    }
 }
 
 /// The same demux as a lane step: a quiet socket costs a parked readiness slot, not a thread for the
@@ -3659,14 +4532,13 @@ fn cut_padded_data(body: &mut Vec<u8>, pad: usize) -> usize {
     inner
 }
 
-/// Returns the connection credit for a body the stream will not deliver: consumed credit held below the batch plus every queued chunk's wire length. The chunk lengths are zeroed so a reader that still holds the stream cannot grant them twice.
+/// Returns the connection credit for a body the stream will not deliver: every queued chunk's wire
+/// length. The chunk lengths are zeroed so a reader that still holds the stream cannot grant them twice.
 fn take_unread_credit(st: &mut StreamState) -> u32 {
-    let queued = st
-        .credit
+    st.credit
         .iter_mut()
         .map(std::mem::take)
-        .fold(0u32, u32::saturating_add);
-    queued.saturating_add(std::mem::take(&mut st.pending_credit))
+        .fold(0u32, u32::saturating_add)
 }
 
 /// The frames both roles answer the same way: settings, pings and flow-control credit. `None`
@@ -3737,7 +4609,7 @@ fn queue_data(conn: &H2Conn, flags: u8, sid: u32, mut body: Vec<u8>) -> bool {
     let streams = conn.streams.lock().unwrap_or_else(PoisonError::into_inner);
     let Some(state) = streams.get(&sid).cloned() else {
         drop(streams);
-        conn.replenish(sid, wire_len);
+        conn.replenish_connection(wire_len);
         return true;
     };
     drop(streams);
@@ -3754,7 +4626,9 @@ fn queue_data(conn: &H2Conn, flags: u8, sid: u32, mut body: Vec<u8>) -> bool {
                 }
             } else {
                 let held = st.queued_bytes.saturating_add(body.len());
-                if st.body.len() >= BODY_CHUNKS || held > BODY_CAP {
+                if st.body.len() >= conn.body_chunks
+                    || held > conn.recv_window as usize + MAX_RECV_FRAME
+                {
                     overflow = true;
                 } else {
                     st.queued_bytes = held;
@@ -3773,16 +4647,15 @@ fn queue_data(conn: &H2Conn, flags: u8, sid: u32, mut body: Vec<u8>) -> bool {
         done
     };
     if overflow {
-        conn.reset_stream(sid);
+        conn.reset_stream_code(sid, E_CANCEL);
         conn.replenish_connection(wire_len);
         return true;
     }
     if !queued {
         if credit_now {
-            conn.replenish(sid, wire_len);
-        } else {
-            conn.replenish_connection(wire_len);
+            conn.replenish_stream(sid, wire_len);
         }
+        conn.replenish_connection(wire_len);
     }
     if done {
         conn.retire(sid);
@@ -3881,6 +4754,9 @@ fn pump_frame(
                         opened.store(true, Ordering::Relaxed);
                     }
                 }
+                if conn.refused.load(Ordering::SeqCst) {
+                    return false;
+                }
             } else {
                 *frag = Some((sid, block, end_stream));
             }
@@ -3911,6 +4787,9 @@ fn pump_frame(
                             opened.store(true, Ordering::Relaxed);
                         }
                     }
+                    if conn.refused.load(Ordering::SeqCst) {
+                        return false;
+                    }
                 } else {
                     *frag = Some((sid, gathered, end_stream));
                 }
@@ -3929,7 +4808,7 @@ fn pump_frame(
             let streams = conn.streams.lock().unwrap_or_else(PoisonError::into_inner);
             let Some(state) = streams.get(&sid).cloned() else {
                 drop(streams);
-                conn.replenish(sid, wire_len);
+                conn.replenish_connection(wire_len);
                 return true;
             };
             drop(streams);
@@ -3949,7 +4828,9 @@ fn pump_frame(
                         }
                     } else {
                         let held = st.queued_bytes.saturating_add(body.len());
-                        if st.body.len() >= BODY_CHUNKS || held > BODY_CAP {
+                        if st.body.len() >= conn.body_chunks
+                            || held > conn.recv_window as usize + MAX_RECV_FRAME
+                        {
                             overflow = true;
                         } else {
                             st.queued_bytes = held;
@@ -3967,7 +4848,7 @@ fn pump_frame(
                 (finished, abandoned, stopped)
             };
             if overflow {
-                conn.reset_stream(sid);
+                conn.reset_stream_code(sid, E_CANCEL);
                 conn.replenish_connection(wire_len);
                 return true;
             }
@@ -3985,10 +4866,9 @@ fn pump_frame(
             }
             if !queued {
                 if credit_now {
-                    conn.replenish(sid, wire_len);
-                } else {
-                    conn.replenish_connection(wire_len);
+                    conn.replenish_stream(sid, wire_len);
                 }
+                conn.replenish_connection(wire_len);
             }
             true
         }
@@ -3997,6 +4877,18 @@ fn pump_frame(
             true
         }
         T_GOAWAY => {
+            if sid != 0 {
+                conn.refuse(E_PROTOCOL);
+                return false;
+            }
+            let _gate = conn
+                .open_gate
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if body.len() >= 8 {
+                let last = u32::from_be_bytes([body[0], body[1], body[2], body[3]]) & 0x7FFF_FFFF;
+                conn.goaway_last.fetch_min(last, Ordering::SeqCst);
+            }
             conn.goaway.store(true, Ordering::SeqCst);
             true
         }
@@ -4012,7 +4904,79 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::atomic::AtomicUsize;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_windowed_client_advertises_half_its_connection_window() {
+        let client =
+            super::H2Client::new_windowed(std::io::empty(), NullWrite, None, Some(4 * 1024 * 1024))
+                .expect("client");
+        assert_eq!(client.conn.recv_window, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn a_full_connection_reports_capacity_without_spending_a_stream() {
+        let client = super::H2Client::new(std::io::empty(), NullWrite, None).expect("client");
+        client.conn.peer_max.store(0, Ordering::SeqCst);
+        let block = block_encode(&[(":method", "CONNECT"), (":authority", "example.test")]);
+        assert!(matches!(
+            client.open_naive_result(&block, false, Instant::now() + Duration::from_secs(5)),
+            Err(H2OpenError::Full)
+        ));
+        assert_eq!(
+            client.next.load(Ordering::SeqCst),
+            1,
+            "a capacity refusal does not consume a stream id or send CONNECT"
+        );
+    }
+
+    #[test]
+    fn an_idle_settle_pumps_a_capacity_increase_buffered_beside_a_zero() {
+        let mut frames = Vec::new();
+        let mut zero = Vec::new();
+        zero.extend_from_slice(&S_MAX_CONCURRENT.to_be_bytes());
+        zero.extend_from_slice(&0u32.to_be_bytes());
+        write_frame(&mut frames, T_SETTINGS, 0, 0, &zero);
+        let mut open = Vec::new();
+        open.extend_from_slice(&S_MAX_CONCURRENT.to_be_bytes());
+        open.extend_from_slice(&2u32.to_be_bytes());
+        write_frame(&mut frames, T_SETTINGS, 0, 0, &open);
+        let client = super::H2Client::new(
+            FramesThenIdle {
+                bytes: frames,
+                at: 0,
+            },
+            NullWrite,
+            None,
+        )
+        .expect("client");
+        client.conn.peer_max.store(0, Ordering::SeqCst);
+        assert!(!client.has_capacity());
+        client.settle();
+        let block = block_encode(&[(":method", "CONNECT"), (":authority", "example.test")]);
+        assert!(
+            client
+                .open_naive_result(&block, false, Instant::now() + Duration::from_secs(5))
+                .is_ok(),
+            "an idle pump left the client unable to open"
+        );
+    }
+
+    #[test]
+    fn a_body_chunk_limit_covers_the_advertised_window_at_four_kib() {
+        for window in [
+            4 * 1024 * 1024,
+            4 * 1024 * 1024 + 1,
+            64 * 1024 * 1024,
+            128 * 1024 * 1024,
+        ] {
+            assert!(
+                body_chunk_limit(window) * BODY_CHUNK_BYTES >= window as usize,
+                "a full window of 4 KiB frames must fit under the chunk limit"
+            );
+            assert!(body_chunk_limit(window) >= BODY_CHUNKS);
+        }
+    }
 
     /// The production pump with no demux clock: a unit test drives frames, not a connection's handshake.
     fn pump_frame(
@@ -4583,6 +5547,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -4592,6 +5557,7 @@ mod tests {
             cv: Condvar::new(),
             send_window: Mutex::new(65_535),
             responded: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
         });
         conn.streams
             .lock()
@@ -4677,6 +5643,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -4686,6 +5653,7 @@ mod tests {
             cv: Condvar::new(),
             send_window: Mutex::new(65_535),
             responded: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
         });
         conn.streams
             .lock()
@@ -4746,6 +5714,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -4755,6 +5724,7 @@ mod tests {
             cv: Condvar::new(),
             send_window: Mutex::new(-1),
             responded: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
         });
         conn.streams
             .lock()
@@ -4791,6 +5761,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -4800,6 +5771,7 @@ mod tests {
             cv: Condvar::new(),
             send_window: Mutex::new(-8_192),
             responded: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
         });
         conn.streams
             .lock()
@@ -4864,6 +5836,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -4873,6 +5846,7 @@ mod tests {
             cv: Condvar::new(),
             send_window: Mutex::new(65_535),
             responded: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
         });
         conn.streams
             .lock()
@@ -5773,6 +6747,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -5782,6 +6757,7 @@ mod tests {
             cv: Condvar::new(),
             send_window: Mutex::new(0),
             responded: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
         });
         conn.streams
             .lock()
@@ -5825,6 +6801,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -5834,6 +6811,7 @@ mod tests {
             cv: Condvar::new(),
             send_window: Mutex::new(65_535),
             responded: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
         });
         conn.streams
             .lock()
@@ -5903,6 +6881,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -5912,6 +6891,7 @@ mod tests {
             cv: Condvar::new(),
             send_window: Mutex::new(65_535),
             responded: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
         });
         conn.streams
             .lock()
@@ -6019,6 +6999,7 @@ mod tests {
         let client = super::H2Client {
             conn: Arc::clone(&conn),
             next: AtomicU32::new(1),
+            open_order: Mutex::new(()),
         };
         let (mut reader, mut writer) = client
             .open("example.org", &test_settings("stream-one"), "https", false)
@@ -6137,6 +7118,25 @@ mod tests {
         }
     }
 
+    /// A scripted peer that goes quiet after its bytes, the way a live connection does once the
+    /// frames under test have landed.
+    struct FramesThenIdle {
+        bytes: Vec<u8>,
+        at: usize,
+    }
+
+    impl Read for FramesThenIdle {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.at >= self.bytes.len() {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            let take = buf.len().min(self.bytes.len() - self.at);
+            buf[..take].copy_from_slice(&self.bytes[self.at..self.at + take]);
+            self.at += take;
+            Ok(take)
+        }
+    }
+
     /// Bytes that arrive a few at a time, with a timeout between every delivery, the way a TLS
     /// record lands on a socket armed with the relay poll.
     struct Trickle {
@@ -6183,13 +7183,21 @@ mod tests {
             upload_of: Mutex::new(HashMap::new()),
             session_gate: Mutex::new(()),
             send_conn: Mutex::new(65_535),
+            conn_credit: AtomicUsize::new(0),
+            waiting: AtomicUsize::new(0),
             batch_gate: Mutex::new(()),
             wake: Condvar::new(),
             decoder: Mutex::new(Decoder::default()),
-            max_frame: Mutex::new(16_384),
+            max_frame: AtomicUsize::new(16_384),
             peer_initial: Mutex::new(65_535),
+            peer_max: AtomicUsize::new(usize::MAX),
+            recv_window: WINDOW,
+            conn_top_up: CONN_WINDOW_TOP_UP,
+            body_chunks: body_chunk_limit(WINDOW),
             dead,
+            open_gate: Mutex::new(()),
             goaway: AtomicBool::new(false),
+            goaway_last: AtomicU32::new(u32::MAX),
             refused: AtomicBool::new(false),
             client_read: Some(Mutex::new(read)),
             client_partial: Mutex::new(PartialFrame::default()),
@@ -6206,6 +7214,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -6215,12 +7224,70 @@ mod tests {
             cv: Condvar::new(),
             send_window: Mutex::new(65_535),
             responded: AtomicBool::new(true),
+            cancelled: AtomicBool::new(false),
         });
         conn.streams
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(1, Arc::clone(&state));
         (conn, state, written)
+    }
+
+    struct Blocking {
+        entered: Arc<(Mutex<bool>, Condvar)>,
+        released: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl Read for Blocking {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            let (entered, signal) = &*self.entered;
+            *entered.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            signal.notify_all();
+            let (released, wake) = &*self.released;
+            let mut released = released.lock().unwrap_or_else(PoisonError::into_inner);
+            while !*released {
+                released = wake.wait(released).unwrap_or_else(PoisonError::into_inner);
+            }
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn a_pumping_client_reader_gets_sub_batch_connection_credit() {
+        let entered = Arc::new((Mutex::new(false), Condvar::new()));
+        let released = Arc::new((Mutex::new(false), Condvar::new()));
+        let (conn, _state, written) = reading_conn(Box::new(Blocking {
+            entered: Arc::clone(&entered),
+            released: Arc::clone(&released),
+        }));
+        let pump = {
+            let conn = Arc::clone(&conn);
+            thread::spawn(move || {
+                let _ = conn.pump_read(|| false, false, None);
+            })
+        };
+        {
+            let (started, signal) = &*entered;
+            let mut started = started.lock().unwrap_or_else(PoisonError::into_inner);
+            while !*started {
+                started = signal.wait(started).unwrap_or_else(PoisonError::into_inner);
+            }
+        }
+        conn.credit_connection(100, 65_535);
+        {
+            let bytes = written.lock().unwrap_or_else(PoisonError::into_inner);
+            assert!(
+                bytes.len() >= 13,
+                "the waiting pump needs the credit returned before it polls again"
+            );
+            assert_eq!(
+                u32::from_be_bytes([bytes[9], bytes[10], bytes[11], bytes[12]]),
+                100
+            );
+        }
+        *released.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        released.1.notify_all();
+        pump.join().expect("the pump ends");
     }
 
     /// A response head split across `HEADERS` and `CONTINUATION` decodes its `:status` once the
@@ -6300,6 +7367,18 @@ mod tests {
         );
     }
 
+    /// A response head that does not decode is the same connection-level compression failure:
+    /// the shared HPACK state is out of step, so the pump must not keep the connection reusable.
+    #[test]
+    fn a_bad_response_head_refuses_the_connection() {
+        let (conn, _written, _slices) = bare_conn();
+        assert!(!client_headers(&conn, 1, &[0x80], true));
+        assert!(
+            conn.refused.load(Ordering::SeqCst),
+            "the shared decoder is no longer in step, so the connection must end"
+        );
+    }
+
     /// A trailer block that does not decode is a connection-level compression failure: resetting
     /// only the stream leaves the shared HPACK state out of step with the peer.
     #[test]
@@ -6329,6 +7408,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -6338,6 +7418,7 @@ mod tests {
             cv: Condvar::new(),
             send_window: Mutex::new(65_535),
             responded: AtomicBool::new(true),
+            cancelled: AtomicBool::new(false),
         });
         conn.streams
             .lock()
@@ -6373,6 +7454,7 @@ mod tests {
     /// it: the stream stays open in the client's eyes, so what it sends after that is bounded by
     /// the stream window, while the shared connection window keeps flowing for every other stream.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn a_data_after_the_upload_reader_left_is_dropped_and_uncredited() {
         let (conn, written, slices) = bare_conn();
         let settings = XhttpSettings::stream_one();
@@ -6384,6 +7466,7 @@ mod tests {
                 ended: false,
                 finished: true,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -6393,6 +7476,7 @@ mod tests {
             cv: Condvar::new(),
             send_window: Mutex::new(65_535),
             responded: AtomicBool::new(true),
+            cancelled: AtomicBool::new(false),
         });
         conn.streams
             .lock()
@@ -6726,13 +7810,21 @@ mod tests {
             upload_of: Mutex::new(HashMap::new()),
             session_gate: Mutex::new(()),
             send_conn: Mutex::new(65_535),
+            conn_credit: AtomicUsize::new(0),
+            waiting: AtomicUsize::new(0),
             batch_gate: Mutex::new(()),
             wake: Condvar::new(),
             decoder: Mutex::new(Decoder::default()),
-            max_frame: Mutex::new(16_384),
+            max_frame: AtomicUsize::new(16_384),
             peer_initial: Mutex::new(65_535),
+            peer_max: AtomicUsize::new(usize::MAX),
+            recv_window: WINDOW,
+            conn_top_up: CONN_WINDOW_TOP_UP,
+            body_chunks: body_chunk_limit(WINDOW),
             dead,
+            open_gate: Mutex::new(()),
             goaway: AtomicBool::new(false),
+            goaway_last: AtomicU32::new(u32::MAX),
             refused: AtomicBool::new(false),
             client_read: None,
             client_partial: Mutex::new(PartialFrame::default()),
@@ -6754,6 +7846,32 @@ mod tests {
             false,
         );
         (conn, written, slices)
+    }
+
+    #[test]
+    fn the_h2_lane_offer_costs_the_frame_batch_and_nothing_else() {
+        let slices = Arc::new(AtomicUsize::new(0));
+        let conn = conn_with(
+            Box::new(Counted {
+                written: Arc::new(Mutex::new(Vec::new())),
+                slices: Arc::clone(&slices),
+            }),
+            false,
+        );
+        let state = conn.attach_stream(1, false).expect("stream");
+        let data = [0u8; 16 * 1024];
+        for _ in 0..64 {
+            *conn
+                .send_conn
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = 65_535;
+            *state
+                .send_window
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = 65_535;
+            assert_eq!(conn.try_send_one_ready(1, &data), Some(true));
+        }
+        assert_eq!(slices.load(Ordering::SeqCst), 64);
     }
 
     /// A SETTINGS payload whose length is not a multiple of six is a connection error
@@ -6964,41 +8082,42 @@ mod tests {
         );
     }
 
-    /// One credit is both `WINDOW_UPDATE`s: the pair differs only by stream id, so it goes out as one 26-byte write under one lock, where two `frame()` calls were two locks and two records on the wire for the same bytes.
+    /// A stream's credit is one 13-byte `WINDOW_UPDATE` for that stream; the connection window is
+    /// credited separately, so several streams sharing it cannot starve one another.
     #[test]
-    fn a_credit_grants_both_windows_in_one_write() {
-        let (conn, written, slices) = bare_conn();
+    fn stream_and_connection_credits_are_separate_windows() {
         let increment = 0x1234_5678u32;
-        conn.replenish(7, 0);
-        conn.replenish(7, usize::MAX);
+        let (conn, written, slices) = bare_conn();
+        conn.replenish_stream(7, 0);
+        conn.replenish_stream(7, usize::MAX);
         assert_eq!(
             slices.load(Ordering::SeqCst),
             0,
             "a credit of nothing, or of more than a frame can say, writes nothing"
         );
-        conn.replenish(7, increment as usize);
+        conn.replenish_stream(7, increment as usize);
         assert_eq!(
             slices.load(Ordering::SeqCst),
             1,
-            "one credit, one write, whatever the pair costs the old shape"
+            "one stream credit, one write"
         );
         let bytes = written.lock().unwrap_or_else(PoisonError::into_inner);
-        assert_eq!(bytes.len(), 26, "the pair is 26 bytes and nothing else");
-        let mut at = 0usize;
-        for id in [0, 7] {
-            let (len, kind, flags, sid) = read_head(&mut &bytes[at..at + 9]).expect("head");
-            assert_eq!(
-                (len, kind, flags, sid),
-                (4, T_WINDOW, 0, id),
-                "the frame at {at} is the credit for stream {id}"
-            );
-            assert_eq!(
-                bytes[at + 9..at + 13],
-                increment.to_be_bytes(),
-                "both windows rise by the bytes consumed"
-            );
-            at += 13;
-        }
+        assert_eq!(bytes.len(), 13, "a stream credit is one frame");
+        let (len, kind, flags, sid) = read_head(&mut &bytes[..9]).expect("head");
+        assert_eq!((len, kind, flags, sid), (4, T_WINDOW, 0, 7));
+        assert_eq!(bytes[9..13], increment.to_be_bytes());
+
+        let (conn, written, slices) = bare_conn();
+        assert!(conn.replenish_connection(0));
+        assert!(conn.replenish_connection(usize::MAX));
+        assert_eq!(slices.load(Ordering::SeqCst), 0);
+        assert!(conn.replenish_connection(increment as usize));
+        assert_eq!(slices.load(Ordering::SeqCst), 1);
+        let bytes = written.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(bytes.len(), 13);
+        let (len, kind, flags, sid) = read_head(&mut &bytes[..9]).expect("head");
+        assert_eq!((len, kind, flags, sid), (4, T_WINDOW, 0, 0));
+        assert_eq!(bytes[9..13], increment.to_be_bytes());
     }
 
     /// A DATA frame returns its windows when the reader takes it, not when it is queued: an
@@ -7046,8 +8165,8 @@ mod tests {
         assert_eq!(&short[..8], &[0x33u8; 8]);
     }
 
-    /// A threaded connection spends one control write for four read frames, and the end of the
-    /// stream flushes the credit still held: the peer's window never waits on a batch that no
+    /// A threaded connection batches four read frames into one credit per window, and the end of
+    /// the stream flushes the credit still held: the peer's window never waits on a batch that no
     /// further DATA will complete.
     #[test]
     fn a_threaded_credit_batches_four_frames_and_flushes_at_the_end() {
@@ -7077,22 +8196,29 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(
-            slices.load(Ordering::SeqCst),
-            1,
-            "four read frames go out as one credit"
-        );
         assert!(
             conn.control.drained(Duration::from_secs(1)),
-            "the credit write finishes before its bytes are read"
+            "the credit writes finish before their bytes are read"
+        );
+        assert!(
+            (1..=2).contains(&slices.load(Ordering::SeqCst)),
+            "the two windows are one or two writes, never one per frame"
         );
         let bytes = written.lock().unwrap_or_else(PoisonError::into_inner);
         assert_eq!(bytes.len(), 26, "the pair is 26 bytes and nothing else");
-        assert_eq!(
-            u32::from_be_bytes(bytes[9..13].try_into().unwrap()),
-            CREDIT_BATCH_BYTES as u32,
-            "the batch carries every read byte"
-        );
+        for (at, id) in [(0, 0), (13, 1)] {
+            let (len, kind, flags, got) = read_head(&mut &bytes[at..at + 9]).expect("head");
+            assert_eq!(
+                (len, kind, flags, got),
+                (4, T_WINDOW, 0, id),
+                "the frame at {at} credits window {id}"
+            );
+            assert_eq!(
+                u32::from_be_bytes(bytes[at + 9..at + 13].try_into().unwrap()),
+                CREDIT_BATCH_BYTES as u32,
+                "the frame at {at} carries every read byte"
+            );
+        }
     }
 
     /// A peer reset frees the stream's stream window but must hand its deferred connection credit
@@ -7200,7 +8326,7 @@ mod tests {
             }),
             true,
         );
-        conn.replenish(1, 16);
+        conn.replenish_stream(1, 16);
         let mut in_write = entered.0.lock().unwrap_or_else(PoisonError::into_inner);
         while !*in_write {
             in_write = entered
@@ -7212,7 +8338,7 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::channel();
         let sender_conn = Arc::clone(&conn);
         thread::spawn(move || {
-            sender_conn.replenish(2, 16);
+            sender_conn.replenish_stream(2, 16);
             let _ = sender.send(());
         });
         assert_eq!(
@@ -7225,7 +8351,7 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
             let len = written.lock().unwrap_or_else(PoisonError::into_inner).len();
-            if len == 52 {
+            if len == 26 {
                 break;
             }
             assert!(
@@ -7257,7 +8383,7 @@ mod tests {
             }),
             true,
         );
-        conn.replenish(1, 16);
+        conn.replenish_stream(1, 16);
         let mut in_write = entered.0.lock().unwrap_or_else(PoisonError::into_inner);
         while !*in_write {
             in_write = entered
@@ -7301,7 +8427,7 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
             let len = written.lock().unwrap_or_else(PoisonError::into_inner).len();
-            if len == 56 {
+            if len == 43 {
                 break;
             }
             assert!(
@@ -7324,7 +8450,7 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
             let len = written.lock().unwrap_or_else(PoisonError::into_inner).len();
-            if len == 43 {
+            if len == 30 {
                 break;
             }
             assert!(
@@ -7424,7 +8550,7 @@ mod tests {
             }),
             true,
         );
-        conn.replenish(1, 16);
+        conn.replenish_stream(1, 16);
         let mut in_write = entered.0.lock().unwrap_or_else(PoisonError::into_inner);
         while !*in_write {
             in_write = entered
@@ -7435,7 +8561,7 @@ mod tests {
         drop(in_write);
         let mut queued = 0;
         while !conn.dead.load(Ordering::SeqCst) && queued <= CAP + CONTROL_BATCH + 2 {
-            conn.replenish(2, 16);
+            conn.replenish_stream(2, 16);
             queued += 1;
         }
         assert!(
@@ -7459,7 +8585,7 @@ mod tests {
     #[test]
     fn a_failed_control_write_ends_the_connection() {
         let conn = conn_with(Box::new(Broken), true);
-        conn.replenish(1, 16);
+        conn.replenish_stream(1, 16);
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while !conn.dead.load(Ordering::SeqCst) {
             assert!(
@@ -7513,6 +8639,7 @@ mod tests {
                 ended: false,
                 finished: true,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: true,
                 status: None,
@@ -7522,6 +8649,7 @@ mod tests {
             cv: Condvar::new(),
             send_window: Mutex::new(65_535),
             responded: AtomicBool::new(true),
+            cancelled: AtomicBool::new(false),
         });
         conn.streams
             .lock()
@@ -7579,6 +8707,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -7588,6 +8717,7 @@ mod tests {
             cv: Condvar::new(),
             send_window: Mutex::new(i64::try_from(total).unwrap_or(i64::MAX)),
             responded: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
         });
         conn.streams
             .lock()
@@ -7784,6 +8914,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -7793,6 +8924,7 @@ mod tests {
             cv: Condvar::new(),
             send_window: Mutex::new(0),
             responded: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
         });
         conn.streams
             .lock()
@@ -7842,6 +8974,7 @@ mod tests {
                 ended: true,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -7851,6 +8984,7 @@ mod tests {
             cv: Condvar::new(),
             send_window: Mutex::new(0),
             responded: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
         });
         conn.streams
             .lock()
@@ -7905,6 +9039,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -7914,6 +9049,7 @@ mod tests {
             cv: Condvar::new(),
             send_window: Mutex::new(4),
             responded: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
         });
         conn.streams
             .lock()
@@ -7931,6 +9067,60 @@ mod tests {
         );
     }
 
+    /// A grant that lands after the zero-room offer but before the transport wait is already paid:
+    /// the wait must recheck both windows under the credit lock instead of sleeping the whole turn.
+    #[test]
+    fn a_credit_that_landed_before_the_transport_wait_is_not_slept_out() {
+        let (conn, _written, _slices) = bare_conn();
+        let state = Arc::new(H2Stream {
+            state: Mutex::new(StreamState {
+                body: VecDeque::new(),
+                credit: VecDeque::new(),
+                queued_bytes: 0,
+                ended: false,
+                finished: false,
+                request_ended: false,
+                tunnel: false,
+                stopped: false,
+                abandoned: false,
+                status: None,
+                dead: false,
+                pending_credit: 0,
+            }),
+            cv: Condvar::new(),
+            send_window: Mutex::new(0),
+            responded: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+        });
+        conn.streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(1, Arc::clone(&state));
+        *conn
+            .send_conn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = 0;
+        {
+            let mut conn_window = conn
+                .send_conn
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let mut stream_window = state
+                .send_window
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            *conn_window = 4;
+            *stream_window = 4;
+        }
+        conn.wake.notify_all();
+        let began = std::time::Instant::now();
+        conn.wait_transport(1, Duration::from_millis(250));
+        assert!(
+            began.elapsed() < Duration::from_millis(100),
+            "the paid transport window was slept out"
+        );
+    }
+
     /// A stream or connection that dies must wake a writer parked on its window, not leave it to
     /// discover the death when the relay stall expires.
     fn assert_death_wakes_a_parked_sender(death: impl FnOnce(&H2Conn)) {
@@ -7943,6 +9133,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -7952,6 +9143,7 @@ mod tests {
             cv: Condvar::new(),
             send_window: Mutex::new(0),
             responded: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
         });
         conn.streams
             .lock()
@@ -8044,8 +9236,8 @@ mod tests {
         server.join().expect("joins");
     }
 
-    /// The last bytes the connection wrote are one credit for `sid` of `inc`: the pair of
-    /// four-octet `WINDOW_UPDATE` frames, connection-level then stream-level, both saying `inc`.
+    /// The last bytes the connection wrote are one stream credit for `sid` of `inc`: the shared
+    /// connection window keeps its own batch, so a single read flushes only the stream half.
     fn expect_one_credit(
         written: &Arc<Mutex<Vec<u8>>>,
         slices: &Arc<AtomicUsize>,
@@ -8058,9 +9250,40 @@ mod tests {
             "one credit, one write for stream {sid}"
         );
         let bytes = written.lock().unwrap_or_else(PoisonError::into_inner);
-        assert_eq!(bytes.len(), 26, "the credit is the pair and nothing else");
-        let mut at = 0usize;
-        for id in [0, sid] {
+        assert_eq!(
+            bytes.len(),
+            13,
+            "the credit is the stream half and nothing else"
+        );
+        let (len, kind, flags, got) = read_head(&mut &bytes[..9]).expect("head");
+        assert_eq!(
+            (len, kind, flags, got),
+            (4, T_WINDOW, 0, sid),
+            "the frame is the credit for stream {sid}"
+        );
+        assert_eq!(
+            bytes[9..13],
+            inc.to_be_bytes(),
+            "the stream window rises by the frame's wire length"
+        );
+    }
+
+    /// A frame whose payload was swallowed still pays both windows in the pump, so the pair is
+    /// written back to back: the stream first, then the shared connection.
+    fn expect_stream_and_connection_credits(
+        written: &Arc<Mutex<Vec<u8>>>,
+        slices: &Arc<AtomicUsize>,
+        sid: u32,
+        inc: u32,
+    ) {
+        assert_eq!(
+            slices.load(Ordering::SeqCst),
+            2,
+            "the swallowed frame credits both windows"
+        );
+        let bytes = written.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(bytes.len(), 26, "the two halves are 13 bytes each");
+        for (at, id) in [(0, sid), (13, 0)] {
             let (len, kind, flags, got) = read_head(&mut &bytes[at..at + 9]).expect("head");
             assert_eq!(
                 (len, kind, flags, got),
@@ -8072,8 +9295,37 @@ mod tests {
                 inc.to_be_bytes(),
                 "both windows rise by the frame's wire length"
             );
-            at += 13;
         }
+    }
+
+    /// A frame for a stream that is gone credits only the shared connection window.
+    fn expect_one_connection_credit(
+        written: &Arc<Mutex<Vec<u8>>>,
+        slices: &Arc<AtomicUsize>,
+        inc: u32,
+    ) {
+        assert_eq!(
+            slices.load(Ordering::SeqCst),
+            1,
+            "one credit, one write for the connection"
+        );
+        let bytes = written.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(
+            bytes.len(),
+            13,
+            "the credit is the connection half and nothing else"
+        );
+        let (len, kind, flags, got) = read_head(&mut &bytes[..9]).expect("head");
+        assert_eq!(
+            (len, kind, flags, got),
+            (4, T_WINDOW, 0, 0),
+            "the frame is the connection credit"
+        );
+        assert_eq!(
+            bytes[9..13],
+            inc.to_be_bytes(),
+            "the connection window rises by the frame's wire length"
+        );
     }
 
     /// A DATA frame's credit is what the frame cost the peer's window — the whole wire payload, Pad Length octet and Padding counted (RFC 7540 6.9, where the reference takes `f.Length`) — so both `WINDOW_UPDATE` halves carry `1 + payload + pad`. Crediting the post-cut payload under-credits every padded frame by `1 + pad`; crediting a swallowed payload nothing starves the peer outright.
@@ -8091,6 +9343,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -8100,6 +9353,7 @@ mod tests {
             cv: Condvar::new(),
             send_window: Mutex::new(65_535),
             responded: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
         });
         conn.streams
             .lock()
@@ -8152,7 +9406,7 @@ mod tests {
             vec![200u8, b'x'],
             &mut frag
         ));
-        expect_one_credit(&written, &slices, 1, 2);
+        expect_stream_and_connection_credits(&written, &slices, 1, 2);
 
         // DATA for a stream that is not there is credited at the wire length on its way out, too.
         written
@@ -8169,7 +9423,7 @@ mod tests {
             vec![3u8, b'p', 3, 3, 3],
             &mut frag
         ));
-        expect_one_credit(&written, &slices, 9, 5);
+        expect_one_connection_credit(&written, &slices, 5);
 
         // Unpadded: the payload is the wire, and that arm does not move.
         written

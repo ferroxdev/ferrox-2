@@ -607,6 +607,8 @@ mod tests {
         let client = crate::conn::Connection::connect(addr).expect("dialled");
         let (peer, _) = listener.accept().expect("accepted");
         let read = client.try_clone().expect("clones the reader");
+        read.set_read_timeout(Some(crate::budgets::RELAY_POLL))
+            .expect("arms the reader");
         let write = client.try_clone().expect("clones the writer");
         let conn = H2Client::new(read, write, Some(Arc::new(client))).expect("a client");
         (conn, peer)

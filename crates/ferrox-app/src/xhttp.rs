@@ -4191,7 +4191,8 @@ impl crate::proxy::CarrierSink for XhttpWriter {
     #[inline]
     fn wait_for_room(&self, turn: std::time::Duration) {
         match self.stream.get() {
-            Some(StreamOut::H2(out)) => out.wait_room(turn),
+            Some(StreamOut::H2(out)) if out.room() == 0 => out.wait_room(turn),
+            Some(StreamOut::H2(out)) => out.wait_transport(turn),
             _ => std::thread::sleep(turn),
         }
     }

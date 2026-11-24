@@ -1136,7 +1136,13 @@ fn send_gso(
         msg_flags: 0,
     };
     // SAFETY: `message` names `parts`, `storage` and `control`, which outlive the call, and each part points at a slot the caller filled for the same sweep.
-    let sent = unsafe { libc::sendmsg(sock.as_raw_fd(), &raw const message, 0) };
+    let sent = unsafe {
+        libc::sendmsg(
+            sock.as_raw_fd(),
+            &raw const message,
+            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+        )
+    };
     if sent == isize::try_from(total).unwrap_or(isize::MAX) {
         return Gso::Sent;
     }
@@ -1206,7 +1212,7 @@ fn send_mmsg(
                 sock.as_raw_fd(),
                 rest.as_mut_ptr().cast::<libc::mmsghdr>(),
                 rest.len() as libc::c_uint,
-                0,
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
             )
         };
         match sent {
@@ -2173,6 +2179,7 @@ pub(crate) fn rebind_path(
     set_gro(&fresh, sock.gro && sock.gso && sock.whole_datagrams());
     set_receive_buffer(&fresh, DATAGRAM_BUFFER);
     set_send_buffer(&fresh, DATAGRAM_BUFFER);
+    arm_send_timeout(&fresh);
     if let Ok(mut slot) = sock.source.lock() {
         *slot = Some(source);
     }
@@ -2232,8 +2239,19 @@ fn armed_lane(sock: UdpSocket, gro: bool) -> UdpSocket {
     let _ = gro;
     set_receive_buffer(&sock, DATAGRAM_BUFFER);
     set_send_buffer(&sock, DATAGRAM_BUFFER);
+    arm_send_timeout(&sock);
     sock
 }
+
+/// A platform without a per-call send flag gets a one-millisecond write timeout, so a full buffer
+/// cannot park the relay worker in the kernel.
+#[cfg(not(target_os = "linux"))]
+fn arm_send_timeout(sock: &UdpSocket) {
+    let _ = sock.set_write_timeout(Some(Duration::from_millis(1)));
+}
+
+#[cfg(target_os = "linux")]
+fn arm_send_timeout(_sock: &UdpSocket) {}
 
 #[cfg(target_os = "linux")]
 fn set_gro(sock: &UdpSocket, on: bool) {
@@ -2582,8 +2600,97 @@ const HELD_LIMIT: usize = 256;
 fn refused(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
-        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+        std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::TimedOut
     ) || error.raw_os_error() == Some(libc::ENOBUFS)
+}
+
+/// One datagram send that cannot wait in the kernel: a relay lane parks on a full send buffer
+/// instead of holding the connection lock its other streams need.
+fn sendto_ready(sock: &UdpSocket, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+        let (storage, name_len) = crate::proxy::sockaddr_of(to);
+        let fd = sock.as_raw_fd();
+        let sent = sendto_flags(fd, buf, &storage, name_len);
+        if sent < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(sent as usize)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        sock.send_to(buf, to)
+    }
+}
+
+/// One connected send with the same per-call decision, for a lane a proxy shim owns.
+fn send_ready(sock: &UdpSocket, buf: &[u8]) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+        let fd = sock.as_raw_fd();
+        let sent = send_flags(fd, buf);
+        if sent < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(sent as usize)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        sock.send(buf)
+    }
+}
+
+#[cfg(unix)]
+fn sendto_flags(
+    fd: std::os::fd::RawFd,
+    buf: &[u8],
+    storage: &libc::sockaddr_storage,
+    name_len: libc::socklen_t,
+) -> isize {
+    let name = std::ptr::from_ref(storage).cast();
+    #[cfg(target_os = "linux")]
+    {
+        unsafe {
+            libc::sendto(
+                fd,
+                buf.as_ptr().cast(),
+                buf.len(),
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                name,
+                name_len,
+            )
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // No per-call flag here: the lane's one-millisecond write timeout bounds a full buffer.
+        unsafe { libc::sendto(fd, buf.as_ptr().cast(), buf.len(), 0, name, name_len) }
+    }
+}
+
+#[cfg(unix)]
+fn send_flags(fd: std::os::fd::RawFd, buf: &[u8]) -> isize {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe {
+            libc::send(
+                fd,
+                buf.as_ptr().cast(),
+                buf.len(),
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            )
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        unsafe { libc::send(fd, buf.as_ptr().cast(), buf.len(), 0) }
+    }
 }
 
 /// Where datagrams go. The association's control connection is held, never read: dropping it ends it.
@@ -2769,13 +2876,13 @@ impl Hopper {
     fn send(&self, buf: &[u8], to: SocketAddr, obfs: Option<&Mask>) -> std::io::Result<usize> {
         let (sock, dest) = self.egress(to);
         let Some(obfs) = obfs else {
-            return sock.send_to(buf, dest);
+            return sendto_ready(&sock, buf, dest);
         };
         let mut wire = Unfilled::<{ MAX_DATAGRAM + SALAMANDER_SALT }>::new();
         let sealed = obfs
             .seal_into(buf, wire.as_mut())
             .ok_or(std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-        sock.send_to(&wire.as_mut()[..sealed], dest)
+        sendto_ready(&sock, &wire.as_mut()[..sealed], dest)
     }
 
     /// Read one datagram, advancing the schedule first so a reader sees the same
@@ -2878,6 +2985,21 @@ const GECKO_MAX_PER_SOURCE: usize = 8;
 /// fragment is built in is big enough for any padded frame the plan can ask for.
 const GECKO_BUFFER: usize = ferrox_core::hysteria::Gecko::MAX_BUFFER as usize;
 
+/// The fragments a refused gecko write still owes, so a retry resumes the same message id
+/// and chunk sequence instead of starting a second partial message.
+struct FragmentState {
+    msg_id: u8,
+    total: usize,
+    next: usize,
+    /// When the first chunk left, so a pause past the reassembly ttl restarts under a new id.
+    started: Instant,
+    /// The bytes the first attempt framed, so a retry finishes those chunks rather than a re-encoding.
+    buf: Vec<u8>,
+    /// The caller's plaintext before any mask, so a re-encoded retry still names the same message.
+    key: Vec<u8>,
+    to: SocketAddr,
+}
+
 /// One message mid-reassembly: its chunk count, the offsets of the payloads landed so
 /// far indexed by chunk into the one arena, and when it expires.
 struct GeckoMessage {
@@ -2940,6 +3062,7 @@ pub(crate) struct Gecko {
     min: usize,
     max: usize,
     msg: AtomicU64,
+    fragment: Mutex<Option<FragmentState>>,
     reassembly: Mutex<Reassembly>,
 }
 
@@ -2956,6 +3079,7 @@ impl Gecko {
             min: usize::from(window.min_pkt),
             max: usize::from(window.max_pkt),
             msg: AtomicU64::new(0),
+            fragment: Mutex::new(None),
             reassembly: Mutex::new(Reassembly::default()),
         }
     }
@@ -2973,6 +3097,7 @@ impl Gecko {
             min: usize::from(window.min_pkt),
             max: usize::from(window.max_pkt),
             msg: AtomicU64::new(0),
+            fragment: Mutex::new(None),
             reassembly: Mutex::new(Reassembly::default()),
         })
     }
@@ -2981,7 +3106,7 @@ impl Gecko {
     fn send_wire(&self, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
         match self.hop.as_ref() {
             Some(hop) => hop.send(buf, to, None),
-            None => self.sock.send_to(buf, to),
+            None => sendto_ready(&self.sock, buf, to),
         }
     }
 
@@ -3006,20 +3131,44 @@ impl Gecko {
     /// Split a long-header packet into `2..=8` chunks, each framed, padded to the
     /// window and masked as its own datagram. The message id is one draw for the whole
     /// packet; the chunk count and each pad are drawn per write.
-    fn send_fragmented(&self, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
-        let total = ferrox_core::hysteria::GECKO_MIN_CHUNKS
-            + (entropy()
-                % (ferrox_core::hysteria::GECKO_MAX_CHUNKS
-                    - ferrox_core::hysteria::GECKO_MIN_CHUNKS
-                    + 1) as u64) as usize;
-        let msg_id = self.msg.fetch_add(1, Ordering::Relaxed) as u8;
+    fn send_fragmented(&self, buf: &[u8], to: SocketAddr, key: &[u8]) -> std::io::Result<usize> {
+        let mut fragment = self
+            .fragment
+            .lock()
+            .map_err(|_| std::io::Error::other("gecko fragment lock poisoned"))?;
+        let resume = fragment
+            .as_ref()
+            .filter(|state| {
+                state.key == key && state.to == to && state.started.elapsed() < GECKO_TTL
+            })
+            .map(|state| (state.msg_id, state.total, state.next, state.buf.clone()));
+        let (msg_id, total, start, source) = if let Some((msg_id, total, next, buf)) = resume {
+            (msg_id, total, next, buf)
+        } else {
+            let total = ferrox_core::hysteria::GECKO_MIN_CHUNKS
+                + (entropy()
+                    % (ferrox_core::hysteria::GECKO_MAX_CHUNKS
+                        - ferrox_core::hysteria::GECKO_MIN_CHUNKS
+                        + 1) as u64) as usize;
+            let msg_id = self.msg.fetch_add(1, Ordering::Relaxed) as u8;
+            *fragment = Some(FragmentState {
+                msg_id,
+                total,
+                next: 0,
+                started: Instant::now(),
+                buf: buf.to_vec(),
+                key: key.to_vec(),
+                to,
+            });
+            (msg_id, total, 0, buf.to_vec())
+        };
         let mut pad = [0u8; GECKO_BUFFER];
         let mut frame = Unfilled::<GECKO_BUFFER>::new();
         let mut wire = Unfilled::<{ GECKO_BUFFER + SALAMANDER_SALT }>::new();
-        for idx in 0..total {
-            let (start, end) = ferrox_core::hysteria::gecko_chunk_range(buf.len(), idx, total)
+        for idx in start..total {
+            let (start, end) = ferrox_core::hysteria::gecko_chunk_range(source.len(), idx, total)
                 .ok_or(invalid(std::io::ErrorKind::InvalidInput))?;
-            let chunk = &buf[start..end];
+            let chunk = &source[start..end];
             let base = ferrox_core::hysteria::SALAMANDER_SALT
                 + ferrox_core::hysteria::GECKO_HEADER
                 + chunk.len();
@@ -3049,17 +3198,37 @@ impl Gecko {
                 .obfs
                 .seal_into(&frame.as_mut()[..written], wire.as_mut())
                 .ok_or(invalid(std::io::ErrorKind::InvalidInput))?;
-            self.send_wire(&wire.as_mut()[..sealed], to)?;
+            match self.send_wire(&wire.as_mut()[..sealed], to) {
+                Ok(0) => return Err(std::io::ErrorKind::WouldBlock.into()),
+                Ok(_) => {
+                    if let Some(state) = fragment.as_mut() {
+                        state.next = idx + 1;
+                    }
+                }
+                Err(error) => return Err(error),
+            }
         }
+        *fragment = None;
         Ok(buf.len())
     }
 
-    fn send(&self, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
-        if buf
-            .first()
-            .is_some_and(|b| b & ferrox_core::hysteria::GECKO_FLAG != 0)
+    fn send(&self, buf: &[u8], to: SocketAddr, key: &[u8]) -> std::io::Result<usize> {
+        let resuming = self
+            .fragment
+            .lock()
+            .ok()
+            .and_then(|state| {
+                state.as_ref().map(|state| {
+                    state.key == key && state.to == to && state.started.elapsed() < GECKO_TTL
+                })
+            })
+            .unwrap_or(false);
+        if resuming
+            || key
+                .first()
+                .is_some_and(|b| b & ferrox_core::hysteria::GECKO_FLAG != 0)
         {
-            return self.send_fragmented(buf, to);
+            return self.send_fragmented(buf, to, key);
         }
         self.send_masked(buf, to)
     }
@@ -3647,12 +3816,12 @@ impl Datagram {
 
     fn send_on(&self, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
         if self.proxy_peer.is_some() {
-            return self.sock.send(buf);
+            return send_ready(&self.sock, buf);
         }
         if let Some(sock) = self.rebound() {
-            return sock.send_to(buf, to);
+            return sendto_ready(&sock, buf, to);
         }
-        self.sock.send_to(buf, to)
+        sendto_ready(&self.sock, buf, to)
     }
 
     fn recv_on(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
@@ -3666,7 +3835,7 @@ impl Datagram {
 
     pub(crate) fn send_to(&self, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
         let Some(mask) = self.udp_mask.as_ref() else {
-            return self.send_layered(buf, to);
+            return self.send_layered(buf, to, buf);
         };
         let Ok(mut encoder) = mask.encoder.lock() else {
             return Err(std::io::Error::other("the udp mask encoder is gone"));
@@ -3674,12 +3843,12 @@ impl Datagram {
         let Some(wire) = encoder.encode(buf) else {
             return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
         };
-        self.send_layered(wire, to)
+        self.send_layered(wire, to, buf)
     }
 
-    fn send_layered(&self, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
+    fn send_layered(&self, buf: &[u8], to: SocketAddr, key: &[u8]) -> std::io::Result<usize> {
         if let Some(gecko) = self.gecko.as_ref() {
-            return gecko.send(buf, to);
+            return gecko.send(buf, to, key);
         }
         if let Some(hop) = self.hop.as_ref() {
             return hop.send(buf, to, self.obfs.as_ref());
@@ -5168,7 +5337,7 @@ impl Write for QuicStream {
         let deadline = Instant::now() + SEND_WAIT;
         let mut rest = bytes::Bytes::copy_from_slice(buf);
         while !rest.is_empty() {
-            match self.send_once(&mut rest) {
+            match self.send_once(&mut rest, true) {
                 Ok(0) => {
                     if Instant::now() >= deadline {
                         let sent = buf.len() - rest.len();
@@ -5202,6 +5371,20 @@ impl Write for QuicStream {
         };
         flush_egress(&mut conn, &self.sock);
         Ok(())
+    }
+}
+
+impl crate::proxy::LaneWrite for QuicStream {
+    fn push(&mut self, data: &[u8]) -> crate::proxy::Push {
+        if !data.is_empty() && self.stalled.load(Ordering::Relaxed) {
+            return crate::proxy::Push::Lost;
+        }
+        match self.try_write(data) {
+            Ok(0) => crate::proxy::Push::Parked,
+            Ok(n) => crate::proxy::Push::Took(n),
+            Err(error) if crate::proxy::is_timeout(&error) => crate::proxy::Push::Parked,
+            Err(_) => crate::proxy::Push::Lost,
+        }
     }
 }
 
@@ -5277,10 +5460,43 @@ impl QuicStream {
         self
     }
 
+    /// One non-blocking send flight: no room answers zero, so a relay lane parks instead of a worker.
+    pub(crate) fn try_write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.stop.load(Ordering::Relaxed) {
+            return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        }
+        if self.stalled.load(Ordering::Relaxed) {
+            return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        }
+        let mut rest = bytes::Bytes::copy_from_slice(buf);
+        let n = self.send_once(&mut rest, false)?;
+        if n > 0 {
+            self.meter.write(n);
+            self.activity.touch();
+        }
+        Ok(n)
+    }
+
     /// One send flight without holding the lock across the wait behind it.
-    fn send_once(&mut self, rest: &mut bytes::Bytes) -> std::io::Result<usize> {
-        let Ok(mut conn) = self.conn.lock() else {
-            return Err(std::io::Error::other("quic connection lock poisoned"));
+    fn send_once(&mut self, rest: &mut bytes::Bytes, wait: bool) -> std::io::Result<usize> {
+        let mut conn = if wait {
+            match self.conn.lock() {
+                Ok(conn) => conn,
+                Err(_) => {
+                    return Err(std::io::Error::other("quic connection lock poisoned"));
+                }
+            }
+        } else {
+            match self.conn.try_lock() {
+                Ok(conn) => conn,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(0),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(std::io::Error::other("quic connection lock poisoned"));
+                }
+            }
         };
         // A closed or draining connection cannot progress: fail the write instead of parking it for SEND_WAIT.
         if conn.is_closed() || conn.is_draining() {
@@ -5360,6 +5576,14 @@ impl QuicStream {
     pub(crate) fn shutdown_read(&self) {
         if let Ok(mut conn) = self.conn.lock() {
             let _ = conn.stream_shutdown(self.id, quiche::Shutdown::Read, 0);
+            flush_egress(&mut conn, &self.sock);
+        }
+    }
+
+    /// Stop reading with H3's no-error code after a complete response.
+    pub(crate) fn shutdown_read_h3(&self) {
+        if let Ok(mut conn) = self.conn.lock() {
+            let _ = conn.stream_shutdown(self.id, quiche::Shutdown::Read, 0x0100);
             flush_egress(&mut conn, &self.sock);
         }
     }

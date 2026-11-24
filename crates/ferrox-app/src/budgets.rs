@@ -11,6 +11,9 @@ pub(crate) const HANDSHAKE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) const RELAY_POLL: Duration = Duration::from_millis(1);
 
+/// An idle inbound TLS read: teardown shuts the socket, so this only bounds a peer that vanishes without one, and the driven path holds no session lock across the wait.
+pub(crate) const SESSION_IDLE_POLL: Duration = Duration::from_secs(1);
+
 /// A shaped handshake's read quantum: the core gives a hello 1500 polls, so 20 ms here is its 30 s budget.
 pub(crate) const HANDSHAKE_POLL: Duration = Duration::from_millis(20);
 

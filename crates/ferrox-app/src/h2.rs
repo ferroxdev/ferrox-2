@@ -27,6 +27,7 @@ pub(crate) const E_FLOW: u32 = 0x03;
 pub(crate) const E_COMPRESSION: u32 = 0x09;
 pub(crate) const E_FRAME_SIZE: u32 = 0x06;
 pub(crate) const E_REFUSED: u32 = 0x07;
+pub(crate) const E_CANCEL: u32 = 0x08;
 pub(crate) const WINDOW: u32 = 4 * 1024 * 1024;
 pub(crate) const FRAME_CAP: usize = 17 * 1024 * 1024;
 pub(crate) const HEAD_CAP: usize = 64 * 1024;

@@ -1290,8 +1290,12 @@ impl<'a> Gather<'a> {
 
     /// Waits out a paced tail for the blocking writer: the framed relay never takes this path, so the
     /// wait costs a lane only when a caller asked for every byte before it returned.
-    fn settle_blocking(shared: &Shared) -> bool {
-        let deadline = Instant::now() + crate::budgets::relay_stall();
+    fn settle_tail(shared: &Shared) -> bool {
+        let mut deadline = Instant::now() + crate::budgets::relay_stall();
+        Self::settle_blocking(shared, &mut deadline)
+    }
+
+    fn settle_blocking(shared: &Shared, deadline: &mut Instant) -> bool {
         loop {
             let settled = match shared.stream.lock() {
                 Ok(mut stream) => stream.settle(),
@@ -1300,8 +1304,9 @@ impl<'a> Gather<'a> {
             match settled {
                 Settle::Clear => return true,
                 Settle::Lost => return false,
+                Settle::Advanced => *deadline = Instant::now() + crate::budgets::relay_stall(),
                 Settle::Parked => {
-                    if Instant::now() >= deadline {
+                    if Instant::now() >= *deadline {
                         return false;
                     }
                     std::thread::sleep(crate::budgets::RELAY_POLL);
@@ -1313,16 +1318,21 @@ impl<'a> Gather<'a> {
     /// The same offer for a caller that may wait: a refused batch drains the paced tail and takes
     /// its window again before the next try.
     fn flush_blocking(&mut self, shared: &Arc<Shared>) -> bool {
-        let deadline = Instant::now() + crate::budgets::relay_stall();
+        let mut deadline = Instant::now() + crate::budgets::relay_stall();
         loop {
+            if Instant::now() >= deadline {
+                refund(shared, self.credit);
+                self.credit = 0;
+                return false;
+            }
             match self.flush(shared) {
                 Accepted::All => return true,
                 Accepted::Lost => return false,
                 Accepted::Full => {
-                    if Instant::now() >= deadline || !Self::settle_blocking(shared) {
+                    if !Self::settle_blocking(shared, &mut deadline) {
                         return false;
                     }
-                    if self.credit > 0 && !take_window(shared, self.credit, true) {
+                    if self.credit > 0 && !take_window_until(shared, self.credit, Some(deadline)) {
                         return false;
                     }
                     if let Ok(stream) = shared.stream.lock() {
@@ -1759,7 +1769,7 @@ impl GrpcWriter {
                 self.shared.ended.store(false, Ordering::SeqCst);
                 return;
             }
-            let _ = Gather::settle_blocking(&self.shared);
+            let _ = Gather::settle_tail(&self.shared);
             return;
         }
         if self.shared.upload_ended.load(Ordering::SeqCst) {
@@ -1771,7 +1781,7 @@ impl GrpcWriter {
             self.shared.upload_ended.store(false, Ordering::SeqCst);
             return;
         }
-        let _ = Gather::settle_blocking(&self.shared);
+        let _ = Gather::settle_tail(&self.shared);
     }
 
     /// The relay read the target and it failed: the trailer must carry the matching status, where a
@@ -1802,7 +1812,7 @@ impl GrpcWriter {
                 self.shared.ended.store(false, Ordering::SeqCst);
                 return;
             }
-            let _ = Gather::settle_blocking(&self.shared);
+            let _ = Gather::settle_tail(&self.shared);
             return;
         }
         if self.shared.upload_ended.load(Ordering::SeqCst) {
@@ -1813,7 +1823,7 @@ impl GrpcWriter {
             return;
         }
         self.shared.upload_ended.store(true, Ordering::SeqCst);
-        let _ = Gather::settle_blocking(&self.shared);
+        let _ = Gather::settle_tail(&self.shared);
     }
 
     /// `END_STREAM` costs no flow credit, but it still rides the paced tail: a full transport is drained and the same empty frame retried.
@@ -1899,10 +1909,10 @@ impl GrpcWriter {
             {
                 return false;
             }
-            if !reserved && !self.credit(batch, total as u64) {
+            if batch.full() && !batch.flush_blocking(&self.shared) {
                 return false;
             }
-            if batch.full() && !batch.flush_blocking(&self.shared) {
+            if !reserved && !self.credit(batch, total as u64) {
                 return false;
             }
             batch.add(
@@ -1917,10 +1927,10 @@ impl GrpcWriter {
         while at < total {
             let n = (total - at).min(max);
             let last = at + n == total;
-            if !reserved && !self.credit(batch, n as u64) {
+            if batch.full() && !batch.flush_blocking(&self.shared) {
                 return false;
             }
-            if batch.full() && !batch.flush_blocking(&self.shared) {
+            if !reserved && !self.credit(batch, n as u64) {
                 return false;
             }
             let flags = if last && end { F_END } else { 0 };
@@ -3098,13 +3108,17 @@ impl Tail {
         if self.lost {
             return Settle::Lost;
         }
+        let mut moved = false;
         while self.at < self.bytes.len() {
             match self.inner.write(&self.bytes[self.at..]) {
                 Ok(0) => {
                     self.lost = true;
                     return Settle::Lost;
                 }
-                Ok(n) => self.at += n,
+                Ok(n) => {
+                    self.at += n;
+                    moved = true;
+                }
                 Err(error)
                     if error.kind() == std::io::ErrorKind::WouldBlock
                         || crate::proxy::is_timeout(&error) =>
@@ -3119,7 +3133,11 @@ impl Tail {
         }
         self.bytes.clear();
         self.at = 0;
-        Settle::Clear
+        if moved {
+            Settle::Advanced
+        } else {
+            Settle::Clear
+        }
     }
 }
 
@@ -3171,7 +3189,7 @@ impl crate::proxy::FrameWrite for Tail {
         if self.at < self.bytes.len() {
             match self.drain() {
                 Settle::Lost => return Accepted::Lost,
-                Settle::Clear | Settle::Parked => {}
+                Settle::Clear | Settle::Advanced | Settle::Parked => {}
             }
         }
         if self.at < self.bytes.len() {
@@ -6740,7 +6758,7 @@ mod tests {
             client.read_exact(&mut body).expect("body");
             if kind == T_RST {
                 assert_eq!(sid, 1);
-                assert_eq!(body[..4], E_REFUSED.to_be_bytes());
+                assert_eq!(body[..4], crate::h2::E_CANCEL.to_be_bytes());
                 refused = true;
             }
         }

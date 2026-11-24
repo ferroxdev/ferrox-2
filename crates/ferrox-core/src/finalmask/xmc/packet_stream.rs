@@ -253,6 +253,43 @@ impl<R, W: Write> PacketStream<R, W> {
         }
     }
 
+    fn write_locks(
+        &self,
+    ) -> io::Result<(
+        std::sync::MutexGuard<'_, W>,
+        std::sync::MutexGuard<'_, WriteBuffer>,
+    )> {
+        if super::ready() {
+            let writer = match self.writer.try_lock() {
+                Ok(writer) => writer,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(io::Error::other("packet stream writer poisoned"));
+                }
+            };
+            let frame = match self.write_buffer.try_lock() {
+                Ok(frame) => frame,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(io::Error::other("packet stream write buffer poisoned"));
+                }
+            };
+            return Ok((writer, frame));
+        }
+        Ok((
+            self.writer
+                .lock()
+                .map_err(|_| io::Error::other("packet stream writer poisoned"))?,
+            self.write_buffer
+                .lock()
+                .map_err(|_| io::Error::other("packet stream write buffer poisoned"))?,
+        ))
+    }
+
     fn flush_pending_keepalive(&self) -> io::Result<()> {
         if !self.has_pending_keepalive.load(Ordering::Acquire) {
             return Ok(());
@@ -367,25 +404,11 @@ impl<R: Read, W: Write> Read for PacketStream<R, W> {
 impl<R, W: Write> Write for &PacketStream<R, W> {
     fn write(&mut self, input: &[u8]) -> io::Result<usize> {
         if input.is_empty() {
-            let mut writer = self
-                .writer
-                .lock()
-                .map_err(|_| io::Error::other("packet stream writer poisoned"))?;
-            let mut frame = self
-                .write_buffer
-                .lock()
-                .map_err(|_| io::Error::other("packet stream write buffer poisoned"))?;
+            let (mut writer, mut frame) = self.write_locks()?;
             return flush_frame(&mut *writer, &mut frame).map(|()| 0);
         }
 
-        let mut writer = self
-            .writer
-            .lock()
-            .map_err(|_| io::Error::other("packet stream writer poisoned"))?;
-        let mut frame = self
-            .write_buffer
-            .lock()
-            .map_err(|_| io::Error::other("packet stream write buffer poisoned"))?;
+        let (mut writer, mut frame) = self.write_locks()?;
         if frame.pos < frame.bytes.len() {
             flush_frame(&mut *writer, &mut frame).map_err(|error| {
                 io::Error::new(
@@ -420,14 +443,7 @@ impl<R, W: Write> Write for &PacketStream<R, W> {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        let mut writer = self
-            .writer
-            .lock()
-            .map_err(|_| io::Error::other("packet stream writer poisoned"))?;
-        let mut frame = self
-            .write_buffer
-            .lock()
-            .map_err(|_| io::Error::other("packet stream write buffer poisoned"))?;
+        let (mut writer, mut frame) = self.write_locks()?;
         flush_frame(&mut *writer, &mut frame)?;
         writer.flush()
     }
@@ -632,6 +648,19 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Err(io::ErrorKind::TimedOut.into())
         }
+    }
+
+    #[test]
+    fn a_ready_write_returns_backpressure_when_the_writer_is_held() {
+        let stream = PacketStream::new(std::io::Cursor::new(Vec::<u8>::new()), Pipe::new(), true);
+        let held = stream.writer.lock().expect("writer");
+        let _ready = crate::finalmask::xmc::ReadyWrite::enter();
+        let mut write = &stream;
+        assert_eq!(
+            write.write(b"x").expect_err("the writer is held").kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(held);
     }
 
     #[test]
