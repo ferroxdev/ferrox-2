@@ -5103,6 +5103,11 @@ impl Write for QuicStream {
         while !rest.is_empty() {
             match self.send_once(&mut rest) {
                 Ok(0) => {
+                    // A relay step hands the lane back parked on this connection's socket, where the ack that reopens the window (drawn by the flush above) wakes it; only a caller outside a step waits here.
+                    if crate::proxy::relay_step_owns_poll() {
+                        self.note_datagram_wait();
+                        return Ok(buf.len() - rest.len());
+                    }
                     if Instant::now() >= deadline {
                         let sent = buf.len() - rest.len();
                         if sent > 0 {

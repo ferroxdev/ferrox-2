@@ -13832,6 +13832,29 @@ impl<T: Write> Half<T> {
         Ok(())
     }
 
+    /// One offer, without the wait `write_all` spends on the rest: a relay keeps the bytes the
+    /// destination refused and sends them on its next turn, so a stream whose window is shut parks
+    /// the lane instead of holding a pool worker asleep until the window reopens.
+    fn write_some(&self, buf: &[u8]) -> std::io::Result<usize> {
+        let Ok(mut guard) = self.writer_lock() else {
+            return Err(std::io::Error::other("relay half poisoned"));
+        };
+        let n = guard.write(buf)?;
+        if n == buf.len() {
+            // Buffered writers only send on flush; raw sockets treat it as a no-op.
+            guard.flush()?;
+        }
+        if n > 0 {
+            if let Self::Shared {
+                grain: Some(grain), ..
+            } = self
+            {
+                grain.moved();
+            }
+        }
+        Ok(n)
+    }
+
     fn writer_lock(&self) -> Result<MutexGuard<'_, T>, ()> {
         match self {
             Self::Split { write, .. } => write.lock().map_err(|_| ()),
@@ -14008,14 +14031,48 @@ where
     R: Read,
     W: Write + HalfShut,
 {
+    // A tail the last turn's write left owed goes out before another read: the source has no copy of it.
+    while buffer.owed() {
+        match to.write_some(buffer.owed_tail()) {
+            Ok(n) if n > 0 => {
+                buffer.owed_take(n);
+                ended.mark_progress();
+            }
+            Ok(_) => {
+                note_wait_finish(ended);
+                return Next::Idle;
+            }
+            Err(error) if is_timeout(&error) => {
+                note_wait_finish(ended);
+                return Next::Idle;
+            }
+            Err(_) => return Next::Done,
+        }
+    }
     match from.read_once(buffer.as_mut()) {
         Ok(0) => {
             to.spill_write();
             Next::Done
         }
-        Ok(n) if to.write_once(buffer.filled(n)).is_ok() => {
-            ended.mark_progress();
-            Next::More
+        Ok(n) => {
+            let _ = buffer.filled(n);
+            buffer.owe(n);
+            match to.write_some(buffer.owed_tail()) {
+                Ok(taken) if taken > 0 => {
+                    buffer.owed_take(taken);
+                    ended.mark_progress();
+                    Next::More
+                }
+                Ok(_) => {
+                    note_wait_finish(ended);
+                    Next::Idle
+                }
+                Err(error) if is_timeout(&error) => {
+                    note_wait_finish(ended);
+                    Next::Idle
+                }
+                Err(_) => Next::Done,
+            }
         }
         Err(error) if is_timeout(&error) => {
             if ended.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
@@ -14026,7 +14083,7 @@ where
                 Next::Idle
             }
         }
-        Ok(_) | Err(_) => Next::Done,
+        Err(_) => Next::Done,
     }
 }
 
@@ -35396,6 +35453,9 @@ pub(crate) struct RelayBuf {
     limit: usize,
     moved: usize,
     promote_to: usize,
+    /// The bytes of the frame in the window a destination has not taken yet, and how many of them it took: a write whose window is shut keeps the tail here instead of sleeping a pool worker until it reopens.
+    owed: usize,
+    sent: usize,
 }
 
 impl RelayBuf {
@@ -35419,6 +35479,8 @@ impl RelayBuf {
             limit: usize::MAX,
             moved: 0,
             promote_to: RELAY_BUFFER,
+            owed: 0,
+            sent: 0,
         }
     }
 
@@ -35457,6 +35519,8 @@ impl RelayBuf {
     /// the read clock, and the bytes it would read are not there, so it can hold no allocation. The
     /// next step takes one again, and `held` is the witness that the park kept none.
     pub fn release(&mut self) {
+        self.owed = 0;
+        self.sent = 0;
         if self.bytes.len() == RELAY_SMALL_BUFFER || self.bytes.len() == RELAY_BUFFER {
             give_relay_window(std::mem::take(&mut self.bytes));
         }
@@ -35506,6 +35570,33 @@ impl RelayBuf {
     #[must_use]
     pub fn prefix(&self, n: usize) -> &[u8] {
         &self.bytes[..n]
+    }
+
+    /// The frame a write offered is now owed by the window: a destination that takes part of it keeps the rest here, and the next step writes it before it reads.
+    pub fn owe(&mut self, n: usize) {
+        self.owed = n;
+        self.sent = 0;
+    }
+
+    /// The unwritten tail of a frame the destination is still owed.
+    #[must_use]
+    pub fn owed_tail(&self) -> &[u8] {
+        &self.bytes[self.sent..self.owed]
+    }
+
+    /// The bytes one write took: the window is clear once the last of them is gone.
+    pub fn owed_take(&mut self, n: usize) {
+        self.sent += n;
+        if self.sent >= self.owed {
+            self.owed = 0;
+            self.sent = 0;
+        }
+    }
+
+    /// Whether a write left bytes the destination has not taken.
+    #[must_use]
+    pub fn owed(&self) -> bool {
+        self.sent < self.owed
     }
 
     #[cfg(test)]
@@ -45519,6 +45610,91 @@ fn b64url(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A window that shuts mid-frame hands the lane back with the unwritten tail kept, and the
+    /// next turn sends that tail before it reads: a refused write costs a park, not the flow.
+    #[test]
+    fn a_write_a_shut_window_refuses_keeps_its_tail() {
+        /// One frame, then the end of the wire.
+        struct Frame(Option<Vec<u8>>);
+
+        impl Read for Frame {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                match self.0.take() {
+                    Some(bytes) => {
+                        let n = bytes.len().min(buf.len());
+                        buf[..n].copy_from_slice(&bytes[..n]);
+                        Ok(n)
+                    }
+                    None => Ok(0),
+                }
+            }
+        }
+
+        /// A destination whose window takes `room` bytes in all.
+        struct Window {
+            room: Arc<std::sync::atomic::AtomicUsize>,
+            got: Arc<Mutex<Vec<u8>>>,
+        }
+
+        impl Write for Window {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let room = self
+                    .room
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .min(buf.len());
+                if room == 0 {
+                    return Ok(0);
+                }
+                self.room
+                    .fetch_sub(room, std::sync::atomic::Ordering::Relaxed);
+                self.got
+                    .lock()
+                    .expect("got")
+                    .extend_from_slice(&buf[..room]);
+                Ok(room)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl HalfShut for Window {
+            fn spill(&self) {}
+        }
+
+        let room = Arc::new(std::sync::atomic::AtomicUsize::new(3));
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let from = Half::shared(Frame(Some(b"abcdefgh".to_vec())));
+        let to = Half::shared(Window {
+            room: Arc::clone(&room),
+            got: Arc::clone(&got),
+        });
+        let flow = RelayFinish::new(true, Arc::new(|| {}), None);
+        let mut buffer = RelayBuf::new();
+        assert!(matches!(
+            spill_lane_step(&from, &to, &mut buffer, &flow),
+            Next::More
+        ));
+        assert_eq!(&*got.lock().expect("got"), b"abc", "the window took 3");
+        assert!(buffer.owed(), "the refused tail stays in the window");
+        assert!(matches!(
+            spill_lane_step(&from, &to, &mut buffer, &flow),
+            Next::Idle
+        ));
+        assert!(buffer.owed(), "a park keeps the bytes it could not send");
+        room.store(64, std::sync::atomic::Ordering::Relaxed);
+        assert!(matches!(
+            spill_lane_step(&from, &to, &mut buffer, &flow),
+            Next::Done
+        ));
+        assert_eq!(
+            &*got.lock().expect("got"),
+            b"abcdefgh",
+            "the tail went out before the next read"
+        );
+    }
 
     /// A bridge datagram borrows the configured outbound and its tag; the clone belongs to the
     /// lane spawn, not to every datagram.
