@@ -3305,7 +3305,7 @@ mod tests {
             proxy::FrameWrite::settle(&mut write),
             proxy::Settle::Clear
         ));
-        assert!(write.pending.is_empty());
+        assert_eq!(write.pending, Vec::<u8>::new());
     }
 
     #[test]
