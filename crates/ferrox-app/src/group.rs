@@ -18,7 +18,6 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 type ResolvedMember = Option<(String, Outbound, Option<u64>)>;
 type ResolvedMembers = HashMap<usize, ResolvedMember>;
-type Candidate<'a> = (usize, Cow<'a, str>, Outbound, u64);
 type Fastest<'a> = (u16, usize, Cow<'a, str>, Outbound, u64);
 type Stored<'a> = (usize, Cow<'a, str>, Outbound, u64, Option<u16>);
 
@@ -242,7 +241,7 @@ impl Group {
         // Retained: the stored member, the fastest, and the first; any other is resolved and dropped.
         let mut current: Option<Stored<'a>> = None;
         let mut best: Option<Fastest<'a>> = None;
-        let mut first: Option<Candidate<'a>> = None;
+        let mut first: Option<(usize, u64)> = None;
         // One window for the whole tree: a nested group shares this map and is handed it, not locked again.
         let guard = match readings {
             Some(_) => None,
@@ -262,7 +261,7 @@ impl Group {
                 continue;
             };
             if first.is_none() {
-                first = Some((at, leaf.clone(), out.clone(), revision));
+                first = Some((at, revision));
             }
             let delay = readings.and_then(|readings| History::read(readings, &leaf, revision));
             if stored == at {
@@ -284,7 +283,12 @@ impl Group {
         let (at, leaf, out, revision) = if takeover {
             match best {
                 Some((_, at, leaf, out, revision)) => (at, leaf, out, revision),
-                None => first?,
+                None => {
+                    let (at, revision) = first?;
+                    let (leaf, out, _) =
+                        resolve_member(route, &self.members[at], network, resolved, readings)?;
+                    (at, leaf, out, revision)
+                }
             }
         } else {
             let (at, leaf, out, revision, _) = current?;
@@ -643,7 +647,9 @@ pub(crate) fn spawn(
 }
 
 impl Group {
-    /// The bound group's route, for the dial seams that hold only the outbound.
+    /// The bound group's route, for the dial seams that hold only the outbound. The tag is owned:
+    /// the only route this seam can reach is a `Weak::upgrade`, which lives no longer than the call,
+    /// and holding the strong `Arc` in the group would close the `RouteShared` cycle.
     pub(crate) fn resolve_bound(&self, network: Network) -> Option<(String, Outbound)> {
         let route = self.route()?;
         self.resolve(&route, network)

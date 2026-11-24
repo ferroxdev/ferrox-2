@@ -1077,6 +1077,7 @@ engine-selector syscalls-per-flow UNBLESSED no selector workload yet
 engine-selector copies-per-flow UNBLESSED no copy checker yet
 engine-selector dial-allocations 1 ferrox-app-proxy::tests::a_selector_dial_allocates_only_the_tag_it_returns
 engine-selector urltest-dial-allocations 0 ferrox-app-proxy::tests::a_flat_urltest_dial_allocates_nothing
+engine-selector nested-urltest-dial-allocations 1 ferrox-app-proxy::tests::a_nested_urltest_dial_allocates_only_the_tag_it_returns
 engine-selector sweep-lock-windows 1 ferrox-app-proxy::tests::a_urltest_reads_its_history_under_one_lock
 engine-selector nested-sweep-lock-windows 1 ferrox-app-proxy::tests::a_nested_urltest_reads_under_the_outer_window
 engine-selector seconds-per-flow UNBLESSED CI bench.yml (no cell yet)

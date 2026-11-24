@@ -85089,6 +85089,38 @@ end
         );
     }
 
+    /// A nested leaf is owned, so a dial through a nested url-test allocates the tag it returns and
+    /// nothing else: the fallback slot keeps the member's position, not a second copy of its leaf.
+    #[test]
+    fn a_nested_urltest_dial_allocates_only_the_tag_it_returns() {
+        let shared = group_route(
+            r#"{"outbounds":[
+                {"tag":"a","protocol":"freedom"},
+                {"tag":"b","protocol":"freedom"},
+                {"tag":"c","protocol":"freedom"},
+                {"tag":"inner","type":"urltest","outbounds":["a","b"],"url":"http://127.0.0.1/204"},
+                {"tag":"pick","type":"urltest","outbounds":["inner","c"],"url":"http://127.0.0.1/204"}
+            ],"routing":{}}"#,
+        );
+        let group = group_of(&shared, "pick");
+        group.record("a", 10);
+        let dial = || {
+            group
+                .resolve(&shared, crate::router::Network::Tcp)
+                .expect("picks")
+        };
+        // A flow is the dial after the process's one-time setup, so the gate takes a warm one.
+        let (warm_up, _) = ferrox_core::alloc_count::measure(dial);
+        assert_eq!(warm_up.0, "a");
+        let (picked, counts) = ferrox_core::alloc_count::measure(dial);
+        assert_eq!(picked.0, "a");
+        assert_eq!(
+            counts.allocs, 1,
+            "a nested url-test dial allocated {} times for the one owned tag it returns",
+            counts.allocs
+        );
+    }
+
     /// A url-test reading sweep takes the shared history lock once, not once per member.
     #[test]
     fn a_urltest_reads_its_history_under_one_lock() {
