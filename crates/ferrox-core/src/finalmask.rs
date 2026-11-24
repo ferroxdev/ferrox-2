@@ -2246,7 +2246,7 @@ mod tests {
     #[test]
     fn a_deferred_zero_width_piece_reports_backpressure() {
         let mut mask = Fragment::new(
-            0,
+            1,
             1,
             vec![range(0, 0), range(4, 4)],
             vec![range(1, 1)],
