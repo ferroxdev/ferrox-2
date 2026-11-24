@@ -2874,20 +2874,24 @@ impl WarpOut {
             self.serve_on(lane, client, asked, prefix);
             return;
         };
+        let deadline = Instant::now() + GATEWAY_PROBE_TIMEOUT;
         self.serve_on(
             lane,
             tunnel,
             &crate::proxy::Destination::Address(gateway.proxy),
             &[],
         );
-        let deadline = Instant::now() + GATEWAY_PROBE_TIMEOUT;
-        let answered = local
-            .set_write_timeout(Some(GATEWAY_PROBE_TIMEOUT))
-            .and_then(|()| {
-                (&local)
-                    .write_all(&request)
-                    .and_then(|()| read_connect_head(&local, deadline))
-            });
+        let budget = deadline.saturating_duration_since(Instant::now());
+        if budget.is_zero() {
+            gateway.retire("the gateway did not open within the probe budget");
+            self.serve_on(lane, client, asked, prefix);
+            return;
+        }
+        let answered = local.set_write_timeout(Some(budget)).and_then(|()| {
+            (&local)
+                .write_all(&request)
+                .and_then(|()| read_connect_head(&local, deadline))
+        });
         let (accepted, extra) = match answered {
             Ok(head) => head,
             Err(reason) => {

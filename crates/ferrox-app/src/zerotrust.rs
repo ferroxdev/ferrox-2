@@ -55,12 +55,28 @@ impl TeamSettings {
         token: Option<&str>,
         email: Option<&str>,
     ) -> Result<Option<Self>, String> {
-        let raw = pick(team, "AETHER_TEAM");
+        Self::from_parts_with(team, client_id, client_secret, token, email, |key| {
+            std::env::var(key).ok()
+        })
+    }
+
+    fn from_parts_with<F>(
+        team: Option<&str>,
+        client_id: Option<&str>,
+        client_secret: Option<&str>,
+        token: Option<&str>,
+        email: Option<&str>,
+        env: F,
+    ) -> Result<Option<Self>, String>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let raw = pick(team, "AETHER_TEAM", &env);
         let Some(raw) = raw else {
-            let supplied = pick(client_id, "AETHER_ACCESS_CLIENT_ID").is_some()
-                || pick(client_secret, "AETHER_ACCESS_CLIENT_SECRET").is_some()
-                || pick(token, "AETHER_ACCESS_TOKEN").is_some()
-                || pick(email, "AETHER_ACCESS_EMAIL").is_some();
+            let supplied = pick(client_id, "AETHER_ACCESS_CLIENT_ID", &env).is_some()
+                || pick(client_secret, "AETHER_ACCESS_CLIENT_SECRET", &env).is_some()
+                || pick(token, "AETHER_ACCESS_TOKEN", &env).is_some()
+                || pick(email, "AETHER_ACCESS_EMAIL", &env).is_some();
             if supplied {
                 return Err(
                     "warp: access credentials need a team; name `team` or AETHER_TEAM".to_owned(),
@@ -75,10 +91,10 @@ impl TeamSettings {
         })?;
         Ok(Some(Self {
             team,
-            client_id: pick(client_id, "AETHER_ACCESS_CLIENT_ID"),
-            client_secret: pick(client_secret, "AETHER_ACCESS_CLIENT_SECRET"),
-            token: pick(token, "AETHER_ACCESS_TOKEN"),
-            email: pick(email, "AETHER_ACCESS_EMAIL"),
+            client_id: pick(client_id, "AETHER_ACCESS_CLIENT_ID", &env),
+            client_secret: pick(client_secret, "AETHER_ACCESS_CLIENT_SECRET", &env),
+            token: pick(token, "AETHER_ACCESS_TOKEN", &env),
+            email: pick(email, "AETHER_ACCESS_EMAIL", &env),
         }))
     }
 
@@ -95,14 +111,16 @@ impl TeamSettings {
     }
 }
 
-fn pick(value: Option<&str>, key: &str) -> Option<String> {
+fn pick<F>(value: Option<&str>, key: &str, env: &F) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
     value
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .map(str::to_owned)
         .or_else(|| {
-            std::env::var(key)
-                .ok()
+            env(key)
                 .map(|text| text.trim().to_owned())
                 .filter(|text| !text.is_empty())
         })
@@ -285,7 +303,7 @@ fn decode_entities(raw: &str) -> String {
 }
 
 fn query_value(url: &str, key: &str) -> Option<String> {
-    let query = url.split_once('?')?.1;
+    let query = url.split_once('?')?.1.split('#').next().unwrap_or("");
     for pair in query.split('&') {
         if let Some((name, value)) = pair.split_once('=') {
             if name == key {
@@ -855,6 +873,12 @@ fn with_email_code(
                 settings.login_url()
             )
         })?;
+    if origin(&verify_url) != origin(&settings.team_domain()) {
+        return Err(
+            "warp: access offered a login form on another origin; refusing to send the email"
+                .to_owned(),
+        );
+    }
     let sent = session.post_form(
         &verify_url,
         &[
@@ -1043,8 +1067,9 @@ mod tests {
 
     #[test]
     fn access_credentials_without_a_team_are_refused() {
-        let error = TeamSettings::from_parts(None, None, None, Some("a-token"), None)
-            .expect_err("access without a team");
+        let error =
+            TeamSettings::from_parts_with(None, None, None, Some("a-token"), None, |_| None)
+                .expect_err("access without a team");
         assert!(error.contains("need a team"), "{error}");
     }
 
@@ -1551,6 +1576,14 @@ mod tests {
             Some("a b")
         );
         assert_eq!(query_value("https://x/cb", "nonce"), None);
+        assert_eq!(
+            query_value("https://x/cb?nonce=abc#step", "nonce").as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            query_value("https://x/cb?nonce=a%23b#step", "nonce").as_deref(),
+            Some("a#b")
+        );
     }
 
     #[test]
@@ -1687,6 +1720,35 @@ mod tests {
         .expect_err("a refused service token");
         assert!(error.contains("403"), "{error}");
         assert!(error.contains("service token"), "{error}");
+    }
+
+    #[test]
+    fn an_email_form_on_another_origin_is_refused() {
+        let settings = TeamSettings {
+            team: "acme".to_owned(),
+            email: Some("user@example.com".to_owned()),
+            ..TeamSettings::default()
+        };
+        let posts = std::cell::Cell::new(0);
+        let error = sign_in(
+            &settings,
+            now(),
+            &|method, url, _, _| {
+                if method == "GET" && url.ends_with("/warp") {
+                    return Ok(reply(
+                        200,
+                        Vec::new(),
+                        "<form action=\"https://evil.example/verify\"><input id=\"totp-form\"></form>",
+                    ));
+                }
+                posts.set(posts.get() + 1);
+                Err("must not post".to_owned())
+            },
+            &mut |_, _| Some("123456".to_owned()),
+        )
+        .expect_err("a form on another origin");
+        assert!(error.contains("another origin"), "{error}");
+        assert_eq!(posts.get(), 0);
     }
 
     #[test]
