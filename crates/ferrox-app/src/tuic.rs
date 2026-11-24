@@ -372,31 +372,37 @@ impl TuicOut {
                     .lock()
                     .is_ok_and(|conn| lane_established(&conn, lane))
         };
-        while held.values().map(Vec::len).sum::<usize>() >= MAX_TUIC_LANES {
-            let (key, at) = held.iter().find_map(|(key, pool)| {
-                pool.iter()
-                    .position(|lane| lane.leases.load(Ordering::Acquire) == 0)
-                    .map(|at| (key.clone(), at))
-            })?;
-            if let Some(pool) = held.get_mut(&key) {
-                pool.remove(at);
-            }
-        }
-        let pool = held.entry(key).or_default();
-        if let Some(lane) = pool
-            .iter()
-            .find(|lane| lane.leases.load(Ordering::Acquire) == 0 && live(lane))
-        {
+        if let Some(lane) = held.get(&key).and_then(|pool| {
+            pool.iter()
+                .find(|lane| lane.leases.load(Ordering::Acquire) == 0 && live(lane))
+        }) {
             lane.leases.fetch_add(1, Ordering::AcqRel);
             return Some(LaneLease(Arc::clone(lane)));
         }
-        if pool.len() < LANES_PER_KEY {
-            let lane = self.connect_lane(source, options)?;
-            lane.leases.fetch_add(1, Ordering::AcqRel);
-            pool.push(Arc::clone(&lane));
-            return Some(LaneLease(lane));
+        if held.get(&key).map_or(0, Vec::len) < LANES_PER_KEY {
+            let mut room = true;
+            while held.values().map(Vec::len).sum::<usize>() >= MAX_TUIC_LANES {
+                let Some((evict, at)) = held.iter().find_map(|(key, pool)| {
+                    pool.iter()
+                        .position(|lane| lane.leases.load(Ordering::Acquire) == 0)
+                        .map(|at| (key.clone(), at))
+                }) else {
+                    room = false;
+                    break;
+                };
+                if let Some(pool) = held.get_mut(&evict) {
+                    pool.remove(at);
+                }
+            }
+            if room {
+                let lane = self.connect_lane(source, options)?;
+                lane.leases.fetch_add(1, Ordering::AcqRel);
+                held.entry(key).or_default().push(Arc::clone(&lane));
+                return Some(LaneLease(lane));
+            }
         }
-        let lane = pool
+        let lane = held
+            .get(&key)?
             .iter()
             .filter(|lane| live(lane))
             .min_by_key(|lane| lane.leases.load(Ordering::Acquire))?;
@@ -560,7 +566,7 @@ impl TuicOut {
             stream.close();
             return;
         }
-        proxy::relay_quic_stream(client, stream, None);
+        proxy::relay_quic_stream(client, stream, Some(Box::new(move || drop(lane))));
     }
 
     #[allow(clippy::too_many_lines)]
