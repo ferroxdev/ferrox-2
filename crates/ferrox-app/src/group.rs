@@ -108,26 +108,35 @@ impl History {
     }
 }
 
-#[derive(Debug, Default)]
+/// The member position a group dials on each network: two relaxed atomics, so a dial reads its
+/// selection without a lock and a probe's write only moves the one it measured.
+#[derive(Debug)]
 struct Selected {
-    tcp: Option<usize>,
-    udp: Option<usize>,
+    tcp: AtomicUsize,
+    udp: AtomicUsize,
 }
 
 impl Selected {
-    /// The member position a group dials on `network`, so a dial reads a slice rather than hashing a tag.
-    fn get(&self, network: Network) -> Option<usize> {
-        match network {
-            Network::Udp => self.udp,
-            _ => self.tcp,
+    const fn new(at: usize) -> Self {
+        Self {
+            tcp: AtomicUsize::new(at),
+            udp: AtomicUsize::new(at),
         }
     }
 
-    fn set(&mut self, network: Network, at: usize) {
-        *match network {
-            Network::Udp => &mut self.udp,
-            _ => &mut self.tcp,
-        } = Some(at);
+    /// The member position a group dials on `network`, so a dial reads a slice rather than hashing a tag.
+    fn get(&self, network: Network) -> usize {
+        match network {
+            Network::Udp => self.udp.load(Ordering::Relaxed),
+            _ => self.tcp.load(Ordering::Relaxed),
+        }
+    }
+
+    fn set(&self, network: Network, at: usize) {
+        match network {
+            Network::Udp => self.udp.store(at, Ordering::Relaxed),
+            _ => self.tcp.store(at, Ordering::Relaxed),
+        }
     }
 }
 
@@ -149,7 +158,7 @@ pub(crate) struct Group {
     kind: Kind,
     members: Vec<String>,
     default: Option<usize>,
-    selected: Mutex<Selected>,
+    selected: Selected,
     history: Arc<History>,
     url: String,
     interval: Duration,
@@ -198,11 +207,9 @@ impl Group {
     /// The member position a selector dials on `network`: its stored choice, its default, or its
     /// first member.
     fn choice(&self, network: Network) -> usize {
-        self.selected
-            .lock()
-            .ok()
-            .and_then(|selected| selected.get(network))
-            .filter(|at| *at < self.members.len())
+        let at = self.selected.get(network);
+        (at < self.members.len())
+            .then_some(at)
             .or(self.default)
             .unwrap_or(0)
     }
@@ -231,11 +238,7 @@ impl Group {
         resolved: &mut ResolvedMembers,
         readings: Option<&HashMap<String, Reading>>,
     ) -> Option<(Cow<'a, str>, Outbound, Option<u64>)> {
-        let stored = self
-            .selected
-            .lock()
-            .ok()
-            .and_then(|selected| selected.get(network));
+        let stored = self.selected.get(network);
         // Retained: the stored member, the fastest, and the first; any other is resolved and dropped.
         let mut current: Option<Stored<'a>> = None;
         let mut best: Option<Fastest<'a>> = None;
@@ -262,7 +265,7 @@ impl Group {
                 first = Some((at, leaf.clone(), out.clone(), revision));
             }
             let delay = readings.and_then(|readings| History::read(readings, &leaf, revision));
-            if stored == Some(at) {
+            if stored == at {
                 current = Some((at, leaf, out, revision, delay));
             } else if let Some(delay) = delay {
                 if best.as_ref().is_none_or(|(fastest, ..)| delay < *fastest) {
@@ -287,10 +290,8 @@ impl Group {
             let (at, leaf, out, revision, _) = current?;
             (at, leaf, out, revision)
         };
-        if stored != Some(at) {
-            if let Ok(mut selected) = self.selected.lock() {
-                selected.set(network, at);
-            }
+        if stored != at {
+            self.selected.set(network, at);
         }
         Some((leaf, out, Some(revision)))
     }
@@ -547,15 +548,12 @@ impl Group {
             }
         }
         let first = default.unwrap_or(0);
-        let mut selected = Selected::default();
-        selected.set(Network::Tcp, first);
-        selected.set(Network::Udp, first);
         Ok(Self {
             tag: tag.to_owned(),
             kind,
             members,
             default,
-            selected: Mutex::new(selected),
+            selected: Selected::new(first),
             history,
             url,
             interval,
