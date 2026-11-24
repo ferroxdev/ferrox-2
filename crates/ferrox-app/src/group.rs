@@ -265,7 +265,7 @@ impl Group {
         // Retained: the stored member, the fastest, and the first; any other is resolved and dropped.
         let mut current: Option<Stored<'a>> = None;
         let mut best: Option<Fastest<'a>> = None;
-        let mut first: Option<(usize, u64)> = None;
+        let mut first: Option<usize> = None;
         // One window for the whole tree: a nested group shares this map and is handed it, not locked again.
         let guard = match readings {
             Some(_) => None,
@@ -285,7 +285,7 @@ impl Group {
                 continue;
             };
             if first.is_none() {
-                first = Some((at, revision));
+                first = Some(at);
             }
             let delay = readings.and_then(|readings| History::read(readings, &leaf, revision));
             if stored == at {
@@ -308,16 +308,16 @@ impl Group {
             if let Some((_, at, leaf, out, revision)) = best {
                 (at, leaf, out, revision)
             } else {
-                let (at, revision) = first?;
+                let at = first?;
                 // The stored member is often the first eligible one; its resolution is at hand.
                 match current {
-                    Some((current_at, leaf, out, _, _)) if current_at == at => {
+                    Some((current_at, leaf, out, revision, _)) if current_at == at => {
                         (at, leaf, out, revision)
                     }
                     _ => {
-                        let (leaf, out, _) =
+                        let (leaf, out, revision) =
                             resolve_member(route, &self.members[at], network, resolved, readings)?;
-                        (at, leaf, out, revision)
+                        (at, leaf, out, revision?)
                     }
                 }
             }
