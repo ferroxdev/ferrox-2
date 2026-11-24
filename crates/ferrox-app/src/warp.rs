@@ -436,6 +436,7 @@ fn spec_identity(
 }
 
 impl WarpSpec {
+    #[allow(clippy::too_many_lines)]
     fn from(settings: &crate::json::Json) -> Result<Self, String> {
         let (mode, register, identity_file, inline) = spec_identity(settings)?;
         let api = settings
@@ -3615,7 +3616,7 @@ fn forced_edges(peers: &ForcedPeers<'_>) -> Result<ForcedEdges, String> {
 /// One-tap registration: create a device, enroll its MASQUE key, enable it,
 /// save the identity where only the user can read it, and return the outbound
 /// config that references the saved file.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn one_tap(
     path: &str,
     mode: &str,
