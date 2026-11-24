@@ -60,14 +60,13 @@ pub struct Rendered {
 }
 
 /// Render `prompt`; a malformed library is `check`'s find, not something to re-detect here.
-#[allow(clippy::needless_pass_by_value)]
 pub fn render(
     library: &Library,
     prompt: &Prompt,
     values: &BTreeMap<String, String>,
     addons: &[Addon],
     worktree: Option<&Worktree>,
-    options: Options,
+    options: &Options,
 ) -> Rendered {
     let missing: Vec<String> = prompt
         .required_inputs_for(addons)
@@ -658,7 +657,7 @@ with {target=core}
             &values(&[]),
             &addons,
             Some(&worktree(Place::Absent)),
-            Options {
+            &Options {
                 provenance: true,
                 ..Options::default()
             },
@@ -686,7 +685,7 @@ with {target=core}
             &values(&[]),
             &[],
             Some(&worktree(Place::Absent)),
-            Options::default(),
+            &Options::default(),
         );
         assert!(
             rendered.text.contains("./scripts/new-worktree.sh p1-one"),
@@ -721,7 +720,7 @@ with {target=core}
             &values(&[]),
             &[],
             Some(&odd),
-            Options::default(),
+            &Options::default(),
         );
         assert!(
             rendered
@@ -743,7 +742,7 @@ with {target=core}
                 &values(&[]),
                 &[],
                 Some(&worktree(place)),
-                Options::default(),
+                &Options::default(),
             );
             assert!(
                 rendered.text.contains("git rebase origin/main"),
@@ -786,7 +785,7 @@ with {target=core}
             &values(&[]),
             &[],
             Some(&worktree(Place::Mismatch)),
-            Options::default(),
+            &Options::default(),
         );
         assert!(
             rendered.text.contains("another branch"),
@@ -810,7 +809,7 @@ with {target=core}
             &values(&[]),
             &[],
             Some(&worktree(Place::Occupied)),
-            Options::default(),
+            &Options::default(),
         );
         assert!(
             rendered.text.contains("is not a worktree"),
@@ -834,7 +833,7 @@ with {target=core}
             &values(&[]),
             &[],
             None,
-            Options::default(),
+            &Options::default(),
         );
         assert!(!rendered.text.contains("## Worktree"), "{}", rendered.text);
     }
@@ -849,7 +848,7 @@ with {target=core}
             &values(&[]),
             &[],
             None,
-            Options::default(),
+            &Options::default(),
         );
         assert!(!rendered.text.contains("# P1 · One"), "{}", rendered.text);
         assert!(!rendered.text.contains("library tag "));
@@ -865,7 +864,7 @@ with {target=core}
             &values(&[("len", "200")]),
             &[],
             None,
-            Options::default(),
+            &Options::default(),
         );
         assert!(rendered.text.contains("run with 200"));
         assert!(!rendered.text.contains("run with 40"));
@@ -882,7 +881,7 @@ with {target=core}
             &values(&[]),
             &[],
             None,
-            Options::default(),
+            &Options::default(),
         );
         assert_eq!(rendered.missing, vec!["scope"]);
         assert!(
@@ -903,7 +902,7 @@ with {target=core}
             allow_unfilled: true,
             ..Options::default()
         };
-        let rendered = render(&library, prompt, &values(&[]), &[], None, options);
+        let rendered = render(&library, prompt, &values(&[]), &[], None, &options);
         let gap = rendered.text.find("## Inputs required").unwrap();
         let protocol = rendered.text.find("prove it or do not say it").unwrap();
         assert!(gap < protocol, "the gap is the first thing read");
@@ -928,7 +927,7 @@ with {target=core}
             &values(&[("len", "40")]),
             &addons,
             None,
-            options,
+            &options,
         );
         assert!(
             rendered.text.contains("--set len=40 --addon local-first"),
@@ -967,7 +966,7 @@ with {target=core}
             &values(&[("len", "a```b")]),
             &[],
             None,
-            Options {
+            &Options {
                 allow_unfilled: true,
                 ..Options::default()
             },
@@ -991,7 +990,7 @@ with {target=core}
             retry_row: Some("A13".to_owned()),
             ..Options::default()
         };
-        let rendered = render(&library, prompt, &values(&[]), &[], None, options);
+        let rendered = render(&library, prompt, &values(&[]), &[], None, &options);
         assert!(
             rendered
                 .text
@@ -1039,7 +1038,7 @@ run with {len=40} and {scope} and {state}
             &values(&[("state", "planned")]),
             &[],
             None,
-            options,
+            &options,
         );
         assert!(
             rendered
@@ -1420,7 +1419,7 @@ body
             &values(&[]),
             &[],
             None,
-            Options {
+            &Options {
                 provenance: true,
                 ..Options::default()
             },
@@ -1442,7 +1441,7 @@ body
             &values(&[]),
             &[],
             None,
-            Options {
+            &Options {
                 provenance: true,
                 ..Options::default()
             },
@@ -1455,7 +1454,7 @@ body
             &values(&[]),
             &[],
             None,
-            Options::default(),
+            &Options::default(),
         );
         assert!(!quiet.text.contains("ferrox-prompt ·"));
     }
@@ -1470,7 +1469,7 @@ body
             &values(&[]),
             &[],
             None,
-            Options {
+            &Options {
                 gates: false,
                 ..Options::default()
             },
