@@ -3296,9 +3296,15 @@ mod tests {
     fn a_short_h2_buffer_drain_reports_progress() {
         let mut write = BoxedWrite::new(Box::new(TrickleWrite));
         write.pending = b"abcdef".to_vec();
-        assert!(matches!(write.settle(), proxy::Settle::Advanced));
+        assert!(matches!(
+            proxy::FrameWrite::settle(&mut write),
+            proxy::Settle::Advanced
+        ));
         assert_eq!(write.pending, b"def");
-        assert!(matches!(write.settle(), proxy::Settle::Clear));
+        assert!(matches!(
+            proxy::FrameWrite::settle(&mut write),
+            proxy::Settle::Clear
+        ));
         assert!(write.pending.is_empty());
     }
 
