@@ -2435,12 +2435,29 @@ enum Fast {
 /// first handshake did not carry; a failed second round keeps the first socket, and a server that
 /// still answers directly leaves the first-record rewrite in place.
 fn dial_kind(target: &SocketAddr, fast: bool) -> Result<(Connection, Fast), Failure> {
+    dial_kind_until(target, fast, None)
+}
+
+fn dial_kind_until(
+    target: &SocketAddr,
+    fast: bool,
+    deadline: Option<Instant>,
+) -> Result<(Connection, Fast), Failure> {
+    let budget = deadline.map_or_else(budgets::dial, |deadline| {
+        budgets::dial().min(deadline.saturating_duration_since(Instant::now()))
+    });
+    if budget.is_zero() {
+        return Err(Failure::new(Stage::SocketConnected, Kind::Unreachable));
+    }
     // The seam's one dial entry: a named source or option builds the socket before the same budget, and neither is the TCP dial unchanged.
     let sockopts = DIAL_SOCKOPTS.with(|cell| cell.borrow().clone());
     if let Some(options) = sockopts.as_deref() {
         if let Some(tag) = options.dialer_proxy() {
             let stream = dial_through_proxy(*target, tag, options)
                 .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?;
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(Failure::new(Stage::SocketConnected, Kind::Unreachable));
+            }
             no_delay(&stream);
             return Ok((outbound_metered(stream), Fast::Off));
         }
@@ -2450,10 +2467,12 @@ fn dial_kind(target: &SocketAddr, fast: bool) -> Result<(Connection, Fast), Fail
     if fast && crate::fastopen::supported() {
         let mut kept = None;
         let mut outcome = Fast::Refused;
-        let budget = budgets::dial();
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         for round in 0..2 {
             let left = budget.saturating_sub(started.elapsed());
+            let left = deadline.map_or(left, |deadline| {
+                left.min(deadline.saturating_duration_since(Instant::now()))
+            });
             match dial_from(target, source, sockopts.as_deref(), true, left) {
                 Ok((stream, armed)) => {
                     let deferred = armed && crate::fastopen::deferred(&stream);
@@ -2470,6 +2489,9 @@ fn dial_kind(target: &SocketAddr, fast: bool) -> Result<(Connection, Fast), Fail
                 Err(_) if round == 0 => {
                     let plain = sockopts.map(|options| options.without_fast_open());
                     let left = budget.saturating_sub(started.elapsed());
+                    let left = deadline.map_or(left, |deadline| {
+                        left.min(deadline.saturating_duration_since(Instant::now()))
+                    });
                     match dial_from(target, source, plain.as_ref(), false, left) {
                         Ok((stream, _)) => {
                             kept = Some(stream);
@@ -2491,10 +2513,12 @@ fn dial_kind(target: &SocketAddr, fast: bool) -> Result<(Connection, Fast), Fail
     }
     let outcome = if fast { Fast::Absent } else { Fast::Off };
     let stream = match (source, sockopts) {
-        (None, None) => crate::conn::connect(&crate::conn::Target::Ip(*target), budgets::dial())
-            .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?,
+        (None, None) => {
+            crate::conn::connect(&crate::conn::Target::Ip(*target), budget)
+                .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?
+        }
         (source, sockopts) => Connection::Tcp(
-            dial_from(target, source, sockopts.as_deref(), false, budgets::dial())
+            dial_from(target, source, sockopts.as_deref(), false, budget)
                 .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?
                 .0,
         ),
@@ -23178,21 +23202,43 @@ pub(crate) fn dial_tls_session(
     cfg: &ferrox_core::tls::TlsConfig,
     mask: Option<&ferrox_core::finalmask::Chain>,
 ) -> Option<ferrox_core::tls::ClientSession<Connection>> {
+    dial_tls_session_until(server, cfg, mask, None)
+}
+
+pub(crate) fn dial_tls_session_until(
+    server: &SocketAddr,
+    cfg: &ferrox_core::tls::TlsConfig,
+    mask: Option<&ferrox_core::finalmask::Chain>,
+    deadline: Option<Instant>,
+) -> Option<ferrox_core::tls::ClientSession<Connection>> {
     let mut retry = None;
     let mut ready = None;
+    let mut prior_write = None;
     for attempt in 0..2 {
         let current = retry.as_ref().unwrap_or(cfg);
         let fast = current
             .sni
             .as_ref()
             .is_some_and(|sni| sni.method == ferrox_core::evasion::SniMethod::FastOpen);
-        let (uplink, fast) = match dial_kind(server, fast) {
+        let (uplink, fast) = match dial_kind_until(server, fast, deadline) {
             Ok(uplink) => uplink,
             Err(failure) => {
                 note_dial_failure(server, failure);
                 return None;
             }
         };
+        if let Some(deadline) = deadline {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            prior_write = uplink.write_timeout().ok().flatten();
+            if uplink.set_read_timeout(Some(left)).is_err()
+                || uplink.set_write_timeout(Some(left)).is_err()
+            {
+                return None;
+            }
+        }
         let cut = current.fragment.as_ref().map(|fragment| {
             mask.map_or_else(
                 || ferrox_core::finalmask::Chain::default().with_front(fragment),
@@ -23224,6 +23270,9 @@ pub(crate) fn dial_tls_session(
         }
     }
     let session = ready?;
+    if deadline.is_some() {
+        let _ = session.get_ref().set_write_timeout(prior_write.flatten());
+    }
     // Session-shared behind a lock: reads wait one tick, and `TlsHalf::read` spends a grain unlocked.
     if session
         .get_ref()

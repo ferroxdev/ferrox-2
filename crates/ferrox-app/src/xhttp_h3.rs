@@ -1917,8 +1917,10 @@ fn check_decoder_stream(conn: &mut QuicheConnection, control: &mut ControlState,
     while at < control.decoder_prefix.len() {
         let first = control.decoder_prefix[at];
         let prefix = if first & 0x80 != 0 { 7 } else { 6 };
-        let Some((value, used)) = decode_prefixed(&control.decoder_prefix, at, prefix) else {
-            break;
+        let (value, used) = match decode_prefixed(&control.decoder_prefix, at, prefix) {
+            Prefix::Complete(value, used) => (value, used),
+            Prefix::Incomplete => break,
+            Prefix::Invalid => return false,
         };
         if first & 0xc0 == 0 && value == 0 {
             return false;
@@ -1929,28 +1931,38 @@ fn check_decoder_stream(conn: &mut QuicheConnection, control: &mut ControlState,
     true
 }
 
-/// The prefix integer at `at`, or `None` when the bytes so far do not complete it.
-fn decode_prefixed(buf: &[u8], at: usize, prefix: u8) -> Option<(u64, usize)> {
+enum Prefix {
+    Complete(u64, usize),
+    Incomplete,
+    Invalid,
+}
+
+/// The prefix integer at `at`, distinguishing bytes that can still complete from an integer that
+/// exceeds the decoder's bound.
+fn decode_prefixed(buf: &[u8], at: usize, prefix: u8) -> Prefix {
     let mask = (1u8 << prefix) - 1;
     let mut value = u64::from(buf[at] & mask);
     let mut used = 1;
     if u64::from(buf[at] & mask) < u64::from(mask) {
-        return Some((value, used));
+        return Prefix::Complete(value, used);
     }
     let mut shift = 0u32;
     while at + used < buf.len() {
         let byte = buf[at + used];
         used += 1;
         if shift > 56 {
-            return None;
+            return Prefix::Invalid;
         }
-        value = value.checked_add(u64::from(byte & 0x7f) << shift)?;
+        let Some(next) = value.checked_add(u64::from(byte & 0x7f) << shift) else {
+            return Prefix::Invalid;
+        };
+        value = next;
         if byte & 0x80 == 0 {
-            return Some((value, used));
+            return Prefix::Complete(value, used);
         }
         shift += 7;
     }
-    None
+    Prefix::Incomplete
 }
 
 enum EncoderHead {
@@ -2502,6 +2514,13 @@ pub(crate) fn packets(
 mod tests {
     use super::*;
     use crate::proxy::WindowRead;
+
+    #[test]
+    fn an_overlong_decoder_integer_is_invalid_not_incomplete() {
+        let mut buf = vec![0x7f];
+        buf.extend_from_slice(&[0xff; 10]);
+        assert!(matches!(decode_prefixed(&buf, 0, 6), Prefix::Invalid));
+    }
 
     struct Recorder(Arc<std::sync::Mutex<Option<std::io::ErrorKind>>>);
 

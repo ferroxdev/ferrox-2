@@ -794,9 +794,7 @@ impl Fragment {
         };
         loop {
             if READY.with(std::cell::Cell::get) && READY_WAIT.with(std::cell::Cell::get) > 0 {
-                if from == 0 {
-                    self.piece_resume = Some((p.len(), segment));
-                }
+                self.piece_resume = Some((p.len() - from, segment));
                 return Ok(from);
             }
             let Some(to) = self.cut(segment, from, p.len(), bound) else {
@@ -806,9 +804,7 @@ impl Fragment {
                 self.park_after(raw, segment)?;
                 segment += 1;
                 if READY.with(std::cell::Cell::get) && READY_WAIT.with(std::cell::Cell::get) > 0 {
-                    if from == 0 {
-                        self.piece_resume = Some((p.len(), segment));
-                    }
+                    self.piece_resume = Some((p.len() - from, segment));
                     return Ok(from);
                 }
                 continue;
@@ -824,6 +820,7 @@ impl Fragment {
                             io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                         ) =>
                 {
+                    self.piece_resume = Some((p.len() - from, segment));
                     return Ok(from);
                 }
                 Err(error) => return Err(error),
@@ -2108,6 +2105,39 @@ mod tests {
             .expect_err("a delayed write returns backpressure");
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
         assert_eq!(wire.bytes, Vec::<u8>::new());
+    }
+
+    #[test]
+    fn a_ready_piece_resumes_the_next_segment_after_progress() {
+        let mut mask = Fragment::new(
+            0,
+            2,
+            vec![range(1, 1), range(65_535, 65_535)],
+            vec![range(1, 1)],
+            range(0, 0),
+        )
+        .expect("valid");
+        let p = vec![0x5a; 16 * 1024];
+        let mut wire = Wire::default();
+        let _ready = ready_write();
+        let mut at = 0;
+        for _ in 0..4 {
+            at += mask.write(&mut wire, &p[at..]).expect("writes");
+            if at == p.len() {
+                break;
+            }
+            assert!(
+                take_ready_wait().is_some(),
+                "each stalled write records its wait"
+            );
+        }
+        let _ = take_ready_wait();
+        assert_eq!(at, p.len(), "the write resumes the suffix it did not send");
+        assert_eq!(wire.bytes, p, "the peer sees each octet once");
+        assert!(
+            wire.calls <= 3,
+            "positive progress resumes the next segment instead of repeating the first"
+        );
     }
 
     #[test]

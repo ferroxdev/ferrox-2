@@ -706,8 +706,45 @@ fn serve_uot_stream(stream: &NaiveStream, version: u8) {
     let reader_failed = Arc::clone(&failed);
     let mut reader = stream.clone();
     let mut replies = stream.clone();
-    let send4 = udp4.as_ref().and_then(|socket| socket.try_clone().ok());
-    let send6 = udp6.as_ref().and_then(|socket| socket.try_clone().ok());
+    let (send4, send6) = match connected {
+        Some(peer) if peer.is_ipv4() => {
+            let Some(send) = udp4.as_ref().and_then(|socket| socket.try_clone().ok()) else {
+                stream.abort();
+                return;
+            };
+            (Some(send), None)
+        }
+        Some(_) => {
+            let Some(send) = udp6.as_ref().and_then(|socket| socket.try_clone().ok()) else {
+                stream.abort();
+                return;
+            };
+            (None, Some(send))
+        }
+        None => {
+            let send4 = match udp4.as_ref() {
+                Some(socket) => match socket.try_clone() {
+                    Ok(send) => Some(send),
+                    Err(_) => {
+                        stream.abort();
+                        return;
+                    }
+                },
+                None => None,
+            };
+            let send6 = match udp6.as_ref() {
+                Some(socket) => match socket.try_clone() {
+                    Ok(send) => Some(send),
+                    Err(_) => {
+                        stream.abort();
+                        return;
+                    }
+                },
+                None => None,
+            };
+            (send4, send6)
+        }
+    };
     let send_connected = connected.is_some();
     let fixed_peer = connected;
     let spawned = std::thread::Builder::new()
@@ -983,6 +1020,8 @@ impl Write for NaiveStream {
                         continue;
                     }
                     if Instant::now() >= deadline {
+                        self.inner.write_lost.store(true, Ordering::Relaxed);
+                        self.inner.abort();
                         return Self::short(done);
                     }
                     self.wait_room(crate::budgets::RELAY_POLL);
@@ -1004,6 +1043,8 @@ impl Write for NaiveStream {
                     return Self::short(done);
                 }
                 proxy::Settle::Parked if Instant::now() >= deadline => {
+                    self.inner.write_lost.store(true, Ordering::Relaxed);
+                    self.inner.abort();
                     return Self::short(done);
                 }
                 proxy::Settle::Parked => self.wait_room(crate::budgets::RELAY_POLL),
@@ -2319,7 +2360,7 @@ impl NaiveOut {
             if pool.len() + inflight < self.pool_limit && Instant::now() < deadline {
                 self.h2_inflight.fetch_add(1, Ordering::Relaxed);
                 drop(pool);
-                let client = self.connect_h2();
+                let client = self.connect_h2(deadline);
                 let mut published = self.h2.lock();
                 let mut existing = None;
                 if let Ok(pool) = published.as_mut() {
@@ -2342,12 +2383,13 @@ impl NaiveOut {
                     }
                 }
                 self.h2_inflight.fetch_sub(1, Ordering::Relaxed);
-                drop(published);
-                self.h2_ready.notify_all();
-                if client.is_none()
+                let retry = client.is_none()
                     && existing.is_none()
                     && self.h2_inflight.load(Ordering::Relaxed) > 0
-                {
+                    && Instant::now() < deadline;
+                drop(published);
+                self.h2_ready.notify_all();
+                if retry {
                     pool = self.h2.lock().ok()?;
                     continue;
                 }
@@ -2375,11 +2417,17 @@ impl NaiveOut {
         }
     }
 
-    fn connect_h2(self: &Arc<Self>) -> Option<Arc<H2Client>> {
+    fn connect_h2(self: &Arc<Self>, deadline: Instant) -> Option<Arc<H2Client>> {
+        if Instant::now() >= deadline {
+            return None;
+        }
         let server = proxy::resolve_outbound(&self.address, self.port)?;
+        if Instant::now() >= deadline {
+            return None;
+        }
         let mut tls = (*self.tls).clone();
         tls.alpn = Arc::from(vec![b"h2".to_vec()]);
-        let session = proxy::dial_tls_session(&server, &tls, None)?;
+        let session = proxy::dial_tls_session_until(&server, &tls, None, Some(deadline))?;
         let raw = Arc::new(session.get_ref().try_clone().ok()?);
         let (reader, mut writer) = proxy::tls_client_halves(session)?;
         writer.arm_write(crate::budgets::RELAY_POLL);
@@ -2397,7 +2445,7 @@ impl NaiveOut {
         while attempts < 2 {
             let client = self.h2_client(deadline)?;
             let block = self.h2_block(target);
-            match client.open_naive_result(&block, false) {
+            match client.open_naive_result(&block, false, deadline) {
                 Ok((reader, out)) => {
                     let Some((status, padded)) = reader.wait_head(deadline) else {
                         let unprocessed = reader.unprocessed();
@@ -2492,13 +2540,13 @@ impl NaiveOut {
                     }
                 }
                 self.h3_inflight.fetch_sub(1, Ordering::Relaxed);
-                drop(published);
-                self.h3_ready.notify_all();
-                if client.is_none()
+                let retry = client.is_none()
                     && existing.is_none()
                     && self.h3_inflight.load(Ordering::Relaxed) > 0
-                    && Instant::now() < deadline
-                {
+                    && Instant::now() < deadline;
+                drop(published);
+                self.h3_ready.notify_all();
+                if retry {
                     pool = self.h3.lock().ok()?;
                     continue;
                 }
@@ -2692,6 +2740,18 @@ pub(crate) fn outbound(root: &Json) -> Result<Option<NaiveOut>, String> {
         (!username.is_empty() || !password.is_empty()).then(|| basic_token(username, password));
     let tls = outbound_tls(first, address)?;
     let quic = field("quic").and_then(Json::as_bool).unwrap_or(false);
+    if quic
+        && first
+            .get("streamSettings")
+            .and_then(|settings| settings.get("sockopt"))
+            .and_then(|sockopt| sockopt.get("dialerProxy"))
+            .is_some()
+    {
+        return Err(
+            "naive quic outbound cannot use dialerProxy; the QUIC dial does not traverse the hop"
+                .to_owned(),
+        );
+    }
     let uot = uot_option(field("udp_over_tcp").or_else(|| field("udpOverTcp")))?;
     let stream_window = memory_bytes("stream_receive_window", field("stream_receive_window"))?
         .filter(|window| *window > 0);
@@ -3917,7 +3977,9 @@ mod tests {
             ("proxy-authorization", "Basic wrong"),
             ("padding", "x"),
         ]);
-        let (mut reader, out) = h2.open_naive_result(&block, false).expect("stream");
+        let (mut reader, out) = h2
+            .open_naive_result(&block, false, Instant::now() + Duration::from_secs(5))
+            .expect("stream");
         let mut one = [0u8; 1];
         let _ = reader.read(&mut one);
         assert_eq!(reader.status(), Some(407));

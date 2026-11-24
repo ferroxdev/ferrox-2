@@ -16,13 +16,13 @@ graph TD
     P -- yes --> O["CONNECT + Basic + Padding"]
     P -- no --> T["TLS or QUIC connect"]
     T --> O
-    O --> H{"response Padding?"}
+    O --> A["Naive inbound<br/>H2 or H3"]
+    A --> C["CONNECT + credential + Padding gate"]
+    C --> H{"response Padding?"}
     H -- yes --> F["first 8 records<br/>u16 len + u8 pad"]
     H -- no --> R["raw framing both ways"]
     F --> R
-    R --> A["Naive inbound<br/>H2 or H3"]
-    A --> C["CONNECT + credential + Padding gate"]
-    C --> M{"UoT magic?"}
+    R --> M{"UoT magic?"}
     M -- yes --> V["UDP4/UDP6 sockets<br/>datagram relay"]
     M -- no --> D["dial -connect-authority"]
     V --> R

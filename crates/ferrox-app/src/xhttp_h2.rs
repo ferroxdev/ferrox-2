@@ -4,7 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::h2::{
     block_encode, frame_head, write_frame, Decoder, E_CANCEL, E_COMPRESSION, E_FRAME_SIZE,
@@ -3200,6 +3200,28 @@ pub(crate) enum H2OpenError {
     Failed,
 }
 
+fn lock_until<'a, T>(
+    lock: &'a Mutex<T>,
+    deadline: Option<Instant>,
+) -> Option<std::sync::MutexGuard<'a, T>> {
+    let Some(deadline) = deadline else {
+        return lock.lock().ok();
+    };
+    loop {
+        match lock.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(std::sync::TryLockError::Poisoned(_)) => return None,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return None;
+                }
+                std::thread::sleep(left.min(Duration::from_millis(2)));
+            }
+        }
+    }
+}
+
 /// One client connection, one stream: the reference opens a stream per session and keeps the
 /// connection for the pool, so a stream ending must not close what a later session can reuse.
 /// One client connection: the reference opens a stream per session and keeps the connection for
@@ -3375,8 +3397,9 @@ impl H2Client {
         &self,
         block: &[u8],
         end_request: bool,
+        deadline: Instant,
     ) -> Result<(H2StreamReader, H2StreamOut), H2OpenError> {
-        self.open_headers_result(block, None, end_request)
+        self.open_headers_result(block, None, end_request, Some(deadline))
     }
 
     /// Sends one request head on a fresh stream. `end_request` marks a bodyless request (the GET
@@ -3387,7 +3410,7 @@ impl H2Client {
         owner: Option<Arc<ClientOwner>>,
         end_request: bool,
     ) -> Option<(H2StreamReader, H2StreamOut)> {
-        self.open_headers_result(block, owner, end_request).ok()
+        self.open_headers_result(block, owner, end_request, None).ok()
     }
 
     fn open_headers_result(
@@ -3395,13 +3418,17 @@ impl H2Client {
         block: &[u8],
         owner: Option<Arc<ClientOwner>>,
         end_request: bool,
+        deadline: Option<Instant>,
     ) -> Result<(H2StreamReader, H2StreamOut), H2OpenError> {
-        let Ok(order) = self.open_order.lock() else {
-            return Err(H2OpenError::Closed);
+        let Some(order) = lock_until(&self.open_order, deadline) else {
+            return Err(H2OpenError::Failed);
         };
-        let Ok(gate) = self.conn.open_gate.lock() else {
-            return Err(H2OpenError::Closed);
+        let Some(gate) = lock_until(&self.conn.open_gate, deadline) else {
+            return Err(H2OpenError::Failed);
         };
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(H2OpenError::Failed);
+        }
         if self.conn.goaway.load(Ordering::SeqCst) || self.conn.dead.load(Ordering::SeqCst) {
             return Err(H2OpenError::Closed);
         }
@@ -3414,6 +3441,10 @@ impl H2Client {
         };
         // Admission is ordered with GOAWAY here; the HEADERS write must not hold the gate the read pump takes to publish SETTINGS or GOAWAY.
         drop(gate);
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            self.conn.fail_stream(sid);
+            return Err(H2OpenError::Failed);
+        }
         let flags = if end_request {
             F_END_HEADERS | F_END
         } else {
@@ -4824,7 +4855,7 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::atomic::AtomicUsize;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn a_windowed_client_advertises_half_its_connection_window() {
@@ -4840,7 +4871,7 @@ mod tests {
         client.conn.peer_max.store(0, Ordering::SeqCst);
         let block = block_encode(&[(":method", "CONNECT"), (":authority", "example.test")]);
         assert!(matches!(
-            client.open_naive_result(&block, false),
+            client.open_naive_result(&block, false, Instant::now() + Duration::from_secs(5)),
             Err(H2OpenError::Full)
         ));
         assert_eq!(
@@ -4875,7 +4906,9 @@ mod tests {
         client.settle();
         let block = block_encode(&[(":method", "CONNECT"), (":authority", "example.test")]);
         assert!(
-            client.open_naive_result(&block, false).is_ok(),
+            client
+                .open_naive_result(&block, false, Instant::now() + Duration::from_secs(5))
+                .is_ok(),
             "an idle pump left the client unable to open"
         );
     }

@@ -5170,7 +5170,7 @@ impl Write for QuicStream {
         let deadline = Instant::now() + SEND_WAIT;
         let mut rest = bytes::Bytes::copy_from_slice(buf);
         while !rest.is_empty() {
-            match self.send_once(&mut rest) {
+            match self.send_once(&mut rest, true) {
                 Ok(0) => {
                     if Instant::now() >= deadline {
                         let sent = buf.len() - rest.len();
@@ -5305,7 +5305,7 @@ impl QuicStream {
             return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
         }
         let mut rest = bytes::Bytes::copy_from_slice(buf);
-        let n = self.send_once(&mut rest)?;
+        let n = self.send_once(&mut rest, false)?;
         if n > 0 {
             self.meter.write(n);
             self.activity.touch();
@@ -5314,9 +5314,22 @@ impl QuicStream {
     }
 
     /// One send flight without holding the lock across the wait behind it.
-    fn send_once(&mut self, rest: &mut bytes::Bytes) -> std::io::Result<usize> {
-        let Ok(mut conn) = self.conn.lock() else {
-            return Err(std::io::Error::other("quic connection lock poisoned"));
+    fn send_once(&mut self, rest: &mut bytes::Bytes, wait: bool) -> std::io::Result<usize> {
+        let mut conn = if wait {
+            match self.conn.lock() {
+                Ok(conn) => conn,
+                Err(_) => {
+                    return Err(std::io::Error::other("quic connection lock poisoned"));
+                }
+            }
+        } else {
+            match self.conn.try_lock() {
+                Ok(conn) => conn,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(0),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(std::io::Error::other("quic connection lock poisoned"));
+                }
+            }
         };
         // A closed or draining connection cannot progress: fail the write instead of parking it for SEND_WAIT.
         if conn.is_closed() || conn.is_draining() {
