@@ -5088,8 +5088,8 @@ impl Read for QuicStream {
             }
             if relayed {
                 self.note_datagram_wait();
-                // The pump thread reads this socket too, so the park keeps the reader's own clock behind the wake it arms.
-                crate::proxy::note_wait_idle(crate::budgets::RELAY_POLL);
+                // The pump thread reads this socket too and can take the datagram this wait arms for, so the park keeps a quantum behind the descriptor wake.
+                crate::proxy::note_wait_idle(STREAM_QUANTUM);
                 return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
             }
             if Instant::now() >= deadline {
