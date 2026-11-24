@@ -1902,6 +1902,12 @@ enum EncoderHead {
     Invalid,
 }
 
+enum EncoderCheck {
+    Pending,
+    Ok,
+    Fatal,
+}
+
 /// Read the QPACK encoder stream's mandatory first instruction, Set Dynamic Table Capacity. The
 /// client advertises zero, so a positive value is a stream error.
 fn read_qpack_capacity(conn: &mut QuicheConnection, id: u64, prefix: &mut Vec<u8>) -> EncoderHead {
@@ -1936,6 +1942,31 @@ fn read_qpack_capacity(conn: &mut QuicheConnection, id: u64, prefix: &mut Vec<u8
             }
             Ok((_, _)) | Err(quiche::Error::Done) => return EncoderHead::Pending,
             Err(_) => return EncoderHead::Invalid,
+        }
+    }
+}
+
+fn check_encoder_capacity(
+    conn: &mut QuicheConnection,
+    control: &mut ControlState,
+    id: u64,
+) -> EncoderCheck {
+    if control.encoder != Some(id) || control.encoder_checked {
+        return EncoderCheck::Ok;
+    }
+    match read_qpack_capacity(conn, id, &mut control.encoder_prefix) {
+        EncoderHead::Pending => EncoderCheck::Pending,
+        EncoderHead::Capacity(0) => {
+            control.encoder_checked = true;
+            EncoderCheck::Ok
+        }
+        EncoderHead::Capacity(_) | EncoderHead::Invalid => {
+            let _ = conn.close(
+                true,
+                QPACK_ENCODER_STREAM_ERROR,
+                b"encoder capacity above the advertised zero",
+            );
+            EncoderCheck::Fatal
         }
     }
 }
@@ -2019,19 +2050,10 @@ fn h3_control_goaway(
                 }
             }
             if Some(id) != control.id {
-                if control.encoder == Some(id) && !control.encoder_checked {
-                    match read_qpack_capacity(conn, id, &mut control.encoder_prefix) {
-                        EncoderHead::Pending => continue,
-                        EncoderHead::Capacity(0) => control.encoder_checked = true,
-                        EncoderHead::Capacity(_) | EncoderHead::Invalid => {
-                            let _ = conn.close(
-                                true,
-                                QPACK_ENCODER_STREAM_ERROR,
-                                b"encoder capacity above the advertised zero",
-                            );
-                            return None;
-                        }
-                    }
+                match check_encoder_capacity(conn, control, id) {
+                    EncoderCheck::Pending => continue,
+                    EncoderCheck::Fatal => return None,
+                    EncoderCheck::Ok => {}
                 }
                 drain_stream(conn, id);
                 if control.critical.contains(&id) && conn.stream_finished(id) {
