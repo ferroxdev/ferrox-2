@@ -721,7 +721,7 @@ impl H2StreamOut {
     /// The request is refused with its body unread: an `RST_STREAM` frees the stream and the credit
     /// it would otherwise keep granting a body nobody drains.
     pub(crate) fn reset(&self) {
-        self.conn.reset(self.stream);
+        self.conn.reset_or_cancel(self.stream);
     }
 }
 
@@ -1034,7 +1034,7 @@ impl H2StreamReader {
     pub(crate) fn reset_handle(&self) -> impl FnOnce() + Send + 'static {
         let conn = Arc::clone(&self.conn);
         let id = self.id;
-        move || conn.reset(id)
+        move || conn.reset_or_cancel(id)
     }
 
     fn wait<'a>(
@@ -2376,6 +2376,11 @@ impl H2Conn {
     }
 
     fn reset_stream(&self, stream: u32) {
+        self.reset_stream_code(stream, E_REFUSED);
+    }
+
+    /// A local abandon after the response is on the wire is a cancellation, not a refusal the peer may retry.
+    fn reset_or_cancel(&self, stream: u32) {
         let responded = self
             .streams
             .lock()
