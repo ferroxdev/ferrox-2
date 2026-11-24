@@ -3094,24 +3094,23 @@ impl Gecko {
             .as_ref()
             .filter(|state| state.buf == buf && state.to == to)
             .map(|state| (state.msg_id, state.total, state.next));
-        let (msg_id, total, start) = match resume {
-            Some((msg_id, total, next)) => (msg_id, total, next),
-            None => {
-                let total = ferrox_core::hysteria::GECKO_MIN_CHUNKS
-                    + (entropy()
-                        % (ferrox_core::hysteria::GECKO_MAX_CHUNKS
-                            - ferrox_core::hysteria::GECKO_MIN_CHUNKS
-                            + 1) as u64) as usize;
-                let msg_id = self.msg.fetch_add(1, Ordering::Relaxed) as u8;
-                *fragment = Some(FragmentState {
-                    msg_id,
-                    total,
-                    next: 0,
-                    buf: buf.to_vec(),
-                    to,
-                });
-                (msg_id, total, 0)
-            }
+        let (msg_id, total, start) = if let Some((msg_id, total, next)) = resume {
+            (msg_id, total, next)
+        } else {
+            let total = ferrox_core::hysteria::GECKO_MIN_CHUNKS
+                + (entropy()
+                    % (ferrox_core::hysteria::GECKO_MAX_CHUNKS
+                        - ferrox_core::hysteria::GECKO_MIN_CHUNKS
+                        + 1) as u64) as usize;
+            let msg_id = self.msg.fetch_add(1, Ordering::Relaxed) as u8;
+            *fragment = Some(FragmentState {
+                msg_id,
+                total,
+                next: 0,
+                buf: buf.to_vec(),
+                to,
+            });
+            (msg_id, total, 0)
         };
         let mut pad = [0u8; GECKO_BUFFER];
         let mut frame = Unfilled::<GECKO_BUFFER>::new();
