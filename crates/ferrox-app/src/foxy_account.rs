@@ -839,9 +839,19 @@ impl Endpoint {
             Some(at) => (&rest[..at], rest[at..].trim_end_matches('/')),
             None => (rest, ""),
         };
-        let (host, port) = match hostport.rsplit_once(':') {
-            Some((host, port)) => (host, port.parse().ok()?),
-            None => (hostport, 443),
+        let (host, port) = match hostport.strip_prefix('[') {
+            Some(rest) => {
+                let (host, after) = rest.split_once(']')?;
+                let port = match after {
+                    "" => 443,
+                    tail => tail.strip_prefix(':')?.parse().ok()?,
+                };
+                (host, port)
+            }
+            None => match hostport.rsplit_once(':') {
+                Some((host, port)) => (host, port.parse().ok()?),
+                None => (hostport, 443),
+            },
         };
         if host.is_empty() {
             return None;
@@ -2245,6 +2255,25 @@ mod tests {
                 .expect("parses")
                 .port,
             8443
+        );
+    }
+
+    #[test]
+    fn a_bracketed_ipv6_authority_keeps_its_port_apart_from_the_address() {
+        let endpoint = Endpoint::parse("https://[2001:db8::1]", Vec::new().into()).expect("parses");
+        assert_eq!(endpoint.host, "2001:db8::1");
+        assert_eq!(endpoint.port, 443);
+        assert_eq!(
+            endpoint.address,
+            Some("[2001:db8::1]:443".parse().expect("addr"))
+        );
+        let endpoint =
+            Endpoint::parse("https://[2001:db8::1]:8443", Vec::new().into()).expect("parses");
+        assert_eq!(endpoint.host, "2001:db8::1");
+        assert_eq!(endpoint.port, 8443);
+        assert_eq!(
+            endpoint.address,
+            Some("[2001:db8::1]:8443".parse().expect("addr"))
         );
     }
 

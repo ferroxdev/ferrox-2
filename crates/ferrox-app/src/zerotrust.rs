@@ -270,8 +270,9 @@ fn issued_token(reply: &Reply) -> Option<String> {
         .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
         .find_map(|(_, value)| {
             let token = extract_jwt_from_cookie(value)?;
-            let deleted = cookie_expires_at(value).is_some_and(|at| at <= now());
-            (!deleted).then_some(token)
+            let at = now();
+            let deleted = cookie_expires_at(value).is_some_and(|expires| expires <= at);
+            (!deleted && !jwt_expired(&token, at)).then_some(token)
         })
 }
 
@@ -1219,7 +1220,7 @@ pub(crate) fn https_exchange(
     let authority = origin.strip_prefix("https://").unwrap_or(&origin);
     let mut endpoint = Endpoint::parse(&origin, crate::quic::system_roots())
         .ok_or_else(|| "warp access: the redirect target is not an https URL".to_owned())?;
-    if endpoint.port != 443 {
+    if endpoint.port != 443 || authority.starts_with('[') {
         endpoint.host_header = Some(authority.to_owned());
     }
     crate::foxy_account::ask_within(
@@ -1715,6 +1716,27 @@ mod tests {
             "",
         );
         assert!(issued_token(&reply).is_none());
+    }
+
+    #[test]
+    fn an_expired_assertion_cookie_does_not_hide_a_live_one() {
+        let expired = jwt("{\"exp\":1}");
+        let live = jwt("{\"exp\":4102444800}");
+        let reply = reply(
+            200,
+            vec![
+                (
+                    "Set-Cookie".to_owned(),
+                    format!("CF_Authorization={expired}; Path=/old; Secure"),
+                ),
+                (
+                    "Set-Cookie".to_owned(),
+                    format!("CF_Authorization={live}; Path=/new; Secure"),
+                ),
+            ],
+            "",
+        );
+        assert_eq!(issued_token(&reply), Some(live));
     }
 
     #[test]

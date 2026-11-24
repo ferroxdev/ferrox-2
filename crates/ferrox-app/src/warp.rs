@@ -601,7 +601,7 @@ impl WarpSpec {
                 .to_owned()
         })?;
         Ok(if self.mode == Mode::Gool {
-            paths.gool_path_after_outer()
+            paths.masque_sibling_after_outer("gool")
         } else {
             self.gool_path(&paths)?
         })
@@ -636,6 +636,17 @@ impl WarpSpec {
                 .to_owned()
         })?;
         Ok(Slot::MasqueInner.path(&paths))
+    }
+
+    fn mim_path_after_outer_save(&self) -> Result<PathBuf, String> {
+        if let Some(file) = &self.mim.identity_file {
+            return Ok(file.clone());
+        }
+        let paths = self.key_paths().ok_or_else(|| {
+            "warp mim needs `mimIdentityFile`, an inline `mimIdentity`, or an `identityFile`"
+                .to_owned()
+        })?;
+        Ok(paths.masque_sibling_after_outer("secondary"))
     }
 
     /// The inner MASQUE identity, registered beside the outer one when absent.
@@ -3524,15 +3535,15 @@ impl KeyPaths {
         current
     }
 
-    fn gool_path_after_outer(&self) -> PathBuf {
+    fn masque_sibling_after_outer(&self, suffix: &str) -> PathBuf {
         if self.named_masque.is_none() {
-            return Slot::Gool.path(self);
+            return self.masque_sibling(suffix);
         }
-        let current = derive_sibling_path(&self.wireguard, "gool");
+        let current = derive_sibling_path(&self.wireguard, suffix);
         if current.exists() {
             return current;
         }
-        let allocated = derive_sibling_path(&self.masque, "gool");
+        let allocated = derive_sibling_path(&self.masque, suffix);
         if allocated.exists() {
             return allocated;
         }
@@ -3838,6 +3849,29 @@ pub(crate) fn one_tap(
             if mode == Mode::Gool {
                 spec.gool.identity_file = Some(inner_path);
             }
+        }
+    }
+    if !resumed && mode == Mode::Mim {
+        if let Some(identity) = &spec.mim.inline {
+            ensure_saved_team(
+                team.map(|team| team.team.as_str()),
+                identity.team.as_deref(),
+                Path::new("<inline mim identity>"),
+            )?;
+        } else {
+            let inner_path = spec.mim_path_after_outer_save()?;
+            if inner_path.is_file() {
+                match Identity::load(&inner_path) {
+                    Ok(saved) => ensure_saved_team(
+                        team.map(|team| team.team.as_str()),
+                        saved.team.as_deref(),
+                        &inner_path,
+                    )?,
+                    Err(error) if error.corrupt() && spec.register && reprovision_enabled() => {}
+                    Err(error) => return Err(error.into_message()),
+                }
+            }
+            spec.mim.identity_file = Some(inner_path);
         }
     }
     if !resumed {
@@ -4811,9 +4845,9 @@ mod tests {
     }
 
     #[test]
-    fn a_named_outer_uses_the_post_save_gool_sibling() {
+    fn a_named_outer_uses_the_post_save_siblings() {
         let dir = std::env::temp_dir().join(format!(
-            "ferrox-warp-gool-path-{}-{:?}",
+            "ferrox-warp-sibling-path-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -4823,12 +4857,18 @@ mod tests {
         let derived = dir.join("account-masque-masque.json");
         let old_gool = dir.join("account-masque-masque-gool.json");
         let saved_gool = dir.join("account-masque-gool.json");
+        let old_mim = dir.join("account-masque-masque-secondary.json");
+        let saved_mim = dir.join("account-masque-secondary.json");
         std::fs::write(&derived, "{}").expect("the named MASQUE file");
         std::fs::write(&old_gool, "{}").expect("the old gool file");
         std::fs::write(&saved_gool, "{}").expect("the post-save gool file");
+        std::fs::write(&old_mim, "{}").expect("the old mim file");
+        std::fs::write(&saved_mim, "{}").expect("the post-save mim file");
         let paths = KeyPaths::new(&base, None, None);
         assert_eq!(Slot::Gool.path(&paths), old_gool);
-        assert_eq!(paths.gool_path_after_outer(), saved_gool);
+        assert_eq!(paths.masque_sibling_after_outer("gool"), saved_gool);
+        assert_eq!(Slot::MasqueInner.path(&paths), old_mim);
+        assert_eq!(paths.masque_sibling_after_outer("secondary"), saved_mim);
         std::fs::remove_dir_all(&dir).ok();
     }
 
