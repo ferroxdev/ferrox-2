@@ -5115,12 +5115,17 @@ impl Write for QuicStream {
         if self.stalled.load(Ordering::Relaxed) {
             return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
         }
-        // The lock covers one send each: a flow-control wait must not hold it, or ACKs stop arriving.
+        // The lock covers one send each, and a caller that takes a refused region gets its tail back: the window grant arrives as a datagram on the lane's own socket, so the lane parks there and sends the rest next turn.
+        let partial = crate::proxy::partial_write();
         let deadline = Instant::now() + SEND_WAIT;
         let mut rest = bytes::Bytes::copy_from_slice(buf);
         while !rest.is_empty() {
             match self.send_once(&mut rest) {
                 Ok(0) => {
+                    if partial {
+                        self.note_datagram_wait();
+                        return Ok(buf.len() - rest.len());
+                    }
                     if Instant::now() >= deadline {
                         let sent = buf.len() - rest.len();
                         if sent > 0 {
