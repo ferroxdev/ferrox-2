@@ -2498,7 +2498,7 @@ fn connect_status(head: &[u8]) -> Option<u16> {
             return None;
         }
     }
-    status.parse().ok()
+    std::str::from_utf8(status).ok()?.parse().ok()
 }
 
 fn read_connect_head(

@@ -1079,7 +1079,7 @@ pub(crate) fn resolve_token(
         }
     }
     let token = sign_in(settings, now, &https_exchange, prompt)?;
-    let issued = now();
+    let issued = now;
     let mut cached = match CACHED.lock() {
         Ok(cached) => cached,
         Err(poisoned) => poisoned.into_inner(),
