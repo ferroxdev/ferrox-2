@@ -2411,7 +2411,7 @@ mod tests {
             },
         )
         .expect_err("three rejected codes");
-        assert!(error.contains("warp access"), "{error}");
+        assert!(error.contains("after 3 attempts"), "{error}");
         assert_eq!(prompts, 3);
         assert_eq!(posts.get(), 3);
     }
