@@ -1794,21 +1794,39 @@ mod tests {
 
     #[test]
     fn a_hello_chunk_is_kept_to_the_cap_and_a_late_one_is_dropped() {
+        assert_eq!(HEAD_CAP, 16_384, "the documented cap");
+        let mut header = Vec::new();
+        wire::encode_client_hello(
+            &wire::ClientHello {
+                send_bps: 1,
+                recv_bps: 1,
+                auth: &[],
+            },
+            &mut header,
+        );
+        let auth = vec![7u8; HEAD_CAP - header.len()];
+        let mut encoded = Vec::new();
+        wire::encode_client_hello(
+            &wire::ClientHello {
+                send_bps: 1,
+                recv_bps: 1,
+                auth: &auth,
+            },
+            &mut encoded,
+        );
+        assert_eq!(encoded.len(), HEAD_CAP, "a canonical hello fills the cap");
         let mut buf = Vec::new();
-        let almost = vec![1u8; HEAD_CAP - 1];
-        assert!(keep_chunk(&mut buf, &almost));
-        assert!(keep_chunk(&mut buf, &[2u8]));
-        assert_eq!(buf.len(), HEAD_CAP, "a hello of exactly the cap is kept");
+        assert!(keep_chunk(&mut buf, &encoded));
+        let (hello, used) = wire::decode_client_hello(&buf).expect("the cap-sized hello decodes");
+        assert_eq!(used, HEAD_CAP);
+        assert_eq!(hello.auth, &auth[..]);
         assert!(
             !keep_chunk(&mut buf, &[3u8]),
             "a hello past the cap is refused"
         );
-        assert!(buf.is_empty(), "the refused hello leaves no buffer behind");
+        assert_eq!(buf.len(), 0, "the refused hello leaves no buffer behind");
         let over = vec![4u8; HEAD_CAP + 1];
-        assert!(
-            !keep_chunk(&mut buf, &over),
-            "one chunk past the cap is refused"
-        );
+        assert!(!keep_chunk(&mut buf, &over), "one chunk past the cap");
         assert_eq!(buf.len(), 0);
     }
 
