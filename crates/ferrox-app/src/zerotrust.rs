@@ -1185,7 +1185,7 @@ pub(crate) fn resolve_token(
     prompt: &mut dyn FnMut(&str, u32) -> Option<String>,
 ) -> Result<String, String> {
     static CACHED: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
-    let now = now();
+    let started = now();
     {
         let cached = match CACHED.lock() {
             Ok(cached) => cached,
@@ -1198,7 +1198,7 @@ pub(crate) fn resolve_token(
             }
         }
     }
-    let token = sign_in(settings, now, &https_exchange, prompt)?;
+    let token = sign_in(settings, started, &https_exchange, prompt)?;
     let issued = now();
     if !jwt_expiry(&token).is_some_and(|expiry| issued < expiry) {
         return Err(format!(
