@@ -373,12 +373,21 @@ impl<'a> DataBatch<'a> {
         heads: &[[u8; 9]; DATA_FRAMES_PER_WRITE],
         included: usize,
     ) -> bool {
+        let max = *conn
+            .max_frame
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut capped = [[0u8; 9]; DATA_FRAMES_PER_WRITE];
+        let mut take = [0usize; DATA_FRAMES_PER_WRITE];
         let mut parts: [&[u8]; 5 * DATA_FRAMES_PER_WRITE] = [NO_PART; 5 * DATA_FRAMES_PER_WRITE];
         let mut pieces = 0;
         for at in 0..included {
-            parts[pieces] = &heads[at];
+            let id = u32::from_be_bytes([heads[at][5], heads[at][6], heads[at][7], heads[at][8]]);
+            take[at] = fit[at].min(max);
+            capped[at] = frame_head(take[at], T_DATA, 0, id);
+            parts[pieces] = &capped[at];
             pieces += 1;
-            let mut left = fit[at];
+            let mut left = take[at];
             for body in &self.bodies[at][..self.counts[at] as usize] {
                 if left == 0 {
                     break;
@@ -402,6 +411,7 @@ impl<'a> DataBatch<'a> {
             return false;
         }
         drop(write);
+        drop(max);
         let mut new_heads = self.heads;
         let mut new_bodies = self.bodies;
         let mut new_counts = self.counts;
@@ -410,11 +420,11 @@ impl<'a> DataBatch<'a> {
             let len =
                 u32::from_be_bytes([0, self.heads[at][0], self.heads[at][1], self.heads[at][2]])
                     as usize;
-            if fit[at] == len {
+            if take[at] == len {
                 continue;
             }
             let (head, bodies, count) =
-                trim_frame(&self.heads[at], &self.bodies[at], self.counts[at], fit[at]);
+                trim_frame(&self.heads[at], &self.bodies[at], self.counts[at], take[at]);
             new_heads[used] = head;
             new_bodies[used] = bodies;
             new_counts[used] = count;
@@ -573,12 +583,9 @@ impl<'a> DataBatch<'a> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         if self.exceeds(*max) {
-            let max = *max;
-            return if self.flush_split_locked(conn, write, max) {
-                crate::proxy::Accepted::All
-            } else {
-                crate::proxy::Accepted::Lost
-            };
+            drop(max);
+            self.used = 0;
+            return crate::proxy::Accepted::Full;
         }
         let mut parts: [&[u8]; 5 * DATA_FRAMES_PER_WRITE] = [NO_PART; 5 * DATA_FRAMES_PER_WRITE];
         let mut pieces = 0;
@@ -946,6 +953,8 @@ pub(crate) struct H2Conn {
     /// just been told to stop cannot still admit a request.
     open_gate: Mutex<()>,
     goaway: AtomicBool,
+    /// The peer's GOAWAY cutoff: requests above it were explicitly not processed.
+    goaway_last: AtomicU32,
     refused: AtomicBool,
     /// The client half's transport: a client pumps frames on demand from its reader or a writer
     /// waiting for credit, so one thread owns the session and no parser thread outlives it.
@@ -1043,6 +1052,13 @@ impl H2StreamReader {
                 Pumped::Dead => return None,
             }
         }
+    }
+
+    /// Whether the peer's GOAWAY cutoff explicitly excluded this request, the only failed outcome
+    /// that is safe to replay.
+    pub(crate) fn unprocessed(&self) -> bool {
+        self.conn.goaway.load(Ordering::SeqCst)
+            && self.id > self.conn.goaway_last.load(Ordering::SeqCst)
     }
 
     /// A head wait returns as soon as the status is decoded, even while another stream's reader
@@ -2796,6 +2812,7 @@ impl H2Conn {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let since = *partial.since.get_or_insert_with(std::time::Instant::now);
+        let before = partial.head_len + partial.body_len;
         let frame = {
             let partial = &mut *partial;
             if partial.frame.is_none() {
@@ -2808,7 +2825,12 @@ impl H2Conn {
                     deadline,
                 ) {
                     Some(true) => {}
-                    Some(false) => return Pumped::Yield,
+                    Some(false) => {
+                        if partial.head_len + partial.body_len == before {
+                            partial.since = None;
+                        }
+                        return Pumped::Yield;
+                    }
                     None => {
                         self.dead.store(true, Ordering::SeqCst);
                         return Pumped::Dead;
@@ -2837,7 +2859,12 @@ impl H2Conn {
                 deadline,
             ) {
                 Some(true) => {}
-                Some(false) => return Pumped::Yield,
+                Some(false) => {
+                    if partial.head_len + partial.body_len == before {
+                        partial.since = None;
+                    }
+                    return Pumped::Yield;
+                }
                 None => {
                     self.dead.store(true, Ordering::SeqCst);
                     return Pumped::Dead;
@@ -2972,6 +2999,10 @@ fn client_frame(conn: &H2Conn, kind: u8, flags: u8, sid: u32, body: Vec<u8>) -> 
                 .open_gate
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
+            if body.len() >= 8 {
+                let last = u32::from_be_bytes([body[0], body[1], body[2], body[3]]) & 0x7FFF_FFFF;
+                conn.goaway_last.fetch_min(last, Ordering::SeqCst);
+            }
             conn.goaway.store(true, Ordering::SeqCst);
             true
         }
@@ -3122,6 +3153,7 @@ impl H2Client {
             dead,
             open_gate: Mutex::new(()),
             goaway: AtomicBool::new(false),
+            goaway_last: AtomicU32::new(u32::MAX),
             refused: AtomicBool::new(false),
             client_read: Some(Mutex::new(Box::new(read))),
             client_partial: Mutex::new(PartialFrame::default()),
@@ -4153,6 +4185,7 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
                     dead,
                     open_gate: Mutex::new(()),
                     goaway: AtomicBool::new(false),
+                    goaway_last: AtomicU32::new(u32::MAX),
                     refused: AtomicBool::new(false),
                     client_read: None,
                     client_partial: Mutex::new(PartialFrame::default()),
@@ -4658,6 +4691,10 @@ fn pump_frame(
                 .open_gate
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
+            if body.len() >= 8 {
+                let last = u32::from_be_bytes([body[0], body[1], body[2], body[3]]) & 0x7FFF_FFFF;
+                conn.goaway_last.fetch_min(last, Ordering::SeqCst);
+            }
             conn.goaway.store(true, Ordering::SeqCst);
             true
         }
@@ -6955,6 +6992,7 @@ mod tests {
             dead,
             open_gate: Mutex::new(()),
             goaway: AtomicBool::new(false),
+            goaway_last: AtomicU32::new(u32::MAX),
             refused: AtomicBool::new(false),
             client_read: Some(Mutex::new(read)),
             client_partial: Mutex::new(PartialFrame::default()),
@@ -7520,6 +7558,7 @@ mod tests {
             dead,
             open_gate: Mutex::new(()),
             goaway: AtomicBool::new(false),
+            goaway_last: AtomicU32::new(u32::MAX),
             refused: AtomicBool::new(false),
             client_read: None,
             client_partial: Mutex::new(PartialFrame::default()),

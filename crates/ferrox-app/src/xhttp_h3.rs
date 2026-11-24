@@ -1956,15 +1956,11 @@ fn check_encoder_capacity(
     }
     match read_qpack_capacity(conn, id, &mut control.encoder_prefix) {
         EncoderHead::Pending => EncoderCheck::Pending,
-        EncoderHead::Capacity(0) => {
-            control.encoder_checked = true;
-            EncoderCheck::Ok
-        }
         EncoderHead::Capacity(_) | EncoderHead::Invalid => {
             let _ = conn.close(
                 true,
                 QPACK_ENCODER_STREAM_ERROR,
-                b"encoder capacity above the advertised zero",
+                b"encoder input at the advertised zero capacity",
             );
             EncoderCheck::Fatal
         }

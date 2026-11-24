@@ -2357,8 +2357,12 @@ impl NaiveOut {
             match client.open_naive_result(&block, false) {
                 Ok((reader, out)) => {
                     let Some((status, padded)) = reader.wait_head() else {
+                        let unprocessed = reader.unprocessed();
                         out.reset();
                         self.discard_h2(&client);
+                        if !unprocessed {
+                            return None;
+                        }
                         attempts += 1;
                         continue;
                     };
@@ -2645,9 +2649,13 @@ pub(crate) fn outbound(root: &Json) -> Result<Option<NaiveOut>, String> {
     let tls = outbound_tls(first, address)?;
     let quic = field("quic").and_then(Json::as_bool).unwrap_or(false);
     let uot = uot_option(field("udp_over_tcp").or_else(|| field("udpOverTcp")))?;
-    let stream_window = memory_bytes(field("stream_receive_window")).filter(|window| *window > 0);
-    let session_window =
-        memory_bytes(field("quic_session_receive_window")).filter(|window| *window > 0);
+    let stream_window = memory_bytes("stream_receive_window", field("stream_receive_window"))?
+        .filter(|window| *window > 0);
+    let session_window = memory_bytes(
+        "quic_session_receive_window",
+        field("quic_session_receive_window"),
+    )?
+    .filter(|window| *window > 0);
     let congestion = congestion_option(field("quic_congestion_control"))?;
     let pool_limit = field("insecure_concurrency")
         .and_then(Json::as_u32)
@@ -2827,26 +2835,31 @@ fn uot_option(node: Option<&Json>) -> Result<Option<u8>, String> {
 
 /// A `byteformats.MemoryBytes`: a JSON number, or a string whose unit is read the way the reference
 /// reads it, with the decimal units also accepted as their binary counterparts.
-fn memory_bytes(node: Option<&Json>) -> Option<u64> {
-    let text = match node? {
-        Json::Num(value) if *value >= 0.0 => return Some(*value as u64),
+fn memory_bytes(name: &str, node: Option<&Json>) -> Result<Option<u64>, String> {
+    let Some(node) = node else {
+        return Ok(None);
+    };
+    let text = match node {
+        Json::Num(value) if *value >= 0.0 => return Ok(Some(*value as u64)),
         Json::Str(text) => text.trim().to_ascii_lowercase(),
-        _ => return None,
+        _ => return Err(format!("naive {name} must be a non-negative byte count")),
     };
     let split = text
         .find(|ch: char| !ch.is_ascii_digit() && ch != '.')
         .unwrap_or(text.len());
     let (number, unit) = text.split_at(split);
-    let number: f64 = number.parse().ok()?;
+    let number: f64 = number
+        .parse()
+        .map_err(|_| format!("naive {name} `{text}` is not a byte count"))?;
     let multiplier = match unit.trim() {
         "" | "b" => 1.0,
         "k" | "ki" | "kb" | "kib" => 1024.0,
         "m" | "mi" | "mb" | "mib" => 1024.0 * 1024.0,
         "g" | "gi" | "gb" | "gib" => 1024.0 * 1024.0 * 1024.0,
         "t" | "ti" | "tb" | "tib" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
-        _ => return None,
+        _ => return Err(format!("naive {name} `{text}` has an unknown unit")),
     };
-    Some((number * multiplier) as u64)
+    Ok(Some((number * multiplier) as u64))
 }
 
 fn congestion_option(node: Option<&Json>) -> Result<Option<Congestion>, String> {
@@ -3942,12 +3955,14 @@ mod tests {
 
     #[test]
     fn memory_bytes_reads_the_units_the_reference_reads() {
-        let value = |text: &str| memory_bytes(Some(&Json::Str(text.to_owned())));
-        assert_eq!(value("1024"), Some(1024));
-        assert_eq!(value("1k"), Some(1024));
-        assert_eq!(value("1.5MiB"), Some(1_572_864));
-        assert_eq!(value("2g"), Some(2 * 1024 * 1024 * 1024));
-        assert_eq!(value("1x"), None);
+        let value = |text: &str| memory_bytes("window", Some(&Json::Str(text.to_owned())));
+        assert_eq!(value("1024").expect("reads"), Some(1024));
+        assert_eq!(value("1k").expect("reads"), Some(1024));
+        assert_eq!(value("1.5MiB").expect("reads"), Some(1_572_864));
+        assert_eq!(value("2g").expect("reads"), Some(2 * 1024 * 1024 * 1024));
+        assert!(value("1x").is_err());
+        assert!(value("-1").is_err());
+        assert_eq!(memory_bytes("window", None).expect("unset"), None);
     }
 
     #[test]

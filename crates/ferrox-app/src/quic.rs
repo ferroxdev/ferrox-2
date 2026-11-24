@@ -1134,7 +1134,13 @@ fn send_gso(
         msg_flags: 0,
     };
     // SAFETY: `message` names `parts`, `storage` and `control`, which outlive the call, and each part points at a slot the caller filled for the same sweep.
-    let sent = unsafe { libc::sendmsg(sock.as_raw_fd(), &raw const message, 0) };
+    let sent = unsafe {
+        libc::sendmsg(
+            sock.as_raw_fd(),
+            &raw const message,
+            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+        )
+    };
     if sent == isize::try_from(total).unwrap_or(isize::MAX) {
         return Gso::Sent;
     }
@@ -1204,7 +1210,7 @@ fn send_mmsg(
                 sock.as_raw_fd(),
                 rest.as_mut_ptr().cast::<libc::mmsghdr>(),
                 rest.len() as libc::c_uint,
-                0,
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
             )
         };
         match sent {
@@ -2582,6 +2588,105 @@ fn refused(error: &std::io::Error) -> bool {
     ) || error.raw_os_error() == Some(libc::ENOBUFS)
 }
 
+/// One datagram send that cannot wait in the kernel: a relay lane parks on a full send buffer
+/// instead of holding the connection lock its other streams need.
+fn sendto_ready(sock: &UdpSocket, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+        let (storage, name_len) = crate::proxy::sockaddr_of(to);
+        let fd = sock.as_raw_fd();
+        let sent = sendto_flags(fd, buf, &storage, name_len);
+        if sent < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(sent as usize)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        sock.send_to(buf, to)
+    }
+}
+
+/// One connected send with the same per-call decision, for a lane a proxy shim owns.
+fn send_ready(sock: &UdpSocket, buf: &[u8]) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+        let fd = sock.as_raw_fd();
+        let sent = send_flags(fd, buf);
+        if sent < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(sent as usize)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        sock.send(buf)
+    }
+}
+
+#[cfg(unix)]
+fn sendto_flags(
+    fd: std::os::fd::RawFd,
+    buf: &[u8],
+    storage: &libc::sockaddr_storage,
+    name_len: libc::socklen_t,
+) -> isize {
+    let name = std::ptr::from_ref(storage).cast();
+    #[cfg(target_os = "linux")]
+    {
+        unsafe {
+            libc::sendto(
+                fd,
+                buf.as_ptr().cast(),
+                buf.len(),
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                name,
+                name_len,
+            )
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Darwin ignores `MSG_DONTWAIT` on a full buffer, so the flag is armed for the one call.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return -1;
+        }
+        let sent = unsafe { libc::sendto(fd, buf.as_ptr().cast(), buf.len(), 0, name, name_len) };
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+        sent
+    }
+}
+
+#[cfg(unix)]
+fn send_flags(fd: std::os::fd::RawFd, buf: &[u8]) -> isize {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe {
+            libc::send(
+                fd,
+                buf.as_ptr().cast(),
+                buf.len(),
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            )
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return -1;
+        }
+        let sent = unsafe { libc::send(fd, buf.as_ptr().cast(), buf.len(), 0) };
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+        sent
+    }
+}
+
 /// Where datagrams go. The association's control connection is held, never read: dropping it ends it.
 #[derive(Clone)]
 struct Relay {
@@ -2765,13 +2870,13 @@ impl Hopper {
     fn send(&self, buf: &[u8], to: SocketAddr, obfs: Option<&Mask>) -> std::io::Result<usize> {
         let (sock, dest) = self.egress(to);
         let Some(obfs) = obfs else {
-            return sock.send_to(buf, dest);
+            return sendto_ready(&sock, buf, dest);
         };
         let mut wire = Unfilled::<{ MAX_DATAGRAM + SALAMANDER_SALT }>::new();
         let sealed = obfs
             .seal_into(buf, wire.as_mut())
             .ok_or(std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-        sock.send_to(&wire.as_mut()[..sealed], dest)
+        sendto_ready(&sock, &wire.as_mut()[..sealed], dest)
     }
 
     /// Read one datagram, advancing the schedule first so a reader sees the same
@@ -2940,7 +3045,7 @@ impl Gecko {
     fn send_wire(&self, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
         match self.hop.as_ref() {
             Some(hop) => hop.send(buf, to, None),
-            None => self.sock.send_to(buf, to),
+            None => sendto_ready(&self.sock, buf, to),
         }
     }
 
@@ -3552,12 +3657,12 @@ impl Datagram {
 
     fn send_on(&self, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
         if self.proxy_peer.is_some() {
-            return self.sock.send(buf);
+            return send_ready(&self.sock, buf);
         }
         if let Some(sock) = self.rebound() {
-            return sock.send_to(buf, to);
+            return sendto_ready(&sock, buf, to);
         }
-        self.sock.send_to(buf, to)
+        sendto_ready(&self.sock, buf, to)
     }
 
     fn recv_on(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
