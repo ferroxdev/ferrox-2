@@ -85164,7 +85164,7 @@ end
         };
         let (warm_up, _) = ferrox_core::alloc_count::measure(lookup);
         assert_eq!(warm_up.0, "a");
-        let (leaf, counts) = ferrox_core::alloc_count::measure(lookup);
+        let ((leaf, _), counts) = ferrox_core::alloc_count::measure(lookup);
         assert_eq!(leaf, "a");
         assert_eq!(
             (counts.allocs, counts.bytes),
