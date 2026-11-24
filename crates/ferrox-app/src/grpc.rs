@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use crate::proxy::{Accepted, FrameWrite, Settle};
 
 use crate::h2::{
-    block_encode, frame_head, write_frame, Decoder, E_REFUSED, FRAME_CAP, F_ACK, F_END,
+    block_encode, frame_head, write_frame, Decoder, E_CANCEL, E_REFUSED, FRAME_CAP, F_ACK, F_END,
     F_END_HEADERS, F_PADDED, F_PRIORITY, HEAD_CAP, MAGIC, S_HEADER_TABLE, S_MAX_CONCURRENT,
     S_MAX_FRAME, S_WINDOW, T_CONT, T_DATA, T_HEADERS, T_PING, T_RST, T_SETTINGS, T_WINDOW, WINDOW,
     WINDOW_MAX,
@@ -6693,7 +6693,7 @@ mod tests {
             client.read_exact(&mut body).expect("body");
             if kind == T_RST {
                 assert_eq!(sid, 1);
-                assert_eq!(body[..4], E_REFUSED.to_be_bytes());
+                assert_eq!(body[..4], E_CANCEL.to_be_bytes());
                 refused = true;
             }
         }
