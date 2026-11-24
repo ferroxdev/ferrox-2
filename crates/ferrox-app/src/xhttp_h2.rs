@@ -745,7 +745,7 @@ struct StreamState {
     finished: bool,
     /// The request half ended locally: the peer still owes the response, so it does not end the read.
     request_ended: bool,
-    /// A CONNECT tunnel's request half is the upload: its END_STREAM does not end the download.
+    /// A CONNECT tunnel's request half is the upload: its `END_STREAM` does not end the download.
     tunnel: bool,
     /// The upload reader left at a finished response while the client still holds the request open.
     abandoned: bool,

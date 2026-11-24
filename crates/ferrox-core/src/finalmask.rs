@@ -2024,7 +2024,7 @@ mod tests {
             .write(&mut wire, b"abcde")
             .expect_err("a delayed write returns backpressure");
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-        assert!(wire.bytes.is_empty());
+        assert_eq!(wire.bytes, Vec::<u8>::new());
     }
 
     #[test]
