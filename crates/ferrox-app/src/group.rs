@@ -233,7 +233,7 @@ impl Group {
             .and_then(|selected| selected.get(network));
         // Retained: the stored member, the fastest, and the first; any other is resolved and dropped.
         let mut current: Option<(usize, Cow<'a, str>, Outbound, u64, Option<u16>)> = None;
-        let mut best: Option<(u64, usize, Cow<'a, str>, Outbound, u64)> = None;
+        let mut best: Option<(u16, usize, Cow<'a, str>, Outbound, u64)> = None;
         let mut first: Option<(usize, Cow<'a, str>, Outbound, u64)> = None;
         let delays = self.history.guard();
         for (at, member) in self.members.iter().enumerate() {

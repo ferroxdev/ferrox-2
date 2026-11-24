@@ -2320,6 +2320,7 @@ pub(crate) fn dial_udp_through_proxy(
         Outbound::Group(group) => group.resolve(&shared, crate::router::Network::Udp)?,
         out => (Cow::Borrowed(tag), out),
     };
+    let leaf = leaf.into_owned();
     if !udp_lane_supported(&out) {
         return None;
     }
