@@ -14608,6 +14608,26 @@ pub(crate) fn forget_wait_idle() {
     WAIT_IDLE.with(|slot| slot.set(None));
 }
 
+thread_local! {
+    /// A relay read that timed out on a stream with no descriptor: the connection driver wakes it
+    /// when it buffers that stream's bytes, so the poll clock is a fallback rather than the clock.
+    static WAIT_STREAM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn note_stream_wait() {
+    if relay_step_owns_poll() {
+        WAIT_STREAM.with(|slot| slot.set(true));
+    }
+}
+
+pub(crate) fn take_stream_wait() -> bool {
+    WAIT_STREAM.with(std::cell::Cell::take)
+}
+
+pub(crate) fn forget_stream_wait() {
+    WAIT_STREAM.with(|slot| slot.set(false));
+}
+
 /// Scoped claim, so a step that returns or panics leaves the thread as it found it.
 pub(crate) struct RelayStep(bool);
 
@@ -14617,6 +14637,7 @@ impl RelayStep {
         forget_wait_fd();
         forget_wait_finish();
         forget_wait_idle();
+        forget_stream_wait();
         Self(RELAY_STEP.with(|flag| flag.replace(true)))
     }
 }
@@ -36213,6 +36234,7 @@ pub(crate) mod lane_pool {
                 crate::proxy::forget_wait_fd();
                 crate::proxy::forget_wait_finish();
                 crate::proxy::forget_wait_idle();
+                crate::proxy::forget_stream_wait();
             }
             if self.relay {
                 let _step = crate::proxy::RelayStep::enter();
@@ -36273,10 +36295,11 @@ pub(crate) mod lane_pool {
         handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
     }
 
-    /// Lanes with nothing to read wait here, each with the instant it is due another turn.
+    /// Lanes with nothing to read wait here, each with the instant it is due another turn and
+    /// whether a stream driver can wake it.
     #[derive(Default)]
     struct Parked {
-        lanes: Vec<(std::time::Instant, Lane)>,
+        lanes: Vec<(std::time::Instant, Lane, bool)>,
         waking: bool,
     }
 
@@ -36705,32 +36728,72 @@ pub(crate) mod lane_pool {
         park_with(pool, lane, crate::budgets::RELAY_POLL);
     }
 
+    /// A connection driver that has just buffered stream data wakes the lanes waiting on the poll
+    /// clock: a relay read has no descriptor of its own, so without this the peer's bytes wait for
+    /// the next quantum.
+    pub(crate) fn kick_streams() {
+        for pool in [POOL.get(), DEMUX_POOL.get()].into_iter().flatten() {
+            kick_pool(pool);
+        }
+    }
+
+    fn kick_pool(pool: &std::sync::Arc<Pool>) {
+        let mut parked = pool.parked.lock().unwrap_or_else(PoisonError::into_inner);
+        if parked.lanes.is_empty() {
+            return;
+        }
+        let mut batch = Vec::new();
+        let mut waiting = Vec::with_capacity(parked.lanes.len());
+        for (due, lane, stream) in std::mem::take(&mut parked.lanes) {
+            if stream {
+                batch.push(lane);
+            } else {
+                waiting.push((due, lane, stream));
+            }
+        }
+        if batch.is_empty() {
+            return;
+        }
+        let waking = parked.waking;
+        let emptied = waiting.is_empty();
+        parked.lanes = waiting;
+        drop(parked);
+        if emptied && waking {
+            pool.park_wake.notify_one();
+        }
+        let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
+        ready.extend(batch);
+        drop(ready);
+        pool.notify.notify_all();
+    }
+
     /// A lane inserted with an earlier deadline wakes the parker instead of waiting for the
     /// deadline already parked.
     fn park_with(pool: &Pool, lane: Lane, quantum: std::time::Duration) {
         #[cfg(test)]
         pool.timer_parks
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let stream = crate::proxy::take_stream_wait();
         let due = std::time::Instant::now() + wait_for(lane.idle, quantum);
         let mut parked = pool.parked.lock().unwrap_or_else(PoisonError::into_inner);
         if parked.waking {
             let earlier = parked
                 .lanes
                 .iter()
-                .map(|(earliest, _)| *earliest)
+                .map(|(earliest, _, _)| *earliest)
                 .min()
                 .is_none_or(|earliest| due < earliest);
-            parked.lanes.push((due, lane));
+            parked.lanes.push((due, lane, stream));
             if earlier {
                 pool.park_wake.notify_one();
             }
             return;
         }
         parked.waking = true;
-        parked.lanes.push((due, lane));
+        parked.lanes.push((due, lane, stream));
         loop {
             let now = std::time::Instant::now();
-            let next = parked.lanes.iter().map(|(due, _)| *due).min();
+            let next = parked.lanes.iter().map(|(due, _, _)| *due).min();
             match next {
                 Some(next) if next > now => {
                     let (guard, _) = pool
@@ -36747,11 +36810,11 @@ pub(crate) mod lane_pool {
                 Some(_) => {
                     let mut batch = Vec::new();
                     let mut waiting = Vec::with_capacity(parked.lanes.len());
-                    for (due, lane) in std::mem::take(&mut parked.lanes) {
+                    for (due, lane, stream) in std::mem::take(&mut parked.lanes) {
                         if due <= now {
                             batch.push(lane);
                         } else {
-                            waiting.push((due, lane));
+                            waiting.push((due, lane, stream));
                         }
                     }
                     parked.lanes = waiting;
@@ -37976,6 +38039,39 @@ pub(crate) mod lane_pool {
             assert!(
                 (3..40).contains(&batches),
                 "one idle lane was re-queued {batches} times in 200 ms"
+            );
+        }
+
+        /// A driver that buffered stream data wakes a lane on the poll clock before its deadline:
+        /// the lane leaves the parked set for the ready queue, so the worker sees the bytes now.
+        #[test]
+        fn a_kick_moves_a_parked_lane_to_the_ready_queue() {
+            let pool = spawn_pool_full(0, None, false);
+            let lane = || Lane {
+                step: Box::new(|| Next::Done),
+                complete: None,
+                idle: 0,
+                relay: false,
+            };
+            let due = Instant::now() + Duration::from_secs(60);
+            {
+                let mut parked = pool.parked.lock().unwrap_or_else(PoisonError::into_inner);
+                parked.lanes.push((due, lane(), true));
+                parked.lanes.push((due, lane(), false));
+            }
+            kick_pool(&pool);
+            {
+                let parked = pool.parked.lock().unwrap_or_else(PoisonError::into_inner);
+                assert_eq!(parked.lanes.len(), 1, "a lane on the clock left its wait");
+                assert!(!parked.lanes[0].2, "the kicked lane was not the stream's");
+            }
+            assert_eq!(
+                pool.ready
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .len(),
+                1,
+                "the kicked lane did not reach the ready queue"
             );
         }
 

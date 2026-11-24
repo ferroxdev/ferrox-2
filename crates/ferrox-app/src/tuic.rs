@@ -1288,6 +1288,9 @@ fn client_turn(
     }
     ids.clear();
     ids.extend(conn.readable());
+    if ids.iter().any(|id| id % 4 == 0) {
+        crate::proxy::lane_pool::kick_streams();
+    }
     for &id in ids.iter() {
         if id % 4 != 3 {
             continue;
@@ -2201,6 +2204,9 @@ impl Server {
         state.seen.retain(|id| !conn.stream_closed(*id));
         state.readable.clear();
         state.readable.extend(conn.readable());
+        if state.readable.iter().any(|id| id % 4 == 0) {
+            crate::proxy::lane_pool::kick_streams();
+        }
         for id in state.uni.keys() {
             if !state.readable.contains(id) {
                 state.readable.push(*id);
