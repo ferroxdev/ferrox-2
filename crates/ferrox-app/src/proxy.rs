@@ -1,6 +1,7 @@
 use crate::conn::{parse_target, Connection, Listener};
 #[cfg(test)]
 use crate::quic::QuicheConnection;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 #[cfg(windows)]
 use std::io::IoSliceMut;
@@ -2317,7 +2318,7 @@ pub(crate) fn dial_udp_through_proxy(
     };
     let (leaf, out) = match out {
         Outbound::Group(group) => group.resolve(&shared, crate::router::Network::Udp)?,
-        out => (tag.to_owned(), out),
+        out => (Cow::Borrowed(tag), out),
     };
     if !udp_lane_supported(&out) {
         return None;
@@ -84776,6 +84777,7 @@ end
                 .resolve(&shared, crate::router::Network::Tcp)
                 .expect("picks")
                 .0
+                .into_owned()
         };
         assert_eq!(picks(10), "b", "the nested tolerance is honored");
         assert_eq!(
@@ -84829,7 +84831,7 @@ end
             .route_handle()
             .map_or((None, None, None), |route| route.tag_dial_settings(&leaf));
         let start = LaneStart {
-            tag: Some(leaf),
+            tag: Some(leaf.into_owned()),
             source,
             sockopts,
             strategy,
@@ -84934,7 +84936,7 @@ end
             let (tag, _) = group
                 .resolve(&shared, crate::router::Network::Tcp)
                 .expect("picks");
-            tag
+            tag.into_owned()
         };
         assert_eq!(config(100, 40), "b", "a clear winner takes over");
         assert_eq!(
@@ -85004,6 +85006,55 @@ end
             counts.allocs, 1,
             "a dial through two selectors allocated {} times and {} bytes, not the one tag it names",
             counts.allocs, counts.bytes
+        );
+    }
+
+    /// A flat url-test dial borrows the leaf it names: no member list and no tag, counted by the
+    /// allocator rather than read off the code.
+    #[test]
+    fn a_flat_urltest_dial_allocates_nothing() {
+        let shared = group_route(
+            r#"{"outbounds":[
+                {"tag":"a","protocol":"freedom"},
+                {"tag":"b","protocol":"freedom"},
+                {"tag":"c","protocol":"freedom"},
+                {"tag":"d","protocol":"freedom"},
+                {"tag":"e","protocol":"freedom"},
+                {"tag":"f","protocol":"freedom"},
+                {"tag":"g","protocol":"freedom"},
+                {"tag":"h","protocol":"freedom"},
+                {"tag":"pick","type":"urltest","outbounds":["a","b","c","d","e","f","g","h"],"url":"http://127.0.0.1/204"}
+            ],"routing":{}}"#,
+        );
+        let group = group_of(&shared, "pick");
+        for (tag, delay) in [
+            ("a", 300u16),
+            ("b", 290),
+            ("c", 280),
+            ("d", 270),
+            ("e", 260),
+            ("f", 250),
+            ("g", 240),
+            ("h", 230),
+        ] {
+            group.record(tag, delay);
+        }
+        let dial = || {
+            group
+                .resolve(&shared, crate::router::Network::Tcp)
+                .expect("picks")
+        };
+        // A flow is the dial after the process's one-time setup, so the gate takes a warm one.
+        let (warm_up, _) = ferrox_core::alloc_count::measure(dial);
+        assert_eq!(warm_up.0, "h");
+        let (picked, counts) = ferrox_core::alloc_count::measure(dial);
+        assert_eq!(picked.0, "h");
+        assert_eq!(
+            (counts.allocs, counts.bytes),
+            (0, 0),
+            "a flat url-test dial allocated {} times and {} bytes for a leaf it already holds",
+            counts.allocs,
+            counts.bytes
         );
     }
 

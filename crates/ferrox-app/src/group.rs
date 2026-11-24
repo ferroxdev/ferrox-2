@@ -4,6 +4,7 @@
 use crate::json::Json;
 use crate::proxy::{self, Outbound, RouteShared};
 use crate::router::Network;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -182,11 +183,11 @@ impl Group {
 
     /// The lane this group dials on `network`, resolved through any nested group to the leaf its
     /// tag names.
-    pub(crate) fn resolve(
-        &self,
-        route: &RouteShared,
+    pub(crate) fn resolve<'a>(
+        &'a self,
+        route: &'a RouteShared,
         network: Network,
-    ) -> Option<(String, Outbound)> {
+    ) -> Option<(Cow<'a, str>, Outbound)> {
         self.resolve_with(route, network, &mut HashMap::new())
             .map(|(leaf, out, _)| (leaf, out))
     }
@@ -203,12 +204,12 @@ impl Group {
             .unwrap_or(0)
     }
 
-    fn resolve_with(
-        &self,
-        route: &RouteShared,
+    fn resolve_with<'a>(
+        &'a self,
+        route: &'a RouteShared,
         network: Network,
         resolved: &mut ResolvedMembers,
-    ) -> Option<(String, Outbound, Option<u64>)> {
+    ) -> Option<(Cow<'a, str>, Outbound, Option<u64>)> {
         self.touch();
         match self.kind {
             Kind::Selector => {
@@ -219,20 +220,22 @@ impl Group {
         }
     }
 
-    fn pick(
-        &self,
-        route: &RouteShared,
+    fn pick<'a>(
+        &'a self,
+        route: &'a RouteShared,
         network: Network,
         resolved: &mut ResolvedMembers,
-    ) -> Option<(String, Outbound, Option<u64>)> {
+    ) -> Option<(Cow<'a, str>, Outbound, Option<u64>)> {
         let stored = self
             .selected
             .lock()
             .ok()
             .and_then(|selected| selected.get(network));
-        // Every member resolved once; the current one is found among them rather than resolved again.
-        let mut candidates: Vec<(usize, String, Outbound, u64)> =
-            Vec::with_capacity(self.members.len());
+        // Retained: the stored member, the fastest, and the first; any other is resolved and dropped.
+        let mut current: Option<(usize, Cow<'a, str>, Outbound, u64, Option<u16>)> = None;
+        let mut best: Option<(u64, usize, Cow<'a, str>, Outbound, u64)> = None;
+        let mut first: Option<(usize, Cow<'a, str>, Outbound, u64)> = None;
+        let delays = self.history.guard();
         for (at, member) in self.members.iter().enumerate() {
             let Some((leaf, out, revision)) = resolve_member(route, member, network, resolved)
             else {
@@ -244,42 +247,42 @@ impl Group {
             let Some(revision) = revision else {
                 continue;
             };
-            candidates.push((at, leaf, out, revision));
-        }
-        let current = stored.and_then(|at| candidates.iter().position(|slot| slot.0 == at));
-        // One lock for the whole sweep: the current member's reading is read beside every other's.
-        let (mut best, mut current_delay) = (None, None);
-        if let Some(delays) = self.history.guard() {
-            current_delay = current.and_then(|slot| {
-                let (_, leaf, _, revision) = &candidates[slot];
-                History::read(&delays, leaf, *revision)
-            });
-            for (at, (_, leaf, _, revision)) in candidates.iter().enumerate() {
-                let Some(delay) = History::read(&delays, leaf, *revision) else {
-                    continue;
-                };
-                if best.is_none_or(|(fastest, _)| delay < fastest) {
-                    best = Some((delay, at));
+            if first.is_none() {
+                first = Some((at, leaf.clone(), out.clone(), revision));
+            }
+            let delay = delays
+                .as_ref()
+                .and_then(|delays| History::read(delays, &leaf, revision));
+            if stored == Some(at) {
+                current = Some((at, leaf, out, revision, delay));
+            } else if let Some(delay) = delay {
+                if best.as_ref().is_none_or(|(fastest, ..)| delay < *fastest) {
+                    best = Some((delay, at, leaf, out, revision));
                 }
             }
         }
-        let takeover = match (current, current_delay) {
-            (Some(_), Some(current_delay)) => best
-                .is_some_and(|(fastest, _)| fastest.saturating_add(self.tolerance) < current_delay),
+        let takeover = match &current {
+            Some((_, _, _, _, Some(current_delay))) => {
+                best.as_ref().is_some_and(|(fastest, ..)| {
+                    fastest.saturating_add(self.tolerance) < *current_delay
+                })
+            }
             _ => true,
         };
-        let picked = if takeover {
-            best.map(|(_, slot)| slot)
-                .or_else(|| (!candidates.is_empty()).then_some(0))
+        let (at, leaf, out, revision) = if takeover {
+            match best {
+                Some((_, at, leaf, out, revision)) => (at, leaf, out, revision),
+                None => first?,
+            }
         } else {
-            current
-        }?;
-        if stored != Some(candidates[picked].0) {
+            let (at, leaf, out, revision, _) = current?;
+            (at, leaf, out, revision)
+        };
+        if stored != Some(at) {
             if let Ok(mut selected) = self.selected.lock() {
-                selected.set(network, candidates[picked].0);
+                selected.set(network, at);
             }
         }
-        let (_, leaf, out, revision) = candidates.swap_remove(picked);
         Some((leaf, out, Some(revision)))
     }
 
@@ -376,25 +379,31 @@ fn collect_leaves(
 /// The leaf one member tag resolves to, through any nested group. A url-test is the only group a
 /// walk can reach twice, so it is the only answer worth sharing; a selector names one member and is
 /// walked once.
-fn resolve_member(
-    route: &RouteShared,
-    tag: &str,
+fn resolve_member<'a>(
+    route: &'a RouteShared,
+    tag: &'a str,
     network: Network,
     resolved: &mut ResolvedMembers,
-) -> Option<(String, Outbound, Option<u64>)> {
+) -> Option<(Cow<'a, str>, Outbound, Option<u64>)> {
     let (out, revision) = route.member_revision(tag)?;
     match &out {
+        // A nested group's leaf crosses this call's `Arc` clone, so it is owned; a top-level member borrows.
         Outbound::Group(group) if group.kind == Kind::UrlTest => {
             let key = Arc::as_ptr(group) as usize;
             if let Some(done) = resolved.get(&key) {
-                return done.clone();
+                return done
+                    .clone()
+                    .map(|(leaf, out, revision)| (Cow::Owned(leaf), out, revision));
             }
-            let done = group.resolve_with(route, network, resolved);
-            resolved.insert(key, done.clone());
-            done
+            let done = group.resolve_with(route, network, resolved)?;
+            let owned = (done.0.into_owned(), done.1.clone(), done.2);
+            resolved.insert(key, Some(owned.clone()));
+            Some((Cow::Owned(owned.0), owned.1, owned.2))
         }
-        Outbound::Group(group) => group.resolve_with(route, network, resolved),
-        _ => Some((tag.to_owned(), out, revision)),
+        Outbound::Group(group) => group
+            .resolve_with(route, network, resolved)
+            .map(|(leaf, out, revision)| (Cow::Owned(leaf.into_owned()), out, revision)),
+        _ => Some((Cow::Borrowed(tag), out, revision)),
     }
 }
 
@@ -628,6 +637,7 @@ impl Group {
     pub(crate) fn resolve_bound(&self, network: Network) -> Option<(String, Outbound)> {
         let route = self.route()?;
         self.resolve(&route, network)
+            .map(|(leaf, out)| (leaf.into_owned(), out))
     }
 
     pub(crate) fn route_handle(&self) -> Option<Arc<RouteShared>> {
