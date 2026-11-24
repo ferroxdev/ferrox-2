@@ -588,6 +588,16 @@ impl ToTunnel {
         }
     }
 
+    /// Offer a packet without waiting; the caller keeps it on `Full` so backpressure costs no segment.
+    fn try_send(&self, packet: Vec<u8>) -> Result<(), mpsc::TrySendError<Vec<u8>>> {
+        match self {
+            Self::Unbounded(sender) => sender
+                .send(packet)
+                .map_err(|error| mpsc::TrySendError::Disconnected(error.0)),
+            Self::Bounded(sender) => sender.try_send(packet),
+        }
+    }
+
     /// A bounded lane's reply reader must leave when its owner stops, even while the queue is full.
     fn send_or_stop(
         &self,
@@ -1243,6 +1253,29 @@ fn send_packet(to_tunnel: &ToTunnel, packet: Vec<u8>, headroom: usize, limit: us
     fragments
         .into_iter()
         .all(|fragment| to_tunnel.send(fragment).is_ok())
+}
+
+/// The outcome of offering one server packet to the tunnel writer.
+enum Flush {
+    Sent,
+    Blocked(Vec<u8>),
+    Closed,
+}
+
+fn try_send_packet(to_tunnel: &ToTunnel, packet: Vec<u8>, headroom: usize, limit: usize) -> Flush {
+    if packet.len().saturating_sub(headroom) <= limit {
+        return match to_tunnel.try_send(packet) {
+            Ok(()) => Flush::Sent,
+            Err(mpsc::TrySendError::Full(packet)) => Flush::Blocked(packet),
+            Err(mpsc::TrySendError::Disconnected(_)) => Flush::Closed,
+        };
+    }
+    // A fragmented inner packet keeps the blocking send so a run is never torn in half.
+    if send_packet(to_tunnel, packet, headroom, limit) {
+        Flush::Sent
+    } else {
+        Flush::Closed
+    }
 }
 
 fn fragment_packet(packet: &[u8], headroom: usize, limit: usize) -> Option<Vec<Vec<u8>>> {
@@ -2191,8 +2224,13 @@ impl ServerStack {
                 }
             }
             lower_syn_ack_mss(&mut packet, self.headroom, self.mtu);
-            if !send_packet(&self.to_tunnel, packet, self.headroom, self.fragment) {
-                return moved;
+            match try_send_packet(&self.to_tunnel, packet, self.headroom, self.fragment) {
+                Flush::Sent => {}
+                Flush::Blocked(packet) => {
+                    self.device.tx.push_front(packet);
+                    break;
+                }
+                Flush::Closed => return moved,
             }
         }
         self.flows.retain(|flow| {

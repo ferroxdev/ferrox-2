@@ -3001,7 +3001,7 @@ pub(crate) fn serve_inbound(
     let stack_stop = stop.map(|stop| stop.shared());
     std::thread::spawn(move || {
         wg_stack::server(
-            device, to_tunnel, packets_rx, stack_out, 0, None, stack_stop, true,
+            device, to_tunnel, packets_rx, stack_out, 0, None, stack_stop, false,
         );
     });
     let demux_config = Arc::new(Mutex::new(config));
@@ -3075,7 +3075,7 @@ fn serve_cleartext_inbound(
     let stack_stop = stop.map(|stop| stop.shared());
     std::thread::spawn(move || {
         wg_stack::server(
-            device, to_tunnel, packets_rx, stack_out, 0, None, stack_stop, true,
+            device, to_tunnel, packets_rx, stack_out, 0, None, stack_stop, false,
         );
     });
     Ok(local.port())
