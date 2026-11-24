@@ -160,6 +160,18 @@ fn jwt_expiry(token: &str) -> Option<u64> {
         .map(u64::from)
 }
 
+fn jwt_team(token: &str) -> Option<String> {
+    let segments: Vec<&str> = token.split('.').collect();
+    if segments.len() != 3 {
+        return None;
+    }
+    let payload = decode_segment(segments[1])?;
+    let root = crate::json::parse(&String::from_utf8_lossy(&payload)).ok()?;
+    root.get("iss")
+        .and_then(crate::json::Json::as_str)
+        .and_then(normalize_team)
+}
+
 fn jwt_expired(token: &str, now: u64) -> bool {
     jwt_expiry(token).is_some_and(|expiry| expiry <= now)
 }
@@ -729,6 +741,20 @@ fn sign_in(
                     .to_owned(),
             );
         }
+        let issued_for = jwt_team(token).ok_or_else(|| {
+            format!(
+                "warp: the supplied access token does not name the team that issued it; sign in at {} to get one for team {}",
+                settings.login_url(),
+                settings.team
+            )
+        })?;
+        if issued_for != settings.team {
+            return Err(format!(
+                "warp: the supplied access token was issued for team {issued_for}, not {}; sign in at {}",
+                settings.team,
+                settings.login_url()
+            ));
+        }
         eprintln!(
             "[+] using the access token supplied for team {}",
             settings.team
@@ -930,6 +956,12 @@ mod tests {
             engine.encode(payload.as_bytes()),
             engine.encode(b"signature-bytes-that-are-long-enough")
         )
+    }
+
+    fn team_jwt(team: &str, expiry: u64) -> String {
+        jwt(&format!(
+            "{{\"exp\":{expiry},\"iss\":\"https://{team}.cloudflareaccess.com\"}}"
+        ))
     }
 
     fn reply(status: u16, headers: Vec<(String, String)>, body: &str) -> Reply {
@@ -1448,7 +1480,7 @@ mod tests {
 
     #[test]
     fn a_supplied_token_is_used_without_asking() {
-        let token = jwt("{\"exp\":4102444800}");
+        let token = team_jwt("acme", 4_102_444_800);
         let settings = TeamSettings {
             team: "acme".to_owned(),
             token: Some(token.clone()),
@@ -1470,10 +1502,46 @@ mod tests {
     }
 
     #[test]
+    fn a_supplied_token_for_another_team_is_refused() {
+        let settings = TeamSettings {
+            team: "acme".to_owned(),
+            token: Some(team_jwt("other", 4_102_444_800)),
+            ..TeamSettings::default()
+        };
+        let error = sign_in(
+            &settings,
+            now(),
+            &|_, _, _, _| Err("must not make a call".to_owned()),
+            &mut |_, _| None,
+        )
+        .expect_err("a token for another team");
+        assert!(error.contains("other"), "{error}");
+        assert!(error.contains("acme"), "{error}");
+    }
+
+    #[test]
+    fn a_supplied_token_without_a_team_is_refused() {
+        let settings = TeamSettings {
+            team: "acme".to_owned(),
+            token: Some(jwt("{\"exp\":4102444800}")),
+            ..TeamSettings::default()
+        };
+        let error = sign_in(
+            &settings,
+            now(),
+            &|_, _, _, _| Err("must not make a call".to_owned()),
+            &mut |_, _| None,
+        )
+        .expect_err("a token with no issuer");
+        assert!(error.contains("does not name"), "{error}");
+        assert!(error.contains("acme"), "{error}");
+    }
+
+    #[test]
     fn an_expired_supplied_token_is_refused() {
         let settings = TeamSettings {
             team: "acme".to_owned(),
-            token: Some(jwt("{\"exp\":1}")),
+            token: Some(team_jwt("acme", 1)),
             ..TeamSettings::default()
         };
         let error = sign_in(
