@@ -142,6 +142,7 @@ pub(crate) struct ClientFlow {
     pub(crate) destinations: Vec<SocketAddr>,
     pub(crate) prefix: Vec<u8>,
     pub(crate) lease: Option<FlowLease>,
+    pub(crate) ready: Option<std::sync::mpsc::SyncSender<bool>>,
 }
 
 /// Counts a live flow against the lane that carried it, and gives the count back when the
@@ -1721,6 +1722,16 @@ impl ClientStack {
 
     /// Race a client flow's destinations and keep the first connected socket.
     fn connect(&mut self, mut flow: ClientFlow) -> std::io::Result<()> {
+        let ready = flow.ready.take();
+        let result = self.connect_flow(flow);
+        if let Some(ready) = ready {
+            let _ = ready.send(result.is_ok());
+        }
+        result
+    }
+
+    /// Set up one flow after its readiness listener is taken.
+    fn connect_flow(&mut self, mut flow: ClientFlow) -> std::io::Result<()> {
         flow.client.set_nonblocking(true)?;
         let mut candidates = Vec::new();
         let mut refused = None;
@@ -3669,6 +3680,7 @@ mod tests {
                 destinations: vec!["192.0.2.1:80".parse().expect("destination")],
                 prefix: Vec::new(),
                 lease: None,
+                ready: None,
             })
             .expect("connect");
         stack.poll();
@@ -3688,6 +3700,28 @@ mod tests {
         );
         while packets.try_recv().is_ok() {}
         (stack, packets, app, syn)
+    }
+
+    /// A flow the stack cannot set up reports that failure to its caller.
+    #[test]
+    fn a_flow_that_cannot_be_set_up_reports_failure() {
+        let (mut stack, _packets, _app) = established_client();
+        let (_client, proxy) = loopback().expect("pair");
+        let (ready, wait) = std::sync::mpsc::sync_channel(1);
+        let result = stack.connect(ClientFlow {
+            client: proxy,
+            destinations: vec!["192.0.2.1:0".parse().expect("destination")],
+            prefix: Vec::new(),
+            lease: None,
+            ready: Some(ready),
+        });
+        assert!(result.is_err(), "port zero is not a TCP endpoint");
+        assert!(
+            !wait
+                .recv_timeout(Duration::from_secs(1))
+                .expect("the setup result"),
+            "the stack reported a failed flow as ready"
+        );
     }
 
     /// An upload is read straight into the socket's transmit ring: the reader
@@ -3833,6 +3867,7 @@ mod tests {
                 destinations: vec!["192.0.2.1:80".parse().expect("destination")],
                 prefix: Vec::new(),
                 lease: None,
+                ready: None,
             })
             .expect("connect");
         stack.poll();
@@ -4676,6 +4711,7 @@ mod tests {
                 destinations: vec!["192.0.2.1:80".parse().expect("destination")],
                 prefix: Vec::new(),
                 lease: None,
+                ready: None,
             })
             .expect("connect");
         stack.poll();
@@ -4698,6 +4734,7 @@ mod tests {
                 destinations: vec!["192.0.2.1:80".parse().expect("destination")],
                 prefix: Vec::new(),
                 lease: None,
+                ready: None,
             })
             .expect("connect");
         stack.poll();
@@ -5937,6 +5974,7 @@ mod client_tests {
                 destinations: vec!["192.0.2.1:80".parse().expect("destination")],
                 prefix: Vec::new(),
                 lease: None,
+                ready: None,
             })
             .expect("connect");
         stack.poll();

@@ -570,7 +570,13 @@ impl MasqueOut {
         }
     }
 
-    pub(crate) fn serve_tcp(&self, client: Connection, asked: &Destination, prefix: &[u8]) -> bool {
+    pub(crate) fn serve_tcp(
+        &self,
+        client: Connection,
+        asked: &Destination,
+        prefix: &[u8],
+        ready: Option<std::sync::mpsc::SyncSender<bool>>,
+    ) -> bool {
         let (inner, lease) = match self.ensure_flow_at(Instant::now(), || open(&self.spec, false)) {
             Ok(lane) => lane,
             Err(reason) => {
@@ -589,6 +595,7 @@ impl MasqueOut {
                 destinations: vec![destination],
                 prefix: prefix.to_vec(),
                 lease: Some(lease),
+                ready,
             })
             .is_err()
         {
@@ -6225,7 +6232,7 @@ mod tests {
         let (mut app, _) = listener.accept().expect("accept");
         app.set_read_timeout(Some(Duration::from_secs(20)))
             .expect("timeout");
-        masque.serve_tcp(Connection::from(tun), &Destination::Address(target), &[]);
+        masque.serve_tcp(Connection::from(tun), &Destination::Address(target), &[], None);
         app.write_all(b"hello").expect("write");
         let mut answer = [0u8; 5];
         app.read_exact(&mut answer).expect("read");
@@ -6266,7 +6273,7 @@ mod tests {
         let (mut app, _) = listener.accept().expect("accept");
         app.set_read_timeout(Some(Duration::from_secs(20)))
             .expect("timeout");
-        masque.serve_tcp(Connection::from(tun), &Destination::Address(target), &[]);
+        masque.serve_tcp(Connection::from(tun), &Destination::Address(target), &[], None);
         app.write_all(b"hello").expect("write");
         let mut answer = [0u8; 5];
         app.read_exact(&mut answer).expect("read");
@@ -6305,7 +6312,7 @@ mod tests {
         let (mut app, _) = listener.accept().expect("accept");
         app.set_read_timeout(Some(Duration::from_secs(20)))
             .expect("timeout");
-        masque.serve_tcp(Connection::from(tun), &Destination::Address(target), &[]);
+        masque.serve_tcp(Connection::from(tun), &Destination::Address(target), &[], None);
         app.write_all(b"hello").expect("write");
         let mut answer = [0u8; 5];
         app.read_exact(&mut answer).expect("read");
@@ -6352,7 +6359,7 @@ mod tests {
         let (mut app, _) = listener.accept().expect("accept");
         app.set_read_timeout(Some(Duration::from_secs(20)))
             .expect("timeout");
-        masque.serve_tcp(Connection::from(tun), &Destination::Address(target), &[]);
+        masque.serve_tcp(Connection::from(tun), &Destination::Address(target), &[], None);
         let pattern: Vec<u8> = (0..chunk).map(|byte| (byte % 251) as u8).collect();
         let mut answer = vec![0u8; chunk];
         for _ in 0..rounds {
@@ -6405,7 +6412,7 @@ mod tests {
         let (mut app, _) = listener.accept().expect("accept");
         app.set_read_timeout(Some(Duration::from_secs(20)))
             .expect("timeout");
-        masque.serve_tcp(Connection::from(tun), &Destination::Address(target), &[]);
+        masque.serve_tcp(Connection::from(tun), &Destination::Address(target), &[], None);
         let mut answer = vec![0u8; payload.len()];
         let mut got = 0;
         while got < answer.len() {

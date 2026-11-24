@@ -2218,7 +2218,7 @@ fn http_check_wireguard(identity: &Identity, spec: &WarpSpec, edge: SocketAddr) 
         return false;
     };
     http_check(
-        |client, asked| out.serve_tcp(client, asked, b""),
+        |client, asked| out.serve_tcp(client, asked, b"", None),
         spec.ironclad_port,
     )
 }
@@ -2231,7 +2231,7 @@ fn http_check_masque(identity: &Identity, spec: &WarpSpec, edge: SocketAddr) -> 
     };
     http_check(
         |client, asked| {
-            out.serve_tcp(client, asked, b"");
+            out.serve_tcp(client, asked, b"", None);
         },
         edge_spec.ironclad_port,
     )
@@ -2895,16 +2895,22 @@ impl WarpOut {
         client: crate::conn::Connection,
         asked: &crate::proxy::Destination,
         prefix: &[u8],
+        deadline: Instant,
     ) -> bool {
-        if let Some(masque) = &self.masque {
-            masque.serve_tcp(client, asked, prefix)
+        let (ready, wait) = std::sync::mpsc::sync_channel(1);
+        let queued = if let Some(masque) = &self.masque {
+            masque.serve_tcp(client, asked, prefix, Some(ready))
         } else if let Some(gool) = &self.gool {
-            gool.outer.serve_tcp(client, asked, prefix)
+            gool.outer.serve_tcp(client, asked, prefix, Some(ready))
         } else if let Some(mim) = &self.mim {
-            mim.outer.serve_tcp(client, asked, prefix)
+            mim.outer.serve_tcp(client, asked, prefix, Some(ready))
         } else {
             false
-        }
+        };
+        queued
+            && wait
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or(false)
     }
 
     pub(crate) fn edge(&self) -> Option<SocketAddr> {
@@ -2978,6 +2984,7 @@ impl WarpOut {
             tunnel,
             &crate::proxy::Destination::Address(gateway.proxy),
             &[],
+            deadline,
         ) {
             self.serve_lane(client, asked, prefix);
             return;
@@ -3048,22 +3055,22 @@ impl WarpOut {
             }
             Lane::Masque => {
                 if let Some(masque) = &self.masque {
-                    masque.serve_tcp(client, asked, prefix);
+                    masque.serve_tcp(client, asked, prefix, None);
                 }
             }
             Lane::Gool => {
                 if let Some(gool) = &self.gool {
-                    gool.inner.serve_tcp(client, asked, prefix);
+                    gool.inner.serve_tcp(client, asked, prefix, None);
                 }
             }
             Lane::GoolClassic => {
                 if let Some(classic) = &self.gool_classic {
-                    classic.inner.serve_tcp(client, asked, prefix);
+                    classic.inner.serve_tcp(client, asked, prefix, None);
                 }
             }
             Lane::Mim => {
                 if let Some(mim) = &self.mim {
-                    mim.inner.serve_tcp(client, asked, prefix);
+                    mim.inner.serve_tcp(client, asked, prefix, None);
                 }
             }
         }
@@ -5773,6 +5780,7 @@ mod tests {
             crate::conn::Connection::from(tun),
             &crate::proxy::Destination::Address(echo_address),
             b"head",
+            None,
         );
         app.write_all(b"hello")?;
         let mut answer = [0u8; 9];
@@ -5885,6 +5893,7 @@ mod tests {
             crate::conn::Connection::from(tun),
             &crate::proxy::Destination::Address(echo_address),
             b"head",
+            None,
         );
         app.write_all(b"hello").expect("write");
         let mut answer = [0u8; 9];
@@ -6127,6 +6136,7 @@ mod tests {
             crate::conn::Connection::from(tun),
             &crate::proxy::Destination::Address(echo_address),
             b"head",
+            None,
         );
         crate::proxy::echo_trace("wiw: serving");
         // Resend the trigger only after a read timeout, within the same budget, so a slow inner handshake does not fail the test.
