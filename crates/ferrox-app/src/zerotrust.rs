@@ -72,6 +72,9 @@ impl TeamSettings {
     where
         F: Fn(&str) -> Option<String>,
     {
+        if team.is_some_and(|text| text.trim().is_empty()) {
+            return Err("warp: the named team is empty; omit it or name the subdomain".to_owned());
+        }
         let raw = pick(team, "AETHER_TEAM", &env);
         let Some(raw) = raw else {
             let supplied = pick(client_id, "AETHER_ACCESS_CLIENT_ID", &env).is_some()
@@ -236,12 +239,40 @@ fn extract_jwt_from_cookie(header: &str) -> Option<String> {
     None
 }
 
+fn cookie_expires_at(header: &str) -> Option<u64> {
+    let mut max_age = None;
+    let mut expires = None;
+    for attribute in header.split(';').skip(1) {
+        let Some((name, value)) = attribute.split_once('=') else {
+            continue;
+        };
+        match name.trim().to_ascii_lowercase().as_str() {
+            "max-age" => max_age = value.trim().parse::<i64>().ok(),
+            "expires" => expires = Some(value.trim().to_owned()),
+            _ => {}
+        }
+    }
+    max_age
+        .map(|seconds| {
+            if seconds <= 0 {
+                0
+            } else {
+                now().saturating_add(u64::try_from(seconds).unwrap_or(u64::MAX))
+            }
+        })
+        .or_else(|| expires.as_deref().and_then(http_date))
+}
+
 fn issued_token(reply: &Reply) -> Option<String> {
     reply
         .headers
         .iter()
         .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
-        .find_map(|(_, value)| extract_jwt_from_cookie(value))
+        .find_map(|(_, value)| {
+            let token = extract_jwt_from_cookie(value)?;
+            let deleted = cookie_expires_at(value).is_some_and(|at| at <= now());
+            (!deleted).then_some(token)
+        })
 }
 
 fn extract_totp_form_action(html: &str) -> Option<String> {
@@ -1137,7 +1168,12 @@ fn with_email_code(
             ));
         }
         let html = String::from_utf8_lossy(&page.reply.body);
-        let token = extract_jwt_from_html(&html).or(page.token);
+        let html_token = extract_jwt_from_html(&html);
+        let token = [page.token.as_deref(), html_token.as_deref()]
+            .into_iter()
+            .flatten()
+            .find(|candidate| !jwt_expired(candidate, now()))
+            .map(str::to_owned);
         if let Some(token) = token {
             eprintln!(
                 "[+] signed in to team {} with the email code",
@@ -1300,6 +1336,15 @@ mod tests {
         let settings = crate::json::parse("{\"team\":42}").expect("valid json");
         let error = TeamSettings::from_settings(&settings).expect_err("a non-string team");
         assert!(error.contains("`team` must be a string"));
+    }
+
+    #[test]
+    fn a_blank_explicit_team_is_refused_even_with_an_environment_team() {
+        let error = TeamSettings::from_parts_with(Some("  "), None, None, None, None, |_| {
+            Some("env-team".to_owned())
+        })
+        .expect_err("a blank explicit team");
+        assert!(error.contains("empty"), "{error}");
     }
 
     #[test]
@@ -1656,6 +1701,20 @@ mod tests {
             .expect("an off-origin page");
         assert!(page.token.is_none());
         assert!(session.cookies.is_empty());
+    }
+
+    #[test]
+    fn a_deleted_assertion_cookie_is_not_a_token() {
+        let live = jwt("{\"exp\":4102444800}");
+        let reply = reply(
+            200,
+            vec![(
+                "Set-Cookie".to_owned(),
+                format!("CF_Authorization={live}; Max-Age=0; Path=/; Secure"),
+            )],
+            "",
+        );
+        assert!(issued_token(&reply).is_none());
     }
 
     #[test]
@@ -2254,6 +2313,57 @@ mod tests {
         assert_eq!(got, token);
         assert_eq!(prompts, 3);
         assert_eq!(posts.get(), 3);
+    }
+
+    #[test]
+    fn a_live_callback_cookie_beats_an_expired_html_token() {
+        let live = jwt("{\"exp\":4102444800}");
+        let expired = jwt("{\"exp\":1}");
+        let settings = TeamSettings {
+            team: "acme".to_owned(),
+            email: Some("user@example.com".to_owned()),
+            ..TeamSettings::default()
+        };
+        let got = sign_in(
+            &settings,
+            now(),
+            &|method, url, _headers, _body| {
+                if method == "GET" && url.ends_with("/warp") {
+                    return Ok(reply(
+                        200,
+                        Vec::new(),
+                        "<form action=\"https://acme.cloudflareaccess.com/cdn-cgi/access/verify\"><input id=\"totp-form\"></form>",
+                    ));
+                }
+                if method == "POST" && url.ends_with("/verify") {
+                    return Ok(reply(
+                        302,
+                        vec![(
+                            "Location".to_owned(),
+                            "https://acme.cloudflareaccess.com/verify?nonce=abc".to_owned(),
+                        )],
+                        "",
+                    ));
+                }
+                if method == "GET" && url.contains("nonce=abc") {
+                    return Ok(reply(200, Vec::new(), ""));
+                }
+                if method == "POST" && url.ends_with("/cdn-cgi/access/callback") {
+                    return Ok(reply(
+                        200,
+                        vec![(
+                            "Set-Cookie".to_owned(),
+                            format!("CF_Authorization={live}; Path=/; Secure"),
+                        )],
+                        &format!("<meta token={expired}>"),
+                    ));
+                }
+                Err(format!("unexpected {method} {url}"))
+            },
+            &mut |_, _| Some("123456".to_owned()),
+        )
+        .expect("the live cookie");
+        assert_eq!(got, live);
     }
 
     #[test]

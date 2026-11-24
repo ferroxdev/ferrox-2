@@ -592,6 +592,21 @@ impl WarpSpec {
         })
     }
 
+    fn gool_path_after_outer_save(&self) -> Result<PathBuf, String> {
+        if let Some(file) = &self.gool.identity_file {
+            return Ok(file.clone());
+        }
+        let paths = self.key_paths().ok_or_else(|| {
+            "warp gool needs `goolIdentityFile`, an inline `goolIdentity`, or an `identityFile`"
+                .to_owned()
+        })?;
+        Ok(if self.mode == Mode::Gool {
+            paths.gool_path_after_outer()
+        } else {
+            self.gool_path(&paths)?
+        })
+    }
+
     /// The inner `WireGuard` identity, registered beside the outer one when absent.
     fn gool_identity(&self) -> Result<Identity, String> {
         self.gool_identity_in(false)
@@ -3508,6 +3523,21 @@ impl KeyPaths {
         }
         current
     }
+
+    fn gool_path_after_outer(&self) -> PathBuf {
+        if self.named_masque.is_none() {
+            return Slot::Gool.path(self);
+        }
+        let current = derive_sibling_path(&self.wireguard, "gool");
+        if current.exists() {
+            return current;
+        }
+        let allocated = derive_sibling_path(&self.masque, "gool");
+        if allocated.exists() {
+            return allocated;
+        }
+        current
+    }
 }
 
 /// Whether a path already names a slot, so a runtime pointed at the MASQUE half does not derive a second `-masque`.
@@ -3737,7 +3767,7 @@ pub(crate) fn one_tap(
         mim_outer,
         mim_inner,
     } = forced_edges(peers)?;
-    let spec = WarpSpec {
+    let mut spec = WarpSpec {
         mode,
         register: true,
         identity_file: Some(path.clone()),
@@ -3786,23 +3816,28 @@ pub(crate) fn one_tap(
         gateway,
     };
     if !resumed && matches!(mode, Mode::Gool | Mode::GoolClassic) {
-        let inner_path = if spec.gool.inline.is_some() {
-            Some(PathBuf::from("<inline gool identity>"))
-        } else if let Some(file) = &spec.gool.identity_file {
-            Some(file.clone())
-        } else {
-            spec.key_paths()
-                .and_then(|paths| spec.gool_path(&paths).ok())
-        };
-        if let Some(inner_path) =
-            inner_path.filter(|inner_path| inner_path.is_file() || spec.gool.inline.is_some())
-        {
-            let inner = spec.gool_identity_in(true)?;
+        if let Some(identity) = &spec.gool.inline {
             ensure_saved_team(
                 team.map(|team| team.team.as_str()),
-                inner.team.as_deref(),
-                &inner_path,
+                identity.team.as_deref(),
+                Path::new("<inline gool identity>"),
             )?;
+        } else {
+            let inner_path = spec.gool_path_after_outer_save()?;
+            if inner_path.is_file() {
+                match Identity::load(&inner_path) {
+                    Ok(saved) => ensure_saved_team(
+                        team.map(|team| team.team.as_str()),
+                        saved.team.as_deref(),
+                        &inner_path,
+                    )?,
+                    Err(error) if error.corrupt() && spec.register && reprovision_enabled() => {}
+                    Err(error) => return Err(error.into_message()),
+                }
+            }
+            if mode == Mode::Gool {
+                spec.gool.identity_file = Some(inner_path);
+            }
         }
     }
     if !resumed {
@@ -4773,6 +4808,28 @@ mod tests {
             Path::new("/tmp/account-masquerade.json"),
             "masque"
         ));
+    }
+
+    #[test]
+    fn a_named_outer_uses_the_post_save_gool_sibling() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-warp-gool-path-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+        let base = dir.join("account-masque.json");
+        let derived = dir.join("account-masque-masque.json");
+        let old_gool = dir.join("account-masque-masque-gool.json");
+        let saved_gool = dir.join("account-masque-gool.json");
+        std::fs::write(&derived, "{}").expect("the named MASQUE file");
+        std::fs::write(&old_gool, "{}").expect("the old gool file");
+        std::fs::write(&saved_gool, "{}").expect("the post-save gool file");
+        let paths = KeyPaths::new(&base, None, None);
+        assert_eq!(Slot::Gool.path(&paths), old_gool);
+        assert_eq!(paths.gool_path_after_outer(), saved_gool);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A base that already names the MASQUE half still has to register both slots: runtime reuses
@@ -6270,7 +6327,8 @@ mod tests {
     #[test]
     fn a_string_gateway_setting_is_refused() {
         let reason = WarpSpec::from(
-            &crate::json::parse(r#"{"register":true,"gateway":"true"}"#).expect("settings"),
+            &crate::json::parse(r#"{"register":true,"team":"acme","gateway":"true"}"#)
+                .expect("settings"),
         )
         .expect_err("a string gateway");
         assert!(reason.contains("gateway"), "{reason}");

@@ -56,14 +56,17 @@ graph TD
     D -- yes --> V{"saved team matches?"}
     V -- no --> XF["fail, choose another path"]
     V -- yes --> F["GET /reg/id<br/>refresh peer, endpoint, addresses"]
+    F -- "2xx" --> K["plan in memory"]
     F -- "401/404/410" --> G{"AETHER_REPROVISION=0?"}
     G -- no --> U
     G -- yes --> H["keep saved identity"]
     F -- other failure --> H
-    E0 & E --> I["PATCH /reg/id<br/>P-256 SPKI (MASQUE slots)"]
-    I --> J["PATCH /reg/id<br/>warp_enabled"]
+    E0 & E --> EN{"slot enrolls MASQUE?"}
+    EN -- yes --> I["PATCH /reg/id<br/>P-256 SPKI"]
+    EN -- "no (WireGuard)" --> J["PATCH /reg/id<br/>warp_enabled"]
+    I --> J
     J -- "not 2xx" --> X["fail, save nothing"]
-    J -- 2xx --> K["plan in memory"]
+    J -- 2xx --> K
     H --> K
     K --> L["temp file + rename<br/>0600, old keys until here"]
     L --> M["WarpOut::new"]
