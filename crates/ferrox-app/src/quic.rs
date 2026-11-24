@@ -405,8 +405,8 @@ pub(crate) const SILENT_HANDSHAKE: Duration = Duration::from_secs(5);
 pub(crate) const IDLE_TIMEOUT_MS: u64 = 300_000;
 
 /// The receive credit an edge may hold against this process at the first byte: quiche parks every delivered byte here until the app reads it, so the advertised window is the memory the edge gets to spend before the first `MAX_STREAM_DATA` update.
-pub(crate) const MAX_DATA: u64 = 16_777_216;
-pub(crate) const MAX_STREAM_DATA: u64 = 4_194_304;
+pub(crate) const MAX_DATA: u64 = 33_554_432;
+pub(crate) const MAX_STREAM_DATA: u64 = 16_777_216;
 pub(crate) const MAX_STREAMS: u64 = 100;
 
 /// The rate every window in this file is sized for, in bytes per second: 1 Gbit/s, the fastest link a lane's own socket is expected to feed.
