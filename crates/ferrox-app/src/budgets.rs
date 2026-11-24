@@ -11,6 +11,9 @@ pub(crate) const HANDSHAKE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) const RELAY_POLL: Duration = Duration::from_millis(1);
 
+/// A stream leg's empty read has no descriptor to wake it, so it rechecks the connection's buffer on this grain instead of the relay clock.
+pub(crate) const RELAY_STREAM_POLL: Duration = Duration::from_micros(250);
+
 /// A shaped handshake's read quantum: the core gives a hello 1500 polls, so 20 ms here is its 30 s budget.
 pub(crate) const HANDSHAKE_POLL: Duration = Duration::from_millis(20);
 

@@ -14608,6 +14608,25 @@ pub(crate) fn forget_wait_idle() {
     WAIT_IDLE.with(|slot| slot.set(None));
 }
 
+thread_local! {
+    /// The quantum a step's own wait needs, for a lane whose source has no descriptor the pool can watch.
+    static WAIT_QUANTUM: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn note_wait_quantum(quantum: Duration) {
+    if relay_step_owns_poll() {
+        WAIT_QUANTUM.with(|slot| slot.set(Some(quantum)));
+    }
+}
+
+pub(crate) fn take_wait_quantum() -> Option<Duration> {
+    WAIT_QUANTUM.with(std::cell::Cell::take)
+}
+
+pub(crate) fn forget_wait_quantum() {
+    WAIT_QUANTUM.with(|slot| slot.set(None));
+}
+
 /// Scoped claim, so a step that returns or panics leaves the thread as it found it.
 pub(crate) struct RelayStep(bool);
 
@@ -14617,6 +14636,7 @@ impl RelayStep {
         forget_wait_fd();
         forget_wait_finish();
         forget_wait_idle();
+        forget_wait_quantum();
         Self(RELAY_STEP.with(|flag| flag.replace(true)))
     }
 }
@@ -36702,7 +36722,8 @@ pub(crate) mod lane_pool {
     /// Parks an idle lane with the instant it is due another turn; one worker pays the wait for the
     /// whole batch, so the lanes with bytes keep the workers and the wait grows per empty round.
     fn park(pool: &Pool, lane: Lane) {
-        park_with(pool, lane, crate::budgets::RELAY_POLL);
+        let quantum = crate::proxy::take_wait_quantum().unwrap_or(crate::budgets::RELAY_POLL);
+        park_with(pool, lane, quantum);
     }
 
     /// A lane inserted with an earlier deadline wakes the parker instead of waiting for the

@@ -5070,7 +5070,11 @@ impl Read for QuicStream {
                     return Err(std::io::Error::other("quic connection lock poisoned"));
                 }
             }
-            if relayed || Instant::now() >= deadline {
+            if relayed {
+                crate::proxy::note_wait_quantum(crate::budgets::RELAY_STREAM_POLL);
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            if Instant::now() >= deadline {
                 return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
             }
             let left = deadline.saturating_duration_since(Instant::now());
