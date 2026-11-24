@@ -930,10 +930,11 @@ impl Session {
             return;
         };
         let now = now();
-        if token.as_deref().is_some_and(|held| !jwt_expired(held, now)) {
-            return;
-        }
-        if !jwt_expired(&candidate, now) {
+        let candidate_expiry = jwt_expiry(&candidate).filter(|&expiry| now < expiry);
+        let held_expiry = token
+            .as_deref()
+            .and_then(|held| jwt_expiry(held).filter(|&expiry| now < expiry));
+        if candidate_expiry.is_some_and(|expiry| held_expiry.is_none_or(|held| expiry > held)) {
             *token = Some(candidate);
         }
     }
@@ -1220,7 +1221,7 @@ pub(crate) fn https_exchange(
     let authority = origin.strip_prefix("https://").unwrap_or(&origin);
     let mut endpoint = Endpoint::parse(&origin, crate::quic::system_roots())
         .ok_or_else(|| "warp access: the redirect target is not an https URL".to_owned())?;
-    if endpoint.port != 443 || authority.starts_with('[') {
+    if endpoint.port != 443 {
         endpoint.host_header = Some(authority.to_owned());
     }
     crate::foxy_account::ask_within(
@@ -1716,6 +1717,40 @@ mod tests {
             "",
         );
         assert!(issued_token(&reply).is_none());
+    }
+
+    #[test]
+    fn a_later_live_assertion_replaces_an_earlier_one() {
+        let origin = "https://acme.cloudflareaccess.com";
+        let session = Session::for_origin(origin);
+        let earlier = jwt("{\"exp\":4102444800}");
+        let later = jwt("{\"exp\":4102444801}");
+        let mut token = None;
+        session.record_token(
+            origin,
+            &reply(
+                200,
+                vec![(
+                    "Set-Cookie".to_owned(),
+                    format!("CF_Authorization={earlier}; Path=/; Secure"),
+                )],
+                "",
+            ),
+            &mut token,
+        );
+        session.record_token(
+            origin,
+            &reply(
+                200,
+                vec![(
+                    "Set-Cookie".to_owned(),
+                    format!("CF_Authorization={later}; Path=/; Secure"),
+                )],
+                "",
+            ),
+            &mut token,
+        );
+        assert_eq!(token.as_deref(), Some(later.as_str()));
     }
 
     #[test]

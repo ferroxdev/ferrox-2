@@ -5,6 +5,7 @@ use crate::foxy_challenge::{self, Jar};
 use ferrox_core::foxy::account::{self, Signed};
 use ferrox_core::foxy::{edge_peer, Failure, Pass};
 use ferrox_core::tls::{TlsConfig, TlsProvider as _};
+use std::borrow::Cow;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::SocketAddr;
 use std::sync::Mutex;
@@ -924,8 +925,22 @@ impl Endpoint {
 
     /// The `Host`/`:authority` value: a fronted request names the origin, not the edge it dials.
     #[must_use]
-    pub(crate) fn host_header(&self) -> &str {
-        self.host_header.as_deref().unwrap_or(&self.host)
+    pub(crate) fn host_header(&self) -> Cow<'_, str> {
+        if let Some(header) = &self.host_header {
+            return Cow::Borrowed(header);
+        }
+        if self.host.contains(':') {
+            return Cow::Owned(if self.port == 443 {
+                format!("[{}]", self.host)
+            } else {
+                format!("[{}]:{}", self.host, self.port)
+            });
+        }
+        if self.port == 443 {
+            Cow::Borrowed(&self.host)
+        } else {
+            Cow::Owned(format!("{}:{}", self.host, self.port))
+        }
     }
 
     /// Where a request goes: the origin's own prefix, then the path.
@@ -1210,14 +1225,7 @@ impl H2Connection {
         let mut fields: Vec<(String, String)> = Vec::with_capacity(headers.len() + 4);
         fields.push((":method".to_owned(), method.to_owned()));
         fields.push((":scheme".to_owned(), "https".to_owned()));
-        let authority = if endpoint.host_header.is_some() {
-            endpoint.host_header().to_owned()
-        } else if endpoint.port == 443 {
-            endpoint.host.clone()
-        } else {
-            format!("{}:{}", endpoint.host, endpoint.port)
-        };
-        fields.push((":authority".to_owned(), authority));
+        fields.push((":authority".to_owned(), endpoint.host_header().into_owned()));
         fields.push((":path".to_owned(), path.to_owned()));
         for (name, value) in headers {
             let lower = name.to_ascii_lowercase();
@@ -1456,7 +1464,7 @@ fn ask_limited_within(
             endpoint.host
         ));
     }
-    tls.write_all(&request(method, endpoint.host_header(), url, headers, body))
+    tls.write_all(&request(method, &endpoint.host_header(), url, headers, body))
         .and_then(|()| tls.flush())
         .map_err(|why| format!("writing {} {diagnostic}: {why}", endpoint.host))?;
     read_reply_limited(&mut tls, DEFAULT_READ_CHUNK, max_body)
@@ -1476,7 +1484,7 @@ pub(crate) fn ask_to_file(
     max_body: usize,
 ) -> Result<Reply, String> {
     let mut tls = endpoint.connect()?;
-    tls.write_all(&request(method, endpoint.host_header(), url, headers, body))
+    tls.write_all(&request(method, &endpoint.host_header(), url, headers, body))
         .and_then(|()| tls.flush())
         .map_err(|why| format!("writing {} {url}: {why}", endpoint.host))?;
     let mut io = BufReader::with_capacity(1024, &mut tls);
@@ -1550,7 +1558,7 @@ pub(crate) fn ask_head(
     headers: &[(&str, &str)],
 ) -> Result<Reply, String> {
     let mut tls = endpoint.connect()?;
-    tls.write_all(&request("HEAD", endpoint.host_header(), url, headers, &[]))
+    tls.write_all(&request("HEAD", &endpoint.host_header(), url, headers, &[]))
         .and_then(|()| tls.flush())
         .map_err(|why| format!("writing {} {url}: {why}", endpoint.host))?;
     let mut io = BufReader::with_capacity(1024, &mut tls);
@@ -2267,6 +2275,7 @@ mod tests {
             endpoint.address,
             Some("[2001:db8::1]:443".parse().expect("addr"))
         );
+        assert_eq!(endpoint.host_header().as_ref(), "[2001:db8::1]");
         let endpoint =
             Endpoint::parse("https://[2001:db8::1]:8443", Vec::new().into()).expect("parses");
         assert_eq!(endpoint.host, "2001:db8::1");
@@ -2275,6 +2284,10 @@ mod tests {
             endpoint.address,
             Some("[2001:db8::1]:8443".parse().expect("addr"))
         );
+        assert_eq!(endpoint.host_header().as_ref(), "[2001:db8::1]:8443");
+        let head = String::from_utf8(request_head("GET", &endpoint.host_header(), "/", &[], 0))
+            .expect("ascii");
+        assert!(head.contains("\r\nHost: [2001:db8::1]:8443\r\n"));
     }
 
     #[test]

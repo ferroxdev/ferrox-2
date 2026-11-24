@@ -15468,7 +15468,7 @@ mod tests {
         )
         .expect("endpoint");
         assert_eq!(endpoint.host, "edge.example");
-        assert_eq!(endpoint.host_header(), "origin.example");
+        assert_eq!(endpoint.host_header().as_ref(), "origin.example");
         assert_eq!(endpoint.verify_names, ["front.example"]);
         assert!(!endpoint.insecure);
     }
