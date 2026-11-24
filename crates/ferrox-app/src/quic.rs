@@ -5115,17 +5115,12 @@ impl Write for QuicStream {
         if self.stalled.load(Ordering::Relaxed) {
             return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
         }
-        // The lock covers one send each, and inside a relay step the window wait is not taken at all: its grant arrives as a datagram on the lane's own socket, so a closed window hands the tail back and the lane parks there.
-        let parked = crate::proxy::relay_step_owns_poll();
+        // The lock covers one send each: a flow-control wait must not hold it, or ACKs stop arriving.
         let deadline = Instant::now() + SEND_WAIT;
         let mut rest = bytes::Bytes::copy_from_slice(buf);
         while !rest.is_empty() {
             match self.send_once(&mut rest) {
                 Ok(0) => {
-                    if parked {
-                        self.note_datagram_wait();
-                        return Ok(buf.len() - rest.len());
-                    }
                     if Instant::now() >= deadline {
                         let sent = buf.len() - rest.len();
                         if sent > 0 {
