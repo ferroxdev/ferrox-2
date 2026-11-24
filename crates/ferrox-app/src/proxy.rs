@@ -14021,6 +14021,12 @@ fn relay_lanes_handoff<
     flow
 }
 
+/// Hands the lane back with bytes still owed: the window grants that reopen it land on the socket the lane parks on, and the poll clock catches a grant that landed before the park armed.
+fn owed_parked() -> Next {
+    note_wait_idle(crate::budgets::RELAY_POLL);
+    Next::Idle
+}
+
 fn spill_lane_step<R, W>(
     from: &Half<R>,
     to: &Half<W>,
@@ -14038,13 +14044,16 @@ where
                 buffer.owed_take(n);
                 ended.mark_progress();
             }
-            Ok(_) => {
-                note_wait_finish(ended);
-                return Next::Idle;
+            // The lane is woken by the packet that reopens the window, and by a poll clock behind it: that packet can land between this refusal and the park's arm.
+            Ok(_) if ended.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) => {
+                return Next::Done
             }
+            Ok(_) => return owed_parked(),
             Err(error) if is_timeout(&error) => {
-                note_wait_finish(ended);
-                return Next::Idle;
+                if ended.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
+                    return Next::Done;
+                }
+                return owed_parked();
             }
             Err(_) => return Next::Done,
         }
@@ -14063,13 +14072,14 @@ where
                     ended.mark_progress();
                     Next::More
                 }
-                Ok(_) => {
-                    note_wait_finish(ended);
-                    Next::Idle
-                }
+                Ok(_) if ended.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) => Next::Done,
+                Ok(_) => owed_parked(),
                 Err(error) if is_timeout(&error) => {
-                    note_wait_finish(ended);
-                    Next::Idle
+                    if ended.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
+                        Next::Done
+                    } else {
+                        owed_parked()
+                    }
                 }
                 Err(_) => Next::Done,
             }
