@@ -38067,7 +38067,11 @@ pub(crate) mod lane_pool {
                     1,
                     "a lane on another connection left its wait"
                 );
-                assert_eq!(parked.lanes[0].2, Some(9), "the kicked lane was not the stream's");
+                assert_eq!(
+                    parked.lanes[0].2,
+                    Some(9),
+                    "the kicked lane was not the stream's"
+                );
             }
             assert_eq!(
                 pool.ready

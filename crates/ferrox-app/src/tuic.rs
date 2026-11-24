@@ -1290,7 +1290,7 @@ fn client_turn(
     ids.extend(conn.readable());
     if ids.iter().any(|id| id % 4 == 0) {
         crate::proxy::lane_pool::kick_streams(
-            std::sync::Arc::as_ptr(&lane.conn) as *const () as usize,
+            std::sync::Arc::as_ptr(&lane.conn) as *const () as usize
         );
     }
     for &id in ids.iter() {
@@ -2208,7 +2208,7 @@ impl Server {
         state.readable.extend(conn.readable());
         if state.readable.iter().any(|id| id % 4 == 0) {
             crate::proxy::lane_pool::kick_streams(
-                std::sync::Arc::as_ptr(&session.conn) as *const () as usize,
+                std::sync::Arc::as_ptr(&session.conn) as *const () as usize
             );
         }
         for id in state.uni.keys() {
