@@ -149,6 +149,8 @@ pub struct Fragment {
     ent: Entropy,
     count: u64,
     gathered: Option<Gathered>,
+    /// The next record a readiness write may emit, so a delay survives the return to the lane.
+    ready_until: Option<std::time::Instant>,
 }
 
 /// The part of a merged hello already built but not yet accepted by the sink, so a refused write
@@ -191,6 +193,7 @@ impl Fragment {
             ent: Entropy::new(),
             count: 0,
             gathered: None,
+            ready_until: None,
         })
     }
 
@@ -204,6 +207,13 @@ impl Fragment {
 
     /// The write the chain hands this stage, answered with how much of it reached the wire.
     pub fn write<W: Write>(&mut self, raw: &mut W, p: &[u8]) -> io::Result<usize> {
+        if READY.with(std::cell::Cell::get) {
+            match self.ready_until {
+                Some(until) if std::time::Instant::now() < until => return Ok(0),
+                Some(_) => self.ready_until = None,
+                None => {}
+            }
+        }
         if let Some(mut gathered) = self.gathered.take() {
             if let Err(error) = flush_gathered(raw, &mut gathered) {
                 self.gathered = Some(gathered);
@@ -319,6 +329,11 @@ impl Fragment {
         if DRAINING.with(std::cell::Cell::get) {
             // A nonblocking drain cannot wait: the spacing was already part of the write that retained these bytes.
             let _ = raw.flush();
+            return Ok(());
+        }
+        if READY.with(std::cell::Cell::get) {
+            let _ = raw.flush();
+            self.ready_until = Some(std::time::Instant::now() + Duration::from_millis(ms as u64));
             return Ok(());
         }
         match raw.flush() {
@@ -708,6 +723,13 @@ impl Fragment {
         let mut from = 0usize;
         let mut segment = 0usize;
         loop {
+            if READY.with(std::cell::Cell::get)
+                && self
+                    .ready_until
+                    .is_some_and(|until| std::time::Instant::now() < until)
+            {
+                return Ok(from);
+            }
             let Some(to) = self.cut(segment, from, p.len(), bound) else {
                 return write_progress(raw, &p[from..]).map(|written| from + written);
             };
@@ -799,7 +821,8 @@ fn flush_gathered<W: Write>(raw: &mut W, gathered: &mut Gathered) -> io::Result<
         }
         if let Some((_, wait)) = gathered.parks.first().copied() {
             gathered.parks.remove(0);
-            if wait > 0 && !DRAINING.with(std::cell::Cell::get) {
+            if wait > 0 && !DRAINING.with(std::cell::Cell::get) && !READY.with(std::cell::Cell::get)
+            {
                 #[cfg(test)]
                 SLEEPS.with(|count| count.set(count.get() + 1));
                 std::thread::sleep(Duration::from_millis(wait as u64));
@@ -902,6 +925,7 @@ fn between(ip: IpAddr, start: IpAddr, end: IpAddr) -> bool {
 
 thread_local! {
     static DRAINING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static READY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -919,6 +943,21 @@ struct DrainFlag(bool);
 impl Drop for DrainFlag {
     fn drop(&mut self) {
         DRAINING.set(self.0);
+    }
+}
+
+/// A write that must not spend a configured inter-record delay on the thread: the stage records the
+/// deadline and answers `Ok(0)` until it passes, so the lane parks on its own clock instead.
+pub fn ready_write() -> ReadyFlag {
+    ReadyFlag(READY.replace(true))
+}
+
+/// Restores the previous readiness mode when the write returns.
+pub struct ReadyFlag(bool);
+
+impl Drop for ReadyFlag {
+    fn drop(&mut self) {
+        READY.set(self.0);
     }
 }
 

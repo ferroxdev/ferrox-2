@@ -1017,8 +1017,7 @@ impl H2StreamReader {
     }
 
     /// Pump until the response head lands, then report its status and whether it carried `Padding`.
-    pub(crate) fn wait_head(&self) -> Option<(u16, bool)> {
-        let deadline = std::time::Instant::now() + crate::budgets::head_arrival();
+    pub(crate) fn wait_head(&self, deadline: std::time::Instant) -> Option<(u16, bool)> {
         loop {
             if std::time::Instant::now() >= deadline {
                 return None;
@@ -2326,6 +2325,10 @@ impl H2Conn {
     }
 
     fn reset_stream(&self, stream: u32) {
+        self.reset_stream_code(stream, E_REFUSED);
+    }
+
+    fn reset_stream_code(&self, stream: u32, code: u32) {
         if let Some(state) = self
             .streams
             .lock()
@@ -2378,7 +2381,7 @@ impl H2Conn {
             self.replenish_connection(consumed);
         }
         // Queued: a refusal is the demux's answer, so it must not wait on a write the peer has not read.
-        let _ = self.send_control(T_RST, 0, stream, &E_REFUSED.to_be_bytes());
+        let _ = self.send_control(T_RST, 0, stream, &code.to_be_bytes());
     }
 
     /// A reset ends both local halves at once: unlike a finished upload, an aborted POST has no
@@ -3049,15 +3052,13 @@ fn client_headers(conn: &H2Conn, sid: u32, block: &[u8], end_stream: bool) -> bo
         return false;
     };
     if status.is_some_and(|status| !(100..=999).contains(&status)) {
-        conn.fail_stream(sid);
-        conn.compression_error();
-        return false;
+        conn.reset_stream_code(sid, E_PROTOCOL);
+        return true;
     }
     if status.is_some_and(|status| (100..200).contains(&status)) {
         if end_stream {
-            conn.fail_stream(sid);
-            conn.compression_error();
-            return false;
+            conn.reset_stream_code(sid, E_PROTOCOL);
+            return true;
         }
         return true;
     }

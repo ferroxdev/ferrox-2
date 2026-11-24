@@ -134,6 +134,7 @@ struct PaddingWrite {
     pending: Vec<u8>,
     at: usize,
     input: usize,
+    accepted: usize,
     lost: bool,
 }
 
@@ -142,21 +143,34 @@ impl PaddingWrite {
         if self.lost {
             return proxy::Push::Lost;
         }
+        let mut base = 0usize;
+        if self.accepted > 0 {
+            let take = self.accepted.min(data.len());
+            self.accepted -= take;
+            base = take;
+            if self.accepted > 0 {
+                self.lost = true;
+                return proxy::Push::Lost;
+            }
+        }
+        let data = &data[base..];
         if data.is_empty() && self.pending.is_empty() {
-            return proxy::Push::Took(0);
+            return proxy::Push::Took(base);
         }
         let mut done = 0usize;
         if !self.pending.is_empty() {
-            match writer.push(&self.pending[self.at..]) {
-                proxy::Push::Took(n) => self.at += n,
-                proxy::Push::Parked => return Self::progress(done),
-                proxy::Push::Lost => {
-                    self.lost = true;
-                    return proxy::Push::Lost;
+            if self.at < self.pending.len() {
+                match writer.push(&self.pending[self.at..]) {
+                    proxy::Push::Took(n) => self.at += n,
+                    proxy::Push::Parked => return Self::progress(base + done),
+                    proxy::Push::Lost => {
+                        self.lost = true;
+                        return proxy::Push::Lost;
+                    }
                 }
             }
             if self.at < self.pending.len() {
-                return Self::progress(done);
+                return Self::progress(base + done);
             }
             let input = std::mem::take(&mut self.input);
             self.pending.clear();
@@ -170,11 +184,11 @@ impl PaddingWrite {
         }
         if self.written >= PADDING_COUNT {
             return match writer.push(&data[done..]) {
-                proxy::Push::Took(n) => proxy::Push::Took(done + n),
-                proxy::Push::Parked => Self::progress(done),
+                proxy::Push::Took(n) => proxy::Push::Took(base + done + n),
+                proxy::Push::Parked => Self::progress(base + done),
                 proxy::Push::Lost => {
                     self.lost = true;
-                    Self::progress(done)
+                    Self::progress(base + done)
                 }
             };
         }
@@ -191,16 +205,16 @@ impl PaddingWrite {
             self.input = take;
             match writer.push(&self.pending) {
                 proxy::Push::Took(n) => self.at = n,
-                proxy::Push::Parked => return Self::progress(done),
+                proxy::Push::Parked => return Self::progress(base + done),
                 proxy::Push::Lost => {
                     self.pending.clear();
                     self.input = 0;
                     self.lost = true;
-                    return Self::progress(done);
+                    return Self::progress(base + done);
                 }
             }
             if self.at < self.pending.len() {
-                return Self::progress(done);
+                return Self::progress(base + done);
             }
             self.pending.clear();
             self.at = 0;
@@ -208,7 +222,7 @@ impl PaddingWrite {
             self.written += 1;
             done += take;
         }
-        Self::progress(done)
+        Self::progress(base + done)
     }
 
     fn progress(done: usize) -> proxy::Push {
@@ -228,12 +242,14 @@ impl PaddingWrite {
             return None;
         }
         let before = self.at;
-        match writer.push(&self.pending[self.at..]) {
-            proxy::Push::Took(n) => self.at += n,
-            proxy::Push::Parked => {}
-            proxy::Push::Lost => {
-                self.lost = true;
-                return Some(proxy::Settle::Lost);
+        if self.at < self.pending.len() {
+            match writer.push(&self.pending[self.at..]) {
+                proxy::Push::Took(n) => self.at += n,
+                proxy::Push::Parked => {}
+                proxy::Push::Lost => {
+                    self.lost = true;
+                    return Some(proxy::Settle::Lost);
+                }
             }
         }
         if self.at < self.pending.len() {
@@ -243,11 +259,15 @@ impl PaddingWrite {
                 proxy::Settle::Parked
             });
         }
+        self.accepted += std::mem::take(&mut self.input);
         self.pending.clear();
         self.at = 0;
-        self.input = 0;
         self.written += 1;
         None
+    }
+
+    fn take_accepted(&mut self) -> usize {
+        std::mem::take(&mut self.accepted)
     }
 
     #[cfg(test)]
@@ -994,7 +1014,18 @@ impl Write for NaiveStream {
         }
         loop {
             match self.settle() {
-                proxy::Settle::Clear => return Ok(done),
+                proxy::Settle::Clear => {
+                    if self.inner.padded {
+                        let accepted = self
+                            .inner
+                            .write_padding
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .take_accepted();
+                        done = done.saturating_add(accepted).min(buf.len());
+                    }
+                    return Ok(done);
+                }
                 proxy::Settle::Advanced => {
                     deadline = Instant::now() + crate::budgets::relay_stall();
                 }
@@ -1017,7 +1048,16 @@ impl Write for NaiveStream {
         let mut deadline = Instant::now() + crate::budgets::relay_stall();
         loop {
             match self.settle() {
-                proxy::Settle::Clear => break,
+                proxy::Settle::Clear => {
+                    if self.inner.padded {
+                        self.inner
+                            .write_padding
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .take_accepted();
+                    }
+                    break;
+                }
                 proxy::Settle::Advanced => {
                     deadline = Instant::now() + crate::budgets::relay_stall();
                 }
@@ -2396,7 +2436,7 @@ impl NaiveOut {
             let block = self.h2_block(target);
             match client.open_naive_result(&block, false) {
                 Ok((reader, out)) => {
-                    let Some((status, padded)) = reader.wait_head() else {
+                    let Some((status, padded)) = reader.wait_head(deadline) else {
                         let unprocessed = reader.unprocessed();
                         out.reset();
                         self.discard_h2(&client);

@@ -1334,6 +1334,7 @@ impl Connection {
     /// write, so the descriptor is nonblocking while the bytes are offered and restored after.
     pub(crate) fn write_ready(&mut self, parts: &[&[u8]]) -> io::Result<usize> {
         self.set_nonblocking(true)?;
+        let _ready = ferrox_core::finalmask::ready_write();
         let mut total = 0;
         let mut outcome = None;
         'parts: for part in parts {
