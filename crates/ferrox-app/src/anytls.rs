@@ -1800,7 +1800,11 @@ mod tests {
     fn a_partial_anytls_write_is_settle_progress() {
         let written = Arc::new(Mutex::new(Vec::new()));
         let padding = Padding::new(b"stop=0\n").expect("parses");
-        let shared = Shared::new(Box::new(Bounded(Arc::clone(&written))), padding, false);
+        let shared = Arc::new(Shared::new(
+            Box::new(Bounded(Arc::clone(&written))),
+            padding,
+            false,
+        ));
         let mut stream = test_stream(&shared, 1);
         assert!(matches!(
             crate::proxy::LaneWrite::push(&mut stream, b"abcdef"),

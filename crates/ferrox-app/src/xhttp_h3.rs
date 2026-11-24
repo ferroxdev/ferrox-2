@@ -1800,9 +1800,6 @@ fn drain_batch(
     if conn.is_closed() {
         return false;
     }
-    if conn.is_draining() {
-        draining.store(true, Ordering::Relaxed);
-    }
     conn.on_timeout();
     quic::flush_egress(&mut conn, sock);
     if moved && quic::path_failed(&mut conn, local) {
@@ -1845,6 +1842,9 @@ fn sweep(
     };
     if conn.is_closed() {
         return false;
+    }
+    if conn.is_draining() {
+        draining.store(true, Ordering::Relaxed);
     }
     conn.on_timeout();
     quic::flush_egress(&mut conn, sock);
