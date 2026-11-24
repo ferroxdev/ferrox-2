@@ -282,4 +282,4 @@ tuic  tuic::tests::a_full_packet_fits_one_command  ferrox_core::tuic::parse_pack
 reality-tls  proxy::tests::socks_tls_over_raw_reaches_echo  proxy::session_halves
 engine-config  json::tests::the_clean_strip_costs_no_walk  ferrox_app::json::tests::the_clean_strip_costs_no_walk
 engine-config  json::tests::the_comment_strip_costs_one_walk  ferrox_app::json::tests::the_comment_strip_costs_one_walk
-engine-selector  a_selector_dial_costs_the_choice  ferrox_app::proxy::tests::a_selector_dial_costs_the_choice
+engine-selector  proxy::tests::a_selector_dial_costs_the_choice  ferrox_app::proxy::tests::a_selector_dial_costs_the_choice
