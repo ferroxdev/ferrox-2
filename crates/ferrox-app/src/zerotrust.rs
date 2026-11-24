@@ -1386,22 +1386,20 @@ mod tests {
     #[test]
     fn another_teams_ambient_service_token_is_not_used() {
         let env = |key: &str| {
-            Some(match key {
+            Some(str::to_owned(match key {
                 "AETHER_TEAM" => "ambient",
                 "AETHER_ACCESS_CLIENT_ID" => "ambient-id",
                 "AETHER_ACCESS_CLIENT_SECRET" => "ambient-secret",
                 _ => return None,
-            })
-            .map(str::to_owned)
+            }))
         };
-        let explicit =
-            TeamSettings::from_parts_with(Some("explicit"), None, None, None, None, &env)
-                .expect("the explicit team")
-                .expect("settings");
+        let explicit = TeamSettings::from_parts_with(Some("explicit"), None, None, None, None, env)
+            .expect("the explicit team")
+            .expect("settings");
         assert!(!explicit.has_service_token());
         assert_eq!(explicit.client_id, None);
         assert_eq!(explicit.client_secret, None);
-        let matching = TeamSettings::from_parts_with(Some("ambient"), None, None, None, None, &env)
+        let matching = TeamSettings::from_parts_with(Some("ambient"), None, None, None, None, env)
             .expect("the matching team")
             .expect("settings");
         assert!(matching.has_service_token());

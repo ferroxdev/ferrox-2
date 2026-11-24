@@ -257,12 +257,15 @@ impl Drop for Inner {
 /// the key WARP signs with.
 impl std::fmt::Debug for MasqueOut {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MasqueOut")
+        let mut debug = f.debug_struct("MasqueOut");
+        debug
             .field("spec", &self.spec)
             .field("inner", &self.inner)
             .field("dialing", &self.dialing)
-            .field("dialed", &self.dialed)
-            .finish()
+            .field("dialed", &self.dialed);
+        #[cfg(test)]
+        debug.field("queued", &self.queued);
+        debug.finish()
     }
 }
 
