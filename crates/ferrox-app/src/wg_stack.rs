@@ -1914,6 +1914,10 @@ struct ServerStack {
     win_min: u32,
     win_max: u32,
     flight: HashMap<u16, (u32, u32)>,
+    retx: u64,
+    dup: u64,
+    retx_seen: u64,
+    dup_seen: u64,
     congestion: CongestionControl,
 }
 
@@ -1988,6 +1992,10 @@ impl ServerStack {
             win_min: 0,
             win_max: 0,
             flight: HashMap::new(),
+            retx: 0,
+            dup: 0,
+            retx_seen: 0,
+            dup_seen: 0,
             congestion: CongestionControl::Cubic,
         }
     }
@@ -2013,10 +2021,16 @@ impl ServerStack {
         let inflight: u64 = self
             .flight
             .values()
-            .map(|&(end, ack)| u64::from(end.wrapping_sub(ack)))
+            .map(|&(end, ack)| end.wrapping_sub(ack))
+            .filter(|&gap| gap < 32 << 20)
+            .map(u64::from)
             .sum();
+        let retx = self.retx - self.retx_seen;
+        let dup = self.dup - self.dup_seen;
+        self.retx_seen = self.retx;
+        self.dup_seen = self.dup;
         eprintln!(
-            "wgdiag est={est} flows={} queued={queued} recv={recv} can={can} cli=[{}..{}] ws={} inflight={inflight} links={} tx={} rx={}",
+            "wgdiag est={est} flows={} queued={queued} recv={recv} can={can} cli=[{}..{}] ws={} inflight={inflight} links={} retx={retx} dup={dup} tx={} rx={}",
             self.flows.len(),
             self.win_min,
             self.win_max,
@@ -2056,7 +2070,11 @@ impl ServerStack {
                             self.win_min = if self.win_min == 0 { eff } else { self.win_min.min(eff) };
                             self.win_max = self.win_max.max(eff);
                         }
-                        self.flight.entry(probe.dst).or_insert((probe.ack, probe.ack)).1 = probe.ack;
+                        let entry = self.flight.entry(probe.dst).or_insert((probe.ack, probe.ack));
+                        if probe.payload == 0 && probe.ack == entry.1 {
+                            self.dup += 1;
+                        }
+                        entry.1 = probe.ack;
                     }
                 }
                 lower_syn_mss(&mut bytes, at, self.mtu);
@@ -2166,6 +2184,9 @@ impl ServerStack {
                 if probe.payload > 0 {
                     let end = probe.seq.wrapping_add(probe.payload as u32);
                     let entry = self.flight.entry(probe.src).or_insert((end, end));
+                    if end.wrapping_sub(entry.0) > 0x8000_0000 || end <= entry.0 {
+                        self.retx += 1;
+                    }
                     entry.0 = end;
                 }
             }
