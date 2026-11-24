@@ -3410,7 +3410,8 @@ impl H2Client {
         owner: Option<Arc<ClientOwner>>,
         end_request: bool,
     ) -> Option<(H2StreamReader, H2StreamOut)> {
-        self.open_headers_result(block, owner, end_request, None).ok()
+        self.open_headers_result(block, owner, end_request, None)
+            .ok()
     }
 
     fn open_headers_result(

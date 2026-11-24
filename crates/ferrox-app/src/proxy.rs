@@ -2513,10 +2513,8 @@ fn dial_kind_until(
     }
     let outcome = if fast { Fast::Absent } else { Fast::Off };
     let stream = match (source, sockopts) {
-        (None, None) => {
-            crate::conn::connect(&crate::conn::Target::Ip(*target), budget)
-                .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?
-        }
+        (None, None) => crate::conn::connect(&crate::conn::Target::Ip(*target), budget)
+            .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?,
         (source, sockopts) => Connection::Tcp(
             dial_from(target, source, sockopts.as_deref(), false, budget)
                 .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?
@@ -23271,7 +23269,7 @@ pub(crate) fn dial_tls_session_until(
     }
     let session = ready?;
     if deadline.is_some() {
-        let _ = session.get_ref().set_write_timeout(prior_write.flatten());
+        let _ = session.get_ref().set_write_timeout(prior_write);
     }
     // Session-shared behind a lock: reads wait one tick, and `TlsHalf::read` spends a grain unlocked.
     if session
