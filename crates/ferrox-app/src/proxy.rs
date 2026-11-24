@@ -1,7 +1,6 @@
 use crate::conn::{parse_target, Connection, Listener};
 #[cfg(test)]
 use crate::quic::QuicheConnection;
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 #[cfg(windows)]
 use std::io::IoSliceMut;
@@ -2317,10 +2316,12 @@ pub(crate) fn dial_udp_through_proxy(
         shared.member_revision(tag)?.0
     };
     let (leaf, out) = match out {
-        Outbound::Group(group) => group.resolve(&shared, crate::router::Network::Udp)?,
-        out => (Cow::Borrowed(tag), out),
+        Outbound::Group(group) => {
+            let (leaf, out) = group.resolve(&shared, crate::router::Network::Udp)?;
+            (leaf.into_owned(), out)
+        }
+        out => (tag.to_owned(), out),
     };
-    let leaf = leaf.into_owned();
     if !udp_lane_supported(&out) {
         return None;
     }
