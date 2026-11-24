@@ -2,7 +2,7 @@
 //! a device JWT, and the `CF-Access-Jwt-Assertion` header the WARP API reads. The HTTP exchange is
 //! a closure so the flow's redirects, cookies and parsing are testable without a network.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 
@@ -15,6 +15,7 @@ const CODE_ATTEMPTS: u32 = 3;
 const INSTALL_ID_LEN: usize = 22;
 const FCM_SUFFIX_LEN: usize = 134;
 const MAX_REDIRECTS: usize = 10;
+const ACCESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 const UA_REGISTER: &str = crate::warp::REGISTER_AGENT;
 
@@ -183,8 +184,8 @@ fn jwt_expiry(token: &str) -> Option<u64> {
     let payload = decode_segment(segments[1])?;
     let root = crate::json::parse(&String::from_utf8_lossy(&payload)).ok()?;
     root.get("exp")
-        .and_then(crate::json::Json::as_u32)
-        .map(u64::from)
+        .and_then(crate::json::Json::as_i64)
+        .and_then(|expiry| u64::try_from(expiry).ok())
 }
 
 fn jwt_team(token: &str) -> Option<String> {
@@ -200,7 +201,7 @@ fn jwt_team(token: &str) -> Option<String> {
 }
 
 fn jwt_expired(token: &str, now: u64) -> bool {
-    jwt_expiry(token).is_some_and(|expiry| expiry <= now)
+    jwt_expiry(token).is_none_or(|expiry| expiry <= now)
 }
 
 fn now() -> u64 {
@@ -403,13 +404,43 @@ fn url_origin(url: &str) -> Option<(&str, &str)> {
 }
 
 fn origin(url: &str) -> Option<String> {
-    url_origin(url).map(|(scheme, authority)| {
-        format!(
-            "{}://{}",
-            scheme.to_ascii_lowercase(),
-            authority.to_ascii_lowercase()
-        )
+    let (scheme, authority) = url_origin(url)?;
+    let scheme = scheme.to_ascii_lowercase();
+    let authority = authority.to_ascii_lowercase();
+    let (host, port) = split_authority(&authority)?;
+    let default = match scheme.as_str() {
+        "https" => 443,
+        "http" => 80,
+        _ => 0,
+    };
+    let port = match port {
+        Some(port) => Some(port.parse::<u16>().ok()?),
+        None => None,
+    }
+    .filter(|port| *port != default);
+    Some(match port {
+        Some(port) => format!("{scheme}://{host}:{port}"),
+        None => format!("{scheme}://{host}"),
     })
+}
+
+fn split_authority(authority: &str) -> Option<(&str, Option<&str>)> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let host = &authority[..end + 2];
+        return match &rest[end + 1..] {
+            "" => Some((host, None)),
+            tail => tail.strip_prefix(':').map(|port| (host, Some(port))),
+        };
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port))
+            if !host.contains(':') && port.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            Some((host, Some(port)))
+        }
+        _ => Some((authority, None)),
+    }
 }
 
 fn url_host(url: &str) -> Option<&str> {
@@ -468,10 +499,10 @@ fn resolve_url(base: &str, location: &str) -> Option<String> {
     }
     let lower = location.to_ascii_lowercase();
     if lower.starts_with("https://") || lower.starts_with("http://") {
-        return Some(location.to_owned());
+        return Some(normalize_path(&location));
     }
     if let Some(rest) = location.strip_prefix("//") {
-        return Some(format!("{scheme}://{rest}"));
+        return Some(normalize_path(&format!("{scheme}://{rest}")));
     }
     let base = base.split('#').next().unwrap_or(base);
     if let Some(fragment) = location.strip_prefix('#') {
@@ -482,11 +513,47 @@ fn resolve_url(base: &str, location: &str) -> Option<String> {
         return Some(format!("{path}?{query}"));
     }
     if let Some(absolute) = location.strip_prefix('/') {
-        return Some(format!("{scheme}://{authority}/{absolute}"));
+        return Some(normalize_path(&format!(
+            "{scheme}://{authority}/{absolute}"
+        )));
     }
     let path = url_path(base);
     let dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
-    Some(format!("{scheme}://{authority}{dir}/{location}"))
+    Some(normalize_path(&format!(
+        "{scheme}://{authority}{dir}/{location}"
+    )))
+}
+
+fn normalize_path(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    let tail = &rest[end..];
+    let cut = tail.find(['?', '#']).unwrap_or(tail.len());
+    let (path, suffix) = tail.split_at(cut);
+    if !path.starts_with('/') {
+        return url.to_owned();
+    }
+    let trailing = path.ends_with('/') || path.ends_with("/.") || path.ends_with("/..");
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            other => segments.push(other),
+        }
+    }
+    let mut out = format!("{scheme}://{authority}/");
+    out.push_str(&segments.join("/"));
+    if trailing && !out.ends_with('/') {
+        out.push('/');
+    }
+    out.push_str(suffix);
+    out
 }
 
 fn resolve_redirect(current: &str, location: &str) -> Result<String, String> {
@@ -539,6 +606,7 @@ impl Cookie {
 
 struct Session {
     cookies: Vec<Cookie>,
+    allowed_origin: Option<String>,
 }
 
 struct Page {
@@ -551,7 +619,21 @@ impl Session {
     fn new() -> Self {
         Self {
             cookies: Vec::new(),
+            allowed_origin: None,
         }
+    }
+
+    fn for_origin(url: &str) -> Self {
+        Self {
+            cookies: Vec::new(),
+            allowed_origin: origin(url),
+        }
+    }
+
+    fn trusts(&self, url: &str) -> bool {
+        self.allowed_origin
+            .as_deref()
+            .is_none_or(|allowed| origin(url).as_deref() == Some(allowed))
     }
 
     fn exchange(
@@ -583,7 +665,9 @@ impl Session {
             .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect();
         let reply = exchange(method, url, &borrowed, body)?;
-        self.absorb(url, &reply);
+        if self.trusts(url) {
+            self.absorb(url, &reply);
+        }
         Ok(reply)
     }
 
@@ -694,7 +778,7 @@ impl Session {
         let mut token = None;
         for _ in 0..=MAX_REDIRECTS {
             let reply = self.exchange("GET", &current, headers, &[], exchange)?;
-            if token.is_none() {
+            if token.is_none() && self.trusts(&current) {
                 token = issued_token(&reply);
             }
             let location = if is_redirect(reply.status) {
@@ -732,7 +816,7 @@ impl Session {
                 }
                 None => self.exchange("GET", &current, &[], &[], exchange)?,
             };
-            if token.is_none() {
+            if token.is_none() && self.trusts(&current) {
                 token = issued_token(&reply);
             }
             let location = if is_redirect(reply.status) {
@@ -780,7 +864,7 @@ fn sign_in(
         }
         if jwt_expired(token, now) {
             return Err(
-                "warp: the supplied access token has expired; sign in again to get a fresh one"
+                "warp: the supplied access token has expired or has no readable future expiry; sign in again to get a fresh one"
                     .to_owned(),
             );
         }
@@ -863,7 +947,7 @@ fn with_email_code(
     if email.is_empty() {
         return Err("warp: an email address is needed to request a login code".to_owned());
     }
-    let mut session = Session::new();
+    let mut session = Session::for_origin(&settings.team_domain());
     let landing = session.get(&settings.login_url(), &[], exchange)?;
     let verify_url = extract_totp_form_action(&String::from_utf8_lossy(&landing.reply.body))
         .ok_or_else(|| {
@@ -964,8 +1048,15 @@ pub(crate) fn https_exchange(
         https_target(url).ok_or_else(|| format!("warp access: `{url}` is not an https URL"))?;
     let endpoint = Endpoint::parse(&origin, crate::quic::system_roots())
         .ok_or_else(|| format!("warp access: `{url}` is not an https URL"))?;
-    crate::foxy_account::ask(&endpoint, method, &target, headers, body)
-        .map_err(|reason| format!("warp access: {reason}"))
+    crate::foxy_account::ask_within(
+        &endpoint,
+        method,
+        &target,
+        headers,
+        body,
+        ACCESS_REQUEST_TIMEOUT,
+    )
+    .map_err(|reason| format!("warp access: {reason}"))
 }
 
 /// A token resolver that signs in once per process: `--register all` makes several devices and
@@ -982,17 +1073,20 @@ pub(crate) fn resolve_token(
             Err(poisoned) => poisoned.into_inner(),
         };
         if let Some((team, token)) = cached.as_ref() {
-            if *team == settings.team && !jwt_expired(token, now) {
+            if *team == settings.team && jwt_expiry(token).is_some_and(|expiry| now < expiry) {
                 return Ok(token.clone());
             }
         }
     }
     let token = sign_in(settings, now, &https_exchange, prompt)?;
+    let issued = now();
     let mut cached = match CACHED.lock() {
         Ok(cached) => cached,
         Err(poisoned) => poisoned.into_inner(),
     };
-    *cached = Some((settings.team.clone(), token.clone()));
+    *cached = jwt_expiry(&token)
+        .filter(|expiry| issued < *expiry)
+        .map(|_| (settings.team.clone(), token.clone()));
     Ok(token)
 }
 
@@ -1111,6 +1205,34 @@ mod tests {
             ))
         );
         assert_eq!(https_target("http://acme.cloudflareaccess.com"), None);
+    }
+
+    #[test]
+    fn a_default_https_port_is_the_same_origin() {
+        assert_eq!(
+            origin("https://acme.cloudflareaccess.com"),
+            origin("https://acme.cloudflareaccess.com:443")
+        );
+        assert_eq!(
+            origin("https://acme.cloudflareaccess.com:444"),
+            Some("https://acme.cloudflareaccess.com:444".to_owned())
+        );
+        assert_ne!(
+            origin("https://acme.cloudflareaccess.com"),
+            origin("https://evil.example")
+        );
+    }
+
+    #[test]
+    fn a_parent_reference_is_resolved_before_the_redirect() {
+        assert_eq!(
+            resolve_url(
+                "https://acme.cloudflareaccess.com/cdn-cgi/access/login/start",
+                "../verify?nonce=abc",
+            )
+            .as_deref(),
+            Some("https://acme.cloudflareaccess.com/cdn-cgi/access/verify?nonce=abc")
+        );
     }
 
     #[test]
@@ -1254,6 +1376,30 @@ mod tests {
             )
             .expect("the next request");
         assert!(!sent.get());
+    }
+
+    #[test]
+    fn an_off_origin_callback_token_and_cookie_are_ignored() {
+        let token = jwt("{\"exp\":4102444800,\"iss\":\"https://acme.cloudflareaccess.com\"}");
+        let mut session = Session::for_origin("https://acme.cloudflareaccess.com");
+        let page = session
+            .get(
+                "https://evil.example/cdn-cgi/access/callback",
+                &[],
+                &|_, _, _, _| {
+                    Ok(reply(
+                        200,
+                        vec![(
+                            "Set-Cookie".to_owned(),
+                            format!("CF_Authorization={token}; Path=/; Secure"),
+                        )],
+                        "",
+                    ))
+                },
+            )
+            .expect("an off-origin page");
+        assert!(page.token.is_none());
+        assert!(session.cookies.is_empty());
     }
 
     #[test]
@@ -1558,6 +1704,12 @@ mod tests {
         assert!(!jwt_expired(&live, 1));
         assert!(jwt_expired(&live, 4_102_444_800));
         assert_eq!(jwt_expiry("not-a-jwt"), None);
+        assert!(jwt_expired("not-a-jwt", 1));
+        assert!(!jwt_expired(&jwt("{\"exp\":4102444800}"), 1));
+        assert!(jwt_expired(
+            &jwt("{\"iss\":\"https://acme.cloudflareaccess.com\"}"),
+            1
+        ));
     }
 
     #[test]

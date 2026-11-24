@@ -2455,20 +2455,29 @@ fn connect_status(head: &[u8]) -> Option<u16> {
     let mut lines = head.split(|byte| *byte == b'\n');
     let line = lines.next()?;
     let line = line.strip_suffix(b"\r").unwrap_or(line);
-    let text = std::str::from_utf8(line).ok()?;
-    let mut parts = text.split_whitespace();
-    let version = parts.next()?.strip_prefix("HTTP/")?;
-    let (major, minor) = version.split_once('.')?;
+    let mut parts = line.split(|byte| *byte == b' ');
+    let version = parts.next()?;
+    let status = parts.find(|part| !part.is_empty())?;
+    let version = version.strip_prefix(b"HTTP/")?;
+    let dot = version.iter().position(|byte| *byte == b'.')?;
+    let (major, minor) = version.split_at(dot);
+    let minor = minor.get(1..)?;
     if major.is_empty()
         || minor.is_empty()
-        || !major.bytes().all(|byte| byte.is_ascii_digit())
-        || !minor.bytes().all(|byte| byte.is_ascii_digit())
+        || !major.iter().chain(minor).all(|byte| byte.is_ascii_digit())
     {
         return None;
     }
-    let status = parts.next()?;
-    if status.len() != 3 || !status.bytes().all(|byte| byte.is_ascii_digit()) {
+    if status.len() != 3 || !status.iter().all(|byte| byte.is_ascii_digit()) {
         return None;
+    }
+    for reason in parts {
+        if !reason
+            .iter()
+            .all(|byte| matches!(*byte, b'\t' | b' ' | 0x21..=0x7e | 0x80..=0xff))
+        {
+            return None;
+        }
     }
     for field in lines {
         let field = field.strip_suffix(b"\r").unwrap_or(field);
@@ -2682,7 +2691,6 @@ impl WarpOut {
             return Ok(Self::unbuilt(&spec));
         };
         let inner_identity = resolve_for_mode(&mut spec, &mut identity, test)?;
-        let gateway = gateway_for(identity.gateway.as_deref(), spec.gateway);
         if test && spec.mode == Mode::Gool {
             validate_gool(&identity, &spec)?;
             return Ok(Self::unbuilt(&spec));
@@ -2744,6 +2752,16 @@ impl WarpOut {
                 .as_ref()
                 .ok_or("warp mim: the inner identity was not built")?;
             Some(Arc::new(build_mim(&identity, inner, &spec)?))
+        } else {
+            None
+        };
+        let gateway = if masque.is_some() || gool.is_some() || mim.is_some() {
+            gateway_for(identity.gateway.as_deref(), spec.gateway)
+        } else if spec.gateway && identity.gateway.is_some() {
+            eprintln!(
+                "warp: `gateway: true` needs the MASQUE half; http and https go straight through the tunnel"
+            );
+            None
         } else {
             None
         };
@@ -2810,6 +2828,25 @@ impl WarpOut {
         lane
     }
 
+    fn has_masque_carrier(&self) -> bool {
+        self.masque.is_some() || self.gool.is_some() || self.mim.is_some()
+    }
+
+    fn serve_gateway(
+        &self,
+        client: crate::conn::Connection,
+        asked: &crate::proxy::Destination,
+        prefix: &[u8],
+    ) {
+        if let Some(masque) = &self.masque {
+            masque.serve_tcp(client, asked, prefix);
+        } else if let Some(gool) = &self.gool {
+            gool.outer.serve_tcp(client, asked, prefix);
+        } else if let Some(mim) = &self.mim {
+            mim.outer.serve_tcp(client, asked, prefix);
+        }
+    }
+
     pub(crate) fn edge(&self) -> Option<SocketAddr> {
         match self.mode {
             Mode::WireGuard => self.wireguard.as_ref().and_then(|half| half.edge()),
@@ -2868,15 +2905,17 @@ impl WarpOut {
             self.serve_lane(client, asked, prefix);
             return;
         };
-        let lane = self.lane();
+        let direct = self.lane();
+        let deadline = Instant::now() + GATEWAY_PROBE_TIMEOUT;
         let Some((local, tunnel)) = crate::reverse::loopback_pair() else {
-            gateway.retire("no loopback stream");
-            self.serve_on(lane, client, asked, prefix);
+            self.serve_on(direct, client, asked, prefix);
             return;
         };
-        let deadline = Instant::now() + GATEWAY_PROBE_TIMEOUT;
-        self.serve_on(
-            lane,
+        if !self.has_masque_carrier() {
+            self.serve_on(direct, client, asked, prefix);
+            return;
+        }
+        self.serve_gateway(
             tunnel,
             &crate::proxy::Destination::Address(gateway.proxy),
             &[],
@@ -2884,7 +2923,11 @@ impl WarpOut {
         let budget = deadline.saturating_duration_since(Instant::now());
         if budget.is_zero() {
             gateway.retire("the gateway did not open within the probe budget");
-            self.serve_on(lane, client, asked, prefix);
+            self.serve_on(direct, client, asked, prefix);
+            return;
+        }
+        if !gateway.answers(asked) {
+            self.serve_on(direct, client, asked, prefix);
             return;
         }
         let answered = local.set_write_timeout(Some(budget)).and_then(|()| {
@@ -2896,13 +2939,13 @@ impl WarpOut {
             Ok(head) => head,
             Err(reason) => {
                 gateway.retire(&reason.to_string());
-                self.serve_on(lane, client, asked, prefix);
+                self.serve_on(direct, client, asked, prefix);
                 return;
             }
         };
         if !accepted {
             gateway.retire("the gateway refused the CONNECT");
-            self.serve_on(lane, client, asked, prefix);
+            self.serve_on(direct, client, asked, prefix);
             return;
         }
         let _ = local.set_read_timeout(None);
@@ -6163,6 +6206,8 @@ mod tests {
             connect_status(b"HTTP/1.1 200 OK\r\nX-Bad: a\x01b\r\n\r\n"),
             None
         );
+        assert_eq!(connect_status(b"HTTP/1.1 200 \xff\r\n\r\n"), Some(200));
+        assert_eq!(connect_status(b"HTTP/1.1 200 a\x01b\r\n\r\n"), None);
     }
 
     #[test]

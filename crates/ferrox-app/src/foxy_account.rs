@@ -8,7 +8,7 @@ use ferrox_core::tls::{TlsConfig, TlsProvider as _};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::SocketAddr;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(20);
 pub(crate) const USER_AGENT: &str = "MozillaVPN/2.35.0 (sys:linux; iap:true)";
@@ -496,7 +496,10 @@ pub(crate) fn read_reply_limited<S: Read>(
 ) -> Result<Reply, Failure> {
     let mut io = BufReader::with_capacity(1024, io);
     let mut reply = read_head(&mut io)?;
-    if matches!(reply.status, 204 | 304) || (100..200).contains(&reply.status) {
+    while (100..200).contains(&reply.status) && reply.status != 101 {
+        reply = read_head(&mut io)?;
+    }
+    if matches!(reply.status, 101 | 204 | 304) {
         return Ok(reply);
     }
     reply.body = read_body(&mut io, &reply.headers, chunk, max_body)?;
@@ -1334,6 +1337,60 @@ pub(crate) fn ask_limited(
         .map_err(|why| format!("reading {} {url}: {why}", endpoint.host))
 }
 
+/// One request bounded by an absolute deadline, so a peer that drips its answer cannot hold the caller past its budget.
+pub(crate) fn ask_within(
+    endpoint: &Endpoint,
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    budget: Duration,
+) -> Result<Reply, String> {
+    let deadline = Instant::now() + budget;
+    let mut tls = endpoint.connect()?;
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(format!(
+            "reading {} {url}: the request deadline passed before the connection opened",
+            endpoint.host
+        ));
+    }
+    let _ = tls
+        .get_ref()
+        .set_write_timeout(Some(left.max(Duration::from_millis(1))));
+    tls.write_all(&request(method, endpoint.host_header(), url, headers, body))
+        .and_then(|()| tls.flush())
+        .map_err(|why| format!("writing {} {url}: {why}", endpoint.host))?;
+    let mut io = DeadlineRead {
+        tls: &mut tls,
+        deadline,
+    };
+    read_reply_limited(&mut io, DEFAULT_READ_CHUNK, MAX_BODY)
+        .map_err(|why| format!("reading {} {url}: {why}", endpoint.host))
+}
+
+struct DeadlineRead<'a> {
+    tls: &'a mut ferrox_core::tls::ClientSession<Connection>,
+    deadline: Instant,
+}
+
+impl Read for DeadlineRead<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the request deadline passed",
+            ));
+        }
+        let _ = self
+            .tls
+            .get_ref()
+            .set_read_timeout(Some(left.max(Duration::from_millis(1))));
+        self.tls.read(buf)
+    }
+}
+
 /// One GET whose body is written to a file, so an interrupted transfer leaves what arrived for the next Range request.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ask_to_file(
@@ -1896,6 +1953,16 @@ mod tests {
         let reply = read_reply(&mut raw.as_slice(), DEFAULT_READ_CHUNK).expect("reads");
         assert_eq!(reply.status, 200);
         assert_eq!(reply.body, b"hello world");
+    }
+
+    #[test]
+    fn an_informational_response_is_consumed_before_the_final_one() {
+        let raw = piped(
+            b"HTTP/1.1 103 Early Hints\r\nLink: </x>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        );
+        let reply = read_reply(&mut raw.as_slice(), DEFAULT_READ_CHUNK).expect("reads");
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.body, b"ok");
     }
 
     #[test]
