@@ -810,7 +810,7 @@ fn serve_inbounds_counted(
                         if listeners > 0 {
                             if let Some(stop) = &handler_stop {
                                 for _ in 0..listeners {
-                                    handler_stops.push((Arc::clone(stop), address.clone()));
+                                    handler_stops.push((Arc::clone(stop), wake_address.clone()));
                                 }
                             }
                             inbounds += 1;
@@ -14203,7 +14203,7 @@ where
             } else {
                 note_wait_finish(ended);
                 buffer.release();
-                Next::Idle
+                settle_lane(&sink, at, ended).unwrap_or(Next::Idle)
             }
         }
         Err(_) => {

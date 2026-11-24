@@ -1991,28 +1991,42 @@ impl H2Conn {
         }
         let batch = (self.recv_window as usize).clamp(1, CREDIT_BATCH_BYTES);
         self.credit_connection(wire as usize, batch);
-        let pending = {
+        let (pending, starved) = {
             let streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
             let Some(state) = streams.get(&stream).cloned() else {
                 return;
             };
             drop(streams);
             let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let starved = st.body.is_empty() && !st.read_ended() && !st.dead;
             let pending = st.pending_credit.saturating_add(wire);
             let flush = (st.read_ended() && st.body.is_empty())
                 || st.dead
+                || starved
                 || matches!(self.control, Control::Inline)
                 || pending as usize >= batch;
             if flush {
                 st.pending_credit = 0;
-                pending
+                (pending, starved)
             } else {
                 st.pending_credit = pending;
-                0
+                (0, starved)
             }
         };
+        if starved {
+            self.flush_connection_credit();
+        }
         if pending > 0 {
             self.replenish_stream(stream, pending as usize);
+        }
+    }
+
+    /// Return the shared window a reader's consumed bytes are holding while it has no body left,
+    /// so a peer that exhausted the connection window can send the DATA the reader is waiting for.
+    fn flush_connection_credit(&self) {
+        let take = self.conn_credit.swap(0, Ordering::SeqCst);
+        if take > 0 {
+            self.replenish_connection(take);
         }
     }
 
@@ -2798,7 +2812,10 @@ impl H2Conn {
                 ) {
                     Some(true) => {}
                     Some(false) => {
-                        if partial.head_len + partial.body_len == before {
+                        if yieldable
+                            && deadline.is_some()
+                            && partial.head_len + partial.body_len == before
+                        {
                             partial.since = None;
                         }
                         return Pumped::Yield;
@@ -2832,7 +2849,10 @@ impl H2Conn {
             ) {
                 Some(true) => {}
                 Some(false) => {
-                    if partial.head_len + partial.body_len == before {
+                    if yieldable
+                        && deadline.is_some()
+                        && partial.head_len + partial.body_len == before
+                    {
                         partial.since = None;
                     }
                     return Pumped::Yield;
