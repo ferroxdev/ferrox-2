@@ -1474,7 +1474,7 @@ pub(crate) fn server(
 ) {
     let mut stack = ServerStack::new(&config, to_tunnel, out, headroom);
     if !inner_congestion {
-        stack.set_congestion(CongestionControl::None);
+        stack.set_congestion(CongestionControl::Reno);
     }
     stack.device.recycle = recycle;
     loop {
@@ -1955,8 +1955,8 @@ struct ServerStack {
 }
 
 impl ServerStack {
-    /// The inner TCP's congestion controller. A reliable outer transport already
-    /// gates the network, so its inner CC only caps a window the tunnel has room for.
+    /// The inner TCP's congestion controller. The outer transport is reliable, so
+    /// the server caps its window with a controller that grows steadily to it.
     fn set_congestion(&mut self, congestion: CongestionControl) {
         self.congestion = congestion;
     }
