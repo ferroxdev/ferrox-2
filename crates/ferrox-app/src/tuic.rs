@@ -20,6 +20,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const SCID_LEN: usize = 16;
 const HEARTBEAT: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(100);
+/// A client driver's idle arm: a queue the relay drained is refilled within this beat without a packet.
+const CLIENT_POLL: Duration = Duration::from_millis(1);
 const UDP_IDLE: Duration = Duration::from_secs(300);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
 const CONNECT_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -155,6 +157,7 @@ struct Lane {
     sinks: Mutex<HashMap<u16, Arc<UdpSink>>>,
     pending: Mutex<Vec<Pending>>,
     session: Arc<Mutex<Option<Vec<u8>>>>,
+    pump: Arc<quic::StreamPump>,
     heartbeat: thread::Thread,
     auth: Auth,
     authed: AtomicBool,
@@ -537,6 +540,7 @@ impl TuicOut {
             sinks: Mutex::new(HashMap::new()),
             pending: Mutex::new(Vec::new()),
             session: Arc::clone(&self.session),
+            pump: Arc::new(quic::StreamPump::new()),
             heartbeat,
             auth: Auth {
                 uuid: self.uuid,
@@ -626,7 +630,8 @@ impl TuicOut {
             id,
             proxy::flow_outbound_meter().unwrap_or_default(),
         )
-        .with_stop(Arc::clone(&lane.stop));
+        .with_stop(Arc::clone(&lane.stop))
+        .with_pump(&lane.pump);
         if stream.write_all(&header).is_err() {
             stream.close();
             return;
@@ -1123,7 +1128,7 @@ fn drive_client(weak: &std::sync::Weak<Lane>) {
         if lane.stop.load(Ordering::Relaxed) {
             break;
         }
-        if lane.sock.set_read_timeout(Some(POLL)).is_err() {
+        if lane.sock.set_read_timeout(Some(CLIENT_POLL)).is_err() {
             break;
         }
         let alive = match quic::recv_batch(&lane.sock, &mut batch) {
@@ -1163,6 +1168,7 @@ fn drive_client(weak: &std::sync::Weak<Lane>) {
                 let Ok(mut conn) = lane.conn.lock() else {
                     break;
                 };
+                pump_bidi(&mut conn, &lane, &mut ids);
                 service(&mut conn, &lane)
             }
             quic::Drain::Unbatchable => match lane.sock.recv_from(&mut buf) {
@@ -1319,7 +1325,53 @@ fn client_turn(
             uni.insert(id, data);
         }
     }
+    pump_bidi(conn, lane, ids);
     service(conn, lane)
+}
+
+/// Hand every readable client stream's bytes to the queue its relay reads, up to the queue's free
+/// room: a full queue leaves the rest in quiche's window, so the driver never copies ahead of TCP.
+fn pump_bidi(conn: &mut QuicheConnection, lane: &Lane, ids: &mut Vec<u64>) {
+    ids.clear();
+    ids.extend(conn.readable());
+    let mut buf = [0u8; 64 * 1024];
+    for &id in ids.iter() {
+        if id % 4 != 0 {
+            continue;
+        }
+        let Some(queue) = lane.pump.queue(id) else {
+            continue;
+        };
+        loop {
+            let want = queue.free().min(buf.len());
+            if want == 0 {
+                break;
+            }
+            match conn.stream_recv(id, &mut buf[..want]) {
+                Ok((0, fin)) => {
+                    if fin {
+                        queue.finish();
+                    }
+                    break;
+                }
+                Ok((n, fin)) => {
+                    queue.push(&buf[..n]);
+                    if fin {
+                        queue.finish();
+                        break;
+                    }
+                    if n < want {
+                        break;
+                    }
+                }
+                Err(quiche::Error::Done) => break,
+                Err(_) => {
+                    queue.finish();
+                    break;
+                }
+            }
+        }
+    }
 }
 
 fn flush_lane(lane: &Lane, conn: &mut QuicheConnection) {
