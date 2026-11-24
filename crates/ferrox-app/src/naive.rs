@@ -800,6 +800,7 @@ struct NaiveInner {
     reset_end: Mutex<Option<End>>,
     ended: AtomicBool,
     aborted: AtomicBool,
+    write_lost: AtomicBool,
     padded: bool,
 }
 
@@ -867,9 +868,26 @@ impl NaiveStream {
                 reset_end: Mutex::new(Some(end)),
                 ended: AtomicBool::new(false),
                 aborted: AtomicBool::new(false),
+                write_lost: AtomicBool::new(false),
                 padded,
             }),
         }
+    }
+
+    fn short(done: usize) -> std::io::Result<usize> {
+        if done > 0 {
+            Ok(done)
+        } else {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    fn progress(&mut self) -> bool {
+        self.inner
+            .writer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .progress()
     }
 
     fn finish(&self) {
@@ -902,27 +920,46 @@ impl Read for NaiveStream {
 
 impl Write for NaiveStream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.inner.write_lost.load(Ordering::Relaxed) {
+            return Err(std::io::ErrorKind::BrokenPipe.into());
+        }
         let mut done = 0;
-        let deadline = Instant::now() + crate::budgets::relay_stall();
+        let mut deadline = Instant::now() + crate::budgets::relay_stall();
         while done < buf.len() {
             match self.push(&buf[done..]) {
-                proxy::Push::Took(n) if n > 0 => done += n,
+                proxy::Push::Took(n) if n > 0 => {
+                    done += n;
+                    let _ = self.progress();
+                    deadline = Instant::now() + crate::budgets::relay_stall();
+                }
                 proxy::Push::Took(_) | proxy::Push::Parked => {
+                    if self.progress() {
+                        deadline = Instant::now() + crate::budgets::relay_stall();
+                        continue;
+                    }
                     if Instant::now() >= deadline {
-                        return Err(std::io::ErrorKind::BrokenPipe.into());
+                        return Self::short(done);
                     }
                     self.wait_room(crate::budgets::RELAY_POLL);
                 }
-                proxy::Push::Lost => return Err(std::io::ErrorKind::BrokenPipe.into()),
+                proxy::Push::Lost => {
+                    self.inner.write_lost.store(true, Ordering::Relaxed);
+                    return Self::short(done);
+                }
             }
         }
         loop {
             match self.settle() {
                 proxy::Settle::Clear => return Ok(done),
-                proxy::Settle::Advanced => {}
-                proxy::Settle::Lost => return Err(std::io::ErrorKind::BrokenPipe.into()),
+                proxy::Settle::Advanced => {
+                    deadline = Instant::now() + crate::budgets::relay_stall();
+                }
+                proxy::Settle::Lost => {
+                    self.inner.write_lost.store(true, Ordering::Relaxed);
+                    return Self::short(done);
+                }
                 proxy::Settle::Parked if Instant::now() >= deadline => {
-                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                    return Self::short(done);
                 }
                 proxy::Settle::Parked => self.wait_room(crate::budgets::RELAY_POLL),
             }
@@ -930,6 +967,9 @@ impl Write for NaiveStream {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        if self.inner.write_lost.load(Ordering::Relaxed) {
+            return Err(std::io::ErrorKind::BrokenPipe.into());
+        }
         self.inner
             .writer
             .lock()
@@ -1090,6 +1130,7 @@ struct H3OutWrite {
     pending: Vec<u8>,
     at: usize,
     input: usize,
+    moved: bool,
 }
 
 impl H3OutWrite {
@@ -1099,6 +1140,7 @@ impl H3OutWrite {
             pending: Vec::new(),
             at: 0,
             input: 0,
+            moved: false,
         }
     }
 }
@@ -1125,7 +1167,10 @@ impl proxy::LaneWrite for H3OutWrite {
         if !self.pending.is_empty() {
             match self.out.try_write(&self.pending[self.at..]) {
                 Ok(0) => return proxy::Push::Parked,
-                Ok(n) => self.at += n,
+                Ok(n) => {
+                    self.at += n;
+                    self.moved = true;
+                }
                 Err(error) if proxy::is_timeout(&error) => return proxy::Push::Parked,
                 Err(_) => {
                     self.pending.clear();
@@ -1157,7 +1202,10 @@ impl proxy::LaneWrite for H3OutWrite {
         self.at = 0;
         match self.out.try_write(&self.pending) {
             Ok(0) => return proxy::Push::Parked,
-            Ok(n) => self.at = n,
+            Ok(n) => {
+                self.at = n;
+                self.moved = true;
+            }
             Err(error) if proxy::is_timeout(&error) => return proxy::Push::Parked,
             Err(_) => {
                 self.pending.clear();
@@ -1172,6 +1220,10 @@ impl proxy::LaneWrite for H3OutWrite {
         self.at = 0;
         self.input = 0;
         proxy::Push::Took(take)
+    }
+
+    fn progress(&mut self) -> bool {
+        std::mem::take(&mut self.moved)
     }
 }
 
@@ -1721,8 +1773,52 @@ struct PendingUot {
     bytes: usize,
 }
 
+#[derive(Default)]
+struct UotQueue {
+    bytes: AtomicUsize,
+}
+
+impl UotQueue {
+    fn reserve(&self, bytes: usize) -> bool {
+        let mut current = self.bytes.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = current.checked_add(bytes) else {
+                return false;
+            };
+            if next > MAX_UOT_PENDING_BYTES {
+                return false;
+            }
+            match self.bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(seen) => current = seen,
+            }
+        }
+    }
+
+    fn release(&self, bytes: usize) {
+        self.bytes.fetch_sub(bytes, Ordering::Relaxed);
+    }
+}
+
+struct UotPacket {
+    payload: Vec<u8>,
+    queue: Arc<UotQueue>,
+}
+
+impl Drop for UotPacket {
+    fn drop(&mut self) {
+        self.queue.release(self.payload.len());
+    }
+}
+
 struct UotLane {
-    tx: SyncSender<Vec<u8>>,
+    tx: SyncSender<UotPacket>,
+    queue: Arc<UotQueue>,
     done: Arc<AtomicBool>,
     abort: NaiveStream,
     used: u64,
@@ -1735,7 +1831,7 @@ fn uot_writer(
     connect: bool,
     target: &Destination,
     initial: VecDeque<Vec<u8>>,
-    rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+    rx: &std::sync::mpsc::Receiver<UotPacket>,
     done: &AtomicBool,
 ) {
     for packet in initial {
@@ -1755,7 +1851,7 @@ fn uot_writer(
         let Ok(packet) = rx.recv() else {
             break;
         };
-        if write_uot_packet(&mut stream, connect, target, &packet).is_err() {
+        if write_uot_packet(&mut stream, connect, target, &packet.payload).is_err() {
             done.store(true, Ordering::Relaxed);
             stream.abort();
             break;
@@ -1869,6 +1965,7 @@ impl NaiveOut {
                             continue;
                         }
                         let (tx, rx) = std::sync::mpsc::sync_channel(MAX_UOT_PENDING_PACKETS);
+                        let queue = Arc::new(UotQueue::default());
                         let writer_stream = stream.clone();
                         let writer_done = Arc::clone(&done);
                         if done.load(Ordering::Relaxed) {
@@ -1914,6 +2011,7 @@ impl NaiveOut {
                                 key,
                                 UotLane {
                                     tx,
+                                    queue,
                                     done,
                                     abort: stream,
                                     used: use_tick,
@@ -2061,7 +2159,14 @@ impl NaiveOut {
                 if lane.done.load(Ordering::Relaxed) {
                     return true;
                 }
-                match lane.tx.try_send(payload.to_vec()) {
+                if !lane.queue.reserve(payload.len()) {
+                    return false;
+                }
+                let packet = UotPacket {
+                    payload: payload.to_vec(),
+                    queue: Arc::clone(&lane.queue),
+                };
+                match lane.tx.try_send(packet) {
                     Ok(()) | Err(TrySendError::Full(_)) => false,
                     Err(TrySendError::Disconnected(_)) => true,
                 }
@@ -4046,6 +4151,23 @@ mod tests {
         )
         .expect("parses");
         assert!(validate_inbound(&controller).is_err());
+    }
+
+    #[test]
+    fn a_live_uot_queue_holds_its_byte_budget() {
+        let queue = UotQueue::default();
+        assert!(queue.reserve(MAX_UOT_PENDING_BYTES));
+        assert!(!queue.reserve(1));
+        queue.release(MAX_UOT_PENDING_BYTES);
+        assert!(queue.reserve(1));
+        let live = Arc::new(UotQueue::default());
+        assert!(live.reserve(1024));
+        let packet = UotPacket {
+            payload: vec![0; 1024],
+            queue: Arc::clone(&live),
+        };
+        drop(packet);
+        assert!(live.reserve(MAX_UOT_PENDING_BYTES));
     }
 
     #[test]

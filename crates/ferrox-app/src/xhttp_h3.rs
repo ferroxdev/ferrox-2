@@ -1185,7 +1185,11 @@ impl Write for ClientStream {
             let Ok(mut conn) = self.conn.lock() else {
                 return Err(std::io::Error::other("h3 connection lock poisoned"));
             };
-            if self.owner.dead.load(Ordering::Relaxed) || self.owner.rejected(self.id) {
+            if self.owner.dead.load(Ordering::Relaxed)
+                || self.owner.rejected(self.id)
+                || conn.is_draining()
+                || conn.is_closed()
+            {
                 return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
             }
             match conn.stream_send_zc(self.id, rest.clone(), false) {
@@ -1230,7 +1234,11 @@ impl ClientStream {
         let Ok(mut conn) = self.conn.lock() else {
             return Err(std::io::Error::other("h3 connection lock poisoned"));
         };
-        if self.owner.dead.load(Ordering::Relaxed) || self.owner.rejected(self.id) {
+        if self.owner.dead.load(Ordering::Relaxed)
+            || self.owner.rejected(self.id)
+            || conn.is_draining()
+            || conn.is_closed()
+        {
             return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
         }
         match conn.stream_send_zc(self.id, bytes::Bytes::copy_from_slice(buf), false) {

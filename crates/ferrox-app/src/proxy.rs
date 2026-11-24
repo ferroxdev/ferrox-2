@@ -39051,6 +39051,10 @@ pub(crate) trait LaneWrite: Write + Send {
         Settle::Clear
     }
 
+    fn progress(&mut self) -> bool {
+        false
+    }
+
     fn wait_room(&mut self, turn: Duration) {
         std::thread::sleep(turn);
     }
