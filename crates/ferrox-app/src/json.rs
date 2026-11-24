@@ -490,6 +490,80 @@ fn next_in(bytes: &[u8], needles: &[u8]) -> Option<(usize, u8)> {
     None
 }
 
+/// What one walk finds: a comment or a comma that closes its array. A backslash outside a string
+/// is the one byte where the two quote rules disagree, and the caller settles it with both walks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shape {
+    Clean,
+    Comments,
+    Comma,
+    Diverged,
+}
+
+/// One walk answers both questions the strip asks, where two walks asked them one after the other.
+/// The state machine is `has_comments`'s, so a comma is only read outside a string under that same
+/// rule; the pass-2 answer differs only after an outside backslash, which returns `Diverged`.
+fn classify(bytes: &[u8]) -> Shape {
+    let mut at = 0usize;
+    let mut quote = 0u8;
+    let mut escaped = false;
+    let mut comma = false;
+    while at < bytes.len() {
+        if quote != 0 {
+            let escape = escaped;
+            escaped = false;
+            let Some((offset, special)) = next_in(&bytes[at..], &[quote, b'\\']) else {
+                break;
+            };
+            at += offset;
+            if escape && offset == 0 {
+                at += 1;
+                continue;
+            }
+            if special == b'\\' {
+                escaped = true;
+            } else {
+                quote = 0;
+            }
+            at += 1;
+            continue;
+        }
+        let Some((offset, special)) = next_in(&bytes[at..], b"\"'\\#/,") else {
+            break;
+        };
+        at += offset;
+        match special {
+            b'"' | b'\'' => {
+                quote = special;
+                at += 1;
+            }
+            b'#' => return Shape::Comments,
+            b'\\' => return Shape::Diverged,
+            b'/' => {
+                if matches!(bytes.get(at + 1), Some(b'/' | b'*')) {
+                    return Shape::Comments;
+                }
+                at += 1;
+            }
+            _ => {
+                if !comma {
+                    let mut next = at + 1;
+                    while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+                        next += 1;
+                    }
+                    comma = matches!(bytes.get(next), Some(b'}' | b']'));
+                }
+                at += 1;
+            }
+        }
+    }
+    if comma {
+        Shape::Comma
+    } else {
+        Shape::Clean
+    }
+}
+
 /// Whether a comment sits outside a string: read-only, and it stops at the first one.
 fn has_comments(bytes: &[u8]) -> bool {
     let mut at = 0usize;
@@ -744,15 +818,24 @@ fn compact_trailing(out: &mut [u8]) -> usize {
 }
 
 /// JSONC (also `.json5`): `//`, `/* */` and `#` comments and trailing commas, stripped outside
-/// strings so the strict parser sees the JSON the reference's permissive reader would. Two
-/// read-only walks find a comment and a comma that closes its array; a text with neither keeps its
-/// borrow, so an untouched config is allocated or copied zero times.
+/// strings so the strict parser sees the JSON the reference's permissive reader would. One
+/// read-only walk finds a comment or a comma that closes its array, and only a backslash outside a
+/// string sends the text to both exact walks; a text with neither keeps its borrow, so an untouched
+/// config is allocated or copied zero times.
 pub(crate) fn strip_jsonc(text: &str) -> std::borrow::Cow<'_, str> {
     let bytes = text.as_bytes();
-    let comments = has_comments(bytes);
-    if !comments && !has_trailing_comma(bytes) {
-        return std::borrow::Cow::Borrowed(text);
-    }
+    let comments = match classify(bytes) {
+        Shape::Clean => return std::borrow::Cow::Borrowed(text),
+        Shape::Comments => true,
+        Shape::Comma => false,
+        Shape::Diverged => {
+            let comments = has_comments(bytes);
+            if !comments && !has_trailing_comma(bytes) {
+                return std::borrow::Cow::Borrowed(text);
+            }
+            comments
+        }
+    };
     let mut out = if comments {
         let mut out = Vec::with_capacity(bytes.len());
         strip_comments(bytes, &mut out);
@@ -1464,6 +1547,20 @@ mod tests {
         }
         out.truncate(write);
         String::from_utf8_lossy(&out).into_owned()
+    }
+
+    #[test]
+    fn one_walk_classifies_a_comment_a_comma_a_clean_text_and_a_divergence() {
+        assert_eq!(classify(br#"{"a":1}"#), Shape::Clean);
+        assert_eq!(classify(br#"{"a":1,}"#), Shape::Comma);
+        assert_eq!(classify(br#"{"a":[1,2,],"b":3}"#), Shape::Comma);
+        assert_eq!(classify(br#"{"a":","}"#), Shape::Clean);
+        assert_eq!(classify(br#"{"a":"x,}"#), Shape::Clean);
+        assert_eq!(classify(b"{} // note"), Shape::Comments);
+        assert_eq!(classify(b"{} /* note */"), Shape::Comments);
+        assert_eq!(classify(b"{}\n# note"), Shape::Comments);
+        assert_eq!(classify(br#"{"a":1\,}"#), Shape::Diverged);
+        assert_eq!(classify(b"{'a': ','}"), Shape::Clean);
     }
 
     #[test]
