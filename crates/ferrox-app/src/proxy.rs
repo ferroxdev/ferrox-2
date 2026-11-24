@@ -36442,14 +36442,14 @@ pub(crate) mod lane_pool {
     static DEMUX_POOL: OnceLock<std::sync::Arc<Pool>> = OnceLock::new();
     static BORROWED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-    /// A server's flow parks one leg on the peer's window, so eight download lanes carry the widest
-    /// standard cell. The h2 demux runs on its own pool with its own reaper, so this caps the relay
-    /// workers, not the process. A worker starts only when a lane is queued and no worker is idle.
+    /// A server runs both legs of a duplex flow, so its ceiling is two legs for every flow of the
+    /// widest standard cell. The h2 demux runs on its own pool with its own reaper, so this caps the
+    /// relay workers, not the process. A worker starts only when a lane is queued and no worker is idle.
     #[cfg(target_os = "linux")]
-    pub(crate) const RELAY_LANES: usize = 8;
+    pub(crate) const RELAY_LANES: usize = 16;
     /// The timer-parked hosts keep the wider set because their lanes wait without a descriptor.
     #[cfg(not(target_os = "linux"))]
-    pub(crate) const RELAY_LANES: usize = 8;
+    pub(crate) const RELAY_LANES: usize = 16;
 
     /// A client pumps both legs of a flow at once, so its ceiling is two legs for every flow of
     /// the widest standard cell.
