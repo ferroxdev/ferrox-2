@@ -156,6 +156,8 @@ pub(crate) struct MasqueOut {
     inner: Mutex<Slot>,
     dialing: AtomicUsize,
     dialed: Condvar,
+    #[cfg(test)]
+    queued: AtomicUsize,
 }
 
 /// Releases a dial reservation on every exit, including an unwind after a failed lane setup.
@@ -277,8 +279,15 @@ impl MasqueOut {
             }),
             dialing: AtomicUsize::new(0),
             dialed: Condvar::new(),
+            #[cfg(test)]
+            queued: AtomicUsize::new(0),
             spec,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queued(&self) -> usize {
+        self.queued.load(Ordering::Relaxed)
     }
 
     pub(crate) fn edge(&self) -> Option<SocketAddr> {
@@ -602,6 +611,8 @@ impl MasqueOut {
             eprintln!("masque: the userspace stack is gone");
             return false;
         }
+        #[cfg(test)]
+        self.queued.fetch_add(1, Ordering::Relaxed);
         true
     }
 

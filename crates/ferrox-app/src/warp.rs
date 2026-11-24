@@ -3638,14 +3638,21 @@ struct PlannedSlot {
 }
 
 /// Load or make every identity the kind names. A slot with no file is saved as
-/// soon as it is made so a later failure does not orphan it, and a replacement
-/// is saved before the next slot so a refusal cannot be registered twice.
+/// soon as it is made, and a changed or replacement identity is saved before
+/// the next slot so a later failure cannot orphan it or register it twice.
 fn provision_kind(
     spec: &WarpSpec,
     kind: KeyKind,
     paths: &KeyPaths,
 ) -> Result<Vec<PlannedSlot>, String> {
-    provision_kind_with(spec, kind, paths, &register, &refresh_saved)
+    provision_kind_with(
+        spec,
+        kind,
+        paths,
+        &register,
+        &refresh_saved,
+        reprovision_enabled(),
+    )
 }
 
 fn provision_kind_with(
@@ -3654,6 +3661,7 @@ fn provision_kind_with(
     paths: &KeyPaths,
     register_identity: &dyn Fn(&WarpSpec, bool) -> Result<Identity, String>,
     refresh_identity: &dyn Fn(&WarpSpec, &Identity) -> Result<Identity, RegisterError>,
+    reprovision: bool,
 ) -> Result<Vec<PlannedSlot>, String> {
     let planned = planned_slots(kind, paths)?;
     // Every existing slot is checked before a missing one can mint and save a device.
@@ -3681,8 +3689,12 @@ fn provision_kind_with(
                         &path,
                     )?;
                     match refresh_identity(spec, &saved) {
+                        Ok(fresh) if fresh != saved => {
+                            fresh.save(&path)?;
+                            (fresh, true)
+                        }
                         Ok(fresh) => (fresh, false),
-                        Err(error) if error.refused && reprovision_enabled() => {
+                        Err(error) if error.refused && reprovision => {
                             eprintln!(
                             "warp-register: the saved {} identity was refused: {}; registering a fresh one",
                             slot.label(),
@@ -3702,7 +3714,7 @@ fn provision_kind_with(
                         }
                     }
                 }
-                Err(error) if error.corrupt() && reprovision_enabled() => {
+                Err(error) if error.corrupt() && reprovision => {
                     eprintln!(
                         "warp-register: {}; registering a fresh {} identity",
                         error.into_message(),
@@ -4741,7 +4753,8 @@ mod tests {
             Ok(sample_identity())
         };
         let fresh = |_: &WarpSpec, saved: &Identity| Ok(saved.clone());
-        let Err(error) = provision_kind_with(&spec, KeyKind::All, &paths, &counting, &fresh) else {
+        let Err(error) = provision_kind_with(&spec, KeyKind::All, &paths, &counting, &fresh, true)
+        else {
             panic!("the inner slot belongs to another team");
         };
         assert!(error.contains("other"), "{error}");
@@ -4786,7 +4799,8 @@ mod tests {
             }
         };
         let refused = |_: &WarpSpec, _: &Identity| Err(RegisterError::refused("refused"));
-        let Err(error) = provision_kind_with(&spec, KeyKind::Gool, &paths, &register, &refused)
+        let Err(error) =
+            provision_kind_with(&spec, KeyKind::Gool, &paths, &register, &refused, true)
         else {
             panic!("the later slot fails");
         };
@@ -4796,6 +4810,49 @@ mod tests {
             "replacement"
         );
         assert_eq!(registrations.get(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_withdrawn_gateway_is_saved_before_a_later_slot_fails() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-warp-gateway-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+        let base = dir.join("identity.json");
+        let masque = dir.join("identity-masque.json");
+        let paths = KeyPaths::new(&base, None, Some(&masque));
+        let first = Slot::Masque.allocation(&paths);
+        let mut saved = sample_identity();
+        saved.gateway = Some("http://gateway.example".to_owned());
+        saved.save(&first).expect("the saved identity");
+        let spec = WarpSpec {
+            mode: Mode::Gool,
+            identity_file: Some(base.clone()),
+            masque_identity_file: Some(masque.clone()),
+            ..sample_spec()
+        };
+        let refresh = |_: &WarpSpec, saved: &Identity| {
+            let mut fresh = saved.clone();
+            fresh.gateway = None;
+            Ok(fresh)
+        };
+        let register = |_: &WarpSpec, _: bool| Err("the later slot is down".to_owned());
+        let Err(error) =
+            provision_kind_with(&spec, KeyKind::Gool, &paths, &register, &refresh, true)
+        else {
+            panic!("the later slot fails");
+        };
+        assert!(error.contains("later slot"), "{error}");
+        assert_eq!(
+            Identity::load(&first)
+                .expect("the refreshed identity")
+                .gateway,
+            None
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -5513,7 +5570,7 @@ mod tests {
             Ok(sample_identity())
         };
         let fresh = |_: &WarpSpec, saved: &Identity| Ok(saved.clone());
-        let first = provision_kind_with(&spec, KeyKind::Gool, &paths, &counting, &fresh)
+        let first = provision_kind_with(&spec, KeyKind::Gool, &paths, &counting, &fresh, true)
             .expect("the first");
         assert_eq!(registrations.get(), 2, "both slots enrolled once");
         let gool = first
@@ -5522,7 +5579,7 @@ mod tests {
             .expect("the gool slot");
         assert_eq!(spec.gool_path(&paths).expect("the inner path"), gool.path);
         assert_eq!(gool.path, Slot::Gool.path(&paths));
-        let second = provision_kind_with(&spec, KeyKind::Gool, &paths, &counting, &fresh)
+        let second = provision_kind_with(&spec, KeyKind::Gool, &paths, &counting, &fresh, true)
             .expect("the second");
         assert_eq!(registrations.get(), 2, "the second run enrolls nothing");
         assert!(second.iter().all(|planned| !planned.saved));
@@ -6364,14 +6421,40 @@ mod tests {
     }
 
     #[test]
-    fn a_gateway_setup_failure_leaves_the_proxy_healthy() {
+    fn a_gateway_setup_failure_falls_back_to_the_target() {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("an echo server");
+        let echo_address = echo.local_addr().expect("the echo address");
+        echo.set_nonblocking(true).expect("nonblocking echo");
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                match echo.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let mut request = [0u8; 4];
+                        if stream.read_exact(&mut request).is_ok() && &request == b"ping" {
+                            let _ = stream.write_all(b"pong");
+                        }
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
         let masque_inbound = crate::json::parse(
             r#"{"settings":{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/24"]},"streamSettings":{"network":"masque","security":"none"}}"#,
         )
         .expect("a masque inbound");
+        let redirect = echo_address.to_string();
         let masque_port = crate::masque::serve_inbound(
             &masque_inbound,
-            &freedom_outbound(None),
+            &freedom_outbound(Some(&redirect)),
             "127.0.0.1:0",
             None,
         )
@@ -6381,6 +6464,7 @@ mod tests {
         ))
         .expect("a masque outbound");
         let masque = crate::masque::MasqueOut::new(&outbound).expect("the carrier");
+        let queued_before = masque.queued();
         let out = WarpOut {
             mode: Mode::Masque,
             wireguard: None,
@@ -6396,14 +6480,26 @@ mod tests {
             probe_host: String::new(),
             probe_port: 0,
         };
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("pair");
-        let tun = std::net::TcpStream::connect(listener.local_addr().expect("pair address"))
-            .expect("connect");
-        let (_app, _) = listener.accept().expect("accept");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("pair");
+        let tun =
+            TcpStream::connect(listener.local_addr().expect("pair address")).expect("connect");
+        let (mut app, _) = listener.accept().expect("accept");
         out.serve_tcp(
             crate::conn::Connection::from(tun),
             &crate::proxy::Destination::Address("127.0.0.1:80".parse().expect("a target")),
             b"",
+        );
+        app.set_read_timeout(Some(Duration::from_secs(20)))
+            .expect("a read timeout");
+        app.write_all(b"ping").expect("the direct fallback accepts");
+        let mut answer = [0u8; 4];
+        app.read_exact(&mut answer)
+            .expect("the direct fallback reaches the target");
+        assert_eq!(&answer, b"pong");
+        assert_eq!(
+            out.masque.as_ref().expect("the carrier").queued(),
+            queued_before + 2,
+            "the gateway flow and the direct fallback were both queued"
         );
         assert!(
             out.gateway

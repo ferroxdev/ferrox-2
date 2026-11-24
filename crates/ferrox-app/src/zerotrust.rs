@@ -75,6 +75,7 @@ impl TeamSettings {
         if team.is_some_and(|text| text.trim().is_empty()) {
             return Err("warp: the named team is empty; omit it or name the subdomain".to_owned());
         }
+        let explicit_team = team.is_some();
         let raw = pick(team, "AETHER_TEAM", &env);
         let Some(raw) = raw else {
             let supplied = pick(client_id, "AETHER_ACCESS_CLIENT_ID", &env).is_some()
@@ -93,10 +94,20 @@ impl TeamSettings {
                 "warp: `{raw}` is not a usable team name; name the subdomain of <team>.{TEAM_SUFFIX}"
             )
         })?;
+        let ambient_team = env("AETHER_TEAM").and_then(|raw| normalize_team(&raw));
+        let ambient_credentials = !explicit_team || ambient_team.as_deref() == Some(team.as_str());
         Ok(Some(Self {
             team,
-            client_id: pick(client_id, "AETHER_ACCESS_CLIENT_ID", &env),
-            client_secret: pick(client_secret, "AETHER_ACCESS_CLIENT_SECRET", &env),
+            client_id: if ambient_credentials {
+                pick(client_id, "AETHER_ACCESS_CLIENT_ID", &env)
+            } else {
+                client_id.map(str::to_owned)
+            },
+            client_secret: if ambient_credentials {
+                pick(client_secret, "AETHER_ACCESS_CLIENT_SECRET", &env)
+            } else {
+                client_secret.map(str::to_owned)
+            },
             token: pick(token, "AETHER_ACCESS_TOKEN", &env),
             email: pick(email, "AETHER_ACCESS_EMAIL", &env),
         }))
@@ -213,7 +224,7 @@ fn now() -> u64 {
         .map_or(0, |elapsed| elapsed.as_secs())
 }
 
-fn extract_jwt_from_html(html: &str) -> Option<String> {
+fn extract_jwt_from_html(html: &str, now: u64) -> Option<String> {
     let marker = "token=";
     let mut search = html;
     while let Some(at) = search.find(marker) {
@@ -226,12 +237,10 @@ fn extract_jwt_from_html(html: &str) -> Option<String> {
         let rest = &search[start..];
         if boundary {
             let end = rest
-                .find(|c: char| {
-                    c == '"' || c == '\'' || c == '&' || c == '<' || c == '>' || c.is_whitespace()
-                })
+                .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')))
                 .unwrap_or(rest.len());
             let candidate = rest[..end].trim();
-            if looks_like_jwt(candidate) {
+            if looks_like_jwt(candidate) && !jwt_expired(candidate, now) {
                 return Some(candidate.to_owned());
             }
         }
@@ -1111,7 +1120,7 @@ fn with_service_token(settings: &TeamSettings, exchange: &Exchange<'_>) -> Resul
         eprintln!("[+] access issued a device enrolment token");
         return Ok(token);
     }
-    if let Some(token) = extract_jwt_from_html(&String::from_utf8_lossy(&reply.body)) {
+    if let Some(token) = extract_jwt_from_html(&String::from_utf8_lossy(&reply.body), now()) {
         eprintln!("[+] access issued a device enrolment token");
         return Ok(token);
     }
@@ -1187,7 +1196,7 @@ fn with_email_code(
             ));
         }
         let html = String::from_utf8_lossy(&page.reply.body);
-        let html_token = extract_jwt_from_html(&html);
+        let html_token = extract_jwt_from_html(&html, now());
         let token = [page.token.as_deref(), html_token.as_deref()]
             .into_iter()
             .flatten()
@@ -1372,6 +1381,30 @@ mod tests {
             TeamSettings::from_parts_with(None, None, None, Some("a-token"), None, |_| None)
                 .expect_err("access without a team");
         assert!(error.contains("need a team"), "{error}");
+    }
+
+    #[test]
+    fn another_teams_ambient_service_token_is_not_used() {
+        let env = |key: &str| {
+            Some(match key {
+                "AETHER_TEAM" => "ambient",
+                "AETHER_ACCESS_CLIENT_ID" => "ambient-id",
+                "AETHER_ACCESS_CLIENT_SECRET" => "ambient-secret",
+                _ => return None,
+            })
+            .map(str::to_owned)
+        };
+        let explicit =
+            TeamSettings::from_parts_with(Some("explicit"), None, None, None, None, &env)
+                .expect("the explicit team")
+                .expect("settings");
+        assert!(!explicit.has_service_token());
+        assert_eq!(explicit.client_id, None);
+        assert_eq!(explicit.client_secret, None);
+        let matching = TeamSettings::from_parts_with(Some("ambient"), None, None, None, None, &env)
+            .expect("the matching team")
+            .expect("settings");
+        assert!(matching.has_service_token());
     }
 
     #[test]
@@ -2138,7 +2171,7 @@ mod tests {
         let page = format!(
             "<html><meta http-equiv=\"refresh\" content=\"0;url=https://x/cdn-cgi/access/callback?token={token}\"></html>"
         );
-        assert_eq!(extract_jwt_from_html(&page), Some(token));
+        assert_eq!(extract_jwt_from_html(&page, now()), Some(token));
     }
 
     #[test]
@@ -2148,15 +2181,23 @@ mod tests {
             format!("https://x/cb?csrf_token=bad&token={token}"),
             format!("https://x/cb?token=bad&token={token}"),
         ] {
-            assert_eq!(extract_jwt_from_html(&page), Some(token.clone()));
+            assert_eq!(extract_jwt_from_html(&page, now()), Some(token.clone()));
         }
+    }
+
+    #[test]
+    fn an_expired_html_token_does_not_hide_a_live_one() {
+        let expired = jwt("{\"exp\":1}");
+        let live = jwt("{\"exp\":4102444800}");
+        let page = format!("https://x/cb?token={expired}&token={live}");
+        assert_eq!(extract_jwt_from_html(&page, now()), Some(live));
     }
 
     #[test]
     fn a_token_marker_needs_a_parameter_boundary() {
         let token = jwt("{\"exp\":4102444800}");
         assert_eq!(
-            extract_jwt_from_html(&format!("<meta data-token={token}>")),
+            extract_jwt_from_html(&format!("<meta data-token={token}>"), now()),
             None
         );
     }
