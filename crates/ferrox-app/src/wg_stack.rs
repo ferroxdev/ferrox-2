@@ -1905,6 +1905,9 @@ struct ServerStack {
     fragment: usize,
     started: StdInstant,
     diag_at: StdInstant,
+    cli_wscale: u8,
+    win_min: u32,
+    win_max: u32,
 }
 
 impl ServerStack {
@@ -1968,6 +1971,9 @@ impl ServerStack {
             fragment,
             started: StdInstant::now(),
             diag_at: StdInstant::now(),
+            cli_wscale: 0,
+            win_min: 0,
+            win_max: 0,
         }
     }
 
@@ -1990,11 +1996,16 @@ impl ServerStack {
             }
         }
         eprintln!(
-            "wgdiag est={est} flows={} queued={queued} recv={recv} can={can} tx={} rx={}",
+            "wgdiag est={est} flows={} queued={queued} recv={recv} can={can} cli=[{}..{}] ws={} tx={} rx={}",
             self.flows.len(),
+            self.win_min,
+            self.win_max,
+            self.cli_wscale,
             self.device.tx.len(),
             self.device.rx.len()
         );
+        self.win_min = 0;
+        self.win_max = 0;
     }
 
     /// Route one packet to TCP, a UDP lane, or the server echo path.
@@ -2014,6 +2025,18 @@ impl ServerStack {
         let protocol = inner_protocol(&bytes[at..]);
         match protocol {
             Some(PROTOCOL_TCP) => {
+                if let Some((raw, flags, shift)) = tcp_window(&bytes, at) {
+                    if let Some(shift) = shift {
+                        self.cli_wscale = shift;
+                    }
+                    if flags & 0x10 != 0 && flags & 0x02 == 0 {
+                        let eff = u32::from(raw) << self.cli_wscale;
+                        if eff > 0 {
+                            self.win_min = if self.win_min == 0 { eff } else { self.win_min.min(eff) };
+                            self.win_max = self.win_max.max(eff);
+                        }
+                    }
+                }
                 lower_syn_mss(&mut bytes, at, self.mtu);
                 self.device.push(bytes, at);
             }
@@ -2517,6 +2540,44 @@ fn tcp_syn_port(packet: &[u8]) -> Option<u16> {
 
 /// Whether an inner packet carries TCP, which the stack takes, or UDP, which
 /// the datagram lane takes.
+/// The peer's TCP window field and, on a SYN, its window-scale shift.
+fn tcp_window(packet: &[u8], at: usize) -> Option<(u16, u8, Option<u8>)> {
+    let ip = packet.get(at..)?;
+    let header = match ip.first()? >> 4 {
+        4 => usize::from(ip[0] & 0x0f) * 4,
+        6 => IPV6_HEADER,
+        _ => return None,
+    };
+    let tcp = ip.get(header..)?;
+    let flags = *tcp.get(13)?;
+    let window = u16::from_be_bytes([*tcp.get(14)?, *tcp.get(15)?]);
+    let shift = if flags & 0x02 != 0 {
+        let data = usize::from(*tcp.get(12)? >> 4) * 4;
+        let mut i = 20;
+        let mut shift = None;
+        while i + 1 < data && i + 1 < tcp.len() {
+            match tcp[i] {
+                0 => break,
+                1 => i += 1,
+                kind => {
+                    let len = usize::from(tcp[i + 1]);
+                    if len < 2 {
+                        break;
+                    }
+                    if kind == 3 {
+                        shift = tcp.get(i + 2).copied().map(|value| value.min(14));
+                    }
+                    i += len;
+                }
+            }
+        }
+        shift
+    } else {
+        None
+    };
+    Some((window, flags, shift))
+}
+
 pub(crate) fn inner_protocol(packet: &[u8]) -> Option<u8> {
     match packet.first()? >> 4 {
         4 => packet.get(9).copied(),
