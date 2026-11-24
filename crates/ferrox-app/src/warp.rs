@@ -2466,13 +2466,10 @@ fn connect_status(head: &[u8]) -> Option<u16> {
     let dot = version.iter().position(|byte| *byte == b'.')?;
     let (major, minor) = version.split_at(dot);
     let minor = minor.get(1..)?;
-    if major.is_empty()
-        || minor.is_empty()
-        || !major.iter().chain(minor).all(|byte| byte.is_ascii_digit())
-    {
+    if major.is_empty() || minor.is_empty() || !major.iter().chain(minor).all(u8::is_ascii_digit) {
         return None;
     }
-    if status.len() != 3 || !status.iter().all(|byte| byte.is_ascii_digit()) {
+    if status.len() != 3 || !status.iter().all(u8::is_ascii_digit) {
         return None;
     }
     for reason in parts {
@@ -2681,6 +2678,19 @@ fn gateway_for(raw: Option<&str>, enabled: bool) -> Option<Gateway> {
     }
 }
 
+fn select_gateway(spec: &WarpSpec, identity: &Identity, carrier: bool) -> Option<Gateway> {
+    if carrier {
+        gateway_for(identity.gateway.as_deref(), spec.gateway)
+    } else if spec.gateway && identity.gateway.is_some() {
+        eprintln!(
+            "warp: `gateway: true` needs a MASQUE carrier; http and https go straight through the tunnel"
+        );
+        None
+    } else {
+        None
+    }
+}
+
 impl WarpOut {
     fn unbuilt(spec: &WarpSpec) -> Self {
         Self {
@@ -2770,16 +2780,11 @@ impl WarpOut {
         } else {
             None
         };
-        let gateway = if masque.is_some() || gool.is_some() || mim.is_some() {
-            gateway_for(identity.gateway.as_deref(), spec.gateway)
-        } else if spec.gateway && identity.gateway.is_some() {
-            eprintln!(
-                "warp: `gateway: true` needs a MASQUE carrier; http and https go straight through the tunnel"
-            );
-            None
-        } else {
-            None
-        };
+        let gateway = select_gateway(
+            &spec,
+            &identity,
+            masque.is_some() || gool.is_some() || mim.is_some(),
+        );
         if wireguard.is_none()
             && masque.is_none()
             && gool.is_none()

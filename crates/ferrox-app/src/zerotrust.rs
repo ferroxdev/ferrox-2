@@ -581,7 +581,7 @@ fn resolve_url(base: &str, location: &str) -> Option<String> {
     }
     let lower = location.to_ascii_lowercase();
     if lower.starts_with("https://") || lower.starts_with("http://") {
-        return Some(normalize_path(&location));
+        return Some(normalize_path(location));
     }
     if let Some(rest) = location.strip_prefix("//") {
         return Some(normalize_path(&format!("{scheme}://{rest}")));
@@ -644,7 +644,7 @@ fn remove_dot_segments(path: &str) -> String {
         } else if input == "." || input == ".." {
             input = "";
         } else {
-            let start = if input.starts_with('/') { 1 } else { 0 };
+            let start = usize::from(input.starts_with('/'));
             let end = input[start..]
                 .find('/')
                 .map_or(input.len(), |at| start + at);
@@ -1200,7 +1200,7 @@ pub(crate) fn resolve_token(
     }
     let token = sign_in(settings, started, &https_exchange, prompt)?;
     let issued = now();
-    if !jwt_expiry(&token).is_some_and(|expiry| issued < expiry) {
+    if jwt_expiry(&token).is_none_or(|expiry| issued >= expiry) {
         return Err(format!(
             "warp: access returned a device token for team {} that is already expired; sign in again",
             settings.team

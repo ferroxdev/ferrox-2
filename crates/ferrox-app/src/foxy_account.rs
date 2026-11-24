@@ -1438,7 +1438,7 @@ fn ask_limited_within(
     budget: Duration,
 ) -> Result<Reply, String> {
     let deadline = Instant::now() + budget;
-    let diagnostic = url.split(|c| c == '?' || c == '#').next().unwrap_or(url);
+    let diagnostic = url.split(['?', '#']).next().unwrap_or(url);
     let mut tls = endpoint.connect_within(&endpoint.tls(), deadline)?;
     if deadline.saturating_duration_since(Instant::now()).is_zero() {
         return Err(format!(
