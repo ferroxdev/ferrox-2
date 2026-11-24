@@ -97,8 +97,8 @@ fn every_prompt_renders_end_to_end_and_renders_the_same_twice() {
             .required_inputs()
             .map(|name| (name.to_owned(), "supplied-by-the-test".to_owned()))
             .collect();
-        let rendered = render::render(&library, prompt, &values, &[], None, Options::default());
-        let again = render::render(&library, prompt, &values, &[], None, Options::default());
+        let rendered = render::render(&library, prompt, &values, &[], None, &Options::default());
+        let again = render::render(&library, prompt, &values, &[], None, &Options::default());
 
         assert!(
             rendered.missing.is_empty(),
@@ -123,7 +123,7 @@ fn every_prompt_renders_end_to_end_and_renders_the_same_twice() {
             &values,
             &[],
             None,
-            Options {
+            &Options {
                 provenance: true,
                 ..Options::default()
             },
@@ -188,7 +188,7 @@ fn every_add_on_resolves_and_renders() {
                 &values,
                 &resolved,
                 None,
-                Options::default(),
+                &Options::default(),
             );
             assert!(
                 rendered.text.contains(&expected),
@@ -394,7 +394,14 @@ fn a_prompt_with_a_required_input_is_only_offered_when_it_is_filled() {
             values.entry("references".to_owned()).or_insert(references);
         }
         let addons = render::resolve_addons(prompt, &[]).expect("no add-ons requested");
-        let rendered = render::render(&library, prompt, &values, &addons, None, Options::default());
+        let rendered = render::render(
+            &library,
+            prompt,
+            &values,
+            &addons,
+            None,
+            &Options::default(),
+        );
         assert!(
             rendered.missing.is_empty(),
             "P{} is offered but rendering still needs {:?}",
@@ -500,7 +507,7 @@ fn a_row_is_picked_by_key_by_number_or_by_name_and_fills_the_template() {
         .find(|prompt| prompt.targets == Targets::Open)
         .expect("a template draws open rows");
     let values = expand::fill(template, open, &state.pins);
-    let rendered = render::render(&library, template, &values, &[], None, Options::default());
+    let rendered = render::render(&library, template, &values, &[], None, &Options::default());
     assert!(rendered.missing.is_empty(), "P{} left a hole", template.id);
     assert!(
         rendered.text.contains(&open.method),
@@ -570,7 +577,7 @@ fn the_issue_template_takes_a_number_and_names_the_bugfix_branch() {
         ("issue".to_owned(), "661".to_owned()),
         ("references".to_owned(), state.references()),
     ]);
-    let rendered = render::render(&library, prompt, &values, &[], None, Options::default());
+    let rendered = render::render(&library, prompt, &values, &[], None, &Options::default());
     assert!(
         rendered.missing.is_empty(),
         "P{}: {:?}",
