@@ -347,6 +347,7 @@ impl Drop for Lane {
     }
 }
 
+#[allow(clippy::mutable_key_type)]
 fn prune_lanes(held: &mut HashMap<LaneKey, Vec<Arc<Lane>>>) {
     for pool in held.values_mut() {
         pool.retain(|lane| {
@@ -358,6 +359,7 @@ fn prune_lanes(held: &mut HashMap<LaneKey, Vec<Arc<Lane>>>) {
     held.retain(|_, pool| !pool.is_empty());
 }
 
+#[allow(clippy::mutable_key_type)]
 fn lane_room(held: &HashMap<LaneKey, Vec<Arc<Lane>>>) -> bool {
     held.values().map(Vec::len).sum::<usize>() < MAX_TUIC_LANES
         || held
@@ -366,6 +368,7 @@ fn lane_room(held: &HashMap<LaneKey, Vec<Arc<Lane>>>) -> bool {
             .any(|lane| lane.leases.load(Ordering::Acquire) == 0)
 }
 
+#[allow(clippy::mutable_key_type)]
 fn make_lane_room(held: &mut HashMap<LaneKey, Vec<Arc<Lane>>>) -> bool {
     while held.values().map(Vec::len).sum::<usize>() >= MAX_TUIC_LANES {
         let Some((key, at)) = held.iter().find_map(|(key, pool)| {
