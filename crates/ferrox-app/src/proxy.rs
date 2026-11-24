@@ -28795,9 +28795,13 @@ pub(crate) fn device_dial(out: &Outbound) -> crate::tun::Dial {
                 None => crate::tun::DialOutcome::Refused,
             };
         }
+        let (lane, tag) = match front_group_lane(&lane) {
+            Some((member, leaf)) => (member, Some(leaf)),
+            None => (lane, tag.map(std::borrow::Cow::into_owned)),
+        };
         crate::tun::DialOutcome::Fallback(Lane {
             out: std::sync::Arc::new(lane),
-            tag: tag.map(std::borrow::Cow::into_owned),
+            tag,
             source: SEND_THROUGH.with(std::cell::Cell::take),
             sockopts: DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take()),
             strategy: TARGET_STRATEGY.with(std::cell::Cell::take),
@@ -34123,7 +34127,10 @@ fn serve_socks_udp_vless(relay: &UdpSocket, vless: &VlessOut, peer: Option<IpAdd
         if !source_admitted(peer, pinned, src) {
             continue;
         }
-        let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
+        let Some((dest, payload)) = parse_socks_udp_dest(&buf[..n]) else {
+            continue;
+        };
+        let Some(dest) = pool_dest(dest) else {
             continue;
         };
         if payload.is_empty() || !vless_udp_target_allowed(vless, &dest) {
