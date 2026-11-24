@@ -6406,7 +6406,11 @@ mod tests {
             b"",
         );
         assert!(
-            out.gateway.as_ref().expect("a gateway").healthy.load(Ordering::Relaxed),
+            out.gateway
+                .as_ref()
+                .expect("a gateway")
+                .healthy
+                .load(Ordering::Relaxed),
             "a local setup failure retired the gateway"
         );
     }
