@@ -406,10 +406,12 @@ fn resolve_member<'a>(
                     .clone()
                     .map(|(leaf, out, revision)| (Cow::Owned(leaf), out, revision));
             }
-            let done = group.resolve_with(route, network, resolved, readings)?;
-            let owned = (done.0.into_owned(), done.1.clone(), done.2);
-            resolved.insert(key, Some(owned.clone()));
-            Some((Cow::Owned(owned.0), owned.1, owned.2))
+            // A failed subtree is cached too, so a shared descendant that cannot resolve is walked once per sweep, not once per path into it.
+            let done = group
+                .resolve_with(route, network, resolved, readings)
+                .map(|(leaf, out, revision)| (leaf.into_owned(), out, revision));
+            resolved.insert(key, done.clone());
+            done.map(|(leaf, out, revision)| (Cow::Owned(leaf), out, revision))
         }
         Outbound::Group(group) => group
             .resolve_with(route, network, resolved, readings)
