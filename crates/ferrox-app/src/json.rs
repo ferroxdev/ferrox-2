@@ -1443,6 +1443,37 @@ mod tests {
         );
     }
 
+    /// Marks the clean strip's walk for the `ops.yml` report: the loop keeps the pass visible to valgrind.
+    #[test]
+    fn the_clean_strip_costs_no_walk() {
+        let text = format!(
+            "[{}{}]",
+            r#"{"type":"field","port":443},"#.repeat(96),
+            r#"{"type":"field","port":1}"#
+        );
+        let mut total = 0usize;
+        for _ in 0..64 {
+            total += strip_jsonc(std::hint::black_box(&text)).len();
+        }
+        std::hint::black_box(total);
+    }
+
+    /// Marks the comment-bearing strip's walk for the `ops.yml` report.
+    #[test]
+    fn the_comment_strip_costs_one_walk() {
+        use std::fmt::Write as _;
+        let mut text = String::from("{");
+        for at in 0..96 {
+            let _ = write!(text, "\"k{at}\":{at} /* note {at} */,");
+        }
+        text.push_str("\"z\":0}");
+        let mut total = 0usize;
+        for _ in 0..64 {
+            total += strip_jsonc(std::hint::black_box(&text)).len();
+        }
+        std::hint::black_box(total);
+    }
+
     /// The byte walk this file carried before it scanned runs, so a sweep proves the spans copy
     /// the same bytes the one-at-a-time loop did.
     #[allow(clippy::too_many_lines)]
