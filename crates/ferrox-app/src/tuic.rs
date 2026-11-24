@@ -94,6 +94,7 @@ pub(crate) struct TuicOut {
     insecure: bool,
     heartbeat: Duration,
     lanes: Mutex<HashMap<LaneKey, Vec<Arc<Lane>>>>,
+    pending: Mutex<HashMap<LaneKey, usize>>,
     session: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
@@ -123,6 +124,22 @@ impl std::ops::Deref for LaneLease {
 impl Drop for LaneLease {
     fn drop(&mut self) {
         self.0.leases.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct Expansion<'a> {
+    out: &'a TuicOut,
+    key: LaneKey,
+}
+
+impl Drop for Expansion<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.out.pending.lock() {
+            if let Some(n) = pending.get_mut(&self.key) {
+                *n -= 1;
+            }
+            pending.retain(|_, n| *n > 0);
+        }
     }
 }
 
@@ -360,15 +377,6 @@ fn prune_lanes(held: &mut HashMap<LaneKey, Vec<Arc<Lane>>>) {
 }
 
 #[allow(clippy::mutable_key_type)]
-fn lane_room(held: &HashMap<LaneKey, Vec<Arc<Lane>>>) -> bool {
-    held.values().map(Vec::len).sum::<usize>() < MAX_TUIC_LANES
-        || held
-            .values()
-            .flatten()
-            .any(|lane| lane.leases.load(Ordering::Acquire) == 0)
-}
-
-#[allow(clippy::mutable_key_type)]
 fn make_lane_room(held: &mut HashMap<LaneKey, Vec<Arc<Lane>>>) -> bool {
     while held.values().map(Vec::len).sum::<usize>() >= MAX_TUIC_LANES {
         let Some((key, at)) = held.iter().find_map(|(key, pool)| {
@@ -425,11 +433,16 @@ impl TuicOut {
         if let Some(lease) = select(&held, false) {
             return Some(lease);
         }
-        if held.get(&key).map_or(0, Vec::len) >= LANES_PER_KEY || !lane_room(&held) {
+        if !self.reserve_expansion(&key, &held) {
             return select(&held, true);
         }
         drop(held);
+        let expansion = Expansion {
+            out: self,
+            key: key.clone(),
+        };
         let Some(lane) = self.connect_lane(source, options) else {
+            drop(expansion);
             let mut held = self.lanes.lock().ok()?;
             prune_lanes(&mut held);
             return select(&held, true);
@@ -439,10 +452,27 @@ impl TuicOut {
         if held.get(&key).map_or(0, Vec::len) < LANES_PER_KEY && make_lane_room(&mut held) {
             lane.leases.fetch_add(1, Ordering::AcqRel);
             held.entry(key.clone()).or_default().push(Arc::clone(&lane));
+            drop(expansion);
             return Some(LaneLease(lane));
         }
         drop(lane);
+        drop(expansion);
         select(&held, true)
+    }
+
+    #[allow(clippy::mutable_key_type)]
+    fn reserve_expansion(&self, key: &LaneKey, held: &HashMap<LaneKey, Vec<Arc<Lane>>>) -> bool {
+        let Ok(mut pending) = self.pending.lock() else {
+            return false;
+        };
+        let queued: usize = pending.values().sum();
+        let total: usize = held.values().map(Vec::len).sum();
+        let mine = held.get(key).map_or(0, Vec::len) + pending.get(key).copied().unwrap_or(0);
+        if mine >= LANES_PER_KEY || total + queued >= MAX_TUIC_LANES {
+            return false;
+        }
+        *pending.entry(key.clone()).or_default() += 1;
+        true
     }
 
     fn connect_lane(
@@ -1547,6 +1577,7 @@ pub(crate) fn outbound(root: &Json) -> Result<Option<TuicOut>, String> {
         insecure: tls.insecure,
         heartbeat,
         lanes: Mutex::new(HashMap::new()),
+        pending: Mutex::new(HashMap::new()),
         session: Arc::new(Mutex::new(None)),
     }))
 }
@@ -2952,6 +2983,7 @@ mod tests {
             insecure: false,
             heartbeat: Duration::from_secs(30),
             lanes: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
             session: Arc::new(Mutex::new(None)),
         }
     }
