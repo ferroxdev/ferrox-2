@@ -84980,6 +84980,29 @@ end
     /// One tag is the whole allocation a selector dial makes: the leaf its chain names. Two
     /// selectors and one leaf, one allocation, counted by the allocator rather than read off the code.
     #[test]
+    /// Marks one selector dial's work for the `ops.yml` report: the loop keeps the choice visible to valgrind.
+    #[test]
+    fn a_selector_dial_costs_the_choice() {
+        let shared = group_route(
+            r#"{"outbounds":[
+                {"tag":"a","protocol":"freedom"},
+                {"tag":"b","protocol":"freedom"},
+                {"tag":"pick","type":"selector","outbounds":["a","b"],"default":"b"}
+            ],"routing":{}}"#,
+        );
+        let group = group_of(&shared, "pick");
+        let mut total = 0usize;
+        for _ in 0..1_000 {
+            total += group
+                .resolve(std::hint::black_box(&shared), crate::router::Network::Tcp)
+                .expect("picks")
+                .0
+                .len();
+        }
+        std::hint::black_box(total);
+    }
+
+    #[test]
     fn a_selector_dial_allocates_only_the_tag_it_returns() {
         let shared = group_route(
             r#"{"outbounds":[
