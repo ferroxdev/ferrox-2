@@ -28,6 +28,8 @@ const API_VERSION: &str = "v0a4471";
 const CONNECT_HOST: &str = "cloudflareaccess.com";
 /// The SNI the MASQUE edge presents.
 const CONNECT_SNI: &str = "consumer-masque.cloudflareclient.com";
+/// The resolver Aether's `--ech auto` queries for the ECH config.
+pub(crate) const ECH_RESOLVER: &str = "udp://1.1.1.1";
 /// WARP's `WireGuard` endpoint port; the API lists many and this one is the documented one.
 const WIREGUARD_PORT: u16 = 2408;
 /// The MASQUE edge's UDP port.
@@ -192,6 +194,7 @@ struct WarpSpec {
     masque_server_name: String,
     masque_host: String,
     masque_path: String,
+    tls: crate::warp_tls::WarpTls,
     scan: Option<ScanMode>,
     peer: Option<SocketAddr>,
     wg_peer: Option<SocketAddr>,
@@ -478,6 +481,7 @@ impl WarpSpec {
         };
         let (masque_address, masque_port, masque_server_name, masque_host, masque_path) =
             masque_settings(settings.get("masque"));
+        let tls = crate::warp_tls::WarpTls::from_settings(Some(settings), &masque_server_name)?;
         let edge = EdgeSpec::from(settings)?;
         let noize = crate::noize::NoizeSettings::from_settings(settings)?;
         let quic_v2 = quic_v2_enabled(settings, std::env::var("AETHER_QUIC_V2").ok().as_deref());
@@ -507,6 +511,7 @@ impl WarpSpec {
             masque_server_name,
             masque_host,
             masque_path,
+            tls,
             scan: edge.scan,
             peer: edge.peer,
             wg_peer: edge.wg_peer,
@@ -704,6 +709,7 @@ impl WarpSpec {
             masque_server_name: CONNECT_SNI.to_owned(),
             masque_host: CONNECT_HOST.to_owned(),
             masque_path: "/".to_owned(),
+            tls: crate::warp_tls::WarpTls::default(),
             scan: None,
             peer: None,
             wg_peer: None,
@@ -806,6 +812,18 @@ fn api_endpoint(spec: &WarpSpec, base: &str) -> Result<Endpoint, String> {
         .ok_or_else(|| format!("warp: `{base}` is not an https API origin"))?
         .with_h2_fingerprint("chrome_plain")
         .without_resumption();
+    if let Some(fingerprint) = spec.tls.fingerprint {
+        endpoint.h2_fingerprint = Some(fingerprint);
+    }
+    if let Some(groups) = &spec.tls.groups {
+        endpoint.curves = Arc::clone(groups);
+    }
+    if let Some(ech) = &spec.tls.ech {
+        endpoint.ech_config_list = Some(Arc::clone(ech));
+    }
+    if let Some(fragment) = &spec.tls.fragment {
+        endpoint.fragment = Some(fragment.clone());
+    }
     if let Some(address) = &spec.api_address {
         let (host, port) = split_host_port(address, 443).ok_or_else(|| {
             format!(
@@ -2220,16 +2238,21 @@ fn masque_outbound(identity: &Identity, spec: &WarpSpec) -> Result<crate::json::
         ("publicKey", string(&b64(&masque.server))),
         ("address", address_json(&masque.addresses)),
     ]);
-    let masque_settings = obj_pairs(vec![
+    let mut masque_settings = vec![
         ("warp", warp),
         ("host", string(&spec.masque_host)),
         ("path", string(&spec.masque_path)),
         ("noize", string(spec.noize.masque_profile())),
         ("quicV2", crate::json::Json::Bool(spec.quic_v2)),
-    ]);
+    ];
+    if let Some(warp_tls) = spec.tls.json() {
+        masque_settings.push(("warpTls", warp_tls));
+    }
+    let masque_settings = obj_pairs(masque_settings);
     let tls = obj_pairs(vec![
         ("serverName", string(&spec.masque_server_name)),
         ("allowInsecure", crate::json::Json::Bool(true)),
+        ("fingerprint", string("chrome_plain")),
     ]);
     let stream = obj_pairs(vec![
         ("network", string("masque")),
@@ -2794,15 +2817,20 @@ fn mim_outbound(
         ("publicKey", string(&b64(&masque.server))),
         ("address", address_json(&masque.addresses)),
     ]);
-    let masque_settings = obj_pairs(vec![
+    let mut masque_settings = vec![
         ("warp", warp),
         ("host", string(&spec.masque_host)),
         ("path", string(&spec.masque_path)),
         ("noize", string(spec.noize.masque_profile())),
-    ]);
+    ];
+    if let Some(warp_tls) = spec.tls.json() {
+        masque_settings.push(("warpTls", warp_tls));
+    }
+    let masque_settings = obj_pairs(masque_settings);
     let tls = obj_pairs(vec![
         ("serverName", string(&spec.masque_server_name)),
         ("allowInsecure", crate::json::Json::Bool(true)),
+        ("fingerprint", string("chrome_plain")),
     ]);
     let stream = obj_pairs(vec![
         ("network", string("masque")),
@@ -3186,6 +3214,8 @@ pub(crate) fn one_tap(
     api: Option<&str>,
     api_address: Option<&str>,
     peers: &ForcedPeers<'_>,
+    tls: crate::warp_tls::WarpTls,
+    masque_sni: Option<&str>,
 ) -> Result<String, String> {
     let mode = Mode::parse(Some(mode))?;
     let path = PathBuf::from(path);
@@ -3226,9 +3256,10 @@ pub(crate) fn one_tap(
             .collect(),
         masque_address: CONNECT_HOST.to_owned(),
         masque_port: QUIC_PORT,
-        masque_server_name: CONNECT_SNI.to_owned(),
+        masque_server_name: masque_sni.unwrap_or(CONNECT_SNI).to_owned(),
         masque_host: CONNECT_HOST.to_owned(),
         masque_path: "/".to_owned(),
+        tls,
         scan: (mode == Mode::GoolClassic && (wiw_outer.is_none() || wiw_inner.is_none()))
             .then_some(ScanMode::Balanced),
         peer: None,
@@ -3290,6 +3321,13 @@ pub(crate) fn one_tap(
     if peers.no_quic_v2 {
         settings.push(("quicV2", crate::json::Json::Bool(false)));
     }
+    if spec.masque_server_name != CONNECT_SNI {
+        settings.push((
+            "masque",
+            obj_pairs(vec![("serverName", string(&spec.masque_server_name))]),
+        ));
+    }
+    settings.extend(spec.tls.settings());
     Ok(config_text(settings))
 }
 
@@ -3411,6 +3449,16 @@ pub(crate) fn register_command(args: &mut std::iter::Skip<std::env::Args>, usage
     let mut noize = None;
     let mut no_profile_retry = false;
     let mut no_quic_v2 = false;
+    let mut fragment = false;
+    let mut fragment_size = None;
+    let mut fragment_delay = None;
+    let mut tls_ciphers = None;
+    let mut tls_groups = None;
+    let mut disable_grease = false;
+    let mut ech = None;
+    let mut ech_dns = None;
+    let mut ech_domain = None;
+    let mut masque_sni = None;
     while let Some(arg) = args.next() {
         let mut value = || args.next().unwrap_or_else(|| usage());
         match arg.as_str() {
@@ -3424,6 +3472,16 @@ pub(crate) fn register_command(args: &mut std::iter::Skip<std::env::Args>, usage
             "--noize" => noize = Some(value()),
             "--no-profile-retry" => no_profile_retry = true,
             "--no-quic-v2" => no_quic_v2 = true,
+            "--fragment" => fragment = true,
+            "--fragment-size" => fragment_size = Some(value()),
+            "--fragment-delay" => fragment_delay = Some(value()),
+            "--tls-ciphers" => tls_ciphers = Some(value()),
+            "--tls-groups" => tls_groups = Some(value()),
+            "--disable-grease" => disable_grease = true,
+            "--ech" => ech = Some(value()),
+            "--ech-dns" => ech_dns = Some(value()),
+            "--ech-domain" => ech_domain = Some(value()),
+            "--masque-sni" => masque_sni = Some(value()),
             "--api" => api = Some(value()),
             "--api-address" => api_address = Some(value()),
             "--wg-config" => wireguard = Some(value()),
@@ -3441,6 +3499,24 @@ pub(crate) fn register_command(args: &mut std::iter::Skip<std::env::Args>, usage
             _ => usage(),
         }
     }
+    let tls = match crate::warp_tls::WarpTls::from_parts(
+        fragment,
+        fragment_size.as_deref(),
+        fragment_delay.as_deref(),
+        tls_ciphers.as_deref(),
+        tls_groups.as_deref(),
+        disable_grease,
+        ech.as_deref(),
+        ech_dns.as_deref(),
+        ech_domain.as_deref(),
+        masque_sni.as_deref().unwrap_or(CONNECT_SNI),
+    ) {
+        Ok(tls) => tls,
+        Err(reason) => {
+            eprintln!("warp-register: {reason}");
+            std::process::exit(1);
+        }
+    };
     let result = match kind {
         None => {
             if wireguard.is_some() || masque.is_some() {
@@ -3460,6 +3536,8 @@ pub(crate) fn register_command(args: &mut std::iter::Skip<std::env::Args>, usage
                     no_profile_retry,
                     no_quic_v2,
                 },
+                tls.clone(),
+                masque_sni.as_deref(),
             )
         }
         Some(kind) => {
@@ -3471,6 +3549,10 @@ pub(crate) fn register_command(args: &mut std::iter::Skip<std::env::Args>, usage
                 }
             };
             let mut spec = WarpSpec::for_command(mode, api, api_address);
+            spec.tls = tls;
+            if let Some(sni) = masque_sni.as_deref() {
+                sni.clone_into(&mut spec.masque_server_name);
+            }
             spec.identity_file = Some(PathBuf::from(&base));
             spec.wireguard_identity_file =
                 wireguard.as_deref().map(Path::new).map(Path::to_path_buf);
@@ -3533,6 +3615,7 @@ mod tests {
             masque_server_name: CONNECT_SNI.to_owned(),
             masque_host: CONNECT_HOST.to_owned(),
             masque_path: "/".to_owned(),
+            tls: crate::warp_tls::WarpTls::default(),
             scan: None,
             peer: None,
             wg_peer: None,
@@ -3655,6 +3738,7 @@ mod tests {
             masque_server_name: CONNECT_SNI.to_owned(),
             masque_host: CONNECT_HOST.to_owned(),
             masque_path: "/".to_owned(),
+            tls: crate::warp_tls::WarpTls::default(),
             scan: None,
             peer: None,
             wg_peer: None,
@@ -3747,6 +3831,7 @@ mod tests {
             masque_server_name: CONNECT_SNI.to_owned(),
             masque_host: CONNECT_HOST.to_owned(),
             masque_path: "/".to_owned(),
+            tls: crate::warp_tls::WarpTls::default(),
             scan: None,
             peer: None,
             wg_peer: None,
@@ -3783,6 +3868,33 @@ mod tests {
                 .and_then(crate::json::Json::as_u32),
             Some(u32::from(DEFAULT_MTU))
         );
+    }
+
+    #[test]
+    fn the_api_hello_carries_the_fragment_and_groups() {
+        let mut spec = sample_spec();
+        spec.tls = crate::warp_tls::WarpTls::from_parts(
+            true,
+            Some("8-16"),
+            None,
+            None,
+            Some("P-256:X25519"),
+            true,
+            None,
+            None,
+            None,
+            CONNECT_SNI,
+        )
+        .expect("the flags");
+        let endpoint =
+            api_endpoint(&spec, "https://api.cloudflareclient.com/v0a4471").expect("an origin");
+        assert!(endpoint.fragment.is_some());
+        assert_eq!(endpoint.curves.as_ref(), &[0x0017, 0x001d]);
+        assert!(endpoint.h2_fingerprint.is_some_and(|fingerprint| {
+            fingerprint
+                .profile()
+                .is_some_and(|profile| !profile.ciphers.contains(&0x0a0a))
+        }));
     }
 
     #[test]
@@ -4044,6 +4156,8 @@ mod tests {
                 no_profile_retry: false,
                 no_quic_v2: false,
             },
+            crate::warp_tls::WarpTls::default(),
+            None,
         );
         std::fs::remove_file(&path).ok();
         assert!(out.is_ok(), "{out:?}");

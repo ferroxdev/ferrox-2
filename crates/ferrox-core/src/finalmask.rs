@@ -40,6 +40,13 @@ pub enum MaskRole {
     Server,
 }
 
+/// The clock a masked handshake waits against: the app owns wall time, so this crate asks for
+/// the cap instead of reading a clock.
+pub trait Deadline: std::fmt::Debug + Send + Sync {
+    /// Sleep at most `wait`, bounded by the clock; `Duration::ZERO` only checks it.
+    fn wait(&self, wait: Duration) -> io::Result<()>;
+}
+
 /// The record type a handshake rides, and the width of a TLS record header.
 const HANDSHAKE: u8 = 22;
 const HEADER: usize = 5;
@@ -149,6 +156,8 @@ pub struct Fragment {
     ent: Entropy,
     count: u64,
     gathered: Option<Gathered>,
+    /// The clock a handshake gives this stage's waits; unarmed elsewhere.
+    deadline: Option<Arc<dyn Deadline>>,
 }
 
 /// The part of a merged hello already built but not yet accepted by the sink, so a refused write
@@ -191,6 +200,7 @@ impl Fragment {
             ent: Entropy::new(),
             count: 0,
             gathered: None,
+            deadline: None,
         })
     }
 
@@ -202,10 +212,17 @@ impl Fragment {
         self
     }
 
+    /// The same stage whose waits are bounded by `deadline`; a schedule that finishes first is unchanged.
+    #[must_use]
+    pub fn with_deadline(mut self, deadline: Arc<dyn Deadline>) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
     /// The write the chain hands this stage, answered with how much of it reached the wire.
     pub fn write<W: Write>(&mut self, raw: &mut W, p: &[u8]) -> io::Result<usize> {
         if let Some(mut gathered) = self.gathered.take() {
-            if let Err(error) = flush_gathered(raw, &mut gathered) {
+            if let Err(error) = flush_gathered(raw, &mut gathered, self.deadline.as_deref()) {
                 self.gathered = Some(gathered);
                 return Err(error);
             }
@@ -286,7 +303,7 @@ impl Fragment {
     /// Put the retained burst on the wire without a new plaintext write.
     fn flush<W: Write>(&mut self, raw: &mut W) -> io::Result<()> {
         if let Some(mut gathered) = self.gathered.take() {
-            if let Err(error) = flush_gathered(raw, &mut gathered) {
+            if let Err(error) = flush_gathered(raw, &mut gathered, self.deadline.as_deref()) {
                 self.gathered = Some(gathered);
                 return Err(error);
             }
@@ -309,6 +326,7 @@ impl Fragment {
     /// The delay between two records, after the record before it has left every stage below this
     /// one: a stage that retained it would otherwise sleep and then send it beside the next.
     fn park_after<W: Write>(&mut self, raw: &mut W, segment: usize) -> io::Result<()> {
+        self.check_deadline()?;
         let Some(ms) = self
             .delay_at(segment)
             .pick_from(&mut self.ent)
@@ -317,7 +335,7 @@ impl Fragment {
             return Ok(());
         };
         match raw.flush() {
-            Ok(()) => std::thread::sleep(Duration::from_millis(ms as u64)),
+            Ok(()) => self.wait(ms)?,
             // The record before this delay is out; a full socket only costs the spacing.
             Err(error)
                 if matches!(
@@ -327,6 +345,17 @@ impl Fragment {
             Err(error) => return Err(error),
         }
         Ok(())
+    }
+
+    fn check_deadline(&self) -> io::Result<()> {
+        match self.deadline.as_deref() {
+            Some(deadline) => deadline.wait(Duration::ZERO),
+            None => Ok(()),
+        }
+    }
+
+    fn wait(&self, ms: i64) -> io::Result<()> {
+        wait_for(self.deadline.as_deref(), Duration::from_millis(ms as u64))
     }
 
     /// Why this write is not a hello the mask may cut: too short for a header, not a handshake
@@ -772,7 +801,11 @@ fn write_record<W: Write>(raw: &mut W, head: &[u8], body: &[u8]) -> io::Result<(
     write_iovecs(raw, &mut parts)
 }
 
-fn flush_gathered<W: Write>(raw: &mut W, gathered: &mut Gathered) -> io::Result<()> {
+fn flush_gathered<W: Write>(
+    raw: &mut W,
+    gathered: &mut Gathered,
+    deadline: Option<&dyn Deadline>,
+) -> io::Result<()> {
     while gathered.at < gathered.bytes.len() {
         let end = gathered
             .parks
@@ -781,6 +814,9 @@ fn flush_gathered<W: Write>(raw: &mut W, gathered: &mut Gathered) -> io::Result<
                 (*offset).min(gathered.bytes.len())
             });
         while gathered.at < end {
+            if let Some(deadline) = deadline {
+                deadline.wait(Duration::ZERO)?;
+            }
             match raw.write(&gathered.bytes[gathered.at..end]) {
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
                 Ok(taken) => gathered.at += taken,
@@ -791,13 +827,22 @@ fn flush_gathered<W: Write>(raw: &mut W, gathered: &mut Gathered) -> io::Result<
         if let Some((_, wait)) = gathered.parks.first().copied() {
             gathered.parks.remove(0);
             if wait > 0 {
-                std::thread::sleep(Duration::from_millis(wait as u64));
+                wait_for(deadline, Duration::from_millis(wait as u64))?;
             }
         }
     }
     gathered.at = 0;
     gathered.bytes.clear();
     Ok(())
+}
+
+fn wait_for(deadline: Option<&dyn Deadline>, wait: Duration) -> io::Result<()> {
+    if let Some(deadline) = deadline {
+        deadline.wait(wait)
+    } else {
+        std::thread::sleep(wait);
+        Ok(())
+    }
 }
 
 /// Hand the list to the sink in as few vectored calls as it takes, advancing the list on a short
@@ -1190,6 +1235,44 @@ impl<R: Read + PeekRead> PeekRead for ReadPipe<'_, R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Debug)]
+    struct TestDeadline {
+        state: Mutex<(Duration, Duration)>,
+    }
+
+    impl TestDeadline {
+        fn new(left: Duration) -> Self {
+            Self {
+                state: Mutex::new((left, Duration::ZERO)),
+            }
+        }
+
+        fn left(&self) -> Duration {
+            self.state.lock().expect("the test clock").0
+        }
+
+        fn waited(&self) -> Duration {
+            self.state.lock().expect("the test clock").1
+        }
+    }
+
+    impl Deadline for TestDeadline {
+        fn wait(&self, wait: Duration) -> io::Result<()> {
+            let mut state = self.state.lock().expect("the test clock");
+            if state.0.is_zero() {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            let sleep = wait.min(state.0);
+            state.1 += sleep;
+            state.0 -= sleep;
+            if state.0.is_zero() {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            Ok(())
+        }
+    }
 
     fn range(min: i64, max: i64) -> Range {
         Range::ordered(min, max)
@@ -1676,6 +1759,52 @@ mod tests {
             mask.ent.refills, 0,
             "a fixed config answers its low ends and never reaches the supply at all"
         );
+    }
+
+    #[test]
+    fn a_deadline_caps_a_delay_that_would_outlive_it() {
+        let clock = Arc::new(TestDeadline::new(Duration::from_millis(20)));
+        let mut mask = Fragment::new(
+            0,
+            1,
+            vec![range(11, 11), range(37, 37)],
+            vec![range(1000, 1000)],
+            range(24, 24),
+        )
+        .expect("valid")
+        .with_deadline(clock.clone());
+        let whole = hello(48);
+        let mut wire = Wire::default();
+        assert_eq!(
+            mask.write(&mut wire, &whole)
+                .expect_err("the clock expires")
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(clock.waited(), Duration::from_millis(20));
+        assert!(clock.left().is_zero());
+        assert!(!wire.bytes.is_empty(), "the first piece went out");
+    }
+
+    #[test]
+    fn a_deadline_leaves_a_shorter_delay_alone() {
+        let clock = Arc::new(TestDeadline::new(Duration::from_secs(1)));
+        let mut mask = Fragment::new(
+            0,
+            1,
+            vec![range(11, 11), range(37, 37)],
+            vec![range(1, 1)],
+            range(24, 24),
+        )
+        .expect("valid")
+        .with_deadline(clock.clone());
+        let whole = hello(48);
+        let mut wire = Wire::default();
+        assert_eq!(mask.write(&mut wire, &whole).expect("writes"), whole.len());
+        assert_eq!(clock.waited(), Duration::from_millis(2));
+        let (widths, message) = records(&wire.bytes);
+        assert_eq!(widths, vec![11, 37]);
+        assert_eq!(message, whole[HEADER..]);
     }
 
     #[test]

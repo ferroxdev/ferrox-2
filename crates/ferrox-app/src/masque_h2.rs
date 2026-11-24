@@ -46,7 +46,7 @@ const CREDIT_BATCH: usize = 64 * 1024;
 const DEFAULT_WINDOW: i64 = 65_535;
 const H2_CONNECTIONS: usize = 256;
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct Deadline(Arc<AtomicU64>);
 
 fn monotonic_nanos() -> u64 {
@@ -77,6 +77,26 @@ impl Deadline {
     /// The instant the handshake clock names, while it is armed.
     fn at(&self) -> Option<Instant> {
         self.remaining().map(|left| Instant::now() + left)
+    }
+}
+
+impl ferrox_core::finalmask::Deadline for Deadline {
+    fn wait(&self, wait: Duration) -> std::io::Result<()> {
+        let Some(left) = self.remaining() else {
+            std::thread::sleep(wait);
+            return Ok(());
+        };
+        if left.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        let sleep = wait.min(left);
+        if !sleep.is_zero() {
+            std::thread::sleep(sleep);
+        }
+        if self.remaining().is_some_and(|left| left.is_zero()) {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        Ok(())
     }
 }
 
@@ -178,10 +198,14 @@ pub(crate) fn handshake_cap(deadline: &Deadline) -> crate::budgets::HandshakeCap
 
 /// Wrap a TCP stream in the handshake clock and disable Nagle.
 pub(crate) fn handshake_stream(tcp: Connection) -> (DeadlineStream, Deadline) {
-    let _ = tcp.set_nodelay(true);
     let deadline = Deadline::default();
     deadline.arm(Instant::now() + HANDSHAKE);
-    (DeadlineStream::new(tcp, deadline.clone()), deadline)
+    (handshake_stream_at(tcp, deadline.clone()), deadline)
+}
+
+fn handshake_stream_at(tcp: Connection, deadline: Deadline) -> DeadlineStream {
+    let _ = tcp.set_nodelay(true);
+    DeadlineStream::new(tcp, deadline)
 }
 
 impl Read for DeadlineStream {
@@ -797,9 +821,19 @@ impl Client {
         let tcp = connect_edge(edge, sockopt)?;
         let _ = tcp.set_read_timeout(Some(HANDSHAKE));
         let _ = tcp.set_write_timeout(Some(HANDSHAKE));
+        let deadline = Deadline::default();
+        deadline.arm(Instant::now() + HANDSHAKE);
+        let cut = tls_config.fragment.as_ref().map(|fragment| {
+            let fragment = fragment.clone().with_deadline(Arc::new(deadline.clone()));
+            mask.map_or_else(
+                || ferrox_core::finalmask::Chain::default().with_front(&fragment),
+                |chain| chain.with_front(&fragment),
+            )
+        });
+        let mask = cut.as_ref().or(mask);
         let tcp =
             Connection::from(tcp).with_mask_role(mask, ferrox_core::finalmask::MaskRole::Client);
-        let (tcp, deadline) = handshake_stream(tcp);
+        let tcp = handshake_stream_at(tcp, deadline.clone());
         let cap = handshake_cap(&deadline);
         let owned = warp_tls(tls_config, warp);
         let mut tls = ferrox_core::tls::connect(owned.as_ref().unwrap_or(tls_config), tcp)
