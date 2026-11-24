@@ -1904,6 +1904,7 @@ struct ServerStack {
     reassembly: Reassembly,
     fragment: usize,
     started: StdInstant,
+    diag_at: StdInstant,
 }
 
 impl ServerStack {
@@ -1966,7 +1967,34 @@ impl ServerStack {
             reassembly: Reassembly::default(),
             fragment,
             started: StdInstant::now(),
+            diag_at: StdInstant::now(),
         }
+    }
+
+    fn diag(&mut self) {
+        let now = StdInstant::now();
+        if now.duration_since(self.diag_at) < Duration::from_millis(500) {
+            return;
+        }
+        self.diag_at = now;
+        let (mut est, mut queued, mut can, mut recv) = (0u32, 0usize, 0u32, 0usize);
+        for flow in &self.flows {
+            let socket = self.sockets.get::<TcpSocket>(flow.handle);
+            if socket.state() == State::Established {
+                est += 1;
+                queued += socket.send_queue();
+                recv += socket.recv_queue();
+                if socket.can_send() {
+                    can += 1;
+                }
+            }
+        }
+        eprintln!(
+            "wgdiag est={est} flows={} queued={queued} recv={recv} can={can} tx={} rx={}",
+            self.flows.len(),
+            self.device.tx.len(),
+            self.device.rx.len()
+        );
     }
 
     /// Route one packet to TCP, a UDP lane, or the server echo path.
@@ -2084,6 +2112,7 @@ impl ServerStack {
             moved |= pump(flow, &mut self.sockets, up_ready);
         }
         self.iface.poll(now, &mut self.device, &mut self.sockets);
+        self.diag();
         for _ in 0..TX_BURST {
             let Some(mut packet) = self.device.tx.pop_front() else {
                 break;
