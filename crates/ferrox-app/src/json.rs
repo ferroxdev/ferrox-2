@@ -1443,35 +1443,42 @@ mod tests {
         );
     }
 
-    /// Marks the clean strip's walk for the `ops.yml` report: the loop keeps the pass visible to valgrind.
-    #[test]
-    fn the_clean_strip_costs_no_walk() {
-        let text = format!(
-            "[{}{}]",
-            r#"{"type":"field","port":443},"#.repeat(96),
-            r#"{"type":"field","port":1}"#
-        );
+    /// A 96-member array with no comment and no trailing comma; a const, so the frame is the pass.
+    const CLEAN_ARRAY: &str = r#"[{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":1}]"#;
+
+    /// The same 96 members, each carrying a block comment, for the comment pass's frame.
+    const COMMENTED_ARRAY: &str = r#"{"k0":0 /* note 0 */,"k1":1 /* note 1 */,"k2":2 /* note 2 */,"k3":3 /* note 3 */,"k4":4 /* note 4 */,"k5":5 /* note 5 */,"k6":6 /* note 6 */,"k7":7 /* note 7 */,"k8":8 /* note 8 */,"k9":9 /* note 9 */,"k10":10 /* note 10 */,"k11":11 /* note 11 */,"k12":12 /* note 12 */,"k13":13 /* note 13 */,"k14":14 /* note 14 */,"k15":15 /* note 15 */,"k16":16 /* note 16 */,"k17":17 /* note 17 */,"k18":18 /* note 18 */,"k19":19 /* note 19 */,"k20":20 /* note 20 */,"k21":21 /* note 21 */,"k22":22 /* note 22 */,"k23":23 /* note 23 */,"k24":24 /* note 24 */,"k25":25 /* note 25 */,"k26":26 /* note 26 */,"k27":27 /* note 27 */,"k28":28 /* note 28 */,"k29":29 /* note 29 */,"k30":30 /* note 30 */,"k31":31 /* note 31 */,"k32":32 /* note 32 */,"k33":33 /* note 33 */,"k34":34 /* note 34 */,"k35":35 /* note 35 */,"k36":36 /* note 36 */,"k37":37 /* note 37 */,"k38":38 /* note 38 */,"k39":39 /* note 39 */,"k40":40 /* note 40 */,"k41":41 /* note 41 */,"k42":42 /* note 42 */,"k43":43 /* note 43 */,"k44":44 /* note 44 */,"k45":45 /* note 45 */,"k46":46 /* note 46 */,"k47":47 /* note 47 */,"k48":48 /* note 48 */,"k49":49 /* note 49 */,"k50":50 /* note 50 */,"k51":51 /* note 51 */,"k52":52 /* note 52 */,"k53":53 /* note 53 */,"k54":54 /* note 54 */,"k55":55 /* note 55 */,"k56":56 /* note 56 */,"k57":57 /* note 57 */,"k58":58 /* note 58 */,"k59":59 /* note 59 */,"k60":60 /* note 60 */,"k61":61 /* note 61 */,"k62":62 /* note 62 */,"k63":63 /* note 63 */,"k64":64 /* note 64 */,"k65":65 /* note 65 */,"k66":66 /* note 66 */,"k67":67 /* note 67 */,"k68":68 /* note 68 */,"k69":69 /* note 69 */,"k70":70 /* note 70 */,"k71":71 /* note 71 */,"k72":72 /* note 72 */,"k73":73 /* note 73 */,"k74":74 /* note 74 */,"k75":75 /* note 75 */,"k76":76 /* note 76 */,"k77":77 /* note 77 */,"k78":78 /* note 78 */,"k79":79 /* note 79 */,"k80":80 /* note 80 */,"k81":81 /* note 81 */,"k82":82 /* note 82 */,"k83":83 /* note 83 */,"k84":84 /* note 84 */,"k85":85 /* note 85 */,"k86":86 /* note 86 */,"k87":87 /* note 87 */,"k88":88 /* note 88 */,"k89":89 /* note 89 */,"k90":90 /* note 90 */,"k91":91 /* note 91 */,"k92":92 /* note 92 */,"k93":93 /* note 93 */,"k94":94 /* note 94 */,"k95":95 /* note 95 */,"z":0}"#;
+
+    /// The clean strip over a fixed buffer, kept out of line so `ops.yml` sees its frame.
+    #[inline(never)]
+    fn clean_strip_probe() -> usize {
         let mut total = 0usize;
         for _ in 0..64 {
-            total += strip_jsonc(std::hint::black_box(&text)).len();
+            total += strip_jsonc(std::hint::black_box(CLEAN_ARRAY)).len();
         }
-        std::hint::black_box(total);
+        total
     }
 
-    /// Marks the comment-bearing strip's walk for the `ops.yml` report.
-    #[test]
-    fn the_comment_strip_costs_one_walk() {
-        use std::fmt::Write as _;
-        let mut text = String::from("{");
-        for at in 0..96 {
-            let _ = write!(text, "\"k{at}\":{at} /* note {at} */,");
-        }
-        text.push_str("\"z\":0}");
+    /// The comment-bearing strip over a fixed buffer, kept out of line for `ops.yml`.
+    #[inline(never)]
+    fn comment_strip_probe() -> usize {
         let mut total = 0usize;
         for _ in 0..64 {
-            total += strip_jsonc(std::hint::black_box(&text)).len();
+            total += strip_jsonc(std::hint::black_box(COMMENTED_ARRAY)).len();
         }
-        std::hint::black_box(total);
+        total
+    }
+
+    /// Marks the clean strip's walk for the `ops.yml` report: one pass over a fixed buffer, no fixture.
+    #[test]
+    fn the_clean_strip_costs_no_walk() {
+        std::hint::black_box(clean_strip_probe());
+    }
+
+    /// Marks the comment-bearing strip's walk for the `ops.yml` report, the same way.
+    #[test]
+    fn the_comment_strip_costs_one_walk() {
+        std::hint::black_box(comment_strip_probe());
     }
 
     /// The byte walk this file carried before it scanned runs, so a sweep proves the spans copy
