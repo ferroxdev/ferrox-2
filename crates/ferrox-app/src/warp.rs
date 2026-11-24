@@ -2218,7 +2218,7 @@ fn http_check_wireguard(identity: &Identity, spec: &WarpSpec, edge: SocketAddr) 
         return false;
     };
     http_check(
-        |client, asked| out.serve_tcp(client, asked, b"", None),
+        |client, asked| out.serve_tcp(client, asked, b""),
         spec.ironclad_port,
     )
 }
@@ -3070,7 +3070,7 @@ impl WarpOut {
             }
             Lane::Mim => {
                 if let Some(mim) = &self.mim {
-                    mim.inner.serve_tcp(client, asked, prefix);
+                    mim.inner.serve_tcp(client, asked, prefix, None);
                 }
             }
         }
@@ -5892,6 +5892,7 @@ mod tests {
             crate::conn::Connection::from(tun),
             &crate::proxy::Destination::Address(echo_address),
             b"head",
+            None,
         );
         app.write_all(b"hello").expect("write");
         let mut answer = [0u8; 9];
