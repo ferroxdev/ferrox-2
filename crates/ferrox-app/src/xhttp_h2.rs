@@ -379,12 +379,14 @@ impl<'a> DataBatch<'a> {
             .unwrap_or_else(PoisonError::into_inner);
         let mut capped = [[0u8; 9]; DATA_FRAMES_PER_WRITE];
         let mut take = [0usize; DATA_FRAMES_PER_WRITE];
-        let mut parts: [&[u8]; 5 * DATA_FRAMES_PER_WRITE] = [NO_PART; 5 * DATA_FRAMES_PER_WRITE];
-        let mut pieces = 0;
         for at in 0..included {
             let id = u32::from_be_bytes([heads[at][5], heads[at][6], heads[at][7], heads[at][8]]);
             take[at] = fit[at].min(max);
             capped[at] = frame_head(take[at], T_DATA, 0, id);
+        }
+        let mut parts: [&[u8]; 5 * DATA_FRAMES_PER_WRITE] = [NO_PART; 5 * DATA_FRAMES_PER_WRITE];
+        let mut pieces = 0;
+        for at in 0..included {
             parts[pieces] = &capped[at];
             pieces += 1;
             let mut left = take[at];
