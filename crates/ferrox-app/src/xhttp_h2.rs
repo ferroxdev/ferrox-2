@@ -1186,6 +1186,7 @@ impl Read for H2StreamReader {
             }
             if self.conn.client_read.is_some() {
                 drop(st);
+                self.conn.flush_connection_credit();
                 match self.pump(crate::proxy::relay_step_owns_poll()) {
                     Pumped::Alive => {}
                     Pumped::Yield => {
@@ -1206,6 +1207,16 @@ impl Read for H2StreamReader {
                     self.conn.forget_upload(self.id);
                     return Err(std::io::Error::other("h2 body stalled"));
                 }
+                drop(st);
+                self.conn.flush_connection_credit();
+                st = self
+                    .stream
+                    .state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if !st.body.is_empty() || st.read_ended() || st.dead {
+                    continue;
+                }
                 let (_guard, wait) = self
                     .stream
                     .cv
@@ -1217,6 +1228,16 @@ impl Read for H2StreamReader {
                 continue;
             }
             // A body read carries its arrival deadline, so a withheld DATA frame ends there instead of at the stall.
+            drop(st);
+            self.conn.flush_connection_credit();
+            st = self
+                .stream
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if !st.body.is_empty() || st.read_ended() || st.dead {
+                continue;
+            }
             let (wait_for, deadline_bounded) = body_wait(crate::budgets::relay_stall());
             let (next, wait) = self
                 .stream
@@ -1279,6 +1300,7 @@ impl crate::proxy::WindowRead for H2StreamReader {
             }
             if self.conn.client_read.is_some() {
                 drop(st);
+                self.conn.flush_connection_credit();
                 match self.conn.pump_read(
                     || {
                         let st = self
@@ -1309,6 +1331,16 @@ impl crate::proxy::WindowRead for H2StreamReader {
                     self.conn.forget_upload(self.id);
                     return Err(std::io::Error::other("h2 body stalled"));
                 }
+                drop(st);
+                self.conn.flush_connection_credit();
+                st = self
+                    .stream
+                    .state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if !st.body.is_empty() || st.read_ended() || st.dead {
+                    continue;
+                }
                 let (_guard, wait) = self
                     .stream
                     .cv
@@ -1317,6 +1349,16 @@ impl crate::proxy::WindowRead for H2StreamReader {
                 if wait.timed_out() {
                     return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
                 }
+                continue;
+            }
+            drop(st);
+            self.conn.flush_connection_credit();
+            st = self
+                .stream
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if !st.body.is_empty() || st.read_ended() || st.dead {
                 continue;
             }
             let (next, wait) = self
@@ -1991,31 +2033,26 @@ impl H2Conn {
         }
         let batch = (self.recv_window as usize).clamp(1, CREDIT_BATCH_BYTES);
         self.credit_connection(wire as usize, batch);
-        let (pending, starved) = {
+        let pending = {
             let streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
             let Some(state) = streams.get(&stream).cloned() else {
                 return;
             };
             drop(streams);
             let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
-            let starved = st.body.is_empty() && !st.read_ended() && !st.dead;
             let pending = st.pending_credit.saturating_add(wire);
             let flush = (st.read_ended() && st.body.is_empty())
                 || st.dead
-                || starved
                 || matches!(self.control, Control::Inline)
                 || pending as usize >= batch;
             if flush {
                 st.pending_credit = 0;
-                (pending, starved)
+                pending
             } else {
                 st.pending_credit = pending;
-                (0, starved)
+                0
             }
         };
-        if starved {
-            self.flush_connection_credit();
-        }
         if pending > 0 {
             self.replenish_stream(stream, pending as usize);
         }
