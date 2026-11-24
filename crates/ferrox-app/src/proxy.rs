@@ -23326,13 +23326,13 @@ pub(crate) fn tls_client_halves(
     Some((Box::new(reader), Box::new(writer)))
 }
 
-pub(crate) fn tls_server_halves(
-    session: AnyTlsServerSession,
-) -> Option<(Box<dyn Read + Send>, Box<dyn FrameWrite + Send>, bool)> {
+pub(crate) type ServerHalves = (Box<dyn Read + Send>, Box<dyn FrameWrite + Send>);
+
+pub(crate) fn tls_server_halves(session: AnyTlsServerSession) -> Option<(ServerHalves, bool)> {
     let driven = Drivable::transport(&session).is_some();
     let raw = session.get_ref().get_ref().try_clone().ok()?;
     let (reader, writer) = session_halves(session, raw);
-    Some((Box::new(reader), Box::new(writer), driven))
+    Some(((Box::new(reader), Box::new(writer)), driven))
 }
 
 pub(crate) fn relay_anytls_stream(

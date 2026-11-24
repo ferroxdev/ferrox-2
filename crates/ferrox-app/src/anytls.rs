@@ -1188,7 +1188,7 @@ fn serve_connection(
         if session.handshake().is_err() {
             return;
         }
-        let Some((reader, writer, driven)) = proxy::tls_server_halves(session) else {
+        let Some(((reader, writer), driven)) = proxy::tls_server_halves(session) else {
             return;
         };
         (reader, writer, driven)

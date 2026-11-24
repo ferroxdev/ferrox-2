@@ -1660,7 +1660,7 @@ fn serve_h2_connection(
         if session.alpn() != Some(b"h2") {
             return;
         }
-        let Some((reader, writer, _driven)) = proxy::tls_server_halves(session) else {
+        let Some(((reader, writer), _driven)) = proxy::tls_server_halves(session) else {
             return;
         };
         (reader, writer)
@@ -3270,9 +3270,9 @@ mod tests {
 
     impl proxy::LaneWrite for Sink {}
 
-    struct Trickle;
+    struct TrickleWrite;
 
-    impl Write for Trickle {
+    impl Write for TrickleWrite {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             Ok(buf.len())
         }
@@ -3282,7 +3282,7 @@ mod tests {
         }
     }
 
-    impl proxy::FrameWrite for Trickle {
+    impl proxy::FrameWrite for TrickleWrite {
         fn write_slices(&mut self, _parts: &[&[u8]]) -> bool {
             false
         }
@@ -3294,7 +3294,7 @@ mod tests {
 
     #[test]
     fn a_short_h2_buffer_drain_reports_progress() {
-        let mut write = BoxedWrite::new(Box::new(Trickle));
+        let mut write = BoxedWrite::new(Box::new(TrickleWrite));
         write.pending = b"abcdef".to_vec();
         assert!(matches!(write.settle(), proxy::Settle::Advanced));
         assert_eq!(write.pending, b"def");
