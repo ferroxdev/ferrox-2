@@ -149,8 +149,6 @@ pub struct Fragment {
     ent: Entropy,
     count: u64,
     gathered: Option<Gathered>,
-    /// The next record a readiness write may emit, so a delay survives the return to the lane.
-    ready_until: Option<std::time::Instant>,
 }
 
 /// The part of a merged hello already built but not yet accepted by the sink, so a refused write
@@ -193,7 +191,6 @@ impl Fragment {
             ent: Entropy::new(),
             count: 0,
             gathered: None,
-            ready_until: None,
         })
     }
 
@@ -207,12 +204,8 @@ impl Fragment {
 
     /// The write the chain hands this stage, answered with how much of it reached the wire.
     pub fn write<W: Write>(&mut self, raw: &mut W, p: &[u8]) -> io::Result<usize> {
-        if READY.with(std::cell::Cell::get) {
-            match self.ready_until {
-                Some(until) if std::time::Instant::now() < until => return Ok(0),
-                Some(_) => self.ready_until = None,
-                None => {}
-            }
+        if READY.with(std::cell::Cell::get) && READY_WAIT.with(std::cell::Cell::get) > 0 {
+            return Ok(0);
         }
         if let Some(mut gathered) = self.gathered.take() {
             if let Err(error) = flush_gathered(raw, &mut gathered) {
@@ -333,7 +326,7 @@ impl Fragment {
         }
         if READY.with(std::cell::Cell::get) {
             let _ = raw.flush();
-            self.ready_until = Some(std::time::Instant::now() + Duration::from_millis(ms as u64));
+            READY_WAIT.with(|wait| wait.set(wait.get().max(ms as u64)));
             return Ok(());
         }
         match raw.flush() {
@@ -723,11 +716,7 @@ impl Fragment {
         let mut from = 0usize;
         let mut segment = 0usize;
         loop {
-            if READY.with(std::cell::Cell::get)
-                && self
-                    .ready_until
-                    .is_some_and(|until| std::time::Instant::now() < until)
-            {
+            if READY.with(std::cell::Cell::get) && READY_WAIT.with(std::cell::Cell::get) > 0 {
                 return Ok(from);
             }
             let Some(to) = self.cut(segment, from, p.len(), bound) else {
@@ -821,11 +810,14 @@ fn flush_gathered<W: Write>(raw: &mut W, gathered: &mut Gathered) -> io::Result<
         }
         if let Some((_, wait)) = gathered.parks.first().copied() {
             gathered.parks.remove(0);
-            if wait > 0 && !DRAINING.with(std::cell::Cell::get) && !READY.with(std::cell::Cell::get)
-            {
-                #[cfg(test)]
-                SLEEPS.with(|count| count.set(count.get() + 1));
-                std::thread::sleep(Duration::from_millis(wait as u64));
+            if wait > 0 {
+                if READY.with(std::cell::Cell::get) {
+                    READY_WAIT.with(|left| left.set(left.get().max(wait as u64)));
+                } else if !DRAINING.with(std::cell::Cell::get) {
+                    #[cfg(test)]
+                    SLEEPS.with(|count| count.set(count.get() + 1));
+                    std::thread::sleep(Duration::from_millis(wait as u64));
+                }
             }
         }
     }
@@ -926,6 +918,7 @@ fn between(ip: IpAddr, start: IpAddr, end: IpAddr) -> bool {
 thread_local! {
     static DRAINING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static READY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static READY_WAIT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -949,10 +942,18 @@ impl Drop for DrainFlag {
 /// A write that must not spend a configured inter-record delay on the thread: the stage records the
 /// deadline and answers `Ok(0)` until it passes, so the lane parks on its own clock instead.
 pub fn ready_write() -> ReadyFlag {
+    READY_WAIT.with(|wait| wait.set(0));
     ReadyFlag(READY.replace(true))
 }
 
+/// The delay a readiness write deferred instead of sleeping, for the caller's own clock.
+pub fn take_ready_wait() -> Option<Duration> {
+    let ms = READY_WAIT.with(|wait| wait.replace(0));
+    (ms > 0).then(|| Duration::from_millis(ms))
+}
+
 /// Restores the previous readiness mode when the write returns.
+#[derive(Debug)]
 pub struct ReadyFlag(bool);
 
 impl Drop for ReadyFlag {

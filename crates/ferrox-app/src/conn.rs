@@ -87,6 +87,8 @@ pub(crate) struct Masked {
     mark: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     /// The absolute instant a masked read must stop, carried under a chain that may loop inside one call.
     read_until: std::sync::Mutex<Option<Instant>>,
+    /// The spacing a readiness write deferred, so the next offer parks on the lane's clock.
+    ready_until: std::sync::Arc<std::sync::Mutex<Option<Instant>>>,
 }
 
 /// The first-write rewrite an outbound's `sniSpoof` arms, shared by every handle of one stream
@@ -888,6 +890,7 @@ impl Connection {
                     sni: None,
                     mark: None,
                     read_until: std::sync::Mutex::new(None),
+                    ready_until: std::sync::Arc::new(std::sync::Mutex::new(None)),
                 })
             }
             (Connection::Metered(metered), mask) => Connection::Metered(Metered {
@@ -928,6 +931,7 @@ impl Connection {
                 sni: Some(state()),
                 mark: None,
                 read_until: std::sync::Mutex::new(None),
+                ready_until: std::sync::Arc::new(std::sync::Mutex::new(None)),
             }),
             Connection::Masked(mut masked) => {
                 masked.sni = Some(state());
@@ -965,6 +969,7 @@ impl Connection {
                 sni: None,
                 mark: Some(mark),
                 read_until: std::sync::Mutex::new(None),
+                ready_until: std::sync::Arc::new(std::sync::Mutex::new(None)),
             }),
             Connection::Masked(mut masked) => {
                 masked.mark = Some(mark);
@@ -1333,6 +1338,18 @@ impl Connection {
     /// The Windows arm toggles the socket for the call: `select` cannot promise a whole blocking
     /// write, so the descriptor is nonblocking while the bytes are offered and restored after.
     pub(crate) fn write_ready(&mut self, parts: &[&[u8]]) -> io::Result<usize> {
+        if let Connection::Masked(masked) = self {
+            let mut until = masked
+                .ready_until
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(deadline) = *until {
+                if Instant::now() < deadline {
+                    return Ok(0);
+                }
+                *until = None;
+            }
+        }
         self.set_nonblocking(true)?;
         let _ready = ferrox_core::finalmask::ready_write();
         let mut total = 0;
@@ -1352,6 +1369,15 @@ impl Connection {
                         break 'parts;
                     }
                 }
+            }
+        }
+        if let Connection::Masked(masked) = self {
+            if let Some(wait) = ferrox_core::finalmask::take_ready_wait() {
+                *masked
+                    .ready_until
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(Instant::now() + wait);
             }
         }
         let restored = self.set_nonblocking(false);
@@ -1751,6 +1777,7 @@ impl Connection {
                     sni: masked.sni.as_ref().map(std::sync::Arc::clone),
                     mark: masked.mark.as_ref().map(std::sync::Arc::clone),
                     read_until: std::sync::Mutex::new(None),
+                    ready_until: std::sync::Arc::clone(&masked.ready_until),
                 })
             }),
             Connection::Metered(metered) => metered.inner.try_clone().map(|inner| {
@@ -5941,6 +5968,7 @@ mod tests {
             })),
             mark: None,
             read_until: std::sync::Mutex::new(None),
+            ready_until: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
