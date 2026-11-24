@@ -5071,7 +5071,9 @@ impl Read for QuicStream {
                 }
             }
             if relayed {
-                crate::proxy::note_stream_wait();
+                crate::proxy::note_stream_wait(
+                    std::sync::Arc::as_ptr(&self.conn) as *const () as usize,
+                );
                 return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
             }
             if Instant::now() >= deadline {

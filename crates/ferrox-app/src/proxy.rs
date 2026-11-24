@@ -14609,23 +14609,23 @@ pub(crate) fn forget_wait_idle() {
 }
 
 thread_local! {
-    /// A relay read that timed out on a stream with no descriptor: the connection driver wakes it
-    /// when it buffers that stream's bytes, so the poll clock is a fallback rather than the clock.
-    static WAIT_STREAM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The connection of a relay read that timed out on a stream with no descriptor: its driver
+    /// wakes the lane when it buffers that connection's bytes, so the poll clock is a fallback.
+    static WAIT_STREAM: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
-pub(crate) fn note_stream_wait() {
+pub(crate) fn note_stream_wait(connection: usize) {
     if relay_step_owns_poll() {
-        WAIT_STREAM.with(|slot| slot.set(true));
+        WAIT_STREAM.with(|slot| slot.set(Some(connection)));
     }
 }
 
-pub(crate) fn take_stream_wait() -> bool {
+pub(crate) fn take_stream_wait() -> Option<usize> {
     WAIT_STREAM.with(std::cell::Cell::take)
 }
 
 pub(crate) fn forget_stream_wait() {
-    WAIT_STREAM.with(|slot| slot.set(false));
+    WAIT_STREAM.with(|slot| slot.set(None));
 }
 
 /// Scoped claim, so a step that returns or panics leaves the thread as it found it.
@@ -36295,11 +36295,11 @@ pub(crate) mod lane_pool {
         handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
     }
 
-    /// Lanes with nothing to read wait here, each with the instant it is due another turn and
-    /// whether a stream driver can wake it.
+    /// Lanes with nothing to read wait here, each with the instant it is due another turn and the
+    /// connection whose driver can wake it.
     #[derive(Default)]
     struct Parked {
-        lanes: Vec<(std::time::Instant, Lane, bool)>,
+        lanes: Vec<(std::time::Instant, Lane, Option<usize>)>,
         waking: bool,
     }
 
@@ -36728,16 +36728,16 @@ pub(crate) mod lane_pool {
         park_with(pool, lane, crate::budgets::RELAY_POLL);
     }
 
-    /// A connection driver that has just buffered stream data wakes the lanes waiting on the poll
-    /// clock: a relay read has no descriptor of its own, so without this the peer's bytes wait for
-    /// the next quantum.
-    pub(crate) fn kick_streams() {
+    /// A connection driver that has just buffered stream data wakes the lanes whose stream read
+    /// found nothing: a relay read has no descriptor of its own, so without this the bytes wait for
+    /// the next poll quantum.
+    pub(crate) fn kick_streams(connection: usize) {
         for pool in [POOL.get(), DEMUX_POOL.get()].into_iter().flatten() {
-            kick_pool(pool);
+            kick_pool(pool, connection);
         }
     }
 
-    fn kick_pool(pool: &std::sync::Arc<Pool>) {
+    fn kick_pool(pool: &std::sync::Arc<Pool>, connection: usize) {
         let mut parked = pool.parked.lock().unwrap_or_else(PoisonError::into_inner);
         if parked.lanes.is_empty() {
             return;
@@ -36745,7 +36745,7 @@ pub(crate) mod lane_pool {
         let mut batch = Vec::new();
         let mut waiting = Vec::with_capacity(parked.lanes.len());
         for (due, lane, stream) in std::mem::take(&mut parked.lanes) {
-            if stream {
+            if stream == Some(connection) {
                 batch.push(lane);
             } else {
                 waiting.push((due, lane, stream));
@@ -38056,14 +38056,18 @@ pub(crate) mod lane_pool {
             let due = Instant::now() + Duration::from_secs(60);
             {
                 let mut parked = pool.parked.lock().unwrap_or_else(PoisonError::into_inner);
-                parked.lanes.push((due, lane(), true));
-                parked.lanes.push((due, lane(), false));
+                parked.lanes.push((due, lane(), Some(7)));
+                parked.lanes.push((due, lane(), Some(9)));
             }
-            kick_pool(&pool);
+            kick_pool(&pool, 7);
             {
                 let parked = pool.parked.lock().unwrap_or_else(PoisonError::into_inner);
-                assert_eq!(parked.lanes.len(), 1, "a lane on the clock left its wait");
-                assert!(!parked.lanes[0].2, "the kicked lane was not the stream's");
+                assert_eq!(
+                    parked.lanes.len(),
+                    1,
+                    "a lane on another connection left its wait"
+                );
+                assert_eq!(parked.lanes[0].2, Some(9), "the kicked lane was not the stream's");
             }
             assert_eq!(
                 pool.ready
