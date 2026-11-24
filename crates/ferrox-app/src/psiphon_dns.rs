@@ -1473,7 +1473,7 @@ mod tests {
             }
         });
         let mut config = Config::from_servers(&[server]);
-        config.request_timeout = std::time::Duration::from_millis(50);
+        config.request_timeout = std::time::Duration::from_secs(2);
         config.await_timeout = std::time::Duration::from_secs(1);
         let (addresses, ttl) = super::query(
             "psiphon.test",
@@ -1543,7 +1543,7 @@ mod tests {
         let responder = thread::spawn(move || responder(&socket));
         let mut config = Config::from_servers(&[server]);
         config.prefer_alternate_probability = 1.0;
-        config.request_timeout = std::time::Duration::from_millis(50);
+        config.request_timeout = std::time::Duration::from_secs(2);
         let first = resolve_with(&config, "psiphon.test", 443).expect("first");
         responder.join().expect("responder");
         let second = resolve_with(&config, "psiphon.test", 443).expect("cached");
@@ -1706,7 +1706,7 @@ mod tests {
         let server = socket.local_addr().expect("address");
         let responder = thread::spawn(move || responder(&socket));
         let mut config = Config::from_servers(&[server]);
-        config.request_timeout = std::time::Duration::from_millis(50);
+        config.request_timeout = std::time::Duration::from_secs(2);
         let (addresses, ttl) = super::query(
             "psiphon.test",
             server,

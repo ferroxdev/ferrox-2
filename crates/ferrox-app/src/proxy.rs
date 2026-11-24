@@ -68101,29 +68101,42 @@ mod tests {
             r#"{"protocol": "shadowsocks", "settings": {"password": "pw", "method": "aes-256-gcm", "network": ["udp"]}}"#,
         )
         .expect("parses");
-        let address = (0..64)
-            .find_map(|_| {
-                let tcp = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
-                let port = tcp.local_addr().ok()?.port();
-                let udp = UdpSocket::bind(("127.0.0.1", port)).ok()?;
-                drop(udp);
-                drop(tcp);
-                let address = format!("127.0.0.1:{port}");
-                if serve_shadowsocks_inbound(
-                    &address,
-                    &inbound,
-                    true,
-                    &std::collections::HashSet::new(),
-                    None,
-                ) == 0
-                {
-                    return None;
-                }
-                std::net::TcpStream::connect(("127.0.0.1", port))
-                    .is_err()
-                    .then_some(address)
-            })
-            .expect("a port free for tcp and udp that the udp-only front binds");
+        // The probe releases the port before the front binds it, so a pass can lose the race and retry.
+        let mut address = None;
+        for _ in 0..256 {
+            let Some(tcp) = std::net::TcpListener::bind("127.0.0.1:0").ok() else {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            };
+            let Some(port) = tcp.local_addr().ok().map(|address| address.port()) else {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            };
+            let Some(udp) = UdpSocket::bind(("127.0.0.1", port)).ok() else {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            };
+            drop(udp);
+            drop(tcp);
+            let candidate = format!("127.0.0.1:{port}");
+            if serve_shadowsocks_inbound(
+                &candidate,
+                &inbound,
+                true,
+                &std::collections::HashSet::new(),
+                None,
+            ) == 0
+            {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                address = Some(candidate);
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        let address = address.expect("a port free for tcp and udp that the udp-only front binds");
         let master = ferrox_core::shadowsocks::MasterKey::new("pw", 32);
         let method = ferrox_core::shadowsocks::Method::Aes256Gcm;
         let mut wire = vec![0u8; crate::shadowsocks::DATAGRAM_MAX];
