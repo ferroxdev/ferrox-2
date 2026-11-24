@@ -1338,6 +1338,19 @@ impl Connection {
     /// The Windows arm toggles the socket for the call: `select` cannot promise a whole blocking
     /// write, so the descriptor is nonblocking while the bytes are offered and restored after.
     pub(crate) fn write_ready(&mut self, parts: &[&[u8]]) -> io::Result<usize> {
+        match self {
+            Connection::Metered(metered) => {
+                let outcome = metered.inner.write_ready(parts);
+                if let Ok(n) = outcome {
+                    metered.meter.write(n);
+                }
+                return outcome;
+            }
+            Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
+                return inner.write_ready(parts);
+            }
+            _ => {}
+        }
         if let Connection::Masked(masked) = self {
             let mut until = masked
                 .ready_until

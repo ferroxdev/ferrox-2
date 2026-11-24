@@ -205,7 +205,11 @@ impl Fragment {
     /// The write the chain hands this stage, answered with how much of it reached the wire.
     pub fn write<W: Write>(&mut self, raw: &mut W, p: &[u8]) -> io::Result<usize> {
         if READY.with(std::cell::Cell::get) && READY_WAIT.with(std::cell::Cell::get) > 0 {
-            return Ok(0);
+            return if p.is_empty() {
+                Ok(0)
+            } else {
+                Err(io::ErrorKind::WouldBlock.into())
+            };
         }
         if let Some(mut gathered) = self.gathered.take() {
             if let Err(error) = flush_gathered(raw, &mut gathered) {
@@ -2001,6 +2005,26 @@ mod tests {
             wire.wire.bytes.len() >= HEADER,
             "the record the delay separated left before the delay"
         );
+    }
+
+    #[test]
+    fn a_ready_nested_write_reports_wouldblock_for_a_nonempty_slice() {
+        let mut fragment = Fragment::new(
+            0,
+            1,
+            vec![range(4, 4)],
+            vec![range(1000, 1000)],
+            range(0, 0),
+        )
+        .expect("valid");
+        let mut wire = Wire::default();
+        let _ready = ready_write();
+        READY_WAIT.with(|wait| wait.set(1));
+        let error = fragment
+            .write(&mut wire, b"abcde")
+            .expect_err("a delayed write returns backpressure");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(wire.bytes.is_empty());
     }
 
     #[test]

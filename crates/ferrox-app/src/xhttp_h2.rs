@@ -7,8 +7,8 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::h2::{
-    block_encode, frame_head, write_frame, Decoder, E_COMPRESSION, E_FRAME_SIZE, E_PROTOCOL,
-    E_REFUSED, F_ACK, F_END, F_END_HEADERS, F_PADDED, F_PRIORITY, HEAD_CAP, MAGIC,
+    block_encode, frame_head, write_frame, Decoder, E_CANCEL, E_COMPRESSION, E_FRAME_SIZE,
+    E_PROTOCOL, E_REFUSED, F_ACK, F_END, F_END_HEADERS, F_PADDED, F_PRIORITY, HEAD_CAP, MAGIC,
     S_MAX_CONCURRENT, S_MAX_FRAME, S_WINDOW, T_CONT, T_DATA, T_GOAWAY, T_HEADERS, T_PING, T_RST,
     T_SETTINGS, T_WINDOW, WINDOW, WINDOW_MAX,
 };
@@ -68,6 +68,7 @@ struct DataBatch<'a> {
     bodies: [[&'a [u8]; 4]; DATA_FRAMES_PER_WRITE],
     counts: [u8; DATA_FRAMES_PER_WRITE],
     used: usize,
+    completed: usize,
 }
 
 /// The suffix of a frame after the first `skip` bytes, with its head length and part count corrected.
@@ -102,6 +103,7 @@ impl<'a> DataBatch<'a> {
             bodies: [[NO_PART; 4]; DATA_FRAMES_PER_WRITE],
             counts: [0; DATA_FRAMES_PER_WRITE],
             used: 0,
+            completed: 0,
         }
     }
 
@@ -413,6 +415,7 @@ impl<'a> DataBatch<'a> {
             return false;
         }
         drop(write);
+        self.completed += take[..written].iter().sum::<usize>();
         let mut new_heads = self.heads;
         let mut new_bodies = self.bodies;
         let mut new_counts = self.counts;
@@ -442,6 +445,16 @@ impl<'a> DataBatch<'a> {
         self.counts = new_counts;
         self.used = used;
         true
+    }
+
+    /// The prefix already on the wire, with the unsent reservation returned to the connection.
+    fn short(&mut self, conn: &H2Conn) -> std::io::Result<usize> {
+        self.refund_reserved(conn);
+        if self.completed == 0 {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        } else {
+            Ok(self.completed)
+        }
     }
 
     /// Return the credit a batch that will never be written took from the connection and its stream.
@@ -526,6 +539,7 @@ impl<'a> DataBatch<'a> {
                     conn.dead.store(true, Ordering::SeqCst);
                     return false;
                 }
+                self.completed += take;
             }
         }
         true
@@ -557,11 +571,18 @@ impl<'a> DataBatch<'a> {
                 }
             }
         }
+        let total: usize = self
+            .heads
+            .iter()
+            .take(self.used)
+            .map(|head| u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize)
+            .sum();
         self.used = 0;
         if !write.write_slices(&parts[..pieces]) {
             conn.dead.store(true, Ordering::SeqCst);
             return false;
         }
+        self.completed += total;
         true
     }
 
@@ -692,6 +713,11 @@ impl H2StreamOut {
         self.conn.respond_trailers(self.stream, block)
     }
 
+    /// A CONNECT stream keeps its download open when the upload half ends.
+    pub(crate) fn mark_tunnel(&self) {
+        self.conn.mark_tunnel(self.stream);
+    }
+
     /// The request is refused with its body unread: an `RST_STREAM` frees the stream and the credit
     /// it would otherwise keep granting a body nobody drains.
     pub(crate) fn reset(&self) {
@@ -719,6 +745,8 @@ struct StreamState {
     finished: bool,
     /// The request half ended locally: the peer still owes the response, so it does not end the read.
     request_ended: bool,
+    /// A CONNECT tunnel's request half is the upload: its END_STREAM does not end the download.
+    tunnel: bool,
     /// The upload reader left at a finished response while the client still holds the request open.
     abandoned: bool,
     /// The session ended under the reader, so later DATA is discarded instead of queued for an answer already owed.
@@ -735,7 +763,7 @@ impl StreamState {
     /// ending on the side that reads requests. A client's request half ending still expects an
     /// answer on the same stream.
     fn read_ended(&self) -> bool {
-        self.ended || (self.finished && !self.request_ended)
+        self.ended || (self.finished && !self.request_ended && !self.tunnel)
     }
 
     /// Both halves are done, so the stream can retire: the peer's `END_STREAM` and the half this
@@ -928,6 +956,9 @@ pub(crate) struct H2Conn {
     session_gate: Mutex<()>,
     send_conn: Mutex<u64>,
     conn_credit: AtomicUsize,
+    /// Readers parked on a stream body, so held connection credit wakes one instead of waiting out
+    /// its timeout while a sibling's bytes sit below the batch threshold.
+    waiting: AtomicUsize,
     /// Held across a reserved batch write so a SETTINGS window change cannot land before it.
     batch_gate: Mutex<()>,
     wake: Condvar,
@@ -1004,6 +1035,24 @@ impl H2StreamReader {
         let conn = Arc::clone(&self.conn);
         let id = self.id;
         move || conn.reset(id)
+    }
+
+    fn wait(
+        &self,
+        st: std::sync::MutexGuard<'_, StreamState>,
+        turn: Duration,
+    ) -> (
+        std::sync::MutexGuard<'_, StreamState>,
+        std::sync::WaitTimeoutResult,
+    ) {
+        self.conn.waiting.fetch_add(1, Ordering::SeqCst);
+        let out = self
+            .stream
+            .cv
+            .wait_timeout(st, turn)
+            .unwrap_or_else(PoisonError::into_inner);
+        self.conn.waiting.fetch_sub(1, Ordering::SeqCst);
+        out
     }
 
     /// The response status decoded for a client stream, once its head has arrived.
@@ -1216,11 +1265,7 @@ impl Read for H2StreamReader {
                 if !st.body.is_empty() || st.read_ended() || st.dead {
                     continue;
                 }
-                let (_guard, wait) = self
-                    .stream
-                    .cv
-                    .wait_timeout(st, crate::budgets::RELAY_POLL)
-                    .unwrap_or_else(PoisonError::into_inner);
+                let (_guard, wait) = self.wait(st, crate::budgets::RELAY_POLL);
                 if wait.timed_out() {
                     return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
                 }
@@ -1238,11 +1283,7 @@ impl Read for H2StreamReader {
                 continue;
             }
             let (wait_for, deadline_bounded) = body_wait(crate::budgets::relay_stall());
-            let (next, wait) = self
-                .stream
-                .cv
-                .wait_timeout(st, wait_for)
-                .unwrap_or_else(PoisonError::into_inner);
+            let (next, wait) = self.wait(st, wait_for);
             st = next;
             if wait.timed_out() {
                 drop(st);
@@ -1341,11 +1382,7 @@ impl crate::proxy::WindowRead for H2StreamReader {
                 if !st.body.is_empty() || st.read_ended() || st.dead {
                     continue;
                 }
-                let (_guard, wait) = self
-                    .stream
-                    .cv
-                    .wait_timeout(st, crate::budgets::RELAY_POLL)
-                    .unwrap_or_else(PoisonError::into_inner);
+                let (_guard, wait) = self.wait(st, crate::budgets::RELAY_POLL);
                 if wait.timed_out() {
                     return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
                 }
@@ -1361,11 +1398,7 @@ impl crate::proxy::WindowRead for H2StreamReader {
             if !st.body.is_empty() || st.read_ended() || st.dead {
                 continue;
             }
-            let (next, wait) = self
-                .stream
-                .cv
-                .wait_timeout(st, crate::budgets::relay_stall())
-                .unwrap_or_else(PoisonError::into_inner);
+            let (next, wait) = self.wait(st, crate::budgets::relay_stall());
             st = next;
             if wait.timed_out() {
                 drop(st);
@@ -1637,20 +1670,18 @@ impl H2Conn {
         let mut sent = 0;
         while !payload.is_empty() {
             if self.dead.load(Ordering::SeqCst) || state.gone() {
-                batch.refund_reserved(self);
-                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+                return batch.short(self);
             }
             if batch.full() && !batch.flush(self) {
-                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+                return batch.short(self);
             }
             let fit = payload.len().min(max);
             let Some(chunk) = self.take_send_window(&state, fit as u64, false) else {
                 if self.dead.load(Ordering::SeqCst) || state.gone() {
-                    batch.refund_reserved(self);
-                    return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+                    return batch.short(self);
                 }
                 if !batch.flush(self) {
-                    return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+                    return batch.short(self);
                 }
                 return if sent == 0 {
                     Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
@@ -1663,7 +1694,7 @@ impl H2Conn {
             sent += chunk;
         }
         if !batch.flush(self) {
-            return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+            return batch.short(self);
         }
         Ok(sent)
     }
@@ -2082,6 +2113,11 @@ impl H2Conn {
             let total = previous.saturating_add(n);
             if total >= batch {
                 self.replenish_connection(total);
+            } else if self.waiting.load(Ordering::SeqCst) > 0 {
+                let streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
+                for state in streams.values() {
+                    state.cv.notify_all();
+                }
             }
         }
     }
@@ -2324,8 +2360,29 @@ impl H2Conn {
         }
     }
 
+    fn mark_tunnel(&self, stream: u32) {
+        if let Some(state) = self
+            .streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&stream)
+        {
+            state
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .tunnel = true;
+        }
+    }
+
     fn reset_stream(&self, stream: u32) {
-        self.reset_stream_code(stream, E_REFUSED);
+        let responded = self
+            .streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&stream)
+            .is_some_and(|state| state.responded.load(Ordering::SeqCst));
+        self.reset_stream_code(stream, if responded { E_CANCEL } else { E_REFUSED });
     }
 
     fn reset_stream_code(&self, stream: u32, code: u32) {
@@ -2669,6 +2726,7 @@ impl H2Conn {
                 ended: end_stream,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -3172,6 +3230,7 @@ impl H2Client {
             session_gate: Mutex::new(()),
             send_conn: Mutex::new(65_535),
             conn_credit: AtomicUsize::new(0),
+            waiting: AtomicUsize::new(0),
             batch_gate: Mutex::new(()),
             wake: Condvar::new(),
             decoder: Mutex::new(Decoder::default()),
@@ -4201,6 +4260,7 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
                     session_gate: Mutex::new(()),
                     send_conn: Mutex::new(65_535),
                     conn_credit: AtomicUsize::new(0),
+                    waiting: AtomicUsize::new(0),
                     batch_gate: Mutex::new(()),
                     wake: Condvar::new(),
                     decoder: Mutex::new(Decoder::default()),
@@ -5379,6 +5439,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -5474,6 +5535,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -5544,6 +5606,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -5590,6 +5653,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -5664,6 +5728,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -6574,6 +6639,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -6627,6 +6693,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -6706,6 +6773,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -7008,6 +7076,7 @@ mod tests {
             session_gate: Mutex::new(()),
             send_conn: Mutex::new(65_535),
             conn_credit: AtomicUsize::new(0),
+            waiting: AtomicUsize::new(0),
             batch_gate: Mutex::new(()),
             wake: Condvar::new(),
             decoder: Mutex::new(Decoder::default()),
@@ -7037,6 +7106,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -7173,6 +7243,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -7230,6 +7301,7 @@ mod tests {
                 ended: false,
                 finished: true,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -7574,6 +7646,7 @@ mod tests {
             session_gate: Mutex::new(()),
             send_conn: Mutex::new(65_535),
             conn_credit: AtomicUsize::new(0),
+            waiting: AtomicUsize::new(0),
             batch_gate: Mutex::new(()),
             wake: Condvar::new(),
             decoder: Mutex::new(Decoder::default()),
@@ -8401,6 +8474,7 @@ mod tests {
                 ended: false,
                 finished: true,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: true,
                 status: None,
@@ -8468,6 +8542,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -8674,6 +8749,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -8733,6 +8809,7 @@ mod tests {
                 ended: true,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -8797,6 +8874,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -8836,6 +8914,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,
@@ -9045,6 +9124,7 @@ mod tests {
                 ended: false,
                 finished: false,
                 request_ended: false,
+                tunnel: false,
                 stopped: false,
                 abandoned: false,
                 status: None,

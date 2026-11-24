@@ -2987,7 +2987,10 @@ struct FragmentState {
     msg_id: u8,
     total: usize,
     next: usize,
+    /// The bytes the first attempt framed, so a retry finishes those chunks rather than a re-encoding.
     buf: Vec<u8>,
+    /// The caller's plaintext before any mask, so a re-encoded retry still names the same message.
+    key: Vec<u8>,
     to: SocketAddr,
 }
 
@@ -3085,17 +3088,17 @@ impl Gecko {
     /// Split a long-header packet into `2..=8` chunks, each framed, padded to the
     /// window and masked as its own datagram. The message id is one draw for the whole
     /// packet; the chunk count and each pad are drawn per write.
-    fn send_fragmented(&self, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
+    fn send_fragmented(&self, buf: &[u8], to: SocketAddr, key: &[u8]) -> std::io::Result<usize> {
         let mut fragment = self
             .fragment
             .lock()
             .map_err(|_| std::io::Error::other("gecko fragment lock poisoned"))?;
         let resume = fragment
             .as_ref()
-            .filter(|state| state.buf == buf && state.to == to)
-            .map(|state| (state.msg_id, state.total, state.next));
-        let (msg_id, total, start) = if let Some((msg_id, total, next)) = resume {
-            (msg_id, total, next)
+            .filter(|state| state.key == key && state.to == to)
+            .map(|state| (state.msg_id, state.total, state.next, state.buf.clone()));
+        let (msg_id, total, start, source) = if let Some((msg_id, total, next, buf)) = resume {
+            (msg_id, total, next, buf)
         } else {
             let total = ferrox_core::hysteria::GECKO_MIN_CHUNKS
                 + (entropy()
@@ -3108,17 +3111,18 @@ impl Gecko {
                 total,
                 next: 0,
                 buf: buf.to_vec(),
+                key: key.to_vec(),
                 to,
             });
-            (msg_id, total, 0)
+            (msg_id, total, 0, buf.to_vec())
         };
         let mut pad = [0u8; GECKO_BUFFER];
         let mut frame = Unfilled::<GECKO_BUFFER>::new();
         let mut wire = Unfilled::<{ GECKO_BUFFER + SALAMANDER_SALT }>::new();
         for idx in start..total {
-            let (start, end) = ferrox_core::hysteria::gecko_chunk_range(buf.len(), idx, total)
+            let (start, end) = ferrox_core::hysteria::gecko_chunk_range(source.len(), idx, total)
                 .ok_or(invalid(std::io::ErrorKind::InvalidInput))?;
-            let chunk = &buf[start..end];
+            let chunk = &source[start..end];
             let base = ferrox_core::hysteria::SALAMANDER_SALT
                 + ferrox_core::hysteria::GECKO_HEADER
                 + chunk.len();
@@ -3162,12 +3166,12 @@ impl Gecko {
         Ok(buf.len())
     }
 
-    fn send(&self, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
+    fn send(&self, buf: &[u8], to: SocketAddr, key: &[u8]) -> std::io::Result<usize> {
         if buf
             .first()
             .is_some_and(|b| b & ferrox_core::hysteria::GECKO_FLAG != 0)
         {
-            return self.send_fragmented(buf, to);
+            return self.send_fragmented(buf, to, key);
         }
         self.send_masked(buf, to)
     }
@@ -3720,7 +3724,7 @@ impl Datagram {
 
     pub(crate) fn send_to(&self, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
         let Some(mask) = self.udp_mask.as_ref() else {
-            return self.send_layered(buf, to);
+            return self.send_layered(buf, to, buf);
         };
         let Ok(mut encoder) = mask.encoder.lock() else {
             return Err(std::io::Error::other("the udp mask encoder is gone"));
@@ -3728,12 +3732,12 @@ impl Datagram {
         let Some(wire) = encoder.encode(buf) else {
             return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
         };
-        self.send_layered(wire, to)
+        self.send_layered(wire, to, buf)
     }
 
-    fn send_layered(&self, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
+    fn send_layered(&self, buf: &[u8], to: SocketAddr, key: &[u8]) -> std::io::Result<usize> {
         if let Some(gecko) = self.gecko.as_ref() {
-            return gecko.send(buf, to);
+            return gecko.send(buf, to, key);
         }
         if let Some(hop) = self.hop.as_ref() {
             return hop.send(buf, to, self.obfs.as_ref());

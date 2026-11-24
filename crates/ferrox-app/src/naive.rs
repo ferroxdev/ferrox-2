@@ -134,7 +134,6 @@ struct PaddingWrite {
     pending: Vec<u8>,
     at: usize,
     input: usize,
-    accepted: usize,
     lost: bool,
 }
 
@@ -143,26 +142,15 @@ impl PaddingWrite {
         if self.lost {
             return proxy::Push::Lost;
         }
-        let mut base = 0usize;
-        if self.accepted > 0 {
-            let take = self.accepted.min(data.len());
-            self.accepted -= take;
-            base = take;
-            if self.accepted > 0 {
-                self.lost = true;
-                return proxy::Push::Lost;
-            }
-        }
-        let data = &data[base..];
         if data.is_empty() && self.pending.is_empty() {
-            return proxy::Push::Took(base);
+            return proxy::Push::Took(0);
         }
         let mut done = 0usize;
         if !self.pending.is_empty() {
             if self.at < self.pending.len() {
                 match writer.push(&self.pending[self.at..]) {
                     proxy::Push::Took(n) => self.at += n,
-                    proxy::Push::Parked => return Self::progress(base + done),
+                    proxy::Push::Parked => return Self::progress(done),
                     proxy::Push::Lost => {
                         self.lost = true;
                         return proxy::Push::Lost;
@@ -170,7 +158,7 @@ impl PaddingWrite {
                 }
             }
             if self.at < self.pending.len() {
-                return Self::progress(base + done);
+                return Self::progress(done);
             }
             let input = std::mem::take(&mut self.input);
             self.pending.clear();
@@ -184,11 +172,11 @@ impl PaddingWrite {
         }
         if self.written >= PADDING_COUNT {
             return match writer.push(&data[done..]) {
-                proxy::Push::Took(n) => proxy::Push::Took(base + done + n),
-                proxy::Push::Parked => Self::progress(base + done),
+                proxy::Push::Took(n) => proxy::Push::Took(done + n),
+                proxy::Push::Parked => Self::progress(done),
                 proxy::Push::Lost => {
                     self.lost = true;
-                    Self::progress(base + done)
+                    Self::progress(done)
                 }
             };
         }
@@ -205,16 +193,16 @@ impl PaddingWrite {
             self.input = take;
             match writer.push(&self.pending) {
                 proxy::Push::Took(n) => self.at = n,
-                proxy::Push::Parked => return Self::progress(base + done),
+                proxy::Push::Parked => return Self::progress(done),
                 proxy::Push::Lost => {
                     self.pending.clear();
                     self.input = 0;
                     self.lost = true;
-                    return Self::progress(base + done);
+                    return Self::progress(done);
                 }
             }
             if self.at < self.pending.len() {
-                return Self::progress(base + done);
+                return Self::progress(done);
             }
             self.pending.clear();
             self.at = 0;
@@ -222,7 +210,7 @@ impl PaddingWrite {
             self.written += 1;
             done += take;
         }
-        Self::progress(base + done)
+        Self::progress(done)
     }
 
     fn progress(done: usize) -> proxy::Push {
@@ -233,7 +221,8 @@ impl PaddingWrite {
         }
     }
 
-    /// Drive a record already accepted before settling: a `Clear` only when no partial record remains.
+    /// Drive the wire bytes of a record `push` left partial. A completed record stays pending so the
+    /// retry's `push` claims its payload instead of the caller writing it a second time.
     fn settle(&mut self, writer: &mut dyn proxy::LaneWrite) -> Option<proxy::Settle> {
         if self.lost {
             return Some(proxy::Settle::Lost);
@@ -259,15 +248,7 @@ impl PaddingWrite {
                 proxy::Settle::Parked
             });
         }
-        self.accepted += std::mem::take(&mut self.input);
-        self.pending.clear();
-        self.at = 0;
-        self.written += 1;
         None
-    }
-
-    fn take_accepted(&mut self) -> usize {
-        std::mem::take(&mut self.accepted)
     }
 
     #[cfg(test)]
@@ -1014,18 +995,7 @@ impl Write for NaiveStream {
         }
         loop {
             match self.settle() {
-                proxy::Settle::Clear => {
-                    if self.inner.padded {
-                        let accepted = self
-                            .inner
-                            .write_padding
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .take_accepted();
-                        done = done.saturating_add(accepted).min(buf.len());
-                    }
-                    return Ok(done);
-                }
+                proxy::Settle::Clear => return Ok(done),
                 proxy::Settle::Advanced => {
                     deadline = Instant::now() + crate::budgets::relay_stall();
                 }
@@ -1048,16 +1018,7 @@ impl Write for NaiveStream {
         let mut deadline = Instant::now() + crate::budgets::relay_stall();
         loop {
             match self.settle() {
-                proxy::Settle::Clear => {
-                    if self.inner.padded {
-                        self.inner
-                            .write_padding
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .take_accepted();
-                    }
-                    break;
-                }
+                proxy::Settle::Clear => break,
                 proxy::Settle::Advanced => {
                     deadline = Instant::now() + crate::budgets::relay_stall();
                 }
@@ -1691,6 +1652,7 @@ impl H2Service for NaiveH2Service {
                 out.reset();
                 return false;
             }
+            out.mark_tunnel();
             let writer = H2OutWrite { out: out.clone() };
             let stream = NaiveStream::new(Box::new(reader), Box::new(writer), End::H2(out), true);
             let reset = stream.clone();
@@ -1718,6 +1680,7 @@ impl H2Service for NaiveH2Service {
                     dial_out.reset();
                     return;
                 }
+                dial_out.mark_tunnel();
                 let writer = H2OutWrite {
                     out: dial_out.clone(),
                 };
@@ -2451,6 +2414,7 @@ impl NaiveOut {
                         return None;
                     }
                     let reader = H2ClientRead { inner: reader };
+                    out.mark_tunnel();
                     let writer = H2OutWrite { out: out.clone() };
                     return Some(NaiveStream::new(
                         Box::new(reader),
@@ -3643,6 +3607,65 @@ mod tests {
             at += 6 + zeros;
         }
         assert_eq!(&bytes[at..], b"tail");
+    }
+
+    struct Gate {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        room: usize,
+    }
+
+    impl Write for Gate {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.bytes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl proxy::LaneWrite for Gate {
+        fn push(&mut self, data: &[u8]) -> proxy::Push {
+            if self.room == 0 {
+                return proxy::Push::Parked;
+            }
+            let take = data.len().min(self.room);
+            self.bytes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend_from_slice(&data[..take]);
+            self.room -= take;
+            proxy::Push::Took(take)
+        }
+    }
+
+    #[test]
+    fn a_flushed_pending_record_is_claimed_by_the_retry_not_written_twice() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = Gate {
+            bytes: Arc::clone(&bytes),
+            room: 1,
+        };
+        let mut padding = PaddingWrite::default();
+        assert!(matches!(
+            padding.push(&mut sink, b"abc"),
+            proxy::Push::Parked
+        ));
+        sink.room = usize::MAX;
+        assert!(padding.settle(&mut sink).is_none());
+        let written = bytes.lock().unwrap_or_else(PoisonError::into_inner).len();
+        assert!(matches!(
+            padding.push(&mut sink, b"abc"),
+            proxy::Push::Took(3)
+        ));
+        assert_eq!(
+            bytes.lock().unwrap_or_else(PoisonError::into_inner).len(),
+            written
+        );
     }
 
     #[test]

@@ -14187,6 +14187,13 @@ where
     }
     match from.read_once(buffer.as_mut()) {
         Ok(0) => {
+            if let Some(next) = settle_lane(&sink, at, ended) {
+                if at.lost {
+                    at.lost = false;
+                    ended.mark_failed();
+                }
+                return next;
+            }
             to.spill_write();
             Next::Done
         }
