@@ -24,7 +24,9 @@ const HANDSHAKE: Duration = Duration::from_secs(10);
 const EDGE_RETRY: Duration = Duration::from_secs(1);
 const READ_WAIT: Duration = Duration::from_millis(10);
 /// The read a burst takes: shorter than the idle wait, so egress the stack produces right after data lands leaves without it, the same re-arm the QUIC pump takes.
-const READ_TAIL: Duration = Duration::from_micros(20);
+const READ_TAIL: Duration = Duration::from_micros(250);
+/// The wait the first datagram of a batch takes after a client frame, so the stack's reply leaves on this turn instead of the next one.
+const GATHER_WAIT: Duration = Duration::from_micros(200);
 const CLOSE_WAIT: Duration = Duration::from_millis(100);
 const UDP_DRAIN: Duration = Duration::from_secs(1);
 const WARP_ASSIGN_WAIT: Duration = Duration::from_millis(250);
@@ -1340,6 +1342,8 @@ struct Session {
     warp: bool,
     half_closed: bool,
     udp_quiet: Option<Instant>,
+    fed: bool,
+    diag_at: Instant,
     end: bool,
 }
 
@@ -1368,6 +1372,8 @@ impl Session {
             warp: false,
             half_closed: false,
             udp_quiet: None,
+            fed: false,
+            diag_at: Instant::now(),
             end: false,
         }
     }
@@ -1489,6 +1495,7 @@ impl Session {
                 } else if Some(id) == self.request {
                     self.send_window += i64::from(increment);
                 }
+                self.fed = true;
             }
             h2::T_PING if flags & h2::F_ACK == 0 => {
                 wire.send(h2::T_PING, h2::F_ACK, 0, body);
@@ -1541,6 +1548,7 @@ impl Session {
                 let data = strip_padding(flags, body, false);
                 self.window(wire, length);
                 self.capsules(wire, data);
+                self.fed = true;
                 if flags & h2::F_END != 0 {
                     self.half_close();
                 }
@@ -1849,21 +1857,35 @@ impl Session {
             if wire.closed || self.end || self.queued.len() >= QUEUED_CAP {
                 break;
             }
+            let wait = if pulled == 0 && self.fed {
+                self.fed = false;
+                Some(GATHER_WAIT)
+            } else {
+                None
+            };
             let packet = if let Some(udp) = &self.udp {
                 udp.try_recv()
-            } else {
-                match self
-                    .outgoing
-                    .as_ref()
-                    .map(std::sync::mpsc::Receiver::try_recv)
-                {
-                    Some(Ok(packet)) => Some(packet),
-                    Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
-                        origin_closed = true;
-                        None
-                    }
-                    _ => None,
+            } else if let Some(rx) = self.outgoing.as_ref() {
+                match wait {
+                    Some(limit) => match rx.recv_timeout(limit) {
+                        Ok(packet) => Some(packet),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            origin_closed = true;
+                            None
+                        }
+                    },
+                    None => match rx.try_recv() {
+                        Ok(packet) => Some(packet),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            origin_closed = true;
+                            None
+                        }
+                    },
                 }
+            } else {
+                None
             };
             let Some(packet) = packet else {
                 break;
@@ -1885,6 +1907,19 @@ impl Session {
         }
         if pulled > 0 {
             self.udp_quiet = Some(Instant::now());
+        }
+        let now = Instant::now();
+        if now >= self.diag_at {
+            eprintln!(
+                "h2diag win={} conn={} send={} queued={} pulled={} closed={}",
+                self.send_window.min(self.connection_window),
+                self.connection_window,
+                self.send_window,
+                self.queued.len(),
+                pulled,
+                origin_closed
+            );
+            self.diag_at = now + Duration::from_millis(250);
         }
         origin_closed
     }
