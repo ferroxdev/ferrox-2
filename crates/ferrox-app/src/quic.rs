@@ -5094,9 +5094,13 @@ impl StreamQueue {
         loop {
             if !data.is_empty() {
                 let n = data.len().min(buf.len());
-                for byte in &mut buf[..n] {
-                    *byte = data.pop_front().unwrap_or_default();
+                let (front, back) = data.as_slices();
+                let head = n.min(front.len());
+                buf[..head].copy_from_slice(&front[..head]);
+                if head < n {
+                    buf[head..n].copy_from_slice(&back[..n - head]);
                 }
+                data.drain(..n);
                 return Ok(n);
             }
             if self.eof.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
