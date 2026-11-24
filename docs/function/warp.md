@@ -4,9 +4,9 @@
 
 `mode: mim` carries one MASQUE conversation inside another: the outer identity is the enrolled WARP one, the inner comes from `mimIdentity`/`mimIdentityFile` or `<identity>-masque-secondary.json`, and `mimOuter`/`mimInner` (or `AETHER_MIM_OUTER_PEER`/`AETHER_MIM_INNER_PEER`) name the hops. `mode: gool-classic` is the older form: the outer half is a WireGuard tunnel and the inner identity comes from `goolIdentity`/`goolIdentityFile` or `<identity>-secondary.json`; `wiwOuter`/`wiwInner` name the two edges, and with `scan` on each hop is verified with its own key and the inner sweep rejects the outer edge's IP. `WireGuardOut::udp_forwarder` moves the inner peer to a loopback socket and carries its datagrams through the outer WireGuard tunnel, reserving the WireGuard header's headroom; the inner MTU is capped at 1200. Its server side is an outer `wireguard` inbound whose freedom redirect carries the inner UDP flow to the inner `wireguard` listener (`wireguard_rides_inside_wireguard`).
 
-A `team`/`--team` name (or `AETHER_TEAM` when the flag is omitted) enrols a managed device instead. The name is normalised from a bare subdomain, a full `<team>.cloudflareaccess.com` domain or an enrolment URL, and the sign-in order is the reference's: a supplied JWT (`accessToken`/`--access-token`/`AETHER_ACCESS_TOKEN`, checked for shape and `exp`), then a service token (`accessClientId`+`accessClientSecret`/`--access-id`+`--access-secret`, read from the `CF_Authorization` cookie or the page's `token=`), then an emailed one-time code (`accessEmail`/`--access-email`, three attempts). The access flow follows up to ten redirects, keeps its cookies, resolves relative `Location`s, reads `action=` from the TOTP form, and takes the nonce from the verify reply's URL. One JWT is cached per process, so `--register all` asks once. The JWT is sent only on `POST /reg` as `CF-Access-Jwt-Assertion`; the enrollment, enable and read-back carry the device bearer alone. A team registration posts `key`, `install_id`, `fcm_token`, `tos`, `model`, `name`, `serial_number` and `locale`, with `name` and `serial_number` the 22-character install id, and no `key_type`, `tunnel_type` or `os_version`. The team identity is saved beside the personal one, `<base>-team-<team>` (or its slot siblings), unless `-o`/`--config`/`--identity`/`--out` names a path.
+A `team`/`--team` name (or `AETHER_TEAM` when the flag is omitted) enrols a managed device instead. The name is normalised from a bare subdomain, a full `<team>.cloudflareaccess.com` domain or an enrolment URL, and the sign-in order is the reference's: a supplied JWT (`accessToken`/`--access-token`/`AETHER_ACCESS_TOKEN`, checked for shape and `exp`), then a service token (`accessClientId`+`accessClientSecret`/`--access-id`+`--access-secret`, read from the `CF_Authorization` cookie or the page's `token=`), then an emailed one-time code (`accessEmail`/`--access-email`, three attempts). The access flow follows up to ten redirects, keeps its cookies, resolves relative `Location`s, reads `action=` from the TOTP form, and takes the nonce from the verify reply's URL. One JWT is cached per process, so `--register all` asks once. The JWT is sent only on `POST /reg` as `CF-Access-Jwt-Assertion`; the enrollment, enable and read-back carry the device bearer alone. A team registration posts `key`, `install_id`, `fcm_token`, `tos`, `model`, `name`, `serial_number` and `locale`, with `name` and `serial_number` the 22-character install id, and no `key_type`, `tunnel_type` or `os_version`. The team identity is saved beside the personal one, `<base>-team-<team>~` (or its slot siblings), unless `-o`/`--config`/`--identity`/`--out` names a path. A saved matching team is read back without sign-in; the token flow runs only when the device is registered or replaced.
 
-`gateway`/`--gateway` sends HTTP and HTTPS through the organization's `config.services.http_proxy`, saved as `gatewayProxy` in the identity. For each 80/443 flow the tunnel opens the proxy, writes `CONNECT <authority> HTTP/1.1` with the reference's `WARP for Android` agent, waits up to 5 s for a complete head, and requires a 2xx before forwarding the client's buffered bytes; the first refusal, timeout, closed socket or malformed head retires the proxy for the life of the process and that flow goes straight through the tunnel. A saved proxy with `gateway` absent prints the address without using it; `gateway: true` with no published proxy says so and carries direct. Every other port, and every UDP flow, ignores the gateway.
+`gateway`/`--gateway` sends HTTP and HTTPS through the organization's `config.services.http_proxy`, saved as `gatewayProxy` in the identity. For each 80/443 flow the tunnel opens the proxy, writes `CONNECT <authority> HTTP/1.1` with the reference's `WARP for Android` agent, waits up to 5 s for a complete head, and requires a 2xx before forwarding the client's buffered bytes; the first refusal, timeout, closed socket or malformed head retires the proxy for the life of the process and that flow goes straight through the tunnel. A destination that is not a valid authority, and any flow outside the gateway's TCP ports, goes direct without retiring a working proxy. A saved proxy with `gateway` absent prints the address without using it; `gateway: true` with no published proxy says so and carries direct. Every other port, and every UDP flow, ignores the gateway.
 
 The identity comes from an inline `identity` block, a saved `identityFile`, or `register: true`, which registers once and saves into `identityFile`; a restart reuses the file and never creates a second device. A saved file is read back from the API before use: the peer, endpoint, reserved bytes and addresses are refreshed in place, so a device whose edge moved keeps working. `ferrox-app warp-register [--register masque|wg|gool|gool-classic|mim|all] ...` is the form, and `--noize`/`--no-profile-retry`/`--no-quic-v2` are copied into the outbound it prints. Without `--register` it registers one combined device (both halves), saves the identity owner-only (0600 on Unix), and writes the config.
 
@@ -43,14 +43,16 @@ The checks are unit races rather than a network comparison: `noize::tests::six_w
 ```mermaid
 graph TD
     A["warp-register --register kind"] --> T{"team named?"}
-    T -- yes --> T1["normalize team<br/>sign in: token / service / email"]
-    T1 --> T2["base = &lt;base&gt;-team-&lt;team&gt;<br/>unless a path was given"]
-    T2 --> B["KeyKind -> slots"]
-    T -- no --> B
+    T -- yes --> T1["normalize team<br/>base = &lt;base&gt;-team-&lt;team&gt;~<br/>unless a path was given"]
+    T -- no --> B["KeyKind -> slots"]
+    T1 --> B
     B --> C["derive each slot path<br/>base / -masque / -secondary / -gool"]
     C --> D{"file exists?"}
-    D -- no --> E["POST /reg<br/>curve25519 key"]
+    D -- no --> E["sign in: token / service / email<br/>POST /reg<br/>curve25519 key"]
     D -- yes --> F["GET /reg/id<br/>refresh peer, endpoint, addresses"]
+    F --> V{"saved team matches?"}
+    V -- no --> XF["fail, choose another path"]
+    V -- yes --> H
     F -- "401/404/410" --> G{"AETHER_REPROVISION=0?"}
     G -- no --> E
     G -- yes --> H["keep saved identity"]
@@ -89,11 +91,11 @@ graph TD
     Q -- "first true" --> R["chosen lane (once)"]
     P -- "fixed" --> R
     R --> S["serve_tcp / serve_udp<br/>on the winning half"]
-    S --> GW{"gateway active<br/>and port 80/443?"}
+    S --> GW{"gateway active,<br/>TCP port 80/443,<br/>valid authority?"}
     GW -- yes --> GW1["loopback -> serve_lane(proxy)<br/>CONNECT authority"]
     GW1 -- "2xx" --> GW2["forward prefix, relay"]
     GW1 -- "refused / timeout" --> GWR["retire proxy<br/>direct tunnel egress"]
-    GW -- no --> GWR
+    GW -- "no / ineligible" --> DE["direct tunnel egress"]
 ```
 
 ## Ops

@@ -9,6 +9,7 @@ use base64::Engine as _;
 use crate::foxy_account::{Endpoint, Reply};
 
 const TEAM_SUFFIX: &str = "cloudflareaccess.com";
+const TEAM_DOMAIN_SUFFIX: &str = ".cloudflareaccess.com";
 const ENROLL_PATH: &str = "/warp";
 const CODE_ATTEMPTS: u32 = 3;
 const INSTALL_ID_LEN: usize = 22;
@@ -31,13 +32,19 @@ type Exchange<'a> = dyn Fn(&str, &str, &[(&str, &str)], &[u8]) -> Result<Reply, 
 
 impl TeamSettings {
     pub(crate) fn from_settings(settings: &crate::json::Json) -> Result<Option<Self>, String> {
-        let text = |key: &str| settings.get(key).and_then(crate::json::Json::as_str);
+        let text = |key: &str| -> Result<Option<&str>, String> {
+            match settings.get(key) {
+                None => Ok(None),
+                Some(crate::json::Json::Str(text)) => Ok(Some(text)),
+                Some(_) => Err(format!("warp: `{key}` must be a string")),
+            }
+        };
         Self::from_parts(
-            text("team"),
-            text("accessClientId"),
-            text("accessClientSecret"),
-            text("accessToken"),
-            text("accessEmail"),
+            text("team")?,
+            text("accessClientId")?,
+            text("accessClientSecret")?,
+            text("accessToken")?,
+            text("accessEmail")?,
         )
     }
 
@@ -106,14 +113,12 @@ pub(crate) fn normalize_team(raw: &str) -> Option<String> {
     if let Some(head) = value.split('/').next() {
         value = head.to_owned();
     }
-    if let Some(head) = value.strip_suffix(TEAM_SUFFIX) {
-        value = head.trim_end_matches('.').to_owned();
+    if let Some(head) = value.strip_suffix(TEAM_DOMAIN_SUFFIX) {
+        value = head.to_owned();
+    } else if value == TEAM_SUFFIX {
+        return None;
     }
-    if value.is_empty()
-        || !value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
+    if value.is_empty() || !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return None;
     }
     Some(value)
@@ -343,24 +348,127 @@ fn is_redirect(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
 }
 
-fn resolve_url(base: &str, location: &str) -> String {
+fn url_origin(url: &str) -> Option<(&str, &str)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    (!authority.is_empty()).then_some((scheme, authority))
+}
+
+fn origin(url: &str) -> Option<String> {
+    url_origin(url).map(|(scheme, authority)| {
+        format!(
+            "{}://{}",
+            scheme.to_ascii_lowercase(),
+            authority.to_ascii_lowercase()
+        )
+    })
+}
+
+fn url_host(url: &str) -> Option<&str> {
+    let (_, authority) = url_origin(url)?;
+    if let Some(rest) = authority.strip_prefix('[') {
+        rest.split(']')
+            .next()
+            .map(|host| &authority[..host.len() + 2])
+    } else {
+        authority.split(':').next()
+    }
+}
+
+fn url_path(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let start = rest.find('/').unwrap_or(rest.len());
+    let path = rest[start..].split(['?', '#']).next().unwrap_or("");
+    if path.is_empty() {
+        "/"
+    } else {
+        path
+    }
+}
+
+fn default_cookie_path(path: &str) -> String {
+    if !path.starts_with('/') {
+        return "/".to_owned();
+    }
+    match path.rfind('/') {
+        Some(0) | None => "/".to_owned(),
+        Some(at) => path[..at].to_owned(),
+    }
+}
+
+fn resolve_url(base: &str, location: &str) -> Option<String> {
     let location = decode_entities(location);
-    if location.starts_with("https://") || location.starts_with("http://") {
-        return location;
+    let location = location.trim();
+    let (scheme, authority) = url_origin(base)?;
+    if location.is_empty() {
+        return Some(base.split('#').next().unwrap_or(base).to_owned());
     }
-    let (scheme, rest) = base.split_once("://").unwrap_or(("https", base));
-    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let lower = location.to_ascii_lowercase();
+    if lower.starts_with("https://") || lower.starts_with("http://") {
+        return Some(location.to_owned());
+    }
+    if let Some(rest) = location.strip_prefix("//") {
+        return Some(format!("{scheme}://{rest}"));
+    }
+    let base = base.split('#').next().unwrap_or(base);
+    if let Some(fragment) = location.strip_prefix('#') {
+        return Some(format!("{base}#{fragment}"));
+    }
+    if let Some(query) = location.strip_prefix('?') {
+        let path = base.split_once('?').map_or(base, |(path, _)| path);
+        return Some(format!("{path}?{query}"));
+    }
     if let Some(absolute) = location.strip_prefix('/') {
-        return format!("{scheme}://{authority}/{absolute}");
+        return Some(format!("{scheme}://{authority}/{absolute}"));
     }
-    match path.rsplit_once('/') {
-        Some((dir, _)) if !dir.is_empty() => format!("{scheme}://{authority}/{dir}/{location}"),
-        _ => format!("{scheme}://{authority}/{location}"),
+    let path = url_path(base);
+    let dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
+    Some(format!("{scheme}://{authority}{dir}/{location}"))
+}
+
+fn resolve_redirect(current: &str, location: &str) -> Result<String, String> {
+    let next = resolve_url(current, location)
+        .ok_or_else(|| "warp access: the redirect target is not a usable URL".to_owned())?;
+    if !next.to_ascii_lowercase().starts_with("https://") {
+        return Err("warp access: refusing a redirect away from https".to_owned());
+    }
+    Ok(next)
+}
+
+struct Cookie {
+    name: String,
+    value: String,
+    domain: String,
+    host_only: bool,
+    path: String,
+    secure: bool,
+}
+
+impl Cookie {
+    fn matches(&self, url: &str) -> bool {
+        let Some(host) = url_host(url) else {
+            return false;
+        };
+        let host = host.to_ascii_lowercase();
+        let domain = if self.host_only {
+            host == self.domain
+        } else {
+            host == self.domain || host.ends_with(&format!(".{}", self.domain))
+        };
+        if !domain || (self.secure && !url.to_ascii_lowercase().starts_with("https://")) {
+            return false;
+        }
+        let path = url_path(url);
+        path == self.path
+            || (path.starts_with(&self.path)
+                && (self.path.ends_with('/')
+                    || path.as_bytes().get(self.path.len()) == Some(&b'/')))
     }
 }
 
 struct Session {
-    cookies: Vec<(String, String)>,
+    cookies: Vec<Cookie>,
 }
 
 struct Page {
@@ -387,16 +495,16 @@ impl Session {
             .iter()
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect();
-        if !self.cookies.is_empty() {
-            let mut jar = String::new();
-            for (index, (name, value)) in self.cookies.iter().enumerate() {
-                if index > 0 {
-                    jar.push_str("; ");
-                }
-                jar.push_str(name);
-                jar.push('=');
-                jar.push_str(value);
+        let mut jar = String::new();
+        for cookie in self.cookies.iter().filter(|cookie| cookie.matches(url)) {
+            if !jar.is_empty() {
+                jar.push_str("; ");
             }
+            jar.push_str(&cookie.name);
+            jar.push('=');
+            jar.push_str(&cookie.value);
+        }
+        if !jar.is_empty() {
             owned.push(("Cookie".to_owned(), jar));
         }
         let borrowed: Vec<(&str, &str)> = owned
@@ -404,30 +512,86 @@ impl Session {
             .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect();
         let reply = exchange(method, url, &borrowed, body)?;
-        self.absorb(&reply);
+        self.absorb(url, &reply);
         Ok(reply)
     }
 
-    fn absorb(&mut self, reply: &Reply) {
+    fn absorb(&mut self, url: &str, reply: &Reply) {
+        let Some(host) = url_host(url).map(str::to_ascii_lowercase) else {
+            return;
+        };
+        let request_path = url_path(url);
         for (name, value) in &reply.headers {
             if !name.eq_ignore_ascii_case("set-cookie") {
                 continue;
             }
-            let Some(cookie) = value.split(';').next() else {
+            let mut parts = value.split(';');
+            let Some(pair) = parts.next() else {
                 continue;
             };
-            let Some((key, value)) = cookie.split_once('=') else {
+            let Some((key, value)) = pair.split_once('=') else {
                 continue;
             };
-            match self
+            let key = key.trim();
+            if key.is_empty() {
+                continue;
+            }
+            let mut domain = None;
+            let mut path = None;
+            let mut secure = false;
+            for attribute in parts {
+                let attribute = attribute.trim();
+                if attribute.eq_ignore_ascii_case("secure") {
+                    secure = true;
+                    continue;
+                }
+                let Some((name, value)) = attribute.split_once('=') else {
+                    continue;
+                };
+                match name.trim().to_ascii_lowercase().as_str() {
+                    "domain" => {
+                        let value = value.trim().trim_start_matches('.').to_ascii_lowercase();
+                        if !value.is_empty() {
+                            domain = Some(value);
+                        }
+                    }
+                    "path" => {
+                        let value = value.trim();
+                        if value.starts_with('/') {
+                            path = Some(value.to_owned());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let (domain, host_only) = match domain {
+                Some(domain)
+                    if domain.contains('.')
+                        && (host == domain || host.ends_with(&format!(".{domain}"))) =>
+                {
+                    (domain, false)
+                }
+                Some(_) => continue,
+                None => (host.clone(), true),
+            };
+            let path = path.unwrap_or_else(|| default_cookie_path(request_path));
+            if let Some(existing) = self
                 .cookies
                 .iter_mut()
-                .find(|(known, _)| known == key.trim())
+                .find(|cookie| cookie.name == key && cookie.domain == domain && cookie.path == path)
             {
-                Some((_, slot)) => value.trim().clone_into(slot),
-                None => self
-                    .cookies
-                    .push((key.trim().to_owned(), value.trim().to_owned())),
+                value.trim().clone_into(&mut existing.value);
+                existing.secure = secure;
+                existing.host_only = host_only;
+            } else {
+                self.cookies.push(Cookie {
+                    name: key.to_owned(),
+                    value: value.trim().to_owned(),
+                    domain,
+                    host_only,
+                    path,
+                    secure,
+                });
             }
         }
     }
@@ -452,7 +616,7 @@ impl Session {
                     reply,
                 });
             };
-            current = resolve_url(&current, &location);
+            current = resolve_redirect(&current, &location)?;
         }
         Err("warp access: too many redirects".to_owned())
     }
@@ -485,7 +649,13 @@ impl Session {
                     reply,
                 });
             };
-            current = resolve_url(&current, &location);
+            let next = resolve_redirect(&current, &location)?;
+            if matches!(reply.status, 307 | 308) && origin(&current) != origin(&next) {
+                return Err(
+                    "warp access: refusing to resend the login form to another origin".to_owned(),
+                );
+            }
+            current = next;
             if matches!(reply.status, 301..=303) {
                 body = None;
             }
@@ -597,6 +767,12 @@ fn with_email_code(
         ],
         exchange,
     )?;
+    if !(200..300).contains(&sent.reply.status) {
+        return Err(format!(
+            "warp: access did not accept the login code request for team {} (status {}); try again later",
+            settings.team, sent.reply.status
+        ));
+    }
     let nonce = query_value(&sent.url, "nonce")
         .or_else(|| query_value(&landing.url, "nonce"))
         .ok_or_else(|| {
@@ -613,15 +789,23 @@ fn with_email_code(
             return Err("warp: no login code was entered".to_owned());
         }
         let page = session.post_form(&callback, &[("code", code), ("nonce", &nonce)], exchange)?;
+        if page.reply.status >= 500 || page.reply.status == 429 {
+            return Err(format!(
+                "warp: access did not answer the login code check (status {}); try again later",
+                page.reply.status
+            ));
+        }
         let token =
             extract_jwt_from_html(&String::from_utf8_lossy(&page.reply.body)).or_else(|| {
                 session
                     .cookies
                     .iter()
                     .rev()
-                    .find(|(name, _)| name.eq_ignore_ascii_case("CF_Authorization"))
-                    .map(|(_, value)| value.clone())
-                    .filter(|value| looks_like_jwt(value))
+                    .find(|cookie| {
+                        cookie.name.eq_ignore_ascii_case("CF_Authorization")
+                            && looks_like_jwt(&cookie.value)
+                    })
+                    .map(|cookie| cookie.value.clone())
             });
         if let Some(token) = token {
             eprintln!(
@@ -753,7 +937,200 @@ mod tests {
     fn an_empty_or_malformed_team_is_rejected() {
         assert_eq!(normalize_team("   "), None);
         assert_eq!(normalize_team("bad name!"), None);
+        assert_eq!(normalize_team("bad_team"), None);
+        assert_eq!(normalize_team("acmecloudflareaccess.com"), None);
         assert_eq!(normalize_team("https://cloudflareaccess.com"), None);
+    }
+
+    #[test]
+    fn a_non_string_team_setting_is_refused() {
+        let settings = crate::json::parse("{\"team\":42}").expect("valid json");
+        let error = TeamSettings::from_settings(&settings).expect_err("a non-string team");
+        assert!(error.contains("`team` must be a string"));
+    }
+
+    #[test]
+    fn a_query_only_redirect_keeps_the_resource_path() {
+        assert_eq!(
+            resolve_url(
+                "https://acme.cloudflareaccess.com/cdn-cgi/access/verify?step=1",
+                "?nonce=next",
+            )
+            .as_deref(),
+            Some("https://acme.cloudflareaccess.com/cdn-cgi/access/verify?nonce=next")
+        );
+    }
+
+    #[test]
+    fn a_redirect_away_from_https_is_refused() {
+        let error = resolve_redirect(
+            "https://acme.cloudflareaccess.com/cdn-cgi/access/verify",
+            "http://evil.example/next",
+        )
+        .expect_err("an insecure redirect");
+        assert!(error.contains("https"));
+    }
+
+    #[test]
+    fn a_cookie_is_scoped_to_its_issuing_host_and_path() {
+        let mut session = Session::new();
+        session.absorb(
+            "https://acme.cloudflareaccess.com/cdn-cgi/access/verify",
+            &reply(
+                200,
+                vec![(
+                    "Set-Cookie".to_owned(),
+                    "CF_Authorization=a-token; Path=/cdn-cgi/access; Secure".to_owned(),
+                )],
+                "",
+            ),
+        );
+        let sent = std::cell::Cell::new(false);
+        session
+            .exchange(
+                "GET",
+                "https://acme.cloudflareaccess.com/cdn-cgi/access/callback",
+                &[],
+                &[],
+                &|_, _, headers, _| {
+                    sent.set(headers.iter().any(|(key, _)| {
+                        key.eq_ignore_ascii_case("cookie")
+                            && headers
+                                .iter()
+                                .any(|(_, value)| value.contains("CF_Authorization=a-token"))
+                    }));
+                    Ok(reply(200, Vec::new(), ""))
+                },
+            )
+            .expect("a scoped request");
+        assert!(sent.get());
+        let leaked = std::cell::Cell::new(false);
+        session
+            .exchange(
+                "GET",
+                "https://evil.example/cdn-cgi/access/callback",
+                &[],
+                &[],
+                &|_, _, headers, _| {
+                    leaked.set(
+                        headers
+                            .iter()
+                            .any(|(key, _)| key.eq_ignore_ascii_case("cookie")),
+                    );
+                    Ok(reply(200, Vec::new(), ""))
+                },
+            )
+            .expect("a foreign request");
+        assert!(!leaked.get());
+    }
+
+    #[test]
+    fn a_cross_origin_307_does_not_replay_the_code() {
+        let calls = std::cell::Cell::new(0);
+        let error = Session::new()
+            .post_form(
+                "https://acme.cloudflareaccess.com/cdn-cgi/access/callback",
+                &[("code", "123456"), ("nonce", "abc")],
+                &|_, _, _, _| {
+                    calls.set(calls.get() + 1);
+                    Ok(reply(
+                        307,
+                        vec![(
+                            "Location".to_owned(),
+                            "https://evil.example/callback".to_owned(),
+                        )],
+                        "",
+                    ))
+                },
+            )
+            .err()
+            .expect("a cross-origin rerun");
+        assert!(error.contains("another origin"));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn a_rejected_verify_request_does_not_prompt_for_a_code() {
+        let settings = TeamSettings {
+            team: "acme".to_owned(),
+            email: Some("user@example.com".to_owned()),
+            ..TeamSettings::default()
+        };
+        let mut prompted = 0;
+        let error = sign_in(
+            &settings,
+            now(),
+            &|method, url, _, _| {
+                if method == "GET" && url.ends_with("/warp") {
+                    return Ok(reply(
+                        200,
+                        Vec::new(),
+                        "<form action=\"https://acme.cloudflareaccess.com/cdn-cgi/access/verify\"><input id=\"totp-form\"></form>",
+                    ));
+                }
+                if method == "POST" && url.ends_with("/verify") {
+                    return Ok(reply(429, Vec::new(), ""));
+                }
+                Err(format!("unexpected {method} {url}"))
+            },
+            &mut |_, _| {
+                prompted += 1;
+                Some("123456".to_owned())
+            },
+        )
+        .expect_err("a refused send");
+        assert!(error.contains("did not accept the login code request"));
+        assert_eq!(prompted, 0);
+    }
+
+    #[test]
+    fn a_callback_outage_is_not_a_rejected_code() {
+        let settings = TeamSettings {
+            team: "acme".to_owned(),
+            email: Some("user@example.com".to_owned()),
+            ..TeamSettings::default()
+        };
+        let posts = std::cell::Cell::new(0);
+        let mut prompted = 0;
+        let error = sign_in(
+            &settings,
+            now(),
+            &|method, url, _, _| {
+                if method == "GET" && url.ends_with("/warp") {
+                    return Ok(reply(
+                        200,
+                        Vec::new(),
+                        "<form action=\"https://acme.cloudflareaccess.com/cdn-cgi/access/verify\"><input id=\"totp-form\"></form>",
+                    ));
+                }
+                if method == "POST" && url.ends_with("/verify") {
+                    return Ok(reply(
+                        302,
+                        vec![(
+                            "Location".to_owned(),
+                            "https://acme.cloudflareaccess.com/verify?nonce=abc".to_owned(),
+                        )],
+                        "",
+                    ));
+                }
+                if method == "GET" && url.contains("nonce=abc") {
+                    return Ok(reply(200, Vec::new(), ""));
+                }
+                if method == "POST" && url.ends_with("/cdn-cgi/access/callback") {
+                    posts.set(posts.get() + 1);
+                    return Ok(reply(524, Vec::new(), ""));
+                }
+                Err(format!("unexpected {method} {url}"))
+            },
+            &mut |_, _| {
+                prompted += 1;
+                Some("123456".to_owned())
+            },
+        )
+        .expect_err("a callback outage");
+        assert!(error.contains("did not answer the login code check"));
+        assert_eq!(prompted, 1);
+        assert_eq!(posts.get(), 1);
     }
 
     #[test]
@@ -919,7 +1296,7 @@ mod tests {
                 }
                 if method == "POST" && url.ends_with("/cdn-cgi/access/callback") {
                     posts.set(posts.get() + 1);
-                    if posts.get() == CODE_ATTEMPTS {
+                    if posts.get() == 3 {
                         let page = format!("<meta token={token}>");
                         return Ok(reply(200, Vec::new(), &page));
                     }
@@ -935,14 +1312,14 @@ mod tests {
         )
         .expect("a code after retries");
         assert_eq!(got, token);
-        assert_eq!(prompts, CODE_ATTEMPTS);
-        assert_eq!(posts.get(), CODE_ATTEMPTS);
+        assert_eq!(prompts, 3);
+        assert_eq!(posts.get(), 3);
     }
 
     #[test]
     fn an_install_id_is_twenty_two_alphanumerics() {
         let id = generate_install_id();
-        assert_eq!(id.len(), INSTALL_ID_LEN);
+        assert_eq!(id.len(), 22);
         assert!(id.chars().all(|c| c.is_ascii_alphanumeric()));
     }
 

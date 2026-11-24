@@ -83,6 +83,7 @@ const GATEWAY_MAX_HEAD: usize = 16 * 1024;
 struct Identity {
     device_id: String,
     token: String,
+    team: Option<String>,
     wireguard: WireGuardIdentity,
     masque: Option<MasqueIdentity>,
     gateway: Option<String>,
@@ -94,6 +95,7 @@ impl std::fmt::Debug for Identity {
         f.debug_struct("Identity")
             .field("device_id", &self.device_id)
             .field("token", &"<redacted>")
+            .field("team", &self.team)
             .field("wireguard", &self.wireguard)
             .field("masque", &self.masque)
             .finish_non_exhaustive()
@@ -554,7 +556,13 @@ impl WarpSpec {
                 "warp: `register: true` needs an `identityFile` to save the account".into(),
             );
         };
-        self.identity_at_in(path, false, test)
+        let identity = self.identity_at_in(path, false, test)?;
+        ensure_saved_team(
+            self.team.as_ref().map(|team| team.team.as_str()),
+            identity.team.as_deref(),
+            path,
+        )?;
+        Ok(identity)
     }
 
     /// The identity files this spec names, in the same shape the register command plans.
@@ -1187,6 +1195,7 @@ where
     Ok(Identity {
         device_id: registered.device_id,
         token: registered.token,
+        team: spec.team.as_ref().map(|team| team.team.clone()),
         wireguard: WireGuardIdentity {
             private,
             peer: registered.peer,
@@ -1235,9 +1244,7 @@ where
     let root = reply_root(&reply)?;
     let config = parse_config(&root)?;
     let mut fresh = identity.clone();
-    if config.gateway.is_some() {
-        fresh.gateway.clone_from(&config.gateway);
-    }
+    fresh.gateway.clone_from(&config.gateway);
     fresh.wireguard.peer = config.peer;
     fresh.wireguard.endpoint = spec.endpoint.unwrap_or(config.endpoint);
     fresh.wireguard.reserved = config.reserved;
@@ -1564,6 +1571,10 @@ impl Identity {
             .and_then(crate::json::Json::as_str)
             .unwrap_or_default()
             .to_owned();
+        let team = value
+            .get("team")
+            .and_then(crate::json::Json::as_str)
+            .map(str::to_owned);
         let wireguard = value
             .get("wireguard")
             .ok_or("warp identity has no `wireguard`")?;
@@ -1631,6 +1642,7 @@ impl Identity {
         Ok(Self {
             device_id,
             token,
+            team,
             wireguard: WireGuardIdentity {
                 private,
                 peer,
@@ -1665,6 +1677,9 @@ impl Identity {
             ("token", string(&self.token)),
             ("wireguard", wireguard),
         ];
+        if let Some(team) = &self.team {
+            pairs.push(("team", string(team)));
+        }
         if let Some(masque) = &self.masque {
             pairs.push((
                 "masque",
@@ -2402,21 +2417,62 @@ impl Gateway {
     }
 }
 
-fn connect_request(asked: &crate::proxy::Destination) -> Vec<u8> {
+fn connect_authority(asked: &crate::proxy::Destination) -> Option<String> {
     let authority = asked.authority();
-    format!(
-        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: {REGISTER_AGENT}\r\n\r\n"
+    if authority.parse::<SocketAddr>().is_ok() {
+        return Some(authority);
+    }
+    let (host, port) = authority.rsplit_once(':')?;
+    let port = port.parse::<u16>().ok().filter(|port| *port != 0)?;
+    let host = host.trim_end_matches('.');
+    let valid = !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        });
+    valid.then(|| format!("{host}:{port}"))
+}
+
+fn connect_request(asked: &crate::proxy::Destination) -> Option<Vec<u8>> {
+    let authority = connect_authority(asked)?;
+    Some(
+        format!(
+            "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: {REGISTER_AGENT}\r\n\r\n"
+        )
+        .into_bytes(),
     )
-    .into_bytes()
 }
 
 fn connect_status(head: &[u8]) -> Option<u16> {
     let text = std::str::from_utf8(head).ok()?;
     let line = text.split("\r\n").next()?;
-    line.split_whitespace().nth(1)?.parse().ok()
+    let mut parts = line.split_whitespace();
+    let version = parts.next()?.strip_prefix("HTTP/")?;
+    let (major, minor) = version.split_once('.')?;
+    if major.is_empty()
+        || minor.is_empty()
+        || !major.bytes().all(|byte| byte.is_ascii_digit())
+        || !minor.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let status = parts.next()?;
+    if status.len() != 3 || !status.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    status.parse().ok()
 }
 
-fn read_connect_head(stream: &crate::conn::Connection) -> std::io::Result<(bool, Vec<u8>)> {
+fn read_connect_head(
+    stream: &crate::conn::Connection,
+    deadline: Instant,
+) -> std::io::Result<(bool, Vec<u8>)> {
     let mut head = Vec::new();
     let mut buf = [0u8; 512];
     loop {
@@ -2425,9 +2481,24 @@ fn read_connect_head(stream: &crate::conn::Connection) -> std::io::Result<(bool,
             .position(|window| window == b"\r\n\r\n")
             .map(|at| at + 4)
         {
+            if at > GATEWAY_MAX_HEAD {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "the gateway sent a head larger than the limit",
+                ));
+            }
+            let Some(status) = connect_status(&head[..at]) else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "the gateway answered with an invalid CONNECT status",
+                ));
+            };
+            if (100..200).contains(&status) {
+                head.drain(..at);
+                continue;
+            }
             let extra = head.split_off(at);
-            let accepted = connect_status(&head).is_some_and(|status| (200..300).contains(&status));
-            return Ok((accepted, extra));
+            return Ok(((200..300).contains(&status), extra));
         }
         if head.len() >= GATEWAY_MAX_HEAD {
             return Err(std::io::Error::new(
@@ -2435,6 +2506,14 @@ fn read_connect_head(stream: &crate::conn::Connection) -> std::io::Result<(bool,
                 "the gateway sent no complete head",
             ));
         }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the gateway did not finish its CONNECT head in time",
+            ));
+        }
+        stream.set_read_timeout(Some(remaining))?;
         let mut source = stream;
         let read = source.read(&mut buf)?;
         if read == 0 {
@@ -2762,6 +2841,10 @@ impl WarpOut {
         asked: &crate::proxy::Destination,
         prefix: &[u8],
     ) {
+        let Some(request) = connect_request(asked) else {
+            self.serve_lane(client, asked, prefix);
+            return;
+        };
         let lane = self.lane();
         let Some((local, tunnel)) = crate::reverse::loopback_pair() else {
             gateway.retire("no loopback stream");
@@ -2774,39 +2857,40 @@ impl WarpOut {
             &crate::proxy::Destination::Address(gateway.proxy),
             &[],
         );
-        let armed = local
-            .set_read_timeout(Some(GATEWAY_PROBE_TIMEOUT))
-            .and_then(|()| local.set_write_timeout(Some(GATEWAY_PROBE_TIMEOUT)));
-        let answered = armed
+        let deadline = Instant::now() + GATEWAY_PROBE_TIMEOUT;
+        let answered = local
+            .set_write_timeout(Some(GATEWAY_PROBE_TIMEOUT))
             .and_then(|()| {
                 (&local)
-                    .write_all(&connect_request(asked))
-                    .and_then(|()| read_connect_head(&local))
-            })
-            .and_then(|(accepted, extra)| {
-                if !accepted {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::ConnectionRefused,
-                        "the gateway refused the CONNECT",
-                    ));
-                }
-                (&local).write_all(prefix)?;
-                if !extra.is_empty() {
-                    (&client).write_all(&extra)?;
-                }
-                Ok(())
+                    .write_all(&request)
+                    .and_then(|()| read_connect_head(&local, deadline))
             });
-        match answered {
-            Ok(()) => {
-                let _ = local.set_read_timeout(None);
-                let _ = local.set_write_timeout(None);
-                crate::proxy::relay_handoff(&client, &local);
-            }
+        let (accepted, extra) = match answered {
+            Ok(head) => head,
             Err(reason) => {
                 gateway.retire(&reason.to_string());
                 self.serve_on(lane, client, asked, prefix);
+                return;
             }
+        };
+        if !accepted {
+            gateway.retire("the gateway refused the CONNECT");
+            self.serve_on(lane, client, asked, prefix);
+            return;
         }
+        let _ = local.set_read_timeout(None);
+        let _ = local.set_write_timeout(None);
+        let forwarded = (&local).write_all(prefix).and_then(|()| {
+            if extra.is_empty() {
+                Ok(())
+            } else {
+                (&client).write_all(&extra)
+            }
+        });
+        if forwarded.is_err() {
+            return;
+        }
+        crate::proxy::relay_handoff(&client, &local);
     }
     fn serve_lane(
         &self,
@@ -3340,6 +3424,22 @@ fn named_slot(path: &Path, suffix: &str) -> bool {
     stem.ends_with(&format!("-{suffix}"))
 }
 
+fn ensure_saved_team(
+    expected: Option<&str>,
+    saved: Option<&str>,
+    path: &Path,
+) -> Result<(), String> {
+    if expected == saved {
+        return Ok(());
+    }
+    Err(format!(
+        "warp: `{}` belongs to {}, not {}; remove it or choose another path",
+        path.display(),
+        saved.map_or("a personal identity", |team| team),
+        expected.map_or("a personal identity", |team| team)
+    ))
+}
+
 fn derive_sibling_path(base: &Path, suffix: &str) -> PathBuf {
     let name = base
         .file_name()
@@ -3399,25 +3499,32 @@ fn provision_kind_with(
     for (slot, path) in planned {
         let (identity, replace, saved) = if path.is_file() {
             match Identity::load(&path) {
-                Ok(saved) => match refresh_identity(spec, &saved) {
-                    Ok(fresh) => (fresh, false, false),
-                    Err(error) if error.refused && reprovision_enabled() => {
-                        eprintln!(
+                Ok(saved) => {
+                    ensure_saved_team(
+                        spec.team.as_ref().map(|team| team.team.as_str()),
+                        saved.team.as_deref(),
+                        &path,
+                    )?;
+                    match refresh_identity(spec, &saved) {
+                        Ok(fresh) => (fresh, false, false),
+                        Err(error) if error.refused && reprovision_enabled() => {
+                            eprintln!(
                             "warp-register: the saved {} identity was refused: {}; registering a fresh one",
                             slot.label(),
                             error.reason
                         );
-                        (register_identity(spec, slot.enrolls_masque())?, true, false)
+                            (register_identity(spec, slot.enrolls_masque())?, true, false)
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "warp-register: keeping the saved {} identity unchecked: {}",
+                                slot.label(),
+                                error.reason
+                            );
+                            (saved, false, false)
+                        }
                     }
-                    Err(error) => {
-                        eprintln!(
-                            "warp-register: keeping the saved {} identity unchecked: {}",
-                            slot.label(),
-                            error.reason
-                        );
-                        (saved, false, false)
-                    }
-                },
+                }
                 Err(error) if error.corrupt() && reprovision_enabled() => {
                     eprintln!(
                         "warp-register: {}; registering a fresh {} identity",
@@ -3499,6 +3606,11 @@ pub(crate) fn one_tap(
     if resumed {
         // The outer device was already created; a failed inner enrollment must be able to finish on the next run instead of minting a second device.
         let saved = Identity::load(&path).map_err(LoadError::into_message)?;
+        ensure_saved_team(
+            team.map(|team| team.team.as_str()),
+            saved.team.as_deref(),
+            &path,
+        )?;
         if matches!(mode, Mode::Masque | Mode::Gool | Mode::Mim) && saved.masque.is_none() {
             return Err(format!(
                 "warp: `{}` has no MASQUE key for mode `{mode:?}`; remove it to register a new device",
@@ -3832,7 +3944,7 @@ pub(crate) fn register_command(args: &mut std::iter::Skip<std::env::Args>, usage
     };
     if let Some(team) = &team {
         if !base_named {
-            base = derive_sibling_path(Path::new(&base), &format!("team-{}", team.team))
+            base = derive_sibling_path(Path::new(&base), &format!("team-{}~", team.team))
                 .to_string_lossy()
                 .into_owned();
         }
@@ -3960,6 +4072,7 @@ mod tests {
     fn sample_identity() -> Identity {
         Identity {
             device_id: "a-device".to_owned(),
+            team: None,
             token: "a-token".to_owned(),
             wireguard: WireGuardIdentity {
                 private: [7u8; 32],
@@ -4120,6 +4233,7 @@ mod tests {
         let key = rcgen::KeyPair::generate().expect("a MASQUE key");
         let identity = Identity {
             device_id: "a-device".to_owned(),
+            team: None,
             token: "a-token".to_owned(),
             wireguard: WireGuardIdentity {
                 private: [7u8; 32],
@@ -4303,6 +4417,7 @@ mod tests {
     fn an_identity_survives_a_save_and_load() {
         let identity = Identity {
             device_id: "a-device".to_owned(),
+            team: Some("acme".to_owned()),
             token: "a-token".to_owned(),
             wireguard: WireGuardIdentity {
                 private: [7u8; 32],
@@ -4320,6 +4435,7 @@ mod tests {
         identity.save(&path).expect("saves");
         let loaded = Identity::load(&path).expect("loads");
         assert_eq!(loaded.device_id, identity.device_id);
+        assert_eq!(loaded.team.as_deref(), Some("acme"));
         assert_eq!(loaded.wireguard.private, identity.wireguard.private);
         assert_eq!(loaded.wireguard.peer, identity.wireguard.peer);
         assert_eq!(loaded.wireguard.endpoint, identity.wireguard.endpoint);
@@ -4616,6 +4732,7 @@ mod tests {
         let spec = WarpSpec::for_command(Mode::Auto, None, None);
         let saved = Identity {
             device_id: "a-device".to_owned(),
+            team: None,
             token: "a-token".to_owned(),
             wireguard: WireGuardIdentity {
                 private: [7u8; 32],
@@ -4625,7 +4742,7 @@ mod tests {
                 reserved: [1, 2, 3],
             },
             masque: None,
-            gateway: None,
+            gateway: Some("192.0.2.7:8080".to_owned()),
         };
         let fresh_reply = sample_reply(&b64(&[0x55; 32]));
         let call = |method: &str, path: &str, _headers: &[(&str, &str)], body: &[u8]| {
@@ -4638,6 +4755,24 @@ mod tests {
         assert_eq!(fresh.wireguard.peer, [0x55; 32]);
         assert_eq!(fresh.wireguard.reserved, [9, 8, 7]);
         assert_eq!(fresh.wireguard.addresses.len(), 2);
+        assert!(fresh.gateway.is_none(), "a withdrawn proxy is cleared");
+    }
+
+    #[test]
+    fn a_saved_team_must_match_the_requested_team() {
+        let path = Path::new("/tmp/team.json");
+        assert!(ensure_saved_team(Some("acme"), Some("acme"), path).is_ok());
+        assert!(ensure_saved_team(Some("acme"), Some("other"), path).is_err());
+        assert!(ensure_saved_team(Some("acme"), None, path).is_err());
+    }
+
+    #[test]
+    fn a_team_and_a_slot_suffix_cannot_share_a_path() {
+        let acme = derive_sibling_path(Path::new("warp-identity.json"), "team-acme~");
+        let acme_masque = derive_sibling_path(&acme, "masque");
+        let acme_masque_team =
+            derive_sibling_path(Path::new("warp-identity.json"), "team-acme-masque~");
+        assert_ne!(acme_masque, acme_masque_team);
     }
 
     #[test]
@@ -4645,6 +4780,7 @@ mod tests {
         let spec = WarpSpec::for_command(Mode::Auto, None, None);
         let saved = Identity {
             device_id: "a-device".to_owned(),
+            team: None,
             token: "a-token".to_owned(),
             wireguard: WireGuardIdentity {
                 private: [7u8; 32],
@@ -4725,6 +4861,7 @@ mod tests {
         let spec = WarpSpec::for_command(Mode::Auto, None, None);
         let saved = Identity {
             device_id: "a-device".to_owned(),
+            team: None,
             token: "a-token".to_owned(),
             wireguard: WireGuardIdentity {
                 private: [7u8; 32],
@@ -5027,6 +5164,7 @@ mod tests {
     fn the_gool_inner_hop_points_at_the_forwarder_and_caps_the_mtu() {
         let identity = Identity {
             device_id: "gool".to_owned(),
+            team: None,
             token: String::new(),
             wireguard: WireGuardIdentity {
                 private: [0x11; 32],
@@ -5101,6 +5239,7 @@ mod tests {
     fn the_mim_inner_outbound_targets_the_forwarder_inside_the_outer_tunnel() {
         let identity = Identity {
             device_id: "mim".to_owned(),
+            team: None,
             token: String::new(),
             wireguard: WireGuardIdentity {
                 private: [7u8; 32],
@@ -5132,6 +5271,7 @@ mod tests {
         let key = rcgen::KeyPair::generate().expect("a key");
         let identity = Identity {
             device_id: "mim".to_owned(),
+            team: None,
             token: String::new(),
             wireguard: WireGuardIdentity {
                 private: [7u8; 32],
@@ -5264,6 +5404,7 @@ mod tests {
 
         let inner_identity = Identity {
             device_id: "gool".to_owned(),
+            team: None,
             token: String::new(),
             wireguard: WireGuardIdentity {
                 private: client_private,
@@ -5590,6 +5731,7 @@ mod tests {
 
         let inner_identity = Identity {
             device_id: "wiw".to_owned(),
+            team: None,
             token: String::new(),
             wireguard: WireGuardIdentity {
                 private: inner_client_private,
@@ -5746,6 +5888,7 @@ mod tests {
             .expect("a world-readable identity");
         let identity = Identity {
             device_id: "a-device".to_owned(),
+            team: None,
             token: "a-token".to_owned(),
             wireguard: WireGuardIdentity {
                 private: [1; 32],
@@ -5855,20 +5998,38 @@ mod tests {
 
     #[test]
     fn the_connect_request_names_the_authority_and_the_agent() {
-        let wire = String::from_utf8(connect_request(&crate::proxy::Destination::Name(
+        let request = connect_request(&crate::proxy::Destination::Name(
             "example.com".to_owned(),
             443,
-        )))
-        .expect("utf8");
+        ))
+        .expect("a valid authority");
+        let wire = String::from_utf8(request).expect("utf8");
         assert_eq!(
             wire,
             "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nUser-Agent: WARP for Android\r\n\r\n"
         );
-        let v6 = String::from_utf8(connect_request(&crate::proxy::Destination::Address(
+        let v6 = connect_request(&crate::proxy::Destination::Address(
             "[2606:4700::1]:443".parse().expect("an address"),
-        )))
-        .expect("utf8");
-        assert!(v6.starts_with("CONNECT [2606:4700::1]:443 HTTP/1.1"));
+        ))
+        .expect("a valid authority");
+        assert!(String::from_utf8(v6)
+            .expect("utf8")
+            .starts_with("CONNECT [2606:4700::1]:443 HTTP/1.1"));
+        assert!(connect_request(&crate::proxy::Destination::Name(
+            "example.com\r\nHost: injected".to_owned(),
+            443
+        ))
+        .is_none());
+        assert!(connect_request(&crate::proxy::Destination::Name(
+            "bad]name:443".to_owned(),
+            443
+        ))
+        .is_none());
+        assert!(connect_request(&crate::proxy::Destination::Name(
+            "example.com".to_owned(),
+            0
+        ))
+        .is_none());
     }
 
     #[test]
