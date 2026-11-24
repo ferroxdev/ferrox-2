@@ -1259,6 +1259,7 @@ impl Read for H2StreamReader {
 }
 
 impl crate::proxy::WindowRead for H2StreamReader {
+    #[allow(clippy::too_many_lines)]
     fn read_window(&mut self) -> std::io::Result<crate::proxy::Window<'_>> {
         loop {
             if self.at < self.cur.len() {
