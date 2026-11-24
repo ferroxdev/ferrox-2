@@ -24,7 +24,7 @@ const HANDSHAKE: Duration = Duration::from_secs(10);
 const EDGE_RETRY: Duration = Duration::from_secs(1);
 const READ_WAIT: Duration = Duration::from_millis(10);
 /// The read a burst takes: shorter than the idle wait, so egress the stack produces right after data lands leaves without it, the same re-arm the QUIC pump takes.
-const READ_TAIL: Duration = Duration::from_micros(250);
+const READ_TAIL: Duration = Duration::from_micros(20);
 const CLOSE_WAIT: Duration = Duration::from_millis(100);
 const UDP_DRAIN: Duration = Duration::from_secs(1);
 const WARP_ASSIGN_WAIT: Duration = Duration::from_millis(250);
