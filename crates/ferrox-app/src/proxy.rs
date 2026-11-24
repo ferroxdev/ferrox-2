@@ -14149,6 +14149,30 @@ impl<T: Read> Half<T> {
 }
 
 impl<T: Write> Half<T> {
+    /// One write under the writer lock and no flush: a relay step that a writer refuses keeps the tail
+    /// and parks, where `write_once` would hold the worker until the writer took all of it.
+    fn write_upto(&self, buf: &[u8]) -> std::io::Result<usize> {
+        let Ok(mut guard) = self.writer_lock() else {
+            return Err(std::io::Error::other("relay half poisoned"));
+        };
+        guard.write(buf)
+    }
+
+    /// The flush `write_once` folds into its write, for a caller that wrote the buffer in pieces.
+    fn write_flush(&self) -> std::io::Result<()> {
+        let Ok(mut guard) = self.writer_lock() else {
+            return Err(std::io::Error::other("relay half poisoned"));
+        };
+        guard.flush()?;
+        if let Self::Shared {
+            grain: Some(grain), ..
+        } = self
+        {
+            grain.moved();
+        }
+        Ok(())
+    }
+
     fn write_once(&self, buf: &[u8]) -> std::io::Result<()> {
         let Ok(mut guard) = self.writer_lock() else {
             return Err(std::io::Error::other("relay half poisoned"));
@@ -36029,6 +36053,9 @@ pub(crate) struct RelayBuf {
     limit: usize,
     moved: usize,
     promote_to: usize,
+    /// The region the last read filled, and how much of it a writer has already taken.
+    filled_to: usize,
+    taken: usize,
 }
 
 impl RelayBuf {
@@ -36052,6 +36079,8 @@ impl RelayBuf {
             limit: usize::MAX,
             moved: 0,
             promote_to: RELAY_BUFFER,
+            filled_to: 0,
+            taken: 0,
         }
     }
 
@@ -36090,6 +36119,8 @@ impl RelayBuf {
     /// the read clock, and the bytes it would read are not there, so it can hold no allocation. The
     /// next step takes one again, and `held` is the witness that the park kept none.
     pub fn release(&mut self) {
+        self.filled_to = 0;
+        self.taken = 0;
         if self.bytes.len() == RELAY_SMALL_BUFFER || self.bytes.len() == RELAY_BUFFER {
             give_relay_window(std::mem::take(&mut self.bytes));
         }
@@ -36119,6 +36150,8 @@ impl RelayBuf {
     #[must_use]
     pub fn filled(&mut self, n: usize) -> &[u8] {
         self.ensure();
+        self.filled_to = n;
+        self.taken = 0;
         self.moved = self.moved.saturating_add(n);
         if self.window < self.promote_to && (n == self.window || self.moved >= self.promote_to) {
             self.window = self.promote_to;
@@ -36139,6 +36172,23 @@ impl RelayBuf {
     #[must_use]
     pub fn prefix(&self, n: usize) -> &[u8] {
         &self.bytes[..n]
+    }
+
+    /// The tail of the last read's region that no writer has taken yet.
+    #[must_use]
+    pub fn pending(&self) -> &[u8] {
+        let end = self.filled_to.min(self.bytes.len());
+        &self.bytes[self.taken.min(end)..end]
+    }
+
+    #[must_use]
+    pub fn pending_len(&self) -> usize {
+        self.filled_to.min(self.bytes.len()) - self.taken.min(self.filled_to.min(self.bytes.len()))
+    }
+
+    /// Counts bytes a writer took off `pending`.
+    pub fn advance(&mut self, n: usize) {
+        self.taken = (self.taken + n).min(self.filled_to);
     }
 
     #[cfg(test)]
@@ -38924,9 +38974,36 @@ where
     R: Read,
     W: Write,
 {
+    // A writer that refused the tail parked the lane mid-buffer: the bytes it did not take are sent before another read overwrites them.
+    if buffer.pending_len() > 0 {
+        return match send_pending(to, buffer) {
+            Ok(true) => {
+                ended.mark_progress();
+                Next::More
+            }
+            Ok(false) => {
+                note_wait_finish(ended);
+                Next::Idle
+            }
+            Err(()) => Next::Done,
+        };
+    }
     match from.read_once(buffer.as_mut()) {
         Ok(0) => Next::Done,
-        Ok(n) if to.write_once(buffer.filled(n)).is_ok() => Next::More,
+        Ok(n) => {
+            let _ = buffer.filled(n);
+            match send_pending(to, buffer) {
+                Ok(true) => {
+                    ended.mark_progress();
+                    Next::More
+                }
+                Ok(false) => {
+                    note_wait_finish(ended);
+                    Next::Idle
+                }
+                Err(()) => Next::Done,
+            }
+        }
         // A record still arriving has progress behind it, so the step already spent its turn: the lane requeues rather than reading the yield as an idle peer.
         Err(error) if is_driven_yield(&error) => Next::Retry,
         Err(error) if is_timeout(&error) => {
@@ -38938,8 +39015,26 @@ where
                 Next::Idle
             }
         }
-        Ok(_) | Err(_) => Next::Done,
+        Err(_) => Next::Done,
     }
+}
+
+/// Writes the region the step holds until the writer takes all of it. `Ok(false)` is a writer that
+/// took nothing more right now: the lane parks on the descriptor its grant arrives on and the tail
+/// stays in the buffer, so no byte is written twice and no worker waits out the window.
+fn send_pending<W: Write>(to: &Half<W>, buffer: &mut RelayBuf) -> Result<bool, ()> {
+    while buffer.pending_len() > 0 {
+        match to.write_upto(buffer.pending()) {
+            Ok(0) => return Ok(false),
+            Ok(n) => buffer.advance(n),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if is_timeout(&error) => return Ok(false),
+            Err(_) => return Err(()),
+        }
+    }
+    to.write_flush().map_err(|_| ())?;
+    buffer.release();
+    Ok(true)
 }
 
 /// A finished lane's bookkeeping: the sibling sees the end, and the pair closes when both have.
