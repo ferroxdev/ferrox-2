@@ -134,10 +134,14 @@ struct PaddingWrite {
     pending: Vec<u8>,
     at: usize,
     input: usize,
+    lost: bool,
 }
 
 impl PaddingWrite {
     fn push(&mut self, writer: &mut dyn proxy::LaneWrite, data: &[u8]) -> proxy::Push {
+        if self.lost {
+            return proxy::Push::Lost;
+        }
         if data.is_empty() && self.pending.is_empty() {
             return proxy::Push::Took(0);
         }
@@ -146,7 +150,10 @@ impl PaddingWrite {
             match writer.push(&self.pending[self.at..]) {
                 proxy::Push::Took(n) => self.at += n,
                 proxy::Push::Parked => return Self::progress(done),
-                proxy::Push::Lost => return proxy::Push::Lost,
+                proxy::Push::Lost => {
+                    self.lost = true;
+                    return proxy::Push::Lost;
+                }
             }
             if self.at < self.pending.len() {
                 return Self::progress(done);
@@ -156,6 +163,7 @@ impl PaddingWrite {
             self.at = 0;
             self.written += 1;
             if data.len() < input {
+                self.lost = true;
                 return proxy::Push::Lost;
             }
             done = input;
@@ -164,7 +172,10 @@ impl PaddingWrite {
             return match writer.push(&data[done..]) {
                 proxy::Push::Took(n) => proxy::Push::Took(done + n),
                 proxy::Push::Parked => Self::progress(done),
-                proxy::Push::Lost => proxy::Push::Lost,
+                proxy::Push::Lost => {
+                    self.lost = true;
+                    Self::progress(done)
+                }
             };
         }
         while done < data.len() && self.written < PADDING_COUNT {
@@ -184,7 +195,8 @@ impl PaddingWrite {
                 proxy::Push::Lost => {
                     self.pending.clear();
                     self.input = 0;
-                    return proxy::Push::Lost;
+                    self.lost = true;
+                    return Self::progress(done);
                 }
             }
             if self.at < self.pending.len() {
@@ -364,7 +376,8 @@ fn write_uot_packet(
     }
     head.extend_from_slice(&len.to_be_bytes());
     write_all(writer, &head)?;
-    write_all(writer, payload)
+    write_all(writer, payload)?;
+    writer.flush()
 }
 
 #[cfg(test)]
@@ -970,6 +983,23 @@ impl Write for NaiveStream {
         if self.inner.write_lost.load(Ordering::Relaxed) {
             return Err(std::io::ErrorKind::BrokenPipe.into());
         }
+        let mut deadline = Instant::now() + crate::budgets::relay_stall();
+        loop {
+            match self.settle() {
+                proxy::Settle::Clear => break,
+                proxy::Settle::Advanced => {
+                    deadline = Instant::now() + crate::budgets::relay_stall();
+                }
+                proxy::Settle::Lost => {
+                    self.inner.write_lost.store(true, Ordering::Relaxed);
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                proxy::Settle::Parked if Instant::now() >= deadline => {
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                proxy::Settle::Parked => self.wait_room(crate::budgets::RELAY_POLL),
+            }
+        }
         self.inner
             .writer
             .lock()
@@ -997,6 +1027,16 @@ impl proxy::LaneWrite for NaiveStream {
     }
 
     fn settle(&mut self) -> proxy::Settle {
+        if self.inner.padded
+            && self
+                .inner
+                .write_padding
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .lost
+        {
+            return proxy::Settle::Lost;
+        }
         self.inner
             .writer
             .lock()
@@ -1769,8 +1809,8 @@ type UotOpen = Result<
 
 struct PendingUot {
     target: Destination,
-    packets: VecDeque<Vec<u8>>,
-    bytes: usize,
+    packets: VecDeque<UotPacket>,
+    queue: Arc<UotQueue>,
 }
 
 #[derive(Default)]
@@ -1830,7 +1870,7 @@ fn uot_writer(
     mut stream: NaiveStream,
     connect: bool,
     target: &Destination,
-    initial: VecDeque<Vec<u8>>,
+    initial: VecDeque<UotPacket>,
     rx: &std::sync::mpsc::Receiver<UotPacket>,
     done: &AtomicBool,
 ) {
@@ -1838,7 +1878,7 @@ fn uot_writer(
         if done.load(Ordering::Relaxed) {
             return;
         }
-        if write_uot_packet(&mut stream, connect, target, &packet).is_err() {
+        if write_uot_packet(&mut stream, connect, target, &packet.payload).is_err() {
             done.store(true, Ordering::Relaxed);
             stream.abort();
             return;
@@ -1965,7 +2005,6 @@ impl NaiveOut {
                             continue;
                         }
                         let (tx, rx) = std::sync::mpsc::sync_channel(MAX_UOT_PENDING_PACKETS);
-                        let queue = Arc::new(UotQueue::default());
                         let writer_stream = stream.clone();
                         let writer_done = Arc::clone(&done);
                         if done.load(Ordering::Relaxed) {
@@ -1973,7 +2012,10 @@ impl NaiveOut {
                             continue;
                         }
                         let PendingUot {
-                            target, packets, ..
+                            target,
+                            packets,
+                            queue,
+                            ..
                         } = lane;
                         let writer = std::thread::Builder::new()
                             .name("ferrox-naive-uot-write".to_owned())
@@ -2060,10 +2102,12 @@ impl NaiveOut {
             if !lanes.contains_key(&key) {
                 if let Some(lane) = pending.get_mut(&key) {
                     if lane.packets.len() < MAX_UOT_PENDING_PACKETS
-                        && lane.bytes + payload.len() <= MAX_UOT_PENDING_BYTES
+                        && lane.queue.reserve(payload.len())
                     {
-                        lane.bytes += payload.len();
-                        lane.packets.push_back(payload.to_vec());
+                        lane.packets.push_back(UotPacket {
+                            payload: payload.to_vec(),
+                            queue: Arc::clone(&lane.queue),
+                        });
                     }
                     continue;
                 }
@@ -2073,14 +2117,21 @@ impl NaiveOut {
                 let Ok(reply_relay) = relay.try_clone() else {
                     continue;
                 };
+                let queue = Arc::new(UotQueue::default());
+                if !queue.reserve(payload.len()) {
+                    continue;
+                }
                 let mut packets = VecDeque::new();
-                packets.push_back(payload.to_vec());
+                packets.push_back(UotPacket {
+                    payload: payload.to_vec(),
+                    queue: Arc::clone(&queue),
+                });
                 pending.insert(
                     key.clone(),
                     PendingUot {
                         target: target.clone(),
                         packets,
-                        bytes: payload.len(),
+                        queue,
                     },
                 );
                 let tx = open_tx.clone();
@@ -2468,10 +2519,16 @@ impl NaiveOut {
                     attempts += 1;
                     let Ok(Some((status, padded))) = reader.read_response_head() else {
                         out.reset();
+                        if reader.rejected() {
+                            if !client.reusable() {
+                                self.discard_h3(&client);
+                            }
+                            continue;
+                        }
                         if !client.reusable() {
                             self.discard_h3(&client);
                         }
-                        continue;
+                        return None;
                     };
                     if !(200..300).contains(&status) {
                         out.reset();

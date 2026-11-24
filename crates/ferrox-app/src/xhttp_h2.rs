@@ -462,6 +462,60 @@ impl<'a> DataBatch<'a> {
         conn.wake.notify_all();
     }
 
+    /// Whether a reserved frame is wider than the peer's latest limit, so the batch must be split
+    /// before it reaches the wire.
+    fn exceeds(&self, max: usize) -> bool {
+        self.heads
+            .iter()
+            .take(self.used)
+            .any(|head| usize::from_be_bytes([0, head[0], head[1], head[2]]) > max)
+    }
+
+    /// Emit a batch whose frames were sized under an older, larger limit as DATA frames no wider
+    /// than the current one. The frame-size lock is held by the caller across the write.
+    fn flush_split_locked(
+        &mut self,
+        conn: &H2Conn,
+        write: &mut (dyn crate::proxy::FrameWrite + Send),
+        max: usize,
+    ) -> bool {
+        let used = std::mem::take(&mut self.used);
+        for at in 0..used {
+            let head = self.heads[at];
+            let id = u32::from_be_bytes([head[5], head[6], head[7], head[8]]);
+            let mut body = 0;
+            let mut offset = 0;
+            let mut left = usize::from_be_bytes([0, head[0], head[1], head[2]]);
+            while left > 0 {
+                let take = left.min(max);
+                let split = frame_head(take, T_DATA, 0, id);
+                let mut parts: [&[u8]; 5] = [NO_PART; 5];
+                parts[0] = &split;
+                let mut pieces = 1;
+                let mut need = take;
+                while need > 0 {
+                    let part = &self.bodies[at][body];
+                    if offset == part.len() {
+                        body += 1;
+                        offset = 0;
+                        continue;
+                    }
+                    let fit = (part.len() - offset).min(need);
+                    parts[pieces] = &part[offset..offset + fit];
+                    pieces += 1;
+                    need -= fit;
+                    left -= fit;
+                    offset += fit;
+                }
+                if !write.write_slices(&parts[..pieces]) {
+                    conn.dead.store(true, Ordering::SeqCst);
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// The same bytes into a write half the caller already holds: a lane takes the lock without
     /// waiting, so a busy writer parks the lane instead of stacking workers behind the mutex.
     fn flush_locked(
@@ -471,6 +525,14 @@ impl<'a> DataBatch<'a> {
     ) -> bool {
         if self.used == 0 {
             return true;
+        }
+        let max = conn
+            .max_frame
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if self.exceeds(*max) {
+            let max = *max;
+            return self.flush_split_locked(conn, write, max);
         }
         let mut parts: [&[u8]; 5 * DATA_FRAMES_PER_WRITE] = [NO_PART; 5 * DATA_FRAMES_PER_WRITE];
         let mut pieces = 0;
@@ -501,6 +563,18 @@ impl<'a> DataBatch<'a> {
     ) -> crate::proxy::Accepted {
         if self.used == 0 {
             return crate::proxy::Accepted::All;
+        }
+        let max = conn
+            .max_frame
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if self.exceeds(*max) {
+            let max = *max;
+            return if self.flush_split_locked(conn, write, max) {
+                crate::proxy::Accepted::All
+            } else {
+                crate::proxy::Accepted::Lost
+            };
         }
         let mut parts: [&[u8]; 5 * DATA_FRAMES_PER_WRITE] = [NO_PART; 5 * DATA_FRAMES_PER_WRITE];
         let mut pieces = 0;
@@ -2915,6 +2989,11 @@ fn client_headers(conn: &H2Conn, sid: u32, block: &[u8], end_stream: bool) -> bo
         return false;
     }
     if status.is_some_and(|status| (100..200).contains(&status)) {
+        if end_stream {
+            conn.fail_stream(sid);
+            conn.compression_error();
+            return false;
+        }
         return true;
     }
     let status = status.map(|status| status | if padding { PADDING_BIT } else { 0 });
@@ -4627,14 +4706,22 @@ mod tests {
         open.extend_from_slice(&S_MAX_CONCURRENT.to_be_bytes());
         open.extend_from_slice(&2u32.to_be_bytes());
         write_frame(&mut frames, T_SETTINGS, 0, 0, &open);
-        let client =
-            super::H2Client::new(std::io::Cursor::new(frames), NullWrite, None).expect("client");
+        let client = super::H2Client::new(
+            FramesThenIdle {
+                bytes: frames,
+                at: 0,
+            },
+            NullWrite,
+            None,
+        )
+        .expect("client");
         client.conn.peer_max.store(0, Ordering::SeqCst);
         assert!(!client.has_capacity());
         client.settle();
+        let block = block_encode(&[(":method", "CONNECT"), (":authority", "example.test")]);
         assert!(
-            client.has_capacity(),
-            "the increase buffered behind the zero limit was not pumped"
+            client.open_naive_result(&block, false).is_ok(),
+            "an idle pump left the client unable to open"
         );
     }
 
@@ -6783,6 +6870,25 @@ mod tests {
     impl Read for Silent {
         fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
             Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+        }
+    }
+
+    /// A scripted peer that goes quiet after its bytes, the way a live connection does once the
+    /// frames under test have landed.
+    struct FramesThenIdle {
+        bytes: Vec<u8>,
+        at: usize,
+    }
+
+    impl Read for FramesThenIdle {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.at >= self.bytes.len() {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            let take = buf.len().min(self.bytes.len() - self.at);
+            buf[..take].copy_from_slice(&self.bytes[self.at..self.at + take]);
+            self.at += take;
+            Ok(take)
         }
     }
 

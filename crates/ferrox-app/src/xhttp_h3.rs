@@ -22,6 +22,7 @@ const H3_FRAME_UNEXPECTED: u64 = 0x0105;
 const H3_FRAME_ERROR: u64 = 0x0106;
 const H3_ID_ERROR: u64 = 0x0108;
 const H3_SETTINGS_ERROR: u64 = 0x0109;
+const QPACK_ENCODER_STREAM_ERROR: u64 = 0x0201;
 const H3_MISSING_SETTINGS: u64 = 0x010a;
 
 /// One request stream's byte transport: a served stream on the QUIC driver, or one the client
@@ -69,6 +70,13 @@ impl Wire {
         match self {
             Self::Server(stream) => stream.activity(),
             Self::Client(stream) => Arc::clone(&stream.activity),
+        }
+    }
+
+    fn rejected(&self) -> bool {
+        match self {
+            Self::Server(_) => false,
+            Self::Client(stream) => stream.owner.rejected(stream.id),
         }
     }
 
@@ -209,6 +217,12 @@ impl H3Reader {
 
     pub(crate) fn status(&self) -> Option<u16> {
         self.status
+    }
+
+    /// Whether the peer's GOAWAY cutoff excluded this request before its answer arrived, which is
+    /// the only read failure after CONNECT that proves the request was never processed.
+    pub(crate) fn rejected(&self) -> bool {
+        self.wire.rejected()
     }
 
     fn content_length(&self) -> Option<usize> {
@@ -1826,6 +1840,8 @@ struct ControlState {
     /// Peer QPACK encoder and decoder streams: critical, so their payload is drained but never stopped.
     critical: Vec<u64>,
     encoder: Option<u64>,
+    encoder_prefix: Vec<u8>,
+    encoder_checked: bool,
     decoder: Option<u64>,
     skip: u64,
     /// Whether the control stream's first frame was SETTINGS, as RFC 9114 requires.
@@ -1880,6 +1896,50 @@ fn drain_stream(conn: &mut QuicheConnection, id: u64) {
     }
 }
 
+enum EncoderHead {
+    Pending,
+    Capacity(u64),
+    Invalid,
+}
+
+/// Read the QPACK encoder stream's mandatory first instruction, Set Dynamic Table Capacity. The
+/// client advertises zero, so a positive value is a stream error.
+fn read_qpack_capacity(conn: &mut QuicheConnection, id: u64, prefix: &mut Vec<u8>) -> EncoderHead {
+    loop {
+        if let Some(first) = prefix.first().copied() {
+            if first & 0xe0 != 0x20 {
+                return EncoderHead::Invalid;
+            }
+            let mut value = u64::from(first & 0x1f);
+            if value < 0x1f {
+                return EncoderHead::Capacity(value);
+            }
+            let mut shift = 0u32;
+            for byte in &prefix[1..] {
+                if shift > 56 {
+                    return EncoderHead::Invalid;
+                }
+                value = value.saturating_add(u64::from(byte & 0x7f) << shift);
+                if byte & 0x80 == 0 {
+                    return EncoderHead::Capacity(value);
+                }
+                shift += 7;
+            }
+        }
+        let mut byte = [0u8; 1];
+        match conn.stream_recv(id, &mut byte) {
+            Ok((1, fin)) => {
+                prefix.push(byte[0]);
+                if fin {
+                    return EncoderHead::Invalid;
+                }
+            }
+            Ok((_, _)) | Err(quiche::Error::Done) => return EncoderHead::Pending,
+            Err(_) => return EncoderHead::Invalid,
+        }
+    }
+}
+
 /// The server's HTTP/3 control stream: its type, SETTINGS, then a GOAWAY that ends new requests but
 /// not the tunnels already open. The stream is found by its type, and a partial frame stays
 /// buffered until the next read completes it.
@@ -1892,6 +1952,14 @@ fn h3_control_goaway(
         || control.critical.iter().any(|id| conn.stream_finished(*id))
     {
         let _ = conn.close(true, H3_CLOSED_CRITICAL_STREAM, b"critical stream closed");
+        return None;
+    }
+    if conn.readable().any(|id| id % 4 == 1) {
+        let _ = conn.close(
+            true,
+            H3_STREAM_CREATION_ERROR,
+            b"server-initiated bidirectional stream",
+        );
         return None;
     }
     let ids: Vec<u64> = conn
@@ -1951,6 +2019,20 @@ fn h3_control_goaway(
                 }
             }
             if Some(id) != control.id {
+                if control.encoder == Some(id) && !control.encoder_checked {
+                    match read_qpack_capacity(conn, id, &mut control.encoder_prefix) {
+                        EncoderHead::Pending => continue,
+                        EncoderHead::Capacity(0) => control.encoder_checked = true,
+                        EncoderHead::Capacity(_) | EncoderHead::Invalid => {
+                            let _ = conn.close(
+                                true,
+                                QPACK_ENCODER_STREAM_ERROR,
+                                b"encoder capacity above the advertised zero",
+                            );
+                            return None;
+                        }
+                    }
+                }
                 drain_stream(conn, id);
                 if control.critical.contains(&id) && conn.stream_finished(id) {
                     let _ = conn.close(true, H3_CLOSED_CRITICAL_STREAM, b"critical stream closed");
