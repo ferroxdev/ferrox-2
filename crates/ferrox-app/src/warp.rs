@@ -4870,7 +4870,11 @@ mod tests {
 
     #[test]
     fn a_read_back_updates_the_saved_identity() {
-        let spec = WarpSpec::for_command(Mode::Auto, None, None);
+        let mut spec = WarpSpec::for_command(Mode::Auto, None, None);
+        spec.team = Some(crate::zerotrust::TeamSettings {
+            team: "acme".to_owned(),
+            ..crate::zerotrust::TeamSettings::default()
+        });
         let saved = Identity {
             device_id: "a-device".to_owned(),
             team: Some("acme".to_owned()),
