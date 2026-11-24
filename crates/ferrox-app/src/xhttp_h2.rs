@@ -1037,12 +1037,12 @@ impl H2StreamReader {
         move || conn.reset(id)
     }
 
-    fn wait(
+    fn wait<'a>(
         &self,
-        st: std::sync::MutexGuard<'_, StreamState>,
+        st: std::sync::MutexGuard<'a, StreamState>,
         turn: Duration,
     ) -> (
-        std::sync::MutexGuard<'_, StreamState>,
+        std::sync::MutexGuard<'a, StreamState>,
         std::sync::WaitTimeoutResult,
     ) {
         self.conn.waiting.fetch_add(1, Ordering::SeqCst);
