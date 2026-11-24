@@ -468,7 +468,7 @@ impl<'a> DataBatch<'a> {
         self.heads
             .iter()
             .take(self.used)
-            .any(|head| usize::from_be_bytes([0, head[0], head[1], head[2]]) > max)
+            .any(|head| usize::from(u32::from_be_bytes([0, head[0], head[1], head[2]])) > max)
     }
 
     /// Emit a batch whose frames were sized under an older, larger limit as DATA frames no wider
@@ -485,7 +485,7 @@ impl<'a> DataBatch<'a> {
             let id = u32::from_be_bytes([head[5], head[6], head[7], head[8]]);
             let mut body = 0;
             let mut offset = 0;
-            let mut left = usize::from_be_bytes([0, head[0], head[1], head[2]]);
+            let mut left = usize::from(u32::from_be_bytes([0, head[0], head[1], head[2]]));
             while left > 0 {
                 let take = left.min(max);
                 let split = frame_head(take, T_DATA, 0, id);
