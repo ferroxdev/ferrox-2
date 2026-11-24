@@ -3012,6 +3012,9 @@ impl H2Client {
             }
             None => (WINDOW, CONN_WINDOW_TOP_UP),
         };
+        if let Some(raw) = &raw {
+            let _ = raw.set_read_timeout(Some(crate::budgets::RELAY_POLL));
+        }
         let dead = Arc::new(AtomicBool::new(false));
         let write: SharedWriter = Arc::new(Mutex::new(Box::new(write)));
         let conn = Arc::new(H2Conn {
