@@ -489,6 +489,7 @@ struct Session {
 struct Page {
     url: String,
     reply: Reply,
+    token: Option<String>,
 }
 
 impl Session {
@@ -635,8 +636,12 @@ impl Session {
         exchange: &Exchange<'_>,
     ) -> Result<Page, String> {
         let mut current = url.to_owned();
+        let mut token = None;
         for _ in 0..=MAX_REDIRECTS {
             let reply = self.exchange("GET", &current, headers, &[], exchange)?;
+            if token.is_none() {
+                token = issued_token(&reply);
+            }
             let location = if is_redirect(reply.status) {
                 reply.header("Location").map(str::to_owned)
             } else {
@@ -646,6 +651,7 @@ impl Session {
                 return Ok(Page {
                     url: current,
                     reply,
+                    token,
                 });
             };
             current = resolve_redirect(&current, &location)?;
@@ -663,6 +669,7 @@ impl Session {
         let headers = [("Content-Type", "application/x-www-form-urlencoded")];
         let mut current = url.to_owned();
         let mut body = Some(form);
+        let mut token = None;
         for _ in 0..=MAX_REDIRECTS {
             let reply = match body.as_deref() {
                 Some(bytes) => {
@@ -670,6 +677,9 @@ impl Session {
                 }
                 None => self.exchange("GET", &current, &[], &[], exchange)?,
             };
+            if token.is_none() {
+                token = issued_token(&reply);
+            }
             let location = if is_redirect(reply.status) {
                 reply.header("Location").map(str::to_owned)
             } else {
@@ -679,6 +689,7 @@ impl Session {
                 return Ok(Page {
                     url: current,
                     reply,
+                    token,
                 });
             };
             let next = resolve_redirect(&current, &location)?;
@@ -826,8 +837,8 @@ fn with_email_code(
                 page.reply.status
             ));
         }
-        let token = extract_jwt_from_html(&String::from_utf8_lossy(&page.reply.body))
-            .or_else(|| issued_token(&page.reply));
+        let html = String::from_utf8_lossy(&page.reply.body);
+        let token = extract_jwt_from_html(&html).or(page.token);
         if let Some(token) = token {
             eprintln!(
                 "[+] signed in to team {} with the email code",
@@ -1258,6 +1269,71 @@ mod tests {
         assert!(error.contains("did not answer the login code check"));
         assert_eq!(prompted, 1);
         assert_eq!(posts.get(), 1);
+    }
+
+    #[test]
+    fn a_callback_token_on_a_redirect_is_kept() {
+        let settings = TeamSettings {
+            team: "acme".to_owned(),
+            email: Some("user@example.com".to_owned()),
+            ..TeamSettings::default()
+        };
+        let token = jwt("{\"exp\":4102444800}");
+        let mut prompted = 0;
+        let got = sign_in(
+            &settings,
+            now(),
+            &|method, url, _, _| {
+                if method == "GET" && url.ends_with("/warp") {
+                    return Ok(reply(
+                        200,
+                        Vec::new(),
+                        "<form action=\"https://acme.cloudflareaccess.com/cdn-cgi/access/verify\"><input id=\"totp-form\"></form>",
+                    ));
+                }
+                if method == "POST" && url.ends_with("/verify") {
+                    return Ok(reply(
+                        302,
+                        vec![(
+                            "Location".to_owned(),
+                            "https://acme.cloudflareaccess.com/verify?nonce=abc".to_owned(),
+                        )],
+                        "",
+                    ));
+                }
+                if method == "GET" && url.contains("nonce=abc") {
+                    return Ok(reply(200, Vec::new(), ""));
+                }
+                if method == "POST" && url.ends_with("/cdn-cgi/access/callback") {
+                    return Ok(reply(
+                        302,
+                        vec![
+                            (
+                                "Location".to_owned(),
+                                "https://acme.cloudflareaccess.com/cdn-cgi/access/callback?done=1"
+                                    .to_owned(),
+                            ),
+                            (
+                                "Set-Cookie".to_owned(),
+                                format!("CF_Authorization={token}; Path=/; Secure"),
+                            ),
+                        ],
+                        "",
+                    ));
+                }
+                if method == "GET" && url.contains("done=1") {
+                    return Ok(reply(200, Vec::new(), ""));
+                }
+                Err(format!("unexpected {method} {url}"))
+            },
+            &mut |_, _| {
+                prompted += 1;
+                Some("123456".to_owned())
+            },
+        )
+        .expect("a token issued on the redirect is kept");
+        assert_eq!(got, token);
+        assert_eq!(prompted, 1);
     }
 
     #[test]
