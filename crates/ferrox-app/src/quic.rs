@@ -5028,7 +5028,7 @@ pub(crate) struct StreamPump {
 
 /// A queue's room in either direction stays under one relay buffer's worth per wait, so a full
 /// queue backpressures the far side rather than growing with its window.
-const PUMP_QUEUE: usize = 256 * 1024;
+const PUMP_QUEUE: usize = 1024 * 1024;
 
 impl StreamPump {
     pub(crate) fn new() -> Self {
