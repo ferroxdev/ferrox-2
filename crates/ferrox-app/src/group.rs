@@ -285,9 +285,22 @@ impl Group {
                 Some((_, at, leaf, out, revision)) => (at, leaf, out, revision),
                 None => {
                     let (at, revision) = first?;
-                    let (leaf, out, _) =
-                        resolve_member(route, &self.members[at], network, resolved, readings)?;
-                    (at, leaf, out, revision)
+                    // The stored member is often the first eligible one; its resolution is at hand.
+                    match current {
+                        Some((current_at, leaf, out, _, _)) if current_at == at => {
+                            (at, leaf, out, revision)
+                        }
+                        _ => {
+                            let (leaf, out, _) = resolve_member(
+                                route,
+                                &self.members[at],
+                                network,
+                                resolved,
+                                readings,
+                            )?;
+                            (at, leaf, out, revision)
+                        }
+                    }
                 }
             }
         } else {

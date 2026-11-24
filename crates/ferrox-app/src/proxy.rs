@@ -85090,7 +85090,7 @@ end
     }
 
     /// A nested leaf is owned, so a dial through a nested url-test allocates the tag it returns and
-    /// nothing else: the fallback slot keeps the member's position, not a second copy of its leaf.
+    /// nothing else: the fallback slot keeps the member's position and reuses the stored member.
     #[test]
     fn a_nested_urltest_dial_allocates_only_the_tag_it_returns() {
         let shared = group_route(
@@ -85103,7 +85103,6 @@ end
             ],"routing":{}}"#,
         );
         let group = group_of(&shared, "pick");
-        group.record("a", 10);
         let dial = || {
             group
                 .resolve(&shared, crate::router::Network::Tcp)
@@ -85112,6 +85111,13 @@ end
         // A flow is the dial after the process's one-time setup, so the gate takes a warm one.
         let (warm_up, _) = ferrox_core::alloc_count::measure(dial);
         assert_eq!(warm_up.0, "a");
+        let (unread, no_reading) = ferrox_core::alloc_count::measure(dial);
+        assert_eq!(unread.0, "a", "with no reading the stored member answers");
+        assert_eq!(
+            no_reading.allocs, 1,
+            "a fallback dial re-resolved the stored member it already held"
+        );
+        group.record("a", 10);
         let (picked, counts) = ferrox_core::alloc_count::measure(dial);
         assert_eq!(picked.0, "a");
         assert_eq!(
