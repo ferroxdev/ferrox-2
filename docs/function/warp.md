@@ -48,15 +48,17 @@ graph TD
     T1 --> B
     B --> C["derive each slot path<br/>base / -masque / -secondary / -gool"]
     C --> D{"file exists?"}
-    D -- no --> E["sign in: token / service / email<br/>POST /reg<br/>curve25519 key"]
+    D -- no --> U{"team named?"}
+    U -- no --> E0["personal: POST /reg<br/>curve25519 key"]
+    U -- yes --> E["team: sign in: token / service / email<br/>POST /reg<br/>curve25519 key"]
     D -- yes --> V{"saved team matches?"}
     V -- no --> XF["fail, choose another path"]
     V -- yes --> F["GET /reg/id<br/>refresh peer, endpoint, addresses"]
     F -- "401/404/410" --> G{"AETHER_REPROVISION=0?"}
-    G -- no --> E
+    G -- no --> U
     G -- yes --> H["keep saved identity"]
     F -- other failure --> H
-    E --> I["PATCH /reg/id<br/>P-256 SPKI (MASQUE slots)"]
+    E0 & E --> I["PATCH /reg/id<br/>P-256 SPKI (MASQUE slots)"]
     I --> J["PATCH /reg/id<br/>warp_enabled"]
     J -- "not 2xx" --> X["fail, save nothing"]
     J -- 2xx --> K["plan in memory"]

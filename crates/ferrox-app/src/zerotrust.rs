@@ -57,6 +57,15 @@ impl TeamSettings {
     ) -> Result<Option<Self>, String> {
         let raw = pick(team, "AETHER_TEAM");
         let Some(raw) = raw else {
+            let supplied = pick(client_id, "AETHER_ACCESS_CLIENT_ID").is_some()
+                || pick(client_secret, "AETHER_ACCESS_CLIENT_SECRET").is_some()
+                || pick(token, "AETHER_ACCESS_TOKEN").is_some()
+                || pick(email, "AETHER_ACCESS_EMAIL").is_some();
+            if supplied {
+                return Err(
+                    "warp: access credentials need a team; name `team` or AETHER_TEAM".to_owned(),
+                );
+            }
             return Ok(None);
         };
         let team = normalize_team(&raw).ok_or_else(|| {
@@ -404,6 +413,22 @@ fn url_path(url: &str) -> &str {
     } else {
         path
     }
+}
+
+fn https_target(url: &str) -> Option<(String, String)> {
+    let (scheme, authority) = url_origin(url)?;
+    if scheme != "https" {
+        return None;
+    }
+    let rest = url.strip_prefix("https://")?;
+    let start = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let mut target = rest[start..].split('#').next().unwrap_or("").to_owned();
+    if target.is_empty() {
+        target.push('/');
+    } else if target.starts_with('?') {
+        target.insert(0, '/');
+    }
+    Some((format!("https://{authority}"), target))
 }
 
 fn default_cookie_path(path: &str) -> String {
@@ -790,6 +815,12 @@ fn with_service_token(settings: &TeamSettings, exchange: &Exchange<'_>) -> Resul
         ("User-Agent", UA_REGISTER),
     ];
     let reply = exchange("GET", &url, &headers, &[])?;
+    if !(200..400).contains(&reply.status) {
+        return Err(format!(
+            "warp: access refused the service token for team `{}` (status {}); confirm the client id and secret",
+            settings.team, reply.status
+        ));
+    }
     if let Some(token) = issued_token(&reply) {
         eprintln!("[+] access issued a device enrolment token");
         return Ok(token);
@@ -905,14 +936,11 @@ pub(crate) fn https_exchange(
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> Result<Reply, String> {
-    let endpoint = Endpoint::parse(url, crate::quic::system_roots())
+    let (origin, target) =
+        https_target(url).ok_or_else(|| format!("warp access: `{url}` is not an https URL"))?;
+    let endpoint = Endpoint::parse(&origin, crate::quic::system_roots())
         .ok_or_else(|| format!("warp access: `{url}` is not an https URL"))?;
-    let path = if endpoint.base.is_empty() {
-        "/"
-    } else {
-        endpoint.base.as_str()
-    };
-    crate::foxy_account::ask(&endpoint, method, path, headers, body)
+    crate::foxy_account::ask(&endpoint, method, &target, headers, body)
         .map_err(|reason| format!("warp access: {reason}"))
 }
 
@@ -1011,6 +1039,53 @@ mod tests {
         let settings = crate::json::parse("{\"team\":42}").expect("valid json");
         let error = TeamSettings::from_settings(&settings).expect_err("a non-string team");
         assert!(error.contains("`team` must be a string"));
+    }
+
+    #[test]
+    fn access_credentials_without_a_team_are_refused() {
+        let error = TeamSettings::from_parts(None, None, None, Some("a-token"), None)
+            .expect_err("access without a team");
+        assert!(error.contains("need a team"), "{error}");
+    }
+
+    #[test]
+    fn an_https_request_keeps_its_path_and_query() {
+        assert_eq!(
+            https_target("https://acme.cloudflareaccess.com"),
+            Some((
+                "https://acme.cloudflareaccess.com".to_owned(),
+                "/".to_owned()
+            ))
+        );
+        assert_eq!(
+            https_target("https://acme.cloudflareaccess.com/warp/"),
+            Some((
+                "https://acme.cloudflareaccess.com".to_owned(),
+                "/warp/".to_owned()
+            ))
+        );
+        assert_eq!(
+            https_target("https://acme.cloudflareaccess.com/warp?nonce=abc"),
+            Some((
+                "https://acme.cloudflareaccess.com".to_owned(),
+                "/warp?nonce=abc".to_owned()
+            ))
+        );
+        assert_eq!(
+            https_target("https://acme.cloudflareaccess.com?nonce=abc"),
+            Some((
+                "https://acme.cloudflareaccess.com".to_owned(),
+                "/?nonce=abc".to_owned()
+            ))
+        );
+        assert_eq!(
+            https_target("https://acme.cloudflareaccess.com/warp#fragment"),
+            Some((
+                "https://acme.cloudflareaccess.com".to_owned(),
+                "/warp".to_owned()
+            ))
+        );
+        assert_eq!(https_target("http://acme.cloudflareaccess.com"), None);
     }
 
     #[test]
@@ -1583,6 +1658,35 @@ mod tests {
         )
         .expect("a service token");
         assert_eq!(got, token);
+    }
+
+    #[test]
+    fn a_refused_service_token_is_reported() {
+        let token = jwt("{\"exp\":4102444800}");
+        let settings = TeamSettings {
+            team: "acme".to_owned(),
+            client_id: Some("the-id".to_owned()),
+            client_secret: Some("the-secret".to_owned()),
+            ..TeamSettings::default()
+        };
+        let error = sign_in(
+            &settings,
+            now(),
+            &|_, _, _, _| {
+                Ok(reply(
+                    403,
+                    vec![(
+                        "Set-Cookie".to_owned(),
+                        format!("CF_Authorization={token}; Path=/; Secure"),
+                    )],
+                    "",
+                ))
+            },
+            &mut |_, _| None,
+        )
+        .expect_err("a refused service token");
+        assert!(error.contains("403"), "{error}");
+        assert!(error.contains("service token"), "{error}");
     }
 
     #[test]

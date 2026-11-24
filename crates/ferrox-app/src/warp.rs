@@ -1204,7 +1204,7 @@ where
             reserved: registered.reserved,
         },
         masque,
-        gateway: registered.gateway,
+        gateway: spec.team.as_ref().and(registered.gateway),
     })
 }
 
@@ -1244,7 +1244,9 @@ where
     let root = reply_root(&reply)?;
     let config = parse_config(&root)?;
     let mut fresh = identity.clone();
-    fresh.gateway.clone_from(&config.gateway);
+    if spec.team.is_some() {
+        fresh.gateway.clone_from(&config.gateway);
+    }
     fresh.wireguard.peer = config.peer;
     fresh.wireguard.endpoint = spec.endpoint.unwrap_or(config.endpoint);
     fresh.wireguard.reserved = config.reserved;
@@ -1690,7 +1692,7 @@ impl Identity {
                 ]),
             ));
         }
-        if let Some(gateway) = &self.gateway {
+        if let (Some(_), Some(gateway)) = (&self.team, &self.gateway) {
             pairs.push(("gatewayProxy", string(gateway)));
         }
         obj_pairs(pairs)
@@ -2450,10 +2452,11 @@ fn connect_request(asked: &crate::proxy::Destination) -> Option<Vec<u8>> {
 }
 
 fn connect_status(head: &[u8]) -> Option<u16> {
-    let text = std::str::from_utf8(head).ok()?;
-    let mut lines = text.split("\r\n");
+    let mut lines = head.split(|byte| *byte == b'\n');
     let line = lines.next()?;
-    let mut parts = line.split_whitespace();
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let text = std::str::from_utf8(line).ok()?;
+    let mut parts = text.split_whitespace();
     let version = parts.next()?.strip_prefix("HTTP/")?;
     let (major, minor) = version.split_once('.')?;
     if major.is_empty()
@@ -2468,14 +2471,20 @@ fn connect_status(head: &[u8]) -> Option<u16> {
         return None;
     }
     for field in lines {
+        let field = field.strip_suffix(b"\r").unwrap_or(field);
         if field.is_empty() {
             break;
         }
-        let (name, _) = field.split_once(':')?;
+        let colon = field.iter().position(|byte| *byte == b':')?;
+        let name = &field[..colon];
+        let value = &field[colon + 1..];
         if name.is_empty()
             || !name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(byte))
+            || !value
+                .iter()
+                .all(|byte| matches!(*byte, b'\t' | b' ' | 0x21..=0x7e | 0x80..=0xff))
         {
             return None;
         }
@@ -4119,6 +4128,10 @@ mod tests {
     }
 
     fn reply_with_ports(peer_key: &str, ports: &[u16]) -> Reply {
+        reply_with_ports_and_gateway(peer_key, ports, None)
+    }
+
+    fn reply_with_ports_and_gateway(peer_key: &str, ports: &[u16], proxy: Option<&str>) -> Reply {
         let peer = obj_pairs(vec![
             ("public_key", string(peer_key)),
             (
@@ -4144,11 +4157,15 @@ mod tests {
                 ("v6", string("2606:4700:110:8a1b::2")),
             ]),
         )]);
-        let config = obj_pairs(vec![
+        let mut config = vec![
             ("client_id", string(&b64(&[9, 8, 7]))),
             ("peers", crate::json::Json::Arr(vec![peer])),
             ("interface", interface),
-        ]);
+        ];
+        if let Some(proxy) = proxy {
+            config.push(("services", obj_pairs(vec![("http_proxy", string(proxy))])));
+        }
+        let config = obj_pairs(config);
         let root = obj_pairs(vec![
             ("id", string("a-device")),
             ("token", string("a-token")),
@@ -4780,6 +4797,31 @@ mod tests {
     }
 
     #[test]
+    fn a_personal_registration_ignores_a_gateway_proxy() {
+        let spec = WarpSpec::for_command(Mode::Auto, None, None);
+        let reply =
+            reply_with_ports_and_gateway(&b64(&[0x42; 32]), &[2408], Some("192.0.2.7:8080"));
+        let call = |_method: &str, _path: &str, _headers: &[(&str, &str)], _body: &[u8]| {
+            Ok::<_, RegisterError>(reply.clone())
+        };
+        let identity = register_with(&spec, false, None, &call).expect("a registration");
+        assert!(identity.gateway.is_none());
+    }
+
+    #[test]
+    fn a_personal_read_back_does_not_touch_the_gateway() {
+        let spec = WarpSpec::for_command(Mode::Auto, None, None);
+        let mut saved = sample_identity();
+        saved.gateway = Some("192.0.2.7:8080".to_owned());
+        let fresh_reply = sample_reply(&b64(&[0x55; 32]));
+        let call = |_method: &str, _path: &str, _headers: &[(&str, &str)], _body: &[u8]| {
+            Ok::<_, RegisterError>(fresh_reply.clone())
+        };
+        let fresh = refresh(&spec, &saved, &call).expect("a read-back");
+        assert_eq!(fresh.gateway, saved.gateway);
+    }
+
+    #[test]
     fn a_refused_enable_is_fatal_and_saves_nothing() {
         let spec = WarpSpec::for_command(Mode::Auto, None, None);
         let wireguard_reply = sample_reply(&b64(&[0x42; 32]));
@@ -4831,7 +4873,7 @@ mod tests {
         let spec = WarpSpec::for_command(Mode::Auto, None, None);
         let saved = Identity {
             device_id: "a-device".to_owned(),
-            team: None,
+            team: Some("acme".to_owned()),
             token: "a-token".to_owned(),
             wireguard: WireGuardIdentity {
                 private: [7u8; 32],
@@ -6105,6 +6147,14 @@ mod tests {
             connect_status(b"HTTP/1.1 200 OK\r\n: empty name\r\n\r\n"),
             None
         );
+        assert_eq!(
+            connect_status(b"HTTP/1.1 200 OK\r\nX-Opaque: \xff\r\n\r\n"),
+            Some(200)
+        );
+        assert_eq!(
+            connect_status(b"HTTP/1.1 200 OK\r\nX-Bad: a\x01b\r\n\r\n"),
+            None
+        );
     }
 
     #[test]
@@ -6169,6 +6219,7 @@ mod tests {
     #[test]
     fn a_team_identity_keeps_the_gateway_across_a_save() {
         let mut identity = sample_identity();
+        identity.team = Some("acme".to_owned());
         identity.gateway = Some("192.0.2.7:8080".to_owned());
         let value = identity.to_json();
         let mut text = String::new();
