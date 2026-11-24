@@ -1168,7 +1168,7 @@ fn drive_client(weak: &std::sync::Weak<Lane>) {
                 let Ok(mut conn) = lane.conn.lock() else {
                     break;
                 };
-                pump_bidi(&mut conn, &lane, &mut ids);
+                pump_streams(&mut conn, &lane);
                 service(&mut conn, &lane)
             }
             quic::Drain::Unbatchable => match lane.sock.recv_from(&mut buf) {
@@ -1325,52 +1325,16 @@ fn client_turn(
             uni.insert(id, data);
         }
     }
-    pump_bidi(conn, lane, ids);
+    pump_streams(conn, lane);
     service(conn, lane)
 }
 
-/// Hand every readable client stream's bytes to the queue its relay reads, up to the queue's free
-/// room: a full queue leaves the rest in quiche's window, so the driver never copies ahead of TCP.
-fn pump_bidi(conn: &mut QuicheConnection, lane: &Lane, ids: &mut Vec<u64>) {
-    ids.clear();
-    ids.extend(conn.readable());
+/// Move every live client stream's two directions while the driver holds the connection, so a relay
+/// worker only copies between TCP and its queue.
+fn pump_streams(conn: &mut QuicheConnection, lane: &Lane) {
     let mut buf = [0u8; 64 * 1024];
-    for &id in ids.iter() {
-        if id % 4 != 0 {
-            continue;
-        }
-        let Some(queue) = lane.pump.queue(id) else {
-            continue;
-        };
-        loop {
-            let want = queue.free().min(buf.len());
-            if want == 0 {
-                break;
-            }
-            match conn.stream_recv(id, &mut buf[..want]) {
-                Ok((0, fin)) => {
-                    if fin {
-                        queue.finish();
-                    }
-                    break;
-                }
-                Ok((n, fin)) => {
-                    queue.push(&buf[..n]);
-                    if fin {
-                        queue.finish();
-                        break;
-                    }
-                    if n < want {
-                        break;
-                    }
-                }
-                Err(quiche::Error::Done) => break,
-                Err(_) => {
-                    queue.finish();
-                    break;
-                }
-            }
-        }
+    for (id, queue) in lane.pump.streams() {
+        quic::pump_stream(conn, id, &queue, &mut buf);
     }
 }
 

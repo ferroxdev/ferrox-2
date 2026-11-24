@@ -5008,12 +5008,17 @@ pub(crate) struct QuicStream {
     queue: Option<Arc<StreamQueue>>,
 }
 
-/// One stream's inbound bytes, filled by the connection driver under its own lock and drained by
-/// the relay, so a client read never takes the connection lock the upload direction is using.
+/// One client stream's two directions, fed and drained by the connection driver so neither relay
+/// worker takes the connection lock the other direction is using.
 pub(crate) struct StreamQueue {
     data: Mutex<VecDeque<u8>>,
+    out: Mutex<VecDeque<u8>>,
     ready: Condvar,
+    wake: Condvar,
     eof: AtomicBool,
+    fin: AtomicBool,
+    fin_done: AtomicBool,
+    closed: AtomicBool,
 }
 
 /// The run of client streams one connection driver feeds.
@@ -5021,8 +5026,8 @@ pub(crate) struct StreamPump {
     streams: Mutex<HashMap<u64, Weak<StreamQueue>>>,
 }
 
-/// A queue's free room stays under one relay buffer's worth per wait, so a full queue backpressures
-/// the driver rather than growing with the peer's window.
+/// A queue's room in either direction stays under one relay buffer's worth per wait, so a full
+/// queue backpressures the far side rather than growing with its window.
 const PUMP_QUEUE: usize = 256 * 1024;
 
 impl StreamPump {
@@ -5040,17 +5045,16 @@ impl StreamPump {
         queue
     }
 
-    pub(crate) fn queue(&self, id: u64) -> Option<Arc<StreamQueue>> {
+    pub(crate) fn streams(&self) -> Vec<(u64, Arc<StreamQueue>)> {
         let Ok(mut streams) = self.streams.lock() else {
-            return None;
+            return Vec::new();
         };
-        match streams.get(&id).and_then(Weak::upgrade) {
-            Some(queue) => Some(queue),
-            None => {
-                streams.remove(&id);
-                None
-            }
-        }
+        let live = streams
+            .iter()
+            .filter_map(|(&id, queue)| queue.upgrade().map(|queue| (id, queue)))
+            .collect();
+        streams.retain(|_, queue| queue.strong_count() > 0);
+        live
     }
 }
 
@@ -5058,25 +5062,30 @@ impl StreamQueue {
     fn new() -> Self {
         Self {
             data: Mutex::new(VecDeque::new()),
+            out: Mutex::new(VecDeque::new()),
             ready: Condvar::new(),
+            wake: Condvar::new(),
             eof: AtomicBool::new(false),
+            fin: AtomicBool::new(false),
+            fin_done: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
         }
     }
 
-    pub(crate) fn free(&self) -> usize {
+    fn free(&self) -> usize {
         self.data
             .lock()
             .map_or(0, |data| PUMP_QUEUE.saturating_sub(data.len()))
     }
 
-    pub(crate) fn push(&self, bytes: &[u8]) {
+    fn push(&self, bytes: &[u8]) {
         if let Ok(mut data) = self.data.lock() {
             data.extend(bytes);
         }
         self.ready.notify_all();
     }
 
-    pub(crate) fn finish(&self) {
+    fn finish(&self) {
         self.eof.store(true, Ordering::Relaxed);
         self.ready.notify_all();
     }
@@ -5116,6 +5125,134 @@ impl StreamQueue {
                     return Err(std::io::Error::other("quic stream queue poisoned"));
                 }
             }
+        }
+    }
+
+    fn write(&self, buf: &[u8], stop: &AtomicBool) -> std::io::Result<usize> {
+        let deadline = Instant::now() + SEND_WAIT;
+        let Ok(mut out) = self.out.lock() else {
+            return Err(std::io::Error::other("quic stream queue poisoned"));
+        };
+        loop {
+            if self.closed.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
+                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+            }
+            let room = PUMP_QUEUE.saturating_sub(out.len());
+            if room > 0 {
+                let take = buf.len().min(room);
+                out.extend(buf[..take].iter().copied());
+                self.wake.notify_all();
+                return Ok(take);
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(std::io::Error::other("quic stream send timed out"));
+            }
+            match self.wake.wait_timeout(out, left) {
+                Ok((next, _)) => out = next,
+                Err(_) => {
+                    return Err(std::io::Error::other("quic stream queue poisoned"));
+                }
+            }
+        }
+    }
+
+    fn finish_write(&self, stop: &AtomicBool) -> bool {
+        self.fin.store(true, Ordering::Relaxed);
+        let deadline = Instant::now() + SEND_WAIT;
+        let Ok(mut out) = self.out.lock() else {
+            return false;
+        };
+        loop {
+            if self.fin_done.load(Ordering::Relaxed) {
+                return true;
+            }
+            if self.closed.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
+                return false;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            match self.wake.wait_timeout(out, left) {
+                Ok((next, _)) => out = next,
+                Err(_) => return false,
+            }
+        }
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Relaxed);
+        self.eof.store(true, Ordering::Relaxed);
+        self.ready.notify_all();
+        self.wake.notify_all();
+    }
+}
+
+/// Move one pump stream's bytes both ways while the driver holds the connection: read what quiche
+/// holds into the relay queue, send the queue's bytes, then our FIN once the queue is empty.
+pub(crate) fn pump_stream(
+    conn: &mut QuicheConnection,
+    id: u64,
+    queue: &StreamQueue,
+    buf: &mut [u8],
+) {
+    loop {
+        let want = queue.free().min(buf.len());
+        if want == 0 {
+            break;
+        }
+        match conn.stream_recv(id, &mut buf[..want]) {
+            Ok((0, fin)) => {
+                if fin {
+                    queue.finish();
+                }
+                break;
+            }
+            Ok((n, fin)) => {
+                queue.push(&buf[..n]);
+                if fin {
+                    queue.finish();
+                    break;
+                }
+                if n < want {
+                    break;
+                }
+            }
+            Err(quiche::Error::Done) => break,
+            Err(_) => {
+                queue.finish();
+                break;
+            }
+        }
+    }
+    let Ok(mut out) = queue.out.lock() else {
+        return;
+    };
+    while !out.is_empty() {
+        let (front, back) = out.as_slices();
+        let chunk = if front.is_empty() { back } else { front };
+        match conn.stream_send(id, chunk, false) {
+            Ok(0) | Err(quiche::Error::Done) => break,
+            Ok(n) => {
+                out.drain(..n);
+            }
+            Err(_) => {
+                queue.close();
+                return;
+            }
+        }
+    }
+    queue.wake.notify_all();
+    if out.is_empty() && queue.fin.load(Ordering::Relaxed) && !queue.fin_done.load(Ordering::Relaxed)
+    {
+        match conn.stream_send(id, &[], true) {
+            Ok(_) => {
+                queue.fin_done.store(true, Ordering::Relaxed);
+                queue.wake.notify_all();
+            }
+            Err(quiche::Error::Done) => {}
+            Err(_) => queue.close(),
         }
     }
 }
@@ -5218,6 +5355,12 @@ impl Write for QuicStream {
         if self.stalled.load(Ordering::Relaxed) {
             return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
         }
+        if let Some(queue) = &self.queue {
+            let n = queue.write(buf, &self.stop)?;
+            self.meter.write(n);
+            self.activity.touch();
+            return Ok(n);
+        }
         // The lock covers one send each: a flow-control wait must not hold it, or ACKs stop arriving.
         let deadline = Instant::now() + SEND_WAIT;
         let mut rest = bytes::Bytes::copy_from_slice(buf);
@@ -5251,6 +5394,9 @@ impl Write for QuicStream {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        if self.queue.is_some() {
+            return Ok(());
+        }
         let Ok(mut conn) = self.conn.lock() else {
             return Err(std::io::Error::other("quic connection lock poisoned"));
         };
@@ -5368,6 +5514,13 @@ impl QuicStream {
     /// poll at a time, so a lane finishing never parks every other stream behind it. `stream_finished`
     /// is the peer's FIN, not ours, so it cannot stand in for the FIN this call exists to send.
     pub(crate) fn fin(&self) -> bool {
+        if let Some(queue) = &self.queue {
+            let sent = queue.finish_write(&self.stop);
+            if sent {
+                self.fin_sent.store(true, Ordering::Relaxed);
+            }
+            return sent;
+        }
         let deadline = Instant::now() + SEND_WAIT;
         loop {
             let outcome = {
