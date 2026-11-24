@@ -3171,7 +3171,7 @@ impl H2Client {
         let Ok(gate) = self.conn.open_gate.lock() else {
             return Err(H2OpenError::Closed);
         };
-        if self.conn.goaway.load(Ordering::SeqCst) {
+        if self.conn.goaway.load(Ordering::SeqCst) || self.conn.dead.load(Ordering::SeqCst) {
             return Err(H2OpenError::Closed);
         }
         if !self.has_capacity() {

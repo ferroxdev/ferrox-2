@@ -1259,6 +1259,8 @@ impl ClientStream {
         if self.owner.dead.load(Ordering::Relaxed)
             || self.owner.rejected(self.id)
             || self.owner.draining.load(Ordering::Relaxed)
+            || conn.is_draining()
+            || conn.is_closed()
         {
             return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
         }
@@ -1299,6 +1301,8 @@ impl ClientStream {
             if self.owner.dead.load(Ordering::Relaxed)
                 || self.owner.rejected(self.id)
                 || (sent == 0 && self.owner.draining.load(Ordering::Relaxed))
+                || conn.is_draining()
+                || conn.is_closed()
             {
                 return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
             }
@@ -1795,6 +1799,9 @@ fn drain_batch(
     }
     if conn.is_closed() {
         return false;
+    }
+    if conn.is_draining() {
+        draining.store(true, Ordering::Relaxed);
     }
     conn.on_timeout();
     quic::flush_egress(&mut conn, sock);

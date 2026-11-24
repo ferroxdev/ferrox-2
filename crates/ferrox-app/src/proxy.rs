@@ -39622,6 +39622,7 @@ fn settle_lane(
         }
         Settle::Advanced => {
             at.parked = None;
+            at.stopped = None;
             at.spins = 0;
             ended.mark_progress();
             Some(Next::Retry)

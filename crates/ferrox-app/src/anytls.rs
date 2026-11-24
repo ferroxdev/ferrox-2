@@ -424,6 +424,14 @@ impl Shared {
             .is_some()
     }
 
+    fn pending_len(&self) -> usize {
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map_or(0, Vec::len)
+    }
+
     fn write_packet(&self, packet: &[u8]) -> std::io::Result<()> {
         let result = self.write_packet_locked(packet);
         if result.is_err() {
@@ -818,6 +826,15 @@ impl proxy::LaneWrite for AnyTlsStream {
     }
 
     fn settle(&mut self) -> proxy::Settle {
+        let before = self.pending_input + self.pending.len() + self.session.shared.pending_len();
+        match self.flush_pending() {
+            proxy::Push::Lost => return proxy::Settle::Lost,
+            proxy::Push::Took(_) => return proxy::Settle::Advanced,
+            proxy::Push::Parked => {}
+        }
+        if self.pending_input + self.pending.len() + self.session.shared.pending_len() < before {
+            return proxy::Settle::Advanced;
+        }
         let Ok(mut writer) = self.session.shared.writer.try_lock() else {
             return proxy::Settle::Parked;
         };
@@ -1732,6 +1749,37 @@ mod tests {
         }
     }
 
+    struct Bounded(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Bounded {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl crate::proxy::FrameWrite for Bounded {
+        fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+            parts.iter().all(|part| self.write_all(part).is_ok())
+        }
+
+        fn write_ready(&mut self, parts: &[&[u8]]) -> Option<std::io::Result<usize>> {
+            let take = parts[0].len().min(2);
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend_from_slice(&parts[0][..take]);
+            Some(Ok(take))
+        }
+    }
+
     fn test_stream(shared: &Arc<Shared>, id: u32) -> AnyTlsStream {
         AnyTlsStream {
             session: Arc::new(Session {
@@ -1746,6 +1794,22 @@ mod tests {
             pending: Vec::new(),
             pending_input: 0,
         }
+    }
+
+    #[test]
+    fn a_partial_anytls_write_is_settle_progress() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let padding = Padding::new(b"stop=0\n").expect("parses");
+        let shared = Shared::new(Box::new(Bounded(Arc::clone(&written))), padding, false);
+        let mut stream = test_stream(&shared, 1);
+        assert!(matches!(
+            crate::proxy::LaneWrite::push(&mut stream, b"abcdef"),
+            crate::proxy::Push::Parked
+        ));
+        assert!(matches!(
+            crate::proxy::LaneWrite::settle(&mut stream),
+            crate::proxy::Settle::Advanced
+        ));
     }
 
     #[test]
