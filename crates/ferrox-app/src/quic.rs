@@ -2239,14 +2239,14 @@ fn armed_lane(sock: UdpSocket, gro: bool) -> UdpSocket {
     sock
 }
 
-/// Winsock has no per-call non-blocking send flag: a one-millisecond send timeout keeps a full
-/// buffer from parking the relay worker in the kernel.
-#[cfg(windows)]
+/// A platform without a per-call send flag gets a one-millisecond write timeout, so a full buffer
+/// cannot park the relay worker in the kernel.
+#[cfg(not(target_os = "linux"))]
 fn arm_send_timeout(sock: &UdpSocket) {
     let _ = sock.set_write_timeout(Some(Duration::from_millis(1)));
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn arm_send_timeout(_sock: &UdpSocket) {}
 
 #[cfg(target_os = "linux")]
@@ -2596,7 +2596,9 @@ const HELD_LIMIT: usize = 256;
 fn refused(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
-        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+        std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::TimedOut
     ) || error.raw_os_error() == Some(libc::ENOBUFS)
 }
 

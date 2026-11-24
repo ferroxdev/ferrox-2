@@ -385,9 +385,12 @@ impl<'a> DataBatch<'a> {
             take[at] = fit[at].min(max);
             capped[at] = frame_head(take[at], T_DATA, 0, id);
         }
+        let written = (0..included)
+            .find(|&at| take[at] < fit[at])
+            .map_or(included, |at| at + 1);
         let mut parts: [&[u8]; 5 * DATA_FRAMES_PER_WRITE] = [NO_PART; 5 * DATA_FRAMES_PER_WRITE];
         let mut pieces = 0;
-        for at in 0..included {
+        for at in 0..written {
             parts[pieces] = &capped[at];
             pieces += 1;
             let mut left = take[at];
@@ -419,7 +422,7 @@ impl<'a> DataBatch<'a> {
         let mut new_bodies = self.bodies;
         let mut new_counts = self.counts;
         let mut used = 0;
-        for at in 0..included {
+        for at in 0..written {
             let len =
                 u32::from_be_bytes([0, self.heads[at][0], self.heads[at][1], self.heads[at][2]])
                     as usize;
@@ -433,7 +436,7 @@ impl<'a> DataBatch<'a> {
             new_counts[used] = count;
             used += 1;
         }
-        for at in included..self.used {
+        for at in written..self.used {
             new_heads[used] = self.heads[at];
             new_bodies[used] = self.bodies[at];
             new_counts[used] = self.counts[at];
