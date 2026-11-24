@@ -802,12 +802,7 @@ impl Fragment {
         };
         loop {
             if READY.with(std::cell::Cell::get) && READY_WAIT.with(std::cell::Cell::get) > 0 {
-                self.piece_resume = Some((p.len() - from, segment));
-                return if from == 0 {
-                    Err(io::ErrorKind::WouldBlock.into())
-                } else {
-                    Ok(from)
-                };
+                return self.park_piece(p.len(), from, segment);
             }
             let Some(to) = self.cut(segment, from, p.len(), bound) else {
                 return match write_progress(raw, &p[from..]) {
@@ -840,12 +835,7 @@ impl Fragment {
                 self.park_after(raw, segment)?;
                 segment += 1;
                 if READY.with(std::cell::Cell::get) && READY_WAIT.with(std::cell::Cell::get) > 0 {
-                    self.piece_resume = Some((p.len() - from, segment));
-                    return if from == 0 {
-                        Err(io::ErrorKind::WouldBlock.into())
-                    } else {
-                        Ok(from)
-                    };
+                    return self.park_piece(p.len(), from, segment);
                 }
                 continue;
             }
@@ -882,6 +872,15 @@ impl Fragment {
                 self.piece_resume = None;
                 return Ok(from);
             }
+        }
+    }
+
+    fn park_piece(&mut self, len: usize, from: usize, segment: usize) -> io::Result<usize> {
+        self.piece_resume = Some((len - from, segment));
+        if from == 0 {
+            Err(io::ErrorKind::WouldBlock.into())
+        } else {
+            Ok(from)
         }
     }
 }
