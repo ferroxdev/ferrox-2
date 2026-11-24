@@ -1290,6 +1290,11 @@ impl<'a> Gather<'a> {
 
     /// Waits out a paced tail for the blocking writer: the framed relay never takes this path, so the
     /// wait costs a lane only when a caller asked for every byte before it returned.
+    fn settle_tail(shared: &Shared) -> bool {
+        let mut deadline = Instant::now() + crate::budgets::relay_stall();
+        Self::settle_blocking(shared, &mut deadline)
+    }
+
     fn settle_blocking(shared: &Shared, deadline: &mut Instant) -> bool {
         loop {
             let settled = match shared.stream.lock() {
@@ -1762,7 +1767,7 @@ impl GrpcWriter {
                 self.shared.ended.store(false, Ordering::SeqCst);
                 return;
             }
-            let _ = Gather::settle_blocking(&self.shared);
+            let _ = Gather::settle_tail(&self.shared);
             return;
         }
         if self.shared.upload_ended.load(Ordering::SeqCst) {
@@ -1774,7 +1779,7 @@ impl GrpcWriter {
             self.shared.upload_ended.store(false, Ordering::SeqCst);
             return;
         }
-        let _ = Gather::settle_blocking(&self.shared);
+        let _ = Gather::settle_tail(&self.shared);
     }
 
     /// The relay read the target and it failed: the trailer must carry the matching status, where a
@@ -1805,7 +1810,7 @@ impl GrpcWriter {
                 self.shared.ended.store(false, Ordering::SeqCst);
                 return;
             }
-            let _ = Gather::settle_blocking(&self.shared);
+            let _ = Gather::settle_tail(&self.shared);
             return;
         }
         if self.shared.upload_ended.load(Ordering::SeqCst) {
@@ -1816,7 +1821,7 @@ impl GrpcWriter {
             return;
         }
         self.shared.upload_ended.store(true, Ordering::SeqCst);
-        let _ = Gather::settle_blocking(&self.shared);
+        let _ = Gather::settle_tail(&self.shared);
     }
 
     /// `END_STREAM` costs no flow credit, but it still rides the paced tail: a full transport is drained and the same empty frame retried.
