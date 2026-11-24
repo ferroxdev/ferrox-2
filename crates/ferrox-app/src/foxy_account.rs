@@ -1464,9 +1464,15 @@ fn ask_limited_within(
             endpoint.host
         ));
     }
-    tls.write_all(&request(method, &endpoint.host_header(), url, headers, body))
-        .and_then(|()| tls.flush())
-        .map_err(|why| format!("writing {} {diagnostic}: {why}", endpoint.host))?;
+    tls.write_all(&request(
+        method,
+        &endpoint.host_header(),
+        url,
+        headers,
+        body,
+    ))
+    .and_then(|()| tls.flush())
+    .map_err(|why| format!("writing {} {diagnostic}: {why}", endpoint.host))?;
     read_reply_limited(&mut tls, DEFAULT_READ_CHUNK, max_body)
         .map_err(|why| format!("reading {} {diagnostic}: {why}", endpoint.host))
 }
@@ -1484,9 +1490,15 @@ pub(crate) fn ask_to_file(
     max_body: usize,
 ) -> Result<Reply, String> {
     let mut tls = endpoint.connect()?;
-    tls.write_all(&request(method, &endpoint.host_header(), url, headers, body))
-        .and_then(|()| tls.flush())
-        .map_err(|why| format!("writing {} {url}: {why}", endpoint.host))?;
+    tls.write_all(&request(
+        method,
+        &endpoint.host_header(),
+        url,
+        headers,
+        body,
+    ))
+    .and_then(|()| tls.flush())
+    .map_err(|why| format!("writing {} {url}: {why}", endpoint.host))?;
     let mut io = BufReader::with_capacity(1024, &mut tls);
     let reply =
         read_head(&mut io).map_err(|why| format!("reading {} {url}: {why}", endpoint.host))?;
