@@ -149,6 +149,8 @@ pub struct Fragment {
     ent: Entropy,
     count: u64,
     gathered: Option<Gathered>,
+    /// The next piece segment when a readiness wait deferred a zero-width step.
+    piece_resume: Option<(usize, usize)>,
 }
 
 /// The part of a merged hello already built but not yet accepted by the sink, so a refused write
@@ -191,6 +193,7 @@ impl Fragment {
             ent: Entropy::new(),
             count: 0,
             gathered: None,
+            piece_resume: None,
         })
     }
 
@@ -416,9 +419,47 @@ impl Fragment {
                 self.park_after(raw, segment)?;
                 from = to;
                 segment += 1;
+                if READY_WAIT.with(std::cell::Cell::get) > 0 {
+                    self.retain_hello(p, from, segment, record_len, bound);
+                    return Ok(p.len());
+                }
             }
         }
         self.finish_hello(raw, p, record_len)
+    }
+
+    /// Retain the records after a deferred park, so the next write sends them at their own spacing.
+    fn retain_hello(
+        &mut self,
+        p: &[u8],
+        mut from: usize,
+        mut segment: usize,
+        record_len: usize,
+        bound: usize,
+    ) {
+        let mut bytes = Vec::new();
+        let mut parks = Vec::new();
+        while from < record_len {
+            let Some(to) = self.cut(segment, from, record_len, bound) else {
+                bytes.extend_from_slice(&head_of(p, record_len - from));
+                bytes.extend_from_slice(&p[from..record_len]);
+                break;
+            };
+            let wait = self.delay_at(segment).pick_from(&mut self.ent);
+            bytes.extend_from_slice(&head_of(p, to - from));
+            bytes.extend_from_slice(&p[from..to]);
+            parks.push((bytes.len(), wait.unwrap_or(0)));
+            from = to;
+            segment += 1;
+        }
+        bytes.extend_from_slice(&p[record_len..]);
+        if !bytes.is_empty() {
+            self.gathered = Some(Gathered {
+                bytes,
+                at: 0,
+                parks,
+            });
+        }
     }
 
     /// A record that rode in behind the hello keeps its own write, whole or partial; a sink that
@@ -585,10 +626,45 @@ impl Fragment {
             }
             if segment + 1 < cuts.len() {
                 self.park_after(raw, segment)?;
+                if READY_WAIT.with(std::cell::Cell::get) > 0 {
+                    self.retain_sni_after(p, &cuts, segment + 1, record_len);
+                    return Ok(p.len());
+                }
             }
             from = *to;
         }
         self.finish_hello(raw, p, record_len)
+    }
+
+    /// Retain the SNI records after a deferred park, with the waits that follow each one.
+    fn retain_sni_after(
+        &mut self,
+        p: &[u8],
+        cuts: &[usize],
+        start: usize,
+        record_len: usize,
+    ) {
+        let mut bytes = Vec::new();
+        let mut parks = Vec::new();
+        let mut from = if start == 0 { HEADER } else { cuts[start - 1] };
+        for (segment, to) in cuts.iter().enumerate().skip(start) {
+            let wait = (segment + 1 < cuts.len())
+                .then(|| self.delay_at(segment).pick_from(&mut self.ent));
+            bytes.extend_from_slice(&head_of(p, to - from));
+            bytes.extend_from_slice(&p[from..*to]);
+            if let Some(wait) = wait {
+                parks.push((bytes.len(), wait.unwrap_or(0)));
+            }
+            from = *to;
+        }
+        bytes.extend_from_slice(&p[record_len..]);
+        if !bytes.is_empty() {
+            self.gathered = Some(Gathered {
+                bytes,
+                at: 0,
+                parks,
+            });
+        }
     }
 
     /// The burst a sink refused, rebuilt as one buffer: the unsent part first, then every record
@@ -718,9 +794,15 @@ impl Fragment {
             0
         };
         let mut from = 0usize;
-        let mut segment = 0usize;
+        let mut segment = match self.piece_resume.take() {
+            Some((len, segment)) if len == p.len() => segment,
+            _ => 0,
+        };
         loop {
             if READY.with(std::cell::Cell::get) && READY_WAIT.with(std::cell::Cell::get) > 0 {
+                if from == 0 {
+                    self.piece_resume = Some((p.len(), segment));
+                }
                 return Ok(from);
             }
             let Some(to) = self.cut(segment, from, p.len(), bound) else {
@@ -729,6 +811,12 @@ impl Fragment {
             if from == to {
                 self.park_after(raw, segment)?;
                 segment += 1;
+                if READY.with(std::cell::Cell::get) && READY_WAIT.with(std::cell::Cell::get) > 0 {
+                    if from == 0 {
+                        self.piece_resume = Some((p.len(), segment));
+                    }
+                    return Ok(from);
+                }
                 continue;
             }
             let written = match raw.write(&p[from..to]) {
@@ -817,6 +905,7 @@ fn flush_gathered<W: Write>(raw: &mut W, gathered: &mut Gathered) -> io::Result<
             if wait > 0 {
                 if READY.with(std::cell::Cell::get) {
                     READY_WAIT.with(|left| left.set(left.get().max(wait as u64)));
+                    return Err(io::ErrorKind::WouldBlock.into());
                 } else if !DRAINING.with(std::cell::Cell::get) {
                     #[cfg(test)]
                     SLEEPS.with(|count| count.set(count.get() + 1));
@@ -947,7 +1036,7 @@ impl Drop for DrainFlag {
 /// deadline and answers `Ok(0)` until it passes, so the lane parks on its own clock instead.
 pub fn ready_write() -> ReadyFlag {
     READY_WAIT.with(|wait| wait.set(0));
-    ReadyFlag(READY.replace(true))
+    ReadyFlag(READY.replace(true), std::marker::PhantomData)
 }
 
 /// The delay a readiness write deferred instead of sleeping, for the caller's own clock.
@@ -958,7 +1047,7 @@ pub fn take_ready_wait() -> Option<Duration> {
 
 /// Restores the previous readiness mode when the write returns.
 #[derive(Debug)]
-pub struct ReadyFlag(bool);
+pub struct ReadyFlag(bool, std::marker::PhantomData<*const ()>);
 
 impl Drop for ReadyFlag {
     fn drop(&mut self) {

@@ -188,6 +188,7 @@ impl<'a> DataBatch<'a> {
                 None => {
                     drop(credit);
                     self.refund_reserved(conn);
+                    self.used = 0;
                     return false;
                 }
             }
@@ -195,6 +196,7 @@ impl<'a> DataBatch<'a> {
             if left.is_zero() {
                 drop(credit);
                 self.refund_reserved(conn);
+                self.used = 0;
                 return false;
             }
             drop(gate);
@@ -215,6 +217,7 @@ impl<'a> DataBatch<'a> {
                 match pumped {
                     Pumped::Dead => {
                         self.refund_reserved(conn);
+                        self.used = 0;
                         return false;
                     }
                     Pumped::Yield => pump = false,
@@ -236,6 +239,7 @@ impl<'a> DataBatch<'a> {
             pump = true;
             if timed_out {
                 self.refund_reserved(conn);
+                self.used = 0;
                 return false;
             }
         }
@@ -1041,18 +1045,19 @@ impl H2StreamReader {
         &self,
         st: std::sync::MutexGuard<'a, StreamState>,
         turn: Duration,
-    ) -> (
-        std::sync::MutexGuard<'a, StreamState>,
-        std::sync::WaitTimeoutResult,
-    ) {
+    ) -> (std::sync::MutexGuard<'a, StreamState>, bool) {
         self.conn.waiting.fetch_add(1, Ordering::SeqCst);
-        let out = self
+        if self.conn.conn_credit.load(Ordering::SeqCst) > 0 {
+            self.conn.waiting.fetch_sub(1, Ordering::SeqCst);
+            return (st, false);
+        }
+        let (st, out) = self
             .stream
             .cv
             .wait_timeout(st, turn)
             .unwrap_or_else(PoisonError::into_inner);
         self.conn.waiting.fetch_sub(1, Ordering::SeqCst);
-        out
+        (st, out.timed_out())
     }
 
     /// The response status decoded for a client stream, once its head has arrived.
@@ -1250,7 +1255,8 @@ impl Read for H2StreamReader {
             // A lane step owns its thread for one poll; a body idle for the whole stall still ends.
             if crate::proxy::relay_step_owns_poll() {
                 let since = *self.idle_since.get_or_insert_with(std::time::Instant::now);
-                if since.elapsed() >= crate::budgets::relay_stall() {
+                let left = crate::budgets::relay_stall().saturating_sub(since.elapsed());
+                if left.is_zero() {
                     drop(st);
                     self.conn.forget_upload(self.id);
                     return Err(std::io::Error::other("h2 body stalled"));
@@ -1265,8 +1271,8 @@ impl Read for H2StreamReader {
                 if !st.body.is_empty() || st.read_ended() || st.dead {
                     continue;
                 }
-                let (_guard, wait) = self.wait(st, crate::budgets::RELAY_POLL);
-                if wait.timed_out() {
+                let (_guard, wait) = self.wait(st, crate::budgets::RELAY_POLL.min(left));
+                if wait {
                     return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
                 }
                 continue;
@@ -1282,10 +1288,17 @@ impl Read for H2StreamReader {
             if !st.body.is_empty() || st.read_ended() || st.dead {
                 continue;
             }
-            let (wait_for, deadline_bounded) = body_wait(crate::budgets::relay_stall());
+            let since = *self.idle_since.get_or_insert_with(std::time::Instant::now);
+            let left = crate::budgets::relay_stall().saturating_sub(since.elapsed());
+            if left.is_zero() {
+                drop(st);
+                self.conn.forget_upload(self.id);
+                return Err(std::io::Error::other("h2 body stalled"));
+            }
+            let (wait_for, deadline_bounded) = body_wait(left);
             let (next, wait) = self.wait(st, wait_for);
             st = next;
-            if wait.timed_out() {
+            if wait {
                 drop(st);
                 self.conn.forget_upload(self.id);
                 return Err(if deadline_bounded {
@@ -1367,7 +1380,8 @@ impl crate::proxy::WindowRead for H2StreamReader {
             }
             if crate::proxy::relay_step_owns_poll() {
                 let since = *self.idle_since.get_or_insert_with(std::time::Instant::now);
-                if since.elapsed() >= crate::budgets::relay_stall() {
+                let left = crate::budgets::relay_stall().saturating_sub(since.elapsed());
+                if left.is_zero() {
                     drop(st);
                     self.conn.forget_upload(self.id);
                     return Err(std::io::Error::other("h2 body stalled"));
@@ -1382,8 +1396,8 @@ impl crate::proxy::WindowRead for H2StreamReader {
                 if !st.body.is_empty() || st.read_ended() || st.dead {
                     continue;
                 }
-                let (_guard, wait) = self.wait(st, crate::budgets::RELAY_POLL);
-                if wait.timed_out() {
+                let (_guard, wait) = self.wait(st, crate::budgets::RELAY_POLL.min(left));
+                if wait {
                     return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
                 }
                 continue;
@@ -1398,9 +1412,16 @@ impl crate::proxy::WindowRead for H2StreamReader {
             if !st.body.is_empty() || st.read_ended() || st.dead {
                 continue;
             }
-            let (next, wait) = self.wait(st, crate::budgets::relay_stall());
+            let since = *self.idle_since.get_or_insert_with(std::time::Instant::now);
+            let left = crate::budgets::relay_stall().saturating_sub(since.elapsed());
+            if left.is_zero() {
+                drop(st);
+                self.conn.forget_upload(self.id);
+                return Err(std::io::Error::other("h2 body stalled"));
+            }
+            let (next, wait) = self.wait(st, left);
             st = next;
-            if wait.timed_out() {
+            if wait {
                 drop(st);
                 self.conn.forget_upload(self.id);
                 return Err(std::io::Error::other("h2 body stalled"));
@@ -2113,11 +2134,11 @@ impl H2Conn {
             let total = previous.saturating_add(n);
             if total >= batch {
                 self.replenish_connection(total);
-            } else if self.waiting.load(Ordering::SeqCst) > 0 {
-                let streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
-                for state in streams.values() {
-                    state.cv.notify_all();
-                }
+            }
+            let streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
+            for state in streams.values() {
+                let _held = state.state.lock().unwrap_or_else(PoisonError::into_inner);
+                state.cv.notify_all();
             }
         }
     }

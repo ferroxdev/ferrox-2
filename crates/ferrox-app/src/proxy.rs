@@ -23343,9 +23343,9 @@ pub(crate) fn tls_client_halves(
 pub(crate) type ServerHalves = (Box<dyn Read + Send>, Box<dyn FrameWrite + Send>);
 
 pub(crate) fn tls_server_halves(session: AnyTlsServerSession) -> Option<(ServerHalves, bool)> {
-    let driven = Drivable::transport(&session).is_some();
     let raw = session.get_ref().get_ref().try_clone().ok()?;
     let (reader, writer) = session_halves(session, raw);
+    let driven = reader.driven.is_some();
     Some(((Box::new(reader), Box::new(writer)), driven))
 }
 

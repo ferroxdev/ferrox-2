@@ -353,6 +353,11 @@ impl Drop for StreamState {
     }
 }
 
+struct Pending {
+    bytes: Vec<u8>,
+    at: usize,
+}
+
 struct Shared {
     writer: Mutex<Option<Writer>>,
     streams: Mutex<HashMap<u32, Arc<StreamState>>>,
@@ -361,7 +366,7 @@ struct Shared {
     settings_received: AtomicBool,
     peer_version: AtomicU32,
     padding: Mutex<Arc<Padding>>,
-    pending: Mutex<Option<Vec<u8>>>,
+    pending: Mutex<Option<Pending>>,
     packet_count: AtomicU32,
     send_padding: AtomicBool,
     queue_budget: Arc<QueueBudget>,
@@ -414,7 +419,10 @@ impl Shared {
     }
 
     fn queue_pending(&self, packet: Vec<u8>) {
-        *self.pending.lock().unwrap_or_else(PoisonError::into_inner) = Some(packet);
+        *self.pending.lock().unwrap_or_else(PoisonError::into_inner) = Some(Pending {
+            bytes: packet,
+            at: 0,
+        });
     }
 
     fn has_pending(&self) -> bool {
@@ -429,7 +437,7 @@ impl Shared {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
-            .map_or(0, Vec::len)
+            .map_or(0, |pending| pending.bytes.len() - pending.at)
     }
 
     fn write_packet(&self, packet: &[u8]) -> std::io::Result<()> {
@@ -517,9 +525,10 @@ impl Shared {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        let combined = pending.map(|mut pending| {
-            pending.extend_from_slice(packet);
-            pending
+        let combined = pending.map(|pending| {
+            let mut bytes = pending.bytes[pending.at..].to_vec();
+            bytes.extend_from_slice(packet);
+            bytes
         });
         let packet = combined.as_deref().unwrap_or(packet);
         if !self.send_padding.load(Ordering::Relaxed) {
@@ -822,17 +831,17 @@ impl proxy::LaneWrite for AnyTlsStream {
             self.pending = self.session.shared.encode_packet(&packet);
             self.pending_input = data.len();
         }
-        self.flush_pending()
+        self.flush_pending().0
     }
 
     fn settle(&mut self) -> proxy::Settle {
-        let before = self.pending_input + self.pending.len() + self.session.shared.pending_len();
-        match self.flush_pending() {
+        let (push, moved) = self.flush_pending();
+        match push {
             proxy::Push::Lost => return proxy::Settle::Lost,
             proxy::Push::Took(_) => return proxy::Settle::Advanced,
             proxy::Push::Parked => {}
         }
-        if self.pending_input + self.pending.len() + self.session.shared.pending_len() < before {
+        if moved {
             return proxy::Settle::Advanced;
         }
         let Ok(mut writer) = self.session.shared.writer.try_lock() else {
@@ -841,7 +850,16 @@ impl proxy::LaneWrite for AnyTlsStream {
         let Some(writer) = writer.as_mut() else {
             return proxy::Settle::Lost;
         };
-        writer.settle()
+        match writer.settle() {
+            proxy::Settle::Clear
+                if self.session.shared.pending_len() > 0
+                    || !self.pending.is_empty()
+                    || self.pending_input > 0 =>
+            {
+                proxy::Settle::Parked
+            }
+            outcome => outcome,
+        }
     }
 }
 
@@ -854,13 +872,14 @@ impl AnyTlsStream {
         packet
     }
 
-    fn flush_pending(&mut self) -> proxy::Push {
+    fn flush_pending(&mut self) -> (proxy::Push, bool) {
         let Ok(mut guard) = self.session.shared.writer.try_lock() else {
-            return proxy::Push::Parked;
+            return (proxy::Push::Parked, false);
         };
         let Some(writer) = guard.as_mut() else {
-            return proxy::Push::Lost;
+            return (proxy::Push::Lost, false);
         };
+        let mut at = 0;
         let mut bytes = self
             .session
             .shared
@@ -868,47 +887,55 @@ impl AnyTlsStream {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()
+            .map(|pending| {
+                at = pending.at;
+                pending.bytes
+            })
             .unwrap_or_default();
         if !self.pending.is_empty() {
             bytes.extend_from_slice(&self.pending);
             self.pending.clear();
         }
-        let mut complete = bytes.is_empty();
+        let start = at;
+        let mut complete = at == bytes.len();
         let mut failed = false;
+        let mut moved = false;
         if !complete {
-            match writer.write_ready(&[&bytes]) {
-                Some(Ok(n)) if n >= bytes.len() => complete = true,
-                Some(Ok(n)) if n > 0 => {
-                    bytes.drain(..n);
-                }
+            match writer.write_ready(&[&bytes[at..]]) {
+                Some(Ok(n)) if at + n >= bytes.len() => complete = true,
+                Some(Ok(n)) if n > 0 => at += n,
                 Some(Ok(_)) => {}
                 Some(Err(error)) if crate::proxy::is_timeout(&error) => {}
                 Some(Err(_)) => failed = true,
-                None => match writer.offer_slices(&[&bytes]) {
+                None => match writer.offer_slices(&[&bytes[at..]]) {
                     proxy::Accepted::All => complete = true,
                     proxy::Accepted::Full => {}
                     proxy::Accepted::Lost => failed = true,
                 },
             }
+            moved = at > start || (complete && start < bytes.len());
         }
         drop(guard);
         if complete {
             if self.pending_input == 0 {
-                return proxy::Push::Parked;
+                return (proxy::Push::Parked, moved);
             }
-            return proxy::Push::Took(std::mem::take(&mut self.pending_input));
+            return (
+                proxy::Push::Took(std::mem::take(&mut self.pending_input)),
+                moved,
+            );
         }
         if failed {
             self.session.shared.shutdown("anytls session write failed");
-            return proxy::Push::Lost;
+            return (proxy::Push::Lost, moved);
         }
         *self
             .session
             .shared
             .pending
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(bytes);
-        proxy::Push::Parked
+            .unwrap_or_else(PoisonError::into_inner) = Some(Pending { bytes, at });
+        (proxy::Push::Parked, moved)
     }
 }
 

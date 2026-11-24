@@ -1363,6 +1363,8 @@ impl Connection {
                 *until = None;
             }
         }
+        #[cfg(windows)]
+        let _mode = READY_MODE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         self.set_nonblocking(true)?;
         let _ready = ferrox_core::finalmask::ready_write();
         let mut total = 0;
@@ -1413,6 +1415,8 @@ impl Connection {
     pub(crate) fn flush_ready_outcome(&mut self) -> (usize, io::Result<()>) {
         if matches!(self, Connection::Masked(masked) if !masked.is_plain() && masked.xmc.is_none())
         {
+            #[cfg(windows)]
+            let _mode = READY_MODE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Err(error) = self.set_nonblocking(true) {
                 return (0, Err(error));
             }
@@ -2537,6 +2541,9 @@ struct StagedBinding {
 /// A bind records the private staging address it bound, so a copied staging name is never mistaken for another path's listener.
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 static STAGED_BINDINGS: std::sync::Mutex<Vec<StagedBinding>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(windows)]
+static READY_MODE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 fn register_staged(

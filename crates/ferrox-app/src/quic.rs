@@ -2987,6 +2987,8 @@ struct FragmentState {
     msg_id: u8,
     total: usize,
     next: usize,
+    /// When the first chunk left, so a pause past the reassembly ttl restarts under a new id.
+    started: Instant,
     /// The bytes the first attempt framed, so a retry finishes those chunks rather than a re-encoding.
     buf: Vec<u8>,
     /// The caller's plaintext before any mask, so a re-encoded retry still names the same message.
@@ -3095,7 +3097,9 @@ impl Gecko {
             .map_err(|_| std::io::Error::other("gecko fragment lock poisoned"))?;
         let resume = fragment
             .as_ref()
-            .filter(|state| state.key == key && state.to == to)
+            .filter(|state| {
+                state.key == key && state.to == to && state.started.elapsed() < GECKO_TTL
+            })
             .map(|state| (state.msg_id, state.total, state.next, state.buf.clone()));
         let (msg_id, total, start, source) = if let Some((msg_id, total, next, buf)) = resume {
             (msg_id, total, next, buf)
@@ -3110,6 +3114,7 @@ impl Gecko {
                 msg_id,
                 total,
                 next: 0,
+                started: Instant::now(),
                 buf: buf.to_vec(),
                 key: key.to_vec(),
                 to,

@@ -1321,6 +1321,8 @@ impl<'a> Gather<'a> {
         let mut deadline = Instant::now() + crate::budgets::relay_stall();
         loop {
             if Instant::now() >= deadline {
+                refund(shared, self.credit);
+                self.credit = 0;
                 return false;
             }
             match self.flush(shared) {

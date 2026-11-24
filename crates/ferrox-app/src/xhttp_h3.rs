@@ -23,6 +23,7 @@ const H3_FRAME_ERROR: u64 = 0x0106;
 const H3_ID_ERROR: u64 = 0x0108;
 const H3_SETTINGS_ERROR: u64 = 0x0109;
 const QPACK_ENCODER_STREAM_ERROR: u64 = 0x0201;
+const QPACK_DECODER_STREAM_ERROR: u64 = 0x0202;
 const H3_MISSING_SETTINGS: u64 = 0x010a;
 
 /// One request stream's byte transport: a served stream on the QUIC driver, or one the client
@@ -1246,8 +1247,12 @@ impl ClientStream {
         if self.owner.dead.load(Ordering::Relaxed) {
             return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
         }
-        let Ok(mut conn) = self.conn.lock() else {
-            return Err(std::io::Error::other("h3 connection lock poisoned"));
+        let mut conn = match self.conn.try_lock() {
+            Ok(conn) => conn,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(0),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(std::io::Error::other("h3 connection lock poisoned"));
+            }
         };
         if self.owner.dead.load(Ordering::Relaxed)
             || self.owner.rejected(self.id)
@@ -1844,6 +1849,7 @@ struct ControlState {
     encoder_prefix: Vec<u8>,
     encoder_checked: bool,
     decoder: Option<u64>,
+    decoder_prefix: Vec<u8>,
     skip: u64,
     /// Whether the control stream's first frame was SETTINGS, as RFC 9114 requires.
     settings: bool,
@@ -1895,6 +1901,56 @@ fn drain_stream(conn: &mut QuicheConnection, id: u64) {
             break;
         }
     }
+}
+
+/// Drain the peer's QPACK decoder stream, rejecting the zero Insert Count Increment RFC 9204
+/// makes a connection error. An empty, still-open stream is valid; a partial instruction waits.
+fn check_decoder_stream(conn: &mut QuicheConnection, control: &mut ControlState, id: u64) -> bool {
+    let mut chunk = [0u8; 1024];
+    while let Ok((n, _)) = conn.stream_recv(id, &mut chunk) {
+        if n == 0 {
+            break;
+        }
+        control.decoder_prefix.extend_from_slice(&chunk[..n]);
+    }
+    let mut at = 0;
+    while at < control.decoder_prefix.len() {
+        let first = control.decoder_prefix[at];
+        let prefix = if first & 0x80 != 0 { 7 } else { 6 };
+        let Some((value, used)) = decode_prefixed(&control.decoder_prefix, at, prefix) else {
+            break;
+        };
+        if first & 0xc0 == 0 && value == 0 {
+            return false;
+        }
+        at += used;
+    }
+    control.decoder_prefix.drain(..at);
+    true
+}
+
+/// The prefix integer at `at`, or `None` when the bytes so far do not complete it.
+fn decode_prefixed(buf: &[u8], at: usize, prefix: u8) -> Option<(u64, usize)> {
+    let mask = (1u8 << prefix) - 1;
+    let mut value = u64::from(buf[at] & mask);
+    let mut used = 1;
+    if u64::from(buf[at] & mask) < u64::from(mask) {
+        return Some((value, used));
+    }
+    let mut shift = 0u32;
+    while at + used < buf.len() {
+        let byte = buf[at + used];
+        used += 1;
+        if shift > 56 {
+            return None;
+        }
+        value = value.checked_add(u64::from(byte & 0x7f) << shift)?;
+        if byte & 0x80 == 0 {
+            return Some((value, used));
+        }
+        shift += 7;
+    }
+    None
 }
 
 enum EncoderHead {
@@ -2048,6 +2104,16 @@ fn h3_control_goaway(
                 }
             }
             if Some(id) != control.id {
+                if Some(id) == control.decoder
+                    && !check_decoder_stream(conn, control, id)
+                {
+                    let _ = conn.close(
+                        true,
+                        QPACK_DECODER_STREAM_ERROR,
+                        b"qpack decoder input",
+                    );
+                    return None;
+                }
                 match check_encoder_capacity(conn, control, id) {
                     EncoderCheck::Pending => continue,
                     EncoderCheck::Fatal => return None,

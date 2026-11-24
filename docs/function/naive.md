@@ -16,8 +16,10 @@ graph TD
     P -- yes --> O["CONNECT + Basic + Padding"]
     P -- no --> T["TLS or QUIC connect"]
     T --> O
-    O --> F["first 8 records<br/>u16 len + u8 pad"]
-    F --> R["relay both directions"]
+    O --> H{"response Padding?"}
+    H -- yes --> F["first 8 records<br/>u16 len + u8 pad"]
+    H -- no --> R["raw framing both ways"]
+    F --> R
     R --> A["Naive inbound<br/>H2 or H3"]
     A --> C["CONNECT + credential + Padding gate"]
     C --> M{"UoT magic?"}
