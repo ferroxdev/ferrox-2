@@ -1332,9 +1332,7 @@ impl<'a> Gather<'a> {
                     if !Self::settle_blocking(shared, &mut deadline) {
                         return false;
                     }
-                    if self.credit > 0
-                        && !take_window_until(shared, self.credit, Some(deadline))
-                    {
+                    if self.credit > 0 && !take_window_until(shared, self.credit, Some(deadline)) {
                         return false;
                     }
                     if let Ok(stream) = shared.stream.lock() {

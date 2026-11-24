@@ -7198,9 +7198,7 @@ mod tests {
             let (released, wake) = &*self.released;
             let mut released = released.lock().unwrap_or_else(PoisonError::into_inner);
             while !*released {
-                released = wake
-                    .wait(released)
-                    .unwrap_or_else(PoisonError::into_inner);
+                released = wake.wait(released).unwrap_or_else(PoisonError::into_inner);
             }
             Ok(0)
         }
@@ -7224,9 +7222,7 @@ mod tests {
             let (started, signal) = &*entered;
             let mut started = started.lock().unwrap_or_else(PoisonError::into_inner);
             while !*started {
-                started = signal
-                    .wait(started)
-                    .unwrap_or_else(PoisonError::into_inner);
+                started = signal.wait(started).unwrap_or_else(PoisonError::into_inner);
             }
         }
         conn.credit_connection(100, 65_535);
@@ -7241,10 +7237,7 @@ mod tests {
                 100
             );
         }
-        *released
-            .0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = true;
+        *released.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
         released.1.notify_all();
         pump.join().expect("the pump ends");
     }

@@ -924,7 +924,7 @@ impl AnyTlsStream {
                 moved,
             );
         }
-        let mut bytes = std::mem::take(&mut self.pending);
+        let bytes = std::mem::take(&mut self.pending);
         let mut at = 0;
         let (complete, failed) = Self::drain_pending(writer, &bytes, &mut at);
         moved |= at > 0 || (complete && !bytes.is_empty());

@@ -3178,9 +3178,7 @@ impl Gecko {
             .ok()
             .and_then(|state| {
                 state.as_ref().map(|state| {
-                    state.key == key
-                        && state.to == to
-                        && state.started.elapsed() < GECKO_TTL
+                    state.key == key && state.to == to && state.started.elapsed() < GECKO_TTL
                 })
             })
             .unwrap_or(false);

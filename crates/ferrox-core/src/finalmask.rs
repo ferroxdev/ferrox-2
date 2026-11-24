@@ -2237,7 +2237,11 @@ mod tests {
         assert!(take_ready_wait().is_some(), "the first segment parks");
         let second = mask.write(&mut wire, &p[first..]).expect("resumes");
         assert_eq!(second, 4, "the saved four-byte segment runs again");
-        assert_eq!(wire.widths, vec![1, 4], "the selected packet is not bypassed");
+        assert_eq!(
+            wire.widths,
+            vec![1, 4],
+            "the selected packet is not bypassed"
+        );
     }
 
     #[test]
