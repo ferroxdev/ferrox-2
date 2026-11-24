@@ -805,6 +805,7 @@ fn serve_inbounds_counted(
                             label,
                             freedom,
                             handler_stop.as_ref(),
+                            &mut wake_address,
                         );
                         if listeners > 0 {
                             if let Some(stop) = &handler_stop {
@@ -1586,7 +1587,7 @@ impl Stop {
 }
 
 /// Replace an ephemeral port with the one the listener actually bound, so a wake can reach it.
-fn swapped_port(address: &str, port: u16) -> String {
+pub(crate) fn swapped_port(address: &str, port: u16) -> String {
     match address.rsplit_once(':') {
         Some((host, _)) => format!("{host}:{port}"),
         None => address.to_owned(),
@@ -23327,10 +23328,11 @@ pub(crate) fn tls_client_halves(
 
 pub(crate) fn tls_server_halves(
     session: AnyTlsServerSession,
-) -> Option<(Box<dyn Read + Send>, Box<dyn FrameWrite + Send>)> {
+) -> Option<(Box<dyn Read + Send>, Box<dyn FrameWrite + Send>, bool)> {
+    let driven = Drivable::transport(&session).is_some();
     let raw = session.get_ref().get_ref().try_clone().ok()?;
     let (reader, writer) = session_halves(session, raw);
-    Some((Box::new(reader), Box::new(writer)))
+    Some((Box::new(reader), Box::new(writer), driven))
 }
 
 pub(crate) fn relay_anytls_stream(

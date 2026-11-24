@@ -1302,8 +1302,12 @@ impl proxy::FrameWrite for BoxedWrite {
 
     fn settle(&mut self) -> proxy::Settle {
         if !self.pending.is_empty() {
+            let before = self.pending.len();
             match self.offer_pending() {
                 proxy::Accepted::All => {}
+                proxy::Accepted::Full if self.pending.len() < before => {
+                    return proxy::Settle::Advanced;
+                }
                 proxy::Accepted::Full => return proxy::Settle::Parked,
                 proxy::Accepted::Lost => return proxy::Settle::Lost,
             }
@@ -1656,7 +1660,7 @@ fn serve_h2_connection(
         if session.alpn() != Some(b"h2") {
             return;
         }
-        let Some((reader, writer)) = proxy::tls_server_halves(session) else {
+        let Some((reader, writer, _driven)) = proxy::tls_server_halves(session) else {
             return;
         };
         (reader, writer)
@@ -2320,11 +2324,14 @@ impl NaiveOut {
     }
 
     fn connect_h3(self: &Arc<Self>, deadline: Instant) -> Option<Arc<H3Client>> {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        let server = proxy::resolve_outbound(&self.address, self.port)?;
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return None;
         }
-        let server = proxy::resolve_outbound(&self.address, self.port)?;
         let name = if self.tls.server_name.is_empty() {
             &self.address
         } else {
@@ -2376,7 +2383,7 @@ impl NaiveOut {
                 }
                 Err(H3OpenError::Full) => {
                     fill = false;
-                    skip = None;
+                    skip = Some(client);
                     let left = deadline.saturating_duration_since(Instant::now());
                     if left.is_zero() {
                         return None;
@@ -3029,7 +3036,7 @@ fn tcp_start(
     freedom: bool,
     halted: Arc<AtomicBool>,
     stop: Option<Arc<proxy::Stop>>,
-) -> Option<Start> {
+) -> Option<(Start, String)> {
     let target = match crate::conn::parse_target(address) {
         Ok(target) => target,
         Err(error) => {
@@ -3044,30 +3051,35 @@ fn tcp_start(
             return None;
         }
     };
-    Some(Box::new(move |exit, gate| {
-        if !gate.wait() {
-            return;
-        }
-        for stream in listener.incoming() {
-            if halted.load(Ordering::SeqCst) {
-                break;
+    let bound = listener.local_addr().ok()?;
+    let wake = proxy::swapped_port(address, bound.port());
+    Some((
+        Box::new(move |exit, gate| {
+            if !gate.wait() {
+                return;
             }
-            let Ok(stream) = stream else {
-                continue;
-            };
-            let users = Arc::clone(&users);
-            let identity = identity.clone();
-            let session = stop.as_ref().and_then(|stop| stop.track_session(&stream));
-            let _ = std::thread::Builder::new()
-                .name("ferrox-naive-h2".to_owned())
-                .spawn(move || {
-                    let _session = session;
-                    serve_h2_connection(stream, identity, users, freedom);
-                });
-        }
-        drop(listener);
-        drop(exit);
-    }))
+            for stream in listener.incoming() {
+                if halted.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Ok(stream) = stream else {
+                    continue;
+                };
+                let users = Arc::clone(&users);
+                let identity = identity.clone();
+                let session = stop.as_ref().and_then(|stop| stop.track_session(&stream));
+                let _ = std::thread::Builder::new()
+                    .name("ferrox-naive-h2".to_owned())
+                    .spawn(move || {
+                        let _session = session;
+                        serve_h2_connection(stream, identity, users, freedom);
+                    });
+            }
+            drop(listener);
+            drop(exit);
+        }),
+        wake,
+    ))
 }
 
 fn quic_start(
@@ -3114,6 +3126,7 @@ pub(crate) fn serve_inbound(
     path: &str,
     freedom: bool,
     stop: Option<&Arc<proxy::Stop>>,
+    wake: &mut String,
 ) -> usize {
     let (users, (tcp, mut udp), congestion) = match inbound_config(inbound) {
         Ok(config) => config,
@@ -3159,7 +3172,7 @@ pub(crate) fn serve_inbound(
         .map_or_else(|| Arc::new(AtomicBool::new(false)), |stop| stop.shared());
     let mut starts: Vec<Start> = Vec::new();
     if tcp {
-        let Some(start) = tcp_start(
+        let Some((start, bound)) = tcp_start(
             address,
             path,
             Arc::clone(&users),
@@ -3170,6 +3183,7 @@ pub(crate) fn serve_inbound(
         ) else {
             return 0;
         };
+        wake.clone_from(&bound);
         starts.push(start);
     }
     if udp {
@@ -3255,6 +3269,38 @@ mod tests {
     }
 
     impl proxy::LaneWrite for Sink {}
+
+    struct Trickle;
+
+    impl Write for Trickle {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl proxy::FrameWrite for Trickle {
+        fn write_slices(&mut self, _parts: &[&[u8]]) -> bool {
+            false
+        }
+
+        fn write_ready(&mut self, parts: &[&[u8]]) -> Option<std::io::Result<usize>> {
+            Some(Ok(parts[0].len().min(3)))
+        }
+    }
+
+    #[test]
+    fn a_short_h2_buffer_drain_reports_progress() {
+        let mut write = BoxedWrite::new(Box::new(Trickle));
+        write.pending = b"abcdef".to_vec();
+        assert!(matches!(write.settle(), proxy::Settle::Advanced));
+        assert_eq!(write.pending, b"def");
+        assert!(matches!(write.settle(), proxy::Settle::Clear));
+        assert!(write.pending.is_empty());
+    }
 
     #[test]
     fn a_staged_listener_does_not_close_the_shared_stop() {

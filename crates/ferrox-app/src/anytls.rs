@@ -1181,22 +1181,22 @@ fn serve_connection(
         return;
     }
     let bounded_read = tls.is_some();
-    let (mut reader, writer): (Reader, Writer) = if let Some(identity) = tls {
+    let (mut reader, writer, driven): (Reader, Writer, bool) = if let Some(identity) = tls {
         let Ok(mut session) = ferrox_core::tls::accept(identity.as_ref(), stream) else {
             return;
         };
         if session.handshake().is_err() {
             return;
         }
-        let Some(halves) = proxy::tls_server_halves(session) else {
+        let Some((reader, writer, driven)) = proxy::tls_server_halves(session) else {
             return;
         };
-        halves
+        (reader, writer, driven)
     } else {
         let Ok(writer) = stream.try_clone() else {
             return;
         };
-        (Box::new(stream), Box::new(writer))
+        (Box::new(stream), Box::new(writer), false)
     };
     let left = deadline.saturating_duration_since(Instant::now());
     if raw
@@ -1233,7 +1233,12 @@ fn serve_connection(
             left -= take;
         }
     }
-    let timeout = bounded_read.then_some(crate::budgets::RELAY_POLL);
+    let idle = if driven {
+        crate::budgets::SESSION_IDLE_POLL
+    } else {
+        crate::budgets::RELAY_POLL
+    };
+    let timeout = bounded_read.then_some(idle);
     if raw.set_read_timeout(timeout).is_err() {
         return;
     }
