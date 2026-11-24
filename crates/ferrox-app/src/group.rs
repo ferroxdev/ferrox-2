@@ -220,7 +220,7 @@ impl Group {
     /// tag names.
     pub(crate) fn resolve<'a>(
         &'a self,
-        route: &'a RouteShared,
+        route: &RouteShared,
         network: Network,
     ) -> Option<(Cow<'a, str>, Outbound)> {
         self.resolve_with(route, network, &mut ResolvedMembers::default(), None)
@@ -239,7 +239,7 @@ impl Group {
 
     fn resolve_with<'a>(
         &'a self,
-        route: &'a RouteShared,
+        route: &RouteShared,
         network: Network,
         resolved: &mut ResolvedMembers,
         readings: Option<&HashMap<String, Reading>>,
@@ -256,7 +256,7 @@ impl Group {
 
     fn pick<'a>(
         &'a self,
-        route: &'a RouteShared,
+        route: &RouteShared,
         network: Network,
         resolved: &mut ResolvedMembers,
         readings: Option<&HashMap<String, Reading>>,
@@ -425,7 +425,7 @@ fn collect_leaves(
 /// walk can reach twice, so it is the only answer worth sharing; a selector names one member and is
 /// walked once.
 fn resolve_member<'a>(
-    route: &'a RouteShared,
+    route: &RouteShared,
     tag: &'a str,
     network: Network,
     resolved: &mut ResolvedMembers,
@@ -678,13 +678,11 @@ pub(crate) fn spawn(
 }
 
 impl Group {
-    /// The bound group's route, for the dial seams that hold only the outbound. The tag is owned:
-    /// the only route this seam can reach is a `Weak::upgrade`, which lives no longer than the call,
-    /// and holding the strong `Arc` in the group would close the `RouteShared` cycle.
-    pub(crate) fn resolve_bound(&self, network: Network) -> Option<(String, Outbound)> {
+    /// The bound group's route, for the dial seams that hold only the outbound. The tag borrows the
+    /// group's members, not the route, so the route's `Weak::upgrade` lives only as long as the call.
+    pub(crate) fn resolve_bound(&self, network: Network) -> Option<(Cow<'_, str>, Outbound)> {
         let route = self.route()?;
         self.resolve(&route, network)
-            .map(|(leaf, out)| (leaf.into_owned(), out))
     }
 
     pub(crate) fn route_handle(&self) -> Option<Arc<RouteShared>> {

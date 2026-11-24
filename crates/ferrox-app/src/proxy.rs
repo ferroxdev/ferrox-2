@@ -29398,7 +29398,7 @@ fn front_group_lane(out: &Outbound) -> Option<(Outbound, String)> {
     if let Some(route) = group.route_handle() {
         route.carry_tag_settings(&leaf);
     }
-    Some((member, leaf))
+    Some((member, leaf.into_owned()))
 }
 
 /// One tunnel request from either front, already resolved to its lane: the Foxy lane grants after its tunnel opens.
@@ -29438,7 +29438,7 @@ fn serve_connect_at(
             asked,
             front,
             prefix,
-            Some(&leaf),
+            Some(leaf.as_ref()),
             facts,
             depth + 1,
         );
@@ -31509,7 +31509,7 @@ fn serve_socks_udp_lane(mut client: Connection, out: &Outbound) {
         (
             Some(member),
             Some(LaneStart {
-                tag: Some(leaf),
+                tag: Some(leaf.into_owned()),
                 source,
                 sockopts,
                 strategy,
@@ -31596,7 +31596,7 @@ fn serve_udp_lane_with(
         let (source, sockopts, strategy) = group
             .route_handle()
             .map_or((None, None, None), |route| route.tag_dial_settings(&leaf));
-        let _tag = OutboundTag::enter(Some(&leaf));
+        let _tag = OutboundTag::enter(Some(leaf.as_ref()));
         serve_udp_lane_with(
             relay,
             &member,
@@ -31947,12 +31947,16 @@ fn serve_socks_udp_split(
                             .route_handle()
                             .map_or((None, None, None), |route| route.tag_dial_settings(&leaf));
                         let start = LaneStart {
-                            tag: Some(leaf.clone()),
+                            tag: Some(leaf.to_string()),
                             source,
                             sockopts,
                             strategy,
                         };
-                        (Some(member), Some((leaf, revision)), Some(start))
+                        (
+                            Some(member),
+                            Some((leaf.into_owned(), revision)),
+                            Some(start),
+                        )
                     }
                     _ => {
                         if let Some(tag) = key.as_deref() {
@@ -85138,6 +85142,36 @@ end
             fallback.allocs, takeover.allocs,
             "a fallback dial allocated {} times where the takeover dial allocated {} for the same nested tag",
             fallback.allocs, takeover.allocs
+        );
+    }
+
+    /// A bound lookup borrows a flat member's tag: the route handle is a `Weak::upgrade` that lives
+    /// only for the call, and the tag comes from the group's own members.
+    #[test]
+    fn a_bound_lookup_of_a_flat_member_allocates_nothing() {
+        let shared = group_route(
+            r#"{"outbounds":[
+                {"tag":"a","protocol":"freedom"},
+                {"tag":"b","protocol":"freedom"},
+                {"tag":"pick","type":"selector","outbounds":["a","b"],"default":"a"}
+            ],"routing":{}}"#,
+        );
+        let group = group_of(&shared, "pick");
+        let lookup = || {
+            group
+                .resolve_bound(crate::router::Network::Tcp)
+                .expect("resolves")
+        };
+        let (warm_up, _) = ferrox_core::alloc_count::measure(lookup);
+        assert_eq!(warm_up.0, "a");
+        let (leaf, counts) = ferrox_core::alloc_count::measure(lookup);
+        assert_eq!(leaf, "a");
+        assert_eq!(
+            (counts.allocs, counts.bytes),
+            (0, 0),
+            "a bound lookup allocated {} times and {} bytes for a tag the group already holds",
+            counts.allocs,
+            counts.bytes
         );
     }
 
