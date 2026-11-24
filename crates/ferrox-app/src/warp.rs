@@ -3792,7 +3792,6 @@ pub(crate) fn one_tap(
             Some(file.clone())
         } else {
             spec.key_paths()
-                .ok()
                 .and_then(|paths| spec.gool_path(&paths).ok())
         };
         if let Some(inner_path) =
