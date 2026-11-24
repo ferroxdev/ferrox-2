@@ -1267,7 +1267,7 @@ warp team-registration-fields 8 warp::tests::a_team_registration_posts_the_manag
 warp gateway-ports 2 warp::tests::only_http_and_https_use_the_gateway
 warp gateway-connect-status 200 warp::tests::a_connect_status_line_is_read_not_guessed
 warp gateway-proxy-key gatewayProxy warp::tests::a_team_identity_keeps_the_gateway_across_a_save
-warp syscalls-per-registration-record UNBLESSED scripts/count-ops.sh
+warp syscalls-per-registration-record UNBLESSED no syscall checker
 warp copies-per-registration-record UNBLESSED no copy checker yet
 warp seconds-per-registration UNBLESSED CI bench.yml (no WARP registration cell)
 warp mim-inner-datagram-v4 1252 ferrox-app-warp::tests::the_mim_inner_budget_subtracts_the_headers_and_the_masque_overhead

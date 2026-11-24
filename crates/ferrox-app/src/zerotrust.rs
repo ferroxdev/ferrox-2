@@ -536,24 +536,49 @@ fn normalize_path(url: &str) -> String {
     if !path.starts_with('/') {
         return url.to_owned();
     }
-    let trailing = path.ends_with('/') || path.ends_with("/.") || path.ends_with("/..");
-    let mut segments: Vec<&str> = Vec::new();
-    for segment in path.split('/') {
-        match segment {
-            "" | "." => {}
-            ".." => {
-                segments.pop();
-            }
-            other => segments.push(other),
-        }
-    }
-    let mut out = format!("{scheme}://{authority}/");
-    out.push_str(&segments.join("/"));
-    if trailing && !out.ends_with('/') {
-        out.push('/');
-    }
+    let mut out = format!("{scheme}://{authority}{}", remove_dot_segments(path));
     out.push_str(suffix);
     out
+}
+
+fn remove_dot_segments(path: &str) -> String {
+    let mut input = path;
+    let mut out = String::with_capacity(path.len());
+    while !input.is_empty() {
+        if let Some(rest) = input.strip_prefix("../") {
+            input = rest;
+        } else if let Some(rest) = input.strip_prefix("./") {
+            input = rest;
+        } else if input.starts_with("/./") {
+            input = &input[2..];
+        } else if input == "/." {
+            input = "/";
+        } else if input.starts_with("/../") {
+            input = &input[3..];
+            pop_segment(&mut out);
+        } else if input == "/.." {
+            input = "/";
+            pop_segment(&mut out);
+        } else if input == "." || input == ".." {
+            input = "";
+        } else {
+            let start = if input.starts_with('/') { 1 } else { 0 };
+            let end = input[start..]
+                .find('/')
+                .map_or(input.len(), |at| start + at);
+            out.push_str(&input[..end]);
+            input = &input[end..];
+        }
+    }
+    out
+}
+
+fn pop_segment(out: &mut String) {
+    if let Some(at) = out.rfind('/') {
+        out.truncate(at);
+    } else {
+        out.clear();
+    }
 }
 
 fn resolve_redirect(current: &str, location: &str) -> Result<String, String> {
@@ -616,6 +641,7 @@ struct Page {
 }
 
 impl Session {
+    #[cfg(test)]
     fn new() -> Self {
         Self {
             cookies: Vec::new(),
@@ -1046,8 +1072,12 @@ pub(crate) fn https_exchange(
 ) -> Result<Reply, String> {
     let (origin, target) =
         https_target(url).ok_or_else(|| format!("warp access: `{url}` is not an https URL"))?;
-    let endpoint = Endpoint::parse(&origin, crate::quic::system_roots())
+    let authority = origin.strip_prefix("https://").unwrap_or(&origin);
+    let mut endpoint = Endpoint::parse(&origin, crate::quic::system_roots())
         .ok_or_else(|| format!("warp access: `{url}` is not an https URL"))?;
+    if endpoint.port != 443 {
+        endpoint.host_header = Some(authority.to_owned());
+    }
     crate::foxy_account::ask_within(
         &endpoint,
         method,
@@ -1072,6 +1102,7 @@ pub(crate) fn resolve_token(
             Ok(cached) => cached,
             Err(poisoned) => poisoned.into_inner(),
         };
+        let now = now();
         if let Some((team, token)) = cached.as_ref() {
             if *team == settings.team && jwt_expiry(token).is_some_and(|expiry| now < expiry) {
                 return Ok(token.clone());
@@ -1204,6 +1235,13 @@ mod tests {
                 "/warp".to_owned()
             ))
         );
+        assert_eq!(
+            https_target("https://acme.cloudflareaccess.com:8443/warp"),
+            Some((
+                "https://acme.cloudflareaccess.com:8443".to_owned(),
+                "/warp".to_owned()
+            ))
+        );
         assert_eq!(https_target("http://acme.cloudflareaccess.com"), None);
     }
 
@@ -1232,6 +1270,14 @@ mod tests {
             )
             .as_deref(),
             Some("https://acme.cloudflareaccess.com/cdn-cgi/access/verify?nonce=abc")
+        );
+        assert_eq!(
+            resolve_url(
+                "https://acme.cloudflareaccess.com/cdn-cgi/access/login/start",
+                "/cdn-cgi/access//verify",
+            )
+            .as_deref(),
+            Some("https://acme.cloudflareaccess.com/cdn-cgi/access//verify")
         );
     }
 

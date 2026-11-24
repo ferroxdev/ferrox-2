@@ -11,6 +11,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(20);
+const ASK_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const USER_AGENT: &str = "MozillaVPN/2.35.0 (sys:linux; iap:true)";
 pub(crate) const JSON_ACCEPT: &str = "application/json";
 const MAX_HEAD: usize = 16 * 1024;
@@ -1317,10 +1318,10 @@ pub(crate) fn ask(
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> Result<Reply, String> {
-    ask_limited(endpoint, method, url, headers, body, MAX_BODY)
+    ask_limited(endpoint, method, url, headers, body, MAX_BODY, ASK_TIMEOUT)
 }
 
-/// One request whose declared body may exceed the page-sized default.
+/// One request whose declared body may exceed the page-sized default, bounded by an absolute budget.
 pub(crate) fn ask_limited(
     endpoint: &Endpoint,
     method: &str,
@@ -1328,13 +1329,9 @@ pub(crate) fn ask_limited(
     headers: &[(&str, &str)],
     body: &[u8],
     max_body: usize,
+    budget: Duration,
 ) -> Result<Reply, String> {
-    let mut tls = endpoint.connect()?;
-    tls.write_all(&request(method, endpoint.host_header(), url, headers, body))
-        .and_then(|()| tls.flush())
-        .map_err(|why| format!("writing {} {url}: {why}", endpoint.host))?;
-    read_reply_limited(&mut tls, DEFAULT_READ_CHUNK, max_body)
-        .map_err(|why| format!("reading {} {url}: {why}", endpoint.host))
+    ask_limited_within(endpoint, method, url, headers, body, max_body, budget)
 }
 
 /// One request bounded by an absolute deadline, so a peer that drips its answer cannot hold the caller past its budget.
@@ -1344,6 +1341,18 @@ pub(crate) fn ask_within(
     url: &str,
     headers: &[(&str, &str)],
     body: &[u8],
+    budget: Duration,
+) -> Result<Reply, String> {
+    ask_limited_within(endpoint, method, url, headers, body, MAX_BODY, budget)
+}
+
+fn ask_limited_within(
+    endpoint: &Endpoint,
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    max_body: usize,
     budget: Duration,
 ) -> Result<Reply, String> {
     let deadline = Instant::now() + budget;
@@ -1365,7 +1374,7 @@ pub(crate) fn ask_within(
         tls: &mut tls,
         deadline,
     };
-    read_reply_limited(&mut io, DEFAULT_READ_CHUNK, MAX_BODY)
+    read_reply_limited(&mut io, DEFAULT_READ_CHUNK, max_body)
         .map_err(|why| format!("reading {} {url}: {why}", endpoint.host))
 }
 

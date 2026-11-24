@@ -10518,6 +10518,8 @@ fn fetch_osl_resumable(
 
 /// The largest upgrade package this lane will buffer in one download.
 const MAX_UPGRADE_BYTES: usize = 128 * 1024 * 1024;
+/// The whole upgrade download, including a peer that drips informational heads.
+const UPGRADE_TIMEOUT: Duration = Duration::from_secs(300);
 /// The file `UpgradeDownloadURLs` publishes once a complete package is downloaded.
 const UPGRADE_FILENAME: &str = "upgrade";
 
@@ -10640,6 +10642,7 @@ fn fetch_upgrade(
         &transfer_headers(root),
         &[],
         MAX_UPGRADE_BYTES,
+        UPGRADE_TIMEOUT,
     )?;
     if reply.status != 200 {
         return Err(format!("psiphon: {}: HTTP {}", root.url, reply.status));
@@ -10657,6 +10660,8 @@ fn fetch_upgrade(
 }
 
 const FEEDBACK_MAX_BODY: usize = 1024 * 1024;
+/// The whole feedback upload, including a peer that drips informational heads.
+const FEEDBACK_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Encrypt diagnostics with the configured RSA key and PUT them to the first upload root that accepts them.
 pub(crate) fn feedback(
@@ -10722,6 +10727,7 @@ pub(crate) fn feedback(
             &headers,
             &body,
             FEEDBACK_MAX_BODY,
+            FEEDBACK_TIMEOUT,
         ) {
             Ok(reply) if reply.status == 200 => return Ok(()),
             Ok(reply) => last = format!("psiphon: {}: HTTP {}", root.url, reply.status),

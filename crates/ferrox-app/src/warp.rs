@@ -2759,7 +2759,7 @@ impl WarpOut {
             gateway_for(identity.gateway.as_deref(), spec.gateway)
         } else if spec.gateway && identity.gateway.is_some() {
             eprintln!(
-                "warp: `gateway: true` needs the MASQUE half; http and https go straight through the tunnel"
+                "warp: `gateway: true` needs a MASQUE carrier; http and https go straight through the tunnel"
             );
             None
         } else {
@@ -2905,14 +2905,13 @@ impl WarpOut {
             self.serve_lane(client, asked, prefix);
             return;
         };
-        let direct = self.lane();
         let deadline = Instant::now() + GATEWAY_PROBE_TIMEOUT;
         let Some((local, tunnel)) = crate::reverse::loopback_pair() else {
-            self.serve_on(direct, client, asked, prefix);
+            self.serve_lane(client, asked, prefix);
             return;
         };
         if !self.has_masque_carrier() {
-            self.serve_on(direct, client, asked, prefix);
+            self.serve_lane(client, asked, prefix);
             return;
         }
         self.serve_gateway(
@@ -2923,11 +2922,11 @@ impl WarpOut {
         let budget = deadline.saturating_duration_since(Instant::now());
         if budget.is_zero() {
             gateway.retire("the gateway did not open within the probe budget");
-            self.serve_on(direct, client, asked, prefix);
+            self.serve_lane(client, asked, prefix);
             return;
         }
         if !gateway.answers(asked) {
-            self.serve_on(direct, client, asked, prefix);
+            self.serve_lane(client, asked, prefix);
             return;
         }
         let answered = local.set_write_timeout(Some(budget)).and_then(|()| {
@@ -2939,13 +2938,13 @@ impl WarpOut {
             Ok(head) => head,
             Err(reason) => {
                 gateway.retire(&reason.to_string());
-                self.serve_on(direct, client, asked, prefix);
+                self.serve_lane(client, asked, prefix);
                 return;
             }
         };
         if !accepted {
             gateway.retire("the gateway refused the CONNECT");
-            self.serve_on(direct, client, asked, prefix);
+            self.serve_lane(client, asked, prefix);
             return;
         }
         let _ = local.set_read_timeout(None);
