@@ -2144,9 +2144,7 @@ mod tests {
     #[test]
     fn a_csrf_token_does_not_hide_the_enrollment_token() {
         let token = jwt("{\"exp\":4102444800}");
-        let page = format!(
-            "<input name=\"csrf_token\" value=\"not-a-jwt\"><meta token={token}>"
-        );
+        let page = format!("<input name=\"csrf_token\" value=\"not-a-jwt\"><meta token={token}>");
         assert_eq!(extract_jwt_from_html(&page), Some(token));
     }
 
