@@ -2,4 +2,6 @@
 #
 # This branch exists only to measure three probes against the main line, so it
 # lists those three rows and nothing else: the report finishes inside the job.
-carrier-xhttp  xhttp::tests::the_chunk_line_costs_one_walk  xhttp::tests::xhttp_line_probe
+engine-config  json::tests::the_clean_strip_costs_no_walk  ferrox_app::json::tests::the_clean_strip_costs_no_walk
+engine-config  json::tests::the_comment_strip_costs_one_walk  ferrox_app::json::tests::the_comment_strip_costs_one_walk
+engine-selector  proxy::tests::a_selector_dial_costs_the_choice  ferrox_app::proxy::tests::a_selector_dial_costs_the_choice
