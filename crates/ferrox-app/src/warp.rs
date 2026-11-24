@@ -1639,12 +1639,16 @@ impl Identity {
             })
         });
         let masque = masque.transpose()?;
-        let gateway = value
-            .get("gatewayProxy")
-            .and_then(crate::json::Json::as_str)
-            .map(str::trim)
-            .filter(|proxy| !proxy.is_empty())
-            .map(str::to_owned);
+        let gateway = if team.is_some() {
+            value
+                .get("gatewayProxy")
+                .and_then(crate::json::Json::as_str)
+                .map(str::trim)
+                .filter(|proxy| !proxy.is_empty())
+                .map(str::to_owned)
+        } else {
+            None
+        };
         Ok(Self {
             device_id,
             token,
@@ -2537,6 +2541,12 @@ fn read_connect_head(
                     "the gateway answered with an invalid CONNECT status",
                 ));
             };
+            if status == 101 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "the gateway switched protocols instead of answering the CONNECT",
+                ));
+            }
             if (100..200).contains(&status) {
                 head.drain(..at);
                 continue;
@@ -3775,6 +3785,27 @@ pub(crate) fn one_tap(
         team: team.cloned(),
         gateway,
     };
+    if !resumed && matches!(mode, Mode::Gool | Mode::GoolClassic) {
+        let inner_path = if spec.gool.inline.is_some() {
+            Some(PathBuf::from("<inline gool identity>"))
+        } else if let Some(file) = &spec.gool.identity_file {
+            Some(file.clone())
+        } else {
+            spec.key_paths()
+                .ok()
+                .and_then(|paths| spec.gool_path(&paths).ok())
+        };
+        if let Some(inner_path) =
+            inner_path.filter(|inner_path| inner_path.is_file() || spec.gool.inline.is_some())
+        {
+            let inner = spec.gool_identity_in(true)?;
+            ensure_saved_team(
+                team.map(|team| team.team.as_str()),
+                inner.team.as_deref(),
+                &inner_path,
+            )?;
+        }
+    }
     if !resumed {
         let identity = register(&spec, !matches!(mode, Mode::WireGuard | Mode::GoolClassic))?;
         identity.save(&path)?;
@@ -6319,6 +6350,21 @@ mod tests {
         let mut personal = String::new();
         crate::json::write(&sample_identity().to_json(), &mut personal);
         assert!(!personal.contains("gatewayProxy"));
+    }
+
+    #[test]
+    fn a_personal_identity_ignores_a_gateway_proxy_on_load() {
+        let mut identity = sample_identity();
+        identity.gateway = Some("192.0.2.7:8080".to_owned());
+        let mut value = identity.to_json();
+        if let crate::json::Json::Obj(pairs) = &mut value {
+            pairs.push((
+                "gatewayProxy".to_owned(),
+                crate::json::Json::Str("192.0.2.7:8080".to_owned()),
+            ));
+        }
+        let back = Identity::from_json(&value).expect("an identity");
+        assert!(back.gateway.is_none());
     }
 
     #[test]

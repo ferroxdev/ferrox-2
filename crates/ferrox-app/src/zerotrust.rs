@@ -455,7 +455,10 @@ fn url_host(url: &str) -> Option<&str> {
 
 fn url_path(url: &str) -> &str {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let start = rest.find('/').unwrap_or(rest.len());
+    let start = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    if !rest[start..].starts_with('/') {
+        return "/";
+    }
     let path = rest[start..].split(['?', '#']).next().unwrap_or("");
     if path.is_empty() {
         "/"
@@ -524,14 +527,18 @@ fn http_date(value: &str) -> Option<u64> {
         ),
         _ => return None,
     };
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    if !(1601..=9999).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
     let (hour, minute, second) = parse_clock(clock)?;
     let seconds = days_from_civil(year, month, day)
         .checked_mul(86_400)?
         .checked_add(i64::from(hour * 3600 + minute * 60 + second))?;
-    u64::try_from(seconds).ok()
+    if seconds < 0 {
+        Some(0)
+    } else {
+        u64::try_from(seconds).ok()
+    }
 }
 
 fn parse_clock(clock: &str) -> Option<(u32, u32, u32)> {
@@ -883,6 +890,22 @@ impl Session {
         }
     }
 
+    fn record_token(&self, current: &str, reply: &Reply, token: &mut Option<String>) {
+        if !self.trusts(current) {
+            return;
+        }
+        let Some(candidate) = issued_token(reply) else {
+            return;
+        };
+        let now = now();
+        if token.as_deref().is_some_and(|held| !jwt_expired(held, now)) {
+            return;
+        }
+        if !jwt_expired(&candidate, now) {
+            *token = Some(candidate);
+        }
+    }
+
     fn get(
         &mut self,
         url: &str,
@@ -893,9 +916,7 @@ impl Session {
         let mut token = None;
         for _ in 0..=MAX_REDIRECTS {
             let reply = self.exchange("GET", &current, headers, &[], exchange)?;
-            if token.is_none() && self.trusts(&current) {
-                token = issued_token(&reply);
-            }
+            self.record_token(&current, &reply, &mut token);
             let location = if is_redirect(reply.status) {
                 reply.header("Location").map(str::to_owned)
             } else {
@@ -931,9 +952,7 @@ impl Session {
                 }
                 None => self.exchange("GET", &current, &[], &[], exchange)?,
             };
-            if token.is_none() && self.trusts(&current) {
-                token = issued_token(&reply);
-            }
+            self.record_token(&current, &reply, &mut token);
             let location = if is_redirect(reply.status) {
                 reply.header("Location").map(str::to_owned)
             } else {
@@ -1387,6 +1406,15 @@ mod tests {
     }
 
     #[test]
+    fn a_query_slash_is_not_a_path() {
+        assert_eq!(url_path("https://host?next=/access/start"), "/");
+        assert_eq!(
+            resolve_url("https://host?next=/access/start", "verify").as_deref(),
+            Some("https://host/verify")
+        );
+    }
+
+    #[test]
     fn a_redirect_location_keeps_its_query_entities() {
         assert_eq!(
             resolve_url(
@@ -1552,6 +1580,11 @@ mod tests {
         assert_eq!(http_date("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
         assert_eq!(http_date("Thursday, 01-Jan-70 00:00:00 GMT"), Some(0));
         assert_eq!(http_date("Thu Jan  1 00:00:00 1970"), Some(0));
+        assert_eq!(http_date("Fri, 01 Jan 1960 00:00:00 GMT"), Some(0));
+        assert_eq!(
+            http_date("Thu, 01 Jan 999999999999999999 00:00:00 GMT"),
+            None
+        );
     }
 
     #[test]
@@ -1623,6 +1656,47 @@ mod tests {
             .expect("an off-origin page");
         assert!(page.token.is_none());
         assert!(session.cookies.is_empty());
+    }
+
+    #[test]
+    fn an_expired_stored_assertion_is_replaced_by_a_live_one() {
+        let expired = jwt("{\"exp\":1}");
+        let live = jwt("{\"exp\":4102444800}");
+        let mut session = Session::for_origin("https://acme.cloudflareaccess.com");
+        let page = session
+            .get(
+                "https://acme.cloudflareaccess.com/start",
+                &[],
+                &|_, url, _, _| {
+                    if url.ends_with("/start") {
+                        Ok(reply(
+                            302,
+                            vec![
+                                (
+                                    "Location".to_owned(),
+                                    "https://acme.cloudflareaccess.com/next".to_owned(),
+                                ),
+                                (
+                                    "Set-Cookie".to_owned(),
+                                    format!("CF_Authorization={expired}; Path=/; Secure"),
+                                ),
+                            ],
+                            "",
+                        ))
+                    } else {
+                        Ok(reply(
+                            200,
+                            vec![(
+                                "Set-Cookie".to_owned(),
+                                format!("CF_Authorization={live}; Path=/; Secure"),
+                            )],
+                            "",
+                        ))
+                    }
+                },
+            )
+            .expect("a followed redirect");
+        assert_eq!(page.token.as_deref(), Some(live.as_str()));
     }
 
     #[test]
@@ -2178,6 +2252,56 @@ mod tests {
         )
         .expect("a code after retries");
         assert_eq!(got, token);
+        assert_eq!(prompts, 3);
+        assert_eq!(posts.get(), 3);
+    }
+
+    #[test]
+    fn a_code_rejected_three_times_is_an_error() {
+        let settings = TeamSettings {
+            team: "acme".to_owned(),
+            email: Some("user@example.com".to_owned()),
+            ..TeamSettings::default()
+        };
+        let posts = std::cell::Cell::new(0);
+        let mut prompts = 0;
+        let error = sign_in(
+            &settings,
+            now(),
+            &|method, url, _headers, _body| {
+                if method == "GET" && url.ends_with("/warp") {
+                    return Ok(reply(
+                        200,
+                        Vec::new(),
+                        "<form action=\"https://acme.cloudflareaccess.com/cdn-cgi/access/verify\"><input id=\"totp-form\"></form>",
+                    ));
+                }
+                if method == "POST" && url.ends_with("/verify") {
+                    return Ok(reply(
+                        302,
+                        vec![(
+                            "Location".to_owned(),
+                            "https://acme.cloudflareaccess.com/verify?nonce=abc".to_owned(),
+                        )],
+                        "",
+                    ));
+                }
+                if method == "GET" && url.contains("nonce=abc") {
+                    return Ok(reply(200, Vec::new(), ""));
+                }
+                if method == "POST" && url.ends_with("/cdn-cgi/access/callback") {
+                    posts.set(posts.get() + 1);
+                    return Ok(reply(403, Vec::new(), "no"));
+                }
+                Err(format!("unexpected {method} {url}"))
+            },
+            &mut |_, _| {
+                prompts += 1;
+                Some("123456".to_owned())
+            },
+        )
+        .expect_err("three rejected codes");
+        assert!(error.contains("warp access"), "{error}");
         assert_eq!(prompts, 3);
         assert_eq!(posts.get(), 3);
     }

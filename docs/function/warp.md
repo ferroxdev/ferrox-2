@@ -88,17 +88,17 @@ graph TD
     D1 & D2 & D4 --> N
     D0 -- "off" --> O["MASQUE half<br/>row 83 WARP dialect"]
     D1 & D2 & D4 --> O
-    N --> P{"mode auto?"}
-    O --> P
+    N --> G{"gateway active,<br/>TCP port 80/443,<br/>valid authority?"}
+    O --> G
+    G -- yes --> G1["loopback -> serve_on(MASQUE, proxy)<br/>CONNECT authority"]
+    G1 -- "2xx" --> G2["forward prefix, relay"]
+    G1 -- "refused / timeout" --> P{"mode auto?"}
+    G -- "no / ineligible" --> P
     P -- yes --> Q["race: DNS probe<br/>through each tunnel"]
     Q -- "first true" --> R["chosen lane (once)"]
     P -- "fixed" --> R
     R --> S["serve_tcp / serve_udp<br/>on the winning half"]
-    S --> GW{"gateway active,<br/>TCP port 80/443,<br/>valid authority?"}
-    GW -- yes --> GW1["loopback -> serve_on(MASQUE, proxy)<br/>CONNECT authority"]
-    GW1 -- "2xx" --> GW2["forward prefix, relay"]
-    GW1 -- "refused / timeout" --> GWR["retire proxy<br/>direct tunnel egress"]
-    GW -- "no / ineligible" --> DE["direct tunnel egress"]
+    S --> DE["direct tunnel egress"]
 ```
 
 ## Ops
