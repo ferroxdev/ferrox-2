@@ -1551,6 +1551,7 @@ pub(crate) fn outbound(root: &Json) -> Result<Option<TuicOut>, String> {
             return Err(format!("tuic congestion_control `{name}` is not carried"));
         }
     }
+    let cc = Some(cc.unwrap_or_else(|| "bbr".to_owned()));
     let heartbeat = field("heartbeat")
         .or_else(|| field("heartbeat_interval"))
         .and_then(Json::as_u32)
@@ -3464,6 +3465,19 @@ mod tests {
             inner.expiry_passes, 2,
             "one walk of each map, however many associations expired"
         );
+    }
+
+    #[test]
+    fn an_unnamed_controller_is_the_reference_bbr() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"tuic","settings":{"address":"tuic.test","port":443,"uuid":"00112233-4455-6677-8899-aabbccddeeff","password":"secret"},"streamSettings":{"security":"tls","tlsSettings":{"allowInsecure":true}}}]}"#,
+        )
+        .expect("parses");
+        let out = outbound(&root)
+            .expect("the outbound is read")
+            .expect("a tuic outbound");
+        assert_eq!(out.cc.as_deref(), Some("bbr"));
+        assert!(out.client_config().is_some());
     }
 
     #[test]
