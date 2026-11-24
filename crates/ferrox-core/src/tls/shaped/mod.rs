@@ -42,13 +42,13 @@ impl Profile {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Ext {
     pub kind: u16,
     pub body: Body,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum Body {
     Grease,
     Sni,
@@ -179,7 +179,8 @@ impl Fingerprint {
         None
     }
 
-    pub(crate) fn profile(self) -> Option<&'static Profile> {
+    /// The static wire table behind a shaped name, for a caller that derives its own profile.
+    pub fn profile(self) -> Option<&'static Profile> {
         self.0
     }
 

@@ -1227,13 +1227,21 @@ impl ClientSpec {
             .and_then(|settings| settings.get("security"))
             .and_then(Json::as_str)
             .unwrap_or("tls");
+        let stream = outbound.get("streamSettings");
+        let transport = stream.and_then(|settings| settings.get("masqueSettings"));
         let tls = if security.eq_ignore_ascii_case("none") {
             None
         } else {
-            Some(crate::config::outbound_tls(outbound, &address)?)
+            let tls = crate::config::outbound_tls(outbound, &address)?;
+            let warp_tls = transport.and_then(|settings| settings.get("warpTls"));
+            match warp_tls {
+                Some(warp_tls) => Some(Arc::new(
+                    crate::warp_tls::WarpTls::from_settings(Some(warp_tls), &tls.server_name)?
+                        .apply((*tls).clone()),
+                )),
+                None => Some(tls),
+            }
         };
-        let stream = outbound.get("streamSettings");
-        let transport = stream.and_then(|settings| settings.get("masqueSettings"));
         let warp = transport
             .and_then(|settings| settings.get("warp"))
             .map(Warp::from)
@@ -6684,6 +6692,26 @@ mod tests {
                 .expect("the opted spec")
                 .large_segments
         );
+    }
+
+    #[test]
+    fn a_warp_tls_block_shapes_the_masque_hello() {
+        let outbound = crate::json::parse(
+            r#"{"settings":{"address":"127.0.0.1","port":8443},"streamSettings":{"security":"tls","tlsSettings":{"serverName":"consumer-masque.cloudflareclient.com","allowInsecure":true},"masqueSettings":{"warpTls":{"tlsCiphers":[49199],"tlsGroups":[23],"disableGrease":true,"fragment":{"packets":"tlshello","lengths":["8-17"],"delays":["2-11"]}}}}}"#,
+        )
+        .expect("the shaped outbound");
+        let spec = ClientSpec::from(&outbound).expect("the shaped spec");
+        let tls = spec.tls.expect("the TLS config");
+        assert!(tls.fragment.is_some());
+        assert_eq!(tls.curves.as_ref(), &[0x0017]);
+        let profile = tls
+            .fingerprint
+            .expect("a shaped hello")
+            .profile()
+            .expect("a profile");
+        assert_eq!(&profile.ciphers[..3], &[0x1301, 0x1302, 0x1303]);
+        assert_eq!(profile.ciphers[3], 0xc02f);
+        assert!(!profile.ciphers.contains(&0x0a0a));
     }
 
     #[test]

@@ -98,6 +98,7 @@ mod vision;
 mod vmess;
 mod warp;
 mod warp_scan;
+mod warp_tls;
 mod webhook;
 mod wg;
 #[cfg(target_os = "linux")]
@@ -151,6 +152,7 @@ fn usage() -> ! {
         "        [-o|--config FILE] [--wg-config FILE] [--masque-config FILE] [--api URL] [--api-address ADDR]"
     );
     eprintln!("        [--mode auto|wireguard|masque|gool|gool-classic|mim] [--gool-classic] [--wiw-outer ADDR] [--wiw-inner ADDR] [--mim-outer ADDR] [--mim-inner ADDR] [--noize off|light|firewall|balanced|gfw|aggressive] [--no-profile-retry] [--no-quic-v2]");
+    eprintln!("        [--fragment] [--fragment-size N|A-B] [--fragment-delay N|A-B] [--tls-ciphers LIST] [--tls-groups LIST] [--disable-grease] [--ech auto|BASE64] [--ech-dns URL] [--ech-domain NAME] [--masque-sni NAME]");
     eprintln!(
         "                                with --register, make the kind's identities and print them; without it, register one device, save the identity (0600 on Unix), print the outbound"
     );

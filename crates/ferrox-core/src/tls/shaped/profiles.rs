@@ -313,6 +313,13 @@ pub(crate) static P_CHROME_PLAIN: Profile = Profile {
             },
         },
         Ext {
+            kind: 0xfe0d,
+            body: Body::Ech {
+                suites: &[0x0001_0001],
+                payloads: &[128, 160, 192, 224],
+            },
+        },
+        Ext {
             kind: 0xff01,
             body: Body::Raw(&[0x00]),
         },

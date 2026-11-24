@@ -1230,6 +1230,12 @@ warp identity-files-all 5 ferrox-app-warp::tests::every_slot_derives_beside_its_
 warp tunnel-halves-built 2 ferrox-app-warp::tests::a_registered_identity_builds_both_tunnels
 warp identity-file-mode 600 ferrox-app-warp::tests::an_identity_survives_a_save_and_load
 warp api-address-dial-port 8443 ferrox-app-warp::tests::an_api_address_moves_the_dial_not_the_name
+warp chrome-fragment-size-min 8 warp_tls::tests::the_fragment_default_size_and_delay_match_aether
+warp chrome-fragment-size-max 16 warp_tls::tests::the_fragment_default_size_and_delay_match_aether
+warp chrome-fragment-delay-min 2 warp_tls::tests::the_fragment_default_size_and_delay_match_aether
+warp chrome-fragment-delay-max 10 warp_tls::tests::the_fragment_default_size_and_delay_match_aether
+warp chrome-tls12-suites 12 warp_tls::tests::the_default_profile_carries_chromes_tls12_suites
+warp chrome-grease-sentinels 0 warp_tls::tests::disabling_grease_removes_every_sentinel
 warp refused-statuses 3 ferrox-app-warp::tests::a_refused_read_back_is_told_apart_from_an_outage
 warp reprovision-off-spellings 3 ferrox-app-warp::tests::three_spellings_turn_reprovisioning_off
 warp race-first-winner wireguard ferrox-app-warp::tests::the_first_answering_half_wins_the_race

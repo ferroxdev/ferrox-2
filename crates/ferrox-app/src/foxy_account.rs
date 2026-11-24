@@ -805,6 +805,12 @@ pub(crate) struct Endpoint {
     pub(crate) upstream: Option<crate::foxy::UpstreamProxy>,
     /// The shaped hello the HTTP/2 dials ride; `None` keeps the plane's own.
     pub(crate) h2_fingerprint: Option<ferrox_core::tls::shaped::Fingerprint>,
+    /// The groups a WARP API hello offers, in the order the flag named them.
+    pub(crate) curves: std::sync::Arc<[u16]>,
+    /// The ECH config list a WARP API hello encrypts its inner name with.
+    pub(crate) ech_config_list: Option<std::sync::Arc<[u8]>>,
+    /// The first-write cut a WARP API hello reaches the wire in.
+    pub(crate) fragment: Option<ferrox_core::finalmask::Fragment>,
     /// A dial that reopens the session instead of resuming it, the way a first connection does.
     pub(crate) no_resumption: bool,
     /// A dial that accepts any certificate, for the reference's `DisableSystemRootCAs`.
@@ -846,6 +852,9 @@ impl Endpoint {
             dial: None,
             upstream: None,
             h2_fingerprint: None,
+            curves: std::sync::Arc::default(),
+            ech_config_list: None,
+            fragment: None,
             no_resumption: false,
             insecure: false,
             host_header: None,
@@ -957,11 +966,12 @@ impl Endpoint {
             cert_pins: std::sync::Arc::from(Vec::new()),
             verify_names: std::sync::Arc::from(self.verify_names.clone()),
             cipher_suites: std::sync::Arc::default(),
-            curves: std::sync::Arc::default(),
+            curves: std::sync::Arc::clone(&self.curves),
             insecure: self.insecure,
             resumption: true,
             fingerprint: None,
-            ech_config_list: None,
+            ech_config_list: self.ech_config_list.clone(),
+            fragment: self.fragment.clone(),
             websocket: false,
             master_key_log: None,
             client_cert: None,
@@ -1039,6 +1049,11 @@ impl Endpoint {
         };
         let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
         let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+        let cut = cfg
+            .fragment
+            .as_ref()
+            .map(|fragment| ferrox_core::finalmask::Chain::default().with_front(fragment));
+        let stream = stream.with_mask(cut.as_ref());
         let mut tls = ferrox_core::tls::connect(cfg, stream)
             .map_err(|why| format!("tls {}: {why}", self.host))?;
         tls.handshake()

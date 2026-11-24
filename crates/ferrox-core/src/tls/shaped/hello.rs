@@ -1659,6 +1659,25 @@ mod tests {
 
     #[cfg_attr(miri, ignore = "uses the OS random source")]
     #[test]
+    fn a_chrome_plain_profile_can_carry_ech() {
+        let (list, _keys) = crate::tls::ech::generate("public.test", 7).expect("generates");
+        let profile = Fingerprint::resolve("chrome_plain")
+            .expect("a preset name resolves")
+            .profile()
+            .expect("a shaped profile");
+        let mut hello =
+            Hello::build(profile, "hidden.test", &[], false, &[], None).expect("builds");
+        hello
+            .enable_ech(&list)
+            .expect("chrome_plain has an ECH slot");
+        assert_eq!(
+            kind(extensions(&hello.msg[4..]).last().expect("extensions")),
+            0xfe0d
+        );
+    }
+
+    #[cfg_attr(miri, ignore = "uses the OS random source")]
+    #[test]
     fn a_profile_without_an_ech_slot_is_refused() {
         let (list, _keys) = crate::tls::ech::generate("public.test", 7).expect("generates");
         let profile = Fingerprint::resolve("hellochrome_58")
