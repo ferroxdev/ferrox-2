@@ -307,13 +307,10 @@ fn decode_entities(raw: &str) -> String {
         out.push_str(&rest[..at]);
         rest = &rest[at..];
         let window = &rest.as_bytes()[..rest.len().min(9)];
-        let end = match window.iter().position(|&byte| byte == b';') {
-            Some(index) => index,
-            None => {
-                out.push('&');
-                rest = &rest[1..];
-                continue;
-            }
+        let Some(end) = window.iter().position(|&byte| byte == b';') else {
+            out.push('&');
+            rest = &rest[1..];
+            continue;
         };
         let entity = &rest[1..end];
         let decoded = match entity {
