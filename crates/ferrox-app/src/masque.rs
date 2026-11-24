@@ -570,17 +570,17 @@ impl MasqueOut {
         }
     }
 
-    pub(crate) fn serve_tcp(&self, client: Connection, asked: &Destination, prefix: &[u8]) {
+    pub(crate) fn serve_tcp(&self, client: Connection, asked: &Destination, prefix: &[u8]) -> bool {
         let (inner, lease) = match self.ensure_flow_at(Instant::now(), || open(&self.spec, false)) {
             Ok(lane) => lane,
             Err(reason) => {
                 eprintln!("masque: {reason}");
-                return;
+                return false;
             }
         };
         let Some(destination) = self.resolve(&inner, asked) else {
             eprintln!("masque: destination `{asked:?}` does not resolve");
-            return;
+            return false;
         };
         if inner
             .flows
@@ -593,7 +593,9 @@ impl MasqueOut {
             .is_err()
         {
             eprintln!("masque: the userspace stack is gone");
+            return false;
         }
+        true
     }
 
     /// A data-plane probe for the auto race: the tunnel answers a DNS name

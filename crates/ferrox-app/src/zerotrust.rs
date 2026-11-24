@@ -264,16 +264,21 @@ fn cookie_expires_at(header: &str) -> Option<u64> {
 }
 
 fn issued_token(reply: &Reply) -> Option<String> {
+    let at = now();
     reply
         .headers
         .iter()
         .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
-        .find_map(|(_, value)| {
+        .filter_map(|(_, value)| {
             let token = extract_jwt_from_cookie(value)?;
-            let at = now();
-            let deleted = cookie_expires_at(value).is_some_and(|expires| expires <= at);
-            (!deleted && !jwt_expired(&token, at)).then_some(token)
+            if cookie_expires_at(value).is_some_and(|expires| expires <= at) {
+                return None;
+            }
+            let expiry = jwt_expiry(&token).filter(|&expiry| at < expiry)?;
+            Some((expiry, token))
         })
+        .max_by_key(|(expiry, _)| *expiry)
+        .map(|(_, token)| token)
 }
 
 fn extract_totp_form_action(html: &str) -> Option<String> {
@@ -301,9 +306,10 @@ fn decode_entities(raw: &str) -> String {
     while let Some(at) = rest.find('&') {
         out.push_str(&rest[..at]);
         rest = &rest[at..];
-        let end = match rest.find(';') {
-            Some(index) if index <= 8 => index,
-            _ => {
+        let window = &rest.as_bytes()[..rest.len().min(9)];
+        let end = match window.iter().position(|&byte| byte == b';') {
+            Some(index) => index,
+            None => {
                 out.push('&');
                 rest = &rest[1..];
                 continue;
@@ -1751,6 +1757,27 @@ mod tests {
             &mut token,
         );
         assert_eq!(token.as_deref(), Some(later.as_str()));
+    }
+
+    #[test]
+    fn the_latest_live_assertion_cookie_wins() {
+        let earlier = jwt("{\"exp\":4102444800}");
+        let later = jwt("{\"exp\":4102444801}");
+        let reply = reply(
+            200,
+            vec![
+                (
+                    "Set-Cookie".to_owned(),
+                    format!("CF_Authorization={earlier}; Path=/old; Secure"),
+                ),
+                (
+                    "Set-Cookie".to_owned(),
+                    format!("CF_Authorization={later}; Path=/new; Secure"),
+                ),
+            ],
+            "",
+        );
+        assert_eq!(issued_token(&reply), Some(later));
     }
 
     #[test]

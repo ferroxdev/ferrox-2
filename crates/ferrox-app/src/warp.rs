@@ -2230,7 +2230,9 @@ fn http_check_masque(identity: &Identity, spec: &WarpSpec, edge: SocketAddr) -> 
         return false;
     };
     http_check(
-        |client, asked| out.serve_tcp(client, asked, b""),
+        |client, asked| {
+            out.serve_tcp(client, asked, b"");
+        },
         edge_spec.ironclad_port,
     )
 }
@@ -2893,13 +2895,15 @@ impl WarpOut {
         client: crate::conn::Connection,
         asked: &crate::proxy::Destination,
         prefix: &[u8],
-    ) {
+    ) -> bool {
         if let Some(masque) = &self.masque {
-            masque.serve_tcp(client, asked, prefix);
+            masque.serve_tcp(client, asked, prefix)
         } else if let Some(gool) = &self.gool {
-            gool.outer.serve_tcp(client, asked, prefix);
+            gool.outer.serve_tcp(client, asked, prefix)
         } else if let Some(mim) = &self.mim {
-            mim.outer.serve_tcp(client, asked, prefix);
+            mim.outer.serve_tcp(client, asked, prefix)
+        } else {
+            false
         }
     }
 
@@ -2970,14 +2974,16 @@ impl WarpOut {
             self.serve_lane(client, asked, prefix);
             return;
         }
-        self.serve_gateway(
+        if !self.serve_gateway(
             tunnel,
             &crate::proxy::Destination::Address(gateway.proxy),
             &[],
-        );
+        ) {
+            self.serve_lane(client, asked, prefix);
+            return;
+        }
         let budget = deadline.saturating_duration_since(Instant::now());
         if budget.is_zero() {
-            gateway.retire("the gateway did not open within the probe budget");
             self.serve_lane(client, asked, prefix);
             return;
         }
