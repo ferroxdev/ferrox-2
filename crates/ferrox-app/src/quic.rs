@@ -2175,6 +2175,7 @@ pub(crate) fn rebind_path(
     set_gro(&fresh, sock.gro && sock.gso && sock.whole_datagrams());
     set_receive_buffer(&fresh, DATAGRAM_BUFFER);
     set_send_buffer(&fresh, DATAGRAM_BUFFER);
+    arm_send_timeout(&fresh);
     if let Ok(mut slot) = sock.source.lock() {
         *slot = Some(source);
     }
@@ -2234,8 +2235,19 @@ fn armed_lane(sock: UdpSocket, gro: bool) -> UdpSocket {
     let _ = gro;
     set_receive_buffer(&sock, DATAGRAM_BUFFER);
     set_send_buffer(&sock, DATAGRAM_BUFFER);
+    arm_send_timeout(&sock);
     sock
 }
+
+/// Winsock has no per-call non-blocking send flag: a one-millisecond send timeout keeps a full
+/// buffer from parking the relay worker in the kernel.
+#[cfg(windows)]
+fn arm_send_timeout(sock: &UdpSocket) {
+    let _ = sock.set_write_timeout(Some(Duration::from_millis(1)));
+}
+
+#[cfg(not(windows))]
+fn arm_send_timeout(_sock: &UdpSocket) {}
 
 #[cfg(target_os = "linux")]
 fn set_gro(sock: &UdpSocket, on: bool) {
