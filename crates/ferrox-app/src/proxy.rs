@@ -36179,7 +36179,8 @@ pub(crate) mod lane_pool {
         if pool.wake.is_none() || stopping(pool) || !start_reaper(pool) {
             return Err(lane);
         }
-        let idle = crate::proxy::take_wait_idle().unwrap_or(crate::budgets::RELAY_RESPONSE_IDLE);
+        let noted = crate::proxy::take_wait_idle();
+        let idle = noted.unwrap_or(crate::budgets::RELAY_RESPONSE_IDLE);
         let slot = std::sync::Arc::new(ReadySlot {
             id: pool
                 .next_slot
@@ -36202,7 +36203,8 @@ pub(crate) mod lane_pool {
             (Some(Some(at)), false) => Some(at + idle),
             (_, true) => Some(stall),
             (None, false) => Some(now + idle),
-            (Some(None), false) => None,
+            // A reader that shares its socket with the pump asked for a clock: that pump can take the datagram this wait was armed for.
+            (Some(None), false) => noted.map(|wait| now + wait),
         };
         let _ = slot.due.set(due);
         #[cfg(test)]
