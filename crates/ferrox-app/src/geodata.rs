@@ -2379,6 +2379,18 @@ mod tests {
     }
 
     #[test]
+    fn a_case_insensitive_value_is_matched_without_lowering() {
+        let (value, counts) = ferrox_core::alloc_count::measure(|| parse_value("SeP", MONTHS));
+        assert_eq!(value, Ok(9));
+        assert_eq!(counts.allocs, 0, "the table compare is case-insensitive");
+        let (found, counts) = ferrox_core::alloc_count::measure(|| {
+            contains_ignore_ascii_case("gzip, Chunked", "chunked")
+        });
+        assert!(found);
+        assert_eq!(counts.allocs, 0, "the needle and text stay borrowed");
+    }
+
+    #[test]
     fn a_case_insensitive_substring_keeps_the_contains_semantics() {
         for (text, expected) in [
             ("chunked", true),

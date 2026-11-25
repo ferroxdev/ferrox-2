@@ -161,10 +161,12 @@ pub(crate) fn normalize_team(raw: &str) -> Option<String> {
     if value.is_empty() {
         return None;
     }
-    let prefix = ["https://", "http://"]
-        .iter()
-        .find_map(|prefix| value.strip_prefix(*prefix).map(str::len))
-        .map_or(0, |rest| value.len() - rest);
+    let mut prefix = 0;
+    for scheme in ["https://", "http://"] {
+        if let Some(rest) = value[prefix..].strip_prefix(scheme) {
+            prefix = value.len() - rest.len();
+        }
+    }
     if prefix > 0 {
         value.drain(..prefix);
     }
@@ -1460,6 +1462,14 @@ mod tests {
     }
 
     #[test]
+    fn a_team_url_strips_each_scheme_once_in_order() {
+        assert_eq!(
+            normalize_team("https://http://My-Org.cloudflareaccess.com").as_deref(),
+            Some("my-org")
+        );
+    }
+
+    #[test]
     fn a_team_url_is_reduced_with_one_allocation() {
         let (team, counts) = ferrox_core::alloc_count::measure(|| {
             normalize_team("https://My-Org.cloudflareaccess.com/warp")
@@ -1876,6 +1886,18 @@ mod tests {
             http_date("Thu, 01 Jan 999999999999999999 00:00:00 GMT"),
             None
         );
+    }
+
+    #[test]
+    fn a_month_name_and_cookie_expiry_are_read_in_place() {
+        let (month, counts) = ferrox_core::alloc_count::measure(|| month_number("SeP"));
+        assert_eq!(month, Some(9));
+        assert_eq!(counts.allocs, 0, "the month table is matched, not lowered");
+        let (expiry, counts) = ferrox_core::alloc_count::measure(|| {
+            cookie_expires_at("CF_Authorization=x; Max-Age=60; Path=/")
+        });
+        assert!(expiry.is_some());
+        assert_eq!(counts.allocs, 0, "the attribute names stay borrowed");
     }
 
     #[test]
@@ -2421,6 +2443,14 @@ mod tests {
         let token = jwt("{\"exp\":4102444800}");
         let cookie = format!("CF_Authorization={token}; Path=/; Secure; HttpOnly");
         assert_eq!(extract_jwt_from_cookie(&cookie), Some(token));
+    }
+
+    #[test]
+    fn a_jwt_shape_check_does_not_collect_its_segments() {
+        let token = jwt("{\"exp\":4102444800}");
+        let (shape, counts) = ferrox_core::alloc_count::measure(|| looks_like_jwt(&token));
+        assert!(shape);
+        assert_eq!(counts.allocs, 1, "the header decode is the only allocation");
     }
 
     #[test]
