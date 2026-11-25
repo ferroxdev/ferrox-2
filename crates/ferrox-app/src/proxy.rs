@@ -80634,7 +80634,8 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    // The wake is a `shutdown` on the listening socket, which unblocks `accept` on Linux alone.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_watched_listener_stops_without_dialing_its_address() {
         let listener = Listener::bind(&crate::conn::parse_target("127.0.0.1:0").expect("target"))
