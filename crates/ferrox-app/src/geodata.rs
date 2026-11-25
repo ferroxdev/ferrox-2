@@ -550,8 +550,11 @@ fn parse_range(expr: &str, bounds: Bounds) -> Result<u64, String> {
 }
 
 fn parse_value(text: &str, bounds: Bounds) -> Result<u32, String> {
-    let lowered = text.to_ascii_lowercase();
-    if let Some((_, value)) = bounds.names.iter().find(|(name, _)| *name == lowered) {
+    if let Some((_, value)) = bounds
+        .names
+        .iter()
+        .find(|(name, _)| (*name).eq_ignore_ascii_case(text))
+    {
         return Ok(*value);
     }
     parse_uint(text)
@@ -1550,6 +1553,15 @@ fn capped_line_eof(reader: &mut impl BufRead, what: &str) -> Result<Option<Strin
         .map_err(|_| format!("geodata {what} is not UTF-8"))
 }
 
+fn contains_ignore_ascii_case(text: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    text.as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
 #[allow(clippy::too_many_lines)]
 fn read_response(reader: &mut impl Read) -> Result<Response, String> {
     let mut reader = BufReader::new(reader);
@@ -1584,8 +1596,7 @@ fn read_response(reader: &mut impl Read) -> Result<Response, String> {
             .map(|(_, value)| value.as_str())
     };
     let mut body = Vec::new();
-    if header("transfer-encoding")
-        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
+    if header("transfer-encoding").is_some_and(|value| contains_ignore_ascii_case(value, "chunked"))
     {
         read_chunked(&mut reader, &mut body)?;
     } else if let Some(length) =
@@ -2365,5 +2376,36 @@ mod tests {
         let root = config(&format!(r#"{{"cron": "0 3 * * *", "assets": [{assets}]}}"#));
         let error = parse(&root, &[asset_dir()]).expect_err("too many assets");
         assert!(error.contains("at most 100"), "{error}");
+    }
+
+    #[test]
+    fn a_case_insensitive_value_is_matched_without_lowering() {
+        let (value, counts) = ferrox_core::alloc_count::measure(|| parse_value("SeP", MONTHS));
+        assert_eq!(value, Ok(9));
+        assert_eq!(counts.allocs, 0, "the table compare is case-insensitive");
+        let (found, counts) = ferrox_core::alloc_count::measure(|| {
+            contains_ignore_ascii_case("gzip, Chunked", "chunked")
+        });
+        assert!(found);
+        assert_eq!(counts.allocs, 0, "the needle and text stay borrowed");
+    }
+
+    #[test]
+    fn a_case_insensitive_substring_keeps_the_contains_semantics() {
+        for (text, expected) in [
+            ("chunked", true),
+            ("CHUNKED", true),
+            ("gzip, Chunked", true),
+            ("notchunked", true),
+            ("chunkedx", true),
+            ("gzip", false),
+            ("", false),
+        ] {
+            assert_eq!(
+                contains_ignore_ascii_case(text, "chunked"),
+                expected,
+                "{text}"
+            );
+        }
     }
 }
