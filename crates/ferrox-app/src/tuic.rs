@@ -10,9 +10,9 @@ use ferrox_core::tuic as wire;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Shutdown, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -20,8 +20,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const SCID_LEN: usize = 16;
 const HEARTBEAT: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(100);
-/// A client driver's idle arm: a queue the relay drained is refilled within this beat without a packet.
+/// A client driver's idle arm: a local read or stream write is retried within this beat without a packet.
 const CLIENT_POLL: Duration = Duration::from_millis(1);
+const DIRECT_BUFFER: usize = 256 * 1024;
 const UDP_IDLE: Duration = Duration::from_secs(300);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
 const CONNECT_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -157,12 +158,28 @@ struct Lane {
     sinks: Mutex<HashMap<u16, Arc<UdpSink>>>,
     pending: Mutex<Vec<Pending>>,
     session: Arc<Mutex<Option<Vec<u8>>>>,
-    pump: Arc<quic::StreamPump>,
+    direct: Sender<DirectStream>,
     heartbeat: thread::Thread,
     auth: Auth,
     authed: AtomicBool,
     early_since: Option<Instant>,
     establish_by: Option<Instant>,
+}
+
+/// One client stream the driver owns end to end: the QUIC id and the local TCP socket, so neither
+/// direction needs a relay worker or a second copy through a queue.
+struct DirectStream {
+    id: u64,
+    tcp: Connection,
+    out: Vec<u8>,
+    inbound: Vec<u8>,
+    read_eof: bool,
+    fin_sent: bool,
+    peer_fin: bool,
+    write_shut: bool,
+    closed: bool,
+    meter: crate::stats::Meter,
+    finish: Option<Box<dyn FnOnce() + Send>>,
 }
 
 fn lane_established(conn: &QuicheConnection, lane: &Lane) -> bool {
@@ -528,6 +545,7 @@ impl TuicOut {
         let conn = Arc::new(Mutex::new(conn));
         let stop = Arc::new(AtomicBool::new(false));
         let heartbeat = heartbeat(&conn, &socket, self.heartbeat, Arc::clone(&stop));
+        let (direct, direct_rx) = mpsc::channel::<DirectStream>();
         let lane = Arc::new(Lane {
             conn,
             sock: socket,
@@ -540,7 +558,7 @@ impl TuicOut {
             sinks: Mutex::new(HashMap::new()),
             pending: Mutex::new(Vec::new()),
             session: Arc::clone(&self.session),
-            pump: Arc::new(quic::StreamPump::new()),
+            direct,
             heartbeat,
             auth: Auth {
                 uuid: self.uuid,
@@ -557,7 +575,7 @@ impl TuicOut {
         }
         thread::spawn({
             let lane = Arc::downgrade(&lane);
-            move || drive_client(&lane)
+            move || drive_client(&lane, direct_rx)
         });
         Some(lane)
     }
@@ -624,19 +642,27 @@ impl TuicOut {
         };
         *next = next.wrapping_add(4);
         drop(next);
-        let mut stream = QuicStream::new(
-            Arc::clone(&lane.conn),
-            Arc::clone(&lane.sock),
-            id,
-            proxy::flow_outbound_meter().unwrap_or_default(),
-        )
-        .with_stop(Arc::clone(&lane.stop))
-        .with_pump(&lane.pump);
-        if stream.write_all(&header).is_err() {
-            stream.close();
+        let Ok(tcp) = client.try_clone() else {
+            return;
+        };
+        if tcp.set_nonblocking(true).is_err() {
             return;
         }
-        proxy::relay_quic_stream(client, stream, Some(Box::new(move || drop(lane))));
+        header.reserve(DIRECT_BUFFER);
+        let direct = lane.direct.clone();
+        let _ = direct.send(DirectStream {
+            id,
+            tcp,
+            out: header,
+            inbound: Vec::with_capacity(DIRECT_BUFFER),
+            read_eof: false,
+            fin_sent: false,
+            peer_fin: false,
+            write_shut: false,
+            closed: false,
+            meter: proxy::flow_outbound_meter().unwrap_or_default(),
+            finish: Some(Box::new(move || drop(lane))),
+        });
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1114,7 +1140,7 @@ fn reply_worker(weak: &std::sync::Weak<Lane>) -> SyncSender<Reply> {
 }
 
 #[allow(clippy::too_many_lines)]
-fn drive_client(weak: &std::sync::Weak<Lane>) {
+fn drive_client(weak: &std::sync::Weak<Lane>, direct: Receiver<DirectStream>) {
     if weak.upgrade().is_none() {
         return;
     }
@@ -1124,7 +1150,12 @@ fn drive_client(weak: &std::sync::Weak<Lane>) {
     let mut uni: HashMap<u64, Vec<u8>> = HashMap::new();
     let mut out: Vec<Reply> = Vec::new();
     let mut batch = quic::Batch::new();
+    let mut entries: Vec<DirectStream> = Vec::new();
+    let mut finished: Vec<DirectStream> = Vec::new();
     while let Some(lane) = weak.upgrade() {
+        while let Ok(stream) = direct.try_recv() {
+            entries.push(stream);
+        }
         if lane.stop.load(Ordering::Relaxed) {
             break;
         }
@@ -1153,11 +1184,19 @@ fn drive_client(weak: &std::sync::Weak<Lane>) {
                 }
                 lane.finish_handshake() && {
                     let turned = match lane.conn.lock() {
-                        Ok(mut conn) => {
-                            client_turn(&mut conn, &lane, &replies, &mut out, &mut uni, &mut ids)
-                        }
+                        Ok(mut conn) => client_turn(
+                            &mut conn,
+                            &lane,
+                            &replies,
+                            &mut out,
+                            &mut uni,
+                            &mut ids,
+                            &mut entries,
+                            &mut finished,
+                        ),
                         Err(_) => false,
                     };
+                    finish_direct(&mut finished);
                     turned && hand_off(&mut out, &replies)
                 }
             }
@@ -1165,11 +1204,15 @@ fn drive_client(weak: &std::sync::Weak<Lane>) {
                 if !lane.finish_handshake() {
                     break;
                 }
-                let Ok(mut conn) = lane.conn.lock() else {
-                    break;
+                let alive = {
+                    let Ok(mut conn) = lane.conn.lock() else {
+                        break;
+                    };
+                    pump_direct(&mut conn, &mut entries, &mut finished);
+                    service(&mut conn, &lane)
                 };
-                pump_streams(&mut conn, &lane);
-                service(&mut conn, &lane)
+                finish_direct(&mut finished);
+                alive
             }
             quic::Drain::Unbatchable => match lane.sock.recv_from(&mut buf) {
                 Ok((n, from)) => {
@@ -1187,10 +1230,18 @@ fn drive_client(weak: &std::sync::Weak<Lane>) {
                     lane.finish_handshake() && {
                         let turned = match lane.conn.lock() {
                             Ok(mut conn) => client_turn(
-                                &mut conn, &lane, &replies, &mut out, &mut uni, &mut ids,
+                                &mut conn,
+                                &lane,
+                                &replies,
+                                &mut out,
+                                &mut uni,
+                                &mut ids,
+                                &mut entries,
+                                &mut finished,
                             ),
                             Err(_) => false,
                         };
+                        finish_direct(&mut finished);
                         turned && hand_off(&mut out, &replies)
                     }
                 }
@@ -1198,10 +1249,15 @@ fn drive_client(weak: &std::sync::Weak<Lane>) {
                     if !lane.finish_handshake() {
                         break;
                     }
-                    let Ok(mut conn) = lane.conn.lock() else {
-                        break;
+                    let alive = {
+                        let Ok(mut conn) = lane.conn.lock() else {
+                            break;
+                        };
+                        pump_direct(&mut conn, &mut entries, &mut finished);
+                        service(&mut conn, &lane)
                     };
-                    service(&mut conn, &lane)
+                    finish_direct(&mut finished);
+                    alive
                 }
                 Err(_) => break,
             },
@@ -1211,6 +1267,9 @@ fn drive_client(weak: &std::sync::Weak<Lane>) {
             break;
         }
     }
+    entries.clear();
+    while direct.try_recv().is_ok() {}
+    finish_direct(&mut finished);
     if let Some(lane) = weak.upgrade() {
         lane.stop.store(true, Ordering::Relaxed);
         lane.heartbeat.unpark();
@@ -1287,6 +1346,8 @@ fn client_turn(
     out: &mut Vec<Reply>,
     uni: &mut HashMap<u64, Vec<u8>>,
     ids: &mut Vec<u64>,
+    direct: &mut Vec<DirectStream>,
+    finished: &mut Vec<DirectStream>,
 ) -> bool {
     remember_session(conn, &lane.session);
     while let Ok(data) = conn.dgram_recv_buf() {
@@ -1325,16 +1386,190 @@ fn client_turn(
             uni.insert(id, data);
         }
     }
-    pump_streams(conn, lane);
+    pump_direct(conn, direct, finished);
     service(conn, lane)
 }
 
-/// Move every live client stream's two directions while the driver holds the connection, so a relay
-/// worker only copies between TCP and its queue.
-fn pump_streams(conn: &mut QuicheConnection, lane: &Lane) {
+/// Move every live client stream both ways while the driver owns the connection. A finished stream
+/// is moved out so its lease drops only after the connection guard is gone.
+fn pump_direct(
+    conn: &mut QuicheConnection,
+    streams: &mut Vec<DirectStream>,
+    finished: &mut Vec<DirectStream>,
+) {
     let mut buf = [0u8; 64 * 1024];
-    for (id, queue) in lane.pump.streams() {
-        quic::pump_stream(conn, id, &queue, &mut buf);
+    let mut at = 0;
+    while at < streams.len() {
+        if pump_direct_stream(conn, &mut streams[at], &mut buf) {
+            finished.push(streams.swap_remove(at));
+        } else {
+            at += 1;
+        }
+    }
+}
+
+fn pump_direct_stream(
+    conn: &mut QuicheConnection,
+    stream: &mut DirectStream,
+    buf: &mut [u8],
+) -> bool {
+    if stream.closed {
+        return true;
+    }
+    send_direct(conn, stream);
+    if stream.closed {
+        return true;
+    }
+    read_tcp(conn, stream, buf);
+    if stream.closed {
+        return true;
+    }
+    send_direct(conn, stream);
+    if stream.closed {
+        return true;
+    }
+    write_tcp(conn, stream);
+    if stream.closed {
+        return true;
+    }
+    read_quic(conn, stream, buf);
+    if stream.closed {
+        return true;
+    }
+    write_tcp(conn, stream);
+    if stream.closed {
+        return true;
+    }
+    if stream.read_eof && stream.out.is_empty() && !stream.fin_sent {
+        match conn.stream_send(stream.id, &[], true) {
+            Ok(_) => stream.fin_sent = true,
+            Err(quiche::Error::Done) => {}
+            Err(_) => {
+                abort_direct(conn, stream);
+                return true;
+            }
+        }
+    }
+    if stream.peer_fin && stream.inbound.is_empty() && !stream.write_shut {
+        let _ = stream.tcp.shutdown(Shutdown::Write);
+        stream.write_shut = true;
+    }
+    stream.read_eof
+        && stream.fin_sent
+        && stream.peer_fin
+        && stream.write_shut
+        && stream.out.is_empty()
+        && stream.inbound.is_empty()
+}
+
+fn send_direct(conn: &mut QuicheConnection, stream: &mut DirectStream) {
+    while !stream.out.is_empty() {
+        let sent = conn.stream_send(stream.id, &stream.out, false);
+        match sent {
+            Ok(0) | Err(quiche::Error::Done) => break,
+            Ok(n) => {
+                stream.out.drain(..n);
+                stream.meter.write(n);
+            }
+            Err(_) => {
+                abort_direct(conn, stream);
+                return;
+            }
+        }
+    }
+}
+
+fn read_tcp(conn: &mut QuicheConnection, stream: &mut DirectStream, buf: &mut [u8]) {
+    while !stream.read_eof && stream.out.len() < DIRECT_BUFFER {
+        let want = (DIRECT_BUFFER - stream.out.len()).min(buf.len());
+        let read = stream.tcp.read(&mut buf[..want]);
+        match read {
+            Ok(0) => {
+                stream.read_eof = true;
+                break;
+            }
+            Ok(n) => stream.out.extend_from_slice(&buf[..n]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => {
+                abort_direct(conn, stream);
+                return;
+            }
+        }
+    }
+}
+
+fn read_quic(conn: &mut QuicheConnection, stream: &mut DirectStream, buf: &mut [u8]) {
+    while !stream.peer_fin && stream.inbound.len() < DIRECT_BUFFER {
+        let want = (DIRECT_BUFFER - stream.inbound.len()).min(buf.len());
+        let received = conn.stream_recv(stream.id, &mut buf[..want]);
+        match received {
+            Ok((0, fin)) => {
+                if fin {
+                    stream.peer_fin = true;
+                }
+                break;
+            }
+            Ok((n, fin)) => {
+                stream.inbound.extend_from_slice(&buf[..n]);
+                stream.meter.read(n);
+                if fin {
+                    stream.peer_fin = true;
+                }
+                if n < want {
+                    break;
+                }
+            }
+            Err(quiche::Error::Done) => break,
+            Err(quiche::Error::StreamReset(_)) => {
+                abort_direct(conn, stream);
+                return;
+            }
+            Err(_) => {
+                if conn.is_closed() || conn.is_draining() {
+                    abort_direct(conn, stream);
+                }
+                break;
+            }
+        }
+    }
+}
+
+fn write_tcp(conn: &mut QuicheConnection, stream: &mut DirectStream) {
+    while !stream.inbound.is_empty() {
+        let written = stream.tcp.write(&stream.inbound);
+        match written {
+            Ok(0) => {
+                abort_direct(conn, stream);
+                return;
+            }
+            Ok(n) => {
+                stream.inbound.drain(..n);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => {
+                abort_direct(conn, stream);
+                return;
+            }
+        }
+    }
+}
+
+fn abort_direct(conn: &mut QuicheConnection, stream: &mut DirectStream) {
+    stream.closed = true;
+    stream.out.clear();
+    stream.inbound.clear();
+    let _ = conn.stream_shutdown(stream.id, quiche::Shutdown::Read, 0);
+    let _ = conn.stream_shutdown(stream.id, quiche::Shutdown::Write, 0);
+    let _ = stream.tcp.shutdown(Shutdown::Both);
+}
+
+fn finish_direct(finished: &mut Vec<DirectStream>) {
+    for mut stream in finished.drain(..) {
+        if let Some(finish) = stream.finish.take() {
+            finish();
+        }
     }
 }
 
