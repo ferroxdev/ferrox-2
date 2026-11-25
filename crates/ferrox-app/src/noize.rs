@@ -10,22 +10,25 @@ pub(crate) struct NoizeSettings {
 }
 
 impl NoizeSettings {
-    pub(crate) fn from_settings(settings: &Json) -> Result<Self, String> {
+    pub(crate) fn from_settings_with(
+        settings: &Json,
+        var: &dyn Fn(&str) -> Option<String>,
+        present: &dyn Fn(&str) -> bool,
+    ) -> Result<Self, String> {
         let profile = match settings.get("noize") {
             None | Some(Json::Null) => None,
             Some(Json::Str(text)) => Some(text.trim().to_owned()).filter(|text| !text.is_empty()),
             Some(_) => return Err("warp: `noize` must be a profile name".to_owned()),
         }
         .or_else(|| {
-            std::env::var("AETHER_NOIZE")
-                .ok()
+            var("AETHER_NOIZE")
                 .map(|text| text.trim().to_owned())
                 .filter(|text| !text.is_empty())
         });
         let no_retry = settings
             .get("noProfileRetry")
             .and_then(Json::as_bool)
-            .unwrap_or_else(|| std::env::var_os("AETHER_WG_NO_PROFILE_RETRY").is_some());
+            .unwrap_or_else(|| present("AETHER_WG_NO_PROFILE_RETRY"));
         Ok(Self {
             profile,
             no_retry,

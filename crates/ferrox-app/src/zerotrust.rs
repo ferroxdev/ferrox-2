@@ -32,7 +32,10 @@ pub(crate) struct TeamSettings {
 type Exchange<'a> = dyn Fn(&str, &str, &[(&str, &str)], &[u8]) -> Result<Reply, String> + 'a;
 
 impl TeamSettings {
-    pub(crate) fn from_settings(settings: &crate::json::Json) -> Result<Option<Self>, String> {
+    pub(crate) fn from_settings_with(
+        settings: &crate::json::Json,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Option<Self>, String> {
         let text = |key: &str| -> Result<Option<&str>, String> {
             match settings.get(key) {
                 None => Ok(None),
@@ -40,12 +43,13 @@ impl TeamSettings {
                 Some(_) => Err(format!("warp: `{key}` must be a string")),
             }
         };
-        Self::from_parts(
+        Self::from_parts_with(
             text("team")?,
             text("accessClientId")?,
             text("accessClientSecret")?,
             text("accessToken")?,
             text("accessEmail")?,
+            env,
         )
     }
 
@@ -1218,8 +1222,8 @@ fn with_email_code(
             settings.team, sent.reply.status
         ));
     }
-    let nonce = team_nonce(&landing.url, &settings.team_domain())
-        .or_else(|| team_nonce(&sent.url, &settings.team_domain()))
+    let nonce = team_nonce(&sent.url, &settings.team_domain())
+        .or_else(|| team_nonce(&landing.url, &settings.team_domain()))
         .ok_or_else(|| {
             "warp: cloudflare did not return a nonce for the login code; the enrolment flow may have changed".to_owned()
         })?;
@@ -1407,7 +1411,8 @@ mod tests {
     #[test]
     fn a_non_string_team_setting_is_refused() {
         let settings = crate::json::parse("{\"team\":42}").expect("valid json");
-        let error = TeamSettings::from_settings(&settings).expect_err("a non-string team");
+        let error =
+            TeamSettings::from_settings_with(&settings, &|_| None).expect_err("a non-string team");
         assert!(error.contains("`team` must be a string"));
     }
 
@@ -2144,12 +2149,23 @@ mod tests {
             ..TeamSettings::default()
         };
         let token = jwt("{\"exp\":4102444800}");
+        let nonce = std::cell::Cell::new(None);
         let mut prompted = 0;
         let got = sign_in(
             &settings,
             now(),
-            &|method, url, _, _| {
+            &|method, url, fields, _| {
                 if method == "GET" && url.ends_with("/warp") {
+                    return Ok(reply(
+                        302,
+                        vec![(
+                            "Location".to_owned(),
+                            "https://acme.cloudflareaccess.com/warp?nonce=old".to_owned(),
+                        )],
+                        "",
+                    ));
+                }
+                if method == "GET" && url.contains("nonce=old") {
                     return Ok(reply(
                         200,
                         Vec::new(),
@@ -2161,15 +2177,21 @@ mod tests {
                         302,
                         vec![(
                             "Location".to_owned(),
-                            "https://acme.cloudflareaccess.com/verify?nonce=abc".to_owned(),
+                            "https://acme.cloudflareaccess.com/verify?nonce=new".to_owned(),
                         )],
                         "",
                     ));
                 }
-                if method == "GET" && url.contains("nonce=abc") {
+                if method == "GET" && url.contains("nonce=new") {
                     return Ok(reply(200, Vec::new(), ""));
                 }
                 if method == "POST" && url.ends_with("/cdn-cgi/access/callback") {
+                    nonce.set(
+                        fields
+                            .iter()
+                            .find(|(key, _)| *key == "nonce")
+                            .map(|(_, value)| (*value).to_owned()),
+                    );
                     return Ok(reply(
                         302,
                         vec![
@@ -2198,6 +2220,7 @@ mod tests {
         )
         .expect("a token issued on the redirect is kept");
         assert_eq!(got, token);
+        assert_eq!(nonce.take().as_deref(), Some("new"));
         assert_eq!(prompted, 1);
     }
 

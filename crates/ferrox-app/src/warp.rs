@@ -231,27 +231,26 @@ struct EdgeSpec {
 }
 
 impl EdgeSpec {
-    fn from(settings: &crate::json::Json) -> Result<Self, String> {
+    fn from_with(settings: &crate::json::Json, env: &Env<'_>) -> Result<Self, String> {
         let scan = match settings.get("scan") {
             Some(crate::json::Json::Str(text)) => scan_mode(text),
             Some(crate::json::Json::Bool(true)) => Some(ScanMode::Balanced),
             Some(crate::json::Json::Bool(false)) => None,
-            _ => std::env::var("AETHER_SCAN")
-                .ok()
-                .as_deref()
-                .and_then(scan_mode),
+            _ => (env.var)("AETHER_SCAN").as_deref().and_then(scan_mode),
         };
-        let peer = peer_setting(settings, "peer", "AETHER_PEER")?;
-        let wg_peer = peer_setting(settings, "wgPeer", "AETHER_WG_PEER")?;
+        let peer = peer_setting(settings, "peer", "AETHER_PEER", env)?;
+        let wg_peer = peer_setting(settings, "wgPeer", "AETHER_WG_PEER", env)?;
         let ironclad_port = settings
             .get("ironcladPort")
             .and_then(crate::json::Json::as_port)
-            .or_else(|| env_u64("AETHER_IRONCLAD_PORT").and_then(|port| u16::try_from(port).ok()))
+            .or_else(|| {
+                env_u64("AETHER_IRONCLAD_PORT", env).and_then(|port| u16::try_from(port).ok())
+            })
             .unwrap_or(IRONCLAD_PORT);
         let quick_reconnect = settings
             .get("quickReconnect")
             .and_then(crate::json::Json::as_bool)
-            .or_else(|| env_bool("AETHER_QUICK_RECONNECT"))
+            .or_else(|| env_bool("AETHER_QUICK_RECONNECT", env))
             .unwrap_or(false);
         let last_edge = settings
             .get("lastEdge")
@@ -262,14 +261,14 @@ impl EdgeSpec {
             .get("stale")
             .and_then(crate::json::Json::as_u32)
             .map(u64::from)
-            .or_else(|| env_u64("AETHER_WG_STALE_SECS"))
+            .or_else(|| env_u64("AETHER_WG_STALE_SECS", env))
             .filter(|seconds| *seconds > 0)
             .map(|seconds| Duration::from_secs(seconds.min(SCAN_CAP_SECS)));
         let cooldown = settings
             .get("cooldown")
             .and_then(crate::json::Json::as_u32)
             .map(u64::from)
-            .or_else(|| env_u64("AETHER_WG_ENDPOINT_COOLDOWN_SECS"))
+            .or_else(|| env_u64("AETHER_WG_ENDPOINT_COOLDOWN_SECS", env))
             .map_or(Duration::from_secs(COOLDOWN_SECS), |seconds| {
                 Duration::from_secs(seconds.min(SCAN_CAP_SECS))
             });
@@ -296,7 +295,7 @@ struct GoolSettings {
     wiw_inner: Option<SocketAddr>,
 }
 
-fn gool_settings(settings: &crate::json::Json) -> Result<GoolSettings, String> {
+fn gool_settings(settings: &crate::json::Json, env: &Env<'_>) -> Result<GoolSettings, String> {
     let identity_file = settings
         .get("goolIdentityFile")
         .and_then(crate::json::Json::as_str)
@@ -318,8 +317,8 @@ fn gool_settings(settings: &crate::json::Json) -> Result<GoolSettings, String> {
         identity_file,
         inline,
         peer,
-        wiw_outer: nested_peer(settings, "wiwOuter", "AETHER_WIW_OUTER_PEER")?,
-        wiw_inner: nested_peer(settings, "wiwInner", "AETHER_WIW_INNER_PEER")?,
+        wiw_outer: nested_peer(settings, "wiwOuter", "AETHER_WIW_OUTER_PEER", env)?,
+        wiw_inner: nested_peer(settings, "wiwInner", "AETHER_WIW_INNER_PEER", env)?,
     })
 }
 
@@ -332,7 +331,7 @@ struct MimSettings {
     inner: Option<SocketAddr>,
 }
 
-fn mim_settings(settings: &crate::json::Json) -> Result<MimSettings, String> {
+fn mim_settings(settings: &crate::json::Json, env: &Env<'_>) -> Result<MimSettings, String> {
     let identity_file = settings
         .get("mimIdentityFile")
         .and_then(crate::json::Json::as_str)
@@ -342,9 +341,9 @@ fn mim_settings(settings: &crate::json::Json) -> Result<MimSettings, String> {
         .get("mimIdentity")
         .map(Identity::from_json)
         .transpose()?;
-    let mut outer = nested_peer(settings, "mimOuter", "AETHER_MIM_OUTER_PEER")?;
-    let mut inner = nested_peer(settings, "mimInner", "AETHER_MIM_INNER_PEER")?;
-    if let Ok(peers) = std::env::var("AETHER_MIM_PEERS") {
+    let mut outer = nested_peer(settings, "mimOuter", "AETHER_MIM_OUTER_PEER", env)?;
+    let mut inner = nested_peer(settings, "mimInner", "AETHER_MIM_INNER_PEER", env)?;
+    if let Some(peers) = (env.var)("AETHER_MIM_PEERS") {
         let peers = peers.trim();
         if !peers.is_empty() && !mim_scan_keyword(peers) {
             let mut hops = peers
@@ -392,17 +391,14 @@ fn nested_peer(
     settings: &crate::json::Json,
     key: &str,
     environment: &str,
+    env: &Env<'_>,
 ) -> Result<Option<SocketAddr>, String> {
     let text = settings
         .get(key)
         .and_then(crate::json::Json::as_str)
         .filter(|text| !text.is_empty())
         .map(str::to_owned)
-        .or_else(|| {
-            std::env::var(environment)
-                .ok()
-                .filter(|text| !text.is_empty())
-        });
+        .or_else(|| (env.var)(environment).filter(|text| !text.is_empty()));
     text.map(|text| {
         parse_endpoint(&text).ok_or_else(|| format!("warp: `{key}` is not an address: `{text}`"))
     })
@@ -435,9 +431,24 @@ fn spec_identity(
     Ok((mode, register, identity_file, inline))
 }
 
+struct Env<'a> {
+    var: &'a dyn Fn(&str) -> Option<String>,
+    present: &'a dyn Fn(&str) -> bool,
+}
+
 impl WarpSpec {
-    #[allow(clippy::too_many_lines)]
     fn from(settings: &crate::json::Json) -> Result<Self, String> {
+        Self::from_with(
+            settings,
+            &Env {
+                var: &|name| std::env::var(name).ok(),
+                present: &|name| std::env::var_os(name).is_some(),
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn from_with(settings: &crate::json::Json, env: &Env<'_>) -> Result<Self, String> {
         let (mode, register, identity_file, inline) = spec_identity(settings)?;
         let api = settings
             .get("api")
@@ -493,16 +504,17 @@ impl WarpSpec {
         let (masque_address, masque_port, masque_server_name, masque_host, masque_path) =
             masque_settings(settings.get("masque"));
         let tls = crate::warp_tls::WarpTls::from_settings(Some(settings), &masque_server_name)?;
-        let edge = EdgeSpec::from(settings)?;
-        let noize = crate::noize::NoizeSettings::from_settings(settings)?;
-        let quic_v2 = quic_v2_enabled(settings, std::env::var("AETHER_QUIC_V2").ok().as_deref());
-        let gool = gool_settings(settings)?;
+        let edge = EdgeSpec::from_with(settings, env)?;
+        let noize =
+            crate::noize::NoizeSettings::from_settings_with(settings, env.var, env.present)?;
+        let quic_v2 = quic_v2_enabled(settings, (env.var)("AETHER_QUIC_V2").as_deref());
+        let gool = gool_settings(settings, env)?;
         let mim = if mode == Mode::Mim {
-            mim_settings(settings)?
+            mim_settings(settings, env)?
         } else {
             MimSettings::default()
         };
-        let team = crate::zerotrust::TeamSettings::from_settings(settings)?;
+        let team = crate::zerotrust::TeamSettings::from_settings_with(settings, env.var)?;
         let gateway = match settings.get("gateway") {
             Some(crate::json::Json::Bool(value)) => *value,
             Some(_) => return Err("warp: `gateway` must be a boolean".to_owned()),
@@ -808,23 +820,20 @@ fn peer_setting(
     settings: &crate::json::Json,
     key: &str,
     environment: &str,
+    env: &Env<'_>,
 ) -> Result<Option<SocketAddr>, String> {
     let text = settings
         .get(key)
         .and_then(crate::json::Json::as_str)
         .filter(|text| !text.is_empty())
         .map(str::to_owned)
-        .or_else(|| {
-            std::env::var(environment)
-                .ok()
-                .filter(|text| !text.is_empty())
-        });
+        .or_else(|| (env.var)(environment).filter(|text| !text.is_empty()));
     text.map(|text| parse_endpoint(&text).ok_or_else(|| format!("warp: `{key}` is not host:port")))
         .transpose()
 }
 
-fn env_u64(name: &str) -> Option<u64> {
-    std::env::var(name).ok()?.trim().parse().ok()
+fn env_u64(name: &str, env: &Env<'_>) -> Option<u64> {
+    (env.var)(name)?.trim().parse().ok()
 }
 
 fn quic_v2_enabled(settings: &crate::json::Json, environment: Option<&str>) -> bool {
@@ -840,8 +849,8 @@ fn quic_v2_enabled(settings: &crate::json::Json, environment: Option<&str>) -> b
         })
 }
 
-fn env_bool(name: &str) -> Option<bool> {
-    let text = std::env::var(name).ok()?;
+fn env_bool(name: &str, env: &Env<'_>) -> Option<bool> {
+    let text = (env.var)(name)?;
     if ["1", "true", "on", "yes"]
         .iter()
         .any(|on| text.trim().eq_ignore_ascii_case(on))
@@ -2956,7 +2965,7 @@ impl WarpOut {
         asked: &crate::proxy::Destination,
         prefix: &[u8],
         deadline: Instant,
-    ) -> bool {
+    ) -> Option<Arc<AtomicBool>> {
         let (ready, wait) = std::sync::mpsc::sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));
         let queued = if let Some(masque) = &self.masque {
@@ -2992,8 +3001,9 @@ impl WarpOut {
                 .unwrap_or(false);
         if !ready {
             cancelled.store(true, Ordering::Release);
+            return None;
         }
-        ready
+        Some(cancelled)
     }
 
     pub(crate) fn edge(&self) -> Option<SocketAddr> {
@@ -3054,42 +3064,44 @@ impl WarpOut {
             self.serve_lane(client, asked, prefix);
             return;
         };
+        if !self.has_masque_carrier() {
+            self.serve_lane(client, asked, prefix);
+            return;
+        }
         let deadline = Instant::now() + GATEWAY_PROBE_TIMEOUT;
         let Some((local, tunnel)) = crate::reverse::loopback_pair() else {
             self.serve_lane(client, asked, prefix);
             return;
         };
-        if !self.has_masque_carrier() {
+        let fallback = |probe: Option<&Arc<AtomicBool>>,
+                        local: crate::conn::Connection,
+                        client: crate::conn::Connection| {
+            if let Some(probe) = probe {
+                probe.store(true, Ordering::Release);
+            }
+            drop(local);
             self.serve_lane(client, asked, prefix);
-            return;
-        }
-        if !self.serve_gateway(
+        };
+        let Some(probe) = self.serve_gateway(
             tunnel,
             &crate::proxy::Destination::Address(gateway.proxy),
             &[],
             deadline,
-        ) {
-            self.serve_lane(client, asked, prefix);
-            return;
-        }
+        ) else {
+            return fallback(None, local, client);
+        };
         let budget = deadline.saturating_duration_since(Instant::now());
         if budget.is_zero() {
-            self.serve_lane(client, asked, prefix);
-            return;
+            return fallback(Some(&probe), local, client);
         }
         if !gateway.answers(asked) {
-            self.serve_lane(client, asked, prefix);
-            return;
+            return fallback(Some(&probe), local, client);
         }
         if local.set_write_timeout(Some(budget)).is_err() {
-            self.serve_lane(client, asked, prefix);
-            return;
+            return fallback(Some(&probe), local, client);
         }
         let answered = match (&local).write(&request) {
-            Ok(0) | Err(_) => {
-                self.serve_lane(client, asked, prefix);
-                return;
-            }
+            Ok(0) | Err(_) => return fallback(Some(&probe), local, client),
             Ok(written) if written < request.len() => (&local)
                 .write_all(&request[written..])
                 .and_then(|()| read_connect_head(&local, deadline)),
@@ -3099,14 +3111,12 @@ impl WarpOut {
             Ok(head) => head,
             Err(reason) => {
                 gateway.retire(&reason.to_string());
-                self.serve_lane(client, asked, prefix);
-                return;
+                return fallback(Some(&probe), local, client);
             }
         };
         if !accepted {
             gateway.retire("the gateway refused the CONNECT");
-            self.serve_lane(client, asked, prefix);
-            return;
+            return fallback(Some(&probe), local, client);
         }
         let _ = local.set_read_timeout(None);
         let _ = local.set_write_timeout(None);
@@ -3118,6 +3128,7 @@ impl WarpOut {
             }
         });
         if forwarded.is_err() {
+            probe.store(true, Ordering::Release);
             return;
         }
         crate::proxy::relay_handoff(&client, &local);
@@ -3783,6 +3794,7 @@ fn provision_kind_with(
                             slot.label(),
                             error.reason
                         );
+                            backup_corrupt(&path)?;
                             let identity = register_identity(spec, slot.enrolls_masque())?;
                             identity.save(&path)?;
                             (identity, true)
@@ -4864,7 +4876,8 @@ mod tests {
         let masque = dir.join("identity-masque.json");
         let paths = KeyPaths::new(&base, None, Some(&masque));
         let first = Slot::Masque.allocation(&paths);
-        sample_identity().save(&first).expect("the saved identity");
+        let original = sample_identity();
+        original.save(&first).expect("the saved identity");
         let spec = WarpSpec {
             mode: Mode::Gool,
             identity_file: Some(base.clone()),
@@ -4892,6 +4905,12 @@ mod tests {
         assert_eq!(
             Identity::load(&first).expect("the replacement").device_id,
             "replacement"
+        );
+        assert_eq!(
+            Identity::load(&corrupt_target(&first))
+                .expect("the refused identity")
+                .device_id,
+            original.device_id
         );
         assert_eq!(registrations.get(), 2);
         std::fs::remove_dir_all(&dir).ok();
@@ -5538,68 +5557,31 @@ mod tests {
         assert!(KeyKind::parse("other").is_err());
     }
 
-    fn without_access_env<T>(f: impl FnOnce() -> T) -> T {
-        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                for (name, value) in &self.0 {
-                    match value {
-                        Some(value) => std::env::set_var(*name, value),
-                        None => std::env::remove_var(*name),
-                    }
-                }
-            }
+    fn empty_var(_: &str) -> Option<String> {
+        None
+    }
+
+    fn empty_present(_: &str) -> bool {
+        false
+    }
+
+    fn empty_env() -> Env<'static> {
+        Env {
+            var: &empty_var,
+            present: &empty_present,
         }
-        let _lock = crate::router::ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let names = [
-            "AETHER_SCAN",
-            "AETHER_PEER",
-            "AETHER_WG_PEER",
-            "AETHER_IRONCLAD_PORT",
-            "AETHER_QUICK_RECONNECT",
-            "AETHER_WG_STALE_SECS",
-            "AETHER_WG_ENDPOINT_COOLDOWN_SECS",
-            "AETHER_WIW_OUTER_PEER",
-            "AETHER_WIW_INNER_PEER",
-            "AETHER_MIM_OUTER_PEER",
-            "AETHER_MIM_INNER_PEER",
-            "AETHER_MIM_PEERS",
-            "AETHER_QUIC_V2",
-            "AETHER_TEAM",
-            "AETHER_ACCESS_CLIENT_ID",
-            "AETHER_ACCESS_CLIENT_SECRET",
-            "AETHER_ACCESS_TOKEN",
-            "AETHER_ACCESS_EMAIL",
-            "AETHER_NOIZE",
-            "AETHER_WG_NO_PROFILE_RETRY",
-        ];
-        let restore = Restore(
-            names
-                .iter()
-                .map(|name| (*name, std::env::var_os(*name)))
-                .collect(),
-        );
-        for name in names {
-            std::env::remove_var(name);
-        }
-        let result = f();
-        drop(restore);
-        result
     }
 
     #[test]
     fn a_gool_mode_parses_the_inner_hop() {
-        let spec = without_access_env(|| {
-            WarpSpec::from(
-                &crate::json::parse(
-                    r#"{"mode":"gool","register":true,"mtu":1500,"goolPeer":"192.0.2.9:2408","goolIdentityFile":"inner.json"}"#,
-                )
-                .expect("settings"),
+        let spec = WarpSpec::from_with(
+            &crate::json::parse(
+                r#"{"mode":"gool","register":true,"mtu":1500,"goolPeer":"192.0.2.9:2408","goolIdentityFile":"inner.json"}"#,
             )
-            .expect("a gool spec")
-        });
+            .expect("settings"),
+            &empty_env(),
+        )
+        .expect("a gool spec");
         assert_eq!(spec.mode, Mode::Gool);
         assert_eq!(spec.mode.label(), "gool");
         assert_eq!(spec.mtu, 1500);
@@ -5619,15 +5601,14 @@ mod tests {
 
     #[test]
     fn a_gool_classic_mode_parses_both_hops() {
-        let spec = without_access_env(|| {
-            WarpSpec::from(
-                &crate::json::parse(
-                    r#"{"mode":"gool-classic","register":true,"wiwOuter":"192.0.2.1:2408","wiwInner":"192.0.2.2:2408","goolIdentityFile":"inner.json"}"#,
-                )
-                .expect("settings"),
+        let spec = WarpSpec::from_with(
+            &crate::json::parse(
+                r#"{"mode":"gool-classic","register":true,"wiwOuter":"192.0.2.1:2408","wiwInner":"192.0.2.2:2408","goolIdentityFile":"inner.json"}"#,
             )
-            .expect("a gool-classic spec")
-        });
+            .expect("settings"),
+            &empty_env(),
+        )
+        .expect("a gool-classic spec");
         assert_eq!(spec.mode, Mode::GoolClassic);
         assert_eq!(spec.mode.label(), "gool-classic");
         assert_eq!(

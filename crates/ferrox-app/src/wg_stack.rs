@@ -2328,6 +2328,9 @@ fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, up_ready: bool) -> bool {
     let mut moved = false;
     let socket = sockets.get_mut::<TcpSocket>(flow.handle);
     if matches!(socket.state(), State::Established | State::CloseWait) {
+        if !flow.established {
+            socket.set_timeout(None);
+        }
         flow.established = true;
     }
     if socket.state() == State::Closed && !flow.established {
@@ -3813,13 +3816,25 @@ mod tests {
         stack.poll();
         assert_eq!(stack.flows.len(), 1);
         let port = stack.flows[0].local_port;
-        stack.started = StdInstant::now()
-            .checked_sub(crate::budgets::dial())
-            .and_then(|past| past.checked_sub(Duration::from_millis(1)))
-            .expect("the dial timeout fits before now");
+        let advance = crate::budgets::dial() + Duration::from_millis(1);
+        stack.started = stack
+            .started
+            .checked_sub(advance)
+            .expect("the simulated dial timeout fits before the stack origin");
         stack.poll();
         assert!(stack.flows.is_empty(), "the unanswered connect timed out");
         assert!(!stack.ports.contains(&port), "its local port was released");
+    }
+
+    /// A connected flow drops the dial timeout that bounds only its handshake.
+    #[test]
+    fn an_established_flow_clears_the_dial_timeout() {
+        let (mut stack, _packets, _app) = established_client();
+        let socket = stack.sockets.get::<TcpSocket>(stack.flows[0].handle);
+        assert!(
+            socket.timeout().is_none(),
+            "the dial timeout survived establishment"
+        );
     }
 
     /// An upload is read straight into the socket's transmit ring: the reader
