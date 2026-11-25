@@ -27,6 +27,7 @@ const SERVER_SETTINGS: u8 = 10;
 const VERSION: u32 = 2;
 const HEADER: usize = 7;
 const MAX_FRAME: usize = 0xffff;
+const PADDING_LIMIT: usize = 1 << 20;
 const PASSWORD_LEN: usize = 32;
 const POLL: Duration = Duration::from_millis(100);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -45,7 +46,7 @@ const DEFAULT_PADDING: &[u8] = b"stop=8
 7=500-1000";
 
 type Reader = Box<dyn Read + Send>;
-type Writer = Box<dyn Write + Send>;
+type Writer = Box<dyn crate::proxy::FrameWrite + Send>;
 
 #[derive(Clone)]
 enum PaddingStep {
@@ -352,6 +353,12 @@ impl Drop for StreamState {
     }
 }
 
+struct Pending {
+    bytes: Vec<u8>,
+    at: usize,
+    done: Option<Arc<AtomicBool>>,
+}
+
 struct Shared {
     writer: Mutex<Option<Writer>>,
     streams: Mutex<HashMap<u32, Arc<StreamState>>>,
@@ -360,7 +367,7 @@ struct Shared {
     settings_received: AtomicBool,
     peer_version: AtomicU32,
     padding: Mutex<Arc<Padding>>,
-    pending: Mutex<Option<Vec<u8>>>,
+    pending: Mutex<Option<Pending>>,
     packet_count: AtomicU32,
     send_padding: AtomicBool,
     queue_budget: Arc<QueueBudget>,
@@ -413,7 +420,11 @@ impl Shared {
     }
 
     fn queue_pending(&self, packet: Vec<u8>) {
-        *self.pending.lock().unwrap_or_else(PoisonError::into_inner) = Some(packet);
+        *self.pending.lock().unwrap_or_else(PoisonError::into_inner) = Some(Pending {
+            bytes: packet,
+            at: 0,
+            done: None,
+        });
     }
 
     fn has_pending(&self) -> bool {
@@ -423,12 +434,84 @@ impl Shared {
             .is_some()
     }
 
+    fn pending_len(&self) -> usize {
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map_or(0, |pending| pending.bytes.len() - pending.at)
+    }
+
     fn write_packet(&self, packet: &[u8]) -> std::io::Result<()> {
         let result = self.write_packet_locked(packet);
         if result.is_err() {
             self.shutdown("anytls session write failed");
         }
         result
+    }
+
+    fn encode_packet(&self, packet: &[u8]) -> Vec<u8> {
+        if !self.send_padding.load(Ordering::Relaxed) {
+            return packet.to_vec();
+        }
+        let count = self.packet_count.fetch_add(1, Ordering::Relaxed) + 1;
+        let padding = {
+            let held = self.padding.lock().unwrap_or_else(PoisonError::into_inner);
+            Arc::clone(&held)
+        };
+        if count >= padding.stop {
+            self.send_padding.store(false, Ordering::Relaxed);
+            return packet.to_vec();
+        }
+        let mut out = Vec::new();
+        let mut data = packet;
+        for size in padding.steps(count) {
+            let size = match size {
+                PaddingSize::Check => {
+                    if data.is_empty() {
+                        break;
+                    }
+                    continue;
+                }
+                PaddingSize::Bytes(size) => size,
+            };
+            if data.len() > size {
+                out.extend_from_slice(&data[..size]);
+                data = &data[size..];
+                continue;
+            }
+            let payload = data;
+            let records = size.div_ceil(MAX_FRAME);
+            let mut record = Vec::with_capacity(size + records * HEADER);
+            if payload.is_empty() {
+                let mut remaining = size;
+                while remaining > 0 {
+                    let waste = remaining.min(MAX_FRAME);
+                    push_waste(&mut record, waste);
+                    remaining -= waste;
+                }
+            } else {
+                record.extend_from_slice(payload);
+                let mut remaining = size.saturating_sub(record.len());
+                while remaining > HEADER {
+                    let waste = (remaining - HEADER).min(MAX_FRAME);
+                    push_waste(&mut record, waste);
+                    remaining -= HEADER + waste;
+                }
+            }
+            // A peer controls the step list, so one packet's retained padding is capped; the payload that follows is never dropped.
+            if out.len().saturating_add(record.len()) > PADDING_LIMIT {
+                out.extend_from_slice(payload);
+                data = &[];
+                break;
+            }
+            out.extend_from_slice(&record);
+            if !payload.is_empty() {
+                data = &[];
+            }
+        }
+        out.extend_from_slice(data);
+        out
     }
 
     fn write_packet_locked(&self, packet: &[u8]) -> std::io::Result<()> {
@@ -444,14 +527,22 @@ impl Shared {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        let combined = pending.map(|mut pending| {
-            pending.extend_from_slice(packet);
-            pending
+        let done = pending
+            .as_ref()
+            .and_then(|pending| pending.done.as_ref().map(Arc::clone));
+        let combined = pending.map(|pending| {
+            let mut bytes = pending.bytes[pending.at..].to_vec();
+            bytes.extend_from_slice(packet);
+            bytes
         });
         let packet = combined.as_deref().unwrap_or(packet);
         if !self.send_padding.load(Ordering::Relaxed) {
             writer.write_all(packet)?;
-            return writer.flush();
+            writer.flush()?;
+            if let Some(done) = done {
+                done.store(true, Ordering::SeqCst);
+            }
+            return Ok(());
         }
         let count = self.packet_count.fetch_add(1, Ordering::Relaxed) + 1;
         let padding = {
@@ -461,7 +552,11 @@ impl Shared {
         if count >= padding.stop {
             self.send_padding.store(false, Ordering::Relaxed);
             writer.write_all(packet)?;
-            return writer.flush();
+            writer.flush()?;
+            if let Some(done) = done {
+                done.store(true, Ordering::SeqCst);
+            }
+            return Ok(());
         }
         let mut data = packet;
         for size in padding.steps(count) {
@@ -503,7 +598,11 @@ impl Shared {
         if !data.is_empty() {
             writer.write_all(data)?;
         }
-        writer.flush()
+        writer.flush()?;
+        if let Some(done) = done {
+            done.store(true, Ordering::SeqCst);
+        }
+        Ok(())
     }
 
     fn insert_stream(&self, id: u32, state: &Arc<StreamState>) {
@@ -594,6 +693,9 @@ impl Session {
             fin_sent: Arc::new(AtomicBool::new(false)),
             closed: Arc::new(AtomicBool::new(false)),
             holders: Arc::new(AtomicUsize::new(1)),
+            pending: Vec::new(),
+            pending_input: 0,
+            pending_done: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -611,6 +713,9 @@ pub(crate) struct AnyTlsStream {
     fin_sent: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     holders: Arc<AtomicUsize>,
+    pending: Vec<u8>,
+    pending_input: usize,
+    pending_done: Arc<AtomicBool>,
 }
 
 impl Clone for AnyTlsStream {
@@ -623,6 +728,9 @@ impl Clone for AnyTlsStream {
             fin_sent: Arc::clone(&self.fin_sent),
             closed: Arc::clone(&self.closed),
             holders: Arc::clone(&self.holders),
+            pending: Vec::new(),
+            pending_input: 0,
+            pending_done: Arc::clone(&self.pending_done),
         }
     }
 }
@@ -705,10 +813,7 @@ impl Write for AnyTlsStream {
         if buf.is_empty() {
             return Ok(0);
         }
-        let mut packet = Vec::with_capacity(buf.len() + HEADER);
-        for chunk in buf.chunks(MAX_FRAME) {
-            push_frame(&mut packet, PSH, self.id, chunk);
-        }
+        let packet = self.data_packet(buf);
         self.session.shared.write_packet(&packet)?;
         Ok(buf.len())
     }
@@ -730,6 +835,179 @@ impl Write for AnyTlsStream {
             self.session.shared.shutdown("anytls session write failed");
         }
         result
+    }
+}
+
+impl proxy::LaneWrite for AnyTlsStream {
+    fn push(&mut self, data: &[u8]) -> proxy::Push {
+        if data.is_empty() {
+            return proxy::Push::Took(0);
+        }
+        if !self.session.shared.alive() {
+            return proxy::Push::Lost;
+        }
+        if self.pending_input > 0 && self.pending_done.swap(false, Ordering::SeqCst) {
+            return proxy::Push::Took(std::mem::take(&mut self.pending_input));
+        }
+        if self.pending.is_empty() && self.pending_input == 0 {
+            if self.session.shared.pending_len() > 0 {
+                let (push, _) = self.flush_pending();
+                if matches!(push, proxy::Push::Lost) {
+                    return proxy::Push::Lost;
+                }
+                if self.session.shared.pending_len() > 0 {
+                    return proxy::Push::Parked;
+                }
+            }
+            let packet = self.data_packet(data);
+            self.pending = self.session.shared.encode_packet(&packet);
+            self.pending_input = data.len();
+            self.pending_done.store(false, Ordering::SeqCst);
+        }
+        self.flush_pending().0
+    }
+
+    fn settle(&mut self) -> proxy::Settle {
+        let (push, moved) = self.flush_pending();
+        match push {
+            proxy::Push::Lost => return proxy::Settle::Lost,
+            proxy::Push::Took(_) => return proxy::Settle::Advanced,
+            proxy::Push::Parked => {}
+        }
+        if moved {
+            return proxy::Settle::Advanced;
+        }
+        let Ok(mut writer) = self.session.shared.writer.try_lock() else {
+            return proxy::Settle::Parked;
+        };
+        let Some(writer) = writer.as_mut() else {
+            return proxy::Settle::Lost;
+        };
+        match writer.settle() {
+            proxy::Settle::Clear
+                if self.session.shared.pending_len() > 0
+                    || !self.pending.is_empty()
+                    || self.pending_input > 0 =>
+            {
+                proxy::Settle::Parked
+            }
+            outcome => outcome,
+        }
+    }
+}
+
+impl AnyTlsStream {
+    fn data_packet(&self, buf: &[u8]) -> Vec<u8> {
+        let mut packet = Vec::with_capacity(buf.len() + HEADER);
+        for chunk in buf.chunks(MAX_FRAME) {
+            push_frame(&mut packet, PSH, self.id, chunk);
+        }
+        packet
+    }
+
+    fn flush_pending(&mut self) -> (proxy::Push, bool) {
+        let Ok(mut guard) = self.session.shared.writer.try_lock() else {
+            return (proxy::Push::Parked, false);
+        };
+        let Some(writer) = guard.as_mut() else {
+            return (proxy::Push::Lost, false);
+        };
+        let mut moved = false;
+        if self.pending_input > 0 && self.pending_done.swap(false, Ordering::SeqCst) {
+            return (
+                proxy::Push::Took(std::mem::take(&mut self.pending_input)),
+                false,
+            );
+        }
+        let pending = self
+            .session
+            .shared
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(mut pending) = pending {
+            let start = pending.at;
+            let (complete, failed) = Self::drain_pending(writer, &pending.bytes, &mut pending.at);
+            moved = pending.at > start || (complete && start < pending.bytes.len());
+            if failed {
+                drop(guard);
+                self.session.shared.shutdown("anytls session write failed");
+                return (proxy::Push::Lost, moved);
+            }
+            if !complete {
+                *self
+                    .session
+                    .shared
+                    .pending
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(pending);
+                return (proxy::Push::Parked, moved);
+            }
+            if let Some(done) = pending.done.as_ref() {
+                done.store(true, Ordering::SeqCst);
+            }
+        }
+        if self.pending.is_empty() {
+            if self.pending_input == 0 {
+                return (proxy::Push::Parked, moved);
+            }
+            self.pending_done.store(false, Ordering::SeqCst);
+            return (
+                proxy::Push::Took(std::mem::take(&mut self.pending_input)),
+                moved,
+            );
+        }
+        let bytes = std::mem::take(&mut self.pending);
+        let mut at = 0;
+        let (complete, failed) = Self::drain_pending(writer, &bytes, &mut at);
+        moved |= at > 0 || (complete && !bytes.is_empty());
+        if failed {
+            drop(guard);
+            self.session.shared.shutdown("anytls session write failed");
+            return (proxy::Push::Lost, moved);
+        }
+        if complete {
+            if self.pending_input == 0 {
+                return (proxy::Push::Parked, moved);
+            }
+            self.pending_done.store(false, Ordering::SeqCst);
+            return (
+                proxy::Push::Took(std::mem::take(&mut self.pending_input)),
+                moved,
+            );
+        }
+        *self
+            .session
+            .shared
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Pending {
+            bytes,
+            at,
+            done: Some(Arc::clone(&self.pending_done)),
+        });
+        (proxy::Push::Parked, moved)
+    }
+
+    fn drain_pending(writer: &mut Writer, bytes: &[u8], at: &mut usize) -> (bool, bool) {
+        let mut complete = *at == bytes.len();
+        let mut failed = false;
+        if !complete {
+            match writer.write_ready(&[&bytes[*at..]]) {
+                Some(Ok(n)) if *at + n >= bytes.len() => complete = true,
+                Some(Ok(n)) if n > 0 => *at += n,
+                Some(Ok(_)) => {}
+                Some(Err(error)) if crate::proxy::is_timeout(&error) => {}
+                Some(Err(_)) => failed = true,
+                None => match writer.offer_slices(&[&bytes[*at..]]) {
+                    proxy::Accepted::All => complete = true,
+                    proxy::Accepted::Full => {}
+                    proxy::Accepted::Lost => failed = true,
+                },
+            }
+        }
+        (complete, failed)
     }
 }
 
@@ -812,7 +1090,7 @@ impl AnyTlsOut {
     fn connect(self: &Arc<Self>) -> Option<Arc<Session>> {
         let server = proxy::resolve_outbound(&self.address, self.port)?;
         let session = proxy::anytls_dial_session(&server, &self.tls)?;
-        let (mut reader, mut writer) = proxy::anytls_client_halves(session)?;
+        let (mut reader, mut writer) = proxy::tls_client_halves(session)?;
         let padding_len = self.padding.handshake_padding().min(u16::MAX as usize);
         let mut prologue = Vec::with_capacity(PASSWORD_LEN + 2 + padding_len);
         prologue.extend_from_slice(&self.password);
@@ -1018,22 +1296,23 @@ fn serve_connection(
     {
         return;
     }
-    let (mut reader, writer): (Reader, Writer) = if let Some(identity) = tls {
+    let bounded_read = tls.is_some();
+    let (mut reader, writer, driven): (Reader, Writer, bool) = if let Some(identity) = tls {
         let Ok(mut session) = ferrox_core::tls::accept(identity.as_ref(), stream) else {
             return;
         };
         if session.handshake().is_err() {
             return;
         }
-        let Some(halves) = proxy::anytls_server_halves(session) else {
+        let Some(((reader, writer), driven)) = proxy::tls_server_halves(session) else {
             return;
         };
-        halves
+        (reader, writer, driven)
     } else {
         let Ok(writer) = stream.try_clone() else {
             return;
         };
-        (Box::new(stream), Box::new(writer))
+        (Box::new(stream), Box::new(writer), false)
     };
     let left = deadline.saturating_duration_since(Instant::now());
     if raw
@@ -1070,7 +1349,13 @@ fn serve_connection(
             left -= take;
         }
     }
-    if raw.set_read_timeout(None).is_err() {
+    let idle = if driven {
+        crate::budgets::SESSION_IDLE_POLL
+    } else {
+        crate::budgets::RELAY_POLL
+    };
+    let timeout = bounded_read.then_some(idle);
+    if raw.set_read_timeout(timeout).is_err() {
         return;
     }
     let session = Arc::new(Session {
@@ -1126,6 +1411,9 @@ fn read_server(reader: &mut dyn Read, session: &Arc<Session>, context: &Arc<Serv
                     fin_sent: Arc::new(AtomicBool::new(false)),
                     closed: Arc::new(AtomicBool::new(false)),
                     holders: Arc::new(AtomicUsize::new(1)),
+                    pending: Vec::new(),
+                    pending_input: 0,
+                    pending_done: Arc::new(AtomicBool::new(false)),
                 };
                 let context = Arc::clone(context);
                 std::thread::spawn(move || serve_stream(stream, &context));
@@ -1528,6 +1816,7 @@ fn parse_settings(payload: &[u8]) -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
 
     struct Sink(Arc<Mutex<Vec<u8>>>);
 
@@ -1561,6 +1850,83 @@ mod tests {
         }
     }
 
+    impl crate::proxy::FrameWrite for Sink {
+        fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+            parts.iter().all(|part| self.write_all(part).is_ok())
+        }
+    }
+
+    struct Bounded(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Bounded {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl crate::proxy::FrameWrite for Bounded {
+        fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+            parts.iter().all(|part| self.write_all(part).is_ok())
+        }
+
+        fn write_ready(&mut self, parts: &[&[u8]]) -> Option<std::io::Result<usize>> {
+            let take = parts[0].len().min(2);
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend_from_slice(&parts[0][..take]);
+            Some(Ok(take))
+        }
+    }
+
+    struct Scripted {
+        out: Arc<Mutex<Vec<u8>>>,
+        takes: Arc<Mutex<VecDeque<usize>>>,
+    }
+
+    impl Write for Scripted {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.out
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl crate::proxy::FrameWrite for Scripted {
+        fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+            parts.iter().all(|part| self.write_all(part).is_ok())
+        }
+
+        fn write_ready(&mut self, parts: &[&[u8]]) -> Option<std::io::Result<usize>> {
+            let take = self
+                .takes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop_front()
+                .unwrap_or(0);
+            let take = parts[0].len().min(take);
+            self.out
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend_from_slice(&parts[0][..take]);
+            Some(Ok(take))
+        }
+    }
+
     fn test_stream(shared: &Arc<Shared>, id: u32) -> AnyTlsStream {
         AnyTlsStream {
             session: Arc::new(Session {
@@ -1572,7 +1938,115 @@ mod tests {
             fin_sent: Arc::new(AtomicBool::new(false)),
             closed: Arc::new(AtomicBool::new(false)),
             holders: Arc::new(AtomicUsize::new(1)),
+            pending: Vec::new(),
+            pending_input: 0,
+            pending_done: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    #[test]
+    fn a_partial_anytls_write_is_settle_progress() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let padding = Padding::new(b"stop=0\n").expect("parses");
+        let shared = Arc::new(Shared::new(
+            Box::new(Bounded(Arc::clone(&written))),
+            padding,
+            false,
+        ));
+        let mut stream = test_stream(&shared, 1);
+        assert!(matches!(
+            crate::proxy::LaneWrite::push(&mut stream, b"abcdef"),
+            crate::proxy::Push::Parked
+        ));
+        assert!(matches!(
+            crate::proxy::LaneWrite::settle(&mut stream),
+            crate::proxy::Settle::Advanced
+        ));
+    }
+
+    struct Stalled;
+
+    impl Write for Stalled {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl crate::proxy::FrameWrite for Stalled {
+        fn write_slices(&mut self, _: &[&[u8]]) -> bool {
+            false
+        }
+
+        fn write_ready(&mut self, _: &[&[u8]]) -> Option<std::io::Result<usize>> {
+            Some(Ok(0))
+        }
+    }
+
+    #[test]
+    fn a_stalled_carrier_does_not_admit_a_second_suffix() {
+        let padding = Padding::new(b"stop=0\n").expect("parses");
+        let shared = Arc::new(Shared::new(Box::new(Stalled), padding, false));
+        let mut first = test_stream(&shared, 1);
+        assert!(matches!(
+            crate::proxy::LaneWrite::push(&mut first, b"aaaa"),
+            crate::proxy::Push::Parked
+        ));
+        let queued = shared.pending_len();
+        assert!(queued > 0, "the first packet is retained for its retry");
+        let mut second = test_stream(&shared, 2);
+        assert!(matches!(
+            crate::proxy::LaneWrite::push(&mut second, b"bbbb"),
+            crate::proxy::Push::Parked
+        ));
+        assert_eq!(
+            shared.pending_len(),
+            queued,
+            "a blocked suffix is drained before another packet is admitted"
+        );
+        assert!(
+            second.pending.is_empty(),
+            "the second input stays with its caller"
+        );
+        assert_eq!(second.pending_input, 0);
+    }
+
+    #[test]
+    fn a_completed_packet_is_acknowledged_before_a_later_stream() {
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let takes = Arc::new(Mutex::new(VecDeque::from([2, usize::MAX, 0])));
+        let padding = Padding::new(b"stop=0\n").expect("parses");
+        let shared = Arc::new(Shared::new(
+            Box::new(Scripted {
+                out: Arc::clone(&out),
+                takes: Arc::clone(&takes),
+            }),
+            padding,
+            false,
+        ));
+        let mut first = test_stream(&shared, 1);
+        assert!(matches!(
+            crate::proxy::LaneWrite::push(&mut first, b"aaaaaaaa"),
+            crate::proxy::Push::Parked
+        ));
+        let mut second = test_stream(&shared, 2);
+        assert!(matches!(
+            crate::proxy::LaneWrite::push(&mut second, b"bbbbbbbb"),
+            crate::proxy::Push::Parked
+        ));
+        assert!(shared.pending_len() > 0, "the second packet is retained");
+        assert!(matches!(
+            crate::proxy::LaneWrite::push(&mut first, b"aaaaaaaa"),
+            crate::proxy::Push::Took(8)
+        ));
+        assert_eq!(first.pending_input, 0);
+        assert!(
+            shared.pending_len() > 0,
+            "the first stream does not drain the second packet"
+        );
     }
 
     #[test]
@@ -1602,6 +2076,11 @@ mod tests {
                 Ok(())
             }
         }
+        impl crate::proxy::FrameWrite for Null {
+            fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+                parts.iter().all(|part| self.write_all(part).is_ok())
+            }
+        }
         fn cost(padding: Padding) -> ferrox_core::alloc_count::Counts {
             let shared = Shared::new(Box::new(Null), padding, false);
             let ((), counts) = ferrox_core::alloc_count::measure(|| {
@@ -1624,6 +2103,40 @@ mod tests {
         let small = cost(Padding::new(b"stop=8\n1=100-100").expect("parses"));
         assert_eq!(big.allocs, small.allocs, "the eight records cost no calls");
         assert_eq!(big.bytes, small.bytes, "the eight records cost no bytes");
+    }
+
+    #[test]
+    fn peer_padding_cannot_expand_one_packet_without_bound() {
+        let mut scheme = String::from("stop=8\n1=");
+        for step in 0..4_000 {
+            if step > 0 {
+                scheme.push(',');
+            }
+            scheme.push_str("1048576-1048576");
+        }
+        let padding = Padding::new(scheme.as_bytes()).expect("parses");
+        let shared = Shared::new(
+            Box::new(Sink(Arc::new(Mutex::new(Vec::new())))),
+            padding,
+            false,
+        );
+        let encoded = shared.encode_packet(b"abc");
+        assert!(
+            encoded.len() <= PADDING_LIMIT + 3,
+            "one peer-scheduled packet retained {} bytes",
+            encoded.len()
+        );
+        let padding = Padding::new(b"stop=8\n1=1-1,1048576-1048576").expect("parses");
+        let shared = Shared::new(
+            Box::new(Sink(Arc::new(Mutex::new(Vec::new())))),
+            padding,
+            false,
+        );
+        let encoded = shared.encode_packet(b"abc");
+        assert!(
+            encoded.ends_with(b"abc"),
+            "the rejected padding record dropped the payload: {encoded:?}"
+        );
     }
 
     #[test]
@@ -1654,6 +2167,9 @@ mod tests {
             fin_sent: Arc::new(AtomicBool::new(false)),
             closed: Arc::new(AtomicBool::new(false)),
             holders: Arc::new(AtomicUsize::new(1)),
+            pending: Vec::new(),
+            pending_input: 0,
+            pending_done: Arc::new(AtomicBool::new(false)),
         };
         let duplicate = stream.clone();
         drop(stream);

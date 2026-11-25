@@ -21,3 +21,29 @@ pub use protocol::{
     write_string, write_unsigned_short, write_uuid, write_varint, Long, Packet, UnsignedShort,
 };
 pub use session::{Config, Session};
+
+thread_local! {
+    static READY: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether this thread's XMC write is a readiness offer that must not wait on a held lock.
+pub fn ready() -> bool {
+    READY.with(|ready| ready.get() > 0)
+}
+
+/// Marks the current thread's XMC write as a readiness offer for as long as the guard lives.
+#[derive(Debug)]
+pub struct ReadyWrite(());
+
+impl ReadyWrite {
+    pub fn enter() -> Self {
+        READY.with(|ready| ready.set(ready.get() + 1));
+        Self(())
+    }
+}
+
+impl Drop for ReadyWrite {
+    fn drop(&mut self) {
+        READY.with(|ready| ready.set(ready.get().saturating_sub(1)));
+    }
+}

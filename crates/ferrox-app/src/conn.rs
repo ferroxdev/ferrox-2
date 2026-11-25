@@ -87,6 +87,11 @@ pub(crate) struct Masked {
     mark: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     /// The absolute instant a masked read must stop, carried under a chain that may loop inside one call.
     read_until: std::sync::Mutex<Option<Instant>>,
+    /// The spacing a readiness write deferred, so the next offer parks on the lane's clock.
+    ready_until: std::sync::Arc<std::sync::Mutex<Option<Instant>>>,
+    /// Serializes the descriptor's non-blocking window per socket, shared by its handles.
+    #[cfg(windows)]
+    ready_mode: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
 /// The first-write rewrite an outbound's `sniSpoof` arms, shared by every handle of one stream
@@ -244,20 +249,35 @@ impl XmcWriter {
     }
 }
 
+impl XmcWriter {
+    fn chain(&self) -> std::io::Result<std::sync::MutexGuard<'_, ferrox_core::finalmask::Chain>> {
+        if ferrox_core::finalmask::xmc::ready() {
+            return match self.chain.try_lock() {
+                Ok(chain) => Ok(chain),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    Err(std::io::ErrorKind::WouldBlock.into())
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    Err(io::Error::other("the mask chain is gone"))
+                }
+            };
+        }
+        self.chain
+            .lock()
+            .map_err(|_| io::Error::other("the mask chain is gone"))
+    }
+}
+
 impl std::io::Write for XmcWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.arm()?;
-        let Ok(mut chain) = self.chain.lock() else {
-            return Err(io::Error::other("the mask chain is gone"));
-        };
+        let mut chain = self.chain()?;
         chain.write(&mut &self.stream, buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.arm()?;
-        let Ok(mut chain) = self.chain.lock() else {
-            return Err(io::Error::other("the mask chain is gone"));
-        };
+        let mut chain = self.chain()?;
         chain.flush(&mut &self.stream)?;
         (&self.stream).flush()
     }
@@ -307,6 +327,15 @@ impl XmcState {
             .map(std::sync::Arc::clone)
             .map_err(|error| io::Error::other(error.clone()))
     }
+
+    #[cfg(windows)]
+    fn session_ready(&self) -> io::Result<Xmc> {
+        match self.session.get() {
+            Some(Ok(session)) => Ok(std::sync::Arc::clone(session)),
+            Some(Err(error)) => Err(io::Error::other(error.clone())),
+            None => Err(io::ErrorKind::WouldBlock.into()),
+        }
+    }
 }
 
 impl Masked {
@@ -321,6 +350,47 @@ impl Masked {
             Some(state) => state.session(&self.stream, &self.chain).map(Some),
             None => Ok(None),
         }
+    }
+
+    #[cfg(windows)]
+    fn xmc_ready_session(&self) -> io::Result<Xmc> {
+        if let Some(header) = &self.header {
+            match header.try_lock() {
+                Ok(run) if run.is_done() => {}
+                Ok(_) => return Err(io::ErrorKind::WouldBlock.into()),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(io::Error::other("the header handshake is gone"));
+                }
+            }
+        }
+        self.xmc
+            .as_ref()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?
+            .session_ready()
+    }
+
+    #[cfg(windows)]
+    fn send_xmc_ready(&self, parts: &[&[u8]]) -> io::Result<usize> {
+        let session = self.xmc_ready_session()?;
+        let _ready = ferrox_core::finalmask::xmc::ReadyWrite::enter();
+        let Some(buf) = parts.iter().copied().find(|part| !part.is_empty()) else {
+            return Ok(0);
+        };
+        let armed = self.sni.as_deref().map(|sni| sni.arm(buf));
+        if let Some(SniArm::Empty) = &armed {
+            if let Err(error) = (&*session).write_all(&ferrox_core::evasion::EMPTY_RECORD) {
+                return self.keep_shape(armed.as_ref(), Err(error));
+            }
+        }
+        let buf = match &armed {
+            Some(SniArm::Rewrite(record)) => record.as_slice(),
+            _ => buf,
+        };
+        let outcome = (&*session).write(buf);
+        self.keep_shape(armed.as_ref(), outcome)
     }
 
     /// The XMC packet loop can consume control packet after control packet inside one read, so
@@ -554,10 +624,17 @@ impl Masked {
     }
 
     /// Encode a whole frame and put it on the wire in one call, the shape a blocking relay write has.
-    #[cfg(unix)]
+    /// A chain another handle holds is backpressure, not a wait under the caller's readiness guard.
+    #[cfg(any(unix, windows))]
     fn send_ready(&self, parts: &[&[u8]]) -> io::Result<usize> {
-        let Ok(mut chain) = self.chain.lock() else {
-            return Err(io::Error::other("the mask chain is gone"));
+        let mut chain = match self.chain.try_lock() {
+            Ok(chain) => chain,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(io::Error::other("the mask chain is gone"));
+            }
         };
         let first = parts.iter().position(|part| !part.is_empty());
         let mut total = 0usize;
@@ -584,6 +661,7 @@ impl Masked {
                         return Ok(total);
                     }
                 }
+                Err(_) if total > 0 => return Ok(total),
                 Err(error) => return self.keep_shape(armed.as_ref(), Err(error)),
             }
         }
@@ -670,6 +748,34 @@ impl Masked {
             Some(first) => self.recv(&mut first[..]),
             None => Ok(0),
         }
+    }
+
+    /// Drain the chain's retained output without waiting, so a lane can park on it instead of stranding it behind an idle read.
+    fn flush_chain(&self) -> (usize, io::Result<()>) {
+        let mut chain = match self.chain.try_lock() {
+            Ok(chain) => chain,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return (0, Err(io::ErrorKind::WouldBlock.into()));
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return (0, Err(io::Error::other("the mask chain is gone")));
+            }
+        };
+        if chain.is_empty() {
+            return (0, Ok(()));
+        }
+        #[cfg(unix)]
+        let mut wire = CountingWrite {
+            inner: ReadyWire(&self.stream),
+            written: 0,
+        };
+        #[cfg(not(unix))]
+        let mut wire = CountingWrite {
+            inner: &self.stream,
+            written: 0,
+        };
+        let outcome = chain.flush_ready(&mut wire);
+        (wire.written, outcome)
     }
 
     /// Put the chain's retained output on the wire before a wait for the peer's answer.
@@ -866,6 +972,9 @@ impl Connection {
                     sni: None,
                     mark: None,
                     read_until: std::sync::Mutex::new(None),
+                    ready_until: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                    #[cfg(windows)]
+                    ready_mode: std::sync::Arc::new(std::sync::Mutex::new(())),
                 })
             }
             (Connection::Metered(metered), mask) => Connection::Metered(Metered {
@@ -906,6 +1015,9 @@ impl Connection {
                 sni: Some(state()),
                 mark: None,
                 read_until: std::sync::Mutex::new(None),
+                ready_until: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                #[cfg(windows)]
+                ready_mode: std::sync::Arc::new(std::sync::Mutex::new(())),
             }),
             Connection::Masked(mut masked) => {
                 masked.sni = Some(state());
@@ -943,6 +1055,9 @@ impl Connection {
                 sni: None,
                 mark: Some(mark),
                 read_until: std::sync::Mutex::new(None),
+                ready_until: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                #[cfg(windows)]
+                ready_mode: std::sync::Arc::new(std::sync::Mutex::new(())),
             }),
             Connection::Masked(mut masked) => {
                 masked.mark = Some(mark);
@@ -1204,6 +1319,44 @@ impl Connection {
     }
 }
 
+#[cfg(unix)]
+struct ReadyWire<'a>(&'a TcpStream);
+
+#[cfg(unix)]
+impl std::io::Write for ReadyWire<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        sendmsg_ready(self.0, &[buf])
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Counts the bytes a chain puts on the socket, so a settle can tell a draining peer from a stalled one.
+struct CountingWrite<W> {
+    inner: W,
+    written: usize,
+}
+
+impl<W: Write> Write for CountingWrite<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.written += written;
+        Ok(written)
+    }
+
+    fn write_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> io::Result<usize> {
+        let written = self.inner.write_vectored(bufs)?;
+        self.written += written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 impl Connection {
     /// One relay write that never waits: a socket with no room answers `WouldBlock` at once, and the
     /// lane parks on the descriptor's writability instead of spending the send clock in a worker.
@@ -1234,6 +1387,178 @@ impl Connection {
             crate::proxy::note_wait_fd_write(std::os::fd::AsRawFd::as_raw_fd(&*self));
         }
         result
+    }
+
+    /// A lane drains any retained mask output before it reads, so a peer waiting on that output is not held behind the source.
+    #[cfg(unix)]
+    pub(crate) fn flush_ready(&mut self) -> io::Result<()> {
+        self.flush_ready_outcome().1
+    }
+
+    /// The same drain with the bytes it accepted, so a settle can restart its stall clock on progress.
+    #[cfg(unix)]
+    pub(crate) fn flush_ready_outcome(&mut self) -> (usize, io::Result<()>) {
+        match self {
+            Connection::Masked(masked) if masked.xmc.is_none() => masked.flush_chain(),
+            Connection::Metered(metered) => metered.inner.flush_ready_outcome(),
+            Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
+                inner.flush_ready_outcome()
+            }
+            _ => (0, Ok(())),
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    pub(crate) fn flush_ready(&mut self) -> io::Result<()> {
+        std::io::Write::flush(self)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    pub(crate) fn flush_ready_outcome(&mut self) -> (usize, io::Result<()>) {
+        (0, std::io::Write::flush(self))
+    }
+}
+
+#[cfg(windows)]
+impl Connection {
+    /// The Windows arm toggles the socket for the call: `select` cannot promise a whole blocking
+    /// write, so the descriptor is nonblocking while the bytes are offered and restored after.
+    pub(crate) fn write_ready(&mut self, parts: &[&[u8]]) -> io::Result<usize> {
+        match self {
+            Connection::Metered(metered) => {
+                let outcome = metered.inner.write_ready(parts);
+                if let Ok(n) = outcome {
+                    metered.meter.write(n);
+                }
+                return outcome;
+            }
+            Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
+                return inner.write_ready(parts);
+            }
+            _ => {}
+        }
+        #[cfg(windows)]
+        let mode = match self {
+            Connection::Masked(masked) => Some(std::sync::Arc::clone(&masked.ready_mode)),
+            _ => None,
+        };
+        #[cfg(windows)]
+        let _mode = mode.as_ref().map(|mode| {
+            mode.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+        #[cfg(windows)]
+        let _global = mode.is_none().then(|| {
+            READY_MODE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+        if let Connection::Masked(masked) = self {
+            let mut until = masked
+                .ready_until
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(deadline) = *until {
+                if Instant::now() < deadline {
+                    return Ok(0);
+                }
+                *until = None;
+            }
+        }
+        self.set_nonblocking(true)?;
+        let _ready = ferrox_core::finalmask::ready_write();
+        let ready = match self {
+            Connection::Masked(masked) if masked.xmc.is_some() => {
+                Some(masked.send_xmc_ready(parts))
+            }
+            Connection::Masked(masked) => Some(masked.send_ready(parts)),
+            _ => None,
+        };
+        let (total, outcome) = match ready {
+            Some(Ok(total)) => (total, None),
+            Some(Err(error)) => (0, Some(error)),
+            None => self.write_parts_ready(parts),
+        };
+        if let Connection::Masked(masked) = self {
+            if let Some(wait) = ferrox_core::finalmask::take_ready_wait() {
+                *masked
+                    .ready_until
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(Instant::now() + wait);
+            }
+        }
+        let restored = self.set_nonblocking(false);
+        if total > 0 {
+            return Ok(total);
+        }
+        restored?;
+        if let Some(error) = outcome {
+            return Err(error);
+        }
+        Err(io::Error::from(io::ErrorKind::WouldBlock))
+    }
+
+    /// The raw non-blocking loop for an arm with no mask chain to encode.
+    #[cfg(windows)]
+    fn write_parts_ready(&mut self, parts: &[&[u8]]) -> (usize, Option<io::Error>) {
+        let mut total = 0;
+        let mut outcome = None;
+        'parts: for part in parts {
+            let mut rest = *part;
+            while !rest.is_empty() {
+                match <Connection as std::io::Write>::write(self, rest) {
+                    Ok(0) => break 'parts,
+                    Ok(n) => {
+                        total += n;
+                        rest = &rest[n..];
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break 'parts,
+                    Err(error) => {
+                        outcome = Some(error);
+                        break 'parts;
+                    }
+                }
+            }
+        }
+        (total, outcome)
+    }
+
+    /// The same non-blocking window for the mask's retained output: the chain's flush parks on `WouldBlock` and keeps the rest for the next turn.
+    pub(crate) fn flush_ready(&mut self) -> io::Result<()> {
+        self.flush_ready_outcome().1
+    }
+
+    /// The same drain with the bytes it accepted, so a settle can restart its stall clock on progress.
+    pub(crate) fn flush_ready_outcome(&mut self) -> (usize, io::Result<()>) {
+        if matches!(self, Connection::Masked(masked) if masked.xmc.is_none()) {
+            #[cfg(windows)]
+            let mode = match self {
+                Connection::Masked(masked) => Some(std::sync::Arc::clone(&masked.ready_mode)),
+                _ => None,
+            };
+            #[cfg(windows)]
+            let _mode = mode.as_ref().map(|mode| {
+                mode.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            });
+            if let Err(error) = self.set_nonblocking(true) {
+                return (0, Err(error));
+            }
+            let (written, result) = match self {
+                Connection::Masked(masked) => masked.flush_chain(),
+                _ => (0, Ok(())),
+            };
+            let restored = self.set_nonblocking(false);
+            return (written, result.and(restored));
+        }
+        match self {
+            Connection::Metered(metered) => metered.inner.flush_ready_outcome(),
+            Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
+                inner.flush_ready_outcome()
+            }
+            _ => (0, Ok(())),
+        }
     }
 }
 
@@ -1594,6 +1919,9 @@ impl Connection {
                     sni: masked.sni.as_ref().map(std::sync::Arc::clone),
                     mark: masked.mark.as_ref().map(std::sync::Arc::clone),
                     read_until: std::sync::Mutex::new(None),
+                    ready_until: std::sync::Arc::clone(&masked.ready_until),
+                    #[cfg(windows)]
+                    ready_mode: std::sync::Arc::clone(&masked.ready_mode),
                 })
             }),
             Connection::Metered(metered) => metered.inner.try_clone().map(|inner| {
@@ -2340,6 +2668,10 @@ struct StagedBinding {
 /// A bind records the private staging address it bound, so a copied staging name is never mistaken for another path's listener.
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 static STAGED_BINDINGS: std::sync::Mutex<Vec<StagedBinding>> = std::sync::Mutex::new(Vec::new());
+
+/// Serializes the non-blocking window for arms with no chain state; a masked handle uses its own.
+#[cfg(windows)]
+static READY_MODE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 fn register_staged(
@@ -4638,6 +4970,33 @@ mod winunix {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn an_xmc_ready_write_returns_backpressure_when_the_chain_is_held() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let peer = std::thread::spawn(move || {
+            let _ = TcpStream::connect(addr);
+        });
+        let (stream, _) = listener.accept().expect("accepts");
+        let chain = std::sync::Arc::new(std::sync::Mutex::new(
+            ferrox_core::finalmask::Chain::default(),
+        ));
+        let held = chain.lock().expect("chain");
+        let mut writer = XmcWriter {
+            stream,
+            chain: std::sync::Arc::clone(&chain),
+            deadline: HandshakeDeadline::default(),
+        };
+        let _ready = ferrox_core::finalmask::xmc::ReadyWrite::enter();
+        assert_eq!(
+            writer.write(b"x").expect_err("the chain is held").kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(held);
+        peer.join().expect("peer");
+    }
+
     #[test]
     fn an_http_url_keeps_the_authority_and_makes_the_path() {
         let url = HttpUrl::parse("https://example.test:8443/check?q=1#frag").expect("parses");
@@ -6029,6 +6388,9 @@ mod tests {
             })),
             mark: None,
             read_until: std::sync::Mutex::new(None),
+            ready_until: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(windows)]
+            ready_mode: std::sync::Arc::new(std::sync::Mutex::new(())),
         }
     }
 

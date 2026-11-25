@@ -27,6 +27,7 @@ pub use xmc::derivation::{derive_rsa_key, private_key_der, public_key_der};
 pub use xmc::packet_stream::PacketStream;
 pub use xmc::profile::{find_profile, read_login_success, Profile};
 
+use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -158,6 +159,8 @@ pub struct Fragment {
     gathered: Option<Gathered>,
     /// The clock a handshake gives this stage's waits; unarmed elsewhere.
     deadline: Option<Arc<dyn Deadline>>,
+    /// The next piece segment and the bound its write drew, when a wait deferred the rest.
+    piece_resume: Option<(usize, usize, usize)>,
 }
 
 /// The part of a merged hello already built but not yet accepted by the sink, so a refused write
@@ -167,7 +170,7 @@ struct Gathered {
     bytes: Vec<u8>,
     at: usize,
     /// Byte offsets where the configured delay between two retained records falls due.
-    parks: Vec<(usize, i64)>,
+    parks: VecDeque<(usize, i64)>,
 }
 
 impl Fragment {
@@ -201,6 +204,7 @@ impl Fragment {
             count: 0,
             gathered: None,
             deadline: None,
+            piece_resume: None,
         })
     }
 
@@ -221,6 +225,13 @@ impl Fragment {
 
     /// The write the chain hands this stage, answered with how much of it reached the wire.
     pub fn write<W: Write>(&mut self, raw: &mut W, p: &[u8]) -> io::Result<usize> {
+        if READY.with(std::cell::Cell::get) && READY_WAIT.with(std::cell::Cell::get) > 0 {
+            return if p.is_empty() {
+                Ok(0)
+            } else {
+                Err(io::ErrorKind::WouldBlock.into())
+            };
+        }
         if let Some(mut gathered) = self.gathered.take() {
             if let Err(error) = flush_gathered(raw, &mut gathered, self.deadline.as_deref()) {
                 self.gathered = Some(gathered);
@@ -230,6 +241,10 @@ impl Fragment {
                 return Ok(0);
             }
         }
+        if matches!(self.piece_resume, Some((len, _, _)) if len == p.len()) {
+            return self.write_pieces(raw, p);
+        }
+        self.piece_resume = None;
         self.count += 1;
         if self.packets_from == 0 && self.packets_to == 1 {
             if self.hello_done {
@@ -334,8 +349,22 @@ impl Fragment {
         else {
             return Ok(());
         };
+        if DRAINING.with(std::cell::Cell::get) {
+            // A nonblocking drain cannot wait: the spacing was already part of the write that retained these bytes.
+            let _ = raw.flush();
+            return Ok(());
+        }
+        if READY.with(std::cell::Cell::get) {
+            let _ = raw.flush();
+            READY_WAIT.with(|wait| wait.set(wait.get().max(ms as u64)));
+            return Ok(());
+        }
         match raw.flush() {
-            Ok(()) => self.wait(ms)?,
+            Ok(()) => {
+                #[cfg(test)]
+                SLEEPS.with(|count| count.set(count.get() + 1));
+                self.wait(ms)?;
+            }
             // The record before this delay is out; a full socket only costs the spacing.
             Err(error)
                 if matches!(
@@ -417,16 +446,111 @@ impl Fragment {
             while from < record_len {
                 let Some(to) = self.cut(segment, from, record_len, bound) else {
                     // No entropy for a width: the rest goes out as the one record it is.
-                    write_record(raw, &head_of(p, record_len - from), &p[from..record_len])?;
+                    if let Some(bytes) =
+                        write_record(raw, &head_of(p, record_len - from), &p[from..record_len])?
+                    {
+                        self.retain_hello_partial(bytes, p, record_len, segment, record_len, bound);
+                        return Ok(p.len());
+                    }
                     break;
                 };
-                write_record(raw, &head_of(p, to - from), &p[from..to])?;
+                match write_record(raw, &head_of(p, to - from), &p[from..to])? {
+                    None => {}
+                    Some(bytes) => {
+                        self.retain_hello_partial(bytes, p, to, segment, record_len, bound);
+                        return Ok(p.len());
+                    }
+                }
                 self.park_after(raw, segment)?;
                 from = to;
                 segment += 1;
+                if READY.with(std::cell::Cell::get) && READY_WAIT.with(std::cell::Cell::get) > 0 {
+                    self.retain_hello(p, from, segment, record_len, bound);
+                    return Ok(p.len());
+                }
             }
         }
         self.finish_hello(raw, p, record_len)
+    }
+
+    /// Retain the records after a deferred park, so the next write sends them at their own spacing.
+    fn retain_hello(
+        &mut self,
+        p: &[u8],
+        from: usize,
+        segment: usize,
+        record_len: usize,
+        bound: usize,
+    ) {
+        self.retain_hello_after(
+            Gathered {
+                bytes: Vec::new(),
+                at: 0,
+                parks: VecDeque::new(),
+            },
+            p,
+            from,
+            segment,
+            record_len,
+            bound,
+        );
+    }
+
+    /// Retain the exact suffix of a record the sink took part of, followed by every later record.
+    fn retain_hello_after(
+        &mut self,
+        mut gathered: Gathered,
+        p: &[u8],
+        mut from: usize,
+        mut segment: usize,
+        record_len: usize,
+        bound: usize,
+    ) {
+        while from < record_len {
+            let Some(to) = self.cut(segment, from, record_len, bound) else {
+                gathered
+                    .bytes
+                    .extend_from_slice(&head_of(p, record_len - from));
+                gathered.bytes.extend_from_slice(&p[from..record_len]);
+                break;
+            };
+            let wait = self.delay_at(segment).pick_from(&mut self.ent);
+            gathered.bytes.extend_from_slice(&head_of(p, to - from));
+            gathered.bytes.extend_from_slice(&p[from..to]);
+            if let Some(wait) = wait.filter(|wait| *wait > 0) {
+                let at = gathered.bytes.len();
+                gathered.parks.push_back((at, wait));
+            }
+            from = to;
+            segment += 1;
+        }
+        gathered.bytes.extend_from_slice(&p[record_len..]);
+        if !gathered.bytes.is_empty() {
+            self.gathered = Some(gathered);
+        }
+    }
+
+    /// A record the sink took part of still owns its untransmitted suffix and the records behind it.
+    fn retain_hello_partial(
+        &mut self,
+        bytes: Vec<u8>,
+        p: &[u8],
+        from: usize,
+        segment: usize,
+        record_len: usize,
+        bound: usize,
+    ) {
+        let mut gathered = Gathered {
+            bytes,
+            at: 0,
+            parks: VecDeque::new(),
+        };
+        let wait = self.delay_at(segment).pick_from(&mut self.ent);
+        if let Some(wait) = wait.filter(|wait| *wait > 0) {
+            let at = gathered.bytes.len();
+            gathered.parks.push_back((at, wait));
+        }
+        self.retain_hello_after(gathered, p, from, segment + 1, record_len, bound);
     }
 
     /// A record that rode in behind the hello keeps its own write, whole or partial; a sink that
@@ -448,7 +572,7 @@ impl Fragment {
                     self.gathered = Some(Gathered {
                         bytes: p[record_len + taken..].to_vec(),
                         at: 0,
-                        parks: Vec::new(),
+                        parks: VecDeque::new(),
                     });
                     return Ok(p.len());
                 }
@@ -462,7 +586,7 @@ impl Fragment {
                     self.gathered = Some(Gathered {
                         bytes: p[record_len..].to_vec(),
                         at: 0,
-                        parks: Vec::new(),
+                        parks: VecDeque::new(),
                     });
                     return Ok(p.len());
                 }
@@ -548,9 +672,9 @@ impl Fragment {
                 parts.push(io::IoSlice::new(&p[record_len..]));
             }
             let mut parts = &mut parts[..];
-            let before = parts.len();
+            let before = iovec_len(parts);
             if let Err(error) = write_iovecs(raw, &mut parts) {
-                let progressed = parts.len() < before;
+                let progressed = iovec_len(parts) < before;
                 if !progressed
                     && !matches!(
                         error.kind(),
@@ -567,7 +691,7 @@ impl Fragment {
                     self.gathered = Some(Gathered {
                         bytes,
                         at: 0,
-                        parks: Vec::new(),
+                        parks: VecDeque::new(),
                     });
                 }
                 return Ok(p.len());
@@ -578,9 +702,10 @@ impl Fragment {
         for (segment, to) in cuts.iter().enumerate() {
             let head = head_of(p, to - from);
             let mut parts = [io::IoSlice::new(&head), io::IoSlice::new(&p[from..*to])];
+            let before = iovec_len(&parts);
             let mut parts = &mut parts[..];
             if let Err(error) = write_iovecs(raw, &mut parts) {
-                let progressed = parts.len() < 2;
+                let progressed = iovec_len(parts) < before;
                 if !progressed
                     && !matches!(
                         error.kind(),
@@ -593,10 +718,40 @@ impl Fragment {
             }
             if segment + 1 < cuts.len() {
                 self.park_after(raw, segment)?;
+                if READY.with(std::cell::Cell::get) && READY_WAIT.with(std::cell::Cell::get) > 0 {
+                    self.retain_sni_after(p, &cuts, segment + 1, record_len);
+                    return Ok(p.len());
+                }
             }
             from = *to;
         }
         self.finish_hello(raw, p, record_len)
+    }
+
+    /// Retain the SNI records after a deferred park, with the waits that follow each one.
+    fn retain_sni_after(&mut self, p: &[u8], cuts: &[usize], start: usize, record_len: usize) {
+        let mut bytes = Vec::new();
+        let mut parks = VecDeque::new();
+        let mut from = if start == 0 { HEADER } else { cuts[start - 1] };
+        for (segment, to) in cuts.iter().enumerate().skip(start) {
+            let wait = (segment + 1 < cuts.len())
+                .then(|| self.delay_at(segment).pick_from(&mut self.ent))
+                .flatten();
+            bytes.extend_from_slice(&head_of(p, to - from));
+            bytes.extend_from_slice(&p[from..*to]);
+            if let Some(wait) = wait.filter(|wait| *wait > 0) {
+                parks.push_back((bytes.len(), wait));
+            }
+            from = *to;
+        }
+        bytes.extend_from_slice(&p[record_len..]);
+        if !bytes.is_empty() {
+            self.gathered = Some(Gathered {
+                bytes,
+                at: 0,
+                parks,
+            });
+        }
     }
 
     /// The burst a sink refused, rebuilt as one buffer: the unsent part first, then every record
@@ -612,14 +767,16 @@ impl Fragment {
         record_len: usize,
     ) -> usize {
         let mut bytes = Vec::new();
-        let mut waits = Vec::new();
+        let mut waits = VecDeque::new();
         for part in parts {
             bytes.extend_from_slice(part);
         }
         let mut next = to;
         for (offset, later) in cuts[segment + 1..].iter().enumerate() {
             let wait = self.delay_at(segment + offset).pick_from(&mut self.ent);
-            waits.push((bytes.len(), wait.unwrap_or(0)));
+            if let Some(wait) = wait.filter(|wait| *wait > 0) {
+                waits.push_back((bytes.len(), wait));
+            }
             bytes.extend_from_slice(&head_of(p, later - next));
             bytes.extend_from_slice(&p[next..*later]);
             next = *later;
@@ -679,9 +836,9 @@ impl Fragment {
                 at += width;
             }
             let mut parts = &mut parts[..count * 2];
-            let before = parts.len();
+            let before = iovec_len(parts);
             if let Err(error) = write_iovecs(raw, &mut parts) {
-                let progressed = parts.len() < before;
+                let progressed = iovec_len(parts) < before;
                 if !progressed
                     && origin == HEADER
                     && !matches!(
@@ -700,7 +857,7 @@ impl Fragment {
                 self.gathered = Some(Gathered {
                     bytes,
                     at: 0,
-                    parks: Vec::new(),
+                    parks: VecDeque::new(),
                 });
                 return Ok(());
             }
@@ -715,25 +872,62 @@ impl Fragment {
     /// widths, each advance measured by what the socket actually took.
     fn write_pieces<W: Write>(&mut self, raw: &mut W, p: &[u8]) -> io::Result<usize> {
         if p.is_empty() {
+            self.piece_resume = None;
             return Ok(0);
         }
-        let Some(bound) = self.max_split.pick_from(&mut self.ent) else {
-            return write_progress(raw, p);
-        };
-        let bound = if bound > 0 {
-            usize::try_from(bound).unwrap_or(usize::MAX)
-        } else {
-            0
-        };
         let mut from = 0usize;
-        let mut segment = 0usize;
+        let (mut segment, bound) = match self.piece_resume {
+            Some((len, segment, bound)) if len == p.len() => (segment, bound),
+            _ => {
+                self.piece_resume = None;
+                let Some(bound) = self.max_split.pick_from(&mut self.ent) else {
+                    return write_progress(raw, p);
+                };
+                let bound = if bound > 0 {
+                    usize::try_from(bound).unwrap_or(usize::MAX)
+                } else {
+                    0
+                };
+                (0, bound)
+            }
+        };
         loop {
+            if READY.with(std::cell::Cell::get) && READY_WAIT.with(std::cell::Cell::get) > 0 {
+                return self.park_piece(p.len(), from, segment, bound);
+            }
             let Some(to) = self.cut(segment, from, p.len(), bound) else {
-                return write_progress(raw, &p[from..]).map(|written| from + written);
+                return match write_progress(raw, &p[from..]) {
+                    Ok(written) => {
+                        let total = from + written;
+                        if total >= p.len() {
+                            self.piece_resume = None;
+                        } else {
+                            self.piece_resume = Some((p.len() - total, segment, bound));
+                        }
+                        Ok(total)
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        self.piece_resume = Some((p.len() - from, segment, bound));
+                        if from > 0 {
+                            Ok(from)
+                        } else {
+                            Err(error)
+                        }
+                    }
+                    Err(error) => Err(error),
+                };
             };
             if from == to {
                 self.park_after(raw, segment)?;
                 segment += 1;
+                if READY.with(std::cell::Cell::get) && READY_WAIT.with(std::cell::Cell::get) > 0 {
+                    return self.park_piece(p.len(), from, segment, bound);
+                }
                 continue;
             }
             let written = match raw.write(&p[from..to]) {
@@ -747,16 +941,43 @@ impl Fragment {
                             io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                         ) =>
                 {
+                    self.piece_resume = Some((p.len() - from, segment, bound));
                     return Ok(from);
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    if from == 0
+                        && matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        )
+                    {
+                        self.piece_resume = Some((p.len(), segment, bound));
+                    }
+                    return Err(error);
+                }
             };
             from += written;
             self.park_after(raw, segment)?;
             segment += 1;
             if from >= p.len() {
+                self.piece_resume = None;
                 return Ok(from);
             }
+        }
+    }
+
+    fn park_piece(
+        &mut self,
+        len: usize,
+        from: usize,
+        segment: usize,
+        bound: usize,
+    ) -> io::Result<usize> {
+        self.piece_resume = Some((len - from, segment, bound));
+        if from == 0 {
+            Err(io::ErrorKind::WouldBlock.into())
+        } else {
+            Ok(from)
         }
     }
 }
@@ -795,10 +1016,26 @@ fn head_of(p: &[u8], width: usize) -> [u8; HEADER] {
 
 /// A record's header and its body go out as one gathered write, so the body never lands in a buffer
 /// of its own the way the reference's scratch does.
-fn write_record<W: Write>(raw: &mut W, head: &[u8], body: &[u8]) -> io::Result<()> {
+fn write_record<W: Write>(raw: &mut W, head: &[u8], body: &[u8]) -> io::Result<Option<Vec<u8>>> {
     let mut parts = [io::IoSlice::new(head), io::IoSlice::new(body)];
     let mut parts = &mut parts[..];
-    write_iovecs(raw, &mut parts)
+    match write_iovecs(raw, &mut parts) {
+        Ok(()) => Ok(None),
+        Err(error) => {
+            let retryable = matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            );
+            if !retryable {
+                return Err(error);
+            }
+            let mut bytes = Vec::new();
+            for part in parts.iter() {
+                bytes.extend_from_slice(part);
+            }
+            Ok(Some(bytes))
+        }
+    }
 }
 
 fn flush_gathered<W: Write>(
@@ -809,7 +1046,7 @@ fn flush_gathered<W: Write>(
     while gathered.at < gathered.bytes.len() {
         let end = gathered
             .parks
-            .first()
+            .front()
             .map_or(gathered.bytes.len(), |(offset, _)| {
                 (*offset).min(gathered.bytes.len())
             });
@@ -824,10 +1061,16 @@ fn flush_gathered<W: Write>(
                 Err(error) => return Err(error),
             }
         }
-        if let Some((_, wait)) = gathered.parks.first().copied() {
-            gathered.parks.remove(0);
+        if let Some((_, wait)) = gathered.parks.pop_front() {
             if wait > 0 {
-                wait_for(deadline, Duration::from_millis(wait as u64))?;
+                if READY.with(std::cell::Cell::get) {
+                    READY_WAIT.with(|left| left.set(left.get().max(wait as u64)));
+                    return Err(io::ErrorKind::WouldBlock.into());
+                } else if !DRAINING.with(std::cell::Cell::get) {
+                    #[cfg(test)]
+                    SLEEPS.with(|count| count.set(count.get() + 1));
+                    wait_for(deadline, Duration::from_millis(wait as u64))?;
+                }
             }
         }
     }
@@ -848,6 +1091,10 @@ fn wait_for(deadline: Option<&dyn Deadline>, wait: Duration) -> io::Result<()> {
 /// Hand the list to the sink in as few vectored calls as it takes, advancing the list on a short
 /// call so every part stays where the caller put it. A refused call leaves the list at the first
 /// octet the sink did not take.
+fn iovec_len(parts: &[io::IoSlice<'_>]) -> usize {
+    parts.iter().map(|part| part.len()).sum()
+}
+
 #[allow(
     clippy::mut_mut,
     reason = "the list is advanced in place so a refused call leaves the unsent parts for the retry"
@@ -931,6 +1178,57 @@ fn between(ip: IpAddr, start: IpAddr, end: IpAddr) -> bool {
             u128::from(ip) >= u128::from(start) && u128::from(ip) <= u128::from(end)
         }
         _ => false,
+    }
+}
+
+thread_local! {
+    static DRAINING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static READY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static READY_WAIT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static SLEEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn sleeps() -> usize {
+    SLEEPS.with(std::cell::Cell::get)
+}
+
+struct DrainFlag(bool);
+
+impl Drop for DrainFlag {
+    fn drop(&mut self) {
+        DRAINING.set(self.0);
+    }
+}
+
+/// A write that must not spend a configured inter-record delay on the thread: the stage records the
+/// deadline and answers `Ok(0)` until it passes, so the lane parks on its own clock instead.
+pub fn ready_write() -> ReadyFlag {
+    ReadyFlag(
+        READY.replace(true),
+        READY_WAIT.with(|wait| wait.replace(0)),
+        std::marker::PhantomData,
+    )
+}
+
+/// The delay a readiness write deferred instead of sleeping, for the caller's own clock.
+pub fn take_ready_wait() -> Option<Duration> {
+    let ms = READY_WAIT.with(|wait| wait.replace(0));
+    (ms > 0).then(|| Duration::from_millis(ms))
+}
+
+/// Restores the previous readiness mode when the write returns.
+#[derive(Debug)]
+pub struct ReadyFlag(bool, u64, std::marker::PhantomData<*const ()>);
+
+impl Drop for ReadyFlag {
+    fn drop(&mut self) {
+        READY.set(self.0);
+        READY_WAIT.with(|wait| wait.set(self.1));
     }
 }
 
@@ -1113,6 +1411,13 @@ impl Chain {
 
     /// Put every retained piece on the wire, nearest the socket first.
     pub fn flush<W: Write>(&mut self, raw: &mut W) -> io::Result<()> {
+        flush_drive(&mut self.stages, raw)
+    }
+
+    /// The same drain without a stage's inter-record wait: a settle holds this chain's lock and
+    /// must return to the lane instead of sleeping under it.
+    pub fn flush_ready<W: Write>(&mut self, raw: &mut W) -> io::Result<()> {
+        let _draining = DrainFlag(DRAINING.replace(true));
         flush_drive(&mut self.stages, raw)
     }
 
@@ -1494,7 +1799,9 @@ mod tests {
             bytes: Vec::new(),
             calls: 0,
         };
-        write_record(&mut sink, &[HANDSHAKE, 3, 1, 0, 3], b"abc").expect("retries the body");
+        assert!(write_record(&mut sink, &[HANDSHAKE, 3, 1, 0, 3], b"abc")
+            .expect("retries the body")
+            .is_none());
         assert_eq!(
             sink.bytes,
             [HANDSHAKE, 3, 1, 0, 3, b'a', b'b', b'c'],
@@ -1902,6 +2209,71 @@ mod tests {
     }
 
     #[test]
+    fn a_partial_hello_record_keeps_its_exact_suffix() {
+        let mut mask =
+            Fragment::new(0, 1, vec![range(4, 4)], vec![range(1, 1)], range(0, 0)).expect("valid");
+        let whole = hello(10);
+        let mut sink = Stalling {
+            bytes: Vec::new(),
+            limit: 2,
+        };
+        assert_eq!(
+            mask.write(&mut sink, &whole).expect("retains the suffix"),
+            whole.len(),
+            "the logical write is accepted once the suffix is kept"
+        );
+        sink.limit = usize::MAX;
+        mask.write(&mut sink, b"").expect("drains the suffix");
+        let (widths, message) = records(&sink.bytes);
+        assert_eq!(widths, vec![4, 4, 2], "the record sequence is unchanged");
+        assert_eq!(message, whole[HEADER..], "no octet is duplicated or lost");
+    }
+
+    #[test]
+    fn a_refused_later_hello_record_keeps_the_whole_tail() {
+        let mut mask =
+            Fragment::new(0, 1, vec![range(4, 4)], vec![range(1, 1)], range(0, 0)).expect("valid");
+        let whole = hello(10);
+        let mut sink = Stalling {
+            bytes: Vec::new(),
+            limit: HEADER + 4,
+        };
+        assert_eq!(
+            mask.write(&mut sink, &whole)
+                .expect("retains the refused record"),
+            whole.len(),
+            "the first record is on the wire and the rest is kept"
+        );
+        sink.limit = usize::MAX;
+        mask.write(&mut sink, b"").expect("drains the tail");
+        let (widths, message) = records(&sink.bytes);
+        assert_eq!(widths, vec![4, 4, 2], "the record sequence is unchanged");
+        assert_eq!(message, whole[HEADER..], "no octet is duplicated or lost");
+    }
+
+    #[test]
+    fn a_refused_first_hello_record_keeps_the_whole_run() {
+        let mut mask =
+            Fragment::new(0, 1, vec![range(4, 4)], vec![range(1, 1)], range(0, 0)).expect("valid");
+        let whole = hello(10);
+        let mut sink = Stalling {
+            bytes: Vec::new(),
+            limit: 0,
+        };
+        assert_eq!(
+            mask.write(&mut sink, &whole)
+                .expect("retains the refused first record"),
+            whole.len(),
+            "the whole logical write is kept when the first record is refused"
+        );
+        sink.limit = usize::MAX;
+        mask.write(&mut sink, b"").expect("drains the run");
+        let (widths, message) = records(&sink.bytes);
+        assert_eq!(widths, vec![4, 4, 2], "the configured widths survive");
+        assert_eq!(message, whole[HEADER..], "no octet is duplicated or lost");
+    }
+
+    #[test]
     fn a_second_tlshello_stage_sees_the_merged_records_whole() {
         let outer = Fragment::new(0, 1, vec![range(11, 11)], vec![range(0, 0)], range(0, 0))
             .expect("valid");
@@ -2049,6 +2421,195 @@ mod tests {
         assert!(
             wire.wire.bytes.len() >= HEADER,
             "the record the delay separated left before the delay"
+        );
+    }
+
+    #[test]
+    fn a_ready_nested_write_reports_wouldblock_for_a_nonempty_slice() {
+        let mut fragment = Fragment::new(
+            0,
+            1,
+            vec![range(4, 4)],
+            vec![range(1000, 1000)],
+            range(0, 0),
+        )
+        .expect("valid");
+        let mut wire = Wire::default();
+        let _ready = ready_write();
+        READY_WAIT.with(|wait| wait.set(1));
+        let error = fragment
+            .write(&mut wire, b"abcde")
+            .expect_err("a delayed write returns backpressure");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(wire.bytes, Vec::<u8>::new());
+    }
+
+    #[test]
+    fn a_ready_piece_resumes_the_next_segment_after_progress() {
+        let mut mask = Fragment::new(
+            0,
+            2,
+            vec![range(1, 1), range(65_535, 65_535)],
+            vec![range(1, 1)],
+            range(0, 0),
+        )
+        .expect("valid");
+        let p = vec![0x5a; 16 * 1024];
+        let mut wire = Wire::default();
+        let _ready = ready_write();
+        let mut at = 0;
+        for _ in 0..4 {
+            at += mask.write(&mut wire, &p[at..]).expect("writes");
+            if at == p.len() {
+                break;
+            }
+            assert!(
+                take_ready_wait().is_some(),
+                "each stalled write records its wait"
+            );
+        }
+        let _ = take_ready_wait();
+        assert_eq!(at, p.len(), "the write resumes the suffix it did not send");
+        assert_eq!(wire.bytes, p, "the peer sees each octet once");
+        assert!(
+            wire.calls <= 3,
+            "positive progress resumes the next segment instead of repeating the first"
+        );
+    }
+
+    #[test]
+    fn a_zero_byte_refusal_keeps_the_piece_resume_cursor() {
+        let mut mask = Fragment::new(
+            0,
+            2,
+            vec![range(1, 1), range(65_535, 65_535)],
+            vec![range(1, 1)],
+            range(0, 0),
+        )
+        .expect("valid");
+        let p = vec![0x33; 64];
+        let mut first = Wire::default();
+        let _ready = ready_write();
+        assert_eq!(mask.write(&mut first, &p).expect("writes"), 1);
+        let _ = take_ready_wait();
+        let mut retry = RefuseOnce {
+            wire: Wire::default(),
+            left: 1,
+        };
+        let error = mask
+            .write(&mut retry, &p[1..])
+            .expect_err("the retry is refused");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        let n = mask.write(&mut retry, &p[1..]).expect("the retry resumes");
+        assert_eq!(n, p.len() - 1, "the saved segment is retried whole");
+        assert_eq!(retry.wire.bytes, p[1..]);
+    }
+
+    #[test]
+    fn a_piece_continuation_runs_before_a_new_packet_is_counted() {
+        let mut mask = Fragment::new(
+            1,
+            1,
+            vec![range(1, 1), range(4, 4)],
+            vec![range(1, 1)],
+            range(0, 0),
+        )
+        .expect("valid");
+        let p = vec![0x44; 20];
+        let mut wire = Wire::default();
+        let _ready = ready_write();
+        let first = mask.write(&mut wire, &p).expect("writes");
+        assert_eq!(first, 1);
+        assert!(take_ready_wait().is_some(), "the first segment parks");
+        let second = mask.write(&mut wire, &p[first..]).expect("resumes");
+        assert_eq!(second, 4, "the saved four-byte segment runs again");
+        assert_eq!(
+            wire.widths,
+            vec![1, 4],
+            "the selected packet is not bypassed"
+        );
+    }
+
+    #[test]
+    fn a_deferred_zero_width_piece_reports_backpressure() {
+        let mut mask = Fragment::new(
+            1,
+            1,
+            vec![range(0, 0), range(4, 4)],
+            vec![range(1, 1)],
+            range(0, 0),
+        )
+        .expect("valid");
+        let mut wire = Wire::default();
+        let _ready = ready_write();
+        let error = mask
+            .write(&mut wire, b"abcde")
+            .expect_err("a zero-width step defers the write");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(wire.bytes.is_empty(), "the refused write sent nothing");
+        assert_eq!(
+            mask.piece_resume,
+            Some((5, 1, 0)),
+            "the deferred segment is kept for the retry"
+        );
+    }
+
+    #[test]
+    fn a_ready_drain_does_not_wait_for_an_inner_stage() {
+        let sni = Fragment::new(
+            0,
+            1,
+            vec![range(3, 3)],
+            vec![range(1000, 1000)],
+            range(0, 0),
+        )
+        .expect("valid")
+        .sni();
+        let below =
+            Fragment::new(0, 1, vec![range(3, 3)], vec![range(0, 0)], range(0, 0)).expect("valid");
+        let mut chain = Chain::default();
+        chain.push(below);
+        let mut chain = chain.with_front(&sni);
+        let mut wire = RefuseOnce {
+            wire: Wire::default(),
+            left: 1,
+        };
+        let p = client_hello("retained.example");
+        assert_eq!(chain.write(&mut wire, &p).expect("writes"), p.len());
+        let before = sleeps();
+        chain.flush_ready(&mut wire).expect("drains");
+        assert_eq!(
+            sleeps(),
+            before,
+            "a settle slept for a delay it cannot honour"
+        );
+    }
+
+    #[test]
+    fn a_ready_drain_does_not_wait_for_a_gathered_park() {
+        let sni = Fragment::new(
+            0,
+            1,
+            vec![range(3, 3)],
+            vec![range(1000, 1000)],
+            range(0, 0),
+        )
+        .expect("valid")
+        .sni();
+        let mut chain = Chain::default();
+        chain.push(sni);
+        let mut wire = RefuseOnce {
+            wire: Wire::default(),
+            left: 1,
+        };
+        let p = client_hello("retained.example");
+        assert_eq!(chain.write(&mut wire, &p).expect("writes"), p.len());
+        let before = sleeps();
+        chain.flush_ready(&mut wire).expect("drains");
+        assert_eq!(
+            sleeps(),
+            before,
+            "a settle slept for a gathered park it cannot honour"
         );
     }
 

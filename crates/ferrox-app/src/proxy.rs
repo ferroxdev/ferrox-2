@@ -910,6 +910,24 @@ fn serve_inbounds_counted(
                             inbounds += 1;
                         }
                     }
+                    "naive" => {
+                        let listeners = crate::naive::serve_inbound(
+                            address,
+                            inbound,
+                            label,
+                            freedom,
+                            handler_stop.as_ref(),
+                            &mut wake_address,
+                        );
+                        if listeners > 0 {
+                            if let Some(stop) = &handler_stop {
+                                for _ in 0..listeners {
+                                    handler_stops.push((Arc::clone(stop), wake_address.clone()));
+                                }
+                            }
+                            inbounds += 1;
+                        }
+                    }
                     "socks" | "http" | "mixed" => {
                         let Some(out) = routed(inbound, true) else {
                             eprintln!(
@@ -1256,6 +1274,7 @@ fn serve_addresses(inbound: &Json, protocol: &str) -> Option<Vec<String>> {
 fn inbound_sockets(inbound: &Json, protocol: &str) -> (bool, bool) {
     match protocol {
         "socks" | "http" | "mixed" | "anytls" | "hc" | "blackhole" | "redirect" => (true, false),
+        "naive" => crate::naive::inbound_sockets(inbound),
         "hysteria" | "tuic" | "wireguard" => (false, true),
         "masque" => {
             let security = inbound
@@ -1378,6 +1397,9 @@ fn preflight_inbound(inbound: &Json, protocol: &str, addresses: &[String]) -> Re
             }
         }
     }
+    if protocol == "naive" {
+        crate::naive::validate_inbound(inbound)?;
+    }
     let (tcp, udp) = inbound_sockets(inbound, protocol);
     // A transparent door binds its sockets with options plain `bind` cannot set.
     let transparent_door = match protocol {
@@ -1450,7 +1472,7 @@ fn refuse_inbound(protocol: &str, label: &str, inbound: &Json) {
 }
 
 /// Served inbounds; the `tun` device inbound opens a native interface and relays TCP flows.
-const SERVED_INBOUNDS: [&str; 18] = [
+const SERVED_INBOUNDS: [&str; 19] = [
     "vless",
     "trojan",
     "vmess",
@@ -1458,6 +1480,7 @@ const SERVED_INBOUNDS: [&str; 18] = [
     "hysteria",
     "tuic",
     "anytls",
+    "naive",
     "socks",
     "http",
     "mixed",
@@ -1565,7 +1588,7 @@ pub(crate) struct Stop {
 }
 
 /// One accepted session's registration: the stop holds a socket clone it can shut down, and the guard removes it when the work ends.
-struct TrackedSession {
+pub(crate) struct TrackedSession {
     stop: Arc<Stop>,
     id: u64,
 }
@@ -1650,8 +1673,12 @@ impl Stop {
         self.track_sessions.store(false, Ordering::Relaxed);
     }
 
+    pub(crate) fn tracks_sessions(&self) -> bool {
+        self.track_sessions.load(Ordering::Relaxed)
+    }
+
     /// Registers an accepted stream so rollback can shut it down and wait for its work to leave.
-    fn track_session(self: &Arc<Self>, stream: &Connection) -> Option<TrackedSession> {
+    pub(crate) fn track_session(self: &Arc<Self>, stream: &Connection) -> Option<TrackedSession> {
         if !self.track_sessions.load(Ordering::Relaxed) {
             return None;
         }
@@ -1755,7 +1782,7 @@ impl Stop {
 }
 
 /// Replace an ephemeral port with the one the listener actually bound, so a wake can reach it.
-fn swapped_port(address: &str, port: u16) -> String {
+pub(crate) fn swapped_port(address: &str, port: u16) -> String {
     match address.rsplit_once(':') {
         Some((host, _)) => format!("{host}:{port}"),
         None => address.to_owned(),
@@ -2259,6 +2286,30 @@ impl Drop for ProbeDeadlineGuard {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct FlowDial {
+    source: Option<SendThrough>,
+    sockopts: Option<Arc<crate::sockopt::SocketOptions>>,
+    strategy: Option<FreedomDomain>,
+}
+
+impl FlowDial {
+    pub(crate) fn capture() -> Self {
+        Self {
+            source: SEND_THROUGH.with(std::cell::Cell::get),
+            sockopts: DIAL_SOCKOPTS.with(|cell| cell.borrow().clone()),
+            strategy: TARGET_STRATEGY.with(std::cell::Cell::get),
+        }
+    }
+
+    pub(crate) fn run<T>(&self, f: impl FnOnce() -> T) -> T {
+        let _source = SendThroughGuard::enter(self.source);
+        let _sockopts = DialSockoptsGuard::enter(self.sockopts.clone());
+        let _strategy = TargetStrategyGuard::enter(self.strategy);
+        f()
+    }
+}
+
 /// The outbound-level `sendThrough`: an address or a CIDR, while xray's two names for the inbound's
 /// own addresses warn and leave the dial unbound.
 fn parse_send_through(outbound: &Json) -> Result<Option<SendThrough>, String> {
@@ -2513,6 +2564,7 @@ fn udp_lane_supported(out: &Outbound) -> bool {
         Outbound::Group(group) => group
             .resolve_bound(crate::router::Network::Udp)
             .is_some_and(|(_, out)| udp_lane_supported(&out)),
+        Outbound::Naive(naive) => naive.udp_over_tcp(),
         Outbound::Http(_)
         | Outbound::AnyTls(_)
         | Outbound::Veepn(_)
@@ -2690,12 +2742,29 @@ fn probe_dial_budget(budget: Duration) -> Duration {
 /// first handshake did not carry; a failed second round keeps the first socket, and a server that
 /// still answers directly leaves the first-record rewrite in place.
 fn dial_kind(target: &SocketAddr, fast: bool) -> Result<(Connection, Fast), Failure> {
+    dial_kind_until(target, fast, None)
+}
+
+fn dial_kind_until(
+    target: &SocketAddr,
+    fast: bool,
+    deadline: Option<Instant>,
+) -> Result<(Connection, Fast), Failure> {
+    let budget = deadline.map_or_else(budgets::dial, |deadline| {
+        budgets::dial().min(deadline.saturating_duration_since(Instant::now()))
+    });
+    if budget.is_zero() {
+        return Err(Failure::new(Stage::SocketConnected, Kind::Unreachable));
+    }
     // The seam's one dial entry: a named source or option builds the socket before the same budget, and neither is the TCP dial unchanged.
     let sockopts = DIAL_SOCKOPTS.with(|cell| cell.borrow().clone());
     if let Some(options) = sockopts.as_deref() {
         if let Some(tag) = options.dialer_proxy() {
             let stream = dial_through_proxy(*target, tag, options)
                 .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?;
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(Failure::new(Stage::SocketConnected, Kind::Unreachable));
+            }
             no_delay(&stream);
             return Ok((outbound_metered(stream), Fast::Off));
         }
@@ -2709,6 +2778,9 @@ fn dial_kind(target: &SocketAddr, fast: bool) -> Result<(Connection, Fast), Fail
         let started = std::time::Instant::now();
         for round in 0..2 {
             let left = budget.saturating_sub(started.elapsed());
+            let left = deadline.map_or(left, |deadline| {
+                left.min(deadline.saturating_duration_since(Instant::now()))
+            });
             match dial_from(target, source, sockopts.as_deref(), true, left) {
                 Ok((stream, armed)) => {
                     let deferred = armed && crate::fastopen::deferred(&stream);
@@ -2725,6 +2797,9 @@ fn dial_kind(target: &SocketAddr, fast: bool) -> Result<(Connection, Fast), Fail
                 Err(_) if round == 0 => {
                     let plain = sockopts.map(|options| options.without_fast_open());
                     let left = budget.saturating_sub(started.elapsed());
+                    let left = deadline.map_or(left, |deadline| {
+                        left.min(deadline.saturating_duration_since(Instant::now()))
+                    });
                     match dial_from(target, source, plain.as_ref(), false, left) {
                         Ok((stream, _)) => {
                             kept = Some(stream);
@@ -3443,6 +3518,7 @@ pub(crate) enum Outbound {
     Hysteria(Box<HysteriaOut>),
     Tuic(Arc<crate::tuic::TuicOut>),
     AnyTls(Arc<crate::anytls::AnyTlsOut>),
+    Naive(Arc<crate::naive::NaiveOut>),
     Socks(SocksOut),
     Foxy(Box<FoxyOut>),
     Veepn(crate::veepn::VeepnOut),
@@ -3490,6 +3566,7 @@ impl Outbound {
             Self::Hysteria(hy) => resolve_outbound(&hy.address, hy.port),
             Self::Tuic(tuic) => tuic.edge(),
             Self::AnyTls(anytls) => anytls.edge(),
+            Self::Naive(naive) => naive.edge(),
             Self::Socks(socks) => resolve_outbound(&socks.address, socks.port),
             Self::Http(http) => resolve_outbound(&http.address, http.port),
             Self::WireGuard(wireguard) => {
@@ -5419,6 +5496,7 @@ fn chain_hop_can_dial_through(out: &Outbound) -> bool {
         | Outbound::Warp(_)
         | Outbound::Hysteria(_)
         | Outbound::Tuic(_)
+        | Outbound::Naive(_)
         | Outbound::Foxy(_)
         | Outbound::Veepn(_)
         | Outbound::Loopback(_)
@@ -5944,7 +6022,8 @@ fn pick_script_outbound(
 }
 
 /// The target networks a direct-dial server inbound serves; `None` when this tree routes it
-/// through an outbound instead. `AnyTLS` carries streams only, so a datagram rule never reaches it.
+/// through an outbound instead. `AnyTLS` carries streams only; `Naive` also carries `UoT` datagrams,
+/// so a UDP rule that could bypass it must name a freedom outbound.
 fn server_networks(inbound: &Json) -> Option<Vec<crate::router::Network>> {
     let protocol = inbound.get("protocol").and_then(Json::as_str).unwrap_or("");
     match canonical_protocol(protocol) {
@@ -5969,7 +6048,7 @@ fn server_networks(inbound: &Json) -> Option<Vec<crate::router::Network>> {
             }
             (!networks.is_empty()).then_some(networks)
         }
-        "vless" | "trojan" | "vmess" | "hysteria" | "tuic" => Some(vec![
+        "vless" | "trojan" | "vmess" | "hysteria" | "tuic" | "naive" => Some(vec![
             crate::router::Network::Tcp,
             crate::router::Network::Udp,
         ]),
@@ -10232,6 +10311,19 @@ impl Write for FallbackPeer {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+impl LaneWrite for FallbackPeer {
+    fn push(&mut self, data: &[u8]) -> Push {
+        match self {
+            Self::Socket(stream) => stream.push(data),
+            Self::Udp(udp) => match udp.send(data) {
+                Ok(n) => Push::Took(n),
+                Err(error) if is_timeout(&error) => Push::Parked,
+                Err(_) => Push::Lost,
+            },
+        }
     }
 }
 
@@ -15190,6 +15282,45 @@ impl<T: Read> Half<T> {
     }
 }
 
+impl<T: LaneWrite> Write for Half<T> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.push(buf) {
+            Push::Took(n) => Ok(n),
+            Push::Parked => Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+            Push::Lost => Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.writer_lock() {
+            Ok(mut guard) => guard.flush(),
+            Err(()) => Err(std::io::Error::other("relay half poisoned")),
+        }
+    }
+}
+
+impl<T: LaneWrite> LaneWrite for Half<T> {
+    fn push(&mut self, data: &[u8]) -> Push {
+        match self.writer_lock() {
+            Ok(mut guard) => guard.push(data),
+            Err(()) => Push::Lost,
+        }
+    }
+
+    fn settle(&mut self) -> Settle {
+        match self.writer_lock() {
+            Ok(mut guard) => guard.settle(),
+            Err(()) => Settle::Lost,
+        }
+    }
+
+    fn wait_room(&mut self, turn: Duration) {
+        if let Ok(mut guard) = self.writer_lock() {
+            guard.wait_room(turn);
+        }
+    }
+}
+
 impl<T: Write> Half<T> {
     fn write_once(&self, buf: &[u8]) -> std::io::Result<()> {
         let Ok(mut guard) = self.writer_lock() else {
@@ -15337,8 +15468,8 @@ pub(crate) fn relay_quic_stream(
 }
 
 fn relay_lanes_shared<
-    A: Read + Write + Send + 'static + HalfShut,
-    B: Read + Write + Send + 'static + HalfShut,
+    A: Read + LaneWrite + Send + 'static + HalfShut,
+    B: Read + LaneWrite + Send + 'static + HalfShut,
 >(
     a: Half<A>,
     b: Half<B>,
@@ -15348,8 +15479,8 @@ fn relay_lanes_shared<
 }
 
 fn relay_lanes_handoff<
-    A: Read + Write + Send + 'static + HalfShut,
-    B: Read + Write + Send + 'static + HalfShut,
+    A: Read + LaneWrite + Send + 'static + HalfShut,
+    B: Read + LaneWrite + Send + 'static + HalfShut,
 >(
     a: Half<A>,
     b: Half<B>,
@@ -15360,48 +15491,136 @@ fn relay_lanes_handoff<
     let flow = RelayFinish::new(false, Arc::clone(close), None);
     let (up_a, up_b, up_flow) = (Arc::clone(&a), Arc::clone(&b), Arc::clone(&flow));
     let mut forward = RelayBuf::new();
+    let mut forward_at = Forward::new();
     lane_pool::submit(
-        Box::new(move || spill_lane_step(&up_a, &up_b, &mut forward, &up_flow)),
+        Box::new(move || spill_lane_step(&up_a, &up_b, &mut forward, &mut forward_at, &up_flow)),
         Box::new(stream_lane_done(&flow)),
     );
     let mut backward = RelayBuf::new();
+    let mut backward_at = Forward::new();
     let parked = Arc::clone(&flow);
     lane_pool::submit(
-        Box::new(move || spill_lane_step(&b, &a, &mut backward, &parked)),
+        Box::new(move || spill_lane_step(&b, &a, &mut backward, &mut backward_at, &parked)),
         Box::new(stream_lane_done(&flow)),
     );
     flow
 }
 
+struct HalfSink<W>(Arc<Half<W>>);
+
+impl<W> Clone for HalfSink<W> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<W: LaneWrite + 'static> CarrierSink for HalfSink<W> {
+    fn send(&self, bytes: &[u8]) -> bool {
+        self.0.write_once(bytes).is_ok()
+    }
+
+    fn push_ready(&self, bytes: &[u8]) -> Push {
+        match self.0.writer_lock() {
+            Ok(mut guard) => guard.push(bytes),
+            Err(()) => Push::Lost,
+        }
+    }
+
+    fn settle(&self) -> Settle {
+        match self.0.writer_lock() {
+            Ok(mut guard) => guard.settle(),
+            Err(()) => Settle::Lost,
+        }
+    }
+
+    fn progress(&self) -> bool {
+        match self.0.writer_lock() {
+            Ok(mut guard) => guard.progress(),
+            Err(()) => false,
+        }
+    }
+
+    fn wait_for_room(&self, turn: Duration) {
+        if let Ok(mut guard) = self.0.writer_lock() {
+            guard.wait_room(turn);
+        }
+    }
+
+    fn close(&self) {}
+}
+
+fn flush_lane(
+    buffer: &RelayBuf,
+    sink: &impl CarrierSink,
+    at: &mut Forward,
+    ended: &Arc<RelayFinish>,
+) -> Option<Next> {
+    let next = forward_flush(buffer, sink, at);
+    if at.moved {
+        at.moved = false;
+        ended.mark_progress();
+    }
+    if at.lost {
+        at.lost = false;
+        ended.mark_failed();
+    }
+    next
+}
+
 fn spill_lane_step<R, W>(
-    from: &Half<R>,
-    to: &Half<W>,
+    from: &Arc<Half<R>>,
+    to: &Arc<Half<W>>,
     buffer: &mut RelayBuf,
+    at: &mut Forward,
     ended: &Arc<RelayFinish>,
 ) -> Next
 where
     R: Read,
-    W: Write + HalfShut,
+    W: LaneWrite + HalfShut + 'static,
 {
+    let sink = HalfSink(Arc::clone(to));
+    if let Some(next) = settle_lane(&sink, at, ended) {
+        if at.lost {
+            at.lost = false;
+            ended.mark_failed();
+        }
+        return next;
+    }
+    if let Some(next) = flush_lane(buffer, &sink, at, ended) {
+        return next;
+    }
     match from.read_once(buffer.as_mut()) {
         Ok(0) => {
+            if let Some(next) = settle_lane(&sink, at, ended) {
+                if at.lost {
+                    at.lost = false;
+                    ended.mark_failed();
+                }
+                return next;
+            }
             to.spill_write();
             Next::Done
         }
-        Ok(n) if to.write_once(buffer.filled(n)).is_ok() => {
-            ended.mark_progress();
-            Next::More
+        Ok(n) => {
+            at.pending = n;
+            at.sent = 0;
+            let _ = buffer.filled(n);
+            flush_lane(buffer, &sink, at, ended).unwrap_or(Next::More)
         }
         Err(error) if is_timeout(&error) => {
             if ended.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
+                ended.mark_failed();
                 Next::Done
             } else {
                 note_wait_finish(ended);
                 buffer.release();
-                Next::Idle
+                settle_lane(&sink, at, ended).unwrap_or(Next::Idle)
             }
         }
-        Ok(_) | Err(_) => Next::Done,
+        Err(_) => {
+            ended.mark_failed();
+            Next::Done
+        }
     }
 }
 
@@ -24967,26 +25186,48 @@ fn inject_sni_decoy(
     Ok(false)
 }
 
-fn dial_tls_session(
+pub(crate) fn dial_tls_session(
     server: &SocketAddr,
     cfg: &ferrox_core::tls::TlsConfig,
     mask: Option<&ferrox_core::finalmask::Chain>,
 ) -> Option<ferrox_core::tls::ClientSession<Connection>> {
+    dial_tls_session_until(server, cfg, mask, None)
+}
+
+pub(crate) fn dial_tls_session_until(
+    server: &SocketAddr,
+    cfg: &ferrox_core::tls::TlsConfig,
+    mask: Option<&ferrox_core::finalmask::Chain>,
+    deadline: Option<Instant>,
+) -> Option<ferrox_core::tls::ClientSession<Connection>> {
     let mut retry = None;
     let mut ready = None;
+    let mut prior_write = None;
     for attempt in 0..2 {
         let current = retry.as_ref().unwrap_or(cfg);
         let fast = current
             .sni
             .as_ref()
             .is_some_and(|sni| sni.method == ferrox_core::evasion::SniMethod::FastOpen);
-        let (uplink, fast) = match dial_kind(server, fast) {
+        let (uplink, fast) = match dial_kind_until(server, fast, deadline) {
             Ok(uplink) => uplink,
             Err(failure) => {
                 note_dial_failure(server, failure);
                 return None;
             }
         };
+        if let Some(deadline) = deadline {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            prior_write = uplink.write_timeout().ok().flatten();
+            if uplink.set_read_timeout(Some(left)).is_err()
+                || uplink.set_write_timeout(Some(left)).is_err()
+            {
+                return None;
+            }
+        }
         let cut = current.fragment.as_ref().map(|fragment| {
             mask.map_or_else(
                 || ferrox_core::finalmask::Chain::default().with_front(fragment),
@@ -25034,6 +25275,9 @@ fn dial_tls_session(
         }
     }
     let session = ready?;
+    if deadline.is_some() {
+        let _ = session.get_ref().set_write_timeout(prior_write);
+    }
     // Session-shared behind a lock: reads wait one tick, and `TlsHalf::read` spends a grain unlocked.
     if session
         .get_ref()
@@ -25142,20 +25386,21 @@ pub(crate) fn anytls_dial_session(
     dial_tls_session(server, cfg, None)
 }
 
-pub(crate) fn anytls_client_halves(
+pub(crate) fn tls_client_halves(
     session: ferrox_core::tls::ClientSession<Connection>,
-) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
+) -> Option<(Box<dyn Read + Send>, Box<dyn FrameWrite + Send>)> {
     let raw = session.get_ref().try_clone().ok()?;
     let (reader, writer) = session_halves(session, raw);
     Some((Box::new(reader), Box::new(writer)))
 }
 
-pub(crate) fn anytls_server_halves(
-    session: AnyTlsServerSession,
-) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
+pub(crate) type ServerHalves = (Box<dyn Read + Send>, Box<dyn FrameWrite + Send>);
+
+pub(crate) fn tls_server_halves(session: AnyTlsServerSession) -> Option<(ServerHalves, bool)> {
     let raw = session.get_ref().get_ref().try_clone().ok()?;
     let (reader, writer) = session_halves(session, raw);
-    Some((Box::new(reader), Box::new(writer)))
+    let driven = reader.driven.is_some();
+    Some(((Box::new(reader), Box::new(writer)), driven))
 }
 
 pub(crate) fn relay_anytls_stream(
@@ -25178,6 +25423,25 @@ pub(crate) fn relay_anytls_stream(
     flow.then(move || {
         if let Some(finish) = finish {
             finish();
+        }
+    });
+}
+
+pub(crate) fn relay_naive_stream(client: &Connection, stream: crate::naive::NaiveStream) {
+    let Some(upstream) = client.try_clone().ok() else {
+        stream.abort();
+        return;
+    };
+    let stall = Some(crate::budgets::relay_stall());
+    let _ = client.set_write_timeout(stall);
+    let _ = upstream.set_write_timeout(stall);
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+    let tunnel = stream.clone();
+    let flow = relay_lanes_handoff(Half::socket(upstream), Half::socket(stream), &close);
+    let ended = Arc::clone(&flow);
+    flow.then(move || {
+        if ended.failed() {
+            tunnel.abort();
         }
     });
 }
@@ -25710,6 +25974,38 @@ impl Sealed {
             Err(_) => Settle::Lost,
         }
     }
+
+    /// A plain `Write` has no `settle`, so a paced tail parks the writer here until the socket leaves `keep` bytes.
+    fn drain_paced(&mut self, keep: usize) -> std::io::Result<()> {
+        if !self.paced {
+            return Ok(());
+        }
+        let mut deadline = Instant::now() + crate::budgets::relay_stall();
+        while self.bytes.len() > keep {
+            let before = self.bytes.len();
+            self.send()?;
+            if self.bytes.len() <= keep {
+                return Ok(());
+            }
+            if self.bytes.len() < before {
+                deadline = Instant::now() + crate::budgets::relay_stall();
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            std::thread::sleep(left.min(crate::budgets::RELAY_POLL));
+        }
+        Ok(())
+    }
+
+    fn bound_tail(&mut self) -> std::io::Result<()> {
+        self.drain_paced(PACED_TAIL - 1)
+    }
+
+    fn drain_all(&mut self) -> std::io::Result<()> {
+        self.drain_paced(0)
+    }
 }
 
 /// Seals under the session's lock and sends after it drops: the transport write is the one wait
@@ -25736,7 +26032,29 @@ fn seal_out<S: CipherOpen>(
         }
     };
     out.send()?;
+    out.bound_tail()?;
     Ok(wrote)
+}
+
+/// A flush owns the wait the write path parks: a caller that asks for the bytes to be out gets them out.
+fn flush_out<S: CipherOpen>(
+    session: &Arc<Mutex<S>>,
+    out: &Arc<Mutex<Sealed>>,
+) -> std::io::Result<()> {
+    let mut out = out
+        .lock()
+        .map_err(|_| std::io::Error::other("tls half poisoned"))?;
+    {
+        let mut session = session
+            .lock()
+            .map_err(|_| std::io::Error::other("tls half poisoned"))?;
+        if let Err(error) = session.seal_into(&[], &mut out.bytes) {
+            out.bytes.clear();
+            return Err(error);
+        }
+    }
+    out.send()?;
+    out.drain_all()
 }
 
 fn seal_slices_out<S: CipherOpen>(
@@ -25756,7 +26074,8 @@ fn seal_slices_out<S: CipherOpen>(
             return Err(error);
         }
     }
-    out.send()
+    out.send()?;
+    out.bound_tail()
 }
 
 // A reader that drives the transport parks outside the session lock; one that cannot stays behind it.
@@ -26625,9 +26944,9 @@ impl<S: CipherOpen, R> Write for DrivenHalf<S, R> {
 
     fn flush(&mut self) -> std::io::Result<()> {
         if let Some(prefix) = self.write_prefix.take() {
-            return seal_slices_out(&self.session, &self.out, &[&prefix]);
+            seal_slices_out(&self.session, &self.out, &[&prefix])?;
         }
-        seal_out(&self.session, &self.out, &[]).map(|_| ())
+        flush_out(&self.session, &self.out)
     }
 }
 
@@ -26663,7 +26982,7 @@ impl<S: ferrox_core::tls::TlsProvider, R> Write for TlsHalf<S, R> {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        seal_out(&self.session, &self.out, &[]).map(|_| ())
+        flush_out(&self.session, &self.out)
     }
 }
 
@@ -31530,6 +31849,7 @@ fn dial_socks_outbound(
         }
         Outbound::Tuic(tuic) => tuic.dial(client, target),
         Outbound::AnyTls(anytls) => anytls.dial(client, target),
+        Outbound::Naive(naive) => naive.dial(client, target),
         Outbound::Http(http) => {
             dial_http_outbound(client, server, http, target, ladder);
         }
@@ -32386,7 +32706,7 @@ fn origin_head(head: &mut Vec<u8>, line_end: Option<usize>, line: &RequestLine) 
 }
 
 /// An authority as a target: a literal address stays one, a name rides the tunnel untouched, no port means 80.
-fn authority_target(authority: &[u8]) -> Option<Destination> {
+pub(crate) fn authority_target(authority: &[u8]) -> Option<Destination> {
     let authority = std::str::from_utf8(authority).ok()?;
     if let Ok(address) = authority.parse::<SocketAddr>() {
         return Some(Destination::Address(address));
@@ -33544,6 +33864,9 @@ fn serve_udp_lane_with(
         Outbound::Freedom(out) => {
             serve_socks_udp_freedom(relay, out, source, sockopts, associate, peer, stop);
         }
+        Outbound::Naive(naive) if naive.udp_over_tcp() => {
+            naive.serve_udp(relay, associate, peer, stop);
+        }
         Outbound::Socks(socks) => {
             if socks.version == crate::socks::Version::V4 {
                 // SOCKS4 has no datagram half: the association is a SOCKS5 request.
@@ -33671,6 +33994,7 @@ struct UdpLane {
     address: SocketAddr,
     handle: thread::JoinHandle<()>,
     waker: UdpSocket,
+    stop: Arc<AtomicBool>,
 }
 
 struct LaneStart {
@@ -34012,6 +34336,10 @@ fn spawn_udp_lane_with_cancel(
         sockopts,
         strategy,
     } = start.unwrap_or_else(LaneStart::take_thread);
+    let stop = cancel
+        .clone()
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let lane_stop = Arc::clone(&stop);
     let handle = thread::spawn(move || {
         let _tag = OutboundTag::enter(tag.as_deref());
         serve_udp_lane_with(
@@ -34023,13 +34351,14 @@ fn spawn_udp_lane_with_cancel(
             sockopts.as_ref(),
             strategy,
             Some(local),
-            cancel.as_deref(),
+            Some(cancel.as_deref().unwrap_or(lane_stop.as_ref())),
         );
     });
     Some(UdpLane {
         address,
         handle,
         waker,
+        stop,
     })
 }
 
@@ -34047,6 +34376,7 @@ fn retire_udp_lanes(
     }
     thread::spawn(move || {
         for lane in lanes.iter().chain(default_lane.iter()) {
+            lane.stop.store(true, Ordering::Relaxed);
             let _ = lane.waker.set_read_timeout(Some(UDP_POLL));
             let _ = relay.send_to(&[0u8], lane.address);
         }
@@ -40656,6 +40986,7 @@ pub(crate) fn track_relay(finish: &Arc<RelayFinish>) {
 pub(crate) struct RelayFinish {
     left: AtomicU32,
     ended: AtomicBool,
+    failed: AtomicBool,
     ended_at: Mutex<Option<std::time::Instant>>,
     /// The latest write either direction finished, so a lane that still moves bytes keeps its grace.
     progress_at: Mutex<Option<std::time::Instant>>,
@@ -40678,6 +41009,7 @@ impl RelayFinish {
         Arc::new(Self {
             left: AtomicU32::new(2),
             ended: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
             ended_at: Mutex::new(None),
             progress_at: Mutex::new(None),
             parked: Mutex::new(Vec::new()),
@@ -40692,6 +41024,15 @@ impl RelayFinish {
 
     pub(crate) fn ended(&self) -> bool {
         self.ended.load(Ordering::Relaxed)
+    }
+
+    /// A lane that ended on an error rather than a half-close: the tunnel is abandoned, not finished.
+    pub(crate) fn mark_failed(&self) {
+        self.failed.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn failed(&self) -> bool {
+        self.failed.load(Ordering::Relaxed)
     }
 
     pub(crate) fn mark_ended(&self) {
@@ -41326,6 +41667,90 @@ pub(crate) enum Push {
     Lost,
 }
 
+/// A relay writer a lane can offer without waiting: a flow-control wait parks the lane, not the worker.
+pub(crate) trait LaneWrite: Write + Send {
+    fn push(&mut self, data: &[u8]) -> Push {
+        match self.write(data) {
+            Ok(0) => Push::Parked,
+            Ok(n) => Push::Took(n),
+            Err(error) if is_timeout(&error) => Push::Parked,
+            Err(_) => Push::Lost,
+        }
+    }
+
+    fn settle(&mut self) -> Settle {
+        Settle::Clear
+    }
+
+    fn progress(&mut self) -> bool {
+        false
+    }
+
+    fn wait_room(&mut self, turn: Duration) {
+        std::thread::sleep(turn);
+    }
+}
+
+impl LaneWrite for Vec<u8> {}
+
+impl LaneWrite for Box<dyn Write + Send> {}
+
+#[cfg(unix)]
+impl LaneWrite for std::os::unix::net::UnixStream {}
+
+#[cfg(unix)]
+impl FrameWrite for std::os::unix::net::UnixStream {
+    fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+        parts.iter().all(|part| self.write_all(part).is_ok())
+    }
+}
+
+impl LaneWrite for Connection {
+    fn push(&mut self, data: &[u8]) -> Push {
+        #[cfg(unix)]
+        {
+            match self.write_ready(&[data]) {
+                Ok(0) => Push::Parked,
+                Ok(n) => Push::Took(n),
+                Err(error) if is_timeout(&error) => Push::Parked,
+                Err(_) => Push::Lost,
+            }
+        }
+        #[cfg(windows)]
+        {
+            match Connection::write_ready(self, &[data]) {
+                Ok(0) => Push::Parked,
+                Ok(n) => Push::Took(n),
+                Err(error)
+                    if is_timeout(&error) || error.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    Push::Parked
+                }
+                Err(_) => Push::Lost,
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            match <Connection as Write>::write(self, data) {
+                Ok(0) => Push::Parked,
+                Ok(n) => Push::Took(n),
+                Err(error) if is_timeout(&error) => Push::Parked,
+                Err(_) => Push::Lost,
+            }
+        }
+    }
+
+    fn settle(&mut self) -> Settle {
+        let (written, outcome) = self.flush_ready_outcome();
+        match outcome {
+            Ok(()) => Settle::Clear,
+            Err(error) if is_timeout(&error) && written > 0 => Settle::Advanced,
+            Err(error) if is_timeout(&error) => Settle::Parked,
+            Err(_) => Settle::Lost,
+        }
+    }
+}
+
 pub(crate) trait CarrierSink: Clone + Send + 'static {
     fn send(&self, bytes: &[u8]) -> bool;
     /// A lane step must not wait for room a paced carrier frees later: a full queue parks the window instead of holding the worker the other flows need.
@@ -41345,6 +41770,10 @@ pub(crate) trait CarrierSink: Clone + Send + 'static {
     /// drains them, so a stalled record is not stranded behind an idle read.
     fn settle(&self) -> Settle {
         Settle::Clear
+    }
+    /// Wire progress this carrier made without consuming a plaintext byte.
+    fn progress(&self) -> bool {
+        false
     }
     /// The most bytes one relay read should hand this carrier, so a write stays one framed message
     /// the peer's window can pay for; `None` keeps the relay's own window.
@@ -41371,9 +41800,11 @@ pub(crate) enum Accepted {
     Lost,
 }
 
-/// What a settle found: the paced tail is empty, it still owes the socket bytes, or the carrier died.
+/// What a settle found: the paced tail is empty, it shrank but still owes the socket bytes, it made
+/// no progress on the bytes it still owes, or the carrier died.
 pub(crate) enum Settle {
     Clear,
+    Advanced,
     Parked,
     Lost,
 }
@@ -41435,6 +41866,19 @@ impl FrameWrite for Connection {
             return None;
         }
         Some(Connection::write_ready(self, parts))
+    }
+
+    #[cfg(windows)]
+    fn write_ready(&mut self, parts: &[&[u8]]) -> Option<std::io::Result<usize>> {
+        Some(Connection::write_ready(self, parts))
+    }
+
+    fn settle(&mut self) -> Settle {
+        match self.flush_ready() {
+            Ok(()) => Settle::Clear,
+            Err(error) if is_timeout(&error) => Settle::Parked,
+            Err(_) => Settle::Lost,
+        }
     }
 
     fn arm_write(&mut self, timeout: Duration) {
@@ -41524,7 +41968,7 @@ impl<S: ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send
         if out.bytes.len() >= PACED_TAIL {
             match out.settle() {
                 Settle::Clear => {}
-                Settle::Parked => return Accepted::Full,
+                Settle::Advanced | Settle::Parked => return Accepted::Full,
                 Settle::Lost => return Accepted::Lost,
             }
         }
@@ -41769,6 +42213,8 @@ struct Forward {
     spins: u32,
     parked: Option<std::time::Instant>,
     stopped: Option<std::time::Instant>,
+    moved: bool,
+    lost: bool,
 }
 
 impl Forward {
@@ -41780,6 +42226,8 @@ impl Forward {
             spins: 0,
             parked: None,
             stopped: None,
+            moved: false,
+            lost: false,
         }
     }
 }
@@ -41801,16 +42249,28 @@ impl Upload {
 
 /// A paced carrier may still owe bytes no caller offered again: drain them before a read that would
 /// otherwise park the only lane able to hand the peer the grant the parked write waits for.
-fn settle_lane(uplink: &impl CarrierSink, at: &mut Forward) -> Option<Next> {
+fn settle_lane(
+    uplink: &impl CarrierSink,
+    at: &mut Forward,
+    ended: &Arc<RelayFinish>,
+) -> Option<Next> {
     match uplink.settle() {
         Settle::Clear => {
             at.parked = None;
             None
         }
+        Settle::Advanced => {
+            at.parked = None;
+            at.stopped = None;
+            at.spins = 0;
+            ended.mark_progress();
+            Some(Next::Retry)
+        }
         Settle::Parked => {
             let now = std::time::Instant::now();
             let since = *at.parked.get_or_insert(now);
             if now.duration_since(since) >= crate::budgets::relay_stall() {
+                at.lost = true;
                 return Some(Next::Done);
             }
             at.spins += 1;
@@ -41820,7 +42280,10 @@ fn settle_lane(uplink: &impl CarrierSink, at: &mut Forward) -> Option<Next> {
             }
             Some(Next::Retry)
         }
-        Settle::Lost => Some(Next::Done),
+        Settle::Lost => {
+            at.lost = true;
+            Some(Next::Done)
+        }
     }
 }
 
@@ -41834,14 +42297,22 @@ fn write_parked(at: &mut Forward) -> bool {
 /// Offers the bytes a parked window still owes; `Some` ends or parks the lane, `None` means the window is clear and the leg may read again.
 fn forward_flush(buffer: &RelayBuf, uplink: &impl CarrierSink, at: &mut Forward) -> Option<Next> {
     while at.sent < at.pending {
+        if uplink.progress() {
+            at.stopped = None;
+            at.spins = 0;
+        }
         match uplink.push_ready(&buffer.prefix(at.pending)[at.sent..]) {
             Push::Took(n) if n > 0 => {
                 at.sent += n;
                 at.spins = 0;
                 at.stopped = None;
+                at.moved = true;
             }
             // A carrier that takes nothing for the stall budget ends the leg, wherever the lane parks.
-            Push::Took(_) | Push::Parked if write_parked(at) => return Some(Next::Done),
+            Push::Took(_) | Push::Parked if write_parked(at) => {
+                at.lost = true;
+                return Some(Next::Done);
+            }
             // A full socket hands the lane to the reactor, while a full window rejoins the queue at once.
             Push::Took(_) | Push::Parked if crate::proxy::write_wait_pending() => {
                 return Some(Next::Idle);
@@ -41857,6 +42328,7 @@ fn forward_flush(buffer: &RelayBuf, uplink: &impl CarrierSink, at: &mut Forward)
             }
             Push::Lost => {
                 echo_trace("relay fwd send failed");
+                at.lost = true;
                 return Some(Next::Done);
             }
         }
@@ -41979,7 +42451,7 @@ where
     let mut at = Forward::new();
     lane_pool::submit(
         Box::new(move || {
-            if let Some(next) = settle_lane(&uplink, &mut at) {
+            if let Some(next) = settle_lane(&uplink, &mut at, &forward_flow) {
                 return next;
             }
             if let Some(next) = forward_flush(&buffer, &uplink, &mut at) {
@@ -43756,7 +44228,7 @@ fn socks_authenticate<'a>(
     accepted
 }
 
-fn read_socks_named(stream: &mut dyn Read, atyp: u8) -> Option<Destination> {
+pub(crate) fn read_socks_named(stream: &mut dyn Read, atyp: u8) -> Option<Destination> {
     match atyp {
         3 => {
             let mut len = [0u8; 1];
@@ -45035,6 +45507,9 @@ fn find_outbound_with(root: &Json, test: bool) -> Result<Option<Outbound>, Strin
     }
     if let Some(anytls) = crate::anytls::outbound(root)? {
         return Ok(Some(Outbound::AnyTls(Arc::new(anytls))));
+    }
+    if let Some(naive) = crate::naive::outbound(root)? {
+        return Ok(Some(Outbound::Naive(Arc::new(naive))));
     }
     if let Some(wireguard) = find_wireguard_outbound(root)? {
         return Ok(Some(Outbound::WireGuard(Arc::new(wireguard))));
@@ -87425,6 +87900,7 @@ end
                 address,
                 handle,
                 waker,
+                stop: Arc::new(AtomicBool::new(false)),
             },
         )]);
         let mut replies = HashSet::from([address]);
@@ -87453,6 +87929,7 @@ end
                     address: finished,
                     handle: finished_handle,
                     waker: UdpSocket::bind("127.0.0.1:0").expect("binds"),
+                    stop: Arc::new(AtomicBool::new(false)),
                 },
             ),
             (
@@ -87461,6 +87938,7 @@ end
                     address: running,
                     handle: running_handle,
                     waker: UdpSocket::bind("127.0.0.1:0").expect("binds"),
+                    stop: Arc::new(AtomicBool::new(false)),
                 },
             ),
         ]);
@@ -93141,6 +93619,7 @@ mod reverse_tests {
                 let _ = hold.recv();
             }),
             waker: live_socket.try_clone().expect("live waker"),
+            stop: Arc::new(AtomicBool::new(false)),
         };
         let finished_socket = UdpSocket::bind("127.0.0.1:0").expect("finished socket");
         let finished_address = finished_socket.local_addr().expect("finished address");
@@ -93152,6 +93631,7 @@ mod reverse_tests {
             address: finished_address,
             handle: finished_handle,
             waker: finished_socket,
+            stop: Arc::new(AtomicBool::new(false)),
         };
         let default_socket = UdpSocket::bind("127.0.0.1:0").expect("default socket");
         let default_address = default_socket.local_addr().expect("default address");
@@ -93165,6 +93645,7 @@ mod reverse_tests {
                 address: default_address,
                 handle: default_handle,
                 waker: default_socket,
+                stop: Arc::new(AtomicBool::new(false)),
             },
         ));
         let mut lanes = HashMap::from([
