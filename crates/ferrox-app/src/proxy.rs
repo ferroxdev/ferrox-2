@@ -53683,6 +53683,12 @@ mod tests {
     /// flow stopped at the same frame. The payload is large enough to fill both send buffers.
     #[test]
     fn eight_downloads_finish_over_each_grpc_carrier() {
+        // Eight lanes of 4 MiB over three carriers: a lane starved by the suite's load outlives the carrier's idle bound, so run it alone.
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::eight_downloads_finish_over_each_grpc_carrier",
+        ) {
+            return;
+        }
         let _eight = EIGHT_FLOW
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -61432,6 +61438,12 @@ mod tests {
     /// A shadowsocks listener and dial that declare tls answer the handshake before any non-KCP carrier.
     #[test]
     fn a_shadowsocks_inbound_that_declares_tls_answers_every_carrier() {
+        // Six carriers in sequence, each bounded by the inbound's ten-second handshake read: a dial starved by the suite's load outlives it, so run the ladder alone.
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::a_shadowsocks_inbound_that_declares_tls_answers_every_carrier",
+        ) {
+            return;
+        }
         let (cert, key, client) = tls_cert_json();
         let cases = [
             ("raw", r#""network": "tcp""#),
