@@ -2863,19 +2863,16 @@ pub(crate) fn shutdown_listener(listener: &std::net::TcpListener) {
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     if let Ok(bound) = listener.local_addr() {
         // FreeBSD refuses a dial to the unspecified address, so a wildcard listener is woken on loopback.
-        let ip = if bound.ip().is_unspecified() {
+        let wake = if bound.ip().is_unspecified() {
             if bound.is_ipv4() {
-                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                std::net::SocketAddr::from(([127, 0, 0, 1], bound.port()))
             } else {
-                std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+                std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, bound.port()))
             }
         } else {
-            bound.ip()
+            bound
         };
-        let _ = std::net::TcpStream::connect_timeout(
-            &std::net::SocketAddr::new(ip, bound.port()),
-            std::time::Duration::from_millis(100),
-        );
+        let _ = std::net::TcpStream::connect_timeout(&wake, std::time::Duration::from_millis(100));
     }
 }
 

@@ -7714,6 +7714,8 @@ mod tests {
         writer.send_to(&packet, server).expect("sends");
         let mut datagrams = 0usize;
         let mut touched = std::collections::HashSet::new();
+        let mut chunks = std::collections::HashSet::new();
+        let mut total: Option<u8> = None;
         for listener in &listeners {
             let mut buf = [0u8; 2048];
             while let Ok((n, _)) = listener.recv_from(&mut buf) {
@@ -7726,17 +7728,21 @@ mod tests {
                     packet[..plain],
                     "a fragment left the socket inside its salamander mask"
                 );
-                // A datagram another test's port probe left here is not this lane's frame.
                 let Some(unmasked) = mask.deobfuscate_in_place(&mut buf[..n]) else {
                     continue;
                 };
+                // A datagram another test's port probe left here carries no gecko flag once unmasked.
+                let ours = buf[0] & ferrox_core::hysteria::GECKO_FLAG != 0;
                 let Some((frame, _)) = ferrox_core::hysteria::decode_gecko_frame(&buf[..unmasked])
                 else {
+                    assert!(!ours, "this lane's fragment of {n} bytes did not decode");
                     continue;
                 };
                 if frame.msg_id != 0 {
                     continue;
                 }
+                total.get_or_insert(frame.total_chunks);
+                chunks.insert(frame.chunk_idx);
                 datagrams += 1;
                 touched.insert(listener.local_addr().expect("addr").port());
                 assert!(
@@ -7752,6 +7758,16 @@ mod tests {
         assert!(
             touched.len() > 1,
             "the fragments moved off the single dialed port"
+        );
+        let total = total.expect("a message-zero fragment arrived");
+        assert_eq!(
+            chunks.len(),
+            usize::from(total),
+            "every chunk of the message arrived"
+        );
+        assert!(
+            (0..total).all(|idx| chunks.contains(&idx)),
+            "chunks {chunks:?} cover 0..{total}"
         );
     }
 
