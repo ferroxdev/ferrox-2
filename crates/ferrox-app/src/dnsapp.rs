@@ -921,7 +921,11 @@ impl Resolver {
             match self.family(index, name, Family::A, force_local, target) {
                 Lookup::Records(mut found, found_ttl) => {
                     ttl = ttl.min(found_ttl);
-                    ips.append(&mut found);
+                    if ips.is_empty() {
+                        ips = found;
+                    } else {
+                        ips.append(&mut found);
+                    }
                     families += 1;
                 }
                 Lookup::Rcode(code) => rcode = Some(code),
@@ -934,7 +938,11 @@ impl Resolver {
             match self.family(index, name, Family::Aaaa, force_local, target) {
                 Lookup::Records(mut found, found_ttl) => {
                     ttl = ttl.min(found_ttl);
-                    ips.append(&mut found);
+                    if ips.is_empty() {
+                        ips = found;
+                    } else {
+                        ips.append(&mut found);
+                    }
                     families += 1;
                 }
                 Lookup::Rcode(code) => rcode = Some(code),
@@ -2349,8 +2357,8 @@ mod resolver_tests {
             vec!["192.0.2.1".parse::<IpAddr>().unwrap()]
         );
         assert_eq!(
-            counts.allocs, 4,
-            "the focus and order vectors and the answer; the key is borrowed"
+            counts.allocs, 2,
+            "the order vector and the cached answer clone; the key and the used flags are borrowed or on the stack"
         );
     }
 
