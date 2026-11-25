@@ -152,7 +152,11 @@ fn asset_config(asset: &Json) -> Result<Asset, String> {
 
 /// The reference rewrites a `.dat` URL under its rules dataset to the `.gz` asset it publishes.
 fn migrate_url(url: String) -> String {
-    if rules_dataset(&url) && url.to_ascii_lowercase().ends_with(".dat") {
+    let dat = url.len() >= 4
+        && url
+            .get(url.len() - 4..)
+            .is_some_and(|tail| tail.eq_ignore_ascii_case(".dat"));
+    if rules_dataset(&url) && dat {
         eprintln!("geodata: {url} is deprecated; use {url}.gz");
         return format!("{url}.gz");
     }
@@ -160,9 +164,12 @@ fn migrate_url(url: String) -> String {
 }
 
 fn rules_dataset(url: &str) -> bool {
-    let lower = url.to_ascii_lowercase();
-    lower.starts_with("https://github.com/xtls/xray-rules-dat/")
-        || lower.starts_with("https://raw.githubusercontent.com/xtls/xray-rules-dat/")
+    let starts = |prefix: &str| {
+        url.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    };
+    starts("https://github.com/xtls/xray-rules-dat/")
+        || starts("https://raw.githubusercontent.com/xtls/xray-rules-dat/")
 }
 
 /// `.dat` anywhere, and the rules dataset's `.dat.gz` form, which is always stored decompressed.
@@ -1385,11 +1392,16 @@ fn resolve_remote_location(base: &str, location: &str) -> Result<String, String>
 }
 
 fn resolve_location_any(base: &str, location: &str, allow_http: bool) -> Result<String, String> {
-    let prefix = location.get(..8).unwrap_or(location).to_ascii_lowercase();
-    if prefix.starts_with("https://") {
+    if location
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    {
         return Ok(location.to_owned());
     }
-    if prefix.starts_with("http://") {
+    if location
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+    {
         if allow_http && !HttpUrl::parse(base)?.tls {
             return Ok(location.to_owned());
         }
@@ -1772,6 +1784,30 @@ mod tests {
         ] {
             assert_eq!(migrate_url(url.to_owned()), migrated, "{url}");
         }
+    }
+
+    #[test]
+    fn a_rules_url_is_recognised_without_a_lowercase_copy() {
+        let url = "https://github.com/xtls/XRAY-rules-dat/a/geosite.dat";
+        let (rules, counts) = ferrox_core::alloc_count::measure(|| rules_dataset(url));
+        assert!(rules, "the case-folded prefix is the rules dataset");
+        assert_eq!(
+            counts.allocs, 0,
+            "the prefix is compared in place: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn an_absolute_redirect_costs_only_its_result() {
+        let (url, counts) = ferrox_core::alloc_count::measure(|| {
+            resolve_location("https://example.test/a", "HTTPS://example.test/b")
+                .expect("an absolute location is taken as it stands")
+        });
+        assert_eq!(url, "HTTPS://example.test/b");
+        assert_eq!(
+            counts.allocs, 1,
+            "only the returned string is allocated: {counts:?}"
+        );
     }
 
     #[test]

@@ -230,9 +230,10 @@ impl Group {
             .lock()
             .ok()
             .and_then(|selected| selected.get(network));
-        // Every member resolved once; the current one is found among them rather than resolved again.
+        // Every member resolved once; the current one is recorded as it is built rather than looked up again.
         let mut candidates: Vec<(usize, String, Outbound, u64)> =
             Vec::with_capacity(self.members.len());
+        let mut current = None;
         for (at, member) in self.members.iter().enumerate() {
             let Some((leaf, out, revision)) = resolve_member(route, member, network, resolved)
             else {
@@ -244,20 +245,22 @@ impl Group {
             let Some(revision) = revision else {
                 continue;
             };
+            let slot = candidates.len();
             candidates.push((at, leaf, out, revision));
+            if stored == Some(at) {
+                current = Some(slot);
+            }
         }
-        let current = stored.and_then(|at| candidates.iter().position(|slot| slot.0 == at));
         // One lock for the whole sweep: the current member's reading is read beside every other's.
         let (mut best, mut current_delay) = (None, None);
         if let Some(delays) = self.history.guard() {
-            current_delay = current.and_then(|slot| {
-                let (_, leaf, _, revision) = &candidates[slot];
-                History::read(&delays, leaf, *revision)
-            });
             for (at, (_, leaf, _, revision)) in candidates.iter().enumerate() {
                 let Some(delay) = History::read(&delays, leaf, *revision) else {
                     continue;
                 };
+                if Some(at) == current {
+                    current_delay = Some(delay);
+                }
                 if best.is_none_or(|(fastest, _)| delay < fastest) {
                     best = Some((delay, at));
                 }

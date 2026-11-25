@@ -1185,11 +1185,11 @@ impl Inner {
         if self.protocol == Protocol::Yamux {
             let _ = self.write_frame(&yamux_head(YAMUX_WINDOW, 0, id, credit as u32), &[]);
         } else if self.protocol == Protocol::H2Mux {
-            let mut frames = Vec::with_capacity(18);
-            frames.extend_from_slice(&h2::frame_head(4, h2::T_WINDOW, 0, id));
-            frames.extend_from_slice(&(credit as u32).to_be_bytes());
-            frames.extend_from_slice(&h2::frame_head(4, h2::T_WINDOW, 0, 0));
-            frames.extend_from_slice(&(credit as u32).to_be_bytes());
+            let mut frames = [0u8; 26];
+            frames[..9].copy_from_slice(&h2::frame_head(4, h2::T_WINDOW, 0, id));
+            frames[9..13].copy_from_slice(&(credit as u32).to_be_bytes());
+            frames[13..22].copy_from_slice(&h2::frame_head(4, h2::T_WINDOW, 0, 0));
+            frames[22..26].copy_from_slice(&(credit as u32).to_be_bytes());
             let _ = self.write_raw(&frames);
         }
     }
@@ -2929,6 +2929,17 @@ mod tests {
         });
         let _ = inner.self_ref.set(Arc::downgrade(&inner));
         inner
+    }
+
+    /// The two H2 window frames are built on the stack: a credit message costs no heap buffer.
+    #[test]
+    fn an_h2_credit_writes_from_the_stack() {
+        let session = idle_session(Protocol::H2Mux, None);
+        let ((), counts) = ferrox_core::alloc_count::measure(|| session.credit(1, 4096));
+        assert_eq!(
+            counts.allocs, 0,
+            "the window frames were allocated: {counts:?}"
+        );
     }
 
     fn data_frame(protocol: Protocol, len: usize) -> Vec<u8> {

@@ -179,8 +179,8 @@ fn read_response(flow: &mut Flow) -> Option<bool> {
     let mut buf = [0u8; 64];
     loop {
         if let Ok((response, used)) = wire::decode_server_response(&head) {
-            flow.backlog = head[used..].to_vec();
-            flow.at = 0;
+            flow.backlog = head;
+            flow.at = used;
             return Some(response.ok);
         }
         if head.len() > HEAD_CAP || Instant::now() >= deadline {
@@ -281,11 +281,11 @@ fn usable(conn: &QuicheConnection) -> bool {
         && conn.peer_error().is_none()
 }
 
-fn candidates(dial: &Dial) -> Vec<(Session, u64)> {
+fn candidates(key: &Server) -> Vec<(Session, u64)> {
     let Ok(mut pool) = pool().lock() else {
         return Vec::new();
     };
-    let Some(entries) = pool.get_mut(&server_of(dial)) else {
+    let Some(entries) = pool.get_mut(key) else {
         return Vec::new();
     };
     let now = Instant::now();
@@ -305,21 +305,21 @@ fn candidates(dial: &Dial) -> Vec<(Session, u64)> {
         .collect()
 }
 
-fn evict(dial: &Dial, session: &Session) {
+fn evict(key: &Server, session: &Session) {
     let Ok(mut pool) = pool().lock() else {
         return;
     };
-    let Some(entries) = pool.get_mut(&server_of(dial)) else {
+    let Some(entries) = pool.get_mut(key) else {
         return;
     };
     entries.retain(|entry| !Arc::ptr_eq(&entry.session.shared, &session.shared));
 }
 
-fn keep(dial: &Dial, session: Session, next_stream: u64) {
+fn keep(key: Server, session: Session, next_stream: u64) {
     let Ok(mut pool) = pool().lock() else {
         return;
     };
-    pool.entry(server_of(dial)).or_default().push(Pooled {
+    pool.entry(key).or_default().push(Pooled {
         session,
         next_stream,
         used: Instant::now(),
@@ -327,12 +327,13 @@ fn keep(dial: &Dial, session: Session, next_stream: u64) {
 }
 
 fn open_pooled(dial: &Dial, host: &str, port: u16) -> Option<Flow> {
-    for (session, stream) in candidates(dial) {
+    let key = server_of(dial);
+    for (session, stream) in candidates(&key) {
         if let Some(flow) = open_flow(&session, stream, host, port) {
             return Some(flow);
         }
         if session.shared.lock().is_ok_and(|conn| !usable(&conn)) {
-            evict(dial, &session);
+            evict(&key, &session);
         }
     }
     let mut session = connect(dial)?;
@@ -342,7 +343,7 @@ fn open_pooled(dial: &Dial, host: &str, port: u16) -> Option<Flow> {
         driver.stop();
         return None;
     };
-    keep(dial, session, FIRST_FLOW_STREAM + 4);
+    keep(key, session, FIRST_FLOW_STREAM + 4);
     Some(flow)
 }
 
@@ -486,19 +487,18 @@ fn open_udp_flow(session: &Session, host: &str, port: u16) -> Option<(Flow, u32)
         return None;
     }
     let session_id = response.udp_session_id;
-    Some((
-        Flow::from_parts(
-            Arc::clone(&session.shared),
-            Arc::clone(&session.sock),
-            session.local,
-            FIRST_FLOW_STREAM,
-            head.get(used..).unwrap_or_default().to_vec(),
-            true,
-            false,
-        )
-        .with_session(session),
-        session_id,
-    ))
+    let mut flow = Flow::from_parts(
+        Arc::clone(&session.shared),
+        Arc::clone(&session.sock),
+        session.local,
+        FIRST_FLOW_STREAM,
+        head,
+        true,
+        false,
+    )
+    .with_session(session);
+    flow.at = used;
+    Some((flow, session_id))
 }
 
 fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpSocket) {
@@ -506,6 +506,8 @@ fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpS
     let mut reply_head = Vec::with_capacity(22);
     // One reassembly buffer for the whole association: it is the arena the defrag hands back, so a reply does not open a fresh `Vec` per datagram.
     let mut assembled = Vec::new();
+    // The uplink stores the session id once and never resets it, so the reader reads it once and reuses it.
+    let mut known = lane.session.load(Ordering::Relaxed);
     loop {
         if stop.load(Ordering::Relaxed) || !crate::hysteria::drive_once(session, UDP_POLL) {
             break;
@@ -517,7 +519,9 @@ fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpS
             let Ok(message) = wire::decode_udp(&data) else {
                 continue;
             };
-            let known = lane.session.load(Ordering::Relaxed);
+            if known == 0 {
+                known = lane.session.load(Ordering::Relaxed);
+            }
             if known == 0 || u64::from(message.session) + 1 != known {
                 continue;
             }
@@ -708,6 +712,17 @@ impl Assocs {
         for &(start, size) in &waiting.spans {
             send(&waiting.arena[start as usize..(start + size) as usize]);
         }
+        waiting.clear();
+        if waiting.arena.capacity() > QUEUED_ARENA_KEEP {
+            waiting.arena.shrink_to(QUEUED_ARENA_KEEP);
+        }
+        self.waiting = self.waiting.saturating_sub(len);
+    }
+
+    /// Drop a queue whose payload nobody forwards, without walking the spans a drain would call back.
+    fn flush(&mut self, at: usize) {
+        let waiting = &mut self.list[at].waiting;
+        let len = waiting.spans.len();
         waiting.clear();
         if waiting.arena.capacity() > QUEUED_ARENA_KEEP {
             waiting.arena.shrink_to(QUEUED_ARENA_KEEP);
@@ -1160,7 +1175,7 @@ fn relay_datagrams(
                         peer
                     };
                     if let Some(peer) = peer {
-                        flow.assocs.drain(at, |_| {});
+                        flow.assocs.flush(at);
                         let _ = flow
                             .target
                             .send_to(message.payload, target_addr(&flow.target, peer));

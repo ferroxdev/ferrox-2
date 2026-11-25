@@ -1573,12 +1573,13 @@ fn seal_all(
     }
     debug_assert!(buf.len() >= SEAL_HEAD + n + TAG_LEN);
     let end = SEAL_HEAD + n;
-    let mut length = (n as u16).to_be_bytes();
-    let length_tag = send.seal_piece_in_place(&mut length).ok_or_else(invalid)?;
+    buf[..LENGTH_LEN].copy_from_slice(&(n as u16).to_be_bytes());
+    let length_tag = send
+        .seal_piece_in_place(&mut buf[..LENGTH_LEN])
+        .ok_or_else(invalid)?;
     let tag = send
         .seal_piece_in_place(&mut buf[SEAL_HEAD..end])
         .ok_or_else(invalid)?;
-    buf[..LENGTH_LEN].copy_from_slice(&length);
     buf[LENGTH_LEN..SEAL_HEAD].copy_from_slice(&length_tag);
     buf[end..end + TAG_LEN].copy_from_slice(&tag);
     out.write_all(&buf[..end + TAG_LEN])

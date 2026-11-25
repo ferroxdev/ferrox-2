@@ -124,11 +124,12 @@ fn merge_env(base: &mut Vec<(String, Json)>, key: &str, over: &Json) {
     let mut added: Vec<(&str, &Json)> = Vec::new();
     let mut replaced: Vec<(usize, &Json)> = Vec::new();
     for (name, value) in entries {
-        if let Some(&at) = index.get(name.as_str()) {
-            replaced.push((at, value));
-        } else {
-            index.insert(name.as_str(), into.len() + added.len());
-            added.push((name, value));
+        match index.entry(name.as_str()) {
+            std::collections::hash_map::Entry::Occupied(at) => replaced.push((*at.get(), value)),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(into.len() + added.len());
+                added.push((name, value));
+            }
         }
     }
     drop(index);
@@ -165,11 +166,12 @@ fn merge_tagged(base: &mut Vec<(String, Json)>, key: &str, over: &Json, tail: bo
     let mut replaced: Vec<(usize, &Json)> = Vec::new();
     for item in items {
         let tag = item.get("tag").and_then(Json::as_str).unwrap_or_default();
-        if let Some(&at) = index.get(tag) {
-            replaced.push((at, item));
-        } else {
-            index.insert(tag, base + added.len());
-            added.push(item);
+        match index.entry(tag) {
+            std::collections::hash_map::Entry::Occupied(at) => replaced.push((*at.get(), item)),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(base + added.len());
+                added.push(item);
+            }
         }
     }
     drop(index);
@@ -178,8 +180,8 @@ fn merge_tagged(base: &mut Vec<(String, Json)>, key: &str, over: &Json, tail: bo
         existing[at] = item.clone();
     }
     if !tail {
-        let appended = existing.split_off(base);
-        existing.splice(0..0, appended);
+        let appended = existing.len() - base;
+        existing.rotate_right(appended);
     }
 }
 
@@ -243,16 +245,24 @@ fn write_canonical(value: &Json, out: &mut String) {
             out.push(']');
         }
         Json::Obj(pairs) => {
-            let mut sorted: Vec<&(String, Json)> = pairs.iter().collect();
-            sorted.sort_by(|left, right| left.0.cmp(&right.0));
             out.push('{');
-            for (at, (key, item)) in sorted.into_iter().enumerate() {
-                if at > 0 {
-                    out.push(',');
+            if pairs.len() <= 1 {
+                if let Some((key, item)) = pairs.first() {
+                    write_canonical_string(key, out);
+                    out.push(':');
+                    write_canonical(item, out);
                 }
-                write_canonical_string(key, out);
-                out.push(':');
-                write_canonical(item, out);
+            } else {
+                let mut sorted: Vec<&(String, Json)> = pairs.iter().collect();
+                sorted.sort_by(|left, right| left.0.cmp(&right.0));
+                for (at, (key, item)) in sorted.into_iter().enumerate() {
+                    if at > 0 {
+                        out.push(',');
+                    }
+                    write_canonical_string(key, out);
+                    out.push(':');
+                    write_canonical(item, out);
+                }
             }
             out.push('}');
         }
@@ -671,7 +681,9 @@ fn compact_trailing(out: &mut [u8]) -> usize {
             escaped = false;
             let Some((offset, special)) = next_in(&out[at..], &[quote, b'\\']) else {
                 let rest = out.len() - at;
-                out.copy_within(at..at + rest, write);
+                if write != at {
+                    out.copy_within(at..at + rest, write);
+                }
                 return write + rest;
             };
             if escape && offset == 0 {
@@ -681,7 +693,9 @@ fn compact_trailing(out: &mut [u8]) -> usize {
                 continue;
             }
             if offset > 0 {
-                out.copy_within(at..at + offset, write);
+                if write != at {
+                    out.copy_within(at..at + offset, write);
+                }
                 write += offset;
                 at += offset;
             }
@@ -700,11 +714,15 @@ fn compact_trailing(out: &mut [u8]) -> usize {
         }
         let Some((offset, special)) = next_in(&out[at..], b"\"',\\") else {
             let rest = out.len() - at;
-            out.copy_within(at..at + rest, write);
+            if write != at {
+                out.copy_within(at..at + rest, write);
+            }
             return write + rest;
         };
         if offset > 0 {
-            out.copy_within(at..at + offset, write);
+            if write != at {
+                out.copy_within(at..at + offset, write);
+            }
             write += offset;
             at += offset;
         }
@@ -793,9 +811,11 @@ pub(crate) fn order_by_priority(value: &mut Json) {
                         .partial_cmp(&right.0)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
-                let mut slots: Vec<Option<Json>> = items.drain(..).map(Some).collect();
-                for &(_, at) in &order {
-                    items.push(slots[at].take().expect("each element moves once"));
+                if order.iter().enumerate().any(|(at, (_, from))| at != *from) {
+                    let mut slots: Vec<Option<Json>> = items.drain(..).map(Some).collect();
+                    for &(_, at) in &order {
+                        items.push(slots[at].take().expect("each element moves once"));
+                    }
                 }
             }
             for item in items.iter_mut() {
@@ -837,16 +857,13 @@ pub(crate) fn parse(text: &str) -> Result<Json, String> {
 
 /// Resolve `env:NAME` in the fields xray reads as an address or a port list, once at config load.
 fn expand_env(value: &mut Json) {
-    const FIELDS: [&str; 4] = ["address", "listen", "ip", "port"];
     match value {
         Json::Obj(pairs) => {
             for (key, child) in pairs {
-                if FIELDS.contains(&key.as_str()) {
-                    if key == "port" {
-                        expand_port(child);
-                    } else {
-                        expand_strings(child);
-                    }
+                match key.as_str() {
+                    "port" => expand_port(child),
+                    "address" | "listen" | "ip" => expand_strings(child),
+                    _ => {}
                 }
                 expand_env(child);
             }
@@ -1178,6 +1195,18 @@ mod tests {
         assert_eq!(
             counts.allocs, 1,
             "only the sorted key borrows allocate: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn a_single_key_canonical_object_builds_no_sort() {
+        let value = Json::Obj(vec![("only".to_owned(), Json::Bool(true))]);
+        let mut text = String::with_capacity(64);
+        let ((), counts) = ferrox_core::alloc_count::measure(|| write_canonical(&value, &mut text));
+        assert_eq!(text, r#"{"only":true}"#);
+        assert_eq!(
+            counts.allocs, 0,
+            "a one-pair object has nothing to sort: {counts:?}"
         );
     }
 

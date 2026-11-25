@@ -1755,43 +1755,64 @@ impl Session {
     }
 
     fn capsules(&mut self, wire: &mut Wire, bytes: &[u8]) {
-        self.capsules.extend_from_slice(bytes);
+        let mut capsules = std::mem::take(&mut self.capsules);
+        let mut at = 0;
         let mut answers = Vec::new();
         let split: fn(&[u8]) -> Option<(usize, connectip::Capsule<'_>)> = if self.warp {
             connectip::capsule_split_bare
         } else {
             connectip::capsule_split
         };
-        while let Some((used, capsule)) = split(&self.capsules[self.capsule_at..]) {
-            self.capsule_at += used;
-            match capsule {
-                connectip::Capsule::Datagram(packet) => {
-                    if let Some(udp) = &self.udp {
-                        udp.send(packet);
-                    } else {
-                        masque::forward(&self.shared, &self.spec, &self.addrs, packet);
-                    }
-                }
-                connectip::Capsule::AddressRequest(body) if self.udp.is_none() => {
-                    let granted = masque::respond(body, &self.addrs);
-                    if !granted.is_empty() {
-                        let mut out = Vec::new();
-                        connectip::address_assign_encode(&granted, &mut out);
-                        answers.push(out);
-                    }
-                }
-                _ => {}
+        if capsules.is_empty() {
+            let mut used = 0;
+            while let Some((n, capsule)) = split(&bytes[used..]) {
+                used += n;
+                self.consume(capsule, &mut answers);
+            }
+            if used < bytes.len() {
+                capsules.extend_from_slice(&bytes[used..]);
+            }
+        } else {
+            at = self.capsule_at;
+            capsules.extend_from_slice(bytes);
+            while let Some((n, capsule)) = split(&capsules[at..]) {
+                at += n;
+                self.consume(capsule, &mut answers);
+            }
+            if at > 0 {
+                capsules.drain(..at);
+                at = 0;
             }
         }
-        if self.capsule_at > 0 {
-            self.capsules.drain(..self.capsule_at);
-            self.capsule_at = 0;
-        }
+        self.capsules = capsules;
+        self.capsule_at = at;
         if self.capsules.len() > FRAME_CAP {
             self.end = true;
         }
         for answer in answers {
             self.capsule(wire, &answer);
+        }
+    }
+
+    /// Apply one inbound capsule: a datagram goes to its lane, and an address request is answered.
+    fn consume(&self, capsule: connectip::Capsule<'_>, answers: &mut Vec<Vec<u8>>) {
+        match capsule {
+            connectip::Capsule::Datagram(packet) => {
+                if let Some(udp) = &self.udp {
+                    udp.send(packet);
+                } else {
+                    masque::forward(&self.shared, &self.spec, &self.addrs, packet);
+                }
+            }
+            connectip::Capsule::AddressRequest(body) if self.udp.is_none() => {
+                let granted = masque::respond(body, &self.addrs);
+                if !granted.is_empty() {
+                    let mut out = Vec::new();
+                    connectip::address_assign_encode(&granted, &mut out);
+                    answers.push(out);
+                }
+            }
+            _ => {}
         }
     }
 
