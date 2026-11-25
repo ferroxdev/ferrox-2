@@ -54,6 +54,7 @@ fn pending_deletes() -> &'static Mutex<Vec<Route>> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[allow(clippy::type_complexity)]
 fn pending_pinned() -> &'static Mutex<Vec<((IpAddr, u8), Route)>> {
     static PENDING: OnceLock<Mutex<Vec<((IpAddr, u8), Route)>>> = OnceLock::new();
     PENDING.get_or_init(|| Mutex::new(Vec::new()))
@@ -1079,7 +1080,7 @@ fn pending_targets(destination: IpAddr, prefix: u8, interface: &str) -> bool {
     };
     pending_deletes()
         .lock()
-        .is_ok_and(|pending| pending.iter().any(|route| named(route)))
+        .is_ok_and(|pending| pending.iter().any(named))
         || pending_pinned()
             .lock()
             .is_ok_and(|pending| pending.iter().any(|(_, route)| named(route)))

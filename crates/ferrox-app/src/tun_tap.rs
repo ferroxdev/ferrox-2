@@ -143,7 +143,7 @@ impl Bridge {
             .addresses
             .iter()
             .any(|address| matches!(address, IpAddr::V4(v4) if *v4 == asked));
-        if (probe && !owned) || (!self.proxy && !owned) {
+        if !owned && (probe || !self.proxy) {
             return None;
         }
         let mut out = Vec::with_capacity(HEADER_LEN + 28);
@@ -158,7 +158,7 @@ impl Bridge {
         Some(out)
     }
 
-    /// Whether the packet is an ICMPv6 Neighbor Solicitation, whatever its checksum or hop limit.
+    /// Whether the packet is an `ICMPv6` Neighbor Solicitation, whatever its checksum or hop limit.
     fn solicitation(body: &[u8]) -> bool {
         body.len() >= 48
             && body[0] >> 4 == 6

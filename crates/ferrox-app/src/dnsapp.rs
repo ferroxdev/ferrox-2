@@ -878,6 +878,7 @@ impl Resolver {
     }
 
     #[allow(clippy::fn_params_excessive_bools)]
+    #[allow(clippy::too_many_arguments)]
     fn query_server(
         &self,
         index: usize,

@@ -29659,26 +29659,18 @@ fn direct_datagram_ready(plan: &RoutePlan) -> bool {
 
 fn open_direct_datagram(
     socks: &SocksOut,
-    stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    stop: Option<&Arc<std::sync::atomic::AtomicBool>>,
 ) -> Option<DirectDatagram> {
-    if stop
-        .as_ref()
-        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
-    {
+    if stop.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
         return None;
     }
-    let server = resolve_outbound_stopping(&socks.address, socks.port, stop.as_deref())?;
+    let server = resolve_outbound_stopping(&socks.address, socks.port, stop.map(|s| s.as_ref()))?;
     let stream = dial_or_report(&server)?;
     let _ = stream.set_read_timeout(Some(budgets::handshake()));
     let _ = stream.set_write_timeout(Some(budgets::handshake()));
-    let _cancel = stop
-        .as_ref()
-        .and_then(|stop| watch_stop(&stream, Arc::clone(stop)));
+    let _cancel = stop.and_then(|stop| watch_stop(&stream, Arc::clone(stop)));
     let association = crate::socks::associate(stream, &socks.credential)?;
-    if stop
-        .as_ref()
-        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
-    {
+    if stop.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
         return None;
     }
     // The negotiated relay can differ from the server the config names; its leg binds the underlay, so no host route is added for it.
@@ -29695,7 +29687,7 @@ pub(crate) fn device_datagram(out: &Outbound) -> Option<Datagram> {
         Outbound::Socks(socks) if datagram_socks(socks) => {
             let socks = socks.clone();
             Some(Datagram::new(
-                Arc::new(move |stop| open_direct_datagram(&socks, stop)),
+                Arc::new(move |stop| open_direct_datagram(&socks, stop.as_ref())),
                 Arc::new(|| true),
             ))
         }
@@ -29712,7 +29704,7 @@ pub(crate) fn device_datagram(out: &Outbound) -> Option<Datagram> {
                     if !datagram_socks(&socks) {
                         return None;
                     }
-                    open_direct_datagram(&socks, stop)
+                    open_direct_datagram(&socks, stop.as_ref())
                 }),
                 Arc::new(move || direct_datagram_ready(&ready_plan)),
             ))

@@ -655,6 +655,7 @@ pub(crate) fn start(
         });
 }
 
+#[allow(clippy::too_many_lines)]
 fn run(
     assets: &[Asset],
     route: Option<&RouteShared>,
@@ -987,6 +988,7 @@ fn swap_all(staged: &[Stage]) -> Result<Transaction, String> {
     Ok(transaction)
 }
 
+#[allow(clippy::too_many_lines)]
 fn swap_one(stage: &Stage) -> Result<Swap, String> {
     let meta = match std::fs::symlink_metadata(&stage.target) {
         Ok(meta) => Some(meta),

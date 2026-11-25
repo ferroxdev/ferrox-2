@@ -505,6 +505,7 @@ fn listener_address(local: IpAddr, name: &str) -> io::Result<SocketAddr> {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_lines)]
 pub(crate) fn serve(
     spec: &crate::tun::Spec,
     out: &crate::proxy::Outbound,

@@ -767,23 +767,20 @@ fn send_loop(
                 Err(_) => break,
             }
         }
-        loop {
-            match device.send_multiple(&mut gro, &mut batch, headroom) {
-                Ok(_) => break,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    if failed.load(Ordering::Relaxed)
-                        || stopping.is_some_and(|stop| stop.load(Ordering::Relaxed))
-                    {
-                        return;
-                    }
-                    break;
-                }
-                Err(error) if refused(&error) => break,
-                Err(error) => {
-                    eprintln!("tun write: {error}");
-                    failed.store(true, Ordering::Relaxed);
+        match device.send_multiple(&mut gro, &mut batch, headroom) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if failed.load(Ordering::Relaxed)
+                    || stopping.is_some_and(|stop| stop.load(Ordering::Relaxed))
+                {
                     return;
                 }
+            }
+            Err(error) if refused(&error) => {}
+            Err(error) => {
+                eprintln!("tun write: {error}");
+                failed.store(true, Ordering::Relaxed);
+                return;
             }
         }
         for mut buffer in batch.drain(..) {

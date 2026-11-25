@@ -3721,6 +3721,7 @@ fn refuse_flow(
 
 /// Raise one flow's leg: a socket on the association's own address that the handler sends framed datagrams through, answered by a reader that re-wraps each reply as a packet back to the flow's source. Silence past the idle budget ends the flow, so neither its thread nor its leg outlives a target that stopped answering.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 fn open_leg(
     device: &Device,
     relay: SocketAddr,
