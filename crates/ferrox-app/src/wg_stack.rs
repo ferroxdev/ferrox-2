@@ -2283,7 +2283,7 @@ impl ServerStack {
         );
         socket.set_nagle_enabled(false);
         socket.set_ack_delay(None);
-        socket.set_congestion_control(CongestionControl::None);
+        socket.set_congestion_control(CongestionControl::Cubic);
         if socket.listen(IpListenEndpoint { addr: None, port }).is_ok() {
             let handle = self.sockets.add(socket);
             listeners.push(Listener {
