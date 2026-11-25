@@ -304,7 +304,7 @@ impl Group {
             }
             _ => true,
         };
-        let (at, leaf, out, revision) = if takeover {
+        let (answered, leaf, out, revision) = if takeover {
             if let Some((_, at, leaf, out, revision)) = best {
                 (at, leaf, out, revision)
             } else {
@@ -333,8 +333,8 @@ impl Group {
             let (at, leaf, out, revision, _) = current?;
             (at, leaf, out, revision)
         };
-        if stored != at {
-            self.selected.set(network, at);
+        if stored != answered {
+            self.selected.set(network, answered);
         }
         Some((leaf, out, Some(revision)))
     }
