@@ -2154,7 +2154,7 @@ mod tests {
         let got = sign_in(
             &settings,
             now(),
-            &|method, url, fields, _| {
+            &|method, url, _, body| {
                 if method == "GET" && url.ends_with("/warp") {
                     return Ok(reply(
                         302,
@@ -2186,12 +2186,14 @@ mod tests {
                     return Ok(reply(200, Vec::new(), ""));
                 }
                 if method == "POST" && url.ends_with("/cdn-cgi/access/callback") {
-                    nonce.set(
-                        fields
-                            .iter()
-                            .find(|(key, _)| *key == "nonce")
-                            .map(|(_, value)| (*value).to_owned()),
-                    );
+                    let body = String::from_utf8_lossy(body);
+                    let mut seen = None;
+                    for pair in body.split('&') {
+                        if let Some(value) = pair.strip_prefix("nonce=") {
+                            seen = Some(value.to_owned());
+                        }
+                    }
+                    nonce.set(seen);
                     return Ok(reply(
                         302,
                         vec![

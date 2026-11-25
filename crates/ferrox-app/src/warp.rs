@@ -4878,6 +4878,7 @@ mod tests {
         let first = Slot::Masque.allocation(&paths);
         let original = sample_identity();
         original.save(&first).expect("the saved identity");
+        let backup = corrupt_target(&first);
         let spec = WarpSpec {
             mode: Mode::Gool,
             identity_file: Some(base.clone()),
@@ -4907,7 +4908,7 @@ mod tests {
             "replacement"
         );
         assert_eq!(
-            Identity::load(&corrupt_target(&first))
+            Identity::load(&backup)
                 .expect("the refused identity")
                 .device_id,
             original.device_id
