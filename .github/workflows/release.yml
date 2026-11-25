@@ -160,8 +160,10 @@ jobs:
             # beside the binary so `--vpn` works without a separate install.
             curl -fsSL --retry 3 --connect-timeout 10 --max-time 120 \
               -o wintun.zip https://www.wintun.net/builds/wintun-0.14.1.zip
-            rm -rf wintun && 7z x wintun.zip -owintun -y >/dev/null
-            cp wintun/bin/amd64/wintun.dll "$PKG/"
+            rm -rf wintun && 7z x wintun.zip -y >/dev/null
+            dll="$(find wintun -path '*/bin/amd64/wintun.dll' -print -quit)"
+            [ -n "$dll" ] || { echo "::error::wintun.zip has no amd64 DLL"; exit 1; }
+            cp "$dll" "$PKG/"
             rm -rf wintun wintun.zip
             cp "$BIN" "$CLI" dist/ferrox-cli.sh dist/ferrox-cli.cmd dist/README.md dist/USAGE.md "$PKG/"
             sed -i 's/\r$//' "$PKG/ferrox-cli.sh"
