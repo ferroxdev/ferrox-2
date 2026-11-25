@@ -56297,12 +56297,16 @@ mod tests {
     /// flow stopped at the same frame. The payload is large enough to fill both send buffers.
     #[test]
     fn eight_downloads_finish_over_each_grpc_carrier() {
-        // Eight lanes of 4 MiB over three carriers: a lane starved by the suite's load outlives the carrier's idle bound, so run it alone.
+        // Eight lanes of 4 MiB over three carriers: a lane starved by the suite's load outlives the carrier's idle bound, so run it alone with an idle bound the load cannot reach.
         if !crate::conn::in_a_quiet_process(
             "proxy::tests::eight_downloads_finish_over_each_grpc_carrier",
         ) {
             return;
         }
+        crate::budgets::apply_config(&crate::config::Budgets {
+            relay_stall: Some(Duration::from_secs(600)),
+            ..Default::default()
+        });
         let _eight = EIGHT_FLOW
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -64052,12 +64056,16 @@ mod tests {
     /// A shadowsocks listener and dial that declare tls answer the handshake before any non-KCP carrier.
     #[test]
     fn a_shadowsocks_inbound_that_declares_tls_answers_every_carrier() {
-        // Six carriers in sequence, each bounded by the inbound's ten-second handshake read: a dial starved by the suite's load outlives it, so run the ladder alone.
+        // Six carriers in sequence, each bounded by the inbound's ten-second handshake read: a dial starved by the suite's load outlives it, so run the ladder alone with a read the load cannot reach.
         if !crate::conn::in_a_quiet_process(
             "proxy::tests::a_shadowsocks_inbound_that_declares_tls_answers_every_carrier",
         ) {
             return;
         }
+        crate::budgets::apply_config(&crate::config::Budgets {
+            handshake: Some(Duration::from_secs(60)),
+            ..Default::default()
+        });
         let (cert, key, client) = tls_cert_json();
         let cases = [
             ("raw", r#""network": "tcp""#),
@@ -64362,7 +64370,7 @@ mod tests {
             r#""network": "xdrive", "security": "tls",
                 "xdriveSettings": {{"service": "local", "remoteFolder": "{folder}",
                     "segmentBytes": 512, "flushIntervalMs": 2, "pollIntervalMs": 2,
-                    "maxPollIntervalMs": 8, "sessionTtlSeconds": 10}},
+                    "maxPollIntervalMs": 8, "sessionTtlSeconds": 60}},
                 "tlsSettings": {{"allowInsecure": true}}"#
         );
         (dir, settings)
@@ -64879,7 +64887,7 @@ mod tests {
             r#""network": "xdrive", "security": "tls",
                 "xdriveSettings": {{"service": "local", "remoteFolder": "{folder}",
                     "segmentBytes": 512, "flushIntervalMs": 2, "pollIntervalMs": 2,
-                    "maxPollIntervalMs": 8, "sessionTtlSeconds": 10}},
+                    "maxPollIntervalMs": 8, "sessionTtlSeconds": 60}},
                 "tlsSettings": {{"allowInsecure": true}}"#
         );
         let inbound = crate::json::parse(&format!(
@@ -64959,7 +64967,7 @@ mod tests {
             r#""network": "xdrive", "security": "tls",
                 "xdriveSettings": {{"service": "local", "remoteFolder": "{folder}",
                     "segmentBytes": 512, "flushIntervalMs": 2, "pollIntervalMs": 2,
-                    "maxPollIntervalMs": 8, "sessionTtlSeconds": 10}},
+                    "maxPollIntervalMs": 8, "sessionTtlSeconds": 60}},
                 "tlsSettings": {{"allowInsecure": true}}"#
         );
         let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
@@ -65041,7 +65049,7 @@ mod tests {
             r#""network": "xdrive", "security": "tls",
                 "xdriveSettings": {{"service": "local", "remoteFolder": "{folder}",
                     "segmentBytes": 512, "flushIntervalMs": 2, "pollIntervalMs": 2,
-                    "maxPollIntervalMs": 8, "sessionTtlSeconds": 10}},
+                    "maxPollIntervalMs": 8, "sessionTtlSeconds": 60}},
                 "tlsSettings": {{"allowInsecure": true}}"#
         );
         let inbound = crate::json::parse(&format!(
