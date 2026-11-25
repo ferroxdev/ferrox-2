@@ -2538,7 +2538,10 @@ pub(crate) fn dial_udp_through_proxy(
         shared.member_revision(tag)?.0
     };
     let (leaf, out) = match out {
-        Outbound::Group(group) => group.resolve(&shared, crate::router::Network::Udp)?,
+        Outbound::Group(group) => {
+            let (leaf, out) = group.resolve(&shared, crate::router::Network::Udp)?;
+            (leaf.into_owned(), out)
+        }
         out => (tag.to_owned(), out),
     };
     if !udp_lane_supported(&out) {
@@ -30360,7 +30363,7 @@ fn front_group_lane(out: &Outbound) -> Option<(Outbound, String)> {
     if let Some(route) = group.route_handle() {
         route.carry_tag_settings(&leaf);
     }
-    Some((member, leaf))
+    Some((member, leaf.into_owned()))
 }
 
 /// One tunnel request from either front, already resolved to its lane: the Foxy lane grants after its tunnel opens.
@@ -30400,7 +30403,7 @@ fn serve_connect_at(
             asked,
             front,
             prefix,
-            Some(&leaf),
+            Some(leaf.as_ref()),
             facts,
             depth + 1,
         );
@@ -32508,7 +32511,7 @@ fn serve_socks_udp_lane(mut client: Connection, out: &Outbound) {
         (
             Some(member),
             Some(LaneStart {
-                tag: Some(leaf),
+                tag: Some(leaf.into_owned()),
                 source,
                 sockopts,
                 strategy,
@@ -32595,7 +32598,7 @@ fn serve_udp_lane_with(
         let (source, sockopts, strategy) = group
             .route_handle()
             .map_or((None, None, None), |route| route.tag_dial_settings(&leaf));
-        let _tag = OutboundTag::enter(Some(&leaf));
+        let _tag = OutboundTag::enter(Some(leaf.as_ref()));
         serve_udp_lane_with(
             relay,
             &member,
@@ -32949,12 +32952,16 @@ fn serve_socks_udp_split(
                             .route_handle()
                             .map_or((None, None, None), |route| route.tag_dial_settings(&leaf));
                         let start = LaneStart {
-                            tag: Some(leaf.clone()),
+                            tag: Some(leaf.to_string()),
                             source,
                             sockopts,
                             strategy,
                         };
-                        (Some(member), Some((leaf, revision)), Some(start))
+                        (
+                            Some(member),
+                            Some((leaf.into_owned(), revision)),
+                            Some(start),
+                        )
                     }
                     _ => {
                         if let Some(tag) = key.as_deref() {
@@ -54791,6 +54798,12 @@ mod tests {
     /// flow stopped at the same frame. The payload is large enough to fill both send buffers.
     #[test]
     fn eight_downloads_finish_over_each_grpc_carrier() {
+        // Eight lanes of 4 MiB over three carriers: a lane starved by the suite's load outlives the carrier's idle bound, so run it alone.
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::eight_downloads_finish_over_each_grpc_carrier",
+        ) {
+            return;
+        }
         let _eight = EIGHT_FLOW
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -62540,6 +62553,12 @@ mod tests {
     /// A shadowsocks listener and dial that declare tls answer the handshake before any non-KCP carrier.
     #[test]
     fn a_shadowsocks_inbound_that_declares_tls_answers_every_carrier() {
+        // Six carriers in sequence, each bounded by the inbound's ten-second handshake read: a dial starved by the suite's load outlives it, so run the ladder alone.
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::a_shadowsocks_inbound_that_declares_tls_answers_every_carrier",
+        ) {
+            return;
+        }
         let (cert, key, client) = tls_cert_json();
         let cases = [
             ("raw", r#""network": "tcp""#),
@@ -62925,6 +62944,12 @@ mod tests {
 
     #[test]
     fn an_xdrive_vless_xudp_association_carries_a_datagram() {
+        // The lane needs a handshake and a reply inside the suite's parallel run; starved, it outlived the test's two-minute budget on macOS, so run it alone.
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::an_xdrive_vless_xudp_association_carries_a_datagram",
+        ) {
+            return;
+        }
         let _stats = crate::stats::test_lock();
         let (dir, settings) = xdrive_mux_settings("vless-xudp");
         let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
@@ -69209,29 +69234,42 @@ mod tests {
             r#"{"protocol": "shadowsocks", "settings": {"password": "pw", "method": "aes-256-gcm", "network": ["udp"]}}"#,
         )
         .expect("parses");
-        let address = (0..64)
-            .find_map(|_| {
-                let tcp = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
-                let port = tcp.local_addr().ok()?.port();
-                let udp = UdpSocket::bind(("127.0.0.1", port)).ok()?;
-                drop(udp);
-                drop(tcp);
-                let address = format!("127.0.0.1:{port}");
-                if serve_shadowsocks_inbound(
-                    &address,
-                    &inbound,
-                    true,
-                    &std::collections::HashSet::new(),
-                    None,
-                ) == 0
-                {
-                    return None;
-                }
-                std::net::TcpStream::connect(("127.0.0.1", port))
-                    .is_err()
-                    .then_some(address)
-            })
-            .expect("a port free for tcp and udp that the udp-only front binds");
+        // The probe releases the port before the front binds it, so a pass can lose the race and retry.
+        let mut address = None;
+        for _ in 0..256 {
+            let Some(tcp) = std::net::TcpListener::bind("127.0.0.1:0").ok() else {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            };
+            let Some(port) = tcp.local_addr().ok().map(|address| address.port()) else {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            };
+            let Some(udp) = UdpSocket::bind(("127.0.0.1", port)).ok() else {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            };
+            drop(udp);
+            drop(tcp);
+            let candidate = format!("127.0.0.1:{port}");
+            if serve_shadowsocks_inbound(
+                &candidate,
+                &inbound,
+                true,
+                &std::collections::HashSet::new(),
+                None,
+            ) == 0
+            {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                address = Some(candidate);
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        let address = address.expect("a port free for tcp and udp that the udp-only front binds");
         let master = ferrox_core::shadowsocks::MasterKey::new("pw", 32);
         let method = ferrox_core::shadowsocks::Method::Aes256Gcm;
         let mut wire = vec![0u8; crate::shadowsocks::DATAGRAM_MAX];
@@ -80698,7 +80736,7 @@ mod tests {
     /// kernel has no REDIRECT answer for, rather than dialling the listener's own address.
     #[test]
     fn a_redirect_inbound_closes_without_a_kernel_answer() {
-        if !crate::transparent::REDIRECT {
+        if !crate::transparent::REDIRECT || !crate::transparent::redirect_ready() {
             return;
         }
         let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -86492,6 +86530,7 @@ end
                 .resolve(&shared, crate::router::Network::Tcp)
                 .expect("picks")
                 .0
+                .into_owned()
         };
         assert_eq!(picks(10), "b", "the nested tolerance is honored");
         assert_eq!(
@@ -86545,7 +86584,7 @@ end
             .route_handle()
             .map_or((None, None, None), |route| route.tag_dial_settings(&leaf));
         let start = LaneStart {
-            tag: Some(leaf),
+            tag: Some(leaf.into_owned()),
             source,
             sockopts,
             strategy,
@@ -86650,7 +86689,7 @@ end
             let (tag, _) = group
                 .resolve(&shared, crate::router::Network::Tcp)
                 .expect("picks");
-            tag
+            tag.into_owned()
         };
         assert_eq!(config(100, 40), "b", "a clear winner takes over");
         assert_eq!(
@@ -86693,6 +86732,28 @@ end
         assert_eq!(tag, "c");
     }
 
+    /// Marks one selector dial's work for the `ops.yml` report: the loop keeps the choice visible to valgrind.
+    #[test]
+    fn a_selector_dial_costs_the_choice() {
+        let shared = group_route(
+            r#"{"outbounds":[
+                {"tag":"a","protocol":"freedom"},
+                {"tag":"b","protocol":"freedom"},
+                {"tag":"pick","type":"selector","outbounds":["a","b"],"default":"b"}
+            ],"routing":{}}"#,
+        );
+        let group = group_of(&shared, "pick");
+        let mut total = 0usize;
+        for _ in 0..1_000 {
+            total += group
+                .resolve(std::hint::black_box(&shared), crate::router::Network::Tcp)
+                .expect("picks")
+                .0
+                .len();
+        }
+        std::hint::black_box(total);
+    }
+
     /// One tag is the whole allocation a selector dial makes: the leaf its chain names. Two
     /// selectors and one leaf, one allocation, counted by the allocator rather than read off the code.
     #[test]
@@ -86723,6 +86784,124 @@ end
         );
     }
 
+    /// A flat url-test dial borrows the leaf it names: no member list and no tag, counted by the
+    /// allocator rather than read off the code.
+    #[test]
+    fn a_flat_urltest_dial_allocates_nothing() {
+        let shared = group_route(
+            r#"{"outbounds":[
+                {"tag":"a","protocol":"freedom"},
+                {"tag":"b","protocol":"freedom"},
+                {"tag":"c","protocol":"freedom"},
+                {"tag":"d","protocol":"freedom"},
+                {"tag":"e","protocol":"freedom"},
+                {"tag":"f","protocol":"freedom"},
+                {"tag":"g","protocol":"freedom"},
+                {"tag":"h","protocol":"freedom"},
+                {"tag":"pick","type":"urltest","outbounds":["a","b","c","d","e","f","g","h"],"url":"http://127.0.0.1/204"}
+            ],"routing":{}}"#,
+        );
+        let group = group_of(&shared, "pick");
+        for (tag, delay) in [
+            ("a", 300u16),
+            ("b", 290),
+            ("c", 280),
+            ("d", 270),
+            ("e", 260),
+            ("f", 250),
+            ("g", 240),
+            ("h", 230),
+        ] {
+            group.record(tag, delay);
+        }
+        let dial = || {
+            group
+                .resolve(&shared, crate::router::Network::Tcp)
+                .expect("picks")
+        };
+        // A flow is the dial after the process's one-time setup, so the gate takes a warm one.
+        let (warm_up, _) = ferrox_core::alloc_count::measure(dial);
+        assert_eq!(warm_up.0, "h");
+        let (picked, counts) = ferrox_core::alloc_count::measure(dial);
+        assert_eq!(picked.0, "h");
+        assert_eq!(
+            (counts.allocs, counts.bytes),
+            (0, 0),
+            "a flat url-test dial allocated {} times and {} bytes for a leaf it already holds",
+            counts.allocs,
+            counts.bytes
+        );
+    }
+
+    /// A nested dial owns the tag it returns and the sweep's one cached copy, and a fallback dial
+    /// adds nothing: the slot keeps the member's position and reuses the stored member.
+    #[test]
+    fn a_nested_dial_allocates_only_its_tag_and_the_sweeps_copy() {
+        let shared = group_route(
+            r#"{"outbounds":[
+                {"tag":"a","protocol":"freedom"},
+                {"tag":"b","protocol":"freedom"},
+                {"tag":"c","protocol":"freedom"},
+                {"tag":"inner","type":"urltest","outbounds":["a","b"],"url":"http://127.0.0.1/204"},
+                {"tag":"pick","type":"urltest","outbounds":["inner","c"],"url":"http://127.0.0.1/204"}
+            ],"routing":{}}"#,
+        );
+        let group = group_of(&shared, "pick");
+        let dial = || {
+            group
+                .resolve(&shared, crate::router::Network::Tcp)
+                .expect("picks")
+        };
+        // A flow is the dial after the process's one-time setup, so the gate takes a warm one.
+        let (warm_up, _) = ferrox_core::alloc_count::measure(dial);
+        assert_eq!(warm_up.0, "a");
+        let (unread, fallback) = ferrox_core::alloc_count::measure(dial);
+        assert_eq!(unread.0, "a", "with no reading the stored member answers");
+        group.record("a", 10);
+        let (picked, takeover) = ferrox_core::alloc_count::measure(dial);
+        assert_eq!(picked.0, "a");
+        assert_eq!(
+            takeover.allocs, 2,
+            "a nested dial allocated {} times for the tag it returns and the sweep's one cached copy",
+            takeover.allocs
+        );
+        assert_eq!(
+            fallback.allocs, takeover.allocs,
+            "a fallback dial allocated {} times where the takeover dial allocated {} for the same nested tag",
+            fallback.allocs, takeover.allocs
+        );
+    }
+
+    /// A bound lookup borrows a flat member's tag: the route handle is a `Weak::upgrade` that lives
+    /// only for the call, and the tag comes from the group's own members.
+    #[test]
+    fn a_bound_lookup_of_a_flat_member_allocates_nothing() {
+        let shared = group_route(
+            r#"{"outbounds":[
+                {"tag":"a","protocol":"freedom"},
+                {"tag":"b","protocol":"freedom"},
+                {"tag":"pick","type":"selector","outbounds":["a","b"],"default":"a"}
+            ],"routing":{}}"#,
+        );
+        let group = group_of(&shared, "pick");
+        let lookup = || {
+            group
+                .resolve_bound(crate::router::Network::Tcp)
+                .expect("resolves")
+        };
+        let (warm_up, _) = ferrox_core::alloc_count::measure(lookup);
+        assert_eq!(warm_up.0, "a");
+        let ((leaf, _), counts) = ferrox_core::alloc_count::measure(lookup);
+        assert_eq!(leaf, "a");
+        assert_eq!(
+            (counts.allocs, counts.bytes),
+            (0, 0),
+            "a bound lookup allocated {} times and {} bytes for a tag the group already holds",
+            counts.allocs,
+            counts.bytes
+        );
+    }
+
     /// A url-test reading sweep takes the shared history lock once, not once per member.
     #[test]
     fn a_urltest_reads_its_history_under_one_lock() {
@@ -86748,6 +86927,32 @@ end
             "a three-member sweep opened {windows} history windows"
         );
         assert_eq!(tag, "b");
+    }
+
+    /// One history window covers the whole tree: a nested url-test reads the map its outer sweep
+    /// already holds instead of locking it again on the same thread.
+    #[test]
+    fn a_nested_urltest_reads_under_the_outer_window() {
+        let shared = group_route(
+            r#"{"outbounds":[
+                {"tag":"a","protocol":"freedom"},
+                {"tag":"b","protocol":"freedom"},
+                {"tag":"inner","type":"urltest","outbounds":["a","b"],"tolerance":10,"url":"http://127.0.0.1/204"},
+                {"tag":"outer","type":"urltest","outbounds":["inner"],"tolerance":500,"url":"http://127.0.0.1/204"}
+            ],"routing":{}}"#,
+        );
+        let group = group_of(&shared, "outer");
+        group.record("a", 100);
+        group.record("b", 10);
+        let before = group.history_locks();
+        group
+            .resolve(&shared, crate::router::Network::Tcp)
+            .expect("picks");
+        let windows = group.history_locks() - before;
+        assert_eq!(
+            windows, 1,
+            "a nested sweep opened {windows} history windows"
+        );
     }
 
     /// A UDP lookup does not retain a current member that cannot carry datagrams, even when its

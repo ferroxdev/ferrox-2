@@ -2859,6 +2859,21 @@ impl Listener {
 pub(crate) fn shutdown_listener(listener: &std::net::TcpListener) {
     use std::os::fd::AsRawFd as _;
     let _ = unsafe { libc::shutdown(listener.as_raw_fd(), libc::SHUT_RDWR) };
+    // A listening socket's shutdown is refused on the BSDs, where a blocked accept wakes on a dial instead.
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    if let Ok(bound) = listener.local_addr() {
+        // FreeBSD refuses a dial to the unspecified address, so a wildcard listener is woken on loopback.
+        let wake = if bound.ip().is_unspecified() {
+            if bound.is_ipv4() {
+                std::net::SocketAddr::from(([127, 0, 0, 1], bound.port()))
+            } else {
+                std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, bound.port()))
+            }
+        } else {
+            bound
+        };
+        let _ = std::net::TcpStream::connect_timeout(&wake, std::time::Duration::from_millis(100));
+    }
 }
 
 /// The accepted connections of a `Listener`, one family or the other.
