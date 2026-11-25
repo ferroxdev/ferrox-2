@@ -207,11 +207,7 @@ impl FlowFinish {
 
     fn done(&self) {
         if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-            let finish = self
-                .finish
-                .lock()
-                .ok()
-                .and_then(|mut slot| slot.take());
+            let finish = self.finish.lock().ok().and_then(|mut slot| slot.take());
             if let Some(finish) = finish {
                 finish();
             }
@@ -1638,7 +1634,11 @@ fn drive_uploads(weak: &std::sync::Weak<Lane>, uploads: Receiver<UploadStream>) 
     }
 }
 
-fn pump_upload_stream(conn: &mut QuicheConnection, stream: &mut UploadStream, buf: &mut [u8]) -> bool {
+fn pump_upload_stream(
+    conn: &mut QuicheConnection,
+    stream: &mut UploadStream,
+    buf: &mut [u8],
+) -> bool {
     if stream.closed.load(Ordering::Relaxed) {
         return true;
     }
