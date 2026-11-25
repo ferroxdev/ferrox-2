@@ -1882,41 +1882,39 @@ impl Tls2 {
         let Ok(mut inner) = self.inner() else {
             return (false, Err(io(Failure::Io)));
         };
-        let peer_initial = inner.peer_initial;
         let stream = self.stream;
-        if inner.gone
-            || inner
-                .streams
-                .get(&stream)
-                .is_none_or(|s| s.sent_end || s.reset.is_some())
-        {
+        if inner.gone {
             return (
                 false,
                 Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
             );
         }
-        let built = {
-            let entry = inner
-                .streams
-                .entry(stream)
-                .or_insert_with(|| Stream::new(peer_initial));
-            build_packet(
+        let packet = {
+            let Some(entry) = inner.streams.get_mut(&stream) else {
+                return (
+                    false,
+                    Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+                );
+            };
+            if entry.sent_end || entry.reset.is_some() {
+                return (
+                    false,
+                    Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+                );
+            }
+            if !build_packet(
                 &mut entry.packet,
                 source,
                 destination,
                 source_port,
                 destination_port,
                 payload,
-            )
+            ) {
+                return (false, Ok(()));
+            }
+            std::mem::take(&mut entry.packet)
         };
-        if !built {
-            return (false, Ok(()));
-        }
         // The packet leaves the scratch and comes back to it: the buffer is the stream's own and keeps its address across the write, so the next datagram writes over these bytes rather than into a new buffer.
-        let packet = inner
-            .streams
-            .get_mut(&stream)
-            .map_or_else(Vec::new, |entry| std::mem::take(&mut entry.packet));
         let sent = write_capsule(&mut inner, stream, &packet);
         if let Some(entry) = inner.streams.get_mut(&stream) {
             entry.packet = packet;
@@ -3809,23 +3807,26 @@ impl Read for H3 {
 pub(crate) fn exit_country(head: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(head);
     if let Some(after) = text.split_once("loc=") {
-        let code: String = after
-            .1
-            .chars()
-            .take_while(char::is_ascii_alphanumeric)
-            .collect();
-        if is_exit_marker(&code) {
-            return Some(code);
+        let code = ascii_prefix(after.1);
+        if is_exit_marker(code) {
+            return Some(code.to_owned());
         }
     }
     let key = "\"countryCode\":\"";
     let at = text.find(key)? + key.len();
-    let code: String = text
-        .get(at..)?
-        .chars()
-        .take_while(char::is_ascii_alphanumeric)
-        .collect();
-    is_exit_marker(&code).then_some(code)
+    let code = ascii_prefix(text.get(at..)?);
+    if is_exit_marker(code) {
+        Some(code.to_owned())
+    } else {
+        None
+    }
+}
+
+fn ascii_prefix(text: &str) -> &str {
+    let end = text
+        .find(|c: char| !c.is_ascii_alphanumeric())
+        .unwrap_or(text.len());
+    &text[..end]
 }
 
 /// A country code, or the `T1`/`REC` markers an exit probe uses for a restricted edge.
@@ -5048,6 +5049,13 @@ mod tests {
         assert_eq!(exit_country(b"loc=DEU"), None);
         assert_eq!(exit_country(b"loc=T1\n"), Some("T1".to_owned()));
         assert_eq!(exit_country(b"loc=REC\n"), Some("REC".to_owned()));
+        let (value, counts) =
+            ferrox_core::alloc_count::measure(|| exit_country(b"loc=de\nnothing here"));
+        assert_eq!(value, None);
+        assert_eq!(
+            counts.allocs, 0,
+            "a rejected marker is a slice, not a String"
+        );
     }
 }
 

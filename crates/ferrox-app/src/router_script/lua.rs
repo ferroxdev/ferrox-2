@@ -1114,13 +1114,9 @@ struct IpUser(IpAddr);
 impl UserData for IpUser {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_meta_method(MetaMethod::ToString, |_, this, ()| Ok(addr_string(this.0)));
-        methods.add_meta_method(MetaMethod::Len, |_, this, ()| {
-            Ok(ip_user_bytes(this.0).len())
-        });
+        methods.add_meta_method(MetaMethod::Len, |_, this, ()| Ok(ip_user_len(this.0)));
         methods.add_meta_method(MetaMethod::Index, |_, this, index: usize| {
-            Ok(index
-                .checked_sub(1)
-                .and_then(|index| ip_user_bytes(this.0).get(index).copied()))
+            Ok(ip_user_byte(this.0, index))
         });
         methods.add_method("String", |_, this, ()| Ok(addr_string(this.0)));
         methods.add_method("To4", |_, this, ()| {
@@ -1206,6 +1202,21 @@ fn to16(addr: IpAddr) -> IpAddr {
     match addr {
         IpAddr::V4(ip) => IpAddr::V6(ip.to_ipv6_mapped()),
         IpAddr::V6(_) => addr,
+    }
+}
+
+fn ip_user_len(addr: IpAddr) -> usize {
+    match addr {
+        IpAddr::V4(_) => 4,
+        IpAddr::V6(_) => 16,
+    }
+}
+
+fn ip_user_byte(addr: IpAddr, index: usize) -> Option<u8> {
+    let at = index.checked_sub(1)?;
+    match addr {
+        IpAddr::V4(ip) => ip.octets().get(at).copied(),
+        IpAddr::V6(ip) => ip.octets().get(at).copied(),
     }
 }
 
@@ -1517,12 +1528,17 @@ end
 
     #[test]
     fn a_taken_ipv4_address_indexes_its_four_bytes() {
-        let bytes = ip_user_bytes(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9)));
+        let v4 = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9));
+        let v6 = IpAddr::V6(Ipv4Addr::new(192, 0, 2, 9).to_ipv6_mapped());
+        let bytes = ip_user_bytes(v4);
         assert_eq!(bytes, vec![192, 0, 2, 9]);
-        assert_eq!(
-            ip_user_bytes(IpAddr::V6(Ipv4Addr::new(192, 0, 2, 9).to_ipv6_mapped())).len(),
-            16
-        );
+        assert_eq!(ip_user_bytes(v6).len(), 16);
+        let (len, counts) = ferrox_core::alloc_count::measure(|| ip_user_len(v4));
+        assert_eq!(len, 4);
+        assert_eq!(counts.allocs, 0, "the length is a family, not a vector");
+        let (byte, counts) = ferrox_core::alloc_count::measure(|| ip_user_byte(v4, 1));
+        assert_eq!(byte, Some(192));
+        assert_eq!(counts.allocs, 0, "one byte is read from the octets");
     }
 
     #[test]

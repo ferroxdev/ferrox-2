@@ -5,7 +5,7 @@ const BLOCK_SIZE: usize = 16;
 
 pub struct Cfb8 {
     cipher: Aes128,
-    iv: [u8; BLOCK_SIZE],
+    iv: u128,
     decrypt: bool,
 }
 
@@ -25,7 +25,7 @@ impl Cfb8 {
     fn new(key: &[u8; 16], iv: &[u8; 16], decrypt: bool) -> Self {
         Self {
             cipher: Aes128::new_from_slice(key).expect("AES-128 accepts a 16-byte key"),
-            iv: *iv,
+            iv: u128::from_be_bytes(*iv),
             decrypt,
         }
     }
@@ -39,14 +39,15 @@ impl Cfb8 {
     }
 
     fn apply_serial(&mut self, data: &mut [u8]) {
+        let mut iv = self.iv;
         for byte in data {
-            let mut block = self.iv.into();
+            let mut block = Block::from(iv.to_be_bytes());
             self.cipher.encrypt_block(&mut block);
             let ciphertext = *byte;
             *byte ^= block[0];
-            self.iv.rotate_left(1);
-            self.iv[BLOCK_SIZE - 1] = if self.decrypt { ciphertext } else { *byte };
+            iv = (iv << 8) | u128::from(if self.decrypt { ciphertext } else { *byte });
         }
+        self.iv = iv;
     }
 
     fn apply_decrypt(&mut self, data: &mut [u8]) {
@@ -54,7 +55,7 @@ impl Cfb8 {
         while at + BLOCK_SIZE <= data.len() {
             let mut ciphertext = [0u8; BLOCK_SIZE];
             ciphertext.copy_from_slice(&data[at..at + BLOCK_SIZE]);
-            let mut iv = u128::from_be_bytes(self.iv);
+            let mut iv = self.iv;
             let mut blocks = [Block::from([0u8; BLOCK_SIZE]); BLOCK_SIZE];
             for (index, &cipher) in ciphertext.iter().enumerate() {
                 blocks[index] = Block::from(iv.to_be_bytes());
@@ -64,7 +65,7 @@ impl Cfb8 {
             for (index, &cipher) in ciphertext.iter().enumerate() {
                 data[at + index] = cipher ^ blocks[index][0];
             }
-            self.iv = ciphertext;
+            self.iv = u128::from_be_bytes(ciphertext);
             at += BLOCK_SIZE;
         }
         self.apply_serial(&mut data[at..]);

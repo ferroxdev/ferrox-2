@@ -325,29 +325,49 @@ const BUFFER_CACHE: usize = 1024 * 1024;
 
 #[derive(Default)]
 struct BufferPool {
-    bytes: Vec<Vec<u8>>,
+    classes: Vec<(usize, Vec<Vec<u8>>)>,
     cached: usize,
+    #[cfg(test)]
+    probes: usize,
 }
 
 impl BufferPool {
     const fn new() -> Self {
         Self {
-            bytes: Vec::new(),
+            classes: Vec::new(),
             cached: 0,
+            #[cfg(test)]
+            probes: 0,
         }
     }
 
     fn take(&mut self, len: usize) -> Option<Vec<u8>> {
-        let at = self.bytes.iter().rposition(|bytes| bytes.len() == len)?;
-        let bytes = self.bytes.swap_remove(at);
-        self.cached -= bytes.len();
-        Some(bytes)
+        let mut at = 0;
+        while at < self.classes.len() {
+            #[cfg(test)]
+            {
+                self.probes += 1;
+            }
+            if self.classes[at].0 == len {
+                let bytes = self.classes[at].1.pop()?;
+                self.cached -= bytes.len();
+                return Some(bytes);
+            }
+            at += 1;
+        }
+        None
     }
 
     fn put(&mut self, bytes: Vec<u8>) {
-        if self.cached + bytes.len() <= BUFFER_CACHE {
-            self.cached += bytes.len();
-            self.bytes.push(bytes);
+        if self.cached + bytes.len() > BUFFER_CACHE {
+            return;
+        }
+        self.cached += bytes.len();
+        let len = bytes.len();
+        if let Some((_, class)) = self.classes.iter_mut().find(|(class, _)| *class == len) {
+            class.push(bytes);
+        } else {
+            self.classes.push((len, vec![bytes]));
         }
     }
 }
@@ -6383,6 +6403,31 @@ mod tests {
             seen, 0xa5,
             "the reused buffer keeps the bytes it already had"
         );
+    }
+
+    /// The pool holds two size classes, so finding a buffer is bounded by the classes rather than by every
+    /// buffer a burst returned.
+    #[test]
+    fn a_pool_finds_a_buffer_by_size_without_walking_the_pool() {
+        let mut pool = BufferPool::new();
+        for _ in 0..4096 {
+            pool.put(vec![0u8; 16]);
+            pool.put(vec![0u8; 64]);
+        }
+        pool.probes = 0;
+        assert_eq!(pool.take(16).map(|bytes| bytes.len()), Some(16));
+        assert!(
+            pool.probes <= 2,
+            "one comparison per size class, not per returned buffer"
+        );
+        for _ in 0..4095 {
+            assert_eq!(pool.take(16).map(|bytes| bytes.len()), Some(16));
+        }
+        for _ in 0..4096 {
+            assert_eq!(pool.take(64).map(|bytes| bytes.len()), Some(64));
+        }
+        assert!(pool.take(16).is_none());
+        assert_eq!(pool.cached, 0);
     }
 
     /// A sweep of send slots is as many empty `Vec`s as quiche may want, and only the slots it writes borrow a
