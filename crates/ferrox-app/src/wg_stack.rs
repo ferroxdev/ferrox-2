@@ -1775,6 +1775,7 @@ impl ClientStack {
 
     /// Race a client flow's destinations and keep the first connected socket.
     fn connect(&mut self, mut flow: ClientFlow) -> std::io::Result<()> {
+        let probe = flow.ready.is_some();
         let ready = flow.ready.take();
         if flow
             .cancelled
@@ -1783,7 +1784,7 @@ impl ClientStack {
         {
             return Ok(());
         }
-        let result = self.connect_flow(flow);
+        let result = self.connect_flow(flow, probe);
         if let Some(ready) = ready {
             let _ = ready.send(result.is_ok());
         }
@@ -1791,7 +1792,7 @@ impl ClientStack {
     }
 
     /// Set up one flow after its readiness listener is taken.
-    fn connect_flow(&mut self, mut flow: ClientFlow) -> std::io::Result<()> {
+    fn connect_flow(&mut self, mut flow: ClientFlow, probe: bool) -> std::io::Result<()> {
         flow.client.set_nonblocking(true)?;
         let mut candidates = Vec::new();
         let mut refused = None;
@@ -1823,7 +1824,9 @@ impl ClientStack {
             socket.set_nagle_enabled(false);
             socket.set_ack_delay(None);
             socket.set_congestion_control(CongestionControl::Cubic);
-            socket.set_timeout(Some(crate::budgets::dial().into()));
+            if probe {
+                socket.set_timeout(Some(crate::budgets::dial().into()));
+            }
             if let Err(error) = socket.connect(
                 self.iface.context(),
                 IpEndpoint::from(*destination),
