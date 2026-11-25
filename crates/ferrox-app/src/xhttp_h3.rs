@@ -671,6 +671,7 @@ pub(crate) struct H3Writer {
     wire: Wire,
     head: Vec<u8>,
     headed: bool,
+    block: Vec<u8>,
     pending: Vec<u8>,
     at: usize,
     input: usize,
@@ -683,6 +684,7 @@ impl H3Writer {
             wire,
             head: Vec::new(),
             headed: false,
+            block: Vec::new(),
             pending: Vec::new(),
             at: 0,
             input: 0,
@@ -698,9 +700,9 @@ impl Write for H3Writer {
             let Some(at) = head_end(&self.head) else {
                 return Ok(buf.len());
             };
-            let head = std::mem::take(&mut self.head);
-            let text = std::str::from_utf8(&head[..at]).unwrap_or_default();
-            if !send_fields(&self.wire, frames::H3_HEADERS, &response_fields(text)) {
+            let mut head = std::mem::take(&mut self.head);
+            let fields = response_fields(&mut head[..at]);
+            if !send_fields(&self.wire, frames::H3_HEADERS, &fields) {
                 return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
             }
             self.headed = true;
@@ -765,26 +767,12 @@ impl crate::proxy::LaneWrite for H3Writer {
             let Some(at) = head_end(&self.head) else {
                 return crate::proxy::Push::Took(data.len());
             };
-            let head = std::mem::take(&mut self.head);
-            let text = std::str::from_utf8(&head[..at]).unwrap_or_default();
+            let mut head = std::mem::take(&mut self.head);
+            let fields = response_fields(&mut head[..at]);
+            self.block.clear();
+            hpack::qpack_literal_many(&fields, &mut self.block);
             let body = &head[at + 4..];
-            let fields = response_fields(text);
-            let refs: Vec<(&str, &str)> = fields
-                .iter()
-                .map(|(name, value)| (name.as_str(), value.as_str()))
-                .collect();
-            let mut block = Vec::new();
-            hpack::qpack_literal_many(&refs, &mut block);
-            let mut pending = Vec::with_capacity(block.len() + body.len() + 18);
-            frames::quic_varint(&mut pending, frames::H3_HEADERS);
-            frames::quic_varint(&mut pending, block.len() as u64);
-            pending.extend_from_slice(&block);
-            if !body.is_empty() {
-                frames::quic_varint(&mut pending, frames::H3_DATA);
-                frames::quic_varint(&mut pending, body.len() as u64);
-                pending.extend_from_slice(body);
-            }
-            self.pending = pending;
+            stage_head(&mut self.block, &mut self.pending, body);
             self.input = data.len();
             self.at = 0;
             self.headed = true;
@@ -815,11 +803,7 @@ impl crate::proxy::LaneWrite for H3Writer {
             return crate::proxy::Push::Took(0);
         }
         let take = data.len().min(H3_WRITE_CHUNK);
-        let mut pending = Vec::with_capacity(take + 9);
-        frames::quic_varint(&mut pending, frames::H3_DATA);
-        frames::quic_varint(&mut pending, take as u64);
-        pending.extend_from_slice(&data[..take]);
-        self.pending = pending;
+        data_frame(&mut self.pending, &data[..take]);
         self.input = take;
         self.at = 0;
         match self.wire.try_write(&self.pending) {
@@ -894,6 +878,8 @@ impl H3StreamOut {
 
 thread_local! {
     static DATA_FRAME: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static FIELD_BLOCK: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static FIELD_FRAME: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn data_frame(frame: &mut Vec<u8>, payload: &[u8]) {
@@ -902,6 +888,19 @@ fn data_frame(frame: &mut Vec<u8>, payload: &[u8]) {
     frames::quic_varint(frame, frames::H3_DATA);
     frames::quic_varint(frame, payload.len() as u64);
     frame.extend_from_slice(payload);
+}
+
+fn stage_head(block: &mut Vec<u8>, frame: &mut Vec<u8>, body: &[u8]) {
+    frame.clear();
+    frame.reserve(block.len() + body.len() + 18);
+    frames::quic_varint(frame, frames::H3_HEADERS);
+    frames::quic_varint(frame, block.len() as u64);
+    frame.extend_from_slice(block);
+    if !body.is_empty() {
+        frames::quic_varint(frame, frames::H3_DATA);
+        frames::quic_varint(frame, body.len() as u64);
+        frame.extend_from_slice(body);
+    }
 }
 
 fn send_data(wire: &Wire, payload: &[u8]) -> bool {
@@ -919,18 +918,35 @@ fn send_data(wire: &Wire, payload: &[u8]) -> bool {
     })
 }
 
-fn send_fields(wire: &Wire, kind: u64, fields: &[(String, String)]) -> bool {
-    let refs: Vec<(&str, &str)> = fields
-        .iter()
-        .map(|(name, value)| (name.as_str(), value.as_str()))
-        .collect();
-    let mut block = Vec::new();
-    hpack::qpack_literal_many(&refs, &mut block);
-    let mut frame = Vec::with_capacity(block.len() + 9);
-    frames::quic_varint(&mut frame, kind);
-    frames::quic_varint(&mut frame, block.len() as u64);
-    frame.extend_from_slice(&block);
-    wire_ready(wire, &frame)
+fn encode_fields(kind: u64, fields: &[(&str, &str)], block: &mut Vec<u8>, frame: &mut Vec<u8>) {
+    block.clear();
+    hpack::qpack_literal_many(fields, block);
+    frame.clear();
+    frame.reserve(block.len() + 9);
+    frames::quic_varint(frame, kind);
+    frames::quic_varint(frame, block.len() as u64);
+    frame.extend_from_slice(block);
+}
+
+fn send_fields(wire: &Wire, kind: u64, fields: &[(&str, &str)]) -> bool {
+    let sent = FIELD_BLOCK.with(|block| {
+        FIELD_FRAME.with(|frame| {
+            let Ok(mut block) = block.try_borrow_mut() else {
+                return None;
+            };
+            let Ok(mut frame) = frame.try_borrow_mut() else {
+                return None;
+            };
+            encode_fields(kind, fields, &mut block, &mut frame);
+            Some(wire_ready(wire, &frame))
+        })
+    });
+    sent.unwrap_or_else(|| {
+        let mut block = Vec::new();
+        let mut frame = Vec::new();
+        encode_fields(kind, fields, &mut block, &mut frame);
+        wire_ready(wire, &frame)
+    })
 }
 
 /// A frame's bytes go down one clone, and the connection keeps pumping the other direction.
@@ -939,15 +955,17 @@ fn wire_ready(wire: &Wire, bytes: &[u8]) -> bool {
     wire.write_all(bytes).is_ok()
 }
 
-fn response_fields(head: &str) -> Vec<(String, String)> {
-    let mut fields = Vec::with_capacity(2 + head.matches("\r\n").count());
-    let status = head
+fn response_fields(head: &mut [u8]) -> Vec<(&str, &str)> {
+    crate::xhttp_h2::lower_field_names(head);
+    let text = std::str::from_utf8(head).unwrap_or_default();
+    let mut fields = Vec::with_capacity(2 + text.matches("\r\n").count());
+    let status = text
         .lines()
         .next()
         .and_then(|line| line.split_ascii_whitespace().nth(1))
         .unwrap_or("200");
-    fields.push((":status".to_owned(), status.to_owned()));
-    for line in head.lines().skip(1) {
+    fields.push((":status", status));
+    for line in text.lines().skip(1) {
         if line.is_empty() {
             break;
         }
@@ -962,7 +980,7 @@ fn response_fields(head: &str) -> Vec<(String, String)> {
         {
             continue;
         }
-        fields.push((name.to_ascii_lowercase(), value.trim().to_owned()));
+        fields.push((name, value.trim()));
     }
     fields
 }
@@ -972,10 +990,42 @@ fn decode_head(payload: &[u8], expect_request: bool) -> Option<(Option<Vec<u8>>,
     if expect_request {
         let fields = hpack::qpack_fields(payload)?;
         let head = synth_head(&fields)?;
-        Some((Some(head), hpack::qpack_status(payload)))
+        Some((Some(head), status_from_fields(&fields)))
     } else {
-        Some((None, Some(hpack::qpack_status(payload)?)))
+        Some((None, Some(qpack_status_walk(payload)?)))
     }
+}
+
+fn status_from_fields(fields: &[(Vec<u8>, Vec<u8>)]) -> Option<u16> {
+    let mut status = None;
+    for (name, value) in fields {
+        if name == b":status" {
+            status = Some(status_value(value)?);
+        }
+    }
+    status
+}
+
+fn status_value(bytes: &[u8]) -> Option<u16> {
+    if bytes.len() != 3 || !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    Some(
+        u16::from(bytes[0] - b'0') * 100
+            + u16::from(bytes[1] - b'0') * 10
+            + u16::from(bytes[2] - b'0'),
+    )
+}
+
+fn qpack_status_walk(block: &[u8]) -> Option<u16> {
+    #[cfg(test)]
+    STATUS_WALKS.with(|walks| walks.set(walks.get() + 1));
+    hpack::qpack_status(block)
+}
+
+#[cfg(test)]
+thread_local! {
+    static STATUS_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether a field byte can ride an HTTP/1 line: a peer that smuggles `\r\n` through QPACK would write its own headers into the head `accept_core` parses.
@@ -993,31 +1043,49 @@ pub(crate) fn h1_token(bytes: &[u8]) -> bool {
 
 /// The head `accept_core` parses from a request's fields: the same shape the H2 lane synthesises.
 fn synth_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Option<Vec<u8>> {
-    let field = |name: &[u8]| {
-        fields
-            .iter()
-            .find(|(key, _)| key == name)
-            .map(|(_, value)| value.as_slice())
-    };
-    let method = field(b":method")?;
+    let mut method: Option<&[u8]> = None;
+    let mut path: Option<&[u8]> = None;
+    let mut authority: Option<&[u8]> = None;
+    let mut scheme = false;
+    let mut protocol = false;
+    let mut room = 0;
+    for (name, value) in fields {
+        synth_visit();
+        match name.as_slice() {
+            b":method" if method.is_none() => method = Some(value),
+            b":path" if path.is_none() => path = Some(value),
+            b":authority" if authority.is_none() => authority = Some(value),
+            b":scheme" => scheme = true,
+            b":protocol" => protocol = true,
+            _ => {}
+        }
+        if !name.starts_with(b":") {
+            room += name.len() + value.len() + 4;
+        }
+    }
+    let method = method?;
     let target = if method == b"CONNECT" {
-        if field(b":path").is_some() || field(b":scheme").is_some() || field(b":protocol").is_some()
-        {
+        if path.is_some() || scheme || protocol {
             return None;
         }
-        field(b":authority")?
+        authority?
     } else {
-        field(b":path")?
+        path?
     };
     if !h1_token(method) || !h1_token(target) {
         return None;
     }
-    let mut head = Vec::with_capacity(method.len() + target.len() + 64);
+    room += method.len() + target.len() + b" HTTP/3\r\n".len();
+    if let Some(authority) = authority {
+        room += authority.len() + b"Host: \r\n".len();
+    }
+    room += b"Transfer-Encoding: chunked\r\n\r\n".len();
+    let mut head = Vec::with_capacity(room);
     head.extend_from_slice(method);
     head.push(b' ');
     head.extend_from_slice(target);
     head.extend_from_slice(b" HTTP/3\r\n");
-    if let Some(authority) = field(b":authority") {
+    if let Some(authority) = authority {
         if !h1_token(authority) {
             return None;
         }
@@ -1026,6 +1094,7 @@ fn synth_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Option<Vec<u8>> {
         head.extend_from_slice(b"\r\n");
     }
     for (name, value) in fields {
+        synth_visit();
         if name.starts_with(b":") {
             continue;
         }
@@ -1039,6 +1108,16 @@ fn synth_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Option<Vec<u8>> {
     }
     head.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
     Some(head)
+}
+
+fn synth_visit() {
+    #[cfg(test)]
+    SYNTH_FIELD_VISITS.with(|visits| visits.set(visits.get() + 1));
+}
+
+#[cfg(test)]
+thread_local! {
+    static SYNTH_FIELD_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The dial head as request fields: the pseudo-headers the H2 lane's block carries, with this
@@ -2215,19 +2294,20 @@ fn h3_control_frames(
 ) -> Result<bool, u64> {
     if *skip > 0 {
         let drop = (*skip).min(control.len() as u64) as usize;
-        control.drain(..drop);
+        control_drain(control, drop);
         *skip -= drop as u64;
         if *skip > 0 {
             return Ok(false);
         }
     }
     let mut draining = false;
+    let mut at = 0;
     loop {
-        let mut at = 0;
-        let Some(kind) = frames::quic_read(&control[..], &mut at) else {
+        let mut cursor = at;
+        let Some(kind) = frames::quic_read(&control[..], &mut cursor) else {
             break;
         };
-        let Some(len) = frames::quic_read(&control[..], &mut at) else {
+        let Some(len) = frames::quic_read(&control[..], &mut cursor) else {
             break;
         };
         let Ok(len) = usize::try_from(len) else {
@@ -2237,7 +2317,7 @@ fn h3_control_frames(
         if kind == 0x7 && !(1..=8).contains(&len) {
             return Err(H3_FRAME_ERROR);
         }
-        let Some(end) = at.checked_add(len) else {
+        let Some(end) = cursor.checked_add(len) else {
             control.clear();
             break;
         };
@@ -2248,12 +2328,12 @@ fn h3_control_frames(
             if end > control.len() {
                 break;
             }
-            let mut cursor = at;
-            while cursor < end {
-                let Some(id) = frames::quic_read(&control[..end], &mut cursor) else {
+            let mut field = cursor;
+            while field < end {
+                let Some(id) = frames::quic_read(&control[..end], &mut field) else {
                     return Err(H3_FRAME_ERROR);
                 };
-                let Some(_value) = frames::quic_read(&control[..end], &mut cursor) else {
+                let Some(_value) = frames::quic_read(&control[..end], &mut field) else {
                     return Err(H3_FRAME_ERROR);
                 };
                 // RFC 9114 7.2.4: the HTTP/2 settings identifiers are reserved here, so a peer that sends one has broken SETTINGS, not sent an extension.
@@ -2262,7 +2342,7 @@ fn h3_control_frames(
                 }
             }
             *settings = true;
-            control.drain(..end);
+            at = end;
             continue;
         }
         // Only GOAWAY belongs on the server control stream; DATA, HEADERS, CANCEL_PUSH, SETTINGS, PUSH_PROMISE, MAX_PUSH_ID, PRIORITY_UPDATE and the HTTP/2 reserved types are H3_FRAME_UNEXPECTED, unassigned types ignored.
@@ -2274,34 +2354,47 @@ fn h3_control_frames(
         }
         if end > control.len() {
             if kind != 0x7 {
-                let held = control.len().saturating_sub(at);
-                control.drain(..control.len());
+                let held = control.len().saturating_sub(cursor);
+                control.clear();
                 *skip = (len - held) as u64;
+            } else {
+                control_drain(control, at);
             }
+            at = 0;
             break;
         }
         if kind == 0x7 {
-            let mut cursor = at;
-            let Some(cutoff) = frames::quic_read(&control[..end], &mut cursor) else {
+            let mut field = cursor;
+            let Some(cutoff) = frames::quic_read(&control[..end], &mut field) else {
                 return Err(H3_FRAME_ERROR);
             };
-            if cursor != end {
+            if field != end {
                 return Err(H3_FRAME_ERROR);
             }
             if cutoff % 4 != 0 || cutoff > goaway.load(Ordering::SeqCst) {
                 return Err(H3_ID_ERROR);
             }
             goaway.fetch_min(cutoff, Ordering::SeqCst);
-            control.drain(..end);
             draining = true;
-            continue;
         }
-        control.drain(..end);
+        at = end;
     }
+    control_drain(control, at.min(control.len()));
     if *skip == 0 && control.len() > 64 * 1024 {
         control.clear();
     }
     Ok(draining)
+}
+
+fn control_drain(control: &mut Vec<u8>, end: usize) {
+    #[cfg(test)]
+    CONTROL_DRAINS.with(|drains| drains.set(drains.get() + 1));
+    control.drain(..end);
+}
+
+#[cfg(test)]
+thread_local! {
+    static CONTROL_DRAINS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Read just the stream-type varint from a unidirectional stream, leaving its frames unread and
@@ -2578,6 +2671,49 @@ mod tests {
         assert_eq!(&frame[3..], &[2u8; 100]);
     }
 
+    /// The first pass that finds the pseudo-headers also measures the head, so a long field list
+    /// opens the exact buffer instead of growing it a line at a time.
+    #[test]
+    fn a_long_synthesised_head_allocates_once() {
+        let mut fields = vec![
+            (b":method".to_vec(), b"POST".to_vec()),
+            (b":path".to_vec(), b"/x".to_vec()),
+            (b":authority".to_vec(), b"example.test".to_vec()),
+        ];
+        for i in 0..32 {
+            fields.push((format!("x-{i}").into_bytes(), vec![b'a'; 64]));
+        }
+        let (head, counts) =
+            ferrox_core::alloc_count::measure(|| synth_head(&fields).expect("a plain head"));
+        assert_eq!(
+            counts.allocs, 1,
+            "the measured head is the only allocation: {counts:?}"
+        );
+        assert!(head.len() > 32 * 64);
+    }
+
+    /// The writer's two staging buffers survive a response: the next head writes over the block
+    /// and frame the previous one grew, so a stream pays for them once.
+    #[test]
+    fn a_response_head_reuses_its_block_and_frame() {
+        let mut block = Vec::new();
+        let mut frame = Vec::new();
+        hpack::qpack_literal_many(&[(":status", "200"), ("content-length", "3")], &mut block);
+        stage_head(&mut block, &mut frame, b"abc");
+        let expected = frame.clone();
+        block.clear();
+        frame.clear();
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            hpack::qpack_literal_many(&[(":status", "200"), ("content-length", "3")], &mut block);
+            stage_head(&mut block, &mut frame, b"abc");
+        });
+        assert_eq!(
+            counts.allocs, 0,
+            "a same-shape response reuses both staging buffers: {counts:?}"
+        );
+        assert_eq!(frame, expected);
+    }
+
     #[test]
     fn an_overlong_decoder_integer_is_invalid_not_incomplete() {
         let mut buf = vec![0x7f];
@@ -2733,10 +2869,7 @@ mod tests {
     ) -> u16 {
         serve_scripted(identity, move |wire| {
             let length = body.len().to_string();
-            let fields = [
-                (":status".to_owned(), status.to_owned()),
-                ("content-length".to_owned(), length),
-            ];
+            let fields = [(":status", status), ("content-length", length.as_str())];
             if send_fields(wire, frames::H3_HEADERS, &fields) {
                 let _ = send_data(wire, body);
             }
@@ -2960,11 +3093,8 @@ mod tests {
     fn a_plain_h3_answer_skips_an_informational_status() {
         let (identity, roots) = minted_identity("localhost");
         let port = serve_scripted(&identity, |wire| {
-            let interim = [(":status".to_owned(), "103".to_owned())];
-            let final_head = [
-                (":status".to_owned(), "200".to_owned()),
-                ("content-length".to_owned(), "5".to_owned()),
-            ];
+            let interim = [(":status", "103")];
+            let final_head = [(":status", "200"), ("content-length", "5")];
             if send_fields(wire, frames::H3_HEADERS, &interim)
                 && send_fields(wire, frames::H3_HEADERS, &final_head)
             {
@@ -2984,10 +3114,7 @@ mod tests {
     fn a_plain_h3_answer_refuses_a_truncated_body() {
         let (identity, roots) = minted_identity("localhost");
         let port = serve_scripted(&identity, |wire| {
-            let fields = [
-                (":status".to_owned(), "200".to_owned()),
-                ("content-length".to_owned(), "10".to_owned()),
-            ];
+            let fields = [(":status", "200"), ("content-length", "10")];
             if send_fields(wire, frames::H3_HEADERS, &fields) {
                 let _ = send_data(wire, b"short");
             }
@@ -3004,10 +3131,7 @@ mod tests {
     fn a_plain_h3_answer_keeps_a_204_without_a_body() {
         let (identity, roots) = minted_identity("localhost");
         let port = serve_scripted(&identity, |wire| {
-            let fields = [
-                (":status".to_owned(), "204".to_owned()),
-                ("content-length".to_owned(), "10".to_owned()),
-            ];
+            let fields = [(":status", "204"), ("content-length", "10")];
             let _ = send_fields(wire, frames::H3_HEADERS, &fields);
         });
         let client = client(port, roots);
@@ -3178,6 +3302,49 @@ mod tests {
             head,
             b"POST /x HTTP/3\r\nhost: localhost\r\nx-a: 1\r\nTransfer-Encoding: chunked\r\n\r\n"
         );
+    }
+
+    /// A QPACK field names a slice of the head the writer already owns: lowercasing in place
+    /// leaves one allocation for the list, where each line used to own its name and value.
+    #[test]
+    fn an_h3_answer_keeps_its_fields_borrowed() {
+        let mut head = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Test: A\r\nConnection: keep-alive\r\n\r\n".to_vec();
+        let (fields, counts) = ferrox_core::alloc_count::measure(|| response_fields(&mut head));
+        assert_eq!(
+            counts.allocs, 1,
+            "the list is the answer's only allocation: {counts:?}"
+        );
+        assert_eq!(
+            fields,
+            vec![
+                (":status", "200"),
+                ("content-type", "text/plain"),
+                ("x-test", "A"),
+            ]
+        );
+        drop(fields);
+        assert!(head.starts_with(b"HTTP/1.1 200 OK\r\ncontent-type:"));
+    }
+
+    /// The head reads its fields twice: once for the pseudo-headers, once for the lines it writes,
+    /// where five separate `find` walks visited the list before.
+    #[test]
+    fn a_synthesised_head_reads_its_fields_twice() {
+        let fields = vec![
+            (b":method".to_vec(), b"POST".to_vec()),
+            (b":path".to_vec(), b"/x".to_vec()),
+            (b":authority".to_vec(), b"localhost".to_vec()),
+            (b"x-a".to_vec(), b"1".to_vec()),
+        ];
+        SYNTH_FIELD_VISITS.with(|visits| visits.set(0));
+        let _ = synth_head(&fields).expect("a plain field synthesises");
+        SYNTH_FIELD_VISITS.with(|visits| {
+            assert_eq!(
+                visits.get(),
+                2 * fields.len(),
+                "each field is visited once per pass"
+            );
+        });
     }
 
     #[test]
@@ -3391,6 +3558,41 @@ mod tests {
         );
     }
 
+    /// A request already decoded its fields for the synthesized head, so its last `:status`
+    /// comes from that list; a response, which keeps no fields, still walks the block.
+    #[test]
+    fn a_request_status_does_not_walk_the_block_again() {
+        let mut block = Vec::new();
+        hpack::qpack_literal_many(
+            &[
+                (":method", "POST"),
+                (":path", "/x"),
+                (":status", "500"),
+                (":status", "503"),
+            ],
+            &mut block,
+        );
+        STATUS_WALKS.with(|walks| walks.set(0));
+        assert_eq!(
+            decode_head(&block, true),
+            Some((
+                Some(b"POST /x HTTP/3\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec()),
+                Some(503)
+            ))
+        );
+        STATUS_WALKS.with(|walks| {
+            assert_eq!(walks.get(), 0, "the request status reuses its fields");
+        });
+        assert_eq!(decode_head(&block, false), Some((None, Some(503))));
+        STATUS_WALKS.with(|walks| {
+            assert_eq!(
+                walks.get(),
+                1,
+                "a response still walks the block for its status"
+            );
+        });
+    }
+
     #[test]
     fn a_request_head_without_a_method_is_refused() {
         let (identity, roots) = minted_identity("localhost");
@@ -3558,6 +3760,32 @@ mod tests {
             "RFC 9114 rejects a cutoff above the one already accepted"
         );
         assert_eq!(goaway.load(Ordering::SeqCst), 8);
+    }
+
+    /// One sweep consumes every complete frame in the buffer before it moves the bytes: a
+    /// per-frame `drain` memmoved the remaining tail once for each GOAWAY.
+    #[test]
+    fn a_batch_of_control_frames_is_drained_once() {
+        let mut control = Vec::new();
+        settings_frame(&mut control);
+        for _ in 0..64 {
+            frames::quic_varint(&mut control, 0x7);
+            frames::quic_varint(&mut control, 1);
+            frames::quic_varint(&mut control, 4);
+        }
+        let goaway = AtomicU64::new(u64::MAX);
+        let mut skip = 0;
+        let mut settings = false;
+        CONTROL_DRAINS.with(|drains| drains.set(0));
+        assert_eq!(
+            h3_control_frames(&mut control, &mut skip, &mut settings, &goaway),
+            Ok(true)
+        );
+        CONTROL_DRAINS.with(|drains| {
+            assert_eq!(drains.get(), 1, "the batch is drained once");
+        });
+        assert!(control.is_empty());
+        assert_eq!(goaway.load(Ordering::SeqCst), 4);
     }
 
     #[test]

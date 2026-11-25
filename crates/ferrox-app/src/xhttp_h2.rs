@@ -1460,7 +1460,7 @@ fn hop_by_hop(name: &str) -> bool {
 }
 
 /// HTTP/2 field names are lowercase (RFC 9113 8.2.1), so the canonical spelling is lowered in place.
-fn lower_field_names(head: &mut [u8]) {
+pub(crate) fn lower_field_names(head: &mut [u8]) {
     let mut at = match ferrox_core::foxy::line_end(head) {
         Some(end) => end + 2,
         None => return,
@@ -3672,11 +3672,11 @@ fn block_from_head(head: &str, host: &str, scheme: &str) -> Vec<u8> {
     let mut request = lines.next().unwrap_or_default().split_ascii_whitespace();
     let method = request.next().unwrap_or("POST");
     let target = request.next().unwrap_or("/");
-    let mut fields: Vec<(String, String)> = Vec::with_capacity(8);
-    fields.push((":method".to_owned(), method.to_owned()));
-    fields.push((":path".to_owned(), target.to_owned()));
-    fields.push((":scheme".to_owned(), scheme.to_owned()));
-    fields.push((":authority".to_owned(), host.to_owned()));
+    let mut out = Vec::with_capacity(head.len() + host.len() + scheme.len() + 16);
+    crate::h2::push_header(&mut out, ":method", method);
+    crate::h2::push_header(&mut out, ":path", target);
+    crate::h2::push_header(&mut out, ":scheme", scheme);
+    crate::h2::push_header(&mut out, ":authority", host);
     for line in lines {
         if line.is_empty() {
             break;
@@ -3694,13 +3694,9 @@ fn block_from_head(head: &str, host: &str, scheme: &str) -> Vec<u8> {
         {
             continue;
         }
-        fields.push((name.to_ascii_lowercase(), value.trim().to_owned()));
+        crate::h2::push_lower(&mut out, name, value.trim());
     }
-    let refs: Vec<(&str, &str)> = fields
-        .iter()
-        .map(|(name, value)| (name.as_str(), value.as_str()))
-        .collect();
-    block_encode(&refs)
+    out
 }
 
 /// What a connection does with a request stream: xHTTP synthesises its H1 head and reuses the H1
@@ -5398,6 +5394,31 @@ mod tests {
         assert_eq!(
             counts.zeroed_bytes, 8192,
             "a longer frame pays for its own zeroed room"
+        );
+    }
+
+    /// A dial head is already text: its fields go straight into the block, folded on the stack,
+    /// instead of an owned pair per line and a second list of borrows.
+    #[test]
+    fn a_dial_head_is_encoded_without_its_temporary_fields() {
+        let head = "POST /x?z=1 HTTP/1.1\r\nHost: example.test\r\nContent-Length: 3\r\nX-Upper: Value\r\nConnection: keep-alive\r\n\r\n";
+        let (block, counts) =
+            ferrox_core::alloc_count::measure(|| block_from_head(head, "example.test", "https"));
+        assert_eq!(
+            counts.allocs, 1,
+            "the block is the only allocation the head needs: {counts:?}"
+        );
+        assert_eq!(
+            block,
+            block_encode(&[
+                (":method", "POST"),
+                (":path", "/x?z=1"),
+                (":scheme", "https"),
+                (":authority", "example.test"),
+                ("content-length", "3"),
+                ("x-upper", "Value"),
+            ]),
+            "the in-place encoder changed the header block"
         );
     }
 
