@@ -1368,6 +1368,12 @@ impl Receivers {
     }
 }
 
+impl Drop for Peers {
+    fn drop(&mut self) {
+        release_endpoint_owners(self.owner);
+    }
+}
+
 impl std::ops::Deref for Peers {
     type Target = [Peer];
 
@@ -2099,21 +2105,33 @@ fn endpoint_owners() -> &'static Mutex<HashMap<IpAddr, HashSet<usize>>> {
 }
 
 fn release_endpoint_owner(ip: IpAddr, owner: usize) {
-    let last = endpoint_owners()
-        .lock()
-        .map(|mut owners| {
-            let Some(set) = owners.get_mut(&ip) else {
-                return false;
-            };
-            set.remove(&owner);
-            let last = set.is_empty();
-            if last {
-                owners.remove(&ip);
-            }
-            last
-        })
-        .unwrap_or(false);
-    if last {
+    let Ok(mut owners) = endpoint_owners().lock() else {
+        return;
+    };
+    let Some(set) = owners.get_mut(&ip) else {
+        return;
+    };
+    set.remove(&owner);
+    if set.is_empty() {
+        owners.remove(&ip);
+        crate::tun_route::unpin_dialled(ip);
+    }
+}
+
+fn release_endpoint_owners(owner: usize) {
+    let Ok(mut owners) = endpoint_owners().lock() else {
+        return;
+    };
+    let mut released = Vec::new();
+    owners.retain(|ip, set| {
+        set.remove(&owner);
+        let last = set.is_empty();
+        if last {
+            released.push(*ip);
+        }
+        !last
+    });
+    for ip in released {
         crate::tun_route::unpin_dialled(ip);
     }
 }
@@ -2125,6 +2143,9 @@ fn pin_learned(to: SocketAddr, owner: usize) -> bool {
         crate::quic::network_generation(),
         crate::tun_route::capture_generation(),
     );
+    let Ok(mut owners) = endpoint_owners().lock() else {
+        return false;
+    };
     if !LEARNED.with(|seen| {
         seen.borrow()
             .get(&ip)
@@ -2140,9 +2161,7 @@ fn pin_learned(to: SocketAddr, owner: usize) -> bool {
                 .insert(ip, (generation.0, generation.1, uncaptured));
         });
     }
-    if let Ok(mut owners) = endpoint_owners().lock() {
-        owners.entry(ip).or_default().insert(owner);
-    }
+    owners.entry(ip).or_default().insert(owner);
     true
 }
 
@@ -2218,7 +2237,7 @@ fn flush(
                             });
                         }
                     }
-                    send_packet(socket, ipv6_socket, to, primary, &packet, candidates);
+                    send_packet(socket, ipv6_socket, to, primary, &packet, candidates, owner);
                     if primary {
                         if let Some(index) = peer {
                             peers[index].noise.after_handshake(|noise| {
@@ -2839,6 +2858,7 @@ fn send_packet(
     primary: bool,
     packet: &[u8],
     candidates: Option<&[SocketAddr]>,
+    owner: usize,
 ) {
     if is_initiation(packet) {
         if primary && (ipv6 || endpoint.is_ipv4()) {
@@ -2849,7 +2869,7 @@ fn send_packet(
             if target == endpoint || (!ipv6 && target.is_ipv6()) {
                 continue;
             }
-            if !pin_learned(target) {
+            if !pin_learned(target, owner) {
                 continue;
             }
             let _ = socket.send_to(packet, send_endpoint(target, ipv6));
@@ -4028,6 +4048,7 @@ mod tests {
             true,
             &initiation,
             Some(&candidates),
+            0,
         );
         let mut buf = [0u8; 256];
         assert_eq!(
@@ -4050,6 +4071,7 @@ mod tests {
             true,
             &transport,
             Some(&candidates),
+            0,
         );
         assert_eq!(
             recv_from_port(&v4, sender_port, &mut buf),
@@ -4073,6 +4095,7 @@ mod tests {
             true,
             &initiation,
             Some(&candidates),
+            0,
         );
         assert_eq!(
             recv_from_port(&v4, fallback_port, &mut buf),
@@ -4118,6 +4141,7 @@ mod tests {
             true,
             &initiation,
             Some(&candidates),
+            0,
         );
         let mut buf = [0u8; 256];
         assert_eq!(
@@ -4142,6 +4166,7 @@ mod tests {
             true,
             &transport,
             Some(&candidates),
+            0,
         );
         assert_eq!(
             roamed.recv_from(&mut buf).expect("roamed data").0,

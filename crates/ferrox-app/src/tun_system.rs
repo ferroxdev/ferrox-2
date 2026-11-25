@@ -510,7 +510,7 @@ pub(crate) fn serve(
     out: &crate::proxy::Outbound,
     hybrid: bool,
     stopping: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
-) -> io::Result<(String, Vec<thread::JoinHandle<()>>)> {
+) -> io::Result<(String, Vec<std::thread::JoinHandle<()>>)> {
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
@@ -537,6 +537,7 @@ pub(crate) fn serve(
         );
     }
     let device = Arc::new(tun_stack::build(spec, false, false)?.0);
+    device.set_nonblocking(true)?;
     let name = device.name()?;
     let listener = std::net::TcpListener::bind(listener_address(local, &name)?)?;
     listener.set_nonblocking(true)?;
@@ -699,7 +700,9 @@ fn accept_loop(
     use std::thread;
     use std::time::Duration;
 
+    let mut flows: Vec<thread::JoinHandle<()>> = Vec::new();
     while !failed.load(Ordering::Relaxed) {
+        flows.retain(|flow| !flow.is_finished());
         match listener.accept() {
             Ok((stream, peer)) => {
                 let destination = match nat.lock() {
@@ -712,7 +715,7 @@ fn accept_loop(
                 let out = out.clone();
                 let nat = std::sync::Arc::clone(&nat);
                 let port = peer.port();
-                thread::spawn(move || {
+                flows.push(thread::spawn(move || {
                     let conn = crate::conn::Connection::Tcp(stream);
                     let destination = crate::proxy::Destination::Address(destination);
                     let dial = match (dns_hijack, &destination) {
@@ -727,7 +730,7 @@ fn accept_loop(
                     if let Ok(mut nat) = nat.lock() {
                         nat.closed(port, generation);
                     }
-                });
+                }));
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(1));
@@ -738,6 +741,9 @@ fn accept_loop(
                 thread::sleep(Duration::from_millis(10));
             }
         }
+    }
+    for flow in flows {
+        let _ = flow.join();
     }
 }
 

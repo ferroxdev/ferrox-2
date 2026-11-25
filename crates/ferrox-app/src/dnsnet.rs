@@ -33,10 +33,11 @@ pub(crate) fn udp(
             Err(error) => return Err(error),
         }
     }
+    let addr = crate::sockopt::resolve_datagram(options, host, port)?;
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     let routes = crate::tun_route::route_read();
     crate::tun_route::force_underlay();
-    let socket = crate::sockopt::datagram(options, host, port, timeout)?;
+    let socket = crate::sockopt::datagram_at(options, addr, timeout)?;
     socket
         .send(query)
         .map_err(|error| format!("dns udp send: {error}"))?;
@@ -263,6 +264,7 @@ fn connect(
             .saturating_duration_since(Instant::now())
             .max(std::time::Duration::from_millis(1))
     };
+    let deadline = crate::dnsapp::system_deadline().map_or(deadline, |system| deadline.min(system));
     let timeout = left(deadline);
     if !local {
         match crate::proxy::dns_stream(host, port, tag, timeout) {
@@ -271,10 +273,7 @@ fn connect(
             Err(error) => return Err(error),
         }
     }
-    let timeout = crate::dnsapp::system_deadline().map_or_else(
-        || left(deadline),
-        |absolute| left(deadline).min(left(absolute)),
-    );
+    let timeout = left(deadline);
     crate::tun_route::force_underlay();
     let stream = crate::dnsapp::with_system_deadline(deadline, || {
         crate::sockopt::connect(options, host, port, timeout)

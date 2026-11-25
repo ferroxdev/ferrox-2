@@ -10266,6 +10266,22 @@ pub(crate) fn dns_socket(host: &str, port: u16) -> Option<SocketAddr> {
     (host, port).to_socket_addrs().ok()?.next()
 }
 
+pub(crate) fn dns_socket_bounded(
+    host: &str,
+    port: u16,
+    budget: std::time::Duration,
+) -> Option<SocketAddr> {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Some(SocketAddr::new(ip, port));
+    }
+    resolve_bounded(host, port, budget, |host, port| {
+        (host, port)
+            .to_socket_addrs()
+            .map(std::iter::Iterator::collect)
+    })
+    .and_then(|addrs| addrs.first().copied())
+}
+
 fn dns_destination(host: &str, port: u16) -> Destination {
     match host.parse::<std::net::IpAddr>() {
         Ok(ip) => Destination::Address(SocketAddr::new(ip, port)),
@@ -15039,8 +15055,16 @@ struct RungAttempt<'a> {
 /// The edge a configured address names: a numeric address parses straight from its parts, so no `String` is written only for the parser to take it apart again, and a name keeps the resolver's own host-and-port form rather than a `host:port` serialisation it would re-split. A numeric host in a name field is answered identically by both routes, so the resolution and the bytes on the wire do not change. The picked lane's `addressPortStrategy`, when it names one, replaces the name before the resolver sees it.
 pub(crate) fn resolve_outbound(address: &str, port: u16) -> Option<SocketAddr> {
     let stop = DIAL_CANCEL.with(|cell| cell.borrow().clone());
+    resolve_outbound_stopping(address, port, stop.as_deref())
+}
+
+fn resolve_outbound_stopping(
+    address: &str,
+    port: u16,
+    stop: Option<&AtomicBool>,
+) -> Option<SocketAddr> {
     let options = dial_options();
-    let resolved = resolve_outbound_watching(options.as_deref(), address, port, stop.as_deref());
+    let resolved = resolve_outbound_watching(options.as_deref(), address, port, stop);
     if let Some(server) = resolved {
         crate::tun_route::pin_dialled(server.ip());
     }
@@ -15097,9 +15121,13 @@ pub(crate) fn dial_cancelled() -> bool {
 /// Shut a connected socket down when its caller stops, so a handshake that cannot poll a flag
 /// still ends before `Workers::join` waits on it.
 fn watch_dial_cancel(stream: &Connection) -> Option<DialCancelGuard> {
+    let stop = DIAL_CANCEL.with(|cell| cell.borrow().clone())?;
+    watch_stop(stream, stop.as_ref())
+}
+
+fn watch_stop(stream: &Connection, stop: &AtomicBool) -> Option<DialCancelGuard> {
     use std::sync::mpsc::{self, RecvTimeoutError};
 
-    let stop = DIAL_CANCEL.with(|cell| cell.borrow().clone())?;
     let stream = stream.try_clone().ok()?;
     let (done, finished) = mpsc::channel();
     let thread = std::thread::spawn(move || loop {
@@ -19645,10 +19673,9 @@ fn tun_fd_single_owner(root: &Json) -> Result<(), String> {
     return Ok(());
     #[cfg(unix)]
     {
-        if crate::tun::inherited_fd().is_none() {
-            return Ok(());
-        }
-        let mut owners = 0;
+        let inherited_fd = crate::tun::inherited_fd();
+        let mut inherited_owners = 0;
+        let mut explicit = std::collections::HashSet::new();
         if let Some(list) = root.get("inbounds").and_then(Json::as_arr) {
             for inbound in list {
                 if inbound.get("protocol").and_then(Json::as_str) != Some("tun") {
@@ -19659,19 +19686,35 @@ fn tun_fd_single_owner(root: &Json) -> Result<(), String> {
                 };
                 let tap = tun_bool(inbound, "tap").ok().flatten().unwrap_or(false)
                     && cfg!(target_os = "macos");
-                if fd.is_some() || tap || !tun_native(tun_stack(inbound)) {
+                if tap || !tun_native(tun_stack(inbound)) {
                     continue;
                 }
-                owners += 1;
+                match fd {
+                    Some(fd) => {
+                        if !explicit.insert(fd) {
+                            return Err(format!(
+                                "descriptor {fd} is claimed by more than one TUN inbound"
+                            ));
+                        }
+                    }
+                    None if inherited_fd.is_some() => inherited_owners += 1,
+                    None => {}
+                }
             }
         }
-        if owners > 1 {
+        if inherited_owners > 1 {
             return Err(
                 "`FERROX_TUN_FD` can be owned by only one TUN inbound; give the others an explicit `fd`"
                     .to_owned(),
             );
         }
-        if owners > 0 && crate::tun::inherited_live() {
+        if inherited_owners > 0 && inherited_fd.is_some_and(|fd| explicit.contains(&fd)) {
+            return Err(
+                "`FERROX_TUN_FD` can be owned by only one TUN inbound; give the others an explicit `fd`"
+                    .to_owned(),
+            );
+        }
+        if inherited_owners > 0 && crate::tun::inherited_live() {
             return Err(
                 "`FERROX_TUN_FD` is already owned by a live TUN inbound; give this one an explicit `fd`"
                     .to_owned(),
@@ -29617,16 +29660,16 @@ fn open_direct_datagram(
     if stop.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
         return None;
     }
-    let server = resolve_outbound(&socks.address, socks.port)?;
+    let server = resolve_outbound_stopping(&socks.address, socks.port, stop)?;
     let stream = dial_or_report(&server)?;
     let _ = stream.set_read_timeout(Some(budgets::handshake()));
     let _ = stream.set_write_timeout(Some(budgets::handshake()));
+    let _cancel = stop.and_then(|stop| watch_stop(&stream, stop));
     let association = crate::socks::associate(stream, &socks.credential)?;
     if stop.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
         return None;
     }
-    // The negotiated relay can differ from the server the config names, so it is pinned here rather than left to the capture.
-    crate::tun_route::pin_dialled(association.relay.ip());
+    // The negotiated relay can differ from the server the config names; its leg binds the underlay, so no host route is added for it.
     let _ = association.control.set_read_timeout(None);
     let _ = association.control.set_write_timeout(None);
     Some(DirectDatagram {
@@ -41422,15 +41465,7 @@ fn send_parts(
             msg.msg_namelen = len;
         }
         msg.msg_iov = parts.as_mut_ptr();
-        // glibc sizes `msg_iovlen` as a `usize`, every other unix in scope as a 32-bit count.
-        #[cfg(target_os = "linux")]
-        {
-            msg.msg_iovlen = parts.len();
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            msg.msg_iovlen = i32::try_from(parts.len()).unwrap_or(i32::MAX);
-        }
+        msg.msg_iovlen = parts.len() as _;
         loop {
             // SAFETY: `msg` names `parts` and the `sockaddr` storage, both live and sized as the call reads them.
             let sent = unsafe { libc::sendmsg(socket.as_raw_fd(), &raw const msg, 0) };
@@ -47293,9 +47328,15 @@ mod tests {
             let parsed = crate::json::parse(config).expect("config");
             tun_spec(&parsed)
         };
+        #[cfg(unix)]
         for key in ["fd", "file_descriptor", "file-descriptor"] {
             let wanted = spec(&format!(r#"{{"{key}":7}}"#)).expect("a descriptor");
             assert_eq!(wanted.fd(), Some(7), "{key}");
+        }
+        #[cfg(windows)]
+        for key in ["fd", "file_descriptor", "file-descriptor"] {
+            let config = format!(r#"{{"{key}":7}}"#);
+            assert!(spec(&config).is_err(), "{key}");
         }
         assert_eq!(
             spec(r#"{"address":"198.18.0.1"}"#).expect("no fd").fd(),

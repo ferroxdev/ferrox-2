@@ -232,7 +232,7 @@ impl ScriptRouter {
             move |_, _| {
                 if Instant::now() >= deadline {
                     load_expired.store(true, Ordering::Relaxed);
-                    Err(LuaError::RuntimeError("routing script timed out".into()))
+                    Ok(VmState::Yield)
                 } else {
                     Ok(VmState::Continue)
                 }
@@ -331,7 +331,7 @@ impl ScriptRouter {
                 move |_, _| {
                     if Instant::now() >= deadline {
                         call_expired.store(true, Ordering::Relaxed);
-                        Err(LuaError::RuntimeError("routing script timed out".into()))
+                        Ok(VmState::Yield)
                     } else {
                         Ok(VmState::Continue)
                     }
@@ -393,8 +393,11 @@ fn call(lua: &Lua, context: ScriptContext) -> Result<Option<String>, String> {
             attributes,
         })
         .map_err(|error| error.to_string())?;
-    let values = handle
-        .call::<mlua::MultiValue>((
+    let thread = lua
+        .create_thread(handle)
+        .map_err(|error| error.to_string())?;
+    let values = thread
+        .resume::<mlua::MultiValue>((
             context,
             inbound,
             source_port,
@@ -930,7 +933,11 @@ impl UserData for IpMatcherUser {
             };
             let mut kept = Vec::new();
             let mut remaining = ips.as_ref().clone();
-            let single = this.matchers.len() == 1;
+            let ordered = this.matchers.len() > 1
+                || this
+                    .matchers
+                    .iter()
+                    .any(crate::router::IpMatcher::has_buckets);
             for matcher in &this.matchers {
                 let mut next = Vec::with_capacity(remaining.len());
                 let mut hit = Vec::new();
@@ -942,14 +949,14 @@ impl UserData for IpMatcherUser {
                     }
                 }
                 // The reference emits each group's IPv4 answers before its IPv6 answers, and a `::ffff:` answer is IPv4.
-                if !single {
+                if ordered {
                     hit.sort_by_key(|ip| to4(*ip).is_none());
                 }
                 kept.extend(hit);
                 remaining = next;
             }
             let mut unmatched = remaining;
-            if !single {
+            if ordered {
                 unmatched.sort_by_key(|ip| to4(*ip).is_none());
             }
             let kept = lua.create_userdata(IpList {
@@ -1158,7 +1165,7 @@ impl UserData for IpUser {
                 mask.borrow::<MaskUser>()?.0.clone()
             } else {
                 let mask = mask.borrow::<IpUser>()?;
-                ip_bytes(mask.0).to_vec()
+                ip_user_bytes(mask.0)
             };
             Ok(mask_ip(this.0, &mask).map(IpUser))
         });
@@ -1823,6 +1830,63 @@ assert(#rest == 2 and rest[1] == "2001:db8::1" and rest[2] == "198.51.100.2", ta
     }
 
     #[test]
+    fn filter_ips_orders_a_mixed_width_single_matcher() {
+        use crate::json::Json;
+        let lua = Lua::new();
+        install(
+            &lua,
+            &Arc::new(CallHooks::default()),
+            &Arc::new(Vec::new()),
+            &Arc::new(Mutex::new(HashMap::new())),
+        )
+        .expect("installs");
+        let mut assets = Assets::new(Vec::new());
+        let matcher = ip_matcher(
+            &Json::Arr(vec![
+                Json::Str("192.0.2.0/24".into()),
+                Json::Str("2001:db8::1/128".into()),
+            ]),
+            &mut assets,
+            "test",
+        )
+        .expect("matcher");
+        let matcher = lua
+            .create_userdata(IpMatcherUser {
+                matchers: vec![matcher],
+                reverse: None,
+                flip: false,
+            })
+            .expect("matcher userdata");
+        let native: IpAddr = "2001:db8::1".parse().unwrap();
+        let mapped = IpAddr::V6(Ipv4Addr::new(192, 0, 2, 1).to_ipv6_mapped());
+        let ips = lua
+            .create_userdata(IpList {
+                items: Arc::new(vec![native, mapped]),
+            })
+            .expect("list");
+        lua.globals()
+            .set("matcher", matcher)
+            .expect("matcher global");
+        lua.globals().set("ips", ips).expect("ips global");
+        lua.load(
+            r#"
+local kept, rest = matcher:FilterIPs(ips)
+local function all(list)
+  local out = {}
+  for _, ip in list() do out[#out + 1] = ip:String() end
+  return out
+end
+local kept = all(kept)
+local rest = all(rest)
+assert(#kept == 1 and kept[1] == "192.0.2.1", table.concat(kept, ","))
+assert(#rest == 1 and rest[1] == "2001:db8::1", table.concat(rest, ","))
+"#,
+        )
+        .exec()
+        .expect("filters and orders");
+    }
+
+    #[test]
     fn filter_ips_keeps_group_order_for_several_matchers() {
         use crate::json::Json;
         let lua = Lua::new();
@@ -1891,7 +1955,7 @@ assert(#rest == 2 and rest[1] == "198.51.100.3" and rest[2] == "2001:db8::1", ta
             .create_userdata(IpUser("192.0.2.9".parse().expect("address")))
             .expect("userdata");
         lua.globals().set("ip", ip).expect("ip global");
-        lua.load(r#"assert(ip[0] == nil); assert(ip[1] == 192)"#)
+        lua.load(r"assert(ip[0] == nil); assert(ip[1] == 192)")
             .exec()
             .expect("zero is not a byte index");
     }

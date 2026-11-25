@@ -761,15 +761,23 @@ pub(crate) fn datagram(
     port: u16,
     timeout: Duration,
 ) -> Result<UdpSocket, String> {
-    let addr = match options {
-        Some(options) => options.resolve(host, port)?,
+    let addr = resolve_datagram(options, host, port)?;
+    datagram_at(options, addr, timeout)
+}
+
+pub(crate) fn resolve_datagram(
+    options: Option<&SocketOptions>,
+    host: &str,
+    port: u16,
+) -> Result<SocketAddr, String> {
+    match options {
+        Some(options) => options.resolve(host, port),
         None => (host, port)
             .to_socket_addrs()
             .map_err(|e| format!("ech: resolve {host}: {e}"))?
             .next()
-            .ok_or_else(|| format!("ech: {host} resolved to nothing"))?,
-    };
-    datagram_at(options, addr, timeout)
+            .ok_or_else(|| format!("ech: {host} resolved to nothing")),
+    }
 }
 
 /// The same socket when the caller already resolved the endpoint.
@@ -777,7 +785,7 @@ pub(crate) fn datagram_target(addr: SocketAddr, timeout: Duration) -> Result<Udp
     datagram_at(None, addr, timeout)
 }
 
-fn datagram_at(
+pub(crate) fn datagram_at(
     options: Option<&SocketOptions>,
     addr: SocketAddr,
     timeout: Duration,

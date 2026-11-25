@@ -335,16 +335,34 @@ fn entry_matches(path: &Path, queued: &Path) -> bool {
 }
 
 fn referent_matches(path: &Path, queued: &Path) -> bool {
-    // A write through the entry a read's final symlink points at still reaches that read; a write through the symlink does not reach the target's own readers.
-    if !std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
-        || std::fs::symlink_metadata(queued).is_ok_and(|meta| meta.file_type().is_symlink())
-    {
+    // A write through the entry a read's symlink chain points at still reaches that read; a write through the symlink does not reach the target's own readers.
+    if std::fs::symlink_metadata(queued).is_ok_and(|meta| meta.file_type().is_symlink()) {
         return false;
     }
-    let Some(target) = resolve_link_target(path) else {
-        return false;
-    };
-    entry_key(&target).is_some_and(|target| entry_key(queued).as_ref() == Some(&target))
+    let mut current = path.to_path_buf();
+    for _ in 0..32 {
+        if entry_matches(&current, queued) {
+            return true;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&current) else {
+            return false;
+        };
+        if !meta.file_type().is_symlink() {
+            return false;
+        }
+        let Ok(target) = std::fs::read_link(&current) else {
+            return false;
+        };
+        current = if target.is_absolute() {
+            target
+        } else {
+            current
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(target)
+        };
+    }
+    false
 }
 
 /// Walk a final-component symlink chain by its link text, so a referent a queued write has not created yet still resolves.
@@ -1595,7 +1613,23 @@ impl Routing {
     }
 
     pub(crate) fn parse_in(root: &Json, dirs: Vec<PathBuf>) -> Result<Option<Self>, String> {
-        Self::parse_with(root, dirs, ScriptSource::Resolve, None)
+        let (parsed, writes, _) = with_candidate_assets(HashMap::new(), || {
+            Self::parse_with(root, dirs, ScriptSource::Resolve, None)
+        });
+        if parsed.is_ok() {
+            for write in writes {
+                let CacheWrite { target, body, .. } = write;
+                match body.into_bytes() {
+                    Ok(bytes) => {
+                        if let Err(error) = crate::geodata::write_atomic(&target, &bytes) {
+                            eprintln!("routing rule set cache: {error}");
+                        }
+                    }
+                    Err(error) => eprintln!("routing rule set cache: {error}"),
+                }
+            }
+        }
+        parsed
     }
 
     /// A geodata refresh keeps the active script's saved source instead of reopening its file.
@@ -4591,6 +4625,11 @@ impl IpMatcher {
             .collect()
     }
 
+    /// Whether any set holds a range wider than one address, so its order follows the reference's buckets.
+    pub(crate) fn has_buckets(&self) -> bool {
+        self.sets.iter().any(|(set, _)| set.has_buckets())
+    }
+
     /// Match with a Lua userdata's reverse override or pending flip, without cloning the parsed sets.
     pub(crate) fn matches_override(&self, ip: IpAddr, reverse: Option<bool>, flip: bool) -> bool {
         self.sets.iter().any(|(set, own)| {
@@ -4623,6 +4662,11 @@ struct RangeSet {
 }
 
 impl RangeSet {
+    fn has_buckets(&self) -> bool {
+        self.v4.iter().any(|(start, end)| start != end)
+            || self.v6.iter().any(|(start, end)| start != end)
+    }
+
     fn add(&mut self, ip: IpAddr, prefix: u32) -> Result<(), String> {
         match ip {
             IpAddr::V4(ip) => {
@@ -5422,7 +5466,6 @@ pub(crate) struct RemoteBody {
 
 struct RemoteTemp {
     dir: PathBuf,
-    file: std::sync::Mutex<Option<std::fs::File>>,
 }
 
 impl RemoteTemp {
@@ -5460,37 +5503,25 @@ impl RemoteTemp {
                 return Err(format!("stage remote rule set: {error}"));
             }
         };
-        Ok(Self {
-            dir,
-            file: std::sync::Mutex::new(Some(file)),
-        })
+        drop(file);
+        Ok(Self { dir })
     }
 
     fn write(&self, bytes: &[u8]) -> Result<(), String> {
-        let mut file = self
-            .file
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        file.as_mut()
-            .ok_or_else(|| "staged rule set is closed".to_owned())?
-            .write_all(bytes)
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(self.dir.join("body"))
+            .map_err(|error| format!("stage remote rule set: {error}"))?;
+        file.write_all(bytes)
             .map_err(|error| format!("stage remote rule set: {error}"))
     }
 
     fn read(&self) -> Result<Vec<u8>, String> {
-        let file = self
-            .file
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut file = file
-            .as_ref()
-            .ok_or_else(|| "staged rule set is closed".to_owned())?
-            .try_clone()
-            .map_err(|error| format!("read staged rule set: {error}"))?;
-        file.seek(std::io::SeekFrom::Start(0))
-            .map_err(|error| format!("read staged rule set: {error}"))?;
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
+        std::fs::File::open(self.dir.join("body"))
+            .map_err(|error| format!("read staged rule set: {error}"))?
+            .read_to_end(&mut bytes)
             .map_err(|error| format!("read staged rule set: {error}"))?;
         Ok(bytes)
     }
@@ -5498,12 +5529,6 @@ impl RemoteTemp {
 
 impl Drop for RemoteTemp {
     fn drop(&mut self) {
-        let file = self
-            .file
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        drop(file);
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }

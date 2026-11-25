@@ -854,12 +854,12 @@ fn stage_cache(target: &std::path::Path, body: crate::router::CacheBody) -> Resu
     }
     let temp = unique_path(target, ".tmp")
         .map_err(|reason| format!("routing rule set cache: {reason}"))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .map_err(|error| format!("cannot create {}: {error}", temp.display()))?;
     let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .map_err(|error| format!("cannot create {}: {error}", temp.display()))?;
         file.write_all(&bytes)
             .map_err(|error| format!("cannot write {}: {error}", target.display()))?;
         file.flush()
@@ -1011,9 +1011,21 @@ fn swap_one(stage: &Stage) -> Result<Swap, String> {
                 }
                 Err(error) => {
                     if exchange_paths(&stage.temp, &stage.target).is_err() {
+                        let kept = unique_path(&stage.target, ".bak")?;
+                        if std::fs::rename(&stage.temp, &kept).is_err() {
+                            std::fs::copy(&stage.temp, &kept).map_err(|copy| {
+                                format!(
+                                    "cannot move the old {} aside: {error}; cannot keep it at {}: {copy}",
+                                    stage.target.display(),
+                                    kept.display()
+                                )
+                            })?;
+                            let _ = std::fs::remove_file(&stage.temp);
+                        }
                         return Err(format!(
-                            "cannot move the old {} aside: {error}",
-                            stage.target.display()
+                            "cannot move the old {} aside: {error}; kept it at {}",
+                            stage.target.display(),
+                            kept.display()
                         ));
                     }
                 }

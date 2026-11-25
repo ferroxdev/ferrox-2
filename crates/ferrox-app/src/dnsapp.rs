@@ -346,13 +346,23 @@ impl Pool {
             let direct =
                 job.force_local || server.local_dial || server.transport == Transport::Local;
             // Resolve a routed UDP hostname before the asset read guard, so a slow system resolver cannot hold a refresh out.
-            let target = if !direct && server.transport == Transport::Udp {
-                server
-                    .endpoint
-                    .as_ref()
-                    .and_then(|endpoint| crate::proxy::dns_socket(&endpoint.host, endpoint.port))
+            let target: Result<Option<SocketAddr>, ()> = if !direct
+                && server.transport == Transport::Udp
+                && !resolver.cached(job.index, &job.name, job.v4, job.v6)
+            {
+                match server.endpoint.as_ref() {
+                    Some(endpoint) => {
+                        let budget = job
+                            .deadline
+                            .saturating_duration_since(Instant::now())
+                            .max(Duration::from_millis(1));
+                        crate::proxy::dns_socket_bounded(&endpoint.host, endpoint.port, budget)
+                            .map_or(Err(()), |target| Ok(Some(target)))
+                    }
+                    None => Err(()),
+                }
             } else {
-                None
+                Ok(None)
             };
             let _assets = (!job.dns_held && !direct).then(crate::router_script::dns_read_assets);
             let run = || {
@@ -570,7 +580,7 @@ impl Resolver {
         v6: bool,
         fake: bool,
     ) -> Lookup {
-        self.query_server(index, name, v4, v6, fake, false, None)
+        self.query_server(index, name, v4, v6, fake, false, Ok(None))
     }
 
     pub(crate) fn script_lookup(
@@ -713,7 +723,7 @@ impl Resolver {
             if system_deadline().is_some_and(|deadline| Instant::now() >= deadline) {
                 break;
             }
-            match self.query_server(index, name, v4, v6, fake_enabled, force_local, None) {
+            match self.query_server(index, name, v4, v6, fake_enabled, force_local, Ok(None)) {
                 Lookup::Records(ips, ttl) if !ips.is_empty() => return Lookup::Records(ips, ttl),
                 Lookup::Records(_, _) | Lookup::Empty => empty = true,
                 Lookup::Rcode(code) => last_rcode = Some(code),
@@ -754,6 +764,9 @@ impl Resolver {
         let mut skipped = false;
         let mut start = 0;
         while start < order.len() {
+            if system_deadline().is_some_and(|deadline| Instant::now() >= deadline) {
+                break;
+            }
             let mut end = start + 1;
             while end < order.len()
                 && self.servers[order[end]].policy_id == self.servers[order[start]].policy_id
@@ -784,7 +797,17 @@ impl Resolver {
                 }) {
                     if nested {
                         while results[start..end].iter().any(Option::is_none) {
-                            let Ok((late, result)) = receiver.recv() else {
+                            let received = match system_deadline() {
+                                Some(deadline) => receiver.recv_timeout(
+                                    deadline
+                                        .saturating_duration_since(Instant::now())
+                                        .max(Duration::from_millis(1)),
+                                ),
+                                None => receiver
+                                    .recv()
+                                    .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+                            };
+                            let Ok((late, result)) = received else {
                                 break;
                             };
                             results[late] = Some(result);
@@ -797,7 +820,17 @@ impl Resolver {
                 if results[start..end].iter().all(Option::is_some) {
                     break;
                 }
-                let Ok((slot, result)) = receiver.recv() else {
+                let received = match system_deadline() {
+                    Some(deadline) => receiver.recv_timeout(
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .max(Duration::from_millis(1)),
+                    ),
+                    None => receiver
+                        .recv()
+                        .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+                };
+                let Ok((slot, result)) = received else {
                     break;
                 };
                 results[slot] = Some(result);
@@ -821,6 +854,26 @@ impl Resolver {
         })
     }
 
+    fn cached(&self, index: usize, name: &str, v4: bool, v6: bool) -> bool {
+        let server = &self.servers[index];
+        if server.cache.disable {
+            return false;
+        }
+        let Ok(held) = self.cache[index].lock() else {
+            return false;
+        };
+        let Some(entry) = held.get(name) else {
+            return false;
+        };
+        let now = Instant::now();
+        let live = |family: Family| {
+            family
+                .cached(entry)
+                .is_some_and(|record| record.expires > now)
+        };
+        (!v4 || !server.v4 || live(Family::A)) && (!v6 || !server.v6 || live(Family::Aaaa))
+    }
+
     #[allow(clippy::fn_params_excessive_bools)]
     fn query_server(
         &self,
@@ -830,7 +883,7 @@ impl Resolver {
         v6: bool,
         fake_enabled: bool,
         force_local: bool,
-        target: Option<SocketAddr>,
+        target: Result<Option<SocketAddr>, ()>,
     ) -> Lookup {
         let server = &self.servers[index];
         if server.transport == Transport::Fake && !fake_enabled {
@@ -934,7 +987,7 @@ impl Resolver {
         name: &str,
         family: Family,
         force_local: bool,
-        target: Option<SocketAddr>,
+        target: Result<Option<SocketAddr>, ()>,
     ) -> Lookup {
         let server = &self.servers[index];
         if server.transport == Transport::Fake {
@@ -1003,7 +1056,7 @@ impl Resolver {
         name: &str,
         family: Family,
         force_local: bool,
-        target: Option<SocketAddr>,
+        target: Result<Option<SocketAddr>, ()>,
     ) -> Lookup {
         let server = &self.servers[index];
         if server.transport == Transport::Local {
@@ -1041,8 +1094,8 @@ impl Resolver {
         };
         let response = match &server.transport {
             Transport::Udp => {
-                let routed = if let Some(target) = target {
-                    match crate::proxy::dns_udp_target(
+                let routed = match target {
+                    Ok(Some(target)) => match crate::proxy::dns_udp_target(
                         target,
                         server.tag.as_deref(),
                         &query,
@@ -1051,9 +1104,8 @@ impl Resolver {
                         Ok(Some(answer)) => Ok(answer),
                         Ok(None) => crate::dnsnet::udp_target(target, &query, timeout),
                         Err(error) => Err(error),
-                    }
-                } else {
-                    crate::dnsnet::udp(
+                    },
+                    Ok(None) => crate::dnsnet::udp(
                         &endpoint.host,
                         endpoint.port,
                         &query,
@@ -1061,7 +1113,8 @@ impl Resolver {
                         None,
                         timeout,
                         server.local_dial || force_local,
-                    )
+                    ),
+                    Err(()) => Err("dns endpoint lookup failed".to_owned()),
                 };
                 let Ok(answer) = routed else {
                     return Lookup::Failed;

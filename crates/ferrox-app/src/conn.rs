@@ -3842,12 +3842,7 @@ fn connect_cancellable(
     let result = (|| {
         let connected = match socket.connect(address) {
             Ok(()) => true,
-            Err(error)
-                if error.kind() == io::ErrorKind::WouldBlock
-                    || error.raw_os_error() == Some(libc::EINPROGRESS) =>
-            {
-                false
-            }
+            Err(error) if error.raw_os_error() == Some(libc::EINPROGRESS) => false,
             Err(error) => return Err(error),
         };
         if !connected {

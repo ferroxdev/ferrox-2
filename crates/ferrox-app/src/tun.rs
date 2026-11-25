@@ -35,6 +35,9 @@ struct InheritedOwner;
 #[cfg(unix)]
 impl InheritedOwner {
     fn acquire() -> Option<Self> {
+        if inherited_fd().is_some_and(explicit_live) {
+            return None;
+        }
         if INHERITED_LIVE.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 0 {
             Some(Self)
         } else {
@@ -70,6 +73,12 @@ impl ExplicitOwner {
         let mut live = EXPLICIT_LIVE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inherited_live() && inherited_fd() == Some(fd) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "this descriptor already belongs to a live TUN inbound",
+            ));
+        }
         if !live
             .get_or_insert_with(std::collections::HashSet::new)
             .insert(fd)
@@ -81,6 +90,15 @@ impl ExplicitOwner {
         }
         Ok(Self { fd })
     }
+}
+
+#[cfg(unix)]
+fn explicit_live(fd: RawFd) -> bool {
+    EXPLICIT_LIVE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .is_some_and(|live| live.contains(&fd))
 }
 
 #[cfg(unix)]
@@ -907,15 +925,18 @@ impl Handle {
         match self {
             #[cfg(unix)]
             Self::File(file) => {
+                let Some(stop) = stop else {
+                    return file.write(buf);
+                };
                 loop {
-                    if stop.is_some_and(|flag| flag.load(Relaxed)) {
+                    if stop.load(Relaxed) {
                         return Err(io::Error::new(
                             io::ErrorKind::Interrupted,
                             "the tun inbound stopped",
                         ));
                     }
                     if wait_writable_fd(file.as_raw_fd(), std::time::Duration::from_millis(200))? {
-                        if stop.is_some_and(|flag| flag.load(Relaxed)) {
+                        if stop.load(Relaxed) {
                             return Err(io::Error::new(
                                 io::ErrorKind::Interrupted,
                                 "the tun inbound stopped",
@@ -2805,9 +2826,9 @@ impl Handler {
         } else {
             self.poll_datagram_lane();
             match self.leg_lane() {
-                Lane::Hold => return Ok(()),
+                Lane::Hold if render.is_none() => return Ok(()),
+                Lane::Hold | Lane::Front => (None, true),
                 Lane::Direct(relay) => (Some(relay), true),
-                Lane::Front => (None, true),
             }
         };
         let (id, leg) = loop {
@@ -2823,9 +2844,9 @@ impl Handler {
                         drop(table);
                         self.poll_datagram_lane();
                         match self.leg_lane() {
-                            Lane::Hold => return Ok(()),
+                            Lane::Hold if render.is_none() => return Ok(()),
+                            Lane::Hold | Lane::Front => direct_relay = None,
                             Lane::Direct(relay) => direct_relay = Some(relay),
-                            Lane::Front => direct_relay = None,
                         }
                         selected = true;
                         continue;
@@ -3703,7 +3724,7 @@ fn refuse_flow(
 fn open_leg(
     device: &Device,
     relay: SocketAddr,
-    render: Option<(IpAddr, u16)>,
+    shown: Option<(IpAddr, u16)>,
     expected: Option<(IpAddr, u16)>,
     client: (IpAddr, u16),
     idle: std::time::Duration,
@@ -3720,7 +3741,7 @@ fn open_leg(
     let mtu = device.mtu;
     let ended = ended.clone();
     let (client_bytes, client_len) = addr_octets(client.0);
-    let render = render.map(|(ip, port)| SocketAddr::new(ip, port));
+    let shown = shown.map(|(ip, port)| SocketAddr::new(ip, port));
     let expected = expected.map(|(ip, port)| SocketAddr::new(ip, port));
     let stop = Arc::clone(stop);
     let worker = std::thread::spawn(move || {
@@ -3792,7 +3813,7 @@ fn open_leg(
                 continue;
             }
             let Some((endpoint, source_port)) =
-                render.or(source).map(|addr| (addr.ip(), addr.port()))
+                shown.or(source).map(|addr| (addr.ip(), addr.port()))
             else {
                 continue;
             };

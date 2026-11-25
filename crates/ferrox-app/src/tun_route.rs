@@ -1186,11 +1186,9 @@ fn keep_edges_for(
         if let Some(base) = best_covering(routes, destination, captures) {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             if base.kind() != RouteKind::Unicast {
-                let mut route = Route::new(destination, prefix).with_kind(base.kind());
+                let route = Route::new(destination, prefix).with_kind(base.kind());
                 #[cfg(target_os = "linux")]
-                {
-                    route = route.with_table(base.table());
-                }
+                let route = route.with_table(base.table());
                 edges.push(route);
                 return Ok(());
             }
@@ -1290,6 +1288,7 @@ fn defer_delete(manager: &mut RouteManager, route: &Route) {
             if let Ok(mut pending) = pending_deletes().lock() {
                 pending.push(route.clone());
             }
+            schedule_retry();
         }
     }
 }
@@ -1370,38 +1369,47 @@ fn schedule_retry() {
     if RETRY.swap(true, std::sync::atomic::Ordering::AcqRel) {
         return;
     }
-    let _ = std::thread::Builder::new()
-        .name("ferrox-route-cleanup".to_owned())
-        .spawn(|| loop {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            let empty = pending_deletes()
-                .lock()
-                .is_ok_and(|pending| pending.is_empty())
-                && pending_pinned()
-                    .lock()
-                    .is_ok_and(|pending| pending.is_empty());
-            if empty {
-                RETRY.store(false, std::sync::atomic::Ordering::Release);
-                let still_empty = pending_deletes()
+    for attempt in 0..3 {
+        let result = std::thread::Builder::new()
+            .name("ferrox-route-cleanup".to_owned())
+            .spawn(|| loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let empty = pending_deletes()
                     .lock()
                     .is_ok_and(|pending| pending.is_empty())
                     && pending_pinned()
                         .lock()
                         .is_ok_and(|pending| pending.is_empty());
-                if still_empty {
-                    return;
+                if empty {
+                    RETRY.store(false, std::sync::atomic::Ordering::Release);
+                    let still_empty = pending_deletes()
+                        .lock()
+                        .is_ok_and(|pending| pending.is_empty())
+                        && pending_pinned()
+                            .lock()
+                            .is_ok_and(|pending| pending.is_empty());
+                    if still_empty {
+                        return;
+                    }
+                    if RETRY.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                        return;
+                    }
                 }
-                if RETRY.swap(true, std::sync::atomic::Ordering::AcqRel) {
-                    return;
-                }
-            }
-            let _routes = route_write();
-            let _operation = route_operation();
-            let Ok(mut manager) = RouteManager::new() else {
-                continue;
-            };
-            retry_pending(&mut manager);
-        });
+                let _routes = route_write();
+                let _operation = route_operation();
+                let Ok(mut manager) = RouteManager::new() else {
+                    continue;
+                };
+                retry_pending(&mut manager);
+            });
+        if result.is_ok() {
+            return;
+        }
+        RETRY.store(false, std::sync::atomic::Ordering::Release);
+        if attempt < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
