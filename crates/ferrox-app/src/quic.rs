@@ -2260,7 +2260,7 @@ fn clear_gro(sock: &UdpSocket) {
 /// loss the lane pays for in retransmit timers rather than in packets. The send side is the same number for the
 /// mirror reason: quiche hands the socket a burst of a window's worth of datagrams and a `send_to` the kernel
 /// cannot queue is a datagram quiche has already counted as sent.
-const DATAGRAM_BUFFER: i32 = 1 << 20;
+const DATAGRAM_BUFFER: i32 = 8 << 20;
 
 /// The least the ask has to land as for the lane to be worth reading back: a Linux default already clears it, a macOS and a Windows default do not, which is where the arm is observable.
 #[cfg(test)]
@@ -3337,15 +3337,6 @@ impl Datagram {
     #[cfg(target_os = "linux")]
     pub(crate) fn gso(&self) -> bool {
         self.gso
-    }
-
-    /// Keep the kernel from coalescing reads under a reader that takes one datagram per `recv_from`.
-    pub(crate) fn with_gro(mut self, gro: bool) -> Self {
-        if !gro {
-            clear_gro(&self.sock);
-        }
-        self.gro = gro;
-        self
     }
 
     /// Stop coalescing writes when the config names `disableGSO`; a lane that no longer takes the
