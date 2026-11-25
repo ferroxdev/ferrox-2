@@ -139,11 +139,6 @@ const DGRAM_SEND_QUEUE: usize = QUEUE;
 const MASQUE_BUFFER: i32 = 4 << 20;
 /// The server's own connection ID: a short header carries no length, so the demultiplexer reads exactly this many bytes.
 const CID_LEN: usize = 16;
-const QUIC_V2_VERSION: u32 = 0x6b33_43cf;
-const QUIC_V2_BAIT_LEN: usize = 1200;
-const QUIC_V2_BAIT_WAIT: Duration = Duration::from_millis(600);
-const QUIC_V2_VERIFY_WAIT: Duration = Duration::from_millis(500);
-const QUIC_V2_BAIT_TRIES: usize = 2;
 pub(crate) const AUTH_REALM: &str = "Basic realm=\"masque\", charset=\"UTF-8\"";
 const H3_SETTINGS: u64 = 0x04;
 const SETTINGS_H3_DATAGRAM: u64 = 0x33;
@@ -1993,56 +1988,6 @@ fn stage_private(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|error| format!("masque warp staging: {error}"))
 }
 
-fn quic_varint2(value: u64) -> [u8; 2] {
-    (((value & 0x3fff) as u16) | 0x4000).to_be_bytes()
-}
-
-fn build_version_bait() -> [u8; QUIC_V2_BAIT_LEN] {
-    let mut dcid = [0u8; 8];
-    let mut scid = [0u8; 8];
-    let mut packet_number = [0u8; 4];
-    let _ = getrandom::fill(&mut dcid);
-    let _ = getrandom::fill(&mut scid);
-    let _ = getrandom::fill(&mut packet_number);
-
-    let mut bait = [0u8; QUIC_V2_BAIT_LEN];
-    let mut at = 0;
-    bait[at] = 0xc3;
-    at += 1;
-    bait[at..at + 4].copy_from_slice(&QUIC_V2_VERSION.to_be_bytes());
-    at += 4;
-    bait[at] = dcid.len() as u8;
-    at += 1;
-    bait[at..at + dcid.len()].copy_from_slice(&dcid);
-    at += dcid.len();
-    bait[at] = scid.len() as u8;
-    at += 1;
-    bait[at..at + scid.len()].copy_from_slice(&scid);
-    at += scid.len();
-    bait[at] = 0;
-    at += 1;
-    let remaining = QUIC_V2_BAIT_LEN - at - 2;
-    bait[at..at + 2].copy_from_slice(&quic_varint2(remaining as u64));
-    at += 2;
-    bait[at..at + packet_number.len()].copy_from_slice(&packet_number);
-    bait
-}
-
-fn send_version_bait(sock: &Datagram, peer: SocketAddr, wait: Duration, tries: usize) {
-    let bait = build_version_bait();
-    let mut answer = [0u8; 2048];
-    for _ in 0..tries.max(1) {
-        if sock.send_to(&bait, peer).is_err() {
-            return;
-        }
-        let _ = sock.set_read_timeout(Some(wait));
-        match sock.recv_from(&mut answer) {
-            Err(error) if crate::proxy::is_timeout(&error) => {}
-            _ => return,
-        }
-    }
-}
-
 fn establish(
     spec: &ClientSpec,
     sock: &Datagram,
@@ -2071,11 +2016,11 @@ fn attempt(
     let cid = quiche::ConnectionId::from_ref(&scid);
     if spec.quic_v2 {
         let (wait, tries) = if probe {
-            (QUIC_V2_VERIFY_WAIT, 1)
+            (quic::QUIC_V2_VERIFY_WAIT, 1)
         } else {
-            (QUIC_V2_BAIT_WAIT, QUIC_V2_BAIT_TRIES)
+            (quic::QUIC_V2_BAIT_WAIT, quic::QUIC_V2_BAIT_TRIES)
         };
-        send_version_bait(sock, peer, wait, tries);
+        quic::send_version_bait(sock, peer, wait, tries);
     }
     spec.noize.send_before(|packet| {
         let _ = sock.send_to(packet, peer);
@@ -4869,8 +4814,8 @@ mod tests {
 
     #[test]
     fn the_bait_is_a_v2_versioned_long_header_of_the_minimum_size() {
-        let bait = build_version_bait();
-        assert_eq!(bait.len(), QUIC_V2_BAIT_LEN);
+        let bait = crate::quic::build_version_bait();
+        assert_eq!(bait.len(), crate::quic::QUIC_V2_BAIT_LEN);
         assert_eq!(bait[0], 0xc3);
         assert_eq!(
             u32::from_be_bytes([bait[1], bait[2], bait[3], bait[4]]),
@@ -4880,7 +4825,10 @@ mod tests {
         assert_eq!(bait[14], 8);
         let length = u16::from_be_bytes([bait[24], bait[25]]);
         assert_eq!(length & 0xc000, 0x4000);
-        assert_eq!(usize::from(length & 0x3fff), QUIC_V2_BAIT_LEN - 26);
+        assert_eq!(
+            usize::from(length & 0x3fff),
+            crate::quic::QUIC_V2_BAIT_LEN - 26
+        );
         assert!(bait[30..].iter().all(|byte| *byte == 0));
     }
 
@@ -4897,8 +4845,8 @@ mod tests {
 
     #[test]
     fn two_baits_do_not_share_connection_ids() {
-        let first = build_version_bait();
-        let second = build_version_bait();
+        let first = crate::quic::build_version_bait();
+        let second = crate::quic::build_version_bait();
         assert_ne!(first[6..14], second[6..14]);
         assert_ne!(first[15..23], second[15..23]);
     }
@@ -4910,7 +4858,7 @@ mod tests {
         let responder = std::thread::spawn(move || {
             let mut bait = [0u8; 2048];
             let (read, from) = server.recv_from(&mut bait).expect("the bait");
-            assert_eq!(read, QUIC_V2_BAIT_LEN);
+            assert_eq!(read, crate::quic::QUIC_V2_BAIT_LEN);
             assert_eq!(
                 u32::from_be_bytes([bait[1], bait[2], bait[3], bait[4]]),
                 0x6b33_43cf
@@ -4928,7 +4876,7 @@ mod tests {
                 .expect("the version negotiation");
         });
         let client = Datagram::plain(UdpSocket::bind("127.0.0.1:0").expect("the client"));
-        send_version_bait(&client, address, Duration::from_secs(2), 1);
+        crate::quic::send_version_bait(&client, address, Duration::from_secs(2), 1);
         responder.join().expect("the responder");
         let _ = client.set_read_timeout(Some(Duration::from_millis(50)));
         assert!(

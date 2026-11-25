@@ -17613,6 +17613,7 @@ fn vmess_quic_dial(vmess: &VmessOut) -> crate::quic::QuicDial {
         roots: vmess.quic_roots.clone(),
         ech_config_list: vmess.quic_ech.clone(),
         default_cc: None,
+        quic_v2: false,
     }
 }
 
@@ -21384,6 +21385,7 @@ fn vless_quic_dial(vless: &VlessOut) -> crate::quic::QuicDial {
         roots: vless.quic_roots.clone(),
         ech_config_list: vless.quic_ech.clone(),
         default_cc: None,
+        quic_v2: false,
     }
 }
 
@@ -22290,6 +22292,7 @@ fn trojan_quic_dial(trojan: &TrojanOut) -> crate::quic::QuicDial {
         roots: trojan.quic_roots.clone(),
         ech_config_list: trojan.quic_ech.clone(),
         default_cc: None,
+        quic_v2: false,
     }
 }
 
@@ -36373,6 +36376,7 @@ fn foxy_quic_dial(foxy: &FoxyOut, edge: &ferrox_core::foxy::Candidate) -> crate:
         roots: Some(foxy.roots.clone()),
         ech_config_list: None,
         default_cc: Some(ferrox_core::hysteria::Congestion::Bbr),
+        quic_v2: true,
     }
 }
 
@@ -68140,6 +68144,13 @@ mod tests {
         foxy
     }
 
+    /// The Foxy h3 dial is the one that primes v2, so the opener reaches the lane that needs it and no other QUIC wire gains a packet.
+    #[test]
+    fn the_foxy_quic_dial_primes_v2() {
+        let foxy = foxy_with_one_edge();
+        assert!(foxy_quic_dial(&foxy, &foxy.ladder[0]).quic_v2);
+    }
+
     /// `auto` chooses per flow kind, so the lane keeps the last rung each kind opened for `status` to print.
     #[test]
     fn the_lane_remembers_the_carrier_each_flow_kind_opened() {
@@ -76046,6 +76057,7 @@ mod tests {
             roots: Some(roots.into()),
             ech_config_list: None,
             default_cc: None,
+            quic_v2: false,
         };
         let relay = thread::spawn({
             let dial = dial.clone();
@@ -76141,6 +76153,7 @@ mod tests {
             roots: Some(roots.into()),
             ech_config_list: None,
             default_cc: None,
+            quic_v2: false,
         };
         let front = Arc::new(crate::conn::test_bind("127.0.0.1:0").expect("binds"));
         let front_port = front.local_addr().expect("addr").port();
