@@ -1624,7 +1624,11 @@ fn drive_uploads(weak: &std::sync::Weak<Lane>, uploads: Receiver<UploadStream>) 
         for stream in finished.drain(..) {
             stream.finish.done();
         }
-        thread::sleep(CLIENT_POLL);
+        if entries.is_empty() {
+            thread::sleep(CLIENT_POLL);
+        } else {
+            thread::yield_now();
+        }
     }
     for stream in entries.drain(..) {
         stream.finish.done();
