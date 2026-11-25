@@ -29664,7 +29664,11 @@ fn open_direct_datagram(
     if stop.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
         return None;
     }
-    let server = resolve_outbound_stopping(&socks.address, socks.port, stop.map(|s| s.as_ref()))?;
+    let server = resolve_outbound_stopping(
+        &socks.address,
+        socks.port,
+        stop.map(std::convert::AsRef::as_ref),
+    )?;
     let stream = dial_or_report(&server)?;
     let _ = stream.set_read_timeout(Some(budgets::handshake()));
     let _ = stream.set_write_timeout(Some(budgets::handshake()));
