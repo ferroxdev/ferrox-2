@@ -22,7 +22,7 @@ const HEARTBEAT: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(100);
 /// A client driver's idle arm: a local read or stream write is retried within this beat without a packet.
 const CLIENT_POLL: Duration = Duration::from_millis(1);
-const DIRECT_BUFFER: usize = 256 * 1024;
+const DIRECT_BUFFER: usize = 1024 * 1024;
 const UDP_IDLE: Duration = Duration::from_secs(300);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
 const CONNECT_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
