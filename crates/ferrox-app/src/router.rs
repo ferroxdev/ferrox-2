@@ -174,18 +174,6 @@ fn candidate_asset_referent(path: &Path) -> Option<PathBuf> {
     })
 }
 
-/// The entry a swap replaces: the real path with a final-component symlink resolved, so an alias spelling and the refreshed spelling name the same staged file; an entry not yet on disk keeps its real parent.
-pub(crate) fn asset_key(path: &Path) -> Option<PathBuf> {
-    if let Ok(real) = std::fs::canonicalize(path) {
-        return Some(real);
-    }
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty());
-    let parent = std::fs::canonicalize(parent.unwrap_or_else(|| Path::new("."))).ok()?;
-    Some(parent.join(path.file_name()?))
-}
-
 /// The directory entry a path names, with the parent canonicalized but the final name kept: a directory symlink is the same entry, a final-component symlink is not.
 pub(crate) fn entry_key(path: &Path) -> Option<PathBuf> {
     let parent = path
@@ -363,29 +351,6 @@ fn referent_matches(path: &Path, queued: &Path) -> bool {
         };
     }
     false
-}
-
-/// Walk a final-component symlink chain by its link text, so a referent a queued write has not created yet still resolves.
-fn resolve_link_target(path: &Path) -> Option<PathBuf> {
-    let mut current = path.to_path_buf();
-    for _ in 0..32 {
-        let Ok(meta) = std::fs::symlink_metadata(&current) else {
-            return Some(current);
-        };
-        if !meta.file_type().is_symlink() {
-            return Some(current);
-        }
-        let target = std::fs::read_link(&current).ok()?;
-        current = if target.is_absolute() {
-            target
-        } else {
-            current
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(target)
-        };
-    }
-    None
 }
 
 fn candidate_cache_bytes(path: &Path) -> Option<Result<Vec<u8>, String>> {

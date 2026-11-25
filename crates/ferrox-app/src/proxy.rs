@@ -29624,6 +29624,7 @@ impl Datagram {
     }
 
     /// Open the direct lane for the association the live rules pick now.
+    #[cfg(test)]
     pub(crate) fn open(&self) -> Option<DirectDatagram> {
         (self.open)(None)
     }

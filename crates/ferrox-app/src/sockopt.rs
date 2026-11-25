@@ -754,17 +754,6 @@ pub(crate) fn connect(
     Ok(TcpStream::from(socket))
 }
 
-/// Bind a UDP DNS socket with the ECH socket settings applied before the query is sent.
-pub(crate) fn datagram(
-    options: Option<&SocketOptions>,
-    host: &str,
-    port: u16,
-    timeout: Duration,
-) -> Result<UdpSocket, String> {
-    let addr = resolve_datagram(options, host, port)?;
-    datagram_at(options, addr, timeout)
-}
-
 pub(crate) fn resolve_datagram(
     options: Option<&SocketOptions>,
     host: &str,
