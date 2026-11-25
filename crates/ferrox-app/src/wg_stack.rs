@@ -3868,13 +3868,14 @@ mod tests {
         };
         let (to_tunnel, packets) = std::sync::mpsc::channel();
         let mut stack = ClientStack::new(&config, to_tunnel, 0);
+        let (ready, _wait) = std::sync::mpsc::sync_channel(1);
         stack
             .connect(ClientFlow {
                 client: proxy,
                 destinations: vec!["192.0.2.1:80".parse().expect("destination")],
                 prefix: Vec::new(),
                 lease: None,
-                ready: None,
+                ready: Some(ready),
                 cancelled: None,
             })
             .expect("connect");
@@ -3972,13 +3973,14 @@ mod tests {
         let (_app, proxy) = loopback().expect("pair");
         let (to_tunnel, _packets) = std::sync::mpsc::channel();
         let mut stack = ClientStack::new(&device(&["10.0.0.2"], true), to_tunnel, 0);
+        let (ready, _wait) = std::sync::mpsc::sync_channel(1);
         stack
             .connect(ClientFlow {
                 client: proxy,
                 destinations: vec!["192.0.2.1:80".parse().expect("destination")],
                 prefix: Vec::new(),
                 lease: None,
-                ready: None,
+                ready: Some(ready),
                 cancelled: None,
             })
             .expect("connect");
