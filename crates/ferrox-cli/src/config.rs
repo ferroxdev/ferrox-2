@@ -2,7 +2,7 @@
 //! share link, an account and a verbatim file all reach the engine the same way.
 
 use std::net::TcpListener;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Map, Value};
 
@@ -346,6 +346,7 @@ pub fn build_outbound(
         Some(Outbound::Foxy) => foxy_outbound(options, paths, account),
         Some(Outbound::Veepn) => veepn_outbound(options, paths),
         Some(Outbound::Psiphon) => psiphon_outbound(options, paths, false),
+        Some(Outbound::Warp) => Ok(warp_outbound(options, paths)),
         Some(Outbound::Vless) => vless_outbound(&options.vless),
         Some(Outbound::Vmess) => vmess_outbound(options),
         Some(Outbound::Trojan) => trojan_outbound(options),
@@ -425,20 +426,29 @@ pub fn lane_plan(options: &mut Options, paths: &Paths) -> Result<Generated, Stri
     Ok(generated)
 }
 
-fn warp_outbound(options: &Options, paths: &Paths) -> Value {
-    let identity = if options.warp_identity.is_empty() {
-        paths.warp_identity.to_string_lossy().into_owned()
+pub fn warp_identity_path(options: &Options, paths: &Paths) -> PathBuf {
+    if options.warp_identity.is_empty() {
+        return paths.warp_identity.clone();
+    }
+    let path = PathBuf::from(&options.warp_identity);
+    if path.is_absolute() {
+        path
     } else {
-        options.warp_identity.clone()
-    };
-    json!({
-        "protocol": "warp",
-        "settings": {
-            "identityFile": identity,
-            "register": true,
-            "mode": options.warp_mode,
-        },
-    })
+        std::env::current_dir().map_or(path.clone(), |dir| dir.join(path))
+    }
+}
+
+fn warp_outbound(options: &Options, paths: &Paths) -> Value {
+    let identity = warp_identity_path(options, paths);
+    let mut settings = json!({
+        "identityFile": identity.to_string_lossy(),
+        "register": true,
+        "mode": options.warp_mode,
+    });
+    if options.warp_mode == "gool-classic" {
+        settings["scan"] = json!("balanced");
+    }
+    json!({"protocol": "warp", "settings": settings})
 }
 
 fn free_loopback_port() -> Result<u16, String> {
@@ -1693,6 +1703,56 @@ mod tests {
             config_fronts(paths.cfg.to_str().unwrap(), false, false, "").unwrap(),
             "socks"
         );
+    }
+
+    #[test]
+    fn the_warp_lane_builds_every_mode_and_scans_nested_wireguard() {
+        let dir = scratch("warp-lane");
+        let paths = Paths::with_dirs(dir.clone(), dir.join("state"), None);
+        for mode in ["auto", "wireguard", "masque", "gool", "gool-classic", "mim"] {
+            let mut options = options();
+            options.outbound = Some(Outbound::Warp);
+            options.warp_mode = mode.to_owned();
+            let outbound = build_outbound(&options, &paths, None).unwrap();
+            assert_eq!(outbound["protocol"], "warp");
+            assert_eq!(outbound["settings"]["mode"], mode);
+            assert_eq!(outbound["settings"]["register"], true);
+            if mode == "gool-classic" {
+                assert_eq!(outbound["settings"]["scan"], "balanced");
+            } else {
+                assert!(outbound["settings"].get("scan").is_none());
+            }
+        }
+        let mut options = options();
+        options.outbound = Some(Outbound::Warp);
+        options.warp_identity = "custom/identity.json".to_owned();
+        let outbound = build_outbound(&options, &paths, None).unwrap();
+        let identity = outbound["settings"]["identityFile"]
+            .as_str()
+            .expect("an identity path");
+        assert!(std::path::Path::new(identity).is_absolute());
+        assert!(identity.ends_with("custom/identity.json"));
+    }
+
+    #[test]
+    fn warp_lane_with_tun_puts_the_device_first_and_dials_the_warp_outbound() {
+        let dir = scratch("warp-tun");
+        let paths = Paths::with_dirs(dir.clone(), dir.join("state"), None);
+        let mut options = options();
+        options.outbound = Some(Outbound::Warp);
+        let outbound = build_outbound(&options, &paths, None).unwrap();
+        let ports = Ports {
+            socks: 1,
+            http: 2,
+            mixed: 3,
+        };
+        let vpn = Vpn::from_options(&options);
+        write_config(&paths.cfg, &outbound, "socks", ports, Some(&vpn), None).unwrap();
+        let document: Value =
+            serde_json::from_str(&std::fs::read_to_string(&paths.cfg).unwrap()).unwrap();
+        assert_eq!(document["inbounds"][0]["protocol"], "tun");
+        assert_eq!(document["outbounds"][0]["protocol"], "warp");
+        assert_eq!(document["outbounds"][0]["settings"]["mode"], "auto");
     }
 
     #[test]

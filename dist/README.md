@@ -65,6 +65,9 @@ Pick an exit before connecting — the catalogue is public, so this needs no acc
 ./ferrox-cli.sh location --veepn nl # remember a VeePN region
 ./ferrox-cli.sh location --psiphon US
 ./ferrox-cli.sh up --foxy --exclude-ports 22 --exclude-domains printer.lan   # these leave the tunnel
+./ferrox-cli.sh up --warp                       # the WARP (Aether) lane by itself
+./ferrox-cli.sh up --warp --warp-mode gool-classic   # WARP in WARP
+./ferrox-cli.sh up --warp --vpn                 # whole-device capture through WARP
 ./ferrox-cli.sh up --foxy --udp-via warp        # TCP on foxy, UDP on the WARP outbound
 ./ferrox-cli.sh up --foxy --vpn --warp          # TUN capture pinned to the WARP edge
 ./ferrox-cli.sh up --psiphon --warp             # the native Psiphon lane through WARP

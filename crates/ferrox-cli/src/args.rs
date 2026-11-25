@@ -25,6 +25,7 @@ pub enum Outbound {
     Foxy,
     Veepn,
     Psiphon,
+    Warp,
     Vless,
     Vmess,
     Trojan,
@@ -348,8 +349,12 @@ fn vpn_dns(value: &str) -> String {
 /// The WARP carrier modes the app serves, with the aliases its own reader accepts.
 fn warp_mode(value: &str) -> String {
     match value {
-        "auto" | "wireguard" | "wg" | "masque" | "gool" | "wg-over-masque" | "gool-classic"
-        | "wiw" | "warp-in-warp" | "mim" | "masque-in-masque" => value,
+        "auto" => "auto",
+        "wireguard" | "wg" => "wireguard",
+        "masque" => "masque",
+        "gool" | "wg-over-masque" => "gool",
+        "gool-classic" | "wiw" | "warp-in-warp" => "gool-classic",
+        "mim" | "masque-in-masque" => "mim",
         _ => die(&format!(
             "--warp-mode wants auto, wireguard, masque, gool (wg-over-masque), gool-classic (warp-in-warp) or mim (masque-in-masque), got '{value}'; nothing was started."
         )),
@@ -1032,6 +1037,12 @@ pub fn parse() -> Options {
         }
     }
 
+    if options.warp
+        && options.outbound.is_none()
+        && matches!(options.action, Action::Up | Action::Serve)
+    {
+        options.outbound = Some(Outbound::Warp);
+    }
     if options.ping && options.action != Action::Locations {
         die("--ping belongs to 'locations' (ferrox-cli locations --ping); nothing was started.");
     }
@@ -1105,8 +1116,16 @@ pub fn parse() -> Options {
             options.psiphon.dns_alternate = "1.1.1.1,1.0.0.1,8.8.8.8,8.8.4.4".to_owned();
         }
     }
-    if options.warp && !matches!(options.outbound, Some(Outbound::Foxy | Outbound::Psiphon)) {
-        die("--warp chains the foxy or psiphon lane through WARP (up --foxy --warp, up --psiphon --warp); nothing was started.");
+    if options.warp
+        && !matches!(
+            options.outbound,
+            Some(Outbound::Foxy | Outbound::Psiphon | Outbound::Warp)
+        )
+    {
+        die("--warp starts the WARP lane by itself, or chains foxy or psiphon through it (up --warp, up --foxy --warp, up --psiphon --warp); nothing was started.");
+    }
+    if options.outbound == Some(Outbound::Warp) && !options.upstream.is_empty() {
+        die("the WARP lane dials Cloudflare directly; --upstream belongs to the foxy or psiphon lane; nothing was started.");
     }
     if !options.udp_via.is_empty()
         && options.udp_via != "foxy"
@@ -1180,6 +1199,8 @@ outbound (choose one)
   --veepn                VeePN lane; anonymous, no account and no server
   --psiphon              native OSSH/SSH lane; no account and no client binary
   --psiphon-cdn          the same lane with CDN fronting and beast mode
+  --warp                 the WARP (Aether) lane by itself; with --foxy or
+                         --psiphon it chains that carrier through WARP
   --vless LINK           a vless:// share link (tcp, ws, grpc, httpupgrade, xhttp)
   --vmess HOST:PORT --uuid ID
   --trojan HOST:PORT --password PW
@@ -1196,10 +1217,6 @@ foxy options
   --carrier NAME         auto|h1|h2|h3, default auto
   --fxa-user-agent UA    override the pinned desktop Firefox identity for FxA
   --upstream URL         http:// or socks5(h):// hop to reach the edge through
-  --warp                 chain the foxy or psiphon carrier through Cloudflare WARP
-  --warp-mode MODE       auto (default), wireguard, masque, gool (wg-over-masque),
-                         gool-classic (warp-in-warp) or mim (masque-in-masque)
-  --warp-identity FILE   the WARP device identity to reuse (default beside the lane)
   --udp-via LANE         foxy (default), warp, psiphon, psiphon-cdn, direct or
                          block; datagrams take a second outbound while TCP stays
                          on foxy
@@ -1238,6 +1255,13 @@ psiphon options (nothing is required: the signed list names the servers)
   --psiphon-network-id ID / --psiphon-additional-params B64 / --psiphon-emit-bytes
   --psiphon-bin FILE     a psiphon-tunnel-core path, if one is used
   --psiphon-exchange-key KEY / --psiphon-conduit-timeout SECS
+
+warp options (the lane alone, or chained with foxy or psiphon)
+  --warp                 the WARP (Aether) lane by itself, or with --foxy or
+                         --psiphon chains that carrier through WARP first
+  --warp-mode MODE       auto (default), wireguard, masque, gool (wg-over-masque),
+                         gool-classic (WARP in WARP) or mim (MASQUE in MASQUE)
+  --warp-identity FILE   the WARP device identity to reuse (default beside the lane)
 
 fronts
   --fronts LIST          socks,http,mixed (default all three)

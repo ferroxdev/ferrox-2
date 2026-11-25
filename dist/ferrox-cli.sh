@@ -322,6 +322,8 @@ outbound (choose one)
   --veepn                VeePN lane; anonymous, no account and no server
   --psiphon              Psiphon lane; native OSSH/SSH, no client binary
   --psiphon-cdn          the same lane with CDN fronting + beast mode requested
+  --warp                 the WARP (Aether) lane by itself; with --foxy or
+                         --psiphon it chains that carrier through WARP
   --vless LINK           any vless:// share link
   --vmess LINK|HOST:PORT any vmess:// share link, or HOST:PORT with --uuid ID
   --trojan HOST:PORT --password PW
@@ -342,14 +344,6 @@ foxy options (email + password is the whole setup; there is no server to name)
                          h2 and h1 when the path drops QUIC
   --fxa-user-agent UA    override the pinned desktop Firefox identity for FxA
   --upstream URL         http:// or socks5(h):// hop to reach the edge through
-  --warp                 chain the foxy or psiphon carrier through WARP first:
-                         register once, then egress the account plane, the signed
-                         list and the carrier through it. One process, one config
-  --warp-mode MODE       auto (default), wireguard, masque, gool (WG over
-                         MASQUE), gool-classic (WARP in WARP) or mim (MASQUE in
-                         MASQUE); only with --warp or --udp-via warp
-  --warp-identity FILE   identity JSON; default is the per-lane file under
-                         \$CONF_DIR (only with --warp or --udp-via warp)
   --udp-via LANE         split egress: TCP stays on foxy, datagrams take a second
                          outbound in the same config. LANE is foxy (default),
                          warp, psiphon, psiphon-cdn, direct or block. warp reuses
@@ -408,6 +402,17 @@ psiphon options (native OSSH/SSH transport and the lane's local SOCKS)
   --psiphon-device-*, --psiphon-network-id, --psiphon-additional-params,
   --psiphon-establish-timeout, --psiphon-emit-bytes) are still parsed for script
   compatibility; the native engine names each one as ignored in one line.
+
+warp options (the lane alone, or chained with foxy or psiphon)
+  --warp                 the WARP (Aether) lane by itself, or with --foxy or
+                         --psiphon chains that carrier through WARP first:
+                         register once, then egress the account plane, the signed
+                         list and the carrier through it. One process, one config
+  --warp-mode MODE       auto (default), wireguard, masque, gool (WG over
+                         MASQUE), gool-classic (WARP in WARP) or mim (MASQUE in
+                         MASQUE)
+  --warp-identity FILE   identity JSON; default is the per-lane file under
+                         \$CONF_DIR
 
 veepn options (nothing is required: the plane names the region and its edges)
   --region CC            exit region id (lowercase, e.g. nl, us-va), else the remembered one
@@ -1432,10 +1437,10 @@ warp_outbound() {
   identity="$(resolve_real "$(warp_identity_path)")"
   python3 - "$identity" "$WARP_MODE" <<'PY'
 import json, sys
-print(json.dumps({
-    "protocol": "warp",
-    "settings": {"identityFile": sys.argv[1], "register": True, "mode": sys.argv[2]},
-}))
+settings = {"identityFile": sys.argv[1], "register": True, "mode": sys.argv[2]}
+if sys.argv[2] in ("gool-classic", "wiw", "warp-in-warp"):
+    settings["scan"] = "balanced"
+print(json.dumps({"protocol": "warp", "settings": settings}))
 PY
 }
 
@@ -1465,8 +1470,10 @@ import json, os, sys
 in_config, hidden, mode, identity, udp, tag = sys.argv[1:7]
 outbounds, rules = [], []
 if in_config == "1":
-    outbounds.append({"tag": "warp", "protocol": "warp", "settings": {
-        "identityFile": os.path.abspath(identity), "register": True, "mode": mode}})
+    settings = {"identityFile": os.path.abspath(identity), "register": True, "mode": mode}
+    if mode in ("gool-classic", "wiw", "warp-in-warp"):
+        settings["scan"] = "balanced"
+    outbounds.append({"tag": "warp", "protocol": "warp", "settings": settings})
     rules.append({"type": "field", "inboundTag": ["ferrox-warp-hop"], "outboundTag": "warp"})
 if udp:
     lane = json.loads(udp)
@@ -2674,6 +2681,8 @@ build_outbound() {
 build_config() {
   BUILT_UDP_OUTBOUND=""
   BUILT_UDP_TAG=""
+  WARP_IN_CONFIG=0
+  WARP_HIDDEN_PORT=""
   case "$OUTBOUND" in
     foxy)
       read_credentials
@@ -2735,6 +2744,12 @@ build_config() {
       load_lane_location
       BUILT_OUTBOUND="$(build_outbound veepn)" || exit 1
       save_lane_location
+      ;;
+    warp)
+      if [ -n "$UPSTREAM" ]; then
+        die "the WARP lane dials Cloudflare directly; --upstream belongs to the foxy or psiphon lane; nothing was started."
+      fi
+      BUILT_OUTBOUND="$(build_outbound warp)" || exit 1
       ;;
     psiphon)
       load_lane_location
@@ -2814,6 +2829,26 @@ choose_carrier() {
   esac
 }
 
+# The WARP identity belongs to the invoking user, not root: register it before
+# the TUN app is elevated so a later unprivileged lane can read it.
+prepare_warp_identity() {
+  [ "$WANT_VPN" = 1 ] || return 0
+  [ "$(id -u 2>/dev/null || echo 0)" != 0 ] || return 0
+  local warp_used=0
+  [ "$OUTBOUND" = warp ] && warp_used=1
+  [ "$WARP_IN_CONFIG" = 1 ] && warp_used=1
+  [ "$UDP_VIA" = warp ] && warp_used=1
+  [ "$warp_used" = 1 ] || return 0
+  local identity
+  identity="$(resolve_real "$(warp_identity_path)")"
+  mkdir -p "$(dirname "$identity")" 2>/dev/null || true
+  "$BIN" warp-register --mode "$WARP_MODE" -o "$identity" >/dev/null 2>"$STATE_DIR/warp-register.log" || {
+    say "the WARP identity at $identity was not prepared as the invoking user:" >&2
+    tail -n 4 "$STATE_DIR/warp-register.log" >&2 2>/dev/null || true
+    return 1
+  }
+}
+
 start_lane() {
   local new_cfg new_fronts lane_pid reg_dir start_epoch final_cfg
   mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
@@ -2825,6 +2860,7 @@ start_lane() {
   # and a bad link must not send the user to a build before saying what is wrong.
   build_config
   require_bin
+  prepare_warp_identity || return 1
   proxy_lock || {
     [ -n "$CFG_STAGE" ] && rm -f "$CFG_STAGE"
     [ "$OUTBOUND" = config ] || CFG="$final_cfg"
@@ -3786,6 +3822,10 @@ fi
 
 # One country spelling for every lane: --country and --region both name the
 # Psiphon egress region, and --psiphon-region still wins when all three appear.
+if [ "$WANT_WARP" = 1 ] && [ -z "$OUTBOUND" ]; then
+  OUTBOUND=warp
+fi
+
 if [ "$OUTBOUND" = psiphon ] && [ -z "$PSIPHON_REGION" ]; then
   if [ -n "$REGION" ]; then
     PSIPHON_REGION="$REGION"
@@ -3801,8 +3841,8 @@ fi
 if [ -n "$FXA_USER_AGENT" ] && [ "$OUTBOUND" != foxy ]; then
   die "--fxa-user-agent belongs to the foxy lane; nothing was started."
 fi
-if [ "$WANT_WARP" = 1 ] && [ "$OUTBOUND" != foxy ] && [ "$OUTBOUND" != psiphon ]; then
-  die "--warp chains the foxy or psiphon lane through WARP (up --foxy --warp, up --psiphon --warp); nothing was started."
+if [ "$WANT_WARP" = 1 ] && [ "$OUTBOUND" != foxy ] && [ "$OUTBOUND" != psiphon ] && [ "$OUTBOUND" != warp ]; then
+  die "--warp starts the WARP lane by itself, or chains foxy or psiphon through it (up --warp, up --foxy --warp, up --psiphon --warp); nothing was started."
 fi
 if [ "$WARP_MODE_SET" = 1 ] && [ "$WANT_WARP" != 1 ] && [ "$UDP_VIA" != warp ]; then
   die "--warp-mode belongs to --warp or --udp-via warp; nothing was started."

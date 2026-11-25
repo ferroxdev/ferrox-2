@@ -20,7 +20,7 @@ mod proxy;
 use std::fs::File;
 use std::io::{IsTerminal as _, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::exit;
+use std::process::{exit, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -282,6 +282,44 @@ fn write_lane_config(
     Ok(generated.hidden_socks)
 }
 
+#[cfg(unix)]
+fn prepare_warp_identity(options: &Options, paths: &Paths, bin: &Path) -> Result<(), String> {
+    let warp_used = options.outbound == Some(Outbound::Warp)
+        || (options.warp && options.upstream.is_empty())
+        || options.udp_via == "warp";
+    if !options.vpn || !warp_used || unsafe { libc::geteuid() } == 0 {
+        return Ok(());
+    }
+    let identity = config::warp_identity_path(options, paths);
+    let output = Command::new(bin)
+        .arg("warp-register")
+        .arg("--mode")
+        .arg(&options.warp_mode)
+        .arg("-o")
+        .arg(&identity)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| {
+            format!("cannot prepare the WARP identity: {error}; nothing was started.")
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let tail: Vec<&str> = stderr.lines().rev().take(4).collect();
+    Err(format!(
+        "the WARP identity at {} was not prepared as the invoking user: {}",
+        identity.display(),
+        tail.into_iter().rev().collect::<Vec<_>>().join(" | ")
+    ))
+}
+
+#[cfg(not(unix))]
+fn prepare_warp_identity(options: &Options, _paths: &Paths, _bin: &Path) -> Result<(), String> {
+    let _ = options;
+    Ok(())
+}
+
 fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
     let code = up_once(options, paths, serve);
     if code == 3
@@ -352,6 +390,10 @@ fn up_once(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
             return 1;
         }
     };
+    if let Err(error) = prepare_warp_identity(options, paths, &bin) {
+        eprintln!("ferrox-cli: {error}");
+        return 1;
+    }
     if lane::running(paths) {
         println!(
             "a lane{} is already running (pid {}); stopping it first.",
