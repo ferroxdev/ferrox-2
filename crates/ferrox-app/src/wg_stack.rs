@@ -46,10 +46,6 @@ const TCP_RECV_BUFFER: usize = 1024 * 1024;
 /// tunnel's round trip is milliseconds, so the queue bounds a fast link.
 const TCP_SEND_BUFFER: usize = 1024 * 1024;
 
-/// A server's reply buffer bounds how much it keeps in flight per flow. The tunnel
-/// client is a userspace stack without SACK or pacing, so a full peer window dumped
-/// in one burst overruns it; this cap lets the window govern without that overrun.
-const SERVER_SEND_BUFFER: usize = 128 * 1024;
 /// One turn drains at most this many local reads into a flow, so a download
 /// does not wait a whole tick for each buffer when the peer is far ahead.
 const UP_BURST: usize = 64;
@@ -1475,12 +1471,8 @@ pub(crate) fn server(
     headroom: usize,
     recycle: Option<Sender<Vec<u8>>>,
     stop: Option<Arc<AtomicBool>>,
-    inner_congestion: bool,
 ) {
     let mut stack = ServerStack::new(&config, to_tunnel, out, headroom);
-    if !inner_congestion {
-        stack.set_congestion(CongestionControl::None);
-    }
     stack.device.recycle = recycle;
     loop {
         if stop
@@ -1956,16 +1948,9 @@ struct ServerStack {
     dup: u64,
     retx_seen: u64,
     dup_seen: u64,
-    congestion: CongestionControl,
 }
 
 impl ServerStack {
-    /// The inner TCP's congestion controller. The outer transport is reliable, so
-    /// the server caps its window with a controller that grows steadily to it.
-    fn set_congestion(&mut self, congestion: CongestionControl) {
-        self.congestion = congestion;
-    }
-
     /// Build the server's interface, sockets and routes over a device that reserves its headroom.
     fn new(
         config: &DeviceConfig,
@@ -2034,7 +2019,6 @@ impl ServerStack {
             dup: 0,
             retx_seen: 0,
             dup_seen: 0,
-            congestion: CongestionControl::Cubic,
         }
     }
 
@@ -2295,11 +2279,11 @@ impl ServerStack {
         }
         let mut socket = TcpSocket::new(
             SocketBuffer::new(vec![0u8; TCP_RECV_BUFFER]),
-            SocketBuffer::new(vec![0u8; SERVER_SEND_BUFFER]),
+            SocketBuffer::new(vec![0u8; TCP_SEND_BUFFER]),
         );
         socket.set_nagle_enabled(false);
         socket.set_ack_delay(None);
-        socket.set_congestion_control(self.congestion);
+        socket.set_congestion_control(CongestionControl::Cubic);
         if socket.listen(IpListenEndpoint { addr: None, port }).is_ok() {
             let handle = self.sockets.add(socket);
             listeners.push(Listener {

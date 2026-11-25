@@ -1223,7 +1223,6 @@ pub(crate) fn serve_inbound(
             WG_HEADER_SIZE,
             Some(recycle),
             stack_stop,
-            true,
         );
     });
     std::thread::spawn(move || {
