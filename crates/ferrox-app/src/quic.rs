@@ -7698,13 +7698,14 @@ mod tests {
         }
         let server: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().expect("addr");
         let first = UdpSocket::bind("0.0.0.0:0").expect("binds");
+        let mask = gecko_salamander();
         let writer = Datagram::gecked_hopped(
             server,
             ports.clone(),
             (0, 0),
             "0.0.0.0:0",
             &first,
-            gecko_salamander(),
+            mask.clone(),
             gecko_window(),
         )
         .expect("geckos over a hop");
@@ -7719,17 +7720,28 @@ mod tests {
                 if n == 0 {
                     break;
                 }
-                datagrams += 1;
-                touched.insert(listener.local_addr().expect("addr").port());
-                assert!(
-                    (512..=1200).contains(&n),
-                    "a fragment is padded into its window, saw {n}"
-                );
                 let plain = n.min(packet.len());
                 assert_ne!(
                     buf[..plain],
                     packet[..plain],
                     "a fragment left the socket inside its salamander mask"
+                );
+                // A datagram another test's port probe left here is not this lane's frame.
+                let Some(unmasked) = mask.deobfuscate_in_place(&mut buf[..n]) else {
+                    continue;
+                };
+                let Some((frame, _)) = ferrox_core::hysteria::decode_gecko_frame(&buf[..unmasked])
+                else {
+                    continue;
+                };
+                if frame.msg_id != 0 {
+                    continue;
+                }
+                datagrams += 1;
+                touched.insert(listener.local_addr().expect("addr").port());
+                assert!(
+                    (512..=1200).contains(&n),
+                    "a fragment is padded into its window, saw {n}"
                 );
             }
         }
