@@ -4315,6 +4315,29 @@ mod tests {
         let _ = sink.join();
     }
 
+    #[cfg(windows)]
+    fn close_abortively(stream: &TcpStream) {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{setsockopt, LINGER, SOL_SOCKET, SO_LINGER};
+        let linger = LINGER {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let rc = unsafe {
+            setsockopt(
+                stream.as_raw_socket() as _,
+                SOL_SOCKET,
+                SO_LINGER,
+                (&raw const linger).cast(),
+                std::mem::size_of::<LINGER>() as i32,
+            )
+        };
+        assert_eq!(rc, 0, "the engine closes abortively");
+    }
+
+    #[cfg(not(windows))]
+    fn close_abortively(_stream: &TcpStream) {}
+
     /// Only the join on the download thread can keep `serve_flow` running past the upload; closing the engine faults the blocked write, and the fault must reach the caller rather than vanish with a dropped handle.
     #[test]
     fn a_full_duplex_flow_waits_for_and_surfaces_its_download() {
@@ -4358,7 +4381,8 @@ mod tests {
             "serve_flow must wait for the download it spawns, not return on the upload"
         );
 
-        // Closing the engine faults the blocked write; the download reason must surface instead of vanishing with the dropped handle.
+        // A graceful close can leave a Windows writer succeeding into a half-closed peer; an abortive close faults the blocked write the test needs to observe.
+        close_abortively(&engine);
         drop(engine);
         let reason = done_rx
             .recv_timeout(Duration::from_secs(20))
