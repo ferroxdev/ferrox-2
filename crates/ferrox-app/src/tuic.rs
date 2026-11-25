@@ -44,7 +44,7 @@ const RETRY_TOKEN_TAG: usize = 32;
 const MAX_ASSOCIATIONS_PER_SESSION: usize = 256;
 const MAX_UDP_SOCKETS: usize = 2048;
 const MAX_TUIC_LANES: usize = 64;
-const LANES_PER_KEY: usize = 1;
+const LANES_PER_KEY: usize = 2;
 const MAX_RESOLVING_PER_SESSION: usize = 32;
 const MAX_RESOLVE_PAYLOADS: usize = 4;
 const RESOLVE_QUEUE: usize = 256;
@@ -159,7 +159,6 @@ struct Lane {
     pending: Mutex<Vec<Pending>>,
     session: Arc<Mutex<Option<Vec<u8>>>>,
     direct: Sender<DirectStream>,
-    upload: Sender<UploadStream>,
     heartbeat: thread::Thread,
     auth: Auth,
     authed: AtomicBool,
@@ -167,52 +166,20 @@ struct Lane {
     establish_by: Option<Instant>,
 }
 
-/// One client stream's download side: the driver owns the local socket, so the bytes cross once.
+/// One client stream the driver owns end to end: the QUIC id and the local TCP socket, so neither
+/// direction needs a relay worker or a second copy through a queue.
 struct DirectStream {
     id: u64,
     tcp: Connection,
-    inbound: Vec<u8>,
-    peer_fin: bool,
-    write_shut: bool,
-    closed: Arc<AtomicBool>,
-    meter: crate::stats::Meter,
-    finish: Arc<FlowFinish>,
-}
-
-/// One client stream's upload side, owned by the lane's upload thread.
-struct UploadStream {
-    id: u64,
-    tcp: Connection,
     out: Vec<u8>,
+    inbound: Vec<u8>,
     read_eof: bool,
     fin_sent: bool,
-    closed: Arc<AtomicBool>,
+    peer_fin: bool,
+    write_shut: bool,
+    closed: bool,
     meter: crate::stats::Meter,
-    finish: Arc<FlowFinish>,
-}
-
-/// The lease a flow holds until both its upload and its download side have finished.
-struct FlowFinish {
-    remaining: AtomicUsize,
-    finish: Mutex<Option<Box<dyn FnOnce() + Send>>>,
-}
-
-impl FlowFinish {
-    fn new(finish: Box<dyn FnOnce() + Send>) -> Self {
-        Self {
-            remaining: AtomicUsize::new(2),
-            finish: Mutex::new(Some(finish)),
-        }
-    }
-
-    fn done(&self) {
-        if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-            let finish = self.finish.lock().ok().and_then(|mut slot| slot.take());
-            if let Some(finish) = finish {
-                finish();
-            }
-        }
-    }
+    finish: Option<Box<dyn FnOnce() + Send>>,
 }
 
 fn lane_established(conn: &QuicheConnection, lane: &Lane) -> bool {
@@ -591,7 +558,6 @@ impl TuicOut {
         let stop = Arc::new(AtomicBool::new(false));
         let heartbeat = heartbeat(&conn, &socket, self.heartbeat, Arc::clone(&stop));
         let (direct, direct_rx) = mpsc::channel::<DirectStream>();
-        let (upload, upload_rx) = mpsc::channel::<UploadStream>();
         let lane = Arc::new(Lane {
             conn,
             sock: socket,
@@ -605,7 +571,6 @@ impl TuicOut {
             pending: Mutex::new(Vec::new()),
             session: Arc::clone(&self.session),
             direct,
-            upload,
             heartbeat,
             auth: Auth {
                 uuid: self.uuid,
@@ -623,10 +588,6 @@ impl TuicOut {
         thread::spawn({
             let lane = Arc::downgrade(&lane);
             move || drive_client(&lane, direct_rx)
-        });
-        thread::spawn({
-            let lane = Arc::downgrade(&lane);
-            move || drive_uploads(&lane, upload_rx)
         });
         Some(lane)
     }
@@ -702,50 +663,21 @@ impl TuicOut {
         if tcp.set_nonblocking(true).is_err() {
             return;
         }
-        let Ok(upload) = client.try_clone() else {
-            return;
-        };
-        if upload.set_nonblocking(true).is_err() {
-            return;
-        }
         header.reserve(DIRECT_BUFFER);
         let direct = lane.direct.clone();
-        let uploads = lane.upload.clone();
-        let meter = proxy::flow_outbound_meter().unwrap_or_default();
-        let closed = Arc::new(AtomicBool::new(false));
-        let finish = Arc::new(FlowFinish::new(Box::new(move || drop(lane))));
-        if uploads
-            .send(UploadStream {
-                id,
-                tcp: upload,
-                out: header,
-                read_eof: false,
-                fin_sent: false,
-                closed: Arc::clone(&closed),
-                meter: meter.clone(),
-                finish: Arc::clone(&finish),
-            })
-            .is_err()
-        {
-            closed.store(true, Ordering::Relaxed);
-            finish.done();
-        }
-        if direct
-            .send(DirectStream {
-                id,
-                tcp,
-                inbound: Vec::with_capacity(DIRECT_BUFFER),
-                peer_fin: false,
-                write_shut: false,
-                closed: Arc::clone(&closed),
-                meter,
-                finish: Arc::clone(&finish),
-            })
-            .is_err()
-        {
-            closed.store(true, Ordering::Relaxed);
-            finish.done();
-        }
+        let _ = direct.send(DirectStream {
+            id,
+            tcp,
+            out: header,
+            inbound: Vec::with_capacity(DIRECT_BUFFER),
+            read_eof: false,
+            fin_sent: false,
+            peer_fin: false,
+            write_shut: false,
+            closed: false,
+            meter: proxy::flow_outbound_meter().unwrap_or_default(),
+            finish: Some(Box::new(move || drop(lane))),
+        });
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1350,10 +1282,8 @@ fn drive_client(weak: &std::sync::Weak<Lane>, direct: Receiver<DirectStream>) {
             break;
         }
     }
-    finish_direct(&mut entries);
-    while let Ok(stream) = direct.try_recv() {
-        finished.push(stream);
-    }
+    entries.clear();
+    while direct.try_recv().is_ok() {}
     finish_direct(&mut finished);
     if let Some(lane) = weak.upgrade() {
         lane.stop.store(true, Ordering::Relaxed);
@@ -1498,23 +1428,109 @@ fn pump_direct_stream(
     stream: &mut DirectStream,
     buf: &mut [u8],
 ) -> bool {
-    if stream.closed.load(Ordering::Relaxed) {
+    if stream.closed {
+        return true;
+    }
+    send_pending(conn, stream);
+    if stream.closed {
+        return true;
+    }
+    if stream.out.is_empty() {
+        pump_upload(conn, stream, buf);
+    }
+    if stream.closed {
         return true;
     }
     write_pending(conn, stream);
+    if stream.closed {
+        return true;
+    }
     if stream.inbound.is_empty() && !stream.peer_fin {
         pump_download(conn, stream, buf);
     }
+    if stream.closed {
+        return true;
+    }
     write_pending(conn, stream);
+    if stream.closed {
+        return true;
+    }
+    if stream.read_eof && stream.out.is_empty() && !stream.fin_sent {
+        match conn.stream_send(stream.id, &[], true) {
+            Ok(_) => stream.fin_sent = true,
+            Err(quiche::Error::Done) => {}
+            Err(_) => {
+                abort_direct(conn, stream);
+                return true;
+            }
+        }
+    }
     if stream.peer_fin && stream.inbound.is_empty() && !stream.write_shut {
         let _ = stream.tcp.shutdown(Shutdown::Write);
         stream.write_shut = true;
     }
-    stream.closed.load(Ordering::Relaxed)
-        || (stream.peer_fin && stream.write_shut && stream.inbound.is_empty())
+    stream.read_eof
+        && stream.fin_sent
+        && stream.peer_fin
+        && stream.write_shut
+        && stream.out.is_empty()
+        && stream.inbound.is_empty()
+}
+
+fn send_pending(conn: &mut QuicheConnection, stream: &mut DirectStream) {
+    while !stream.out.is_empty() {
+        let sent = conn.stream_send(stream.id, &stream.out, false);
+        match sent {
+            Ok(0) | Err(quiche::Error::Done) => break,
+            Ok(n) => {
+                stream.out.drain(..n);
+                stream.meter.write(n);
+            }
+            Err(_) => {
+                abort_direct(conn, stream);
+                return;
+            }
+        }
+    }
+}
+
+fn pump_upload(conn: &mut QuicheConnection, stream: &mut DirectStream, buf: &mut [u8]) {
+    if stream.read_eof {
+        return;
+    }
+    let read = stream.tcp.read(buf);
+    match read {
+        Ok(0) => stream.read_eof = true,
+        Ok(n) => {
+            let mut at = 0;
+            while at < n {
+                let sent = conn.stream_send(stream.id, &buf[at..n], false);
+                match sent {
+                    Ok(0) | Err(quiche::Error::Done) => {
+                        stream.out.extend_from_slice(&buf[at..n]);
+                        break;
+                    }
+                    Ok(sent) => {
+                        at += sent;
+                        stream.meter.write(sent);
+                    }
+                    Err(_) => {
+                        abort_direct(conn, stream);
+                        return;
+                    }
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+        Err(_) => abort_direct(conn, stream),
+    }
 }
 
 fn pump_download(conn: &mut QuicheConnection, stream: &mut DirectStream, buf: &mut [u8]) {
+    if stream.peer_fin {
+        return;
+    }
     let received = conn.stream_recv(stream.id, buf);
     match received {
         Ok((0, fin)) => {
@@ -1580,7 +1596,8 @@ fn write_pending(conn: &mut QuicheConnection, stream: &mut DirectStream) {
 }
 
 fn abort_direct(conn: &mut QuicheConnection, stream: &mut DirectStream) {
-    stream.closed.store(true, Ordering::Relaxed);
+    stream.closed = true;
+    stream.out.clear();
     stream.inbound.clear();
     let _ = conn.stream_shutdown(stream.id, quiche::Shutdown::Read, 0);
     let _ = conn.stream_shutdown(stream.id, quiche::Shutdown::Write, 0);
@@ -1588,136 +1605,11 @@ fn abort_direct(conn: &mut QuicheConnection, stream: &mut DirectStream) {
 }
 
 fn finish_direct(finished: &mut Vec<DirectStream>) {
-    for stream in finished.drain(..) {
-        stream.finish.done();
-    }
-}
-
-/// One upload thread per lane reads the local sockets while the driver writes the download side.
-fn drive_uploads(weak: &std::sync::Weak<Lane>, uploads: Receiver<UploadStream>) {
-    let mut entries: Vec<UploadStream> = Vec::new();
-    let mut finished: Vec<UploadStream> = Vec::new();
-    while let Some(lane) = weak.upgrade() {
-        while let Ok(stream) = uploads.try_recv() {
-            entries.push(stream);
-        }
-        if lane.stop.load(Ordering::Relaxed) {
-            break;
-        }
-        let mut buf = [0u8; DIRECT_BUFFER];
-        let mut at = 0;
-        while at < entries.len() {
-            let done = match lane.conn.lock() {
-                Ok(mut conn) => pump_upload_stream(&mut conn, &mut entries[at], &mut buf),
-                Err(_) => true,
-            };
-            if done {
-                finished.push(entries.swap_remove(at));
-            } else {
-                at += 1;
-            }
-        }
-        for stream in finished.drain(..) {
-            stream.finish.done();
-        }
-        if entries.is_empty() {
-            thread::sleep(CLIENT_POLL);
-        } else {
-            thread::yield_now();
+    for mut stream in finished.drain(..) {
+        if let Some(finish) = stream.finish.take() {
+            finish();
         }
     }
-    for stream in entries.drain(..) {
-        stream.finish.done();
-    }
-    while let Ok(stream) = uploads.try_recv() {
-        stream.finish.done();
-    }
-}
-
-fn pump_upload_stream(
-    conn: &mut QuicheConnection,
-    stream: &mut UploadStream,
-    buf: &mut [u8],
-) -> bool {
-    if stream.closed.load(Ordering::Relaxed) {
-        return true;
-    }
-    send_upload_pending(conn, stream);
-    if stream.closed.load(Ordering::Relaxed) {
-        return true;
-    }
-    if stream.out.is_empty() && !stream.read_eof {
-        pump_upload(conn, stream, buf);
-    }
-    if stream.closed.load(Ordering::Relaxed) {
-        return true;
-    }
-    if stream.read_eof && stream.out.is_empty() && !stream.fin_sent {
-        match conn.stream_send(stream.id, &[], true) {
-            Ok(_) => stream.fin_sent = true,
-            Err(quiche::Error::Done) => {}
-            Err(_) => abort_upload(conn, stream),
-        }
-    }
-    stream.closed.load(Ordering::Relaxed)
-        || (stream.read_eof && stream.fin_sent && stream.out.is_empty())
-}
-
-fn send_upload_pending(conn: &mut QuicheConnection, stream: &mut UploadStream) {
-    while !stream.out.is_empty() {
-        let sent = conn.stream_send(stream.id, &stream.out, false);
-        match sent {
-            Ok(0) | Err(quiche::Error::Done) => break,
-            Ok(n) => {
-                stream.out.drain(..n);
-                stream.meter.write(n);
-            }
-            Err(_) => {
-                abort_upload(conn, stream);
-                return;
-            }
-        }
-    }
-}
-
-fn pump_upload(conn: &mut QuicheConnection, stream: &mut UploadStream, buf: &mut [u8]) {
-    if stream.read_eof {
-        return;
-    }
-    let read = stream.tcp.read(buf);
-    match read {
-        Ok(0) => stream.read_eof = true,
-        Ok(n) => {
-            let mut at = 0;
-            while at < n {
-                let sent = conn.stream_send(stream.id, &buf[at..n], false);
-                match sent {
-                    Ok(0) | Err(quiche::Error::Done) => {
-                        stream.out.extend_from_slice(&buf[at..n]);
-                        break;
-                    }
-                    Ok(sent) => {
-                        at += sent;
-                        stream.meter.write(sent);
-                    }
-                    Err(_) => {
-                        abort_upload(conn, stream);
-                        return;
-                    }
-                }
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-        Err(_) => abort_upload(conn, stream),
-    }
-}
-
-fn abort_upload(conn: &mut QuicheConnection, stream: &mut UploadStream) {
-    stream.closed.store(true, Ordering::Relaxed);
-    stream.out.clear();
-    let _ = conn.stream_shutdown(stream.id, quiche::Shutdown::Read, 0);
-    let _ = conn.stream_shutdown(stream.id, quiche::Shutdown::Write, 0);
 }
 
 fn flush_lane(lane: &Lane, conn: &mut QuicheConnection) {
