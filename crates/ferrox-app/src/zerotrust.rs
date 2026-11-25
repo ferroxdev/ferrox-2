@@ -310,17 +310,43 @@ fn extract_totp_form_action(html: &str) -> Option<String> {
     let form_start = head.rfind("<form")?;
     let tag_end = html[form_start..].find('>')? + form_start;
     let tag = &html[form_start..tag_end];
-    let key = "action=";
-    let key_at = tag.find(key)? + key.len();
-    let rest = tag[key_at..].trim_start();
-    let quote = rest.chars().next()?;
-    if quote != '\'' && quote != '"' {
-        return None;
-    }
-    let body = &rest[1..];
-    let end = body.find(quote)?;
-    let action = decode_entities(&body[..end]);
+    let action = decode_entities(form_attribute(tag, "action")?);
     action.starts_with("https://").then_some(action)
+}
+
+fn form_attribute<'a>(tag: &'a str, wanted: &str) -> Option<&'a str> {
+    let mut rest = tag.strip_prefix("<form")?.trim_start();
+    while !rest.is_empty() {
+        let name_end = rest
+            .find(|c: char| c.is_whitespace() || matches!(c, '=' | '>'))
+            .unwrap_or(rest.len());
+        let name = &rest[..name_end];
+        rest = rest[name_end..].trim_start();
+        if rest.starts_with('=') {
+            rest = rest[1..].trim_start();
+            let quote = rest.chars().next()?;
+            let (value, after) = if quote == '"' || quote == '\'' {
+                let body = &rest[1..];
+                let end = body.find(quote)?;
+                (&body[..end], &body[end + 1..])
+            } else {
+                let end = rest
+                    .find(|c: char| c.is_whitespace() || matches!(c, '>' | '/'))
+                    .unwrap_or(rest.len());
+                (&rest[..end], &rest[end..])
+            };
+            if name.eq_ignore_ascii_case(wanted) {
+                return Some(value);
+            }
+            rest = after.trim_start();
+        } else if name.eq_ignore_ascii_case(wanted) {
+            return Some("");
+        }
+        if rest.starts_with('>') {
+            return None;
+        }
+    }
+    None
 }
 
 fn decode_entities(raw: &str) -> String {
@@ -2228,6 +2254,15 @@ mod tests {
         assert_eq!(
             extract_totp_form_action(page).as_deref(),
             Some("https://acme.cloudflareaccess.com/cdn-cgi/access/verify?a=1&b=2")
+        );
+    }
+
+    #[test]
+    fn a_data_action_does_not_stand_in_for_the_form_action() {
+        let page = "<form data-action=\"https://acme.cloudflareaccess.com/wrong\" action=\"https://acme.cloudflareaccess.com/right\"><input id=\"totp-form\"></form>";
+        assert_eq!(
+            extract_totp_form_action(page).as_deref(),
+            Some("https://acme.cloudflareaccess.com/right")
         );
     }
 
