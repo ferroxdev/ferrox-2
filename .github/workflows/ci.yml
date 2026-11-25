@@ -174,7 +174,8 @@ jobs:
     # and scripts answers false here; a schedule, with no diff to read, answers true.
     if: needs.plan.outputs.rust == 'true'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    # A cold cache builds the whole workspace on the runner, so the cap covers a build that has nothing to reuse.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -204,7 +205,7 @@ jobs:
       - name: run the full suite
         id: test
         shell: bash
-        timeout-minutes: 20
+        timeout-minutes: 40
         env:
           # Stage tracing for the loopback echo family: captured per test and
           # printed only on failure, so the next scheduler stall names where
