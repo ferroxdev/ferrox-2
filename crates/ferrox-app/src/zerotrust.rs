@@ -1459,11 +1459,11 @@ mod tests {
             "AETHER_ACCESS_TOKEN" => Some(token.clone()),
             _ => None,
         };
-        let explicit = TeamSettings::from_parts_with(Some("chosen"), None, None, None, None, &env)
+        let explicit = TeamSettings::from_parts_with(Some("chosen"), None, None, None, None, env)
             .expect("the explicit team")
             .expect("settings");
         assert_eq!(explicit.token, None);
-        let matching = TeamSettings::from_parts_with(Some("ambient"), None, None, None, None, &env)
+        let matching = TeamSettings::from_parts_with(Some("ambient"), None, None, None, None, env)
             .expect("the matching team")
             .expect("settings");
         assert_eq!(matching.token.as_deref(), Some(token.as_str()));
@@ -1473,7 +1473,7 @@ mod tests {
             None,
             Some("supplied"),
             None,
-            &env,
+            env,
         )
         .expect("the supplied token")
         .expect("settings");
