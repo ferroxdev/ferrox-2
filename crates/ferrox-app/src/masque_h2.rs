@@ -38,6 +38,10 @@ const FRAME_HEAD: usize = 9;
 /// The largest body written head-and-body in one call, control or small DATA; a larger one keeps two writes.
 const INLINE_ROOM: usize = 512;
 const QUEUED_CAP: usize = 64;
+/// How many packets one turn pulls from the origin before yielding to the read side.
+/// The peer's flow-control window is the real bound; a per-turn cap of `QUEUED_CAP`
+/// throttled a download to one 86 KiB burst per wake no matter how open the window was.
+const PULL_CAP: usize = masque::QUEUE;
 /// h2's default `SETTINGS_MAX_FRAME_SIZE`: a DATA body past it is a connection error for a peer that keeps the default.
 const MAX_FRAME_BODY: usize = 16 * 1024;
 /// The capsules one downlink DATA frame carries, half the frame limit so one capsule's overshoot still fits.
@@ -1861,26 +1865,25 @@ impl Session {
         };
         frame.clear();
         frame.resize(FRAME_HEAD, 0);
-        while pulled < QUEUED_CAP {
-            // A full queue stops the pull instead of ending the session: the origin then blocks on its channel and the peer's window update resumes it.
-            if wire.closed || self.end || self.queued.len() >= QUEUED_CAP {
+        let mut blocked = false;
+        while pulled < PULL_CAP {
+            // One slot stays free for the final partial frame, so a full queue stops the pull instead of ending the session; the origin then blocks on its channel.
+            if wire.closed || self.end || self.queued.len() + 1 >= QUEUED_CAP {
                 break;
             }
             let packet = if let Some(udp) = &self.udp {
                 udp.try_recv()
-            } else {
-                match self
-                    .outgoing
-                    .as_ref()
-                    .map(std::sync::mpsc::Receiver::try_recv)
-                {
-                    Some(Ok(packet)) => Some(packet),
-                    Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+            } else if let Some(rx) = self.outgoing.as_ref() {
+                match rx.try_recv() {
+                    Ok(packet) => Some(packet),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         origin_closed = true;
                         None
                     }
-                    _ => None,
                 }
+            } else {
+                None
             };
             let Some(packet) = packet else {
                 break;
@@ -1892,13 +1895,16 @@ impl Session {
             }
             pulled += 1;
             if frame.len() - FRAME_HEAD >= BATCH_BODY {
-                self.frame_body(wire, frame, id);
+                if !self.frame_body(wire, frame, id) {
+                    blocked = true;
+                    break;
+                }
                 frame.clear();
                 frame.resize(FRAME_HEAD, 0);
             }
         }
-        if frame.len() > FRAME_HEAD {
-            self.frame_body(wire, frame, id);
+        if !blocked && frame.len() > FRAME_HEAD {
+            let _ = self.frame_body(wire, frame, id);
         }
         if pulled > 0 {
             self.udp_quiet = Some(Instant::now());
@@ -1907,16 +1913,16 @@ impl Session {
     }
 
     /// Heads a built body with its length and hands it to `send`.
-    fn frame_body(&mut self, wire: &mut Wire, frame: &mut [u8], id: u32) {
+    fn frame_body(&mut self, wire: &mut Wire, frame: &mut [u8], id: u32) -> bool {
         let body = frame.len() - FRAME_HEAD;
         frame[..FRAME_HEAD].copy_from_slice(&h2::frame_head(body, h2::T_DATA, 0, id));
-        self.send(wire, frame);
+        self.send(wire, frame)
     }
 
     /// Sends a built DATA frame in one write when it fits the window and the frame limit, otherwise queues its body.
-    fn send(&mut self, wire: &mut Wire, frame: &[u8]) {
+    fn send(&mut self, wire: &mut Wire, frame: &[u8]) -> bool {
         if self.end || wire.closed || self.request.is_none() {
-            return;
+            return false;
         }
         let body = &frame[FRAME_HEAD..];
         let length = i64::try_from(body.len()).unwrap_or(i64::MAX);
@@ -1927,10 +1933,16 @@ impl Session {
             if wire.send_frame(frame) {
                 self.send_window -= length;
                 self.connection_window -= length;
+                return true;
             }
-            return;
+            return false;
         }
-        self.capsule(wire, body);
+        // A full reply queue parks the gather instead of closing the tunnel: the body stays in the caller's frame and the next window update resumes it.
+        if self.queued.len() < QUEUED_CAP {
+            self.queued.push_back(body.to_vec());
+            return true;
+        }
+        false
     }
 
     /// Sends or bounds queued reply capsules only while the request and wire remain live.
