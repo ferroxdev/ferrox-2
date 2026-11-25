@@ -431,7 +431,6 @@ impl WireGuardOut {
     ) -> Result<wg_stack::UdpForwarder, String> {
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
             .map_err(|error| format!("wireguard forwarder: cannot bind: {error}"))?;
-        widen(&socket);
         let local = socket
             .local_addr()
             .map_err(|error| format!("wireguard forwarder: no local address: {error}"))?;
@@ -2827,7 +2826,7 @@ fn wait_readable(socket: &UdpSocket, timeout: Duration) -> std::io::Result<bool>
 /// Ask the kernel for the queue the reference gives its `WireGuard` socket. It
 /// may cap the request at `net.core.*mem_max`; the default is the smaller
 /// number, and a larger ask never costs the flow anything.
-pub(crate) fn widen(socket: &UdpSocket) {
+fn widen(socket: &UdpSocket) {
     let sock = socket2::SockRef::from(socket);
     let _ = sock.set_recv_buffer_size(SOCKET_BUFFER);
     let _ = sock.set_send_buffer_size(SOCKET_BUFFER);

@@ -93,10 +93,6 @@ const TUN_TICK: Duration = Duration::from_millis(1);
 /// Datagram lanes are idle most of their life; a ten millisecond wake is a
 /// poll of their own, not a bound on a request.
 const LANE_TICK: Duration = Duration::from_millis(10);
-/// The most datagrams a lane moves each way before it looks at the other: draining a whole
-/// downlink backlog before reading one uplink starves the inner TCP's ACKs, whose retransmits
-/// cost more than the turn it saved.
-const LANE_BURST: usize = 64;
 /// The most inner packets the tunnel reader may queue before the stack drains
 /// them; past it the oldest is dropped, as a full device would drop.
 const RX_PACKETS: usize = 4096;
@@ -3168,39 +3164,31 @@ pub(crate) fn client_udp_forward<T: Clone + Into<ToTunnel>>(
     }
     let mut buf = crate::proxy::udp_buffer();
     let mut app: Option<SocketAddr> = None;
-    'lane: while !stop.load(Ordering::Relaxed) {
+    while !stop.load(Ordering::Relaxed) {
         let mut idle = true;
-        for _ in 0..LANE_BURST {
-            let Ok(packet) = reply_rx.try_recv() else {
-                break;
-            };
+        while let Ok(packet) = reply_rx.try_recv() {
             idle &= !forward_downlink(&packet, port, app, relay);
             drop(packet);
         }
-        for _ in 0..LANE_BURST {
-            match relay.recv_from(&mut buf) {
-                Ok((n, sender)) => {
-                    // The lane is pinned to its first local source: a second process that reaches this socket must not take the replies or feed the target.
-                    if app.is_some_and(|bound| bound != sender) {
-                        continue;
-                    }
-                    app = Some(sender);
-                    if !lane_send(config, port, target, &buf[..n], &to_tunnel, headroom) {
-                        break 'lane;
-                    }
-                    idle = false;
+        match relay.recv_from(&mut buf) {
+            Ok((n, sender)) => {
+                // The lane is pinned to its first local source: a second process that reaches this socket must not take the replies or feed the target.
+                if app.is_some_and(|bound| bound != sender) {
+                    continue;
                 }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    break
+                app = Some(sender);
+                if !lane_send(config, port, target, &buf[..n], &to_tunnel, headroom) {
+                    break;
                 }
-                Err(error) if crate::proxy::is_udp_gone(&error) => {}
-                Err(_) => break 'lane,
+                idle = false;
             }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) if crate::proxy::is_udp_gone(&error) => {}
+            Err(_) => break,
         }
         // Wait on the downlink channel when both are quiet, so an idle uplink never stalls it.
         if idle {
@@ -3209,7 +3197,7 @@ pub(crate) fn client_udp_forward<T: Clone + Into<ToTunnel>>(
                     forward_downlink(&packet, port, app, relay);
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break 'lane,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
     }

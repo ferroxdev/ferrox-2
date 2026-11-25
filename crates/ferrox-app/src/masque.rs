@@ -667,7 +667,6 @@ impl MasqueOut {
     ) -> Result<UdpForwarder, String> {
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
             .map_err(|error| format!("masque forwarder: cannot bind: {error}"))?;
-        crate::wg::widen(&socket);
         let local = socket
             .local_addr()
             .map_err(|error| format!("masque forwarder: no local address: {error}"))?;
