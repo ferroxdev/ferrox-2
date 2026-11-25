@@ -124,11 +124,12 @@ fn merge_env(base: &mut Vec<(String, Json)>, key: &str, over: &Json) {
     let mut added: Vec<(&str, &Json)> = Vec::new();
     let mut replaced: Vec<(usize, &Json)> = Vec::new();
     for (name, value) in entries {
-        if let Some(&at) = index.get(name.as_str()) {
-            replaced.push((at, value));
-        } else {
-            index.insert(name.as_str(), into.len() + added.len());
-            added.push((name, value));
+        match index.entry(name.as_str()) {
+            std::collections::hash_map::Entry::Occupied(at) => replaced.push((*at.get(), value)),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(into.len() + added.len());
+                added.push((name, value));
+            }
         }
     }
     drop(index);
@@ -165,11 +166,12 @@ fn merge_tagged(base: &mut Vec<(String, Json)>, key: &str, over: &Json, tail: bo
     let mut replaced: Vec<(usize, &Json)> = Vec::new();
     for item in items {
         let tag = item.get("tag").and_then(Json::as_str).unwrap_or_default();
-        if let Some(&at) = index.get(tag) {
-            replaced.push((at, item));
-        } else {
-            index.insert(tag, base + added.len());
-            added.push(item);
+        match index.entry(tag) {
+            std::collections::hash_map::Entry::Occupied(at) => replaced.push((*at.get(), item)),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(base + added.len());
+                added.push(item);
+            }
         }
     }
     drop(index);
@@ -178,8 +180,8 @@ fn merge_tagged(base: &mut Vec<(String, Json)>, key: &str, over: &Json, tail: bo
         existing[at] = item.clone();
     }
     if !tail {
-        let appended = existing.split_off(base);
-        existing.splice(0..0, appended);
+        let appended = existing.len() - base;
+        existing.rotate_right(appended);
     }
 }
 
@@ -243,16 +245,24 @@ fn write_canonical(value: &Json, out: &mut String) {
             out.push(']');
         }
         Json::Obj(pairs) => {
-            let mut sorted: Vec<&(String, Json)> = pairs.iter().collect();
-            sorted.sort_by(|left, right| left.0.cmp(&right.0));
             out.push('{');
-            for (at, (key, item)) in sorted.into_iter().enumerate() {
-                if at > 0 {
-                    out.push(',');
+            if pairs.len() <= 1 {
+                if let Some((key, item)) = pairs.first() {
+                    write_canonical_string(key, out);
+                    out.push(':');
+                    write_canonical(item, out);
                 }
-                write_canonical_string(key, out);
-                out.push(':');
-                write_canonical(item, out);
+            } else {
+                let mut sorted: Vec<&(String, Json)> = pairs.iter().collect();
+                sorted.sort_by(|left, right| left.0.cmp(&right.0));
+                for (at, (key, item)) in sorted.into_iter().enumerate() {
+                    if at > 0 {
+                        out.push(',');
+                    }
+                    write_canonical_string(key, out);
+                    out.push(':');
+                    write_canonical(item, out);
+                }
             }
             out.push('}');
         }
@@ -447,10 +457,52 @@ fn next_json_special_swar(bytes: &[u8]) -> Option<(usize, u8)> {
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
-/// The first byte of `needles` at or after the front, two eight-byte words per turn: each lane
-/// whose byte equals a needle is marked once, and the earliest mark is always a real lane.
+/// The first byte of `needles` at or after the front: AVX2 walks 32 bytes per turn when the CPU
+/// has it, and the SWAR tail takes two eight-byte words per turn, marking each lane whose byte
+/// equals a needle once; the earliest mark is always a real lane.
 #[inline]
 fn next_in(bytes: &[u8], needles: &[u8]) -> Option<(usize, u8)> {
+    #[cfg(target_arch = "x86_64")]
+    if bytes.len() >= 32 && std::is_x86_feature_detected!("avx2") {
+        // SAFETY: the runtime feature test above proves AVX2 is available.
+        return unsafe { next_in_avx2(bytes, needles) };
+    }
+    next_in_swar(bytes, needles)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn next_in_avx2(bytes: &[u8], needles: &[u8]) -> Option<(usize, u8)> {
+    use core::arch::x86_64::{
+        _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_or_si256,
+        _mm256_set1_epi8, _mm256_setzero_si256,
+    };
+    let mut at = 0usize;
+    while at + 32 <= bytes.len() {
+        // SAFETY: `at + 32` is inside `bytes`, and the load is unaligned.
+        let marked = unsafe {
+            let block = _mm256_loadu_si256(bytes.as_ptr().add(at).cast());
+            let mut found = _mm256_setzero_si256();
+            for &needle in needles {
+                found = _mm256_or_si256(
+                    found,
+                    _mm256_cmpeq_epi8(block, _mm256_set1_epi8(needle.cast_signed())),
+                );
+            }
+            _mm256_movemask_epi8(found)
+        };
+        if marked != 0 {
+            let found = at + marked.trailing_zeros() as usize;
+            return Some((found, bytes[found]));
+        }
+        at += 32;
+    }
+    next_in_swar(&bytes[at..], needles).map(|(found, byte)| (at + found, byte))
+}
+
+/// The SWAR tail: two eight-byte words per turn, and the earliest mark is always a real lane.
+#[inline]
+fn next_in_swar(bytes: &[u8], needles: &[u8]) -> Option<(usize, u8)> {
     const SPREAD: u64 = 0x0101_0101_0101_0101;
     const HIGH: u64 = 0x8080_8080_8080_8080;
     let mark = |word: u64| {
@@ -745,7 +797,9 @@ fn compact_trailing(out: &mut [u8]) -> usize {
             escaped = false;
             let Some((offset, special)) = next_in(&out[at..], &[quote, b'\\']) else {
                 let rest = out.len() - at;
-                out.copy_within(at..at + rest, write);
+                if write != at {
+                    out.copy_within(at..at + rest, write);
+                }
                 return write + rest;
             };
             if escape && offset == 0 {
@@ -755,7 +809,9 @@ fn compact_trailing(out: &mut [u8]) -> usize {
                 continue;
             }
             if offset > 0 {
-                out.copy_within(at..at + offset, write);
+                if write != at {
+                    out.copy_within(at..at + offset, write);
+                }
                 write += offset;
                 at += offset;
             }
@@ -774,11 +830,15 @@ fn compact_trailing(out: &mut [u8]) -> usize {
         }
         let Some((offset, special)) = next_in(&out[at..], b"\"',\\") else {
             let rest = out.len() - at;
-            out.copy_within(at..at + rest, write);
+            if write != at {
+                out.copy_within(at..at + rest, write);
+            }
             return write + rest;
         };
         if offset > 0 {
-            out.copy_within(at..at + offset, write);
+            if write != at {
+                out.copy_within(at..at + offset, write);
+            }
             write += offset;
             at += offset;
         }
@@ -870,15 +930,26 @@ pub(crate) fn order_by_priority(value: &mut Json) {
                 }
             }
             if !order.is_empty() {
-                // The stable sort keeps file order among equal keys, and the drain moves each element once.
-                order.sort_by(|left, right| {
-                    left.0
-                        .partial_cmp(&right.0)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                let mut slots: Vec<Option<Json>> = items.drain(..).map(Some).collect();
-                for &(_, at) in &order {
-                    items.push(slots[at].take().expect("each element moves once"));
+                // The index tie-break keeps file order among equal keys, the drain moves each element once, and a finite key set lets the in-place sort skip the stable sort's scratch.
+                if order.iter().all(|(key, _)| key.is_finite()) {
+                    order.sort_unstable_by(|left, right| {
+                        left.0
+                            .partial_cmp(&right.0)
+                            .expect("finite keys compare")
+                            .then_with(|| left.1.cmp(&right.1))
+                    });
+                } else {
+                    order.sort_by(|left, right| {
+                        left.0
+                            .partial_cmp(&right.0)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                }
+                if order.iter().enumerate().any(|(at, (_, from))| at != *from) {
+                    let mut slots: Vec<Option<Json>> = items.drain(..).map(Some).collect();
+                    for &(_, at) in &order {
+                        items.push(slots[at].take().expect("each element moves once"));
+                    }
                 }
             }
             for item in items.iter_mut() {
@@ -920,16 +991,13 @@ pub(crate) fn parse(text: &str) -> Result<Json, String> {
 
 /// Resolve `env:NAME` in the fields xray reads as an address or a port list, once at config load.
 fn expand_env(value: &mut Json) {
-    const FIELDS: [&str; 4] = ["address", "listen", "ip", "port"];
     match value {
         Json::Obj(pairs) => {
             for (key, child) in pairs {
-                if FIELDS.contains(&key.as_str()) {
-                    if key == "port" {
-                        expand_port(child);
-                    } else {
-                        expand_strings(child);
-                    }
+                match key.as_str() {
+                    "port" => expand_port(child),
+                    "address" | "listen" | "ip" => expand_strings(child),
+                    _ => {}
                 }
                 expand_env(child);
             }
@@ -1160,8 +1228,10 @@ impl Cursor<'_> {
         Ok(unit)
     }
 
+    #[allow(clippy::cast_precision_loss)]
     fn number(&mut self) -> Result<Json, String> {
         let from = self.pos;
+        let mut integer = true;
         if self.bytes.get(self.pos) == Some(&b'-') {
             self.pos += 1;
         }
@@ -1176,12 +1246,14 @@ impl Cursor<'_> {
             }
         }
         if self.bytes.get(self.pos) == Some(&b'.') {
+            integer = false;
             self.pos += 1;
             while self.bytes.get(self.pos).is_some_and(u8::is_ascii_digit) {
                 self.pos += 1;
             }
         }
         if matches!(self.bytes.get(self.pos), Some(b'e' | b'E')) {
+            integer = false;
             self.pos += 1;
             if matches!(self.bytes.get(self.pos), Some(b'+' | b'-')) {
                 self.pos += 1;
@@ -1192,6 +1264,14 @@ impl Cursor<'_> {
         }
         let text = std::str::from_utf8(&self.bytes[from..self.pos])
             .map_err(|_| format!("bad number at offset {from}"))?;
+        if integer {
+            let negative = text.starts_with('-');
+            let digits = text.strip_prefix('-').unwrap_or(text);
+            if let Ok(value) = digits.parse::<u64>() {
+                let value = value as f64;
+                return Ok(Json::Num(if negative { -value } else { value }));
+            }
+        }
         text.parse::<f64>()
             .ok()
             .filter(|number| number.is_finite())
@@ -1265,10 +1345,43 @@ mod tests {
     }
 
     #[test]
+    fn a_single_key_canonical_object_builds_no_sort() {
+        let value = Json::Obj(vec![("only".to_owned(), Json::Bool(true))]);
+        let mut text = String::with_capacity(64);
+        let ((), counts) = ferrox_core::alloc_count::measure(|| write_canonical(&value, &mut text));
+        assert_eq!(text, r#"{"only":true}"#);
+        assert_eq!(
+            counts.allocs, 0,
+            "a one-pair object has nothing to sort: {counts:?}"
+        );
+    }
+
+    #[test]
     fn a_non_finite_number_is_refused_and_rendered_without_a_panic() {
         assert!(parse("1e999").is_err());
         assert_eq!(canonical(&Json::Num(f64::INFINITY)), "null");
         assert_eq!(canonical(&Json::Num(f64::NAN)), "null");
+    }
+
+    #[test]
+    fn a_whole_number_reaches_the_same_float_as_the_reference_parse() {
+        for text in [
+            "0",
+            "-0",
+            "1",
+            "-1",
+            "9007199254740993",
+            "9223372036854775807",
+            "-9223372036854775808",
+            "18446744073709551615",
+            "-18446744073709551615",
+        ] {
+            let expected: f64 = text.parse().expect("reference parses");
+            let Json::Num(number) = parse(text).expect("parses") else {
+                panic!("{text} is a number")
+            };
+            assert_eq!(number.to_bits(), expected.to_bits(), "{text}");
+        }
     }
 
     #[test]
@@ -1731,6 +1844,7 @@ mod tests {
             Some(-2.0),
             Some(-1.0),
             Some(0.0),
+            Some(-0.0),
             Some(0.0),
             Some(0.5),
             Some(1.0),

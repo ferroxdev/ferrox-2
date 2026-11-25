@@ -179,9 +179,10 @@ fn read_response(flow: &mut Flow) -> Option<bool> {
     let mut buf = [0u8; 64];
     loop {
         if let Ok((response, used)) = wire::decode_server_response(&head) {
-            flow.backlog = head[used..].to_vec();
-            flow.at = 0;
-            return Some(response.ok);
+            let ok = response.ok;
+            flow.backlog = head;
+            flow.at = used;
+            return Some(ok);
         }
         if head.len() > HEAD_CAP || Instant::now() >= deadline {
             return None;
@@ -281,11 +282,11 @@ fn usable(conn: &QuicheConnection) -> bool {
         && conn.peer_error().is_none()
 }
 
-fn candidates(dial: &Dial) -> Vec<(Session, u64)> {
+fn candidates(key: &Server) -> Vec<(Session, u64)> {
     let Ok(mut pool) = pool().lock() else {
         return Vec::new();
     };
-    let Some(entries) = pool.get_mut(&server_of(dial)) else {
+    let Some(entries) = pool.get_mut(key) else {
         return Vec::new();
     };
     let now = Instant::now();
@@ -305,21 +306,21 @@ fn candidates(dial: &Dial) -> Vec<(Session, u64)> {
         .collect()
 }
 
-fn evict(dial: &Dial, session: &Session) {
+fn evict(key: &Server, session: &Session) {
     let Ok(mut pool) = pool().lock() else {
         return;
     };
-    let Some(entries) = pool.get_mut(&server_of(dial)) else {
+    let Some(entries) = pool.get_mut(key) else {
         return;
     };
     entries.retain(|entry| !Arc::ptr_eq(&entry.session.shared, &session.shared));
 }
 
-fn keep(dial: &Dial, session: Session, next_stream: u64) {
+fn keep(key: Server, session: Session, next_stream: u64) {
     let Ok(mut pool) = pool().lock() else {
         return;
     };
-    pool.entry(server_of(dial)).or_default().push(Pooled {
+    pool.entry(key).or_default().push(Pooled {
         session,
         next_stream,
         used: Instant::now(),
@@ -327,12 +328,13 @@ fn keep(dial: &Dial, session: Session, next_stream: u64) {
 }
 
 fn open_pooled(dial: &Dial, host: &str, port: u16) -> Option<Flow> {
-    for (session, stream) in candidates(dial) {
+    let key = server_of(dial);
+    for (session, stream) in candidates(&key) {
         if let Some(flow) = open_flow(&session, stream, host, port) {
             return Some(flow);
         }
         if session.shared.lock().is_ok_and(|conn| !usable(&conn)) {
-            evict(dial, &session);
+            evict(&key, &session);
         }
     }
     let mut session = connect(dial)?;
@@ -342,7 +344,7 @@ fn open_pooled(dial: &Dial, host: &str, port: u16) -> Option<Flow> {
         driver.stop();
         return None;
     };
-    keep(dial, session, FIRST_FLOW_STREAM + 4);
+    keep(key, session, FIRST_FLOW_STREAM + 4);
     Some(flow)
 }
 
@@ -486,19 +488,18 @@ fn open_udp_flow(session: &Session, host: &str, port: u16) -> Option<(Flow, u32)
         return None;
     }
     let session_id = response.udp_session_id;
-    Some((
-        Flow::from_parts(
-            Arc::clone(&session.shared),
-            Arc::clone(&session.sock),
-            session.local,
-            FIRST_FLOW_STREAM,
-            head.get(used..).unwrap_or_default().to_vec(),
-            true,
-            false,
-        )
-        .with_session(session),
-        session_id,
-    ))
+    let mut flow = Flow::from_parts(
+        Arc::clone(&session.shared),
+        Arc::clone(&session.sock),
+        session.local,
+        FIRST_FLOW_STREAM,
+        head,
+        true,
+        false,
+    )
+    .with_session(session);
+    flow.at = used;
+    Some((flow, session_id))
 }
 
 fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpSocket) {
@@ -506,6 +507,8 @@ fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpS
     let mut reply_head = Vec::with_capacity(22);
     // One reassembly buffer for the whole association: it is the arena the defrag hands back, so a reply does not open a fresh `Vec` per datagram.
     let mut assembled = Vec::new();
+    // The uplink stores the session id once and never resets it, so the reader reads it once and reuses it.
+    let mut known = lane.session.load(Ordering::Relaxed);
     loop {
         if stop.load(Ordering::Relaxed) || !crate::hysteria::drive_once(session, UDP_POLL) {
             break;
@@ -517,7 +520,9 @@ fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpS
             let Ok(message) = wire::decode_udp(&data) else {
                 continue;
             };
-            let known = lane.session.load(Ordering::Relaxed);
+            if known == 0 {
+                known = lane.session.load(Ordering::Relaxed);
+            }
             if known == 0 || u64::from(message.session) + 1 != known {
                 continue;
             }
@@ -708,6 +713,17 @@ impl Assocs {
         for &(start, size) in &waiting.spans {
             send(&waiting.arena[start as usize..(start + size) as usize]);
         }
+        waiting.clear();
+        if waiting.arena.capacity() > QUEUED_ARENA_KEEP {
+            waiting.arena.shrink_to(QUEUED_ARENA_KEEP);
+        }
+        self.waiting = self.waiting.saturating_sub(len);
+    }
+
+    /// Drop a queue whose payload nobody forwards, without walking the spans a drain would call back.
+    fn flush(&mut self, at: usize) {
+        let waiting = &mut self.list[at].waiting;
+        let len = waiting.spans.len();
         waiting.clear();
         if waiting.arena.capacity() > QUEUED_ARENA_KEEP {
             waiting.arena.shrink_to(QUEUED_ARENA_KEEP);
@@ -1160,7 +1176,7 @@ fn relay_datagrams(
                         peer
                     };
                     if let Some(peer) = peer {
-                        flow.assocs.drain(at, |_| {});
+                        flow.assocs.flush(at);
                         let _ = flow
                             .target
                             .send_to(message.payload, target_addr(&flow.target, peer));
@@ -1452,6 +1468,8 @@ struct Router<'a> {
     serve: &'a Serve,
     udp_idle: Duration,
     routes: HashMap<Vec<u8>, Inbound>,
+    by_client_cid: HashMap<Vec<u8>, Vec<u8>>,
+    by_initial_dcid: HashMap<Vec<u8>, Vec<u8>>,
 }
 
 impl Router<'_> {
@@ -1481,21 +1499,52 @@ impl Router<'_> {
             return;
         }
         crate::quic::flush_egress(&mut conn, &self.sock);
-        self.routes.insert(
-            scid.to_vec(),
-            Inbound {
-                conn: Arc::new(Mutex::new(conn)),
-                authed: false,
-                auth_buf: Vec::new(),
-                served: HashSet::new(),
-                wakes: HashMap::new(),
-                send: StreamWake::new(),
-                udp: Arc::new(Mutex::new(UdpLane::default())),
-                next_udp: 1,
-                client_cid: client_cid.to_vec(),
-                initial_dcid: initial_dcid.to_vec(),
-            },
-        );
+        let key = scid.to_vec();
+        let inbound = Inbound {
+            conn: Arc::new(Mutex::new(conn)),
+            authed: false,
+            auth_buf: Vec::new(),
+            served: HashSet::new(),
+            wakes: HashMap::new(),
+            send: StreamWake::new(),
+            udp: Arc::new(Mutex::new(UdpLane::default())),
+            next_udp: 1,
+            client_cid: client_cid.to_vec(),
+            initial_dcid: initial_dcid.to_vec(),
+        };
+        if let Some(old) = self.routes.insert(key.clone(), inbound) {
+            forget_route(
+                &mut self.by_client_cid,
+                &mut self.by_initial_dcid,
+                &key,
+                &old.client_cid,
+                &old.initial_dcid,
+            );
+        }
+        if !client_cid.is_empty() {
+            self.by_client_cid.insert(client_cid.to_vec(), key.clone());
+        }
+        if !initial_dcid.is_empty() {
+            self.by_initial_dcid.insert(initial_dcid.to_vec(), key);
+        }
+    }
+
+    /// The route a retransmitted Initial names, if one already carries it: its DCID is the key it arrives under, and a client CID matches the first flight's source id.
+    fn initial_route(&self, dcid: &[u8], peer_cid: &[u8]) -> Option<Vec<u8>> {
+        if let Some(key) = self
+            .by_initial_dcid
+            .get(dcid)
+            .filter(|key| self.routes.contains_key(key.as_slice()))
+        {
+            return Some(key.clone());
+        }
+        if peer_cid.is_empty() {
+            return None;
+        }
+        self.by_client_cid
+            .get(peer_cid)
+            .filter(|key| self.routes.contains_key(key.as_slice()))
+            .cloned()
     }
 
     fn drive(&mut self, dcid: &[u8], packet: &mut [u8], from: SocketAddr) {
@@ -1586,16 +1635,25 @@ impl Router<'_> {
     fn idle_at(&mut self, now: u64) {
         let Self {
             routes,
+            by_client_cid,
+            by_initial_dcid,
             sock,
             udp_idle,
             ..
         } = self;
         let idle_nanos = u64::try_from(udp_idle.as_nanos()).unwrap_or(u64::MAX);
-        routes.retain(|_, inbound| {
+        routes.retain(|key, inbound| {
             let Ok(mut conn) = inbound.conn.lock() else {
                 return true;
             };
             if conn.is_closed() {
+                forget_route(
+                    by_client_cid,
+                    by_initial_dcid,
+                    key,
+                    &inbound.client_cid,
+                    &inbound.initial_dcid,
+                );
                 if let Ok(mut lane) = inbound.udp.lock() {
                     for flow in lane.flows.values() {
                         flow.stop.store(true, Ordering::Relaxed);
@@ -1689,6 +1747,8 @@ pub(crate) fn serve_loop(
         serve,
         udp_idle: Duration::from_secs(config.udp_idle),
         routes: HashMap::new(),
+        by_client_cid: HashMap::new(),
+        by_initial_dcid: HashMap::new(),
     };
     let mut buf = Unfilled::<RECV_ROOM>::new();
     if router.sock.set_read_timeout(Some(ROUTE_POLL)).is_err() {
@@ -1743,6 +1803,30 @@ pub(crate) fn serve_loop(
     }
 }
 
+/// Drop a route's reverse names when they still point at it, so a reaped lane leaves no stale lookup.
+fn forget_route(
+    by_client_cid: &mut HashMap<Vec<u8>, Vec<u8>>,
+    by_initial_dcid: &mut HashMap<Vec<u8>, Vec<u8>>,
+    key: &[u8],
+    client_cid: &[u8],
+    initial_dcid: &[u8],
+) {
+    if !client_cid.is_empty()
+        && by_client_cid
+            .get(client_cid)
+            .is_some_and(|held| held.as_slice() == key)
+    {
+        by_client_cid.remove(client_cid);
+    }
+    if !initial_dcid.is_empty()
+        && by_initial_dcid
+            .get(initial_dcid)
+            .is_some_and(|held| held.as_slice() == key)
+    {
+        by_initial_dcid.remove(initial_dcid);
+    }
+}
+
 fn route_packet(
     router: &mut Router<'_>,
     template: &mut quiche::Config,
@@ -1768,17 +1852,9 @@ fn route_packet(
     let dcid = &dcid_buf[..dcid.len()];
     let peer_cid = &peer_buf[..peer_cid.len()];
     if initial {
-        let known = router.routes.contains_key(dcid);
-        let retransmit = router.routes.iter().find_map(|(key, inbound)| {
-            ((!inbound.initial_dcid.is_empty() && inbound.initial_dcid.as_slice() == dcid)
-                || (!peer_cid.is_empty()
-                    && !inbound.client_cid.is_empty()
-                    && inbound.client_cid.as_slice() == peer_cid))
-                .then(|| key.clone())
-        });
-        if known {
+        if router.routes.contains_key(dcid) {
             router.drive(dcid, packet, from);
-        } else if let Some(key) = retransmit {
+        } else if let Some(key) = router.initial_route(dcid, peer_cid) {
             router.drive(&key, packet, from);
         } else {
             router.accept(packet, from, template, peer_cid, dcid);
@@ -2098,6 +2174,8 @@ mod tests {
                 serve: &handler,
                 udp_idle,
                 routes: by_scid,
+                by_client_cid: HashMap::new(),
+                by_initial_dcid: HashMap::new(),
             };
             router.idle_at(stamp + age);
             stop.load(Ordering::Relaxed)
