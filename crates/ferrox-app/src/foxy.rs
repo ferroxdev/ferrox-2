@@ -1441,7 +1441,10 @@ fn fill_data<S: Read>(
     state: &mut FrameState,
     dst: &mut [u8],
 ) -> std::io::Result<usize> {
-    let want = (state.data_len - state.data_at).min(dst.len() as u32) as usize;
+    let want = state
+        .data_len
+        .saturating_sub(state.data_at)
+        .min(dst.len() as u32) as usize;
     let mut at = 0usize;
     while at < want {
         match io.read(&mut dst[at..want]) {
@@ -1494,7 +1497,8 @@ fn resume_data<S: Read>(
             "foxy: a resumed frame met a caller with no room",
         ));
     }
-    if state.stream == stream {
+    // A frame half staged by an earlier read finishes in `out` even for its owner: the staged half is no longer on the wire, and the direct fill would skip it and leave the staging cursor stale.
+    if state.stream == stream && state.payload_at == 0 {
         fill_data(io, state, dst)?;
         let done = state.data_at == state.data_len;
         let frame = frames::H2Frame {
@@ -1515,7 +1519,7 @@ fn resume_data<S: Read>(
         return Ok((frame, true));
     }
     // The frame in flight belongs to another flow, and its first part is already in that flow's own buffer: the rest is staged here and handed to its owner, so a frame is never split between two readers' answers.
-    let want = (state.data_len - state.data_at) as usize;
+    let want = state.data_len.saturating_sub(state.data_at) as usize;
     crate::proxy::resize_scratch(out, want);
     fill_from(io, out, &mut state.payload_at)?;
     let taken = state.payload_at as u32;
@@ -1559,12 +1563,13 @@ fn read_frame<S: Read>(
     fill_from(io, &mut state.head, &mut state.head_at)?;
     let frame = frames::H2Frame::parse(&state.head)
         .ok_or_else(|| std::io::Error::other("foxy: a header that is not a frame"))?;
-    // Only the reading flow's own stream is delivered straight into the caller's buffer: a frame for another stream has to be staged in that stream's own buffer, and one staged cannot also be handed over here.
+    // Only the reading flow's own stream, with nothing already staged, goes straight into the caller's buffer: a frame for another stream or one a quantum left half staged finishes in `out`, so no staged byte is dropped and `payload_at` never points past the frame.
     if frame.kind == frames::DATA
         && frame.stream == stream
         && frame.length > 0
         && frame.flags & frames::PADDED == 0
         && !dst.is_empty()
+        && state.payload_at == 0
     {
         out.clear();
         state.data_len = frame.length;
@@ -4606,6 +4611,108 @@ mod tests {
             self.at += take;
             Ok(take)
         }
+    }
+
+    /// A `Read` that hands over one queued chunk per call and then times out: a staging that stops mid-payload is a read quantum expiring between two socket reads.
+    struct Chunks {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+    }
+
+    impl Read for Chunks {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let Some(mut chunk) = self.chunks.pop_front() else {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            };
+            let take = chunk.len().min(buf.len());
+            buf[..take].copy_from_slice(&chunk[..take]);
+            if take < chunk.len() {
+                chunk.drain(..take);
+                self.chunks.push_front(chunk);
+            }
+            Ok(take)
+        }
+    }
+
+    /// A DATA frame whose payload was half staged by an earlier read resumes with the staged half, not by restarting the frame: restarting drops those bytes and leaves the staging cursor pointing past the frame that follows.
+    #[test]
+    fn a_half_staged_frame_resumes_instead_of_restarting() {
+        let frame = frames::H2Frame {
+            kind: frames::DATA,
+            flags: 0,
+            stream: 1,
+            length: 8,
+        };
+        let mut state = FrameState::default();
+        let mut out = Vec::new();
+        let mut first = Chunks {
+            chunks: [frame.header().to_vec(), b"abcd".to_vec()]
+                .into_iter()
+                .collect(),
+        };
+        assert!(read_frame(&mut first, &mut state, &mut out, &mut [], 1).is_err());
+        assert_eq!(state.payload_at, 4, "half the payload is staged");
+        let mut second = Chunks {
+            chunks: [b"efgh".to_vec()].into_iter().collect(),
+        };
+        let (resumed, delivered) =
+            read_frame(&mut second, &mut state, &mut out, &mut [0u8; 8], 1).expect("resumes");
+        assert!(
+            !delivered,
+            "the payload lands in `out`, not the caller's buffer"
+        );
+        assert_eq!(resumed.length, 8);
+        assert_eq!(&out[..8], b"abcdefgh", "the staged half is not lost");
+        assert_eq!(state.payload_at, 0, "the staging cursor is spent");
+        assert_eq!(state.data_len, 0);
+        assert_eq!(state.data_at, 0);
+    }
+
+    /// A frame another flow staged part of, resumed by its owner, finishes in `out`: the owner's direct fill would skip the staged bytes and then subtract a cursor past the frame's end.
+    #[test]
+    fn a_frame_another_flow_half_staged_resumes_for_its_owner() {
+        let frame = frames::H2Frame {
+            kind: frames::DATA,
+            flags: 0,
+            stream: 1,
+            length: 8,
+        };
+        let mut state = FrameState::default();
+        let mut out = Vec::new();
+        let mut own = Chunks {
+            chunks: [frame.header().to_vec(), b"abcd".to_vec()]
+                .into_iter()
+                .collect(),
+        };
+        let (first, delivered) =
+            read_frame(&mut own, &mut state, &mut out, &mut [0u8; 4], 1).expect("takes the head");
+        assert!(delivered, "the head lands in the caller's buffer");
+        assert_eq!(first.length, 0, "the frame is not done");
+        let mut other = Chunks {
+            chunks: [b"ef".to_vec()].into_iter().collect(),
+        };
+        assert!(read_frame(&mut other, &mut state, &mut out, &mut [0u8; 8], 2).is_err());
+        assert_eq!(
+            state.payload_at, 2,
+            "the other flow staged half of the rest"
+        );
+        let mut tail = Chunks {
+            chunks: [b"gh".to_vec()].into_iter().collect(),
+        };
+        let (resumed, delivered) =
+            read_frame(&mut tail, &mut state, &mut out, &mut [0u8; 8], 1).expect("resumes");
+        assert!(
+            !delivered,
+            "the payload lands in `out`, not the owner's buffer"
+        );
+        assert_eq!(resumed.length, 4);
+        assert_eq!(
+            &out[..4],
+            b"efgh",
+            "the other flow's staged half is not lost"
+        );
+        assert_eq!(state.payload_at, 0, "the staging cursor is spent");
+        assert_eq!(state.data_len, 0);
+        assert_eq!(state.data_at, 0);
     }
 
     /// An edge that answers in its own record costs one read: the walk used to pay one `Read::read`, and one pass through the record deframer, per octet of the status line.
