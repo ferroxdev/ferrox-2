@@ -405,8 +405,8 @@ pub(crate) const SILENT_HANDSHAKE: Duration = Duration::from_secs(5);
 pub(crate) const IDLE_TIMEOUT_MS: u64 = 300_000;
 
 /// The receive credit an edge may hold against this process at the first byte: quiche parks every delivered byte here until the app reads it, so the advertised window is the memory the edge gets to spend before the first `MAX_STREAM_DATA` update.
-pub(crate) const MAX_DATA: u64 = 16_777_216;
-pub(crate) const MAX_STREAM_DATA: u64 = 4_194_304;
+pub(crate) const MAX_DATA: u64 = 33_554_432;
+pub(crate) const MAX_STREAM_DATA: u64 = 16_777_216;
 pub(crate) const MAX_STREAMS: u64 = 100;
 
 /// The rate every window in this file is sized for, in bytes per second: 1 Gbit/s, the fastest link a lane's own socket is expected to feed.
@@ -2260,7 +2260,7 @@ fn clear_gro(sock: &UdpSocket) {
 /// loss the lane pays for in retransmit timers rather than in packets. The send side is the same number for the
 /// mirror reason: quiche hands the socket a burst of a window's worth of datagrams and a `send_to` the kernel
 /// cannot queue is a datagram quiche has already counted as sent.
-const DATAGRAM_BUFFER: i32 = 1 << 20;
+const DATAGRAM_BUFFER: i32 = 8 << 20;
 
 /// The least the ask has to land as for the lane to be worth reading back: a Linux default already clears it, a macOS and a Windows default do not, which is where the arm is observable.
 #[cfg(test)]
@@ -3337,15 +3337,6 @@ impl Datagram {
     #[cfg(target_os = "linux")]
     pub(crate) fn gso(&self) -> bool {
         self.gso
-    }
-
-    /// Keep the kernel from coalescing reads under a reader that takes one datagram per `recv_from`.
-    pub(crate) fn with_gro(mut self, gro: bool) -> Self {
-        if !gro {
-            clear_gro(&self.sock);
-        }
-        self.gro = gro;
-        self
     }
 
     /// Stop coalescing writes when the config names `disableGSO`; a lane that no longer takes the
