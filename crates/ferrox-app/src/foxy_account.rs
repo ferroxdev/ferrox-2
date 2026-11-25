@@ -1633,6 +1633,15 @@ fn is_padding(c: char) -> bool {
 /// The identity as `FxA` accepts it: padding removed wherever it sits, then lower-cased to the form the stretch salt and the login body must agree on.
 #[must_use]
 fn normalize_identity(email: &str) -> String {
+    if email.is_ascii() {
+        let mut out = String::with_capacity(email.len());
+        for byte in email.bytes() {
+            if !char::from(byte).is_whitespace() {
+                out.push(char::from(byte.to_ascii_lowercase()));
+            }
+        }
+        return out;
+    }
     email
         .chars()
         .filter(|c| !is_padding(*c))
@@ -1887,6 +1896,27 @@ mod tests {
         let mut out = Vec::new();
         out.extend_from_slice(bytes);
         out
+    }
+
+    #[test]
+    fn an_ascii_identity_takes_the_same_path_as_the_unicode_fold() {
+        fn reference(email: &str) -> String {
+            email
+                .chars()
+                .filter(|c| !is_padding(*c))
+                .flat_map(char::to_lowercase)
+                .collect()
+        }
+        for email in [
+            "",
+            "  User@Example.COM \n",
+            "a\u{200B}b@example.com",
+            "İ@example.com",
+            "K@example.com",
+            "\u{FEFF}name\t@example.com\u{3000}",
+        ] {
+            assert_eq!(normalize_identity(email), reference(email), "{email:?}");
+        }
     }
 
     #[test]

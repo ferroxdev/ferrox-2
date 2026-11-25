@@ -409,6 +409,7 @@ struct HostRule {
 pub(crate) struct Resolver {
     servers: Vec<Server>,
     hosts: Vec<HostRule>,
+    needs_lower: bool,
     strategy: Strategy,
     disable_fallback: bool,
     disable_fallback_if_match: bool,
@@ -512,9 +513,14 @@ impl Resolver {
         let cache = (0..servers.len())
             .map(|_| Mutex::new(HashMap::new()))
             .collect();
+        let needs_lower = !hosts.is_empty()
+            || servers
+                .iter()
+                .any(|server| server.implicit_local || server.matcher.is_some());
         Ok(Some(Self {
             servers,
             hosts,
+            needs_lower,
             strategy,
             disable_fallback,
             disable_fallback_if_match,
@@ -634,9 +640,14 @@ impl Resolver {
         if name.is_empty() {
             return Lookup::Failed;
         }
+        let mut lower = if self.hosts.is_empty() {
+            String::new()
+        } else {
+            name.to_ascii_lowercase()
+        };
         let mut followed = 0u8;
         loop {
-            match self.host_lookup(&name, v4, v6) {
+            match self.host_lookup(&name, &lower, v4, v6) {
                 Some(HostAnswer::Ips(ips)) if ips.is_empty() => return Lookup::Empty,
                 Some(HostAnswer::Ips(ips)) => return Lookup::Records(ips, HOSTS_TTL),
                 Some(HostAnswer::Rcode(0)) => return Lookup::Empty,
@@ -644,6 +655,11 @@ impl Resolver {
                 Some(HostAnswer::Alias(next)) if followed < 5 && !next.is_empty() => {
                     name = Cow::Owned(next);
                     followed += 1;
+                    lower = if self.hosts.is_empty() {
+                        String::new()
+                    } else {
+                        name.to_ascii_lowercase()
+                    };
                 }
                 Some(HostAnswer::Alias(_)) | None => break,
             }
@@ -651,17 +667,17 @@ impl Resolver {
         if self.strategy == Strategy::System && !fake_enabled {
             return system_lookup(&name, v4, v6);
         }
-        let needs_lower = !self.hosts.is_empty()
-            || self
-                .servers
-                .iter()
-                .any(|server| server.implicit_local || server.matcher.is_some());
-        let lower = if needs_lower {
-            name.to_ascii_lowercase()
+        if lower.is_empty() && self.needs_lower {
+            lower = name.to_ascii_lowercase();
+        }
+        let mut flags = [false; 32];
+        let mut spill = Vec::new();
+        let used: &mut [bool] = if self.servers.len() <= flags.len() {
+            &mut flags[..self.servers.len()]
         } else {
-            String::new()
+            spill.resize(self.servers.len(), false);
+            spill.as_mut_slice()
         };
-        let mut used = vec![false; self.servers.len()];
         let mut order = Vec::new();
         let mut matched = false;
         for (index, server) in self.servers.iter().enumerate() {
@@ -1232,16 +1248,15 @@ impl Resolver {
         }
     }
 
-    fn host_lookup(&self, name: &str, v4: bool, v6: bool) -> Option<HostAnswer> {
+    fn host_lookup(&self, name: &str, lower: &str, v4: bool, v6: bool) -> Option<HostAnswer> {
         if self.hosts.is_empty() {
             return None;
         }
-        let lower = name.to_ascii_lowercase();
         let mut ips = Vec::new();
         let mut domain = None;
         let mut found = false;
         for rule in &self.hosts {
-            if !rule.matcher.matches(name, &lower) {
+            if !rule.matcher.matches(name, lower) {
                 continue;
             }
             found = true;
@@ -2784,7 +2799,7 @@ mod resolver_tests {
         );
         assert!(resolver.lookup("example.com").is_some());
         assert!(resolver
-            .host_lookup("www.example.com", true, true)
+            .host_lookup("www.example.com", "www.example.com", true, true)
             .is_none());
         assert!(resolver.lookup("a.sub.test").is_some());
     }

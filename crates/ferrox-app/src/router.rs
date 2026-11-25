@@ -4122,14 +4122,18 @@ impl SetRule {
 
 #[derive(Debug)]
 pub(crate) struct DomainMatcher {
-    full: DomainSet,
-    suffix: DomainSet,
-    suffix_only: DomainSet,
+    domains: DomainSet,
     substr: Vec<Arc<str>>,
     ac: Option<aho_corasick::AhoCorasick>,
     regex: Vec<regex::Regex>,
     adguard: Vec<SuccinctSet>,
 }
+
+const DOMAIN_SUFFIX: u8 = 1;
+const DOMAIN_SUFFIX_ONLY: u8 = 2;
+const DOMAIN_FULL: u8 = 4;
+const DOMAIN_TEXT: u8 = DOMAIN_SUFFIX | DOMAIN_SUFFIX_ONLY;
+const DOMAIN_EXACT: u8 = DOMAIN_SUFFIX | DOMAIN_FULL;
 
 const PREFIX_LABEL: u8 = b'\r';
 const ROOT_LABEL: u8 = b'\n';
@@ -4397,7 +4401,7 @@ impl SuccinctSet {
 /// on a hash hit, never trusting the hash alone.
 #[derive(Debug, Default)]
 struct DomainSet {
-    entries: Vec<(u64, Arc<str>)>,
+    entries: Vec<(u64, u8, Arc<str>)>,
     slots: Vec<u32>,
     mask: usize,
 }
@@ -4421,25 +4425,32 @@ fn hash_slot(hash: u64) -> u64 {
 }
 
 impl DomainSet {
-    fn insert(&mut self, value: Arc<str>) {
-        self.entries.push((suffix_hash(value.as_bytes()), value));
+    fn insert(&mut self, kind: u8, value: Arc<str>) {
+        self.entries
+            .push((suffix_hash(value.as_bytes()), kind, value));
     }
 
     fn finish(&mut self) {
         self.entries.sort_unstable_by(|left, right| {
             left.0
                 .cmp(&right.0)
-                .then_with(|| left.1.as_ref().cmp(right.1.as_ref()))
+                .then_with(|| left.2.as_ref().cmp(right.2.as_ref()))
         });
-        self.entries
-            .dedup_by(|left, right| left.0 == right.0 && left.1 == right.1);
+        let mut entries: Vec<(u64, u8, Arc<str>)> = Vec::with_capacity(self.entries.len());
+        for (hash, kind, value) in self.entries.drain(..) {
+            match entries.last_mut() {
+                Some(last) if last.0 == hash && last.2 == value => last.1 |= kind,
+                _ => entries.push((hash, kind, value)),
+            }
+        }
+        self.entries = entries;
         let mut capacity = 8;
         while capacity < self.entries.len().saturating_mul(2) {
             capacity <<= 1;
         }
         self.mask = capacity - 1;
         self.slots = vec![0; capacity];
-        for (at, &(hash, _)) in self.entries.iter().enumerate() {
+        for (at, &(hash, _, _)) in self.entries.iter().enumerate() {
             let mut slot = hash_slot(hash) as usize & self.mask;
             while self.slots[slot] != 0 {
                 slot = (slot + 1) & self.mask;
@@ -4448,7 +4459,9 @@ impl DomainSet {
         }
     }
 
-    fn contains(&self, hash: u64, value: &str) -> bool {
+    fn contains(&self, hash: u64, value: &str, kinds: u8) -> bool {
+        #[cfg(test)]
+        DOMAIN_SET_PROBES.with(|probes| probes.set(probes.get() + 1));
         if self.entries.is_empty() {
             return false;
         }
@@ -4458,8 +4471,8 @@ impl DomainSet {
             if at == 0 {
                 return false;
             }
-            let (entry_hash, entry) = &self.entries[at as usize - 1];
-            if *entry_hash == hash && entry.as_ref() == value {
+            let (entry_hash, entry_kind, entry) = &self.entries[at as usize - 1];
+            if *entry_hash == hash && (*entry_kind & kinds) != 0 && entry.as_ref() == value {
                 return true;
             }
             slot = (slot + 1) & self.mask;
@@ -4468,21 +4481,20 @@ impl DomainSet {
 
     #[cfg(test)]
     fn first(&self) -> Option<&Arc<str>> {
-        self.entries.first().map(|(_, value)| value)
+        self.entries.first().map(|(_, _, value)| value)
     }
 }
 
 #[cfg(test)]
 std::thread_local! {
     static DOMAIN_TABLE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static DOMAIN_SET_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl DomainMatcher {
     pub(crate) fn new() -> Self {
         Self {
-            full: DomainSet::default(),
-            suffix: DomainSet::default(),
-            suffix_only: DomainSet::default(),
+            domains: DomainSet::default(),
             substr: Vec::new(),
             ac: None,
             regex: Vec::new(),
@@ -4491,9 +4503,7 @@ impl DomainMatcher {
     }
 
     pub(crate) fn finish(&mut self) -> Result<(), String> {
-        self.full.finish();
-        self.suffix.finish();
-        self.suffix_only.finish();
+        self.domains.finish();
         if !self.substr.is_empty() {
             self.ac = Some(
                 aho_corasick::AhoCorasick::new(self.substr.iter().map(|value| value.as_bytes()))
@@ -4506,9 +4516,9 @@ impl DomainMatcher {
     fn add(&mut self, kind: DomainKind, value: Arc<str>) -> Result<(), String> {
         match kind {
             DomainKind::Substr => self.substr.push(value),
-            DomainKind::Domain => self.suffix.insert(value),
-            DomainKind::SuffixOnly => self.suffix_only.insert(value),
-            DomainKind::Full => self.full.insert(value),
+            DomainKind::Domain => self.domains.insert(DOMAIN_SUFFIX, value),
+            DomainKind::SuffixOnly => self.domains.insert(DOMAIN_SUFFIX_ONLY, value),
+            DomainKind::Full => self.domains.insert(DOMAIN_FULL, value),
             DomainKind::Regex => {
                 let regex = regex::Regex::new(value.as_ref())
                     .map_err(|error| format!("invalid domain regex `{value}`: {error}"))?;
@@ -4519,17 +4529,19 @@ impl DomainMatcher {
     }
 
     pub(crate) fn only_matches(&self, domain: &str) -> bool {
-        !self.full.entries.is_empty()
-            && self
-                .full
-                .entries
-                .iter()
-                .all(|(_, value)| value.eq_ignore_ascii_case(domain))
-            && self.suffix.entries.is_empty()
-            && self.suffix_only.entries.is_empty()
-            && self.substr.is_empty()
-            && self.regex.is_empty()
-            && self.adguard.is_empty()
+        let mut full = false;
+        for (_, kind, value) in &self.domains.entries {
+            if *kind & (DOMAIN_SUFFIX | DOMAIN_SUFFIX_ONLY) != 0 {
+                return false;
+            }
+            if *kind & DOMAIN_FULL != 0 {
+                full = true;
+                if !value.eq_ignore_ascii_case(domain) {
+                    return false;
+                }
+            }
+        }
+        full && self.substr.is_empty() && self.regex.is_empty() && self.adguard.is_empty()
     }
 
     pub(crate) fn matches(&self, host: &str, lower: &str) -> bool {
@@ -4538,17 +4550,14 @@ impl DomainMatcher {
         let bytes = lower.as_bytes();
         let mut hash = 0u64;
         for at in (0..bytes.len()).rev() {
-            if bytes[at] == b'.'
-                && (self.suffix.contains(hash, &lower[at + 1..])
-                    || self.suffix_only.contains(hash, &lower[at + 1..]))
-            {
+            if bytes[at] == b'.' && self.domains.contains(hash, &lower[at + 1..], DOMAIN_TEXT) {
                 return true;
             }
             hash = hash
                 .wrapping_mul(0x9e37_79b1_85eb_ca87)
                 .wrapping_add(u64::from(bytes[at]));
         }
-        if self.suffix.contains(hash, lower) || self.full.contains(hash, lower) {
+        if self.domains.contains(hash, lower, DOMAIN_EXACT) {
             return true;
         }
         if self.ac.as_ref().is_some_and(|ac| ac.is_match(lower)) {
@@ -5038,14 +5047,14 @@ pub(crate) fn add_domain(
         if rest.is_empty() {
             return Err(format!("domain rule `{value}` is empty"));
         }
-        matcher.suffix.insert(lower_arc(rest));
+        matcher.domains.insert(DOMAIN_SUFFIX, lower_arc(rest));
         return Ok(());
     }
     if let Some(rest) = value.strip_prefix("full:") {
         if rest.is_empty() {
             return Err(format!("domain rule `{value}` is empty"));
         }
-        matcher.full.insert(lower_arc(rest));
+        matcher.domains.insert(DOMAIN_FULL, lower_arc(rest));
         return Ok(());
     }
     if let Some(rest) = value.strip_prefix("keyword:") {
@@ -6329,6 +6338,50 @@ mod tests {
     }
 
     #[test]
+    fn a_suffix_only_entry_skips_the_name_and_a_full_entry_skips_subdomains() {
+        let mut matcher = DomainMatcher::new();
+        matcher
+            .add(DomainKind::SuffixOnly, lower_arc("only.test"))
+            .expect("a suffix");
+        matcher
+            .add(DomainKind::Full, lower_arc("full.test"))
+            .expect("a full name");
+        matcher
+            .add(DomainKind::Domain, lower_arc("both.test"))
+            .expect("a domain");
+        matcher
+            .add(DomainKind::Full, lower_arc("both.test"))
+            .expect("the same name as a full entry");
+        matcher.finish().expect("a finished table");
+        for (name, matched) in [
+            ("only.test", false),
+            ("a.only.test", true),
+            ("full.test", true),
+            ("a.full.test", false),
+            ("both.test", true),
+            ("a.both.test", true),
+        ] {
+            assert_eq!(matcher.matches(name, name), matched, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_domain_match_probes_one_table_per_label() {
+        let mut matcher = DomainMatcher::new();
+        matcher
+            .add(DomainKind::Domain, lower_arc("other.test"))
+            .expect("a domain");
+        matcher.finish().expect("a finished table");
+        let before = DOMAIN_SET_PROBES.with(std::cell::Cell::get);
+        assert!(!matcher.matches("a.b.c.test", "a.b.c.test"));
+        let probes = DOMAIN_SET_PROBES.with(std::cell::Cell::get) - before;
+        assert_eq!(
+            probes, 4,
+            "one probe at each of the three labels and one for the full name"
+        );
+    }
+
+    #[test]
     fn a_rule_matches_every_selector_it_names() {
         let root = object(vec![(
             "routing",
@@ -6481,14 +6534,14 @@ mod tests {
             .domains
             .as_ref()
             .expect("first matcher")
-            .full
+            .domains
             .first()
             .expect("first entry");
         let second = rules[1]
             .domains
             .as_ref()
             .expect("second matcher")
-            .full
+            .domains
             .first()
             .expect("second entry");
         assert_eq!(&**first, "shared.test");

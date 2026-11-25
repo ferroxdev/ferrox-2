@@ -161,21 +161,28 @@ pub(crate) fn normalize_team(raw: &str) -> Option<String> {
     if value.is_empty() {
         return None;
     }
-    for prefix in ["https://", "http://"] {
-        if let Some(rest) = value.strip_prefix(prefix) {
-            value = rest.to_owned();
-        }
+    let prefix = ["https://", "http://"]
+        .iter()
+        .find_map(|prefix| value.strip_prefix(*prefix).map(str::len))
+        .map_or(0, |rest| value.len() - rest);
+    if prefix > 0 {
+        value.drain(..prefix);
     }
-    value = value.trim_end_matches('/').to_owned();
-    if let Some(head) = value.split('/').next() {
-        value = head.to_owned();
+    let end = value.trim_end_matches('/').len();
+    value.truncate(end);
+    if let Some(at) = value.find('/') {
+        value.truncate(at);
     }
-    if let Some(head) = value.strip_suffix(TEAM_DOMAIN_SUFFIX) {
-        value = head.to_owned();
+    if value.ends_with(TEAM_DOMAIN_SUFFIX) {
+        let end = value.len() - TEAM_DOMAIN_SUFFIX.len();
+        value.truncate(end);
     } else if value == TEAM_SUFFIX {
         return None;
     }
-    if value.is_empty() || !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+    let valid = value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
+    if value.is_empty() || !valid {
         return None;
     }
     Some(value)
@@ -185,18 +192,32 @@ fn team_domain(team: &str) -> String {
     format!("https://{team}.{TEAM_SUFFIX}")
 }
 
+fn jwt_segments(token: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = token.split('.');
+    let header = parts.next()?;
+    let payload = parts.next()?;
+    let signature = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((header, payload, signature))
+}
+
 fn looks_like_jwt(token: &str) -> bool {
     let token = token.trim();
     if token.len() < 32 {
         return false;
     }
-    let segments: Vec<&str> = token.split('.').collect();
-    segments.len() == 3
-        && segments.iter().all(|segment| !segment.is_empty())
-        && token
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
-        && decode_segment(segments[0]).is_some()
+    let Some((header, payload, signature)) = jwt_segments(token) else {
+        return false;
+    };
+    let body = token
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'));
+    if header.is_empty() || payload.is_empty() || signature.is_empty() || !body {
+        return false;
+    }
+    decode_segment(header).is_some()
 }
 
 fn decode_segment(segment: &str) -> Option<Vec<u8>> {
@@ -206,11 +227,8 @@ fn decode_segment(segment: &str) -> Option<Vec<u8>> {
 }
 
 fn jwt_expiry(token: &str) -> Option<u64> {
-    let segments: Vec<&str> = token.split('.').collect();
-    if segments.len() != 3 {
-        return None;
-    }
-    let payload = decode_segment(segments[1])?;
+    let (_, payload, _) = jwt_segments(token)?;
+    let payload = decode_segment(payload)?;
     let root = crate::json::parse(&String::from_utf8_lossy(&payload)).ok()?;
     root.get("exp")
         .and_then(crate::json::Json::as_i64)
@@ -218,11 +236,8 @@ fn jwt_expiry(token: &str) -> Option<u64> {
 }
 
 fn jwt_team(token: &str) -> Option<String> {
-    let segments: Vec<&str> = token.split('.').collect();
-    if segments.len() != 3 {
-        return None;
-    }
-    let payload = decode_segment(segments[1])?;
+    let (_, payload, _) = jwt_segments(token)?;
+    let payload = decode_segment(payload)?;
     let root = crate::json::parse(&String::from_utf8_lossy(&payload)).ok()?;
     root.get("iss")
         .and_then(crate::json::Json::as_str)
@@ -284,10 +299,11 @@ fn cookie_expires_at(header: &str) -> Option<u64> {
         let Some((name, value)) = attribute.split_once('=') else {
             continue;
         };
-        match name.trim().to_ascii_lowercase().as_str() {
-            "max-age" => max_age = value.trim().parse::<i64>().ok(),
-            "expires" => expires = Some(value.trim().to_owned()),
-            _ => {}
+        let name = name.trim();
+        if name.eq_ignore_ascii_case("max-age") {
+            max_age = value.trim().parse::<i64>().ok();
+        } else if name.eq_ignore_ascii_case("expires") {
+            expires = Some(value.trim());
         }
     }
     max_age
@@ -298,7 +314,7 @@ fn cookie_expires_at(header: &str) -> Option<u64> {
                 now().saturating_add(u64::try_from(seconds).unwrap_or(u64::MAX))
             }
         })
-        .or_else(|| expires.as_deref().and_then(http_date))
+        .or_else(|| expires.and_then(http_date))
 }
 
 fn issued_token(reply: &Reply) -> Option<String> {
@@ -422,31 +438,51 @@ fn team_nonce(url: &str, team_domain: &str) -> Option<String> {
     query_value(url, "nonce")
 }
 
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn percent_decode(raw: &str) -> String {
     let bytes = raw.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
-        match bytes[index] {
-            b'%' if index + 2 < bytes.len() => {
-                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or("");
-                if let Ok(byte) = u8::from_str_radix(hex, 16) {
-                    out.push(byte);
-                    index += 3;
-                } else {
-                    out.push(b'%');
-                    index += 1;
-                }
-            }
-            b'+' => {
-                out.push(b' ');
-                index += 1;
-            }
-            other => {
-                out.push(other);
-                index += 1;
+        let start = index;
+        while index < bytes.len() && bytes[index] != b'%' && bytes[index] != b'+' {
+            index += 1;
+        }
+        out.extend_from_slice(&bytes[start..index]);
+        if index == bytes.len() {
+            break;
+        }
+        if bytes[index] == b'+' {
+            out.push(b' ');
+            index += 1;
+            continue;
+        }
+        if index + 2 < bytes.len() {
+            let pair = &bytes[index + 1..index + 3];
+            let decoded = hex_nibble(pair[0])
+                .zip(hex_nibble(pair[1]))
+                .map(|(high, low)| (high << 4) | low)
+                .or_else(|| {
+                    std::str::from_utf8(pair)
+                        .ok()
+                        .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+                });
+            if let Some(byte) = decoded {
+                out.push(byte);
+                index += 3;
+                continue;
             }
         }
+        out.push(b'%');
+        index += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
 }
@@ -660,20 +696,33 @@ fn parse_clock(clock: &str) -> Option<(u32, u32, u32)> {
 }
 
 fn month_number(month: &str) -> Option<u32> {
-    match month.get(..3)?.to_ascii_lowercase().as_str() {
-        "jan" => Some(1),
-        "feb" => Some(2),
-        "mar" => Some(3),
-        "apr" => Some(4),
-        "may" => Some(5),
-        "jun" => Some(6),
-        "jul" => Some(7),
-        "aug" => Some(8),
-        "sep" => Some(9),
-        "oct" => Some(10),
-        "nov" => Some(11),
-        "dec" => Some(12),
-        _ => None,
+    let head = month.as_bytes().get(..3)?;
+    if head.eq_ignore_ascii_case(b"jan") {
+        Some(1)
+    } else if head.eq_ignore_ascii_case(b"feb") {
+        Some(2)
+    } else if head.eq_ignore_ascii_case(b"mar") {
+        Some(3)
+    } else if head.eq_ignore_ascii_case(b"apr") {
+        Some(4)
+    } else if head.eq_ignore_ascii_case(b"may") {
+        Some(5)
+    } else if head.eq_ignore_ascii_case(b"jun") {
+        Some(6)
+    } else if head.eq_ignore_ascii_case(b"jul") {
+        Some(7)
+    } else if head.eq_ignore_ascii_case(b"aug") {
+        Some(8)
+    } else if head.eq_ignore_ascii_case(b"sep") {
+        Some(9)
+    } else if head.eq_ignore_ascii_case(b"oct") {
+        Some(10)
+    } else if head.eq_ignore_ascii_case(b"nov") {
+        Some(11)
+    } else if head.eq_ignore_ascii_case(b"dec") {
+        Some(12)
+    } else {
+        None
     }
 }
 
@@ -780,7 +829,7 @@ fn pop_segment(out: &mut String) {
 fn resolve_redirect(current: &str, location: &str) -> Result<String, String> {
     let next = resolve_url(current, location)
         .ok_or_else(|| "warp access: the redirect target is not a usable URL".to_owned())?;
-    if !next.to_ascii_lowercase().starts_with("https://") {
+    if !starts_with_ignore_ascii_case(&next, "https://") {
         return Err("warp access: refusing a redirect away from https".to_owned());
     }
     if next.starts_with("https://") {
@@ -788,6 +837,22 @@ fn resolve_redirect(current: &str, location: &str) -> Result<String, String> {
     }
     let rest = next.split_once("://").map_or("", |(_, rest)| rest);
     Ok(format!("https://{rest}"))
+}
+
+fn domain_matches(host: &str, domain: &str) -> bool {
+    if host.eq_ignore_ascii_case(domain) {
+        return true;
+    }
+    let host = host.as_bytes();
+    let domain = domain.as_bytes();
+    host.len() > domain.len()
+        && host[host.len() - domain.len() - 1] == b'.'
+        && host[host.len() - domain.len()..].eq_ignore_ascii_case(domain)
+}
+
+fn starts_with_ignore_ascii_case(text: &str, prefix: &str) -> bool {
+    text.get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
 struct Cookie {
@@ -808,13 +873,12 @@ impl Cookie {
         let Some(host) = url_host(url) else {
             return false;
         };
-        let host = host.to_ascii_lowercase();
         let domain = if self.host_only {
-            host == self.domain
+            host.eq_ignore_ascii_case(&self.domain)
         } else {
-            host == self.domain || host.ends_with(&format!(".{}", self.domain))
+            domain_matches(host, &self.domain)
         };
-        if !domain || (self.secure && !url.to_ascii_lowercase().starts_with("https://")) {
+        if !domain || (self.secure && !starts_with_ignore_ascii_case(url, "https://")) {
             return false;
         }
         let path = url_path(url);
@@ -930,29 +994,25 @@ impl Session {
                 let Some((name, value)) = attribute.split_once('=') else {
                     continue;
                 };
-                match name.trim().to_ascii_lowercase().as_str() {
-                    "domain" => {
-                        let value = value.trim().trim_start_matches('.').to_ascii_lowercase();
-                        if !value.is_empty() {
-                            domain = Some(value);
-                        }
+                let name = name.trim();
+                if name.eq_ignore_ascii_case("domain") {
+                    let value = value.trim().trim_start_matches('.').to_ascii_lowercase();
+                    if !value.is_empty() {
+                        domain = Some(value);
                     }
-                    "path" => {
-                        let value = value.trim();
-                        if value.starts_with('/') {
-                            path = Some(value.to_owned());
-                        }
+                } else if name.eq_ignore_ascii_case("path") {
+                    let value = value.trim();
+                    if value.starts_with('/') {
+                        path = Some(value.to_owned());
                     }
-                    "max-age" => max_age = value.trim().parse::<i64>().ok(),
-                    "expires" => expires = Some(value.trim().to_owned()),
-                    _ => {}
+                } else if name.eq_ignore_ascii_case("max-age") {
+                    max_age = value.trim().parse::<i64>().ok();
+                } else if name.eq_ignore_ascii_case("expires") {
+                    expires = Some(value.trim().to_owned());
                 }
             }
             let (domain, host_only) = match domain {
-                Some(domain)
-                    if domain.contains('.')
-                        && (host == domain || host.ends_with(&format!(".{domain}"))) =>
-                {
+                Some(domain) if domain.contains('.') && domain_matches(&host, &domain) => {
                     (domain, false)
                 }
                 Some(_) => continue,
@@ -1400,6 +1460,15 @@ mod tests {
     }
 
     #[test]
+    fn a_team_url_is_reduced_with_one_allocation() {
+        let (team, counts) = ferrox_core::alloc_count::measure(|| {
+            normalize_team("https://My-Org.cloudflareaccess.com/warp")
+        });
+        assert_eq!(team.as_deref(), Some("my-org"));
+        assert_eq!(counts.allocs, 1, "the fold took a copy: {counts:?}");
+    }
+
+    #[test]
     fn an_empty_or_malformed_team_is_rejected() {
         assert_eq!(normalize_team("   "), None);
         assert_eq!(normalize_team("bad name!"), None);
@@ -1713,6 +1782,23 @@ mod tests {
             )
             .expect("a foreign request");
         assert!(!leaked.get());
+    }
+
+    #[test]
+    fn a_cookie_match_allocates_nothing() {
+        let cookie = Cookie {
+            name: "CF_Authorization".to_owned(),
+            value: "a-token".to_owned(),
+            domain: "cloudflareaccess.com".to_owned(),
+            host_only: false,
+            path: "/".to_owned(),
+            secure: true,
+            expires_at: None,
+        };
+        let url = "https://ACME.CloudflareAccess.com/cdn-cgi/access/callback";
+        let (matched, counts) = ferrox_core::alloc_count::measure(|| cookie.matches(url));
+        assert!(matched);
+        assert_eq!(counts.allocs, 0, "a match took a copy: {counts:?}");
     }
 
     #[test]
@@ -2377,6 +2463,48 @@ mod tests {
             extract_totp_form_action(page).as_deref(),
             Some("https://acme.cloudflareaccess.com/right")
         );
+    }
+
+    #[test]
+    fn percent_decoding_is_byte_identical_to_the_reference() {
+        fn reference(raw: &str) -> String {
+            let bytes = raw.as_bytes();
+            let mut out = Vec::with_capacity(bytes.len());
+            let mut index = 0;
+            while index < bytes.len() {
+                match bytes[index] {
+                    b'%' if index + 2 < bytes.len() => {
+                        let pair = &bytes[index + 1..index + 3];
+                        let hex = std::str::from_utf8(pair).unwrap_or("");
+                        if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                            out.push(byte);
+                            index += 3;
+                        } else {
+                            out.push(b'%');
+                            index += 1;
+                        }
+                    }
+                    b'+' => {
+                        out.push(b' ');
+                        index += 1;
+                    }
+                    other => {
+                        out.push(other);
+                        index += 1;
+                    }
+                }
+            }
+            String::from_utf8_lossy(&out).into_owned()
+        }
+        for raw in [
+            "", "a%20b", "%", "%2", "%20", "%2f", "%2F", "%+1", "%-0", "%+f", "%--", "%zz", "a+b",
+            "%C3%A9", "%c3%28", "é", "%é", "%E9", "%00%00", "a%23b", "%FF", "%0", "%0g", "%+",
+            "%-",
+        ] {
+            assert_eq!(percent_decode(raw), reference(raw), "{raw}");
+        }
+        let long = format!("{}%20{}", "a".repeat(4096), "b".repeat(4096));
+        assert_eq!(percent_decode(&long), reference(&long));
     }
 
     #[test]
