@@ -7110,6 +7110,53 @@ mod tests {
         );
     }
 
+    /// A dial that names v2 sends the bait on its own socket before the first v1 packet: a v1-only server answers the bait with a version negotiation and the handshake then fails on its own terms.
+    #[test]
+    fn a_quic_v2_dial_sends_the_bait_before_the_handshake() {
+        let server = UdpSocket::bind("127.0.0.1:0").expect("the server");
+        let address = server.local_addr().expect("the address");
+        let recorder = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&recorder);
+        let responder = std::thread::spawn(move || {
+            let _ = server.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut bait = [0u8; 2048];
+            let Ok((read, from)) = server.recv_from(&mut bait) else {
+                return;
+            };
+            seen.lock()
+                .expect("the record")
+                .extend_from_slice(&bait[..read]);
+            let dcid = bait[6..14].to_vec();
+            let scid = bait[15..23].to_vec();
+            let mut negotiation = vec![0xc0, 0, 0, 0, 0];
+            negotiation.push(scid.len() as u8);
+            negotiation.extend_from_slice(&scid);
+            negotiation.push(dcid.len() as u8);
+            negotiation.extend_from_slice(&dcid);
+            negotiation.extend_from_slice(&1u32.to_be_bytes());
+            let _ = server.send_to(&negotiation, from);
+        });
+        let dial = QuicDial {
+            id: [0; 16],
+            host: std::sync::Arc::from("localhost"),
+            address: std::sync::Arc::from("127.0.0.1"),
+            port: address.port(),
+            upstream: None,
+            roots: None,
+            ech_config_list: None,
+            default_cc: None,
+            quic_v2: true,
+        };
+        assert!(build_pooled_within(&dial, Duration::from_millis(300)).is_none());
+        responder.join().expect("the responder");
+        let seen = recorder.lock().expect("the record");
+        assert_eq!(seen.len(), QUIC_V2_BAIT_LEN);
+        assert_eq!(
+            u32::from_be_bytes([seen[1], seen[2], seen[3], seen[4]]),
+            QUIC_V2_VERSION
+        );
+    }
+
     #[test]
     fn a_hysteria_dial_presents_the_parrots_zero_length_source_id() {
         let parrot = ferrox_core::hysteria::QuicParams::default();
