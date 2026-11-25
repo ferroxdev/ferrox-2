@@ -3829,7 +3829,7 @@ mod tests {
     /// A connected flow drops the dial timeout that bounds only its handshake.
     #[test]
     fn an_established_flow_clears_the_dial_timeout() {
-        let (mut stack, _packets, _app) = established_client();
+        let (stack, _packets, _app) = established_client();
         let socket = stack.sockets.get::<TcpSocket>(stack.flows[0].handle);
         assert!(
             socket.timeout().is_none(),
