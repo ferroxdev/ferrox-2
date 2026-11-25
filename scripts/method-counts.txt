@@ -1265,6 +1265,15 @@ warp masque-sweep-seeds 10 warp_scan::tests::the_reference_sweep_counts_are_the_
 warp masque-sweep-ports 7 warp_scan::tests::the_reference_sweep_counts_are_the_documented_ones
 warp last-edge-cap 8 warp_scan::tests::the_last_edge_keeps_one_entry_per_carrier_and_is_bounded
 warp ironclad-status 204 warp::tests::an_http_status_line_is_read_not_guessed
+warp team-code-attempts 3 zerotrust::tests::a_rejected_code_is_tried_three_times
+warp team-install-id-length 22 zerotrust::tests::an_install_id_is_twenty_two_alphanumerics
+warp team-registration-fields 8 warp::tests::a_team_registration_posts_the_managed_shape
+warp gateway-ports 2 warp::tests::only_http_and_https_use_the_gateway
+warp gateway-connect-status 200 warp::tests::a_connect_status_line_is_read_not_guessed
+warp gateway-proxy-key gatewayProxy warp::tests::a_team_identity_keeps_the_gateway_across_a_save
+warp syscalls-per-registration-record UNBLESSED no syscall checker
+warp copies-per-registration-record UNBLESSED no copy checker yet
+warp seconds-per-registration UNBLESSED CI bench.yml (no WARP registration cell)
 warp mim-inner-datagram-v4 1252 ferrox-app-warp::tests::the_mim_inner_budget_subtracts_the_headers_and_the_masque_overhead
 warp mim-inner-mtu-v4 1182 ferrox-app-warp::tests::the_mim_inner_budget_subtracts_the_headers_and_the_masque_overhead
 warp noize-wireguard-profiles 6 noize::tests::six_wireguard_profiles_keep_six_shapes

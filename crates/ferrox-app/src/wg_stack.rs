@@ -143,6 +143,8 @@ pub(crate) struct ClientFlow {
     pub(crate) destinations: Vec<SocketAddr>,
     pub(crate) prefix: Vec<u8>,
     pub(crate) lease: Option<FlowLease>,
+    pub(crate) ready: Option<std::sync::mpsc::SyncSender<bool>>,
+    pub(crate) cancelled: Option<Arc<AtomicBool>>,
 }
 
 /// Counts a live flow against the lane that carried it, and gives the count back when the
@@ -460,6 +462,7 @@ struct Flow {
     established: bool,
     done: bool,
     lease: Option<FlowLease>,
+    cancelled: Option<Arc<AtomicBool>>,
 }
 
 impl Flow {
@@ -480,6 +483,7 @@ impl Flow {
             established: false,
             done: false,
             lease: None,
+            cancelled: None,
         }
     }
 
@@ -1738,6 +1742,23 @@ impl ClientStack {
 
     /// Race a client flow's destinations and keep the first connected socket.
     fn connect(&mut self, mut flow: ClientFlow) -> std::io::Result<()> {
+        let ready = flow.ready.take();
+        if flow
+            .cancelled
+            .as_ref()
+            .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
+        {
+            return Ok(());
+        }
+        let result = self.connect_flow(flow);
+        if let Some(ready) = ready {
+            let _ = ready.send(result.is_ok());
+        }
+        result
+    }
+
+    /// Set up one flow after its readiness listener is taken.
+    fn connect_flow(&mut self, mut flow: ClientFlow) -> std::io::Result<()> {
         flow.client.set_nonblocking(true)?;
         let mut candidates = Vec::new();
         let mut refused = None;
@@ -1769,6 +1790,7 @@ impl ClientStack {
             socket.set_nagle_enabled(false);
             socket.set_ack_delay(None);
             socket.set_congestion_control(CongestionControl::Cubic);
+            socket.set_timeout(Some(crate::budgets::dial().into()));
             if let Err(error) = socket.connect(
                 self.iface.context(),
                 IpEndpoint::from(*destination),
@@ -1795,6 +1817,7 @@ impl ClientStack {
         routed.races = candidates;
         routed.pending_up = flow.prefix;
         routed.lease = flow.lease.take();
+        routed.cancelled = flow.cancelled;
         self.flows.push(routed);
         Ok(())
     }
@@ -1821,6 +1844,16 @@ impl ClientStack {
         let mut retiring = std::mem::take(&mut self.retiring);
         let mut moved = false;
         for (flow, &up_ready) in self.flows.iter_mut().zip(ready) {
+            if flow
+                .cancelled
+                .as_ref()
+                .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
+            {
+                self.sockets.get_mut::<TcpSocket>(flow.handle).abort();
+                flow.done = true;
+                moved = true;
+                continue;
+            }
             flow.adopt(
                 &mut self.sockets,
                 &mut self.ports,
@@ -2356,6 +2389,9 @@ fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, up_ready: bool) -> bool {
     let mut moved = false;
     let socket = sockets.get_mut::<TcpSocket>(flow.handle);
     if matches!(socket.state(), State::Established | State::CloseWait) {
+        if !flow.established {
+            socket.set_timeout(None);
+        }
         flow.established = true;
     }
     if socket.state() == State::Closed && !flow.established {
@@ -3773,6 +3809,8 @@ mod tests {
                 destinations: vec!["192.0.2.1:80".parse().expect("destination")],
                 prefix: Vec::new(),
                 lease: None,
+                ready: None,
+                cancelled: None,
             })
             .expect("connect");
         stack.poll();
@@ -3792,6 +3830,115 @@ mod tests {
         );
         while packets.try_recv().is_ok() {}
         (stack, packets, app, syn)
+    }
+
+    /// A flow the stack cannot set up reports that failure to its caller.
+    #[test]
+    fn a_flow_that_cannot_be_set_up_reports_failure() {
+        let (mut stack, _packets, _app) = established_client();
+        let (_client, proxy) = loopback().expect("pair");
+        let (ready, wait) = std::sync::mpsc::sync_channel(1);
+        let result = stack.connect(ClientFlow {
+            client: proxy,
+            destinations: vec!["192.0.2.1:0".parse().expect("destination")],
+            prefix: Vec::new(),
+            lease: None,
+            ready: Some(ready),
+            cancelled: None,
+        });
+        assert!(result.is_err(), "port zero is not a TCP endpoint");
+        assert!(
+            !wait
+                .recv_timeout(Duration::from_secs(1))
+                .expect("the setup result"),
+            "the stack reported a failed flow as ready"
+        );
+    }
+
+    /// An abandoned flow releases its client without opening a tunnel socket.
+    #[test]
+    fn an_abandoned_flow_does_not_open_a_socket() {
+        let (_app, proxy) = loopback().expect("pair");
+        let (to_tunnel, packets) = std::sync::mpsc::channel();
+        let mut stack = ClientStack::new(&device(&["10.0.0.2"], true), to_tunnel, 0);
+        let result = stack.connect(ClientFlow {
+            client: proxy,
+            destinations: vec!["192.0.2.1:80".parse().expect("destination")],
+            prefix: Vec::new(),
+            lease: None,
+            ready: None,
+            cancelled: Some(Arc::new(AtomicBool::new(true))),
+        });
+        assert!(result.is_ok(), "an abandoned flow is not a setup failure");
+        assert!(stack.flows.is_empty(), "no socket was opened");
+        assert!(packets.try_recv().is_err(), "no SYN was sent");
+    }
+
+    /// A flow abandoned after it opened its socket releases that socket and its port.
+    #[test]
+    fn an_abandoned_flow_is_retired_after_connect() {
+        let (_app, proxy) = loopback().expect("pair");
+        let (to_tunnel, packets) = std::sync::mpsc::channel();
+        let mut stack = ClientStack::new(&device(&["10.0.0.2"], true), to_tunnel, 0);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        stack
+            .connect(ClientFlow {
+                client: proxy,
+                destinations: vec!["192.0.2.1:80".parse().expect("destination")],
+                prefix: Vec::new(),
+                lease: None,
+                ready: None,
+                cancelled: Some(cancelled.clone()),
+            })
+            .expect("connect");
+        stack.poll();
+        assert_eq!(stack.flows.len(), 1);
+        let port = stack.flows[0].local_port;
+        assert!(packets.try_recv().is_ok(), "the client sent its SYN");
+        cancelled.store(true, Ordering::Release);
+        stack.poll();
+        assert!(stack.flows.is_empty(), "the abandoned flow was retired");
+        assert!(!stack.ports.contains(&port), "its local port was released");
+    }
+
+    /// A connect the destination never answers is retired by its timeout.
+    #[test]
+    fn an_unanswered_connect_is_retired_by_its_timeout() {
+        let (_app, proxy) = loopback().expect("pair");
+        let (to_tunnel, _packets) = std::sync::mpsc::channel();
+        let mut stack = ClientStack::new(&device(&["10.0.0.2"], true), to_tunnel, 0);
+        stack
+            .connect(ClientFlow {
+                client: proxy,
+                destinations: vec!["192.0.2.1:80".parse().expect("destination")],
+                prefix: Vec::new(),
+                lease: None,
+                ready: None,
+                cancelled: None,
+            })
+            .expect("connect");
+        stack.poll();
+        assert_eq!(stack.flows.len(), 1);
+        let port = stack.flows[0].local_port;
+        let advance = crate::budgets::dial() + Duration::from_millis(1);
+        stack.started = stack
+            .started
+            .checked_sub(advance)
+            .expect("the simulated dial timeout fits before the stack origin");
+        stack.poll();
+        assert!(stack.flows.is_empty(), "the unanswered connect timed out");
+        assert!(!stack.ports.contains(&port), "its local port was released");
+    }
+
+    /// A connected flow drops the dial timeout that bounds only its handshake.
+    #[test]
+    fn an_established_flow_clears_the_dial_timeout() {
+        let (stack, _packets, _app) = established_client();
+        let socket = stack.sockets.get::<TcpSocket>(stack.flows[0].handle);
+        assert!(
+            socket.timeout().is_none(),
+            "the dial timeout survived establishment"
+        );
     }
 
     /// An upload is read straight into the socket's transmit ring: the reader
@@ -3937,6 +4084,8 @@ mod tests {
                 destinations: vec!["192.0.2.1:80".parse().expect("destination")],
                 prefix: Vec::new(),
                 lease: None,
+                ready: None,
+                cancelled: None,
             })
             .expect("connect");
         stack.poll();
@@ -4862,6 +5011,8 @@ mod tests {
                 destinations: vec!["192.0.2.1:80".parse().expect("destination")],
                 prefix: Vec::new(),
                 lease: None,
+                ready: None,
+                cancelled: None,
             })
             .expect("connect");
         stack.poll();
@@ -4884,6 +5035,8 @@ mod tests {
                 destinations: vec!["192.0.2.1:80".parse().expect("destination")],
                 prefix: Vec::new(),
                 lease: None,
+                ready: None,
+                cancelled: None,
             })
             .expect("connect");
         stack.poll();
@@ -6123,6 +6276,8 @@ mod client_tests {
                 destinations: vec!["192.0.2.1:80".parse().expect("destination")],
                 prefix: Vec::new(),
                 lease: None,
+                ready: None,
+                cancelled: None,
             })
             .expect("connect");
         stack.poll();

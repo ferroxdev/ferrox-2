@@ -31328,7 +31328,7 @@ fn serve_connect_at(
         return;
     }
     if let Outbound::Masque(masque) = out {
-        masque.serve_tcp(client, asked, prefix);
+        masque.serve_tcp(client, asked, prefix, None);
         return;
     }
     if let Outbound::Warp(warp) = out {

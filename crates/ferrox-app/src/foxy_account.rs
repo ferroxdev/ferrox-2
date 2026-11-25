@@ -5,12 +5,14 @@ use crate::foxy_challenge::{self, Jar};
 use ferrox_core::foxy::account::{self, Signed};
 use ferrox_core::foxy::{edge_peer, Failure, Pass};
 use ferrox_core::tls::{TlsConfig, TlsProvider as _};
+use std::borrow::Cow;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::SocketAddr;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(20);
+const ASK_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const USER_AGENT: &str = "MozillaVPN/2.35.0 (sys:linux; iap:true)";
 pub(crate) const JSON_ACCEPT: &str = "application/json";
 const MAX_HEAD: usize = 16 * 1024;
@@ -496,7 +498,10 @@ pub(crate) fn read_reply_limited<S: Read>(
 ) -> Result<Reply, Failure> {
     let mut io = BufReader::with_capacity(1024, io);
     let mut reply = read_head(&mut io)?;
-    if matches!(reply.status, 204 | 304) || (100..200).contains(&reply.status) {
+    while (100..200).contains(&reply.status) && reply.status != 101 {
+        reply = read_head(&mut io)?;
+    }
+    if matches!(reply.status, 101 | 204 | 304) {
         return Ok(reply);
     }
     reply.body = read_body(&mut io, &reply.headers, chunk, max_body)?;
@@ -835,9 +840,19 @@ impl Endpoint {
             Some(at) => (&rest[..at], rest[at..].trim_end_matches('/')),
             None => (rest, ""),
         };
-        let (host, port) = match hostport.rsplit_once(':') {
-            Some((host, port)) => (host, port.parse().ok()?),
-            None => (hostport, 443),
+        let (host, port) = match hostport.strip_prefix('[') {
+            Some(rest) => {
+                let (host, after) = rest.split_once(']')?;
+                let port = match after {
+                    "" => 443,
+                    tail => tail.strip_prefix(':')?.parse().ok()?,
+                };
+                (host, port)
+            }
+            None => match hostport.rsplit_once(':') {
+                Some((host, port)) => (host, port.parse().ok()?),
+                None => (hostport, 443),
+            },
         };
         if host.is_empty() {
             return None;
@@ -910,8 +925,22 @@ impl Endpoint {
 
     /// The `Host`/`:authority` value: a fronted request names the origin, not the edge it dials.
     #[must_use]
-    pub(crate) fn host_header(&self) -> &str {
-        self.host_header.as_deref().unwrap_or(&self.host)
+    pub(crate) fn host_header(&self) -> Cow<'_, str> {
+        if let Some(header) = &self.host_header {
+            return Cow::Borrowed(header);
+        }
+        if self.host.contains(':') {
+            return Cow::Owned(if self.port == 443 {
+                format!("[{}]", self.host)
+            } else {
+                format!("[{}]:{}", self.host, self.port)
+            });
+        }
+        if self.port == 443 {
+            Cow::Borrowed(&self.host)
+        } else {
+            Cow::Owned(format!("{}:{}", self.host, self.port))
+        }
     }
 
     /// Where a request goes: the origin's own prefix, then the path.
@@ -1031,6 +1060,26 @@ impl Endpoint {
         &self,
         cfg: &TlsConfig,
     ) -> Result<ferrox_core::tls::ClientSession<Connection>, String> {
+        let stream = self.connect_stream(cfg)?;
+        self.handshake(cfg, stream)
+    }
+
+    fn connect_within(
+        &self,
+        cfg: &TlsConfig,
+        deadline: Instant,
+    ) -> Result<ferrox_core::tls::ClientSession<DeadlineConnection>, String> {
+        let stream = self.connect_stream(cfg)?;
+        self.handshake(
+            cfg,
+            DeadlineConnection {
+                inner: stream,
+                deadline,
+            },
+        )
+    }
+
+    fn connect_stream(&self, cfg: &TlsConfig) -> Result<Connection, String> {
         let edge = self.dial_edge();
         let stream = if let Some(proxy) = &self.upstream {
             crate::foxy::tcp_via(proxy, &edge.0, edge.1)
@@ -1053,12 +1102,74 @@ impl Endpoint {
             .fragment
             .as_ref()
             .map(|fragment| ferrox_core::finalmask::Chain::default().with_front(fragment));
-        let stream = stream.with_mask(cut.as_ref());
+        Ok(stream.with_mask(cut.as_ref()))
+    }
+
+    fn handshake<S>(
+        &self,
+        cfg: &TlsConfig,
+        stream: S,
+    ) -> Result<ferrox_core::tls::ClientSession<S>, String>
+    where
+        S: ferrox_core::tls::Stream + ferrox_core::tls::RecordAlignment,
+    {
         let mut tls = ferrox_core::tls::connect(cfg, stream)
             .map_err(|why| format!("tls {}: {why}", self.host))?;
         tls.handshake()
             .map_err(|why| format!("handshake {}: {why}", self.host))?;
         Ok(tls)
+    }
+}
+
+struct DeadlineConnection {
+    inner: Connection,
+    deadline: Instant,
+}
+
+impl DeadlineConnection {
+    fn remaining(&self) -> std::io::Result<Duration> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the request deadline passed",
+            ));
+        }
+        Ok(left.max(Duration::from_millis(1)))
+    }
+}
+
+impl Read for DeadlineConnection {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.set_read_until(Some(self.deadline));
+        self.inner.set_read_timeout(Some(self.remaining()?))?;
+        self.inner.read(buf)
+    }
+}
+
+impl Write for DeadlineConnection {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.set_write_timeout(Some(self.remaining()?))?;
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.set_write_timeout(Some(self.remaining()?))?;
+        self.inner.flush()
+    }
+}
+
+impl ferrox_core::tls::RecordAlignment for DeadlineConnection {
+    fn engage_record_alignment(&mut self) {
+        ferrox_core::tls::RecordAlignment::engage_record_alignment(&mut self.inner);
+    }
+
+    fn disarm_record_alignment(&mut self) {
+        ferrox_core::tls::RecordAlignment::disarm_record_alignment(&mut self.inner);
+    }
+
+    fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
+        ferrox_core::tls::RecordAlignment::write_all_slices(&mut self.inner, parts)
     }
 }
 
@@ -1114,14 +1225,7 @@ impl H2Connection {
         let mut fields: Vec<(String, String)> = Vec::with_capacity(headers.len() + 4);
         fields.push((":method".to_owned(), method.to_owned()));
         fields.push((":scheme".to_owned(), "https".to_owned()));
-        let authority = if endpoint.host_header.is_some() {
-            endpoint.host_header().to_owned()
-        } else if endpoint.port == 443 {
-            endpoint.host.clone()
-        } else {
-            format!("{}:{}", endpoint.host, endpoint.port)
-        };
-        fields.push((":authority".to_owned(), authority));
+        fields.push((":authority".to_owned(), endpoint.host_header().into_owned()));
         fields.push((":path".to_owned(), path.to_owned()));
         for (name, value) in headers {
             let lower = name.to_ascii_lowercase();
@@ -1314,10 +1418,10 @@ pub(crate) fn ask(
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> Result<Reply, String> {
-    ask_limited(endpoint, method, url, headers, body, MAX_BODY)
+    ask_limited(endpoint, method, url, headers, body, MAX_BODY, ASK_TIMEOUT)
 }
 
-/// One request whose declared body may exceed the page-sized default.
+/// One request whose declared body may exceed the page-sized default, bounded by an absolute budget.
 pub(crate) fn ask_limited(
     endpoint: &Endpoint,
     method: &str,
@@ -1325,13 +1429,52 @@ pub(crate) fn ask_limited(
     headers: &[(&str, &str)],
     body: &[u8],
     max_body: usize,
+    budget: Duration,
 ) -> Result<Reply, String> {
-    let mut tls = endpoint.connect()?;
-    tls.write_all(&request(method, endpoint.host_header(), url, headers, body))
-        .and_then(|()| tls.flush())
-        .map_err(|why| format!("writing {} {url}: {why}", endpoint.host))?;
+    ask_limited_within(endpoint, method, url, headers, body, max_body, budget)
+}
+
+/// One request bounded by an absolute deadline, so a peer that drips its answer cannot hold the caller past its budget.
+pub(crate) fn ask_within(
+    endpoint: &Endpoint,
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    budget: Duration,
+) -> Result<Reply, String> {
+    ask_limited_within(endpoint, method, url, headers, body, MAX_BODY, budget)
+}
+
+fn ask_limited_within(
+    endpoint: &Endpoint,
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    max_body: usize,
+    budget: Duration,
+) -> Result<Reply, String> {
+    let deadline = Instant::now() + budget;
+    let diagnostic = url.split(['?', '#']).next().unwrap_or(url);
+    let mut tls = endpoint.connect_within(&endpoint.tls(), deadline)?;
+    if deadline.saturating_duration_since(Instant::now()).is_zero() {
+        return Err(format!(
+            "reading {} {diagnostic}: the request deadline passed before the connection opened",
+            endpoint.host
+        ));
+    }
+    tls.write_all(&request(
+        method,
+        &endpoint.host_header(),
+        url,
+        headers,
+        body,
+    ))
+    .and_then(|()| tls.flush())
+    .map_err(|why| format!("writing {} {diagnostic}: {why}", endpoint.host))?;
     read_reply_limited(&mut tls, DEFAULT_READ_CHUNK, max_body)
-        .map_err(|why| format!("reading {} {url}: {why}", endpoint.host))
+        .map_err(|why| format!("reading {} {diagnostic}: {why}", endpoint.host))
 }
 
 /// One GET whose body is written to a file, so an interrupted transfer leaves what arrived for the next Range request.
@@ -1347,9 +1490,15 @@ pub(crate) fn ask_to_file(
     max_body: usize,
 ) -> Result<Reply, String> {
     let mut tls = endpoint.connect()?;
-    tls.write_all(&request(method, endpoint.host_header(), url, headers, body))
-        .and_then(|()| tls.flush())
-        .map_err(|why| format!("writing {} {url}: {why}", endpoint.host))?;
+    tls.write_all(&request(
+        method,
+        &endpoint.host_header(),
+        url,
+        headers,
+        body,
+    ))
+    .and_then(|()| tls.flush())
+    .map_err(|why| format!("writing {} {url}: {why}", endpoint.host))?;
     let mut io = BufReader::with_capacity(1024, &mut tls);
     let reply =
         read_head(&mut io).map_err(|why| format!("reading {} {url}: {why}", endpoint.host))?;
@@ -1421,7 +1570,7 @@ pub(crate) fn ask_head(
     headers: &[(&str, &str)],
 ) -> Result<Reply, String> {
     let mut tls = endpoint.connect()?;
-    tls.write_all(&request("HEAD", endpoint.host_header(), url, headers, &[]))
+    tls.write_all(&request("HEAD", &endpoint.host_header(), url, headers, &[]))
         .and_then(|()| tls.flush())
         .map_err(|why| format!("writing {} {url}: {why}", endpoint.host))?;
     let mut io = BufReader::with_capacity(1024, &mut tls);
@@ -1899,6 +2048,16 @@ mod tests {
     }
 
     #[test]
+    fn an_informational_response_is_consumed_before_the_final_one() {
+        let raw = piped(
+            b"HTTP/1.1 103 Early Hints\r\nLink: </x>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        );
+        let reply = read_reply(&mut raw.as_slice(), DEFAULT_READ_CHUNK).expect("reads");
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.body, b"ok");
+    }
+
+    #[test]
     fn a_body_written_to_a_file_keeps_the_bytes_in_order() {
         let dir = std::env::temp_dir().join(format!("ferrox-body-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
@@ -2117,6 +2276,30 @@ mod tests {
                 .port,
             8443
         );
+    }
+
+    #[test]
+    fn a_bracketed_ipv6_authority_keeps_its_port_apart_from_the_address() {
+        let endpoint = Endpoint::parse("https://[2001:db8::1]", Vec::new().into()).expect("parses");
+        assert_eq!(endpoint.host, "2001:db8::1");
+        assert_eq!(endpoint.port, 443);
+        assert_eq!(
+            endpoint.address,
+            Some("[2001:db8::1]:443".parse().expect("addr"))
+        );
+        assert_eq!(endpoint.host_header().as_ref(), "[2001:db8::1]");
+        let endpoint =
+            Endpoint::parse("https://[2001:db8::1]:8443", Vec::new().into()).expect("parses");
+        assert_eq!(endpoint.host, "2001:db8::1");
+        assert_eq!(endpoint.port, 8443);
+        assert_eq!(
+            endpoint.address,
+            Some("[2001:db8::1]:8443".parse().expect("addr"))
+        );
+        assert_eq!(endpoint.host_header().as_ref(), "[2001:db8::1]:8443");
+        let head = String::from_utf8(request_head("GET", &endpoint.host_header(), "/", &[], 0))
+            .expect("ascii");
+        assert!(head.contains("\r\nHost: [2001:db8::1]:8443\r\n"));
     }
 
     #[test]

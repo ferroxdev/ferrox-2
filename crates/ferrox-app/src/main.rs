@@ -114,6 +114,7 @@ mod xhttp_h2;
 mod xhttp_h3;
 mod xmux;
 mod xray_pb;
+mod zerotrust;
 
 use ferrox_core::policy::UnsafeOptIn;
 use ferrox_core::transport::Support;
@@ -156,7 +157,10 @@ fn usage() -> ! {
     eprintln!("        [--mode auto|wireguard|masque|gool|gool-classic|mim] [--gool-classic] [--wiw-outer ADDR] [--wiw-inner ADDR] [--mim-outer ADDR] [--mim-inner ADDR] [--noize off|light|firewall|balanced|gfw|aggressive] [--no-profile-retry] [--no-quic-v2]");
     eprintln!("        [--fragment] [--fragment-size N|A-B] [--fragment-delay N|A-B] [--tls-ciphers LIST] [--tls-groups LIST] [--disable-grease] [--ech auto|BASE64] [--ech-dns URL] [--ech-domain NAME] [--masque-sni NAME]");
     eprintln!(
-        "                                with --register, make the kind's identities and print them; without it, register one device, save the identity (0600 on Unix), print the outbound"
+        "        [--team NAME] [--access-id ID] [--access-secret SECRET] [--access-token JWT] [--access-email ADDR] [--gateway]"
+    );
+    eprintln!(
+        "                                with --register, make the kind's identities and print them; without it, register the mode's device or devices (one for a single hop; both the outer and inner device for gool, gool-classic, or mim), save the identity (0600 on Unix), print the outbound. --team enrols a managed device (name, subdomain of cloudflareaccess.com; sign-in from these flags or AETHER_* env; with --team, the AETHER_ACCESS_CLIENT_* pair applies only when AETHER_TEAM names that same team, so otherwise pass --access-id and --access-secret). --gateway sends TCP ports 80 and 443 through the organization proxy when --register is omitted; a registered slot enables it with `team: \"<team>\"` and `gateway: true` in the outbound. Both forms need a MASQUE carrier (masque, gool, mim, or auto with the MASQUE half); without one, ports 80 and 443 carry direct. A proxy that refuses or times out is retired and those flows fall back to the direct tunnel, so --gateway does not guarantee traffic stays behind the organization proxy. Gateway routing also needs a managed team identity with a published organization proxy; a personal identity routes directly"
     );
     eprintln!(
         "  ferrox-app browser-login --email ADDR --token-file PATH [--code CODE] [--no-open]"

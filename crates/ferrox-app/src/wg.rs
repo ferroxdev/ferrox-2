@@ -389,6 +389,8 @@ impl WireGuardOut {
                 destinations,
                 prefix: prefix.to_vec(),
                 lease: None,
+                ready: None,
+                cancelled: None,
             })
             .is_err()
         {
@@ -1031,6 +1033,8 @@ impl WireGuardOut {
                 destinations: vec![SocketAddr::new(server, self.dns_port)],
                 prefix: Vec::new(),
                 lease: None,
+                ready: None,
+                cancelled: None,
             })
             .is_err()
         {

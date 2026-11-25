@@ -156,6 +156,8 @@ pub(crate) struct MasqueOut {
     inner: Mutex<Slot>,
     dialing: AtomicUsize,
     dialed: Condvar,
+    #[cfg(test)]
+    queued: AtomicUsize,
 }
 
 /// Releases a dial reservation on every exit, including an unwind after a failed lane setup.
@@ -255,12 +257,15 @@ impl Drop for Inner {
 /// the key WARP signs with.
 impl std::fmt::Debug for MasqueOut {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MasqueOut")
+        let mut debug = f.debug_struct("MasqueOut");
+        debug
             .field("spec", &self.spec)
             .field("inner", &self.inner)
             .field("dialing", &self.dialing)
-            .field("dialed", &self.dialed)
-            .finish()
+            .field("dialed", &self.dialed);
+        #[cfg(test)]
+        debug.field("queued", &self.queued);
+        debug.finish()
     }
 }
 
@@ -277,8 +282,15 @@ impl MasqueOut {
             }),
             dialing: AtomicUsize::new(0),
             dialed: Condvar::new(),
+            #[cfg(test)]
+            queued: AtomicUsize::new(0),
             spec,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queued(&self) -> usize {
+        self.queued.load(Ordering::Relaxed)
     }
 
     pub(crate) fn edge(&self) -> Option<SocketAddr> {
@@ -570,17 +582,34 @@ impl MasqueOut {
         }
     }
 
-    pub(crate) fn serve_tcp(&self, client: Connection, asked: &Destination, prefix: &[u8]) {
+    pub(crate) fn serve_tcp(
+        &self,
+        client: Connection,
+        asked: &Destination,
+        prefix: &[u8],
+        ready: Option<std::sync::mpsc::SyncSender<bool>>,
+    ) -> bool {
+        self.serve_tcp_cancellable(client, asked, prefix, ready, None)
+    }
+
+    pub(crate) fn serve_tcp_cancellable(
+        &self,
+        client: Connection,
+        asked: &Destination,
+        prefix: &[u8],
+        ready: Option<std::sync::mpsc::SyncSender<bool>>,
+        cancelled: Option<Arc<AtomicBool>>,
+    ) -> bool {
         let (inner, lease) = match self.ensure_flow_at(Instant::now(), || open(&self.spec, false)) {
             Ok(lane) => lane,
             Err(reason) => {
                 eprintln!("masque: {reason}");
-                return;
+                return false;
             }
         };
         let Some(destination) = self.resolve(&inner, asked) else {
             eprintln!("masque: destination `{asked:?}` does not resolve");
-            return;
+            return false;
         };
         if inner
             .flows
@@ -589,11 +618,17 @@ impl MasqueOut {
                 destinations: vec![destination],
                 prefix: prefix.to_vec(),
                 lease: Some(lease),
+                ready,
+                cancelled,
             })
             .is_err()
         {
             eprintln!("masque: the userspace stack is gone");
+            return false;
         }
+        #[cfg(test)]
+        self.queued.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     /// A data-plane probe for the auto race: the tunnel answers a DNS name
@@ -6223,11 +6258,40 @@ mod tests {
         let (mut app, _) = listener.accept().expect("accept");
         app.set_read_timeout(Some(Duration::from_secs(20)))
             .expect("timeout");
-        masque.serve_tcp(Connection::from(tun), &Destination::Address(target), &[]);
+        masque.serve_tcp(
+            Connection::from(tun),
+            &Destination::Address(target),
+            &[],
+            None,
+        );
         app.write_all(b"hello").expect("write");
         let mut answer = [0u8; 5];
         app.read_exact(&mut answer).expect("read");
         assert_eq!(&answer, b"hello");
+    }
+
+    #[test]
+    fn a_queued_flow_that_cannot_be_set_up_reports_failure() {
+        let (_inbound, port) = serve("127.0.0.1:9");
+        let masque = MasqueOut::new(&outbound(port)).expect("outbound");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("pair");
+        let tun = std::net::TcpStream::connect(listener.local_addr().expect("pair address"))
+            .expect("connect");
+        let (_app, _) = listener.accept().expect("accept");
+        let target: SocketAddr = "192.0.2.1:0".parse().expect("a target");
+        let (ready, wait) = std::sync::mpsc::sync_channel(1);
+        assert!(masque.serve_tcp(
+            Connection::from(tun),
+            &Destination::Address(target),
+            &[],
+            Some(ready),
+        ));
+        assert!(
+            !wait
+                .recv_timeout(Duration::from_secs(20))
+                .expect("the setup result"),
+            "the queued flow reported a failed setup as ready"
+        );
     }
 
     #[test]
@@ -6264,7 +6328,12 @@ mod tests {
         let (mut app, _) = listener.accept().expect("accept");
         app.set_read_timeout(Some(Duration::from_secs(20)))
             .expect("timeout");
-        masque.serve_tcp(Connection::from(tun), &Destination::Address(target), &[]);
+        masque.serve_tcp(
+            Connection::from(tun),
+            &Destination::Address(target),
+            &[],
+            None,
+        );
         app.write_all(b"hello").expect("write");
         let mut answer = [0u8; 5];
         app.read_exact(&mut answer).expect("read");
@@ -6303,7 +6372,12 @@ mod tests {
         let (mut app, _) = listener.accept().expect("accept");
         app.set_read_timeout(Some(Duration::from_secs(20)))
             .expect("timeout");
-        masque.serve_tcp(Connection::from(tun), &Destination::Address(target), &[]);
+        masque.serve_tcp(
+            Connection::from(tun),
+            &Destination::Address(target),
+            &[],
+            None,
+        );
         app.write_all(b"hello").expect("write");
         let mut answer = [0u8; 5];
         app.read_exact(&mut answer).expect("read");
@@ -6350,7 +6424,12 @@ mod tests {
         let (mut app, _) = listener.accept().expect("accept");
         app.set_read_timeout(Some(Duration::from_secs(20)))
             .expect("timeout");
-        masque.serve_tcp(Connection::from(tun), &Destination::Address(target), &[]);
+        masque.serve_tcp(
+            Connection::from(tun),
+            &Destination::Address(target),
+            &[],
+            None,
+        );
         let pattern: Vec<u8> = (0..chunk).map(|byte| (byte % 251) as u8).collect();
         let mut answer = vec![0u8; chunk];
         for _ in 0..rounds {
@@ -6403,7 +6482,12 @@ mod tests {
         let (mut app, _) = listener.accept().expect("accept");
         app.set_read_timeout(Some(Duration::from_secs(20)))
             .expect("timeout");
-        masque.serve_tcp(Connection::from(tun), &Destination::Address(target), &[]);
+        masque.serve_tcp(
+            Connection::from(tun),
+            &Destination::Address(target),
+            &[],
+            None,
+        );
         let mut answer = vec![0u8; payload.len()];
         let mut got = 0;
         while got < answer.len() {
