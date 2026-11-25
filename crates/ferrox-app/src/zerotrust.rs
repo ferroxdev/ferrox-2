@@ -113,12 +113,12 @@ impl TeamSettings {
             client_id: if ambient_credentials {
                 pick(client_id, "AETHER_ACCESS_CLIENT_ID", &env)
             } else {
-                client_id.map(str::to_owned)
+                trimmed(client_id)
             },
             client_secret: if ambient_credentials {
                 pick(client_secret, "AETHER_ACCESS_CLIENT_SECRET", &env)
             } else {
-                client_secret.map(str::to_owned)
+                trimmed(client_secret)
             },
             token,
             email: pick(email, "AETHER_ACCESS_EMAIL", &env),
@@ -138,19 +138,18 @@ impl TeamSettings {
     }
 }
 
-fn pick<F>(value: Option<&str>, key: &str, env: &F) -> Option<String>
-where
-    F: Fn(&str) -> Option<String>,
-{
+fn trimmed(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .map(str::to_owned)
-        .or_else(|| {
-            env(key)
-                .map(|text| text.trim().to_owned())
-                .filter(|text| !text.is_empty())
-        })
+}
+
+fn pick<F>(value: Option<&str>, key: &str, env: &F) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    trimmed(value).or_else(|| env(key).and_then(|text| trimmed(Some(&text))))
 }
 
 pub(crate) fn normalize_team(raw: &str) -> Option<String> {
@@ -1449,6 +1448,24 @@ mod tests {
             .expect("the matching team")
             .expect("settings");
         assert!(matching.has_service_token());
+    }
+
+    #[test]
+    fn blank_explicit_service_token_fields_do_not_select_service_auth() {
+        let settings = TeamSettings::from_parts_with(
+            Some("acme"),
+            Some("  "),
+            Some(""),
+            None,
+            Some("me@example.com"),
+            |_| None,
+        )
+        .expect("the explicit team")
+        .expect("settings");
+        assert_eq!(settings.client_id, None);
+        assert_eq!(settings.client_secret, None);
+        assert!(!settings.has_service_token());
+        assert_eq!(settings.email.as_deref(), Some("me@example.com"));
     }
 
     #[test]

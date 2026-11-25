@@ -461,6 +461,7 @@ struct Flow {
     established: bool,
     done: bool,
     lease: Option<FlowLease>,
+    cancelled: Option<Arc<AtomicBool>>,
 }
 
 impl Flow {
@@ -481,6 +482,7 @@ impl Flow {
             established: false,
             done: false,
             lease: None,
+            cancelled: None,
         }
     }
 
@@ -1771,6 +1773,7 @@ impl ClientStack {
             socket.set_nagle_enabled(false);
             socket.set_ack_delay(None);
             socket.set_congestion_control(CongestionControl::Cubic);
+            socket.set_timeout(Some(crate::budgets::dial()));
             if let Err(error) = socket.connect(
                 self.iface.context(),
                 IpEndpoint::from(*destination),
@@ -1797,6 +1800,7 @@ impl ClientStack {
         routed.races = candidates;
         routed.pending_up = flow.prefix;
         routed.lease = flow.lease.take();
+        routed.cancelled = flow.cancelled;
         self.flows.push(routed);
         Ok(())
     }
@@ -1823,6 +1827,16 @@ impl ClientStack {
         let mut retiring = std::mem::take(&mut self.retiring);
         let mut moved = false;
         for (flow, &up_ready) in self.flows.iter_mut().zip(ready) {
+            if flow
+                .cancelled
+                .as_ref()
+                .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
+            {
+                self.sockets.get_mut::<TcpSocket>(flow.handle).abort();
+                flow.done = true;
+                moved = true;
+                continue;
+            }
             flow.adopt(
                 &mut self.sockets,
                 &mut self.ports,
@@ -3751,6 +3765,58 @@ mod tests {
         assert!(result.is_ok(), "an abandoned flow is not a setup failure");
         assert!(stack.flows.is_empty(), "no socket was opened");
         assert!(packets.try_recv().is_err(), "no SYN was sent");
+    }
+
+    /// A flow abandoned after it opened its socket releases that socket and its port.
+    #[test]
+    fn an_abandoned_flow_is_retired_after_connect() {
+        let (_app, proxy) = loopback().expect("pair");
+        let (to_tunnel, packets) = std::sync::mpsc::channel();
+        let mut stack = ClientStack::new(&device(&["10.0.0.2"], true), to_tunnel, 0);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        stack
+            .connect(ClientFlow {
+                client: proxy,
+                destinations: vec!["192.0.2.1:80".parse().expect("destination")],
+                prefix: Vec::new(),
+                lease: None,
+                ready: None,
+                cancelled: Some(cancelled.clone()),
+            })
+            .expect("connect");
+        stack.poll();
+        assert_eq!(stack.flows.len(), 1);
+        let port = stack.flows[0].local_port;
+        assert!(packets.try_recv().is_ok(), "the client sent its SYN");
+        cancelled.store(true, Ordering::Release);
+        stack.poll();
+        assert!(stack.flows.is_empty(), "the abandoned flow was retired");
+        assert!(!stack.ports.contains(&port), "its local port was released");
+    }
+
+    /// A connect the destination never answers is retired by its timeout.
+    #[test]
+    fn an_unanswered_connect_is_retired_by_its_timeout() {
+        let (_app, proxy) = loopback().expect("pair");
+        let (to_tunnel, _packets) = std::sync::mpsc::channel();
+        let mut stack = ClientStack::new(&device(&["10.0.0.2"], true), to_tunnel, 0);
+        stack
+            .connect(ClientFlow {
+                client: proxy,
+                destinations: vec!["192.0.2.1:80".parse().expect("destination")],
+                prefix: Vec::new(),
+                lease: None,
+                ready: None,
+                cancelled: None,
+            })
+            .expect("connect");
+        stack.poll();
+        assert_eq!(stack.flows.len(), 1);
+        let port = stack.flows[0].local_port;
+        stack.started = StdInstant::now() - crate::budgets::dial() - Duration::from_millis(1);
+        stack.poll();
+        assert!(stack.flows.is_empty(), "the unanswered connect timed out");
+        assert!(!stack.ports.contains(&port), "its local port was released");
     }
 
     /// An upload is read straight into the socket's transmit ring: the reader
