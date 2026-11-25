@@ -1028,6 +1028,7 @@ impl Client {
                 at = 0;
             } else if at >= READ_ROOM {
                 pending.drain(..at);
+                self.wire.init = self.wire.init.saturating_sub(at);
                 at = 0;
             }
         }
@@ -1458,6 +1459,7 @@ impl Session {
                 at = 0;
             } else if at >= READ_ROOM {
                 pending.drain(..at);
+                wire.init = wire.init.saturating_sub(at);
                 at = 0;
             }
             wire.at = at;

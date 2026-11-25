@@ -554,6 +554,7 @@ impl UotPacketReader {
         loop {
             if let Some((target, payload, used)) = parse_uot_packet(&self.buf, connect, fixed)? {
                 self.buf.drain(..used);
+                self.init = self.init.saturating_sub(used);
                 return Ok(Some((target, payload)));
             }
             if self.buf.len() > 70_000 {
@@ -4254,6 +4255,26 @@ mod tests {
             ferrox_core::alloc_count::measure(|| packets.next(&mut recording, false, None));
         assert!(end.expect("read").is_none());
         assert_eq!(counts.allocs, 0, "the end of the stream allocates nothing");
+    }
+
+    #[test]
+    fn a_second_uot_packet_moves_the_watermark_back() {
+        let mut bytes = vec![0u8, 192, 0, 2, 1, 0, 53, 0, 3, 0xAA, 0xBB, 0xCC];
+        bytes.extend_from_slice(&bytes.clone());
+        let mut recording = std::io::Cursor::new(bytes);
+        let mut packets = UotPacketReader::default();
+        let first = packets
+            .next(&mut recording, false, None)
+            .expect("read")
+            .expect("packet");
+        assert_eq!(first.1, [0xAA, 0xBB, 0xCC]);
+        assert_eq!(packets.init, 4096 - 12, "the consumed prefix left the room");
+        let second = packets
+            .next(&mut recording, false, None)
+            .expect("read")
+            .expect("packet");
+        assert_eq!(second.1, [0xAA, 0xBB, 0xCC]);
+        assert_eq!(packets.init, 4096 - 24, "the watermark follows every drain");
     }
 
     #[test]
