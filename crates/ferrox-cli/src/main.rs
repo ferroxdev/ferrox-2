@@ -284,11 +284,19 @@ fn write_lane_config(
     Ok(generated.hidden_socks)
 }
 
-#[cfg(unix)]
-fn prepare_warp_identity(options: &Options, paths: &Paths, bin: &Path) -> Result<(), String> {
-    let warp_used = options.outbound == Some(Outbound::Warp)
+fn warp_identity_needed(options: &Options) -> bool {
+    options.outbound == Some(Outbound::Warp)
         || (options.warp && options.upstream.is_empty())
-        || options.udp_via == "warp";
+        || options.udp_via == "warp"
+}
+
+#[cfg(unix)]
+fn prepare_warp_identity(
+    warp_used: bool,
+    options: &Options,
+    paths: &Paths,
+    bin: &Path,
+) -> Result<(), String> {
     if !options.vpn || !warp_used || unsafe { libc::geteuid() } == 0 {
         return Ok(());
     }
@@ -317,7 +325,12 @@ fn prepare_warp_identity(options: &Options, paths: &Paths, bin: &Path) -> Result
 }
 
 #[cfg(not(unix))]
-fn prepare_warp_identity(options: &Options, _paths: &Paths, _bin: &Path) -> Result<(), String> {
+fn prepare_warp_identity(
+    _warp_used: bool,
+    options: &Options,
+    _paths: &Paths,
+    _bin: &Path,
+) -> Result<(), String> {
     let _ = options;
     Ok(())
 }
@@ -385,6 +398,7 @@ fn up_once(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
             "--upstream names the hop, so --warp is not applied; WARP rides --udp-via warp only."
         );
     }
+    let warp_used = warp_identity_needed(options);
     let hidden_socks = match write_lane_config(options, paths, ports, account.as_ref()) {
         Ok(port) => port,
         Err(error) => {
@@ -392,7 +406,7 @@ fn up_once(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
             return 1;
         }
     };
-    if let Err(error) = prepare_warp_identity(options, paths, &bin) {
+    if let Err(error) = prepare_warp_identity(warp_used, options, paths, &bin) {
         eprintln!("ferrox-cli: {error}");
         return 1;
     }
@@ -1358,6 +1372,28 @@ mod tests {
         assert!(reject_empty_fronts(&options).is_err());
         options.outbound = Some(Outbound::Config);
         assert!(reject_empty_fronts(&options).is_ok());
+    }
+
+    #[test]
+    fn warp_identity_is_needed_before_the_hidden_front_rewrites_upstream() {
+        let mut options = Options {
+            outbound: Some(Outbound::Warp),
+            ..Options::default()
+        };
+        assert!(warp_identity_needed(&options));
+        options.outbound = Some(Outbound::Foxy);
+        options.warp = true;
+        assert!(warp_identity_needed(&options));
+        options.upstream = "socks5://127.0.0.1:1".to_owned();
+        assert!(!warp_identity_needed(&options));
+        options.upstream.clear();
+        options.outbound = Some(Outbound::Psiphon);
+        assert!(warp_identity_needed(&options));
+        options.warp = false;
+        options.udp_via = "warp".to_owned();
+        assert!(warp_identity_needed(&options));
+        options.udp_via.clear();
+        assert!(!warp_identity_needed(&options));
     }
 
     #[test]

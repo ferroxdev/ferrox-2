@@ -2821,8 +2821,7 @@ impl WarpOut {
             return Ok(Self::unbuilt(&spec));
         };
         let inner_identity = resolve_for_mode(&mut spec, &mut identity, test)?;
-        if test && spec.mode == Mode::Gool {
-            validate_gool(&identity, &spec)?;
+        if test && validate_test_lane(&spec, &identity, inner_identity.as_ref())? {
             return Ok(Self::unbuilt(&spec));
         }
         let wireguard = if matches!(
@@ -3352,6 +3351,19 @@ impl MimOut {
     }
 }
 
+fn mim_remote(outer_edge: Option<SocketAddr>, spec: &WarpSpec) -> Result<SocketAddr, String> {
+    spec.mim
+        .inner
+        .or_else(|| {
+            let outer_ip = outer_edge.map(|edge| edge.ip());
+            let mode = spec.scan.unwrap_or(ScanMode::Balanced);
+            warp_scan::masque_candidates(mode)
+                .into_iter()
+                .find(|edge| Some(edge.ip()) != outer_ip)
+        })
+        .ok_or("warp mim: no second MASQUE edge is known for the inner hop".to_owned())
+}
+
 fn build_mim(
     identity: &Identity,
     inner_identity: &Identity,
@@ -3361,19 +3373,45 @@ fn build_mim(
         return Err("warp mim: the outer identity has no MASQUE key".to_owned());
     }
     let outer = build_masque(identity, spec)?;
-    let outer_edge = outer.edge();
-    let remote = spec
-        .mim
-        .inner
-        .or_else(|| {
-            let outer_ip = outer_edge.map(|edge| edge.ip());
-            let mode = spec.scan.unwrap_or(ScanMode::Balanced);
-            warp_scan::masque_candidates(mode)
-                .into_iter()
-                .find(|edge| Some(edge.ip()) != outer_ip)
-        })
-        .ok_or("warp mim: no second MASQUE edge is known for the inner hop")?;
+    let remote = mim_remote(outer.edge(), spec)?;
     MimOut::new(outer, inner_identity, spec, remote)
+}
+
+/// The test dial validates both MASQUE halves without binding the forwarder `MimOut::new` opens.
+fn validate_mim(
+    identity: &Identity,
+    inner_identity: &Identity,
+    spec: &WarpSpec,
+) -> Result<(), String> {
+    if identity.masque.is_none() {
+        return Err("warp mim: the outer identity has no MASQUE key".to_owned());
+    }
+    let outer = build_masque(identity, spec)?;
+    let remote = mim_remote(outer.edge(), spec)?;
+    let datagram = mim_inner_datagram(spec.mtu, remote)?;
+    let mtu = mim_inner_mtu(datagram);
+    let local = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+    let outbound = mim_outbound(inner_identity, spec, local, mtu, datagram)?;
+    crate::masque::MasqueOut::new(&outbound)?;
+    Ok(())
+}
+
+fn validate_test_lane(
+    spec: &WarpSpec,
+    identity: &Identity,
+    inner: Option<&Identity>,
+) -> Result<bool, String> {
+    match spec.mode {
+        Mode::Gool => {
+            validate_gool(identity, spec)?;
+            Ok(true)
+        }
+        Mode::Mim => {
+            validate_mim(identity, inner.ok_or("warp mim: no inner identity")?, spec)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 /// The inner hop's datagram budget: the outer MTU less the IP and UDP headers
@@ -4649,6 +4687,24 @@ mod tests {
                 .and_then(crate::json::Json::as_u32),
             Some(u32::from(DEFAULT_MTU))
         );
+    }
+
+    #[test]
+    fn the_mim_test_dial_validates_both_halves_without_the_forwarder() {
+        let key = rcgen::KeyPair::generate().expect("a MASQUE key");
+        let identity = Identity {
+            masque: Some(MasqueIdentity {
+                private: key.serialize_der(),
+                server: decode_pem(&key.public_key_pem()).expect("the server key"),
+                addresses: vec!["172.16.0.2".parse().expect("a v4 address")],
+            }),
+            ..sample_identity()
+        };
+        let mut spec = sample_spec();
+        spec.mode = Mode::Mim;
+        spec.masque_address = "127.0.0.1".to_owned();
+        spec.mim.inner = Some("192.0.2.9:443".parse().expect("the inner edge"));
+        validate_mim(&identity, &identity, &spec).expect("both MASQUE halves build");
     }
 
     #[test]

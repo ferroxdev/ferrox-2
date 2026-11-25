@@ -1009,43 +1009,54 @@ def check_udp_split(state: pathlib.Path) -> int:
         if len(same.get("outbounds", [])) != 1 or "routing" in same:
             raise AssertionError(f"udp-via foxy emitted a second lane: {same!r}")
 
-        snapshot.unlink(missing_ok=True)
-        subprocess.run(
-            [
-                str(CLI),
-                "up",
-                "--warp",
-                "--warp-mode",
-                "gool-classic",
-                "--fronts",
-                "socks",
-                "--socks",
-                str(free_port()),
-            ],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=WATCH,
-            env=env,
-        )
-        if not snapshot.exists():
-            raise AssertionError("no config was written for the WARP lane")
-        direct_warp = json.loads(snapshot.read_text(encoding="utf-8"))
-        if len(direct_warp.get("outbounds", [])) != 1:
-            raise AssertionError(f"the WARP lane is not a single outbound: {direct_warp!r}")
-        warp_lane = direct_warp["outbounds"][0]
-        if warp_lane.get("protocol") != "warp" or "tag" in warp_lane:
-            raise AssertionError(f"the WARP lane is not an untagged warp outbound: {warp_lane!r}")
-        settings = warp_lane.get("settings", {})
-        if settings.get("mode") != "gool-classic" or settings.get("scan") != "balanced":
-            raise AssertionError(f"the nested WireGuard lane did not request its scan: {settings!r}")
-        if not settings.get("identityFile", "").endswith("warp-identity.json"):
-            raise AssertionError(f"the WARP lane has no identity file: {settings!r}")
-        if "routing" in direct_warp or any(
-            inbound.get("tag") == "ferrox-warp-hop"
-            for inbound in direct_warp.get("inbounds", [])
-        ):
-            raise AssertionError(f"the WARP lane chained itself: {direct_warp!r}")
+        for mode in ("auto", "wireguard", "masque", "gool", "gool-classic", "mim"):
+            snapshot.unlink(missing_ok=True)
+            subprocess.run(
+                [
+                    str(CLI),
+                    "up",
+                    "--warp",
+                    "--warp-mode",
+                    mode,
+                    "--fronts",
+                    "socks",
+                    "--socks",
+                    str(free_port()),
+                ],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=WATCH,
+                env=env,
+            )
+            if not snapshot.exists():
+                raise AssertionError(f"no config was written for the {mode} WARP lane")
+            direct_warp = json.loads(snapshot.read_text(encoding="utf-8"))
+            if len(direct_warp.get("outbounds", [])) != 1:
+                raise AssertionError(
+                    f"the {mode} WARP lane is not a single outbound: {direct_warp!r}"
+                )
+            warp_lane = direct_warp["outbounds"][0]
+            if warp_lane.get("protocol") != "warp" or "tag" in warp_lane:
+                raise AssertionError(
+                    f"the {mode} WARP lane is not an untagged warp outbound: {warp_lane!r}"
+                )
+            settings = warp_lane.get("settings", {})
+            if settings.get("mode") != mode:
+                raise AssertionError(
+                    f"the {mode} lane named mode {settings.get('mode')!r}: {settings!r}"
+                )
+            if (settings.get("scan") == "balanced") != (mode == "gool-classic"):
+                raise AssertionError(
+                    f"the {mode} lane did not request exactly its scan: {settings!r}"
+                )
+            if not settings.get("identityFile", "").endswith("warp-identity.json"):
+                raise AssertionError(f"the {mode} WARP lane has no identity file: {settings!r}")
+            if "routing" in direct_warp or any(
+                inbound.get("tag") == "ferrox-warp-hop"
+                for inbound in direct_warp.get("inbounds", [])
+            ):
+                raise AssertionError(f"the {mode} WARP lane chained itself: {direct_warp!r}")
     except AssertionError as why:
         print(f"check-cli-lane: {why}", file=sys.stderr)
         return 1
