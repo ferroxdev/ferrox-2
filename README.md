@@ -89,6 +89,7 @@ printf '%s %s %s %s\n' '<doc>' '<key>' '<value>' '<checker>' >> scripts/method-c
 | REALITY / TLS | [reality-tls](docs/function/reality-tls.md) | per handshake | per handshake | `UNBLESSED` | `vless-tls-raw-*` arm (CI) |
 | KCP | [kcp](docs/function/kcp.md) | 1 sendto per segment | in place, pooled | `UNBLESSED` | not measured |
 | dokodemo-door inbound | [front-dokodemo](docs/function/front-dokodemo.md) | 1 send + 1 recv per datagram; 1 recvmsg + 1 sendto per transparent datagram | 1 (the relay's own) + 1 reply socket per transparent `(client, original)` | `UNBLESSED` | not measured |
+| redirect + tproxy inbounds | [front-redirect](docs/function/front-redirect.md) | the door's transparent ladders; not measured | the door's lane; a reply socket per transparent `(client, original)`; not measured | `UNBLESSED` | not measured |
 | health observatory + `leastPing`/`leastLoad` | [engine-observatory](docs/function/engine-observatory.md) | 1 dial per probe | 0 per sample put | `UNBLESSED` | not measured |
 | healthcheck inbound | [front-healthcheck](docs/function/front-healthcheck.md) | 1 answer write | 0 (prebuilt) | `UNBLESSED` | not measured |
 | SOCKS5 + SOCKS4, both roles | [socks](docs/function/socks.md) | 2–3 writes + 3–4 reads per dial | 1 (the relay's own) | `UNBLESSED` | not measured |
@@ -297,7 +298,7 @@ Today exactly one method dials per hop. The chaining engine builds stacks as an 
 | # | method | state | notes | supported today by |
 | --- | --- | --- | --- | --- |
 | 134 | mixed (HTTP + SOCKS) inbound | implemented | — | sing-box `protocol/mixed/`; one-byte sniff between SOCKS and HTTP |
-| 135 | redirect + tproxy inbounds | planned | — | sing-box `protocol/redirect/`; Leaf `proxy/redirect/` (the origin-destination spelling, inbound and outbound) |
+| 135 | redirect + tproxy inbounds | implemented | Both roles the method has: dedicated `redirect` (tcp, `SO_ORIGINAL_DST`/`DIOCNATLOOK`) and `tproxy` (tcp plus udp on Linux, `IP_TRANSPARENT`/`IP_BINDANY`, network list defaults both and drops udp where no transparent datagram listener exists), reusing the dokodemo transparent path; Leaf's `redirect` outbound reads `address`/`port` into a freedom redirect. | sing-box `protocol/redirect/`; Leaf `proxy/redirect/` (the origin-destination spelling, inbound and outbound) |
 | 136 | NaïveProxy | planned | — | sing-box `protocol/naive/`; LxBox `naive+https://` |
 | 137 | AnyTLS | implemented — both roles, TCP flows, session reuse; UDP-over-stream not carried | Both roles over TLS or plain TCP inbound; `sha256(password)` prologue, v2 settings, the default padding scheme, `SYN`/`PSH`/`FIN`/`SYNACK`, `UPDATE_PADDING_SCHEME`, `SERVER_SETTINGS`; outbound reads `settings.servers` or the flat settings and pools up to eight idle sessions. UoT is not carried, so UDP flows are not advertised. | sing-box `protocol/anytls/`; [page](docs/function/anytls.md). Row 23 is the link parse |
 | 138 | ShadowTLS | planned | — | sing-box `protocol/shadowtls/` |

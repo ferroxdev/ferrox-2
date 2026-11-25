@@ -2842,6 +2842,23 @@ impl Listener {
     pub(crate) fn incoming(&self) -> Incoming<'_> {
         Incoming { listener: self }
     }
+
+    /// A second handle on a TCP listener, so a stop can shut the socket down without dialing it.
+    #[cfg(unix)]
+    pub(crate) fn tcp_clone(&self) -> Option<std::net::TcpListener> {
+        match self {
+            Listener::Tcp(listener) => listener.try_clone().ok(),
+            #[cfg(any(unix, windows))]
+            Listener::Unix { .. } => None,
+        }
+    }
+}
+
+/// Wake a blocked `accept` on a listening socket without dialing the address it holds.
+#[cfg(unix)]
+pub(crate) fn shutdown_listener(listener: &std::net::TcpListener) {
+    use std::os::fd::AsRawFd as _;
+    let _ = unsafe { libc::shutdown(listener.as_raw_fd(), libc::SHUT_RDWR) };
 }
 
 /// The accepted connections of a `Listener`, one family or the other.
