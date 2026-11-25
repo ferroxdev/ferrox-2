@@ -1582,13 +1582,12 @@ impl Router<'_> {
                 if id < FIRST_FLOW_STREAM || id % 4 != 0 {
                     continue;
                 }
-                if let Some(wake) = inbound.wakes.get(&id) {
-                    wakes.push(Arc::clone(wake));
-                }
-                if inbound.served.contains(&id) {
+                if !inbound.served.insert(id) {
+                    if let Some(wake) = inbound.wakes.get(&id) {
+                        wakes.push(Arc::clone(wake));
+                    }
                     continue;
                 }
-                inbound.served.insert(id);
                 let request_udp = inbound.next_udp;
                 inbound.next_udp = inbound.next_udp.wrapping_add(1);
                 let wake = StreamWake::new();

@@ -892,12 +892,31 @@ impl H3StreamOut {
     }
 }
 
-fn send_data(wire: &Wire, payload: &[u8]) -> bool {
-    let mut frame = Vec::with_capacity(payload.len() + 9);
-    frames::quic_varint(&mut frame, frames::H3_DATA);
-    frames::quic_varint(&mut frame, payload.len() as u64);
+thread_local! {
+    static DATA_FRAME: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn data_frame(frame: &mut Vec<u8>, payload: &[u8]) {
+    frame.clear();
+    frame.reserve(payload.len() + 9);
+    frames::quic_varint(frame, frames::H3_DATA);
+    frames::quic_varint(frame, payload.len() as u64);
     frame.extend_from_slice(payload);
-    wire_ready(wire, &frame)
+}
+
+fn send_data(wire: &Wire, payload: &[u8]) -> bool {
+    let sent = DATA_FRAME.with(|slot| {
+        let Ok(mut frame) = slot.try_borrow_mut() else {
+            return None;
+        };
+        data_frame(&mut frame, payload);
+        Some(wire_ready(wire, &frame))
+    });
+    sent.unwrap_or_else(|| {
+        let mut frame = Vec::new();
+        data_frame(&mut frame, payload);
+        wire_ready(wire, &frame)
+    })
 }
 
 fn send_fields(wire: &Wire, kind: u64, fields: &[(String, String)]) -> bool {
@@ -2544,6 +2563,20 @@ pub(crate) fn packets(
 mod tests {
     use super::*;
     use crate::proxy::WindowRead;
+
+    #[test]
+    fn a_data_frame_reuses_its_buffer_after_the_first() {
+        let mut frame = Vec::new();
+        data_frame(&mut frame, &[1u8; 100]);
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            data_frame(&mut frame, &[2u8; 100]);
+        });
+        assert_eq!(
+            counts.allocs, 0,
+            "a frame of the same shape writes over the bytes it kept"
+        );
+        assert_eq!(&frame[3..], &[2u8; 100]);
+    }
 
     #[test]
     fn an_overlong_decoder_integer_is_invalid_not_incomplete() {

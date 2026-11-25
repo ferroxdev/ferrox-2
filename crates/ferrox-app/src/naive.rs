@@ -194,12 +194,13 @@ impl PaddingWrite {
                 .unwrap_or_else(|| random_below(256) as u8);
             #[cfg(not(test))]
             let padding = random_below(256) as u8;
-            let mut record = Vec::with_capacity(3 + take + usize::from(padding));
-            record.extend_from_slice(&(take as u16).to_be_bytes());
-            record.push(padding);
-            record.extend_from_slice(&data[done..done + take]);
-            record.resize(record.len() + usize::from(padding), 0);
-            self.pending = record;
+            self.pending.clear();
+            self.pending.reserve(3 + take + usize::from(padding));
+            self.pending.extend_from_slice(&(take as u16).to_be_bytes());
+            self.pending.push(padding);
+            self.pending.extend_from_slice(&data[done..done + take]);
+            self.pending
+                .resize(self.pending.len() + usize::from(padding), 0);
             self.at = 0;
             self.input = take;
             match writer.push(&self.pending) {
@@ -418,7 +419,7 @@ fn write_uot_packet(
 ) -> std::io::Result<()> {
     let len = u16::try_from(payload.len())
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    let mut head = Vec::with_capacity(target.addr_len() + 2 + usize::from(!connect));
+    let mut head = Vec::with_capacity(if connect { 2 } else { target.addr_len() + 4 });
     if !connect {
         push_uot_addr(&mut head, target);
     }
@@ -540,12 +541,13 @@ fn parse_uot_packet(
 #[derive(Default)]
 struct UotPacketReader {
     buf: Vec<u8>,
+    init: usize,
 }
 
 impl UotPacketReader {
-    fn next(
+    fn next<R: Read + ?Sized>(
         &mut self,
-        stream: &mut NaiveStream,
+        stream: &mut R,
         connect: bool,
         fixed: Option<&Destination>,
     ) -> std::io::Result<Option<(Destination, Vec<u8>)>> {
@@ -557,18 +559,31 @@ impl UotPacketReader {
             if self.buf.len() > 70_000 {
                 return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
             }
-            let mut chunk = [0u8; 4096];
-            match stream.read(&mut chunk) {
-                Ok(0) if self.buf.is_empty() => return Ok(None),
+            let base = self.buf.len();
+            // SAFETY: the watermark describes this buffer; truncating below `base + 4096` on every outcome leaves every byte below it initialised.
+            unsafe {
+                ferrox_core::read::init_room(&mut self.buf, &mut self.init, base + 4096);
+            }
+            match stream.read(&mut self.buf[base..]) {
+                Ok(0) if base == 0 => {
+                    self.buf.truncate(base);
+                    return Ok(None);
+                }
                 Ok(0) => {
+                    self.buf.truncate(base);
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
                         "truncated UoT datagram",
-                    ))
+                    ));
                 }
-                Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
+                Ok(n) => self.buf.truncate(base + n),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                    self.buf.truncate(base);
+                }
+                Err(error) => {
+                    self.buf.truncate(base);
+                    return Err(error);
+                }
             }
         }
     }
@@ -1306,6 +1321,16 @@ impl H3OutWrite {
     }
 }
 
+fn h3_data_frame(frame: &mut Vec<u8>, data: &[u8]) -> usize {
+    let take = data.len().min(H3_WRITE_CHUNK);
+    frame.clear();
+    frame.reserve(take + 9);
+    frames::quic_varint(frame, frames::H3_DATA);
+    frames::quic_varint(frame, take as u64);
+    frame.extend_from_slice(&data[..take]);
+    take
+}
+
 impl Write for H3OutWrite {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
@@ -1353,12 +1378,7 @@ impl proxy::LaneWrite for H3OutWrite {
         if data.is_empty() {
             return proxy::Push::Took(0);
         }
-        let take = data.len().min(H3_WRITE_CHUNK);
-        let mut frame = Vec::with_capacity(take + 9);
-        frames::quic_varint(&mut frame, frames::H3_DATA);
-        frames::quic_varint(&mut frame, take as u64);
-        frame.extend_from_slice(&data[..take]);
-        self.pending = frame;
+        let take = h3_data_frame(&mut self.pending, data);
         self.input = take;
         self.at = 0;
         match self.out.try_write(&self.pending) {
@@ -1545,16 +1565,14 @@ fn basic_token(user: &str, password: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"))
 }
 
-fn parse_basic(value: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+fn parse_basic(value: &[u8]) -> Option<Vec<u8>> {
     let space = value.iter().position(|byte| *byte == b' ')?;
     if !value[..space].eq_ignore_ascii_case(b"Basic") {
         return None;
     }
-    let decoded = base64::engine::general_purpose::STANDARD
+    base64::engine::general_purpose::STANDARD
         .decode(trim_ascii(&value[space + 1..]))
-        .ok()?;
-    let colon = decoded.iter().position(|byte| *byte == b':')?;
-    Some((decoded[..colon].to_vec(), decoded[colon + 1..].to_vec()))
+        .ok()
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -1569,12 +1587,16 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 }
 
 fn verified(value: Option<&[u8]>, users: &Users) -> bool {
-    let Some((user, password)) = value.and_then(parse_basic) else {
+    let Some(decoded) = value.and_then(parse_basic) else {
         return false;
     };
+    let Some(colon) = decoded.iter().position(|byte| *byte == b':') else {
+        return false;
+    };
+    let (user, password) = (&decoded[..colon], &decoded[colon + 1..]);
     users.iter().any(|(known_user, known_password)| {
-        constant_time_eq(user.as_slice(), known_user.as_bytes())
-            && constant_time_eq(password.as_slice(), known_password.as_bytes())
+        constant_time_eq(user, known_user.as_bytes())
+            && constant_time_eq(password, known_password.as_bytes())
     })
 }
 
@@ -1620,18 +1642,18 @@ fn connect_target(authority: &[u8]) -> Option<Destination> {
     if text.eq_ignore_ascii_case(UOT_V1) || text.eq_ignore_ascii_case(UOT_V2) {
         return Some(Destination::Name(text.to_owned(), 0));
     }
-    if text.parse::<SocketAddr>().is_ok() {
-        return proxy::authority_target(authority);
+    if let Ok(address) = text.parse::<SocketAddr>() {
+        return Some(Destination::Address(address));
     }
     if text.starts_with('[') {
         return None;
     }
     let (host, port) = text.rsplit_once(':')?;
-    port.parse::<u16>().ok()?;
-    if host.is_empty() || host.contains(':') {
+    let port = port.parse::<u16>().ok()?;
+    if host.is_empty() || host.contains(':') || host.len() > ferrox_core::addr::MAX_DOMAIN {
         return None;
     }
-    proxy::authority_target(authority)
+    Some(Destination::Name(host.to_owned(), port))
 }
 
 fn head_target(head: &[u8]) -> Option<Destination> {
@@ -3730,6 +3752,40 @@ mod tests {
         assert_eq!(&bytes[at..], b"tail");
     }
 
+    #[test]
+    fn a_padded_record_reuses_its_buffer_after_the_first() {
+        let written = Arc::new(Mutex::new(Vec::with_capacity(4096)));
+        let mut sink = Sink(Arc::clone(&written));
+        let mut padding = PaddingWrite {
+            fixed_padding: Some(17),
+            ..PaddingWrite::default()
+        };
+        padding.write(&mut sink, b"abc").expect("warm");
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            for _ in 0..7 {
+                padding.write(&mut sink, b"abc").expect("writes");
+            }
+        });
+        assert_eq!(
+            counts.allocs, 0,
+            "a record of the same shape writes over the buffer it kept"
+        );
+    }
+
+    #[test]
+    fn an_h3_data_frame_reuses_its_buffer_after_the_first() {
+        let mut frame = Vec::new();
+        h3_data_frame(&mut frame, &[1u8; 100]);
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            h3_data_frame(&mut frame, &[2u8; 100]);
+        });
+        assert_eq!(
+            counts.allocs, 0,
+            "a frame of the same shape writes over the bytes it kept"
+        );
+        assert_eq!(&frame[3..], &[2u8; 100]);
+    }
+
     struct Gate {
         bytes: Arc<Mutex<Vec<u8>>>,
         room: usize,
@@ -3966,6 +4022,25 @@ mod tests {
         ));
         assert!(!verified(Some(b"Basic !!!"), &users));
         assert!(!verified(None, &users));
+        let head = format!("Basic {token}");
+        let (ok, counts) =
+            ferrox_core::alloc_count::measure(|| verified(Some(head.as_bytes()), &users));
+        assert!(ok);
+        assert_eq!(
+            counts.allocs, 1,
+            "the decode buffer is the only allocation; the halves borrow it"
+        );
+        let ((), before) = ferrox_core::alloc_count::measure(|| {
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(&head[6..])
+                .expect("decodes");
+            let colon = decoded
+                .iter()
+                .position(|byte| *byte == b':')
+                .expect("colon");
+            let _ = (decoded[..colon].to_vec(), decoded[colon + 1..].to_vec());
+        });
+        assert!(before.allocs >= 3, "the old parser built a vector per half");
     }
 
     #[test]
@@ -3985,6 +4060,12 @@ mod tests {
         assert_eq!(
             connect_target(UOT_V2.as_bytes()),
             Some(Destination::Name(UOT_V2.to_owned(), 0))
+        );
+        let long = format!("{}:443", "a".repeat(ferrox_core::addr::MAX_DOMAIN + 1));
+        assert_eq!(
+            connect_target(long.as_bytes()),
+            None,
+            "a name that cannot fit a length byte is refused"
         );
     }
 
@@ -4098,6 +4179,81 @@ mod tests {
             read_uot_packet(&mut reader, false, None).expect("reads"),
             (target, b"hi".to_vec())
         );
+    }
+
+    #[test]
+    fn a_v1_datagram_head_is_one_exact_allocation() {
+        let target = Destination::Name("example.test".to_owned(), 53);
+        let mut out = Vec::with_capacity(64);
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            write_uot_packet(&mut out, false, &target, b"hi").expect("writes");
+        });
+        assert_eq!(
+            counts.allocs, 1,
+            "the address and length fit the head's first buffer"
+        );
+        let ((), before) = ferrox_core::alloc_count::measure(|| {
+            let mut head = Vec::with_capacity(target.addr_len() + 3);
+            push_uot_addr(&mut head, &target);
+            head.extend_from_slice(&2u16.to_be_bytes());
+        });
+        assert!(
+            before.allocs >= 2,
+            "the old capacity left the length one byte over"
+        );
+    }
+
+    #[test]
+    fn a_uot_read_lands_in_the_readers_own_buffer() {
+        struct Recording {
+            chunks: Vec<Vec<u8>>,
+            at: usize,
+            pointer: Option<*const u8>,
+        }
+        impl std::io::Read for Recording {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.pointer = Some(buf.as_ptr());
+                let Some(chunk) = self.chunks.get(self.at) else {
+                    return Ok(0);
+                };
+                let take = chunk.len().min(buf.len());
+                buf[..take].copy_from_slice(&chunk[..take]);
+                self.at += 1;
+                Ok(take)
+            }
+        }
+        let packet = vec![0u8, 192, 0, 2, 1, 0, 53, 0, 3, 0xAA, 0xBB, 0xCC];
+        let mut recording = Recording {
+            chunks: vec![packet[..5].to_vec(), packet[5..].to_vec()],
+            at: 0,
+            pointer: None,
+        };
+        let mut packets = UotPacketReader {
+            buf: Vec::with_capacity(8192),
+            init: 0,
+        };
+        let base = packets.buf.as_ptr();
+        let capacity = packets.buf.capacity();
+        let (packet, counts) =
+            ferrox_core::alloc_count::measure(|| packets.next(&mut recording, false, None));
+        let (target, payload) = packet.expect("read").expect("packet");
+        assert_eq!(
+            target,
+            Destination::Address("192.0.2.1:53".parse().expect("addr"))
+        );
+        assert_eq!(payload, [0xAA, 0xBB, 0xCC]);
+        assert_eq!(counts.allocs, 1, "the payload is the only allocation");
+        assert_eq!(
+            recording.pointer,
+            Some(unsafe { base.add(5) }),
+            "the second read writes into the bytes the first one left"
+        );
+        assert_eq!(packets.buf.as_ptr(), base, "the buffer did not move");
+        assert_eq!(packets.buf.capacity(), capacity, "and did not grow");
+        let (end, counts) =
+            ferrox_core::alloc_count::measure(|| packets.next(&mut recording, false, None));
+        assert!(end.expect("read").is_none());
+        assert_eq!(counts.allocs, 0, "the end of the stream allocates nothing");
     }
 
     #[test]

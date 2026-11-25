@@ -364,6 +364,7 @@ fn connection(
         stream: Box::new(tls),
         pending: Vec::new(),
         init: 0,
+        at: 0,
         closed: false,
         deadline,
     };
@@ -450,6 +451,7 @@ fn cleartext_wire(stream: Connection) -> Wire {
         stream: Box::new(io),
         pending: Vec::new(),
         init: 0,
+        at: 0,
         closed: false,
         deadline,
     }
@@ -458,6 +460,7 @@ fn cleartext_wire(stream: Connection) -> Wire {
 struct Wire {
     stream: Box<dyn ReadWrite + Send>,
     pending: Vec<u8>,
+    at: usize,
     init: usize,
     closed: bool,
     deadline: Deadline,
@@ -478,7 +481,7 @@ impl Wire {
         if Instant::now() > deadline || !self.pending.starts_with(h2::MAGIC) {
             return false;
         }
-        self.pending.drain(..PREFACE);
+        self.at = PREFACE;
         self.deadline.clear();
         true
     }
@@ -717,6 +720,7 @@ fn handshake(
             stream,
             pending: Vec::new(),
             init: 0,
+            at: 0,
             closed: false,
             deadline,
         },
@@ -995,7 +999,7 @@ impl Client {
 
     fn pump(&mut self) {
         let mut pending = std::mem::take(&mut self.wire.pending);
-        let mut at = 0;
+        let mut at = self.wire.at;
         loop {
             match frame_at(&pending, at) {
                 Ok(Some(frame)) => {
@@ -1018,9 +1022,16 @@ impl Client {
             }
         }
         if at > 0 {
-            pending.drain(..at);
             self.last_frame = Instant::now();
+            if at == pending.len() {
+                pending.clear();
+                at = 0;
+            } else if at >= READ_ROOM {
+                pending.drain(..at);
+                at = 0;
+            }
         }
+        self.wire.at = at;
         self.wire.pending = pending;
     }
 
@@ -1415,7 +1426,7 @@ impl Session {
                 break;
             }
             let mut pending = std::mem::take(&mut wire.pending);
-            let mut at = 0;
+            let mut at = wire.at;
             loop {
                 match frame_at(&pending, at) {
                     Ok(Some(frame)) => {
@@ -1442,9 +1453,14 @@ impl Session {
                     }
                 }
             }
-            if at > 0 {
+            if at == pending.len() {
+                pending.clear();
+                at = 0;
+            } else if at >= READ_ROOM {
                 pending.drain(..at);
+                at = 0;
             }
+            wire.at = at;
             wire.pending = pending;
             if self.request.is_none() && Instant::now() >= deadline {
                 self.end = true;
@@ -2127,6 +2143,7 @@ mod tests {
             stream: Box::new(std::io::Cursor::new(Vec::new())),
             pending: Vec::new(),
             init: 0,
+            at: 0,
             closed: false,
             deadline: Deadline::default(),
         };
@@ -2165,6 +2182,7 @@ mod tests {
                 stream: Box::new(std::io::Cursor::new(Vec::new())),
                 pending: Vec::new(),
                 init: 0,
+                at: 0,
                 closed: false,
                 deadline: Deadline::default(),
             },
@@ -2331,6 +2349,7 @@ mod tests {
             stream: Box::new(std::io::Cursor::new(Vec::new())),
             pending: Vec::new(),
             init: 0,
+            at: 0,
             closed: false,
             deadline: Deadline::default(),
         };
@@ -2401,6 +2420,7 @@ mod tests {
             stream: Box::new(Counting(Arc::clone(&out), Arc::clone(&writes))),
             pending: Vec::new(),
             init: 0,
+            at: 0,
             closed: false,
             deadline: Deadline::default(),
         };
@@ -2439,6 +2459,7 @@ mod tests {
             }),
             pending: Vec::new(),
             init: 0,
+            at: 0,
             closed: false,
             deadline: Deadline::default(),
         };
@@ -2478,6 +2499,7 @@ mod tests {
             }),
             pending: Vec::new(),
             init: 0,
+            at: 0,
             closed: false,
             deadline: Deadline::default(),
         };
@@ -2535,6 +2557,7 @@ mod tests {
             stream: Box::new(std::io::Cursor::new(Vec::new())),
             pending: Vec::new(),
             init: 0,
+            at: 0,
             closed: false,
             deadline: Deadline::default(),
         };
@@ -2615,6 +2638,7 @@ mod tests {
             stream: Box::new(std::io::Cursor::new(Vec::new())),
             pending: Vec::new(),
             init: 0,
+            at: 0,
             closed: false,
             deadline: Deadline::default(),
         };
@@ -2762,6 +2786,7 @@ mod tests {
             }),
             pending: Vec::new(),
             init: 0,
+            at: 0,
             closed: false,
             deadline: Deadline::default(),
         };
@@ -2782,6 +2807,7 @@ mod tests {
             }),
             pending: Vec::new(),
             init: 0,
+            at: 0,
             closed: false,
             deadline: Deadline::default(),
         };
@@ -2802,6 +2828,7 @@ mod tests {
             stream: Box::new(Quiet { reads: 1_000 }),
             pending: Vec::new(),
             init: 0,
+            at: 0,
             closed: false,
             deadline,
         };
@@ -2816,6 +2843,7 @@ mod tests {
             stream: Box::new(Quiet { reads: 1_000 }),
             pending: Vec::new(),
             init: 0,
+            at: 0,
             closed: false,
             deadline: Deadline::default(),
         };
@@ -2833,6 +2861,7 @@ mod tests {
             stream: Box::new(std::io::Cursor::new(Vec::new())),
             pending: Vec::new(),
             init: 0,
+            at: 0,
             closed: false,
             deadline: Deadline::default(),
         };
@@ -2855,6 +2884,7 @@ mod tests {
             }),
             pending: Vec::new(),
             init: 0,
+            at: 0,
             closed: false,
             deadline: Deadline::default(),
         };
@@ -2954,6 +2984,7 @@ mod tests {
             }),
             pending,
             init: 0,
+            at: 0,
             closed: false,
             deadline: Deadline::default(),
         };
@@ -2968,6 +2999,36 @@ mod tests {
             21,
             "the due clock stopped before the ping was answered"
         );
+    }
+
+    #[test]
+    fn an_incomplete_frame_tail_stays_where_it_landed() {
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let mut pending = Vec::new();
+        pending.extend_from_slice(&h2::frame_head(8, h2::T_PING, 0, 0));
+        pending.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let tail = [0x12u8, 0x34, 0x56, 0x78, 0x9a];
+        pending.extend_from_slice(&tail);
+        let mut wire = Wire {
+            stream: Box::new(Recorder {
+                out: Arc::clone(&out),
+                writes: Arc::new(AtomicUsize::new(0)),
+            }),
+            pending,
+            at: 0,
+            init: 0,
+            closed: false,
+            deadline: Deadline::default(),
+        };
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()), None);
+        session.run_until(&mut wire, Instant::now() + Duration::from_secs(5));
+        assert_eq!(wire.at, 17, "the answered frame ends where it ended");
+        assert_eq!(
+            wire.pending.len(),
+            22,
+            "the consumed prefix stayed where it was"
+        );
+        assert_eq!(&wire.pending[wire.at..], &tail, "the tail did not move");
     }
 
     /// A clock that falls due after the first frame stops the second one from being answered.
@@ -2987,6 +3048,7 @@ mod tests {
             }),
             pending,
             init: 0,
+            at: 0,
             closed: false,
             deadline: Deadline::default(),
         };
@@ -3023,6 +3085,7 @@ mod tests {
             stream: Box::new(std::io::Cursor::new(Vec::new())),
             pending: Vec::new(),
             init: 0,
+            at: 0,
             closed: false,
             deadline: Deadline::default(),
         };
@@ -3047,6 +3110,7 @@ mod tests {
             stream: Box::new(std::io::Cursor::new(Vec::new())),
             pending: Vec::new(),
             init: 0,
+            at: 0,
             closed: false,
             deadline: Deadline::default(),
         };
@@ -3072,6 +3136,7 @@ mod tests {
             }),
             pending: Vec::new(),
             init: 0,
+            at: 0,
             closed: false,
             deadline: Deadline::default(),
         };
