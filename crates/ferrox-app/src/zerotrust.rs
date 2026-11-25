@@ -343,7 +343,7 @@ fn form_attribute<'a>(tag: &'a str, wanted: &str) -> Option<&'a str> {
                 (&body[..end], &body[end + 1..])
             } else {
                 let end = rest
-                    .find(|c: char| c.is_whitespace() || matches!(c, '>' | '/'))
+                    .find(|c: char| c.is_whitespace() || c == '>')
                     .unwrap_or(rest.len());
                 (&rest[..end], &rest[end..])
             };
@@ -2316,6 +2316,15 @@ mod tests {
         assert_eq!(
             extract_totp_form_action(page).as_deref(),
             Some("https://acme.cloudflareaccess.com/cdn-cgi/access/verify?a=1&b=2")
+        );
+    }
+
+    #[test]
+    fn an_unquoted_form_action_keeps_its_slashes() {
+        let page = "<form action=https://acme.cloudflareaccess.com/cdn-cgi/access/verify><input id=\"totp-form\"></form>";
+        assert_eq!(
+            extract_totp_form_action(page).as_deref(),
+            Some("https://acme.cloudflareaccess.com/cdn-cgi/access/verify")
         );
     }
 
