@@ -42977,7 +42977,14 @@ fn send_parts(
             msg.msg_namelen = len;
         }
         msg.msg_iov = parts.as_mut_ptr();
-        msg.msg_iovlen = parts.len().try_into().unwrap_or(0);
+        #[cfg(target_os = "macos")]
+        {
+            msg.msg_iovlen = parts.len().try_into().unwrap_or(0);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            msg.msg_iovlen = parts.len();
+        }
         loop {
             // SAFETY: `msg` names `parts` and the `sockaddr` storage, both live and sized as the call reads them.
             let sent = unsafe { libc::sendmsg(socket.as_raw_fd(), &raw const msg, 0) };
