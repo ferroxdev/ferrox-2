@@ -80730,7 +80730,7 @@ mod tests {
     /// kernel has no REDIRECT answer for, rather than dialling the listener's own address.
     #[test]
     fn a_redirect_inbound_closes_without_a_kernel_answer() {
-        if !crate::transparent::REDIRECT {
+        if !crate::transparent::REDIRECT || !crate::transparent::redirect_ready() {
             return;
         }
         let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
