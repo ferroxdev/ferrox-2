@@ -354,7 +354,10 @@ impl Pool {
                     Some(endpoint) => {
                         let budget = job
                             .deadline
-                            .saturating_duration_since(Instant::now())
+                            .map_or_else(
+                                || server.timeout,
+                                |deadline| deadline.saturating_duration_since(Instant::now()),
+                            )
                             .max(Duration::from_millis(1));
                         crate::proxy::dns_socket_bounded(&endpoint.host, endpoint.port, budget)
                             .map_or(Err(()), |target| Ok(Some(target)))
@@ -797,7 +800,7 @@ impl Resolver {
                 }) {
                     if nested {
                         while results[start..end].iter().any(Option::is_none) {
-                            let received = match system_deadline() {
+                            let answer = match system_deadline() {
                                 Some(deadline) => receiver.recv_timeout(
                                     deadline
                                         .saturating_duration_since(Instant::now())
@@ -807,7 +810,7 @@ impl Resolver {
                                     .recv()
                                     .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
                             };
-                            let Ok((late, result)) = received else {
+                            let Ok((late, result)) = answer else {
                                 break;
                             };
                             results[late] = Some(result);
@@ -820,7 +823,7 @@ impl Resolver {
                 if results[start..end].iter().all(Option::is_some) {
                     break;
                 }
-                let received = match system_deadline() {
+                let answer = match system_deadline() {
                     Some(deadline) => receiver.recv_timeout(
                         deadline
                             .saturating_duration_since(Instant::now())
@@ -830,7 +833,7 @@ impl Resolver {
                         .recv()
                         .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
                 };
-                let Ok((slot, result)) = received else {
+                let Ok((slot, result)) = answer else {
                     break;
                 };
                 results[slot] = Some(result);

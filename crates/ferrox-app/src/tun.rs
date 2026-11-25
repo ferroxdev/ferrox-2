@@ -2949,7 +2949,7 @@ impl Handler {
         self.opening = Some(rx);
         let stop = self.stopping.clone();
         let worker = budgets::spawn(move || {
-            let _ = tx.send(open.open_stopping(stop.as_deref()));
+            let _ = tx.send(open.open_stopping(stop));
         });
         if let Some(workers) = &self.workers {
             workers.add(worker);

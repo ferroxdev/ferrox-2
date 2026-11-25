@@ -15122,10 +15122,10 @@ pub(crate) fn dial_cancelled() -> bool {
 /// still ends before `Workers::join` waits on it.
 fn watch_dial_cancel(stream: &Connection) -> Option<DialCancelGuard> {
     let stop = DIAL_CANCEL.with(|cell| cell.borrow().clone())?;
-    watch_stop(stream, stop.as_ref())
+    watch_stop(stream, stop)
 }
 
-fn watch_stop(stream: &Connection, stop: &AtomicBool) -> Option<DialCancelGuard> {
+fn watch_stop(stream: &Connection, stop: Arc<AtomicBool>) -> Option<DialCancelGuard> {
     use std::sync::mpsc::{self, RecvTimeoutError};
 
     let stream = stream.try_clone().ok()?;
@@ -29605,15 +29605,18 @@ pub(crate) struct DirectDatagram {
 /// opens it, so a rule the management API changed before the first datagram is the one opened.
 #[derive(Clone)]
 pub(crate) struct Datagram {
-    open:
-        Arc<dyn Fn(Option<&std::sync::atomic::AtomicBool>) -> Option<DirectDatagram> + Send + Sync>,
+    open: Arc<
+        dyn Fn(Option<Arc<std::sync::atomic::AtomicBool>>) -> Option<DirectDatagram> + Send + Sync,
+    >,
     ready: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 impl Datagram {
     fn new(
         open: Arc<
-            dyn Fn(Option<&std::sync::atomic::AtomicBool>) -> Option<DirectDatagram> + Send + Sync,
+            dyn Fn(Option<Arc<std::sync::atomic::AtomicBool>>) -> Option<DirectDatagram>
+                + Send
+                + Sync,
         >,
         ready: Arc<dyn Fn() -> bool + Send + Sync>,
     ) -> Self {
@@ -29628,7 +29631,7 @@ impl Datagram {
     /// Open the lane, refusing once the inbound has begun removal.
     pub(crate) fn open_stopping(
         &self,
-        stop: Option<&std::sync::atomic::AtomicBool>,
+        stop: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> Option<DirectDatagram> {
         (self.open)(stop)
     }
@@ -29655,18 +29658,26 @@ fn direct_datagram_ready(plan: &RoutePlan) -> bool {
 
 fn open_direct_datagram(
     socks: &SocksOut,
-    stop: Option<&std::sync::atomic::AtomicBool>,
+    stop: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Option<DirectDatagram> {
-    if stop.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+    if stop
+        .as_ref()
+        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+    {
         return None;
     }
-    let server = resolve_outbound_stopping(&socks.address, socks.port, stop)?;
+    let server = resolve_outbound_stopping(&socks.address, socks.port, stop.as_deref())?;
     let stream = dial_or_report(&server)?;
     let _ = stream.set_read_timeout(Some(budgets::handshake()));
     let _ = stream.set_write_timeout(Some(budgets::handshake()));
-    let _cancel = stop.and_then(|stop| watch_stop(&stream, stop));
+    let _cancel = stop
+        .as_ref()
+        .and_then(|stop| watch_stop(&stream, Arc::clone(stop)));
     let association = crate::socks::associate(stream, &socks.credential)?;
-    if stop.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+    if stop
+        .as_ref()
+        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+    {
         return None;
     }
     // The negotiated relay can differ from the server the config names; its leg binds the underlay, so no host route is added for it.

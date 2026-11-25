@@ -10,7 +10,7 @@ use crate::xray_pb::Reader;
 use std::borrow::Cow;
 use std::cell::{OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::io::{Read as _, Seek as _, Write as _};
+use std::io::{Read as _, Write as _};
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -408,13 +408,13 @@ fn candidate_cache_bytes_where(
         writes
             .iter()
             .rev()
-            .find(|(queued, _)| matches(path, queued))
-            .map(|(queued, body)| {
-                let loaded = body.read();
+            .find(|write| matches(path, &write.target))
+            .map(|write| {
+                let loaded = write.body.read();
                 if record && loaded.is_ok() {
                     CANDIDATE_CACHE_INPUTS.with(|slot| {
                         if let Some(inputs) = slot.borrow_mut().as_mut() {
-                            inputs.insert(queued.id);
+                            inputs.insert(write.id);
                         }
                     });
                 }
@@ -435,7 +435,7 @@ fn candidate_cache_present_where(path: &Path, matches: fn(&Path, &Path) -> bool)
     CANDIDATE_CACHE_WRITES.with(|slot| {
         slot.borrow()
             .as_ref()
-            .is_some_and(|writes| writes.iter().any(|(queued, _)| matches(path, queued)))
+            .is_some_and(|writes| writes.iter().any(|write| matches(path, &write.target)))
     })
 }
 
