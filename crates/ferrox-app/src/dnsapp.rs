@@ -406,6 +406,7 @@ struct HostRule {
     target: HostTarget,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct Resolver {
     servers: Vec<Server>,
     hosts: Vec<HostRule>,
@@ -423,6 +424,7 @@ impl Resolver {
     /// The built resolver a root config names, or `None` when the config has
     /// no `dns` block. A block with no servers is the reference's localhost
     /// resolver, not an empty one.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn from_root(root: &Json) -> Result<Option<Self>, String> {
         let Some(dns) = root.get("dns").filter(|dns| !matches!(dns, Json::Null)) else {
             return Ok(None);

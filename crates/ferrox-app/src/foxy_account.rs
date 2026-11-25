@@ -1912,11 +1912,13 @@ mod tests {
             "  User@Example.COM \n",
             "a\u{200B}b@example.com",
             "İ@example.com",
-            "K@example.com",
             "\u{FEFF}name\t@example.com\u{3000}",
         ] {
             assert_eq!(normalize_identity(email), reference(email), "{email:?}");
         }
+        let kelvin = char::from_u32(0x212A).expect("the kelvin sign");
+        let email = format!("{kelvin}@example.com");
+        assert_eq!(normalize_identity(&email), reference(&email));
     }
 
     #[test]
