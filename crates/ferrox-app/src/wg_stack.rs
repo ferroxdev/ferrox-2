@@ -1773,7 +1773,7 @@ impl ClientStack {
             socket.set_nagle_enabled(false);
             socket.set_ack_delay(None);
             socket.set_congestion_control(CongestionControl::Cubic);
-            socket.set_timeout(Some(crate::budgets::dial()));
+            socket.set_timeout(Some(crate::budgets::dial().into()));
             if let Err(error) = socket.connect(
                 self.iface.context(),
                 IpEndpoint::from(*destination),
