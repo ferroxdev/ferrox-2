@@ -951,6 +951,52 @@ def check_udp_split(state: pathlib.Path) -> int:
                 f"a split psiphon lane took a fixed local port: {settings!r}"
             )
 
+        snapshot.unlink(missing_ok=True)
+        subprocess.run(
+            [
+                str(CLI),
+                "up",
+                "--psiphon",
+                "--warp",
+                "--fronts",
+                "socks",
+                "--socks",
+                str(free_port()),
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=WATCH,
+            env=env,
+        )
+        if not snapshot.exists():
+            raise AssertionError("no config was written for --psiphon --warp")
+        chained = json.loads(snapshot.read_text(encoding="utf-8"))
+        carrier = chained["outbounds"][0]
+        if carrier.get("protocol") != "psiphon":
+            raise AssertionError(f"the chained carrier is not psiphon: {carrier!r}")
+        upstream = carrier.get("settings", {}).get("upstreamProxy", "")
+        if not upstream.startswith("socks5://127.0.0.1:"):
+            raise AssertionError(f"psiphon did not dial the WARP front: {carrier!r}")
+        if not any(
+            outbound.get("tag") == "warp"
+            and outbound.get("protocol") == "warp"
+            and outbound.get("settings", {}).get("register")
+            for outbound in chained["outbounds"]
+        ):
+            raise AssertionError(f"the chained lane has no WARP outbound: {chained!r}")
+        if not any(
+            inbound.get("tag") == "ferrox-warp-hop"
+            for inbound in chained["inbounds"]
+        ):
+            raise AssertionError(f"the chained lane has no hidden front: {chained!r}")
+        if not any(
+            rule.get("inboundTag") == ["ferrox-warp-hop"]
+            and rule.get("outboundTag") == "warp"
+            for rule in chained.get("routing", {}).get("rules", [])
+        ):
+            raise AssertionError(f"the chained lane has no WARP rule: {chained!r}")
+
         direct = lane("--udp-via", "direct")
         if split(direct, "udp-direct").get("protocol") != "freedom":
             raise AssertionError("udp-via direct is not a freedom outbound")
@@ -1034,7 +1080,7 @@ def warp_ladder_binary(state: pathlib.Path) -> pathlib.Path:
     binary = state / "fake-warp-ladder"
     binary.write_text(
         """#!/usr/bin/env python3
-import json, os, socket, sys
+import json, os, socket, sys, threading
 config = sys.argv[sys.argv.index("-c") + 1]
 with open(config, encoding="utf-8") as handle:
     document = json.load(handle)
@@ -1046,9 +1092,14 @@ chained = outbound.get("settings", {}).get("upstreamProxy")
 if outbound["protocol"] != "warp" and not chained:
     print("foxy: the account plane answered 451", file=sys.stderr)
     sys.exit(1)
+hidden_tag = "ferrox-warp-hop"
+hidden_port = next(
+    (inbound["port"] for inbound in document["inbounds"] if inbound.get("tag") == hidden_tag),
+    None,
+)
 
 
-def socks5_exchange(conn, chained):
+def socks5_exchange(conn, chained, hidden):
     if conn.recv(1)[:1] != b"\\x05":
         raise OSError("not a SOCKS5 greeting")
     conn.recv(conn.recv(1)[0])
@@ -1065,7 +1116,10 @@ def socks5_exchange(conn, chained):
         raise OSError("the client named no name the lane reads")
     far_port = int.from_bytes(conn.recv(2), "big")
     forwarded = None
-    if chained:
+    if hidden:
+        conn.sendall(b"\\x05\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00")
+        conn.sendall(b"HTTP/1.0 200 carried\\r\\n\\r\\nExample Domain\\n")
+    elif chained:
         hop = chained.split("://", 1)[1]
         hop_host, _, hop_port = hop.rpartition(":")
         with socket.create_connection((hop_host, int(hop_port)), timeout=10) as up:
@@ -1097,23 +1151,37 @@ def socks5_exchange(conn, chained):
         conn.sendall(b"HTTP/1.0 200 carried\\r\\n\\r\\nExample Domain\\n")
     with open(os.path.join(state, "fake-socks5.json"), "a", encoding="utf-8") as handle:
         handle.write(
-            json.dumps({"listen": port, "target": name, "forwarded_to": forwarded}) + "\\n"
+            json.dumps({"listen": conn.getsockname()[1], "target": name, "forwarded_to": forwarded}) + "\\n"
         )
 
 
-port = document["inbounds"][0]["port"]
-server = socket.socket()
-server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-server.bind(("127.0.0.1", port))
-server.listen(16)
-while True:
-    conn, _ = server.accept()
-    try:
-        socks5_exchange(conn, chained)
-    except Exception as why:
-        print(f"fake lane: the flow did not carry: {why}", file=sys.stderr)
-    finally:
-        conn.close()
+def serve(port, hidden):
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", port))
+    server.listen(16)
+    while True:
+        conn, _ = server.accept()
+        try:
+            socks5_exchange(conn, chained, hidden)
+        except Exception as why:
+            print(f"fake lane: the flow did not carry: {why}", file=sys.stderr)
+        finally:
+            conn.close()
+
+
+threads = []
+for inbound in document["inbounds"]:
+    if inbound.get("protocol") == "socks":
+        thread = threading.Thread(
+            target=serve,
+            args=(inbound["port"], inbound.get("tag") == hidden_tag),
+            daemon=True,
+        )
+        thread.start()
+        threads.append(thread)
+for thread in threads:
+    thread.join()
 """,
         encoding="utf-8",
     )
@@ -1447,7 +1515,7 @@ def check_vpn_fronts(state: pathlib.Path) -> int:
                 str(http_port),
                 "--mixed",
                 str(mixed_port),
-                "--vpn",
+                "--vpn-proxy",
             ],
             stdin=subprocess.DEVNULL,
             capture_output=True,
@@ -1514,7 +1582,7 @@ def config_lane(
     env["FERROX_BIN"] = str(vpn_lane_binary(state))
     env["FERROX_FAKE_TRACE"] = "1" if trace else ""
     run = subprocess.run(
-        [str(CLI), "up", "--config", str(config), "--vpn"],
+        [str(CLI), "up", "--config", str(config), "--vpn-proxy"],
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
@@ -1804,7 +1872,7 @@ def check_vpn_pac(state: pathlib.Path) -> int:
                 "socks",
                 "--socks",
                 str(port),
-                "--vpn",
+                "--vpn-proxy",
             ],
             stdin=subprocess.DEVNULL,
             capture_output=True,
@@ -1980,7 +2048,7 @@ def check_vpn_proxy_readback(state: pathlib.Path) -> int:
         )
 
     def up(extra: dict[str, str] | None = None):
-        return run(["up", "--config", str(config), "--vpn"], extra)
+        return run(["up", "--config", str(config), "--vpn-proxy"], extra)
 
     def live_lanes() -> list[int]:
         pids = state / "fake-vpn-lane.pids"
@@ -2133,7 +2201,7 @@ def check_vpn_proxy_readback(state: pathlib.Path) -> int:
             [
                 "up",
                 "--veepn",
-                "--vpn",
+                "--vpn-proxy",
                 "--fronts",
                 "socks",
                 "--socks",
@@ -2214,7 +2282,7 @@ def check_vpn_bypass(state: pathlib.Path) -> int:
                 "socks",
                 "--socks",
                 str(port),
-                "--vpn",
+                "--vpn-proxy",
             ],
             stdin=subprocess.DEVNULL,
             capture_output=True,
@@ -2371,7 +2439,7 @@ def check_vpn_platform_refusal(state: pathlib.Path) -> int:
                 "socks",
                 "--socks",
                 str(port),
-                "--vpn",
+                "--vpn-proxy",
             ],
             stdin=subprocess.DEVNULL,
             capture_output=True,
@@ -2535,7 +2603,7 @@ def check_proxy_transaction(state: pathlib.Path) -> int:
     clear()
     seed_service_proxy(state, "http", "proxy.corp", 3128)
     port = free_port()
-    up = run(["up", "--config", str(config("txn-corp.json", "http", port)), "--vpn"], lane_env())
+    up = run(["up", "--config", str(config("txn-corp.json", "http", port)), "--vpn-proxy"], lane_env())
     output = up.stdout + up.stderr
     if up.returncode != 0:
         print(f"check-cli-lane: a corporate-proxy arm failed:\n{output}", file=sys.stderr)
@@ -2565,7 +2633,7 @@ def check_proxy_transaction(state: pathlib.Path) -> int:
 
     clear()
     port = free_port()
-    up = run(["up", "--config", str(config("txn-none.json", "http", port)), "--vpn"], lane_env())
+    up = run(["up", "--config", str(config("txn-none.json", "http", port)), "--vpn-proxy"], lane_env())
     output = up.stdout + up.stderr
     if up.returncode != 0:
         print(f"check-cli-lane: an empty-proxy arm failed:\n{output}", file=sys.stderr)
@@ -2593,7 +2661,7 @@ def check_proxy_transaction(state: pathlib.Path) -> int:
     env = lane_env()
     env["FERROX_FAKE_INTERRUPT"] = "1"
     run_interrupted = subprocess.Popen(
-        [str(CLI), "up", "--config", str(config("txn-int.json", "socks", port)), "--vpn"],
+        [str(CLI), "up", "--config", str(config("txn-int.json", "socks", port)), "--vpn-proxy"],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -2630,7 +2698,7 @@ def check_proxy_transaction(state: pathlib.Path) -> int:
     clear()
     (state / "fake-services").write_text("Wi-Fi\n*Ethernet\n", encoding="utf-8")
     port = free_port()
-    up = run(["up", "--config", str(config("txn-other.json", "http", port)), "--vpn"], lane_env())
+    up = run(["up", "--config", str(config("txn-other.json", "http", port)), "--vpn-proxy"], lane_env())
     output = up.stdout + up.stderr
     if up.returncode != 0:
         print(f"check-cli-lane: an untouched-service arm failed:\n{output}", file=sys.stderr)
@@ -2790,7 +2858,7 @@ def check_proxy_cleanup(state: pathlib.Path) -> int:
     env_a["FERROX_STATE_DIR"] = str(state)
     env_a["FERROX_BIN"] = str(vpn_lane_binary(state))
     env_a["FERROX_FAKE_TRACE"] = "1"
-    up = run(["up", "--config", str(config), "--vpn"], env_a)
+    up = run(["up", "--config", str(config), "--vpn-proxy"], env_a)
     output = up.stdout + up.stderr
     if up.returncode != 0 or not (state / "system-proxy.ports").exists():
         print(
@@ -3063,7 +3131,7 @@ def check_vpn_lane_exit_clears_proxy(state: pathlib.Path) -> int:
     env["FERROX_FAKE_TRACE"] = "1"
     config = vpn_config(state, "vpn-exit.json", port)
     run = subprocess.run(
-        [str(CLI), "up", "--config", str(config), "--vpn"],
+        [str(CLI), "up", "--config", str(config), "--vpn-proxy"],
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
@@ -3130,7 +3198,7 @@ def check_vpn_hangup_clears_proxy(state: pathlib.Path) -> int:
     env["FERROX_BIN"] = str(vpn_lane_binary(state))
     env["FERROX_FAKE_TRACE"] = "1"
     run = subprocess.Popen(
-        [str(CLI), "up", "--config", str(vpn_config(state, "vpn-hup.json", port)), "--vpn"],
+        [str(CLI), "up", "--config", str(vpn_config(state, "vpn-hup.json", port)), "--vpn-proxy"],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -3292,7 +3360,7 @@ def check_stale_proxy_reconciled(state: pathlib.Path) -> int:
     env["FERROX_BIN"] = str(vpn_lane_binary(state))
     env["FERROX_FAKE_TRACE"] = "1"
     up = subprocess.run(
-        [str(CLI), "up", "--config", str(vpn_config(state, "vpn-stale.json", port)), "--vpn"],
+        [str(CLI), "up", "--config", str(vpn_config(state, "vpn-stale.json", port)), "--vpn-proxy"],
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
@@ -3381,9 +3449,9 @@ def check_warp_ladder(state: pathlib.Path) -> int:
             file=sys.stderr,
         )
         return 1
-    if "warp hop up (pid" not in output:
+    if "warp: the foxy plane and carrier ride a WARP exit" not in output:
         print(
-            f"check-cli-lane: a 451 ladder never said the warp hop started:\n{output}",
+            f"check-cli-lane: a 451 ladder never said WARP was applied:\n{output}",
             file=sys.stderr,
         )
         return 1
@@ -3405,13 +3473,13 @@ def check_warp_ladder(state: pathlib.Path) -> int:
         for line in recorded.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    if len(handovers) != 3:
+    if len(handovers) != 2:
         print(
-            f"check-cli-lane: the ladder handed {len(handovers)} configs, not three:\n{output}",
+            f"check-cli-lane: the ladder handed {len(handovers)} configs, not two:\n{output}",
             file=sys.stderr,
         )
         return 1
-    first, hop, second = handovers
+    first, second = handovers
     if first["outbounds"][0]["protocol"] != "foxy" or first["outbounds"][0][
         "settings"
     ].get("upstreamProxy"):
@@ -3420,28 +3488,50 @@ def check_warp_ladder(state: pathlib.Path) -> int:
             file=sys.stderr,
         )
         return 1
-    warp = hop["outbounds"][0]
+    hidden = next(
+        (
+            inbound
+            for inbound in second["inbounds"]
+            if inbound.get("tag") == "ferrox-warp-hop"
+        ),
+        None,
+    )
+    if hidden is None or hidden.get("protocol") != "socks":
+        print(
+            "check-cli-lane: the retried config has no hidden WARP socks front",
+            file=sys.stderr,
+        )
+        return 1
+    warp = next(
+        (outbound for outbound in second["outbounds"] if outbound.get("protocol") == "warp"),
+        None,
+    )
     if (
-        warp["protocol"] != "warp"
+        warp is None
         or not warp["settings"].get("register")
         or not warp["settings"].get("identityFile")
     ):
         print(
-            "check-cli-lane: the hop config is not a registering warp outbound",
-            file=sys.stderr,
-        )
-        return 1
-    if not hop["inbounds"] or hop["inbounds"][0].get("protocol") != "socks":
-        print(
-            "check-cli-lane: the hop config does not front a socks port",
+            "check-cli-lane: the retried config carries no registering warp outbound",
             file=sys.stderr,
         )
         return 1
     chained_to = second["outbounds"][0]["settings"].get("upstreamProxy")
-    if chained_to != f"socks5://127.0.0.1:{hop['inbounds'][0]['port']}":
+    if chained_to != f"socks5://127.0.0.1:{hidden['port']}":
         print(
-            "check-cli-lane: the retried lane does not chain to the hop's socks port"
+            "check-cli-lane: the retried lane does not chain to the hidden front"
             f" (got {chained_to!r})",
+            file=sys.stderr,
+        )
+        return 1
+    rules = second.get("routing", {}).get("rules", [])
+    if not any(
+        rule.get("inboundTag") == ["ferrox-warp-hop"]
+        and rule.get("outboundTag") == warp.get("tag")
+        for rule in rules
+    ):
+        print(
+            "check-cli-lane: the retried config has no inboundTag -> warp rule",
             file=sys.stderr,
         )
         return 1
@@ -3455,7 +3545,6 @@ def check_warp_ladder(state: pathlib.Path) -> int:
         )
         return 1
     front = second["inbounds"][0]["port"]
-    hop_port = hop["inbounds"][0]["port"]
     if not any(
         int(line["proxy"].rsplit(":", 1)[1]) == front
         for line in (json.loads(x) for x in rides.read_text(encoding="utf-8").splitlines() if x.strip())
@@ -3466,11 +3555,11 @@ def check_warp_ladder(state: pathlib.Path) -> int:
         )
         return 1
     if not any(
-        line.get("forwarded_to") == hop_port
+        line.get("forwarded_to") == hidden["port"]
         for line in (json.loads(x) for x in records.read_text(encoding="utf-8").splitlines() if x.strip())
     ):
         print(
-            f"check-cli-lane: the lane never handed a flow to the hop at {hop_port}:\n{output}",
+            f"check-cli-lane: the lane never handed a flow to the hidden front at {hidden['port']}:\n{output}",
             file=sys.stderr,
         )
         return 1
@@ -3487,7 +3576,7 @@ def check_warp_ladder(state: pathlib.Path) -> int:
             )
             return 1
     print(
-        "check-cli-lane: a 451 from the plane moves the lane onto a warp hop, and"
+        "check-cli-lane: a 451 from the plane moves the lane onto WARP, and"
         " the retried lane carries the flow through it"
     )
     return 0

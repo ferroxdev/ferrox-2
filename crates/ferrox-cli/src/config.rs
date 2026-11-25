@@ -16,6 +16,64 @@ pub struct Ports {
     pub mixed: u16,
 }
 
+/// The TUN inbound `--vpn` adds to a generated config. A user config is served
+/// verbatim, so it must carry its own.
+#[derive(Clone, Debug)]
+pub struct Vpn {
+    pub engine: String,
+    pub ipv6: bool,
+    pub mtu: u16,
+    pub name: String,
+    pub dns: String,
+}
+
+impl Vpn {
+    pub fn from_options(options: &Options) -> Self {
+        Self {
+            engine: options.vpn_engine.clone(),
+            ipv6: options.vpn_ipv6,
+            mtu: options.vpn_mtu,
+            name: options.vpn_name.clone(),
+            dns: options.vpn_dns.clone(),
+        }
+    }
+
+    fn inbound(&self) -> Value {
+        let mut inbound = json!({
+            "protocol": "tun",
+            "tag": "tun-in",
+            "stack": self.engine,
+            "auto_route": true,
+            "mtu": self.mtu,
+            "address": if self.ipv6 {
+                vec!["198.18.0.1/15", "fdfe:dcba:9876::1/64"]
+            } else {
+                vec!["198.18.0.1/15"]
+            },
+        });
+        if !self.name.is_empty() {
+            inbound["name"] = Value::String(self.name.clone());
+        }
+        if self.dns != "none" {
+            inbound["dns_mode"] = Value::String("hijack".to_owned());
+            inbound["dns_address"] = json!([self.dns]);
+        }
+        inbound
+    }
+}
+
+/// The hidden loopback front a WARP-chained foxy lane dials; the router sends
+/// its flows to the tagged `warp` outbound, so the lane keeps one process and
+/// the TUN route guard can pin the WARP edge.
+pub const WARP_HOP_TAG: &str = "ferrox-warp-hop";
+
+#[derive(Clone, Debug, Default)]
+pub struct Generated {
+    pub hidden_socks: Option<u16>,
+    pub extra: Vec<(String, Value)>,
+    pub rules: Vec<Value>,
+}
+
 #[derive(Clone, Debug)]
 pub struct FoxyAccount {
     pub email: String,
@@ -209,6 +267,49 @@ pub fn load_foxy_location(options: &mut Options, paths: &Paths) {
     }
 }
 
+pub fn load_veepn_location(options: &mut Options, paths: &Paths) {
+    if !options.region.is_empty() || options.country_set {
+        return;
+    }
+    if let Some(line) = read_trim(&paths.veepn_location) {
+        options.region = line.trim().to_lowercase();
+    }
+}
+
+pub fn save_veepn_location(options: &Options, paths: &Paths) -> Result<(), String> {
+    let region = effective_region(options);
+    if region.is_empty() {
+        return Ok(());
+    }
+    write_private(
+        &paths.veepn_location,
+        &format!("{}\n", region.to_lowercase()),
+    )
+    .map_err(|error| format!("cannot remember the exit: {error}"))
+}
+
+pub fn load_psiphon_location(options: &mut Options, paths: &Paths) {
+    if !options.psiphon.region.is_empty() {
+        return;
+    }
+    if let Some(line) = read_trim(&paths.psiphon_location) {
+        if let Some(country) = line.split_whitespace().next() {
+            options.psiphon.region = country.to_uppercase();
+        }
+    }
+}
+
+pub fn save_psiphon_location(options: &Options, paths: &Paths) -> Result<(), String> {
+    if options.psiphon.region.is_empty() {
+        return Ok(());
+    }
+    write_private(
+        &paths.psiphon_location,
+        &format!("{} \n", options.psiphon.region.to_uppercase()),
+    )
+    .map_err(|error| format!("cannot remember the exit: {error}"))
+}
+
 pub fn save_foxy_location(options: &Options, paths: &Paths) -> Result<(), String> {
     if options.country.is_empty() {
         return Ok(());
@@ -244,12 +345,111 @@ pub fn build_outbound(
     match options.outbound {
         Some(Outbound::Foxy) => foxy_outbound(options, paths, account),
         Some(Outbound::Veepn) => veepn_outbound(options, paths),
+        Some(Outbound::Psiphon) => psiphon_outbound(options, paths, false),
         Some(Outbound::Vless) => vless_outbound(&options.vless),
         Some(Outbound::Vmess) => vmess_outbound(options),
         Some(Outbound::Trojan) => trojan_outbound(options),
         Some(Outbound::Ss) => ss_outbound(options),
         Some(Outbound::Config) | None => Err("no outbound chosen".to_owned()),
     }
+}
+
+/// The extra outbounds and routing `--warp` and `--udp-via` add to a generated
+/// foxy or psiphon config. The carrier outbound itself is built after this runs,
+/// so `options.upstream` already names the hidden front it must dial.
+pub fn lane_plan(options: &mut Options, paths: &Paths) -> Result<Generated, String> {
+    let mut generated = Generated::default();
+    if !matches!(options.outbound, Some(Outbound::Foxy | Outbound::Psiphon)) {
+        return Ok(generated);
+    }
+    let warp_chain = options.warp && options.upstream.is_empty();
+    if warp_chain {
+        let port = free_loopback_port()?;
+        options.upstream = format!("socks5://127.0.0.1:{port}");
+        generated.hidden_socks = Some(port);
+        generated
+            .extra
+            .push(("warp".to_owned(), warp_outbound(options, paths)));
+        generated.rules.push(json!({
+            "type": "field",
+            "inboundTag": [WARP_HOP_TAG],
+            "outboundTag": "warp",
+        }));
+    }
+    if options.outbound != Some(Outbound::Foxy) {
+        return Ok(generated);
+    }
+    match options.udp_via.as_str() {
+        "" | "foxy" => {}
+        "warp" => {
+            if !warp_chain {
+                generated
+                    .extra
+                    .push(("warp".to_owned(), warp_outbound(options, paths)));
+            }
+            generated.rules.insert(
+                0,
+                json!({"type": "field", "network": "udp", "outboundTag": "warp"}),
+            );
+        }
+        "psiphon" | "psiphon-cdn" => {
+            let tag = format!("udp-{}", options.udp_via);
+            generated
+                .extra
+                .push((tag.clone(), psiphon_outbound(options, paths, true)?));
+            generated.rules.insert(
+                0,
+                json!({"type": "field", "network": "udp", "outboundTag": tag}),
+            );
+        }
+        "direct" => {
+            generated
+                .extra
+                .push(("udp-direct".to_owned(), json!({"protocol": "freedom"})));
+            generated.rules.insert(
+                0,
+                json!({"type": "field", "network": "udp", "outboundTag": "udp-direct"}),
+            );
+        }
+        "block" => {
+            generated
+                .extra
+                .push(("udp-block".to_owned(), json!({"protocol": "blackhole"})));
+            generated.rules.insert(
+                0,
+                json!({"type": "field", "network": "udp", "outboundTag": "udp-block"}),
+            );
+        }
+        other => return Err(format!("unknown --udp-via lane `{other}`")),
+    }
+    Ok(generated)
+}
+
+fn warp_outbound(options: &Options, paths: &Paths) -> Value {
+    let identity = if options.warp_identity.is_empty() {
+        paths.warp_identity.to_string_lossy().into_owned()
+    } else {
+        options.warp_identity.clone()
+    };
+    json!({
+        "protocol": "warp",
+        "settings": {
+            "identityFile": identity,
+            "register": true,
+            "mode": options.warp_mode,
+        },
+    })
+}
+
+fn free_loopback_port() -> Result<u16, String> {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .and_then(|listener| listener.local_addr())
+        .map(|address| address.port())
+        .map_err(|error| format!("cannot reserve a loopback port for the WARP hop: {error}"))
+}
+
+fn hidden_inbound(inbound: &Value) -> bool {
+    inbound.get("tag").and_then(Value::as_str) == Some(WARP_HOP_TAG)
 }
 
 fn foxy_outbound(
@@ -319,6 +519,219 @@ fn veepn_outbound(options: &Options, paths: &Paths) -> Result<Value, String> {
         settings.insert("udid".to_owned(), json!(udid));
     }
     Ok(json!({"protocol": "veepn", "settings": settings}))
+}
+
+fn listed(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn psiphon_outbound(options: &Options, paths: &Paths, udp: bool) -> Result<Value, String> {
+    let p = &options.psiphon;
+    let mut settings = Map::new();
+    let state = if p.dir.is_empty() {
+        paths.psiphon_dir.to_string_lossy().into_owned()
+    } else {
+        p.dir.clone()
+    };
+    settings.insert("dataRootDirectory".to_owned(), json!(state));
+    if !p.bin.is_empty() {
+        settings.insert("binary".to_owned(), json!(p.bin));
+    }
+    if !p.listen.is_empty() {
+        settings.insert("listen".to_owned(), json!(p.listen));
+    } else if udp {
+        settings.insert("listen".to_owned(), json!("127.0.0.1:0"));
+    }
+    if !p.http.is_empty() {
+        settings.insert("httpListen".to_owned(), json!(p.http));
+    }
+    if !p.region.is_empty() {
+        settings.insert("region".to_owned(), json!(p.region));
+    }
+    match p.shape.as_str() {
+        "conduit" => {
+            settings.insert("protocolSelection".to_owned(), json!("conduit"));
+        }
+        "cdn" => {
+            settings.insert("protocolSelection".to_owned(), json!("cdn_fronting"));
+        }
+        "auto" => {
+            settings.insert("protocolSelection".to_owned(), json!("auto"));
+        }
+        _ => {}
+    }
+    if !p.ready.is_empty() {
+        settings.insert(
+            "readySeconds".to_owned(),
+            json!(p.ready.parse::<u64>().unwrap_or(0)),
+        );
+    }
+    if !p.base.is_empty() {
+        settings.insert("baseConfig".to_owned(), json!(p.base));
+    }
+    if !p.entries.is_empty() {
+        settings.insert("serverList".to_owned(), json!(p.entries));
+    }
+    if !options.upstream.is_empty() {
+        settings.insert("upstreamProxy".to_owned(), json!(options.upstream));
+    }
+    if p.split {
+        settings.insert("splitTunnelOwnRegion".to_owned(), json!(true));
+    }
+    let split_regions = listed(&p.split_regions);
+    if !split_regions.is_empty() {
+        settings.insert("splitTunnelRegions".to_owned(), json!(split_regions));
+    }
+    if !p.user.is_empty() {
+        settings.insert("localProxyUsername".to_owned(), json!(p.user));
+    }
+    if !p.pass.is_empty() {
+        settings.insert("localProxyPassword".to_owned(), json!(p.pass));
+    }
+    if !p.pool.is_empty() {
+        settings.insert(
+            "tunnelPoolSize".to_owned(),
+            json!(p.pool.parse::<u64>().unwrap_or(0)),
+        );
+    }
+    if !p.workers.is_empty() {
+        settings.insert(
+            "ConnectionWorkerPoolSize".to_owned(),
+            json!(p.workers.parse::<u64>().unwrap_or(0)),
+        );
+    }
+    if let Some(aggressive) = p.aggressive {
+        settings.insert("aggressiveEstablishment".to_owned(), json!(aggressive));
+    }
+    let mut features = listed(&p.features);
+    if p.unsafe_alerts && !features.iter().any(|item| item == "unsafe-traffic-alerts") {
+        features.push("unsafe-traffic-alerts".to_owned());
+    }
+    if !p.location_precision.is_empty()
+        && p.location_precision != "0"
+        && !features.iter().any(|item| item == "coarse-location")
+    {
+        features.push("coarse-location".to_owned());
+    }
+    if !features.is_empty() {
+        settings.insert("ClientFeatures".to_owned(), json!(features));
+    }
+    if !p.latency.is_empty() {
+        let latency = p.latency.parse::<f64>().map_err(|_| {
+            format!(
+                "--psiphon-latency wants a multiplier of at least 1, got '{}'; nothing was started.",
+                p.latency
+            )
+        })?;
+        settings.insert("NetworkLatencyMultiplier".to_owned(), json!(latency));
+    }
+    if !p.cdn_profile.is_empty() {
+        settings.insert("cdnProfile".to_owned(), json!(p.cdn_profile));
+    }
+    for (key, value) in [
+        ("cdnIps", &p.cdn_ips),
+        ("cdnSni", &p.cdn_sni),
+        ("cdnSets", &p.cdn_sets),
+    ] {
+        let items = listed(value);
+        if !items.is_empty() {
+            settings.insert(key.to_owned(), json!(items));
+        }
+    }
+    if !p.share_port.is_empty() {
+        settings.insert(
+            "shareProxyOnNetworkSocksPort".to_owned(),
+            json!(p.share_port.parse::<u64>().unwrap_or(0)),
+        );
+    }
+    if !p.share_http.is_empty() {
+        settings.insert(
+            "shareProxyOnNetworkHttpPort".to_owned(),
+            json!(p.share_http.parse::<u64>().unwrap_or(0)),
+        );
+    }
+    if !p.geoip.is_empty() {
+        settings.insert("GeoIPDatabasePath".to_owned(), json!(p.geoip));
+    }
+    if p.reject_censored {
+        settings.insert("rejectCensoredProxies".to_owned(), json!(true));
+    }
+    let reject_countries = listed(&p.reject_countries);
+    if !reject_countries.is_empty() {
+        settings.insert("rejectProxyCountries".to_owned(), json!(reject_countries));
+    }
+    if !p.compartment.is_empty() {
+        settings.insert("inproxyCompartment".to_owned(), json!(p.compartment));
+    }
+    if p.disable_timeouts {
+        settings.insert("DisableTimeouts".to_owned(), json!(true));
+    }
+    let dns = listed(&p.dns_alternate);
+    if !dns.is_empty() {
+        settings.insert("DNSResolverAlternateServers".to_owned(), json!(dns));
+    }
+    if !p.device_location.is_empty() {
+        settings.insert("deviceLocation".to_owned(), json!(p.device_location));
+    }
+    if !p.device_region.is_empty() {
+        settings.insert("deviceRegion".to_owned(), json!(p.device_region));
+    }
+    if !p.network_id.is_empty() {
+        settings.insert("networkId".to_owned(), json!(p.network_id));
+    }
+    if !p.additional_params.is_empty() {
+        settings.insert(
+            "additionalParameters".to_owned(),
+            json!(p.additional_params),
+        );
+    }
+    if !p.establish_timeout.is_empty() {
+        settings.insert(
+            "EstablishTunnelTimeoutSeconds".to_owned(),
+            json!(p.establish_timeout.parse::<u64>().unwrap_or(0)),
+        );
+    }
+    if p.emit_bytes {
+        settings.insert("emitBytesTransferred".to_owned(), json!(true));
+    }
+    if !p.conduit_mode.is_empty() {
+        settings.insert("conduitMode".to_owned(), json!(p.conduit_mode));
+    }
+    if !p.conduit_timeout.is_empty() {
+        settings.insert(
+            "conduitTimeout".to_owned(),
+            json!(p.conduit_timeout.parse::<u64>().unwrap_or(0)),
+        );
+    }
+    if p.share {
+        settings.insert("shareProxyOnNetwork".to_owned(), json!(true));
+    }
+    for (key, value) in [
+        ("serverListURLs", &p.server_lists),
+        ("ObfuscatedServerListRootURLs", &p.osl),
+    ] {
+        let items = listed(value);
+        if !items.is_empty() {
+            settings.insert(key.to_owned(), json!(items));
+        }
+    }
+    if !p.entry_key.is_empty() {
+        settings.insert(
+            "ServerEntrySignaturePublicKey".to_owned(),
+            json!(p.entry_key),
+        );
+    }
+    if !p.list_key.is_empty() {
+        settings.insert("serverListSignaturePublicKey".to_owned(), json!(p.list_key));
+    }
+    if !p.exchange_key.is_empty() {
+        settings.insert("ExchangeObfuscationKey".to_owned(), json!(p.exchange_key));
+    }
+    Ok(json!({"protocol": "psiphon", "settings": settings}))
 }
 
 fn vless_outbound(link: &str) -> Result<Value, String> {
@@ -612,8 +1025,13 @@ pub fn write_config(
     outbound: &Value,
     fronts: &str,
     ports: Ports,
+    vpn: Option<&Vpn>,
+    generated: Option<&Generated>,
 ) -> Result<(), String> {
     let mut inbounds = Vec::new();
+    if let Some(vpn) = vpn {
+        inbounds.push(vpn.inbound());
+    }
     for front in self::fronts(fronts) {
         let port = match front.as_str() {
             "socks" => ports.socks,
@@ -623,7 +1041,28 @@ pub fn write_config(
         };
         inbounds.push(json!({"protocol": front, "listen": "127.0.0.1", "port": port}));
     }
-    let document = json!({"inbounds": inbounds, "outbounds": [outbound.clone()]});
+    let mut outbounds = vec![outbound.clone()];
+    let mut routing = Vec::new();
+    if let Some(generated) = generated {
+        if let Some(port) = generated.hidden_socks {
+            inbounds.push(json!({
+                "protocol": "socks",
+                "tag": WARP_HOP_TAG,
+                "listen": "127.0.0.1",
+                "port": port,
+            }));
+        }
+        for (tag, outbound) in &generated.extra {
+            let mut outbound = outbound.clone();
+            outbound["tag"] = Value::String(tag.clone());
+            outbounds.push(outbound);
+        }
+        routing.extend(generated.rules.iter().cloned());
+    }
+    let mut document = json!({"inbounds": inbounds, "outbounds": outbounds});
+    if !routing.is_empty() {
+        document["routing"] = json!({"rules": routing});
+    }
     let text = serde_json::to_string_pretty(&document)
         .map_err(|error| format!("cannot encode the config: {error}"))?;
     write_private(path, &format!("{text}\n"))
@@ -643,6 +1082,9 @@ fn adopted_ports(path: &Path, fronts: &[String], fixed: &mut [bool], ports: &mut
     let names = ["socks", "http", "mixed"];
     let mut adopted: Vec<&str> = Vec::new();
     for inbound in inbounds {
+        if hidden_inbound(inbound) {
+            continue;
+        }
         let Some(name) = inbound.get("protocol").and_then(Value::as_str) else {
             continue;
         };
@@ -735,7 +1177,9 @@ pub fn front_listeners(path: &Path, list: &str) -> Vec<(String, String)> {
             let listen = inbounds
                 .and_then(|inbounds| {
                     inbounds.iter().find(|inbound| {
-                        inbound.get("protocol").and_then(Value::as_str) == Some(front.as_str())
+                        !hidden_inbound(inbound)
+                            && inbound.get("protocol").and_then(Value::as_str)
+                                == Some(front.as_str())
                     })
                 })
                 .and_then(|inbound| inbound.get("listen"))
@@ -749,7 +1193,7 @@ pub fn front_listeners(path: &Path, list: &str) -> Vec<(String, String)> {
 
 pub fn config_fronts(
     path: &str,
-    vpn: bool,
+    proxy: bool,
     fronts_set: bool,
     asked: &str,
 ) -> Result<String, String> {
@@ -760,6 +1204,9 @@ pub fn config_fronts(
     let mut order: Vec<String> = Vec::new();
     if let Some(inbounds) = document.get("inbounds").and_then(Value::as_array) {
         for inbound in inbounds {
+            if hidden_inbound(inbound) {
+                continue;
+            }
             let Some(name) = inbound.get("protocol").and_then(Value::as_str) else {
                 continue;
             };
@@ -788,14 +1235,18 @@ pub fn config_fronts(
         }
         order.retain(|front| wanted.contains(front));
     }
-    if vpn {
+    if proxy {
         if order.is_empty() {
             return Err(
-                "the config serves no socks, http or mixed inbound; --vpn needs one".to_owned(),
+                "the config serves no socks, http or mixed inbound; --vpn-proxy needs one"
+                    .to_owned(),
             );
         }
         if let Some(inbounds) = document.get("inbounds").and_then(Value::as_array) {
             for inbound in inbounds {
+                if hidden_inbound(inbound) {
+                    continue;
+                }
                 let Some(name) = inbound.get("protocol").and_then(Value::as_str) else {
                     continue;
                 };
@@ -805,14 +1256,14 @@ pub fn config_fronts(
                 let listen = inbound.get("listen").and_then(Value::as_str);
                 if listen == Some("::1") {
                     return Err(format!(
-                        "inbound `{name}` listens on ::1; --vpn points the Windows proxy at 127.0.0.1, so use 127.0.0.1"
+                        "inbound `{name}` listens on ::1; --vpn-proxy points the Windows proxy at 127.0.0.1, so use 127.0.0.1"
                     ));
                 }
                 let loopback =
                     listen.is_some_and(|listen| listen == "localhost" || listen == "127.0.0.1");
                 if !loopback {
                     return Err(format!(
-                        "inbound `{name}` listens on {}, not loopback; --vpn needs 127.0.0.1",
+                        "inbound `{name}` listens on {}, not loopback; --vpn-proxy needs 127.0.0.1",
                         listen.unwrap_or("all interfaces")
                     ));
                 }
@@ -820,6 +1271,25 @@ pub fn config_fronts(
         }
     }
     Ok(order.join(","))
+}
+
+/// Whether a verbatim config already carries the device `--vpn` would otherwise add.
+pub fn config_has_tun(path: &str) -> Result<bool, String> {
+    let text = read_trim_checked(Path::new(path))
+        .map_err(|error| format!("cannot read config {path}: {error}"))?;
+    let document: Value = serde_json::from_str(&text)
+        .map_err(|error| format!("cannot read config {path}: {error}"))?;
+    Ok(document
+        .get("inbounds")
+        .and_then(Value::as_array)
+        .is_some_and(|inbounds| {
+            inbounds.iter().any(|inbound| {
+                matches!(
+                    inbound.get("protocol").and_then(Value::as_str),
+                    Some("tun" | "utun" | "wintun" | "tun2socks")
+                )
+            })
+        }))
 }
 
 #[cfg(test)]
@@ -1041,7 +1511,7 @@ mod tests {
             http: 2,
             mixed: 3,
         };
-        write_config(&paths.cfg, &outbound, "socks,mixed", ports).unwrap();
+        write_config(&paths.cfg, &outbound, "socks,mixed", ports, None, None).unwrap();
         let document: Value =
             serde_json::from_str(&std::fs::read_to_string(&paths.cfg).unwrap()).unwrap();
         assert_eq!(document["inbounds"][0]["protocol"], "socks");
@@ -1049,6 +1519,213 @@ mod tests {
         assert_eq!(document["inbounds"][1]["protocol"], "mixed");
         assert_eq!(document["inbounds"][1]["port"], 3);
         assert_eq!(document["outbounds"][0]["protocol"], "freedom");
+    }
+
+    #[test]
+    fn write_config_puts_the_tun_inbound_first_with_the_selected_engine() {
+        let dir = scratch("tun");
+        let paths = Paths::with_dirs(dir.clone(), dir.join("state"), None);
+        let outbound = serde_json::json!({"protocol": "freedom"});
+        let ports = Ports {
+            socks: 1,
+            http: 2,
+            mixed: 3,
+        };
+        let vpn = Vpn {
+            engine: "userspace".to_owned(),
+            ipv6: true,
+            mtu: 1400,
+            name: "ferrox9".to_owned(),
+            dns: "192.0.2.53".to_owned(),
+        };
+        write_config(&paths.cfg, &outbound, "socks", ports, Some(&vpn), None).unwrap();
+        let document: Value =
+            serde_json::from_str(&std::fs::read_to_string(&paths.cfg).unwrap()).unwrap();
+        assert_eq!(document["inbounds"][0]["protocol"], "tun");
+        assert_eq!(document["inbounds"][0]["stack"], "userspace");
+        assert_eq!(document["inbounds"][0]["auto_route"], true);
+        assert_eq!(document["inbounds"][0]["mtu"], 1400);
+        assert_eq!(document["inbounds"][0]["name"], "ferrox9");
+        assert_eq!(document["inbounds"][0]["dns_mode"], "hijack");
+        assert_eq!(document["inbounds"][0]["dns_address"][0], "192.0.2.53");
+        assert_eq!(
+            document["inbounds"][0]["address"][1],
+            "fdfe:dcba:9876::1/64"
+        );
+        assert_eq!(document["inbounds"][1]["protocol"], "socks");
+    }
+
+    #[test]
+    fn psiphon_settings_carry_the_native_engine_options() {
+        let dir = scratch("psiphon");
+        let paths = Paths::with_dirs(dir.clone(), dir.join("state"), None);
+        let mut options = options();
+        options.outbound = Some(Outbound::Psiphon);
+        options.psiphon.region = "NL".to_owned();
+        options.psiphon.shape = "cdn".to_owned();
+        options.psiphon.aggressive = Some(true);
+        options.psiphon.split = true;
+        options.psiphon.split_regions = "US, CA".to_owned();
+        options.psiphon.cdn_ips = "192.0.2.1".to_owned();
+        let outbound = build_outbound(&options, &paths, None).unwrap();
+        assert_eq!(outbound["protocol"], "psiphon");
+        assert_eq!(outbound["settings"]["region"], "NL");
+        assert_eq!(outbound["settings"]["protocolSelection"], "cdn_fronting");
+        assert_eq!(outbound["settings"]["aggressiveEstablishment"], true);
+        assert_eq!(outbound["settings"]["splitTunnelOwnRegion"], true);
+        assert_eq!(outbound["settings"]["splitTunnelRegions"][1], "CA");
+        assert_eq!(outbound["settings"]["cdnIps"][0], "192.0.2.1");
+        assert_eq!(
+            outbound["settings"]["dataRootDirectory"],
+            paths.psiphon_dir.to_string_lossy().as_ref()
+        );
+    }
+
+    #[test]
+    fn a_split_psiphon_lane_keeps_the_shell_tag_and_an_ephemeral_port() {
+        let dir = scratch("psiphon-udp");
+        let paths = Paths::with_dirs(dir.clone(), dir.join("state"), None);
+        let mut options = options();
+        options.outbound = Some(Outbound::Foxy);
+        options.udp_via = "psiphon-cdn".to_owned();
+        options.psiphon.shape = "cdn".to_owned();
+        options.psiphon.aggressive = Some(true);
+        options.psiphon.cdn_profile = "fronted".to_owned();
+        let generated = lane_plan(&mut options, &paths).unwrap();
+        let (tag, outbound) = &generated.extra[0];
+        assert_eq!(tag, "udp-psiphon-cdn");
+        assert_eq!(outbound["settings"]["listen"], "127.0.0.1:0");
+        assert_eq!(outbound["settings"]["cdnProfile"], "fronted");
+        assert_eq!(generated.rules[0]["outboundTag"], "udp-psiphon-cdn");
+    }
+
+    #[test]
+    fn write_config_chains_a_psiphon_lane_through_warp() {
+        let dir = scratch("psiphon-warp");
+        let paths = Paths::with_dirs(dir.clone(), dir.join("state"), None);
+        let mut options = options();
+        options.outbound = Some(Outbound::Psiphon);
+        options.warp = true;
+        let generated = lane_plan(&mut options, &paths).unwrap();
+        let hidden = generated.hidden_socks.expect("warp needs a hidden front");
+        let outbound = build_outbound(&options, &paths, None).unwrap();
+        assert_eq!(
+            outbound["settings"]["upstreamProxy"],
+            format!("socks5://127.0.0.1:{hidden}")
+        );
+        let ports = Ports {
+            socks: 1,
+            http: 2,
+            mixed: 3,
+        };
+        write_config(
+            &paths.cfg,
+            &outbound,
+            "socks",
+            ports,
+            None,
+            Some(&generated),
+        )
+        .unwrap();
+        let document: Value =
+            serde_json::from_str(&std::fs::read_to_string(&paths.cfg).unwrap()).unwrap();
+        assert_eq!(document["outbounds"][0]["protocol"], "psiphon");
+        assert_eq!(document["outbounds"][1]["protocol"], "warp");
+        assert_eq!(
+            document["routing"]["rules"][0]["inboundTag"][0],
+            WARP_HOP_TAG
+        );
+    }
+
+    #[test]
+    fn write_config_chains_warp_through_a_hidden_front_and_tags_udp() {
+        let dir = scratch("warp");
+        let paths = Paths::with_dirs(dir.clone(), dir.join("state"), None);
+        let mut options = Options {
+            outbound: Some(Outbound::Foxy),
+            warp: true,
+            warp_mode: "gool".to_owned(),
+            udp_via: "warp".to_owned(),
+            ..Options::default()
+        };
+        let generated = lane_plan(&mut options, &paths).unwrap();
+        let hidden = generated.hidden_socks.expect("warp needs a hidden front");
+        assert!(options.upstream.starts_with("socks5://127.0.0.1:"));
+        let outbound = serde_json::json!({"protocol": "foxy", "settings": {"upstreamProxy": options.upstream}});
+        let ports = Ports {
+            socks: 1,
+            http: 2,
+            mixed: 3,
+        };
+        write_config(
+            &paths.cfg,
+            &outbound,
+            "socks",
+            ports,
+            None,
+            Some(&generated),
+        )
+        .unwrap();
+        let document: Value =
+            serde_json::from_str(&std::fs::read_to_string(&paths.cfg).unwrap()).unwrap();
+        let hidden_inbound = document["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|inbound| inbound["tag"] == WARP_HOP_TAG)
+            .expect("hidden front");
+        assert_eq!(hidden_inbound["protocol"], "socks");
+        assert_eq!(hidden_inbound["port"], hidden);
+        assert_eq!(document["outbounds"][1]["protocol"], "warp");
+        assert_eq!(document["outbounds"][1]["tag"], "warp");
+        assert_eq!(document["outbounds"][1]["settings"]["mode"], "gool");
+        assert_eq!(
+            document["outbounds"][1]["settings"]["identityFile"],
+            paths.warp_identity.to_string_lossy().as_ref()
+        );
+        assert_eq!(document["routing"]["rules"][0]["network"], "udp");
+        assert_eq!(document["routing"]["rules"][0]["outboundTag"], "warp");
+        assert_eq!(
+            document["routing"]["rules"][1]["inboundTag"][0],
+            WARP_HOP_TAG
+        );
+        assert_eq!(
+            config_fronts(paths.cfg.to_str().unwrap(), false, false, "").unwrap(),
+            "socks"
+        );
+    }
+
+    #[test]
+    fn write_config_udp_direct_adds_a_second_tagged_outbound() {
+        let dir = scratch("udp-direct");
+        let paths = Paths::with_dirs(dir.clone(), dir.join("state"), None);
+        let mut options = Options {
+            outbound: Some(Outbound::Foxy),
+            udp_via: "direct".to_owned(),
+            ..Options::default()
+        };
+        let generated = lane_plan(&mut options, &paths).unwrap();
+        assert_eq!(generated.hidden_socks, None);
+        let outbound = serde_json::json!({"protocol": "foxy"});
+        let ports = Ports {
+            socks: 1,
+            http: 2,
+            mixed: 3,
+        };
+        write_config(
+            &paths.cfg,
+            &outbound,
+            "socks",
+            ports,
+            None,
+            Some(&generated),
+        )
+        .unwrap();
+        let document: Value =
+            serde_json::from_str(&std::fs::read_to_string(&paths.cfg).unwrap()).unwrap();
+        assert_eq!(document["outbounds"][1]["protocol"], "freedom");
+        assert_eq!(document["outbounds"][1]["tag"], "udp-direct");
+        assert_eq!(document["routing"]["rules"][0]["outboundTag"], "udp-direct");
     }
 
     #[test]

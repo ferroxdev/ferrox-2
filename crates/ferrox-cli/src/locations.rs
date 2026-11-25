@@ -7,8 +7,8 @@ use std::process::Command;
 
 use serde_json::Value;
 
-use crate::args::die;
-use crate::config::{remembered_city, remembered_country};
+use crate::args::{die, Options, Outbound};
+use crate::config::{build_outbound, remembered_city, remembered_country};
 use crate::lane::require_bin;
 use crate::paths::{read_trim, secure_dir, write_private, Paths};
 
@@ -45,7 +45,13 @@ fn ms_of(value: &Value) -> Option<Option<u64>> {
     Some(object.get("ms").and_then(Value::as_u64))
 }
 
-pub fn list(paths: &Paths, filter: &str, ping: bool) -> Result<(), String> {
+pub fn list(options: &Options, paths: &Paths, filter: &str, ping: bool) -> Result<(), String> {
+    if options.outbound == Some(Outbound::Psiphon) {
+        return psiphon_regions(options, paths, filter);
+    }
+    if options.outbound == Some(Outbound::Veepn) {
+        return veepn_regions(paths, filter);
+    }
     let bin = require_bin();
     secure_dir(&paths.conf_dir)
         .map_err(|error| format!("cannot create the config dir: {error}"))?;
@@ -211,11 +217,243 @@ fn country_reading(best: &BTreeMap<(String, String), Option<u64>>, country: &str
     found
 }
 
-pub fn remember(paths: &Paths, country: &str, city: &str) -> Result<(), String> {
+fn veepn_regions(paths: &Paths, filter: &str) -> Result<(), String> {
+    secure_dir(&paths.conf_dir)
+        .map_err(|error| format!("cannot create the config dir: {error}"))?;
+    let wanted = filter.to_uppercase();
+    let output = Command::new("curl")
+        .args([
+            "-q",
+            "-sS",
+            "--max-time",
+            "20",
+            "https://antpeak.com/v3/location/extension/",
+        ])
+        .output();
+    let mut text = output
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default();
+    if text.trim().is_empty() {
+        let Some(saved) = read_trim(&paths.veepn_locations) else {
+            return Err(
+                "the VeePN list did not answer and no list is saved yet: check the network, then run 'ferrox-cli locations --veepn' again."
+                    .to_owned(),
+            );
+        };
+        println!(
+            "the VeePN list did not answer; showing the last list it gave ({}).",
+            paths.veepn_locations.display()
+        );
+        text = saved;
+    } else {
+        write_private(&paths.veepn_locations, &format!("{}\n", text.trim_end()))
+            .map_err(|error| format!("cannot save the VeePN list: {error}"))?;
+    }
+    let document = serde_json::from_str::<Value>(&text)
+        .map_err(|_| "the VeePN list was not JSON".to_owned())?;
+    let mut places: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    for location in document
+        .get("locations")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let code = location
+            .get("countryCode")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_uppercase();
+        let region = location
+            .get("region")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let name = location
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if code.is_empty()
+            || (!wanted.is_empty() && code != wanted && region.to_uppercase() != wanted)
+        {
+            continue;
+        }
+        places.entry(code).or_default().push((region, name));
+    }
+    if places.is_empty() {
+        if wanted.is_empty() {
+            return Err("the VeePN list named no region just now.".to_owned());
+        }
+        return Err(format!(
+            "{wanted} is not in the VeePN list; run 'ferrox-cli locations --veepn' for every code it lists."
+        ));
+    }
+    let current = read_trim(&paths.veepn_location)
+        .and_then(|line| line.split_whitespace().next().map(str::to_uppercase))
+        .unwrap_or_default();
+    println!(
+        "exit locations from VeePN: {} countries, {} regions",
+        places.len(),
+        places.values().map(Vec::len).sum::<usize>()
+    );
+    println!("the region id is what --region takes (lowercase); --country takes either it or the two-letter code.");
+    for (code, regions) in &places {
+        let mark = if *code == current { "*" } else { " " };
+        println!(" {mark} {code}  {:>3} regions", regions.len());
+        for (region, name) in regions {
+            println!("      {region:<18} {name}");
+        }
+    }
+    println!();
+    println!("remember one:  ferrox-cli location --veepn <REGION>");
+    println!("the list is saved in {}", paths.veepn_locations.display());
+    Ok(())
+}
+
+fn psiphon_regions(options: &Options, paths: &Paths, filter: &str) -> Result<(), String> {
+    let bin = require_bin();
+    secure_dir(&paths.conf_dir)
+        .map_err(|error| format!("cannot create the config dir: {error}"))?;
+    let outbound = build_outbound(options, paths, None)?;
+    let tmp = paths
+        .state_dir
+        .join(format!("psiphon-regions-{}.json", std::process::id()));
+    secure_dir(&paths.state_dir)
+        .map_err(|error| format!("cannot create the state dir: {error}"))?;
+    let document = serde_json::json!({"inbounds": [], "outbounds": [outbound]});
+    write_private(
+        &tmp,
+        &format!("{}\n", serde_json::to_string(&document).unwrap_or_default()),
+    )
+    .map_err(|error| format!("cannot write {}: {error}", tmp.display()))?;
+    let output = Command::new(&bin)
+        .arg("psiphon-regions")
+        .arg("-c")
+        .arg(&tmp)
+        .output();
+    let _ = std::fs::remove_file(&tmp);
+    let wanted = filter.to_uppercase();
+    let mut text = output
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default();
+    if text.trim().is_empty() {
+        let Some(saved) = read_trim(&paths.psiphon_locations) else {
+            return Err(
+                "the Psiphon list did not answer and no list is saved yet: check the network, then run 'ferrox-cli locations --psiphon' again."
+                    .to_owned(),
+            );
+        };
+        println!(
+            "the Psiphon list did not answer; showing the last list it gave ({}).",
+            paths.psiphon_locations.display()
+        );
+        text = saved;
+    } else {
+        write_private(&paths.psiphon_locations, &format!("{}\n", text.trim_end()))
+            .map_err(|error| format!("cannot save the Psiphon list: {error}"))?;
+    }
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let (code, count) = line.split_once('\t').unwrap_or((line, "0"));
+        let code = code.trim().to_uppercase();
+        if code.is_empty() || (!wanted.is_empty() && code != wanted) {
+            continue;
+        }
+        rows.push((code, count.trim().parse::<u64>().unwrap_or(0)));
+    }
+    if rows.is_empty() {
+        if wanted.is_empty() {
+            return Err("the Psiphon server list named no region just now.".to_owned());
+        }
+        return Err(format!(
+            "{wanted} is not in the Psiphon server list; run 'ferrox-cli locations --psiphon' for every code it lists."
+        ));
+    }
+    let current = read_trim(&paths.psiphon_location)
+        .and_then(|line| line.split_whitespace().next().map(str::to_uppercase))
+        .unwrap_or_default();
+    println!(
+        "exit regions from the signed Psiphon server list: {} codes",
+        rows.len()
+    );
+    println!("the code is what --psiphon-region takes; a code with no entry is not dialable from that list.");
+    for (code, count) in &rows {
+        let mark = if *code == current { "*" } else { " " };
+        println!(" {mark} {code:<4} {count:>4} entries");
+    }
+    println!();
+    println!("remember one:  ferrox-cli location --psiphon <CC>");
+    println!("the list is saved in {}", paths.psiphon_locations.display());
+    Ok(())
+}
+
+pub fn remember(options: &Options, paths: &Paths, country: &str, city: &str) -> Result<(), String> {
     let country = country.trim().to_uppercase();
     let city = city.trim().to_uppercase();
     if country.is_empty() {
-        die("usage: ferrox-cli location <CC> [CITY]   (see 'ferrox-cli locations')");
+        die("usage: ferrox-cli location [--foxy|--veepn|--psiphon] <CC> [CITY]   (see 'ferrox-cli locations')");
+    }
+    if options.outbound == Some(Outbound::Veepn) {
+        if let Some(saved) = read_trim(&paths.veepn_locations) {
+            let wanted = country.to_uppercase();
+            let found = serde_json::from_str::<Value>(&saved).is_ok_and(|document| {
+                document
+                    .get("locations")
+                    .and_then(Value::as_array)
+                    .is_some_and(|locations| {
+                        locations.iter().any(|location| {
+                            let code = location
+                                .get("countryCode")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_uppercase();
+                            let region = location
+                                .get("region")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_uppercase();
+                            code == wanted || region == wanted
+                        })
+                    })
+            });
+            if !found {
+                die(&format!(
+                    "'{country}' is not in the saved VeePN list; run 'ferrox-cli locations --veepn' to refresh it, or pick a region it prints."
+                ));
+            }
+        }
+        secure_dir(&paths.conf_dir)
+            .map_err(|error| format!("cannot create the config dir: {error}"))?;
+        write_private(
+            &paths.veepn_location,
+            &format!("{}\n", country.to_lowercase()),
+        )
+        .map_err(|error| format!("cannot remember the exit: {error}"))?;
+        println!("exit remembered: {country}. The next 'up --veepn' moves there.");
+        return Ok(());
+    }
+    if options.outbound == Some(Outbound::Psiphon) {
+        if let Some(saved) = read_trim(&paths.psiphon_locations) {
+            let found = saved.lines().any(|line| {
+                line.split_once('\t')
+                    .is_some_and(|(code, _)| code.eq_ignore_ascii_case(&country))
+            });
+            if !found {
+                die(&format!(
+                    "'{country}' is not in the saved Psiphon list; run 'ferrox-cli locations --psiphon' to refresh it, or pick a code it prints."
+                ));
+            }
+        }
+        secure_dir(&paths.conf_dir)
+            .map_err(|error| format!("cannot create the config dir: {error}"))?;
+        write_private(&paths.psiphon_location, &format!("{country}\n"))
+            .map_err(|error| format!("cannot remember the exit: {error}"))?;
+        println!("exit remembered: {country}. The next 'up --psiphon' moves there.");
+        return Ok(());
     }
     if let Some(saved) = read_trim(&paths.locations_file) {
         let needle = format!("\"country\":\"{country}\"");

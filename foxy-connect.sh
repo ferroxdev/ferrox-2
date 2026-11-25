@@ -15,10 +15,10 @@
 #     honour it (browsers included) carry the whole laptop through the lane.
 #
 # What this is not
-#   * not a TUN device: this binary has no `tun` inbound and no tun2socks
-#     engine (README rows 29 and 58, slice P46), so --tun refuses by name and
-#     says why. UDP leaves the device only where an app asks a SOCKS5 proxy to
-#     carry it; that rides the lane's MASQUE datagrams, not the device.
+#   * not the TUN launcher: use the release `ferrox-cli up --foxy --vpn`, which
+#     opens a TUN device and captures the whole host. This development script
+#     only arms the system proxy; --tun names that other command instead of
+#     pretending the device does not exist.
 #
 # Credentials
 #   Read in this order: FOXY_PASS, $FOXY_CREDENTIALS (default
@@ -572,7 +572,7 @@ while [ $# -gt 0 ]; do
     --code) CODE="${2:-}"; shift 2;;
     --vpn) MODE="vpn"; shift;;
     --no-vpn) CLEAR_VPN=1; shift;;
-    --tun) die "--tun is refused: this binary has no TUN inbound and no tun2socks engine (README rows 29 and 58, slice P46). Use --mode vpn for the system proxy, or --mode socks|http|mixed for one app." ;;
+    --tun) die "--tun belongs to the release launcher: run 'ferrox-cli up --foxy --vpn' (it opens a TUN device). This development script arms the system proxy with --mode vpn, or one app with --mode socks|http|mixed." ;;
     --build) FORCE_BUILD=1; shift;;
     -h|--help) usage; exit 0;;
     *) die "unknown argument: $1 (see --help)";;

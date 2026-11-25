@@ -2,7 +2,7 @@
 # ferrox-cli: one front-facing command for every lane this binary dials.
 #
 #   ferrox-cli login                           save the foxy account once (0600)
-#   ferrox-cli up --foxy --vpn                 the Foxy lane, whole-device proxy
+#   ferrox-cli up --foxy --vpn                 the Foxy lane, TUN whole-device
 #   ferrox-cli up --veepn --vpn                the VeePN lane, no account needed
 #   ferrox-cli up --psiphon --vpn              the Psiphon lane, native OSSH/SSH
 #   ferrox-cli up --psiphon-cdn --vpn          the same lane, CDN fronting requested
@@ -18,10 +18,11 @@
 # dependency and links with thin LTO, so it costs minutes; a dev build is seconds.
 # FERROX_PROFILE=release (or FERROX_RELEASE=1) asks for the measured binary.
 #
-# The fronts are local proxies (SOCKS5, HTTP CONNECT, mixed). "VPN mode" here
-# means the macOS system proxy, because this binary has no utun device: TUN
-# mode is refused by name, and `ferrox-cli tun` says what that costs.
+# The fronts are local proxies (SOCKS5, HTTP CONNECT, mixed). --vpn opens a TUN
+# device instead and captures the whole host; it needs root, and `ferrox-cli tun`
+# lists the engines. --vpn-proxy keeps the old macOS system-proxy behaviour.
 set -uo pipefail
+ORIG_ARGS=("$@")
 
 if [ "$(uname -s 2>/dev/null)" = Linux ] && grep -qi microsoft /proc/version 2>/dev/null; then
   echo "ferrox-cli.sh: WSL detected; run ferrox-cli.exe from Windows instead." >&2
@@ -93,6 +94,7 @@ LOCATIONS_FILE=""
 PID_FILE="$CONF_DIR/lane.pid"
 META_FILE="$CONF_DIR/lane.meta"
 LOG="$CONF_DIR/lane.log"
+STOP_FILE="$STATE_DIR/lane.stop"
 PROXY_PORTS="$STATE_DIR/system-proxy.ports"
 PROXY_STATE="$STATE_DIR/system-proxy.state"
 SUPERVISOR_FILE="$STATE_DIR/system-proxy.supervisor"
@@ -130,14 +132,15 @@ EXCLUDE_DOMAINS=""
 EXCLUDE_PORTS=""
 UPSTREAM=""
 WANT_WARP=0
+WARP_MODE="auto"
+WARP_MODE_SET=0
+WARP_IDENTITY=""
 UDP_VIA=""
 BUILT_UDP_OUTBOUND=""
 BUILT_UDP_TAG=""
-WARP_STARTED=0
-WARP_CFG=""
-WARP_PID_FILE=""
-WARP_LOG=""
-WARP_PORT_FILE=""
+BUILT_CHAIN=""
+WARP_IN_CONFIG=0
+WARP_HIDDEN_PORT=""
 # VeePN has no account and no server: an empty region lets the plane pick, and
 # the device id is kept under $CONF_DIR so a restart is the same device.
 REGION=""
@@ -200,10 +203,18 @@ SOCKS_SET=0; [ -n "${FOXY_SOCKS_PORT:-}" ] && SOCKS_SET=1
 HTTP_SET=0; [ -n "${FOXY_HTTP_PORT:-}" ] && HTTP_SET=1
 MIXED_SET=0; [ -n "${FOXY_MIXED_PORT:-}" ] && MIXED_SET=1
 WANT_VPN=0
+WANT_VPN_PROXY=0
+VPN_ENGINE="native"
+VPN_ENGINE_SET=0
+VPN_IPV6=0
+VPN_MTU=1500
+VPN_NAME=""
+VPN_DNS="1.1.1.1"
 DEBUG=0
 
 die() { echo "ferrox-cli: $*" >&2; exit 1; }
 say() { printf '%s\n' "$*"; }
+
 rule() { printf '%s\n' "----------------------------------------------------------------"; }
 
 # The shell launcher writes and plans configs with Python and proves the lane
@@ -269,7 +280,7 @@ commands
   down       stop the lane and clear the system proxy it set (--all: every lane)
   status     show the lane (--instance NAME for one of several), then its exit
   ports      print the port map and the macOS settings to type
-  tun        what TUN mode would need, and why this binary refuses it
+  tun        the TUN engines and what each one needs
   version    print the binary's version
 
 first run, then every run: the foxy lane signs in once and keeps the session in
@@ -302,8 +313,9 @@ several lanes at once
   A named instance keeps its own config, pid, log, ports and remembered exit;
   the account and the edge catalogue are shared. Ports left unnamed are the
   first free ones near the defaults, so a second lane never fights the first.
-  --vpn belongs to the unnamed lane: the system proxy is one machine-wide
-  setting, and an instance is reached by pointing the app at its fronts.
+  --vpn and --vpn-proxy belong to the unnamed lane: a TUN device and the
+  system proxy are both machine-wide, and an instance is reached by pointing
+  the app at its fronts.
 
 outbound (choose one)
   --foxy                 Foxy lane; account from \$FOXY_CREDENTIALS
@@ -330,15 +342,19 @@ foxy options (email + password is the whole setup; there is no server to name)
                          h2 and h1 when the path drops QUIC
   --fxa-user-agent UA    override the pinned desktop Firefox identity for FxA
   --upstream URL         http:// or socks5(h):// hop to reach the edge through
-  --warp                 chain through WARP first: register once, race WireGuard
-                         against MASQUE, and egress the account plane and the
-                         carrier through it (a region block sees a WARP exit)
+  --warp                 chain the foxy or psiphon carrier through WARP first:
+                         register once, then egress the account plane, the signed
+                         list and the carrier through it. One process, one config
+  --warp-mode MODE       auto (default), wireguard, masque, gool (WG over
+                         MASQUE), gool-classic (WARP in WARP) or mim (MASQUE in
+                         MASQUE); only with --warp or --udp-via warp
+  --warp-identity FILE   identity JSON; default is the per-lane file under
+                         \$CONF_DIR (only with --warp or --udp-via warp)
   --udp-via LANE         split egress: TCP stays on foxy, datagrams take a second
                          outbound in the same config. LANE is foxy (default),
-                         warp, psiphon, psiphon-cdn, direct or block. warp is a
-                         registering WARP lane (or the --warp hop when both are
-                         named); psiphon rides its udpgw; direct is unencrypted;
-                         block drops UDP.
+                         warp, psiphon, psiphon-cdn, direct or block. warp reuses
+                         the --warp outbound when both are named; psiphon rides
+                         its udpgw; direct is unencrypted; block drops UDP.
   --exclude-domains LIST domain suffixes that leave the tunnel and dial directly
                          (comma-separated; example.com also covers its subdomains)
   --exclude-ports LIST   destination ports that leave the tunnel and dial directly
@@ -407,12 +423,19 @@ fronts
   --instance NAME        another lane beside the unnamed one: its config, pid,
                          log, ports and remembered exit are its own; ports left
                          unnamed are the first free ones near the defaults
-  --vpn                  also point the macOS system proxy at the fronts; other
-                         platforms refuse and print the environment command; the
-                         unnamed lane only (it is one machine-wide setting)
   --all                  with down: stop every lane
   --debug                keep the lane's dial trace in the log (FOXY_DEBUG=1)
-  --tun                  refused: this binary has no utun device
+
+vpn (whole-device capture; needs root, and the shell elevates on Unix)
+  --vpn                  open a TUN device and route the host through the lane
+  --tun                  alias for --vpn
+  --vpn-engine ENGINE    native (default), userspace, system or hybrid
+                         aliases: hev, tun2socks, smoltcp, gvisor, mixed
+  --vpn-ipv6             also carry IPv6
+  --vpn-mtu N            device MTU, default 1500
+  --vpn-name NAME        device name (default ferrox0, or the system utun on macOS)
+  --vpn-dns ADDR         resolver that port 53 is sent to, default 1.1.1.1; 'none' leaves it
+  --vpn-proxy            the old behaviour: point the macOS system proxy at the fronts
   -h, --help             this text
   -V, --version          print the binary's version
 
@@ -869,33 +892,51 @@ PY
 
 # One JSON writer for every outbound: python3 already carries this tree's scripts.
 write_config() {
-  local outbound="$1" udp="${2:-}" tag="${3:-}" rc=0
+  local outbound="$1" chain="${2:-}" rc=0
   ( umask 077
-    python3 - "$CFG" "$FRONTS" "$SOCKS_PORT" "$HTTP_PORT" "$MIXED_PORT" "$tag" \
-      3< <(printf '%s' "$outbound") 4< <(printf '%s' "$udp") <<'PY'
+    python3 - "$CFG" "$FRONTS" "$SOCKS_PORT" "$HTTP_PORT" "$MIXED_PORT" \
+      "$WANT_VPN" "$VPN_ENGINE" "$VPN_IPV6" "$VPN_MTU" "$VPN_NAME" "$VPN_DNS" \
+      3< <(printf '%s' "$outbound") 4< <(printf '%s' "$chain") <<'PY'
 import json, os, sys
 
-cfg, fronts, socks, http, mixed, tag = sys.argv[1:7]
+cfg, fronts, socks, http, mixed, vpn, engine, ipv6, mtu, name, dns = sys.argv[1:12]
 with os.fdopen(3) as handle:
     outbound = handle.read()
 with os.fdopen(4) as handle:
-    udp = handle.read()
+    chain = handle.read()
 ports = {"socks": int(socks), "http": int(http), "mixed": int(mixed)}
 wanted = [f.strip() for f in fronts.split(",") if f.strip()]
 for front in wanted:
     if front not in ports:
         sys.exit(f"unknown front `{front}`: socks, http, mixed")
-doc = {
-    "inbounds": [{"protocol": f, "listen": "127.0.0.1", "port": ports[f]} for f in wanted],
-    "outbounds": [json.loads(outbound)],
-}
-if udp:
-    lane = json.loads(udp)
-    lane["tag"] = tag
-    doc["outbounds"].append(lane)
-    doc["routing"] = {
-        "rules": [{"type": "field", "network": "udp", "outboundTag": tag}]
+inbounds = [{"protocol": f, "listen": "127.0.0.1", "port": ports[f]} for f in wanted]
+if vpn == "1":
+    tun = {
+        "protocol": "tun",
+        "tag": "tun-in",
+        "stack": engine,
+        "auto_route": True,
+        "mtu": int(mtu),
+        "address": ["198.18.0.1/15"],
     }
+    if ipv6 == "1":
+        tun["address"].append("fdfe:dcba:9876::1/64")
+    if name:
+        tun["name"] = name
+    if dns and dns != "none":
+        tun["dns_mode"] = "hijack"
+        tun["dns_address"] = [dns]
+    inbounds.insert(0, tun)
+doc = {"inbounds": inbounds, "outbounds": [json.loads(outbound)]}
+if chain:
+    extra = json.loads(chain)
+    hidden = int(extra.get("hidden_port") or 0)
+    if hidden:
+        inbounds.append({"protocol": "socks", "tag": "ferrox-warp-hop",
+                         "listen": "127.0.0.1", "port": hidden})
+    doc["outbounds"].extend(extra.get("outbounds") or [])
+    if extra.get("rules"):
+        doc["routing"] = {"rules": extra["rules"]}
 fd = os.open(cfg, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 os.chmod(cfg, 0o600)
 with os.fdopen(fd, "w") as handle:
@@ -930,6 +971,8 @@ if config:
         document = {}
     adopted = set()
     for inbound in document.get("inbounds", []):
+        if inbound.get("tag") == "ferrox-warp-hop":
+            continue
         name = inbound.get("protocol")
         port = inbound.get("port")
         if name in names and name in fronts and not explicit[names.index(name)] and name not in adopted and isinstance(port, int):
@@ -961,13 +1004,13 @@ PY
 
 # A config lane serves the proxy inbounds its file names, so the fronts and the
 # ports a system proxy may point at come from that file, not from the defaults.
-# A selected front must be reachable at 127.0.0.1 before it is armed, and a file
-# with no proxy inbound is refused by name for --vpn.
+# A selected front must be reachable at 127.0.0.1 before it is armed; --vpn
+# additionally needs the file to carry its own TUN inbound.
 config_fronts() {
-  python3 - "$CONFIG_FILE" "$WANT_VPN" "$FRONTS_SET" "$FRONTS" <<'PY'
+  python3 - "$CONFIG_FILE" "$WANT_VPN_PROXY" "$FRONTS_SET" "$FRONTS" "$WANT_VPN" <<'PY'
 import json, sys
 
-path, vpn, explicit, asked = sys.argv[1:5]
+path, proxy, explicit, asked, tun = sys.argv[1:6]
 try:
     with open(path, encoding="utf-8") as handle:
         document = json.load(handle)
@@ -976,6 +1019,8 @@ except (OSError, ValueError) as error:
 order = []
 for inbound in document.get("inbounds", []):
     if not isinstance(inbound, dict):
+        continue
+    if inbound.get("tag") == "ferrox-warp-hop":
         continue
     name = inbound.get("protocol")
     if name not in ("socks", "http", "mixed"):
@@ -991,8 +1036,19 @@ if explicit == "1":
     if missing:
         sys.exit(f"the config serves no {missing[0]} inbound; --fronts names it")
     order = [front for front in order if front in wanted]
-if vpn == "1" and not order:
-    sys.exit("the config serves no socks, http or mixed inbound; --vpn needs one")
+if proxy == "1" and not order:
+    sys.exit("the config serves no socks, http or mixed inbound; --vpn-proxy needs one")
+if tun == "1":
+    has_tun = any(
+        isinstance(inbound, dict)
+        and inbound.get("protocol") in ("tun", "utun", "wintun", "tun2socks")
+        for inbound in document.get("inbounds", [])
+    )
+    if not has_tun:
+        sys.exit(
+            "--vpn adds a TUN inbound to a generated config; this --config has none. "
+            "Add a `tun` inbound to it, or drop --config and let the launcher generate one"
+        )
 # This launcher reaches every front on 127.0.0.1, so an inbound bound to another
 # address would never answer the startup probe or the system proxy. `0.0.0.0` and
 # `::1` are refused with it: a wildcard front is reachable but also exposed, and
@@ -1363,35 +1419,32 @@ print(json.dumps({"protocol": "psiphon", "settings": settings}))
 PY
 }
 
+warp_identity_path() {
+  if [ -n "$WARP_IDENTITY" ]; then
+    printf '%s' "$WARP_IDENTITY"
+  else
+    printf '%s' "$CONF_DIR/warp-identity${INSTANCE:+-$INSTANCE}.json"
+  fi
+}
+
+warp_outbound() {
+  local identity
+  identity="$(resolve_real "$(warp_identity_path)")"
+  python3 - "$identity" "$WARP_MODE" <<'PY'
+import json, sys
+print(json.dumps({
+    "protocol": "warp",
+    "settings": {"identityFile": sys.argv[1], "register": True, "mode": sys.argv[2]},
+}))
+PY
+}
+
 # The lane UDP rides when it is not the foxy carrier: a second outbound in the
 # same config, so the routing rule `network: udp` sends datagrams there while
 # TCP stays on the first outbound.
 udp_outbound() {
   case "$UDP_VIA" in
-    warp)
-      if [ "$WANT_WARP" = 1 ] && warp_hop_running; then
-        local port
-        port="$(cat "$WARP_PORT_FILE" 2>/dev/null || true)"
-        [ -n "$port" ] || return 1
-        python3 - "$port" <<'PY'
-import json, sys
-port = int(sys.argv[1])
-print(json.dumps({
-    "protocol": "socks",
-    "settings": {"servers": [{"address": "127.0.0.1", "port": port}]},
-}))
-PY
-      else
-        local identity
-        identity="$(resolve_real "$CONF_DIR/warp-identity.json")"
-        python3 - "$identity" <<'PY'
-import json, sys
-print(json.dumps({
-    "protocol": "warp",
-    "settings": {"identityFile": sys.argv[1], "register": True, "mode": "auto"},
-}))
-PY
-      fi ;;
+    warp) warp_outbound ;;
     psiphon|psiphon-cdn)
       local state listen
       state="$(resolve_real "${PSIPHON_DIR:-$CONF_DIR/psiphon-udp${INSTANCE:+-$INSTANCE}}")"
@@ -1401,6 +1454,28 @@ PY
     block) printf '%s' '{"protocol": "blackhole"}' ;;
     *) return 1 ;;
   esac
+}
+
+# The extra outbounds and routing a generated config carries: a hidden loopback
+# front routed to the tagged WARP outbound, and the optional UDP split.
+build_chain() {
+  python3 - "$WARP_IN_CONFIG" "$WARP_HIDDEN_PORT" "$WARP_MODE" "$(warp_identity_path)" \
+    "$BUILT_UDP_OUTBOUND" "$BUILT_UDP_TAG" <<'PY'
+import json, os, sys
+in_config, hidden, mode, identity, udp, tag = sys.argv[1:7]
+outbounds, rules = [], []
+if in_config == "1":
+    outbounds.append({"tag": "warp", "protocol": "warp", "settings": {
+        "identityFile": os.path.abspath(identity), "register": True, "mode": mode}})
+    rules.append({"type": "field", "inboundTag": ["ferrox-warp-hop"], "outboundTag": "warp"})
+if udp:
+    lane = json.loads(udp)
+    lane["tag"] = tag
+    outbounds.append(lane)
+    rules.insert(0, {"type": "field", "network": "udp", "outboundTag": tag})
+print(json.dumps({"hidden_port": int(hidden) if hidden else 0,
+                  "outbounds": outbounds, "rules": rules}))
+PY
 }
 
 # A vless:// or vmess:// share link, or --vmess HOST:PORT, -> xray json.
@@ -1731,8 +1806,8 @@ _system_proxy_preflight() {
   case "$platform" in
     Darwin) ;;
     *)
-      say "ferrox-cli: --vpn sets the macOS system proxy; on ${platform:-this platform} nothing was started." >&2
-      say "  point the app at the fronts instead: ferrox-cli ports" >&2
+      say "ferrox-cli: --vpn-proxy sets the macOS system proxy; on ${platform:-this platform} nothing was started." >&2
+      say "  use --vpn for a TUN device, or point the app at the fronts: ferrox-cli ports" >&2
       case ",$FRONTS," in *,http,*) https="http://127.0.0.1:$HTTP_PORT" ;; esac
       case ",$FRONTS," in *,socks,*) all="socks5h://127.0.0.1:$SOCKS_PORT" ;; esac
       case ",$FRONTS," in
@@ -1754,16 +1829,16 @@ _system_proxy_preflight() {
       ;;
   esac
   command -v networksetup >/dev/null 2>&1 || {
-    say "ferrox-cli: --vpn needs networksetup on PATH; nothing was started." >&2
+    say "ferrox-cli: --vpn-proxy needs networksetup on PATH; nothing was started." >&2
     return 1
   }
   command -v scutil >/dev/null 2>&1 || {
-    say "ferrox-cli: --vpn needs scutil on PATH to verify the proxy; nothing was started." >&2
+    say "ferrox-cli: --vpn-proxy needs scutil on PATH to verify the proxy; nothing was started." >&2
     return 1
   }
   svc="$(networksetup -listallnetworkservices 2>/dev/null | tail -n +2 | sed '/^\*/d' | head -n 1)"
   [ -n "$svc" ] || {
-    say "ferrox-cli: --vpn found no network service to carry the proxy; nothing was started." >&2
+    say "ferrox-cli: --vpn-proxy found no network service to carry the proxy; nothing was started." >&2
     return 1
   }
   state="$(proxy_auto_line "$svc" | sed -n 's/^Auto Proxy Discovery: //p' | head -n 1 | tr '[:upper:]' '[:lower:]')"
@@ -1771,12 +1846,12 @@ _system_proxy_preflight() {
     on|yes) state=on ;;
     off|no) state=off ;;
     *)
-      say "ferrox-cli: --vpn cannot read the current auto discovery state; nothing was started." >&2
+      say "ferrox-cli: --vpn-proxy cannot read the current auto discovery state; nothing was started." >&2
       return 1
       ;;
   esac
   if ! networksetup -setproxyautodiscovery "$svc" "$state" 2>/dev/null; then
-    say "ferrox-cli: --vpn needs administrator permission to change the system proxy; nothing was started." >&2
+    say "ferrox-cli: --vpn-proxy needs administrator permission to change the system proxy; nothing was started." >&2
     say "  run it with sudo, or point the app at the fronts: ferrox-cli ports" >&2
     return 1
   fi
@@ -2487,10 +2562,7 @@ apply_instance() {
   PID_FILE="$CONF_DIR/lane$suffix.pid"
   META_FILE="$CONF_DIR/lane$suffix.meta"
   LOG="$CONF_DIR/lane$suffix.log"
-  WARP_CFG="$CONF_DIR/warp-hop$suffix.json"
-  WARP_PID_FILE="$CONF_DIR/warp-hop$suffix.pid"
-  WARP_LOG="$CONF_DIR/warp-hop$suffix.log"
-  WARP_PORT_FILE="$CONF_DIR/warp-hop$suffix.port"
+  STOP_FILE="$STATE_DIR/lane$suffix.stop"
   PROXY_PORTS="$STATE_DIR/system-proxy$suffix.ports"
   PROXY_STATE="$STATE_DIR/system-proxy$suffix.state"
   SUPERVISOR_FILE="$STATE_DIR/system-proxy$suffix.supervisor"
@@ -2568,6 +2640,18 @@ wait_fronts() {
   return 0
 }
 
+# The app prints this once the device is open and its routes are in; a lane
+# that dies first is not a device that is slow.
+wait_tun() {
+  local _
+  for _ in $(seq 1 600); do
+    grep -q "tun inbound: interface .* up (stack " "$LOG" 2>/dev/null && return 0
+    lane_running || return 1
+    sleep 0.1
+  done
+  return 1
+}
+
 port_map() {
   local front
   for front in ${FRONTS//,/ }; do
@@ -2605,23 +2689,38 @@ build_config() {
         read_credentials
       fi
       # WARP first: the hop egresses the account plane and the carrier, so a
-      # region block on FxA or the catalogue sees a WARP exit. An explicit
-      # --upstream is the user's own hop and wins.
+      # region block on FxA or the catalogue sees a WARP exit. One process:
+      # foxy dials a hidden loopback front, and the router sends that front to
+      # the tagged warp outbound, so a TUN capture pins the WARP edge too.
+      WARP_IN_CONFIG=0
+      WARP_HIDDEN_PORT=""
+      BUILT_UDP_OUTBOUND=""
+      BUILT_UDP_TAG=""
       if [ "$WANT_WARP" = 1 ] && [ -z "$UPSTREAM" ]; then
-        require_bin
-        start_warp_hop || die "the warp hop did not start; nothing was chained."
+        WARP_HIDDEN_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')" ||
+          die "cannot reserve a loopback port for the WARP hop; nothing was started."
+        UPSTREAM="socks5://127.0.0.1:$WARP_HIDDEN_PORT"
+        WARP_IN_CONFIG=1
+        say "warp: the foxy plane and carrier ride a WARP exit through a hidden loopback front."
+      elif [ "$WANT_WARP" = 1 ]; then
+        say "--upstream names the hop, so --warp is not applied; WARP rides --udp-via warp only."
       fi
       BUILT_OUTBOUND="$(build_outbound foxy)" || exit 1
       save_lane_location
       if [ -n "$UDP_VIA" ] && [ "$UDP_VIA" != foxy ]; then
-        BUILT_UDP_OUTBOUND="$(udp_outbound 2>&1)" || die "$BUILT_UDP_OUTBOUND"
-        BUILT_UDP_TAG="udp-$UDP_VIA"
-        case "$UDP_VIA" in
-          warp) say "udp: WARP is a second lane in this config; TCP stays on foxy." ;;
-          psiphon|psiphon-cdn) say "udp: Psiphon's udpgw is a second lane in this config; TCP stays on foxy." ;;
-          direct) say "udp: direct egress (unencrypted) for datagrams; TCP stays on foxy." ;;
-          block) say "udp: dropped at the lane; TCP stays on foxy." ;;
-        esac
+        if [ "$UDP_VIA" = warp ] && [ "$WARP_IN_CONFIG" = 1 ]; then
+          BUILT_UDP_TAG="warp"
+          say "udp: the same WARP outbound carries datagrams; TCP stays on foxy."
+        else
+          BUILT_UDP_OUTBOUND="$(udp_outbound 2>&1)" || die "$BUILT_UDP_OUTBOUND"
+          BUILT_UDP_TAG="udp-$UDP_VIA"
+          case "$UDP_VIA" in
+            warp) say "udp: WARP is a second outbound in this config; TCP stays on foxy." ;;
+            psiphon|psiphon-cdn) say "udp: Psiphon's udpgw is a second lane in this config; TCP stays on foxy." ;;
+            direct) say "udp: direct egress (unencrypted) for datagrams; TCP stays on foxy." ;;
+            block) say "udp: dropped at the lane; TCP stays on foxy." ;;
+          esac
+        fi
       fi
       ;;
     vless)
@@ -2639,6 +2738,17 @@ build_config() {
       ;;
     psiphon)
       load_lane_location
+      WARP_IN_CONFIG=0
+      WARP_HIDDEN_PORT=""
+      if [ "$WANT_WARP" = 1 ] && [ -z "$UPSTREAM" ]; then
+        WARP_HIDDEN_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')" ||
+          die "cannot reserve a loopback port for the WARP hop; nothing was started."
+        UPSTREAM="socks5://127.0.0.1:$WARP_HIDDEN_PORT"
+        WARP_IN_CONFIG=1
+        say "warp: Psiphon rides a WARP exit through a hidden loopback front."
+      elif [ "$WANT_WARP" = 1 ]; then
+        say "--upstream names the hop, so --warp is not applied; WARP rides --udp-via warp only."
+      fi
       BUILT_OUTBOUND="$(build_outbound psiphon)" || exit 1
       save_lane_location
       ;;
@@ -2677,6 +2787,7 @@ EOF
       exit 2
       ;;
   esac
+  BUILT_CHAIN="$(build_chain)" || die "cannot build the WARP/UDP routing; nothing was started."
 }
 
 # The carrier is a choice, not a default: h2 is the rung auto opens on and h3 is
@@ -2704,40 +2815,26 @@ choose_carrier() {
 }
 
 start_lane() {
-  local new_cfg new_fronts old_exit lane_pid reg_dir status=0 start_epoch final_cfg warp_port
+  local new_cfg new_fronts lane_pid reg_dir start_epoch final_cfg
   mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
   mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
   start_epoch="$(cat "$STATE_DIR/stop-epoch" 2>/dev/null || true)"
   LOGIN_GUARD_SET=1; LOGIN_GUARD_EPOCH="$start_epoch"
-  WARP_SELECTED=0
   final_cfg="$CFG"; CFG_STAGE=""
   # Validate first: an invocation that cannot start must not stop a healthy lane,
   # and a bad link must not send the user to a build before saying what is wrong.
-  old_exit="$(trap -p EXIT)"
-  trap 'status=$?; [ "$WARP_STARTED" = 1 ] && stop_owned_warp; exit $status' EXIT
   build_config
   require_bin
-  if [ -n "$old_exit" ]; then eval "$old_exit"; else trap - EXIT; fi
   proxy_lock || {
     [ -n "$CFG_STAGE" ] && rm -f "$CFG_STAGE"
     [ "$OUTBOUND" = config ] || CFG="$final_cfg"
     return 1
   }
   if [ "$(cat "$STATE_DIR/stop-epoch" 2>/dev/null || true)" != "$start_epoch" ]; then
-    [ "$WARP_STARTED" = 1 ] && stop_owned_warp
     [ "$OUTBOUND" = config ] || CFG="$final_cfg"
     proxy_unlock
     say "a concurrent down or logout cancelled this start; try again." >&2
     return 1
-  fi
-  if [ "$WARP_SELECTED" = 1 ]; then
-    warp_port="$(cat "$WARP_PORT_FILE" 2>/dev/null || true)"
-    if ! warp_hop_running || [ "$UPSTREAM" != "socks5://127.0.0.1:$warp_port" ]; then
-      [ "$OUTBOUND" = config ] || CFG="$final_cfg"
-      proxy_unlock
-      say "the warp hop was stopped by a concurrent down; try again." >&2
-      return 1
-    fi
   fi
   save_lane_location
   reg_dir="$(resolve_real "$CONF_DIR")"
@@ -2751,7 +2848,7 @@ start_lane() {
     CFG_STAGE="$(dirname "$final_cfg")/.$(basename "$final_cfg").stage.$$"
     rm -f "$CFG_STAGE"
     CFG="$CFG_STAGE"
-    if ! write_config "$BUILT_OUTBOUND" "$BUILT_UDP_OUTBOUND" "$BUILT_UDP_TAG"; then
+    if ! write_config "$BUILT_OUTBOUND" "$BUILT_CHAIN"; then
       rm -f "$CFG_STAGE"; CFG_STAGE=""
       CFG="$final_cfg"
       proxy_unlock
@@ -2782,17 +2879,52 @@ start_lane() {
     fi
     CFG_STAGE=""
   fi
-  if [ "$DEBUG" = 1 ]; then
-    FOXY_DEBUG=1 "$BIN" run -c "$CFG" >"$LOG" 2>&1 &
-  else
-    "$BIN" run -c "$CFG" >"$LOG" 2>&1 &
+  rm -f "$STOP_FILE"
+  local use_sudo=0 sudo_pid="" windows=0
+  case "$(uname -s 2>/dev/null || true)" in
+    MINGW*|MSYS*|CYGWIN*) windows=1 ;;
+  esac
+  if [ "$WANT_VPN" = 1 ] && [ "$windows" = 0 ] && [ "$(id -u 2>/dev/null || echo 0)" != 0 ]; then
+    command -v sudo >/dev/null 2>&1 ||
+      die "--vpn opens a TUN device and needs root; sudo is not on PATH. Run it as root, or point the app at the fronts: ferrox-cli ports"
+    sudo -v || { proxy_unlock; die "--vpn needs root; sudo could not authenticate."; }
+    use_sudo=1
   fi
-  lane_pid=$!
-  if ! echo "$lane_pid" > "$PID_FILE"; then
-    kill "$lane_pid" 2>/dev/null || true
-    wait "$lane_pid" 2>/dev/null || true
-    proxy_unlock
-    return 1
+  if [ "$use_sudo" = 1 ]; then
+    : > "$PID_FILE" || { proxy_unlock; return 1; }
+    local -a envs=(FERROX_STOP_FILE="$STOP_FILE")
+    [ "$DEBUG" = 1 ] && envs+=(FOXY_DEBUG=1)
+    sudo -n /usr/bin/env "${envs[@]}" /bin/sh -c 'echo $$ > "$1"; shift; exec "$@"' \
+      ferrox-sudo "$PID_FILE" "$BIN" run -c "$CFG" >"$LOG" 2>&1 &
+    sudo_pid=$!
+    for _ in $(seq 1 1200); do
+      lane_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+      [ -n "$lane_pid" ] && break
+      kill -0 "$sudo_pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    if [ -z "$lane_pid" ]; then
+      kill "$sudo_pid" 2>/dev/null || true
+      wait "$sudo_pid" 2>/dev/null || true
+      rm -f "$PID_FILE"
+      proxy_unlock
+      say "the privileged app did not start; last lines of $LOG:" >&2
+      tail -n 20 "$LOG" 2>/dev/null || true
+      return 1
+    fi
+  else
+    if [ "$DEBUG" = 1 ]; then
+      FOXY_DEBUG=1 FERROX_STOP_FILE="$STOP_FILE" "$BIN" run -c "$CFG" >"$LOG" 2>&1 &
+    else
+      FERROX_STOP_FILE="$STOP_FILE" "$BIN" run -c "$CFG" >"$LOG" 2>&1 &
+    fi
+    lane_pid=$!
+    if ! echo "$lane_pid" > "$PID_FILE"; then
+      kill "$lane_pid" 2>/dev/null || true
+      wait "$lane_pid" 2>/dev/null || true
+      proxy_unlock
+      return 1
+    fi
   fi
   proxy_unlock
 }
@@ -2812,11 +2944,28 @@ stop_lane() {
   if lane_running; then
     pid="$(lane_pid)"
     if lane_pid_runs "$pid" "$CFG"; then
-      kill "$pid" 2>/dev/null || true
-      sleep 1
-      lane_running && lane_pid_runs "$pid" "$CFG" && kill -9 "$pid" 2>/dev/null || true
+      # The app restores its routes and exits on the stop file; a process that
+      # predates it gets the signal after the grace period.
+      : >"$STOP_FILE" 2>/dev/null || true
+      while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 50 ]; do
+        sleep 0.1
+        waited=$((waited + 1))
+      done
+      waited=0
+      if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || sudo -n kill "$pid" 2>/dev/null || true
+        sleep 1
+        if kill -0 "$pid" 2>/dev/null; then
+          kill -9 "$pid" 2>/dev/null || sudo -n kill -9 "$pid" 2>/dev/null || true
+          sleep 1
+        fi
+        if kill -0 "$pid" 2>/dev/null; then
+          say "lane pid $pid did not stop; run: sudo kill -9 $pid" >&2
+        fi
+      fi
     fi
   fi
+  rm -f "$STOP_FILE"
   if [ "$clear" = 1 ]; then
     supervisor="$(cat "$SUPERVISOR_PID_FILE" 2>/dev/null || true)"
     [ -n "$supervisor" ] || supervisor="$(cat "$SUPERVISOR_FILE" 2>/dev/null || true)"
@@ -2831,7 +2980,6 @@ stop_lane() {
   rm -f "$PID_FILE"
   local rc=0
   if [ "$clear" = 1 ]; then
-    stop_warp_hop
     system_proxy_off || rc=$?
   fi
   return "$rc"
@@ -2841,95 +2989,6 @@ stop_lane() {
 stop_and_forget() {
   stop_lane 1
   [ "$OUTBOUND" = config ] || rm -f "$CFG"
-}
-
-# A WARP hop is a lane of its own: a loopback socks front over a warp outbound
-# that registers once and keeps the identity, so the foxy plane egresses through
-# WARP and a region block sees a WARP exit instead of this machine.
-warp_hop_running() {
-  local pid port
-  pid="$(cat "$WARP_PID_FILE" 2>/dev/null || true)"
-  port="$(cat "$WARP_PORT_FILE" 2>/dev/null || true)"
-  [ -n "$pid" ] && [ -n "$port" ] && kill -0 "$pid" 2>/dev/null &&
-    lane_pid_runs "$pid" "$WARP_CFG" && port_open "$port"
-}
-
-start_warp_hop() {
-  WARP_STARTED=0
-  WARP_SELECTED=0
-  WARP_OWN_PID=""
-  if warp_hop_running; then
-    UPSTREAM="socks5://127.0.0.1:$(cat "$WARP_PORT_FILE")"
-    WARP_SELECTED=1
-    say "warp hop already up (pid $(cat "$WARP_PID_FILE")); the lane chains through it."
-    return 0
-  fi
-  stop_warp_hop
-  local port pid
-  port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')" || return 1
-  [ -n "$port" ] || return 1
-  ( umask 077
-    python3 - "$WARP_CFG" "$port" "$CONF_DIR/warp-identity.json" <<'PY'
-import json, os, sys
-cfg, port, identity = sys.argv[1:4]
-doc = {
-    "inbounds": [{"protocol": "socks", "listen": "127.0.0.1", "port": int(port)}],
-    "outbounds": [{"protocol": "warp", "settings": {
-        "identityFile": identity, "register": True, "mode": "auto"}}],
-}
-fd = os.open(cfg, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-os.chmod(cfg, 0o600)
-with os.fdopen(fd, "w") as handle:
-    json.dump(doc, handle, indent=2)
-PY
-  ) || return 1
-  chmod 600 "$WARP_CFG"
-  say "warp hop: registering once and racing WireGuard against MASQUE..."
-  "$BIN" run -c "$WARP_CFG" >"$WARP_LOG" 2>&1 &
-  pid=$!
-  WARP_STARTED=1
-  WARP_OWN_PID="$pid"
-  echo "$pid" > "$WARP_PID_FILE"
-  echo "$port" > "$WARP_PORT_FILE"
-  for _ in $(seq 1 120); do
-    port_open "$port" && break
-    kill -0 "$pid" 2>/dev/null || break
-    sleep 1
-  done
-  if ! port_open "$port"; then
-    say "the warp hop did not open; last lines of $WARP_LOG:"
-    tail -n 20 "$WARP_LOG" 2>/dev/null || true
-    stop_owned_warp
-    return 1
-  fi
-  UPSTREAM="socks5://127.0.0.1:$port"
-  WARP_SELECTED=1
-  say "warp hop up (pid $pid) on 127.0.0.1:$port; the account plane and the carrier egress through it."
-}
-
-stop_warp_hop() {
-  local pid
-  pid="$(cat "$WARP_PID_FILE" 2>/dev/null || true)"
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && lane_pid_runs "$pid" "$WARP_CFG"; then
-    kill "$pid" 2>/dev/null || true
-    sleep 1
-    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
-  fi
-  rm -f "$WARP_PID_FILE" "$WARP_PORT_FILE" "$WARP_CFG"
-}
-
-stop_owned_warp() {
-  local pid="${WARP_OWN_PID:-}"
-  [ -n "$pid" ] || return 0
-  if kill -0 "$pid" 2>/dev/null; then
-    kill "$pid" 2>/dev/null || true
-    sleep 1
-    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
-  fi
-  if [ "$(cat "$WARP_PID_FILE" 2>/dev/null || true)" = "$pid" ]; then
-    rm -f "$WARP_PID_FILE" "$WARP_PORT_FILE" "$WARP_CFG"
-  fi
-  WARP_OWN_PID=""; WARP_STARTED=0
 }
 
 forget_lane_config() {
@@ -3036,13 +3095,6 @@ stop_all_lanes() {
         apply_instance
         stop_lane 0 || rc=1
       done
-      for pidfile in "$CONF_DIR"/warp-hop*.pid; do
-        [ -f "$pidfile" ] || continue
-        base="${pidfile##*/}"; base="${base#warp-hop}"; base="${base%.pid}"
-        INSTANCE="${base#-}"
-        apply_instance
-        stop_warp_hop
-      done
     done < "$LANES_FILE"
   fi
   CONF_DIR="$(resolve_real "$saved_conf")"
@@ -3054,13 +3106,6 @@ stop_all_lanes() {
     INSTANCE="${base#-}"
     apply_instance
     stop_lane 0 || rc=1
-  done
-  for pidfile in "$CONF_DIR"/warp-hop*.pid; do
-    [ -f "$pidfile" ] || continue
-    base="${pidfile##*/}"; base="${base#warp-hop}"; base="${base%.pid}"
-    INSTANCE="${base#-}"
-    apply_instance
-    stop_warp_hop
   done
   INSTANCE=""
   apply_instance
@@ -3272,8 +3317,8 @@ verify_flow() {
   return 0
 }
 
-# A region block names itself 451 in the lane's log; WARP is the hop that moves
-# the exit, and the ladder takes it once before anything is reported refused.
+# A region block names itself 451 in the lane's log; WARP moves the exit, and
+# the ladder takes it once before anything is reported refused.
 warp_ladder() {
   [ "$OUTBOUND" = foxy ] || return 1
   [ -z "$UPSTREAM" ] || return 1
@@ -3281,26 +3326,22 @@ warp_ladder() {
   grep -q "the account plane answered 451" "$LOG" 2>/dev/null || return 1
   stop_and_forget
   say "the account plane answered 451 from this region: the lane retries once through"
-  say "a WARP hop (register an identity, race WireGuard against MASQUE, sign in through"
-  say "it). Pass '--warp' to make that the first move next time."
+  say "WARP (register an identity, sign in through it). Pass '--warp' to make that"
+  say "the first move next time."
   WANT_WARP=1
 }
 
-# An interruption before the lane exists can still leave the warp hop this
-# attempt started; stop only that, never a lane that was already running.
 interrupt_before_lane() {
-  [ "$WARP_STARTED" = 1 ] && stop_owned_warp
   say "interrupted: the attempt was stopped; the log stays at $LOG."
 }
 
 action_up() {
   reconcile_stale_proxy || die "the stale system proxy could not be cleared; run ferrox-cli down."
-  if [ "$WANT_VPN" = 1 ] && ! system_proxy_preflight; then exit 1; fi
+  if [ "$WANT_VPN_PROXY" = 1 ] && ! system_proxy_preflight; then exit 1; fi
   choose_carrier
   for _ in 1 2; do
     trap 'interrupt_before_lane; exit 130' INT TERM
     if ! start_lane; then
-      [ "$WARP_STARTED" = 1 ] && stop_owned_warp
       exit 1
     fi
     # An attempt cut short is not a lane: Ctrl-C before it proves a flow removes what it started.
@@ -3313,11 +3354,19 @@ action_up() {
       say "the lane was stopped and its config removed; the log stays at $LOG."
       exit 1
     fi
+    if [ "$WANT_VPN" = 1 ] && ! wait_tun; then
+      say "the lane did not bring up its TUN device; last lines of $LOG:"
+      tail -n 20 "$LOG" 2>/dev/null || true
+      stop_and_forget
+      say "the lane was stopped and its config removed; the log stays at $LOG."
+      exit 1
+    fi
     say "lane${INSTANCE:+ '$INSTANCE'} up (pid $(lane_pid)), fronts:"
     if [ "$OUTBOUND" = config ]; then
       say "  the ones $CONFIG_FILE names (served verbatim)"
     fi
     port_map
+    [ "$WANT_VPN" = 1 ] && say "tun: $VPN_ENGINE engine, whole-device capture; down restores the routes."
     [ "$OUTBOUND" = foxy ] && say "carrier: $CARRIER"
     local ok=0
     if [ -n "$FRONTS" ]; then verify_flow || ok=1; fi
@@ -3333,7 +3382,7 @@ action_up() {
   done
   # Route the machine only at a lane that proved it carries a flow: an armed
   # system proxy over a dead lane takes the network down with it.
-  if [ "$WANT_VPN" = 1 ]; then
+  if [ "$WANT_VPN_PROXY" = 1 ]; then
     if ! system_proxy_on; then
       stop_and_forget
       say "the system proxy was not armed; the lane was stopped and its config removed."
@@ -3347,12 +3396,11 @@ action_up() {
 
 action_serve() {
   reconcile_stale_proxy || die "the stale system proxy could not be cleared; run ferrox-cli down."
-  if [ "$WANT_VPN" = 1 ] && ! system_proxy_preflight; then exit 1; fi
+  if [ "$WANT_VPN_PROXY" = 1 ] && ! system_proxy_preflight; then exit 1; fi
   choose_carrier
   for _ in 1 2; do
     trap 'interrupt_before_lane; exit 130' INT TERM
     if ! start_lane; then
-      [ "$WARP_STARTED" = 1 ] && stop_owned_warp
       exit 1
     fi
     # A serve that never proved a flow is an attempt too: the same interruption cleanup applies.
@@ -3365,11 +3413,19 @@ action_serve() {
       say "the lane was stopped and its config removed; the log stays at $LOG."
       exit 1
     fi
+    if [ "$WANT_VPN" = 1 ] && ! wait_tun; then
+      say "the lane did not bring up its TUN device; last lines of $LOG:"
+      tail -n 20 "$LOG" 2>/dev/null || true
+      stop_and_forget
+      say "the lane was stopped and its config removed; the log stays at $LOG."
+      exit 1
+    fi
     say "lane${INSTANCE:+ '$INSTANCE'} up, fronts:"
     if [ "$OUTBOUND" = config ]; then
       say "  the ones $CONFIG_FILE names (served verbatim)"
     fi
     port_map
+    [ "$WANT_VPN" = 1 ] && say "tun: $VPN_ENGINE engine, whole-device capture; down restores the routes."
     [ "$OUTBOUND" = foxy ] && say "carrier: $CARRIER"
     local ok=0
     if [ -n "$FRONTS" ]; then verify_flow || ok=1; fi
@@ -3382,7 +3438,7 @@ action_serve() {
     fi
     break
   done
-  if [ "$WANT_VPN" = 1 ] && ! system_proxy_on; then
+  if [ "$WANT_VPN_PROXY" = 1 ] && ! system_proxy_on; then
     stop_and_forget
     say "the system proxy was not armed; the lane was stopped and its config removed."
     exit 1
@@ -3452,9 +3508,9 @@ action_ports() {
   if [ -n "$INSTANCE" ]; then
     rule
     [ -f "$CFG" ] || say "instance '$INSTANCE' has not started: these are the defaults it moves off if they are taken."
-    say "point the app you want at these fronts: the macOS system proxy is one"
-    say "machine-wide setting, so an instance never arms it (--vpn belongs to the"
-    say "unnamed lane)."
+    say "point the app you want at these fronts: a TUN device and the macOS system"
+    say "proxy are machine-wide, so an instance never arms either (--vpn and"
+    say "--vpn-proxy belong to the unnamed lane)."
     return 0
   fi
   local front want_socks="" want_http=""
@@ -3497,21 +3553,25 @@ action_version() {
 
 action_tun() {
   cat <<EOF
-TUN mode is refused by this binary, by name, not by silence.
+--vpn opens a TUN device and captures the whole host, UDP included. It needs
+root (Unix) or Administrator (Windows); this launcher elevates through sudo on
+Unix, and on Windows run ferrox-cli.exe from an elevated terminal.
 
-What TUN would be: a virtual network device (utun on macOS) that takes every IP
-packet, so apps that ignore proxies are captured too, UDP included. That needs
-a device driver, a userspace IP stack, and root or a signed entitlement.
+engines (--vpn-engine):
+  native      this tree's own device front; the default and the \`hev\` name
+  userspace   smoltcp stack; alias smoltcp or gvisor
+  system      the kernel's own TCP/IP stack (Linux; falls back elsewhere)
+  hybrid      kernel TCP plus userspace UDP (Linux; alias mixed)
 
-What this binary has: no tun/utun inbound and no tun2socks engine (README rows
-29 and 58). A config naming one is refused with that reason, and \`--tun\` here
-refuses before anything starts.
+also:
+  --vpn-ipv6            carry IPv6 as well as IPv4
+  --vpn-mtu N           device MTU, default 1500
+  --vpn-name NAME       device name (default ferrox0; macOS picks utunN)
+  --vpn-dns ADDR        resolver for port 53, default 1.1.1.1; 'none' leaves it
+  --vpn-proxy           the old behaviour: the macOS system proxy, not TUN
 
-What you get instead:
-  * ferrox-cli up --vpn      the macOS system proxy: TCP apps that honour it
-  * ferrox-cli up --fronts socks   UDP for apps that speak SOCKS5 (browsers do
-                             not send UDP to a SOCKS proxy, so their QUIC goes
-                             around the lane)
+  ferrox-cli up --foxy --vpn
+  ferrox-cli up --foxy --vpn --vpn-engine userspace --vpn-ipv6
 EOF
 }
 
@@ -3638,6 +3698,24 @@ while [ $# -gt 0 ]; do
       FXA_USER_AGENT="$2"; shift 2 ;;
     --upstream) need_value --upstream "an http:// or socks5:// URL" "$#" "${2:-}"; UPSTREAM="$2"; shift 2 ;;
     --warp) WANT_WARP=1; shift ;;
+    --warp-mode)
+      need_value --warp-mode "auto, wireguard, masque, gool, gool-classic or mim" "$#" "${2:-}"
+      case "$2" in
+        auto) WARP_MODE=auto ;;
+        wireguard|wg) WARP_MODE=wireguard ;;
+        masque) WARP_MODE=masque ;;
+        gool|wg-over-masque) WARP_MODE=gool ;;
+        gool-classic|wiw|warp-in-warp) WARP_MODE=gool-classic ;;
+        mim|masque-in-masque) WARP_MODE=mim ;;
+        *) die "--warp-mode wants auto, wireguard, masque, gool, gool-classic or mim, got '$2'; nothing was started." ;;
+      esac
+      WARP_MODE_SET=1; shift 2 ;;
+    --warp-identity)
+      need_value --warp-identity "a path for the WARP identity" "$#" "${2:-}"
+      case "$2" in
+        *$'\n'*) die "--warp-identity wants a path without a newline; nothing was started." ;;
+      esac
+      WARP_IDENTITY="$2"; shift 2 ;;
     --udp-via)
       need_value --udp-via "foxy, warp, psiphon, psiphon-cdn, direct or block" "$#" "${2:-}"
       case "$2" in
@@ -3659,9 +3737,42 @@ while [ $# -gt 0 ]; do
       INSTANCE="$2"; shift 2 ;;
     --all) ALL=1; shift ;;
     --vpn) WANT_VPN=1; shift ;;
+    --vpn-proxy) WANT_VPN_PROXY=1; shift ;;
+    --vpn-engine|--tun-engine)
+      need_value "$1" "native, userspace, system or hybrid" "$#" "${2:-}"
+      case "$2" in
+        native|hev|tun2socks|loopback) VPN_ENGINE=native ;;
+        userspace|smoltcp|gvisor) VPN_ENGINE=userspace ;;
+        system) VPN_ENGINE=system ;;
+        hybrid|mixed) VPN_ENGINE=hybrid ;;
+        *) die "$1 wants native, userspace, system or hybrid (aliases: hev, tun2socks, smoltcp, gvisor, mixed), got '$2'; nothing was started." ;;
+      esac
+      VPN_ENGINE_SET=1; shift 2 ;;
+    --vpn-ipv6) VPN_IPV6=1; shift ;;
+    --vpn-mtu)
+      need_value --vpn-mtu "an MTU between 576 and 9000" "$#" "${2:-}"
+      case "$2" in
+        ''|*[!0-9]*) die "--vpn-mtu wants an MTU between 576 and 9000, got '$2'; nothing was started." ;;
+      esac
+      [ "$2" -ge 576 ] && [ "$2" -le 9000 ] ||
+        die "--vpn-mtu wants an MTU between 576 and 9000, got '$2'; nothing was started."
+      VPN_MTU="$2"; shift 2 ;;
+    --vpn-name)
+      need_value --vpn-name "a device name" "$#" "${2:-}"
+      case "$2" in
+        ''|*[!A-Za-z0-9._-]*) die "--vpn-name wants 1-32 letters, digits, - _ or ., got '$2'; nothing was started." ;;
+      esac
+      [ "${#2}" -le 32 ] || die "--vpn-name wants 1-32 letters, digits, - _ or ., got '$2'; nothing was started."
+      VPN_NAME="$2"; shift 2 ;;
+    --vpn-dns)
+      need_value --vpn-dns "an address or 'none'" "$#" "${2:-}"
+      if [ "$2" != none ] && ! printf '%s' "$2" | grep -Eq '^[0-9a-fA-F:.]+$'; then
+        die "--vpn-dns wants an address or 'none', got '$2'; nothing was started."
+      fi
+      VPN_DNS="$2"; shift 2 ;;
     --debug) DEBUG=1; shift ;;
     --ping) LOC_PING=1; shift ;;
-    --tun) ACTION=tun; shift ;;
+    --tun) WANT_VPN=1; shift ;;
     -h|--help) usage; exit 0 ;;
     -V|--version) ACTION=version; shift ;;
     *) die "unknown argument: $1 (see --help)" ;;
@@ -3690,8 +3801,14 @@ fi
 if [ -n "$FXA_USER_AGENT" ] && [ "$OUTBOUND" != foxy ]; then
   die "--fxa-user-agent belongs to the foxy lane; nothing was started."
 fi
-if [ "$WANT_WARP" = 1 ] && [ "$OUTBOUND" != foxy ]; then
-  die "--warp chains the foxy lane through WARP (up --foxy --warp); nothing was started."
+if [ "$WANT_WARP" = 1 ] && [ "$OUTBOUND" != foxy ] && [ "$OUTBOUND" != psiphon ]; then
+  die "--warp chains the foxy or psiphon lane through WARP (up --foxy --warp, up --psiphon --warp); nothing was started."
+fi
+if [ "$WARP_MODE_SET" = 1 ] && [ "$WANT_WARP" != 1 ] && [ "$UDP_VIA" != warp ]; then
+  die "--warp-mode belongs to --warp or --udp-via warp; nothing was started."
+fi
+if [ -n "$WARP_IDENTITY" ] && [ "$WANT_WARP" != 1 ] && [ "$UDP_VIA" != warp ]; then
+  die "--warp-identity belongs to --warp or --udp-via warp; nothing was started."
 fi
 case "$UDP_VIA" in
   ""|foxy) ;;
@@ -3714,9 +3831,15 @@ if [ "$ALL" = 1 ]; then
   [ -z "$INSTANCE" ] || die "--all stops every lane, so it takes no --instance; nothing was started."
 fi
 
-# The macOS system proxy is one machine-wide setting: two lanes cannot share it.
-if [ -n "$INSTANCE" ] && [ "$WANT_VPN" = 1 ]; then
-  die "the system proxy points at one lane: run '$INSTANCE' without --vpn and point the app at its fronts (ferrox-cli ports --instance $INSTANCE), or arm --vpn on the unnamed lane; nothing was started."
+if [ "$WANT_VPN" = 1 ] && [ "$WANT_VPN_PROXY" = 1 ]; then
+  die "--vpn opens a TUN device and captures the whole host; --vpn-proxy arms the macOS system proxy. Pick one; nothing was started."
+fi
+if [ "$VPN_ENGINE_SET" = 1 ] && [ "$WANT_VPN" = 0 ]; then
+  die "--vpn-engine belongs to --vpn; nothing was started."
+fi
+# A TUN device and the system proxy are both machine-wide: two lanes cannot share either.
+if [ -n "$INSTANCE" ] && { [ "$WANT_VPN" = 1 ] || [ "$WANT_VPN_PROXY" = 1 ]; }; then
+  die "the TUN device and the system proxy are machine-wide: run '$INSTANCE' without --vpn or --vpn-proxy and point the app at its fronts (ferrox-cli ports --instance $INSTANCE), or capture the host on the unnamed lane; nothing was started."
 fi
 
 apply_instance

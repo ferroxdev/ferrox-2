@@ -31,6 +31,12 @@ WARP = {
 }
 SCAN = {"crates/ferrox-app/src/warp_scan.rs"}
 PSIPHON = {"crates/ferrox-app/src/psiphon.rs"}
+DEFAULT_DNS = {
+    "crates/ferrox-cli/src/args.rs",
+    "crates/ferrox-cli/src/main.rs",
+    "dist/ferrox-cli.sh",
+    "dist/USAGE.md",
+}
 def allowed(a, b, c, d, f):
     if (a, b, c, d) == (0, 0, 0, 0) or (a, b, c, d) == (0, 0, 0, 1) or (a, b, c, d) == (255, 255, 255, 255):
         # 0.0.0.0 is "this network" and 0.0.0.1 is the SOCKS4a marker a client
@@ -47,6 +53,10 @@ def allowed(a, b, c, d, f):
         return True
     if a == 198 and b in (18, 19):
         # RFC 2544 benchmarking space, the reference FakeDNS pool's default.
+        return True
+    if (a, b, c, d) in ((1, 1, 1, 1), (1, 0, 0, 1), (8, 8, 8, 8), (8, 8, 4, 4)) and f in DEFAULT_DNS:
+        # The TUN and Psiphon resolver defaults are runtime data in the flags
+        # and their help text, not fixtures.
         return True
     if (a, b, c, d) == (1, 1, 1, 1) or (a, b) == (162, 159):
         # Cloudflare's WARP plane: resolvers and the edge the WARP lane dials

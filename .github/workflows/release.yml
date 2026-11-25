@@ -4,7 +4,7 @@ name: release
 # for every platform a user can run it on and attaches one package per platform
 # to the GitHub Release: the binary, the launcher beside it (`ferrox-cli.exe`,
 # `ferrox-cli.cmd`, and the `ferrox-cli.sh` fallback on Windows, `ferrox-cli.sh`
-# elsewhere), and the two
+# elsewhere), `wintun.dll` on Windows, and the two
 # pages that make trying a lane three commands — `login`, `up --foxy --vpn` (or
 # `up --veepn --vpn` with no account), `down` — with no toolchain, no repository
 # and no config by hand.
@@ -156,6 +156,13 @@ jobs:
           PKG="ferrox-${VERSION#v}-${NAME}"
           rm -rf "$PKG" && mkdir -p "$PKG"
           if [ "$WINDOWS" = 1 ]; then
+            # The TUN front loads wintun.dll dynamically; ship the signed DLL
+            # beside the binary so `--vpn` works without a separate install.
+            curl -fsSL --retry 3 --connect-timeout 10 --max-time 120 \
+              -o wintun.zip https://www.wintun.net/builds/wintun-0.14.1.zip
+            rm -rf wintun && 7z x wintun.zip -owintun -y >/dev/null
+            cp wintun/bin/amd64/wintun.dll "$PKG/"
+            rm -rf wintun wintun.zip
             cp "$BIN" "$CLI" dist/ferrox-cli.sh dist/ferrox-cli.cmd dist/README.md dist/USAGE.md "$PKG/"
             sed -i 's/\r$//' "$PKG/ferrox-cli.sh"
             if grep -q $'\r' "$PKG/ferrox-cli.sh"; then
@@ -177,6 +184,7 @@ jobs:
                 7z l "$PKG.zip" | grep -q 'ferrox-cli.exe' || { echo "::error::$PKG.zip has no ferrox-cli.exe"; exit 1; }
                 7z l "$PKG.zip" | grep -q 'ferrox-cli.cmd' || { echo "::error::$PKG.zip has no ferrox-cli.cmd"; exit 1; }
                 7z l "$PKG.zip" | grep -q 'ferrox-cli.sh' || { echo "::error::$PKG.zip has no ferrox-cli.sh"; exit 1; }
+                7z l "$PKG.zip" | grep -q 'wintun.dll' || { echo "::error::$PKG.zip has no wintun.dll"; exit 1; }
               fi ;;
           esac
           rm -rf "$PKG"
@@ -244,15 +252,16 @@ jobs:
 
             ### What this build carries
 
-            - **`--udp-via`: one lane, two egresses.** Keep TCP on the Foxy lane and send every datagram that reaches the proxy — DNS included — through a second, tagged outbound in the same config. The flag is in `ferrox-cli.sh`; the Windows launcher rejects it. `warp` reuses the `--warp` hop or registers one; `psiphon` and `psiphon-cdn` ride Psiphon's udpgw; `direct` sends datagrams unencrypted; `block` drops them; `foxy` (the default) leaves the single-outbound config untouched. The catch-all `network: udp` rule fixes one association per lane instead of choosing per datagram; IPv4, IPv6 and port 53 behave alike, and a rule added through the management API before the first packet is the one dialled.
-            - **`--warp`: the WARP lane, on Foxy.** Chain the Foxy lane through a one-tap Cloudflare WARP registration that races WireGuard against its MASQUE dialect, with no account and no client binary: `ferrox-cli up --foxy --warp`, or `--udp-via warp` to put only datagrams there. Both flags are in `ferrox-cli.sh`; the Windows launcher rejects them.
-            - **Foxy sign-in over WARP.** On the Foxy lane `--warp` is applied before the account plane, so the Firefox sign-in and the carrier catalogue see a WARP exit instead of a region block. An explicit `--upstream` still wins; when none is set, a 451 from the sign-in moves the lane onto the hop by itself once.
+            - **`--vpn` is a TUN device on every platform.** The launcher opens a TUN device, installs the default routes, and captures the whole host — TCP, UDP and ICMP, including apps that ignore proxies. It needs root on macOS/Linux (only the app process runs under `sudo`; the CLI and its files stay user-owned) or Administrator on Windows (the zip ships `wintun.dll` beside the binary). `down` restores every route, and so do SIGTERM and Ctrl-C. Pick the engine with `--vpn-engine`: `native` (default, the `hev` translator), `userspace` (smoltcp/gvisor), `system` (Linux kernel stack) or `hybrid` (Linux kernel TCP plus userspace UDP); `--vpn-ipv6`, `--vpn-mtu`, `--vpn-name` and `--vpn-dns` tune it. The old system-proxy behaviour moved to `--vpn-proxy`.
+            - **`--udp-via`: one lane, two egresses.** Keep TCP on the Foxy lane and send every datagram that reaches the proxy — DNS included — through a second, tagged outbound in the same config. `warp` reuses the `--warp` outbound when both are named, or registers one on its own; `psiphon` and `psiphon-cdn` ride Psiphon's udpgw in both launchers; `direct` sends datagrams unencrypted; `block` drops them; `foxy` (the default) leaves the single-outbound config untouched. The catch-all `network: udp` rule fixes one association per lane instead of choosing per datagram; IPv4, IPv6 and port 53 behave alike, and a rule added through the management API before the first packet is the one dialled.
+            - **`--warp`: the WARP lane, on Foxy and Psiphon.** Chain either carrier through a one-tap Cloudflare WARP registration with no account and no client binary: `ferrox-cli up --foxy --warp`, `ferrox-cli up --psiphon --warp`, or `--udp-via warp` to put only datagrams there. It is one process and one config: a hidden loopback front is routed to a tagged `warp` outbound, so `down`, the lane log and a TUN capture cover it. `--warp-mode` picks `auto` (default), `wireguard`, `masque`, `gool` (WireGuard over MASQUE), `gool-classic` (WARP in WARP) or `mim` (MASQUE in MASQUE), and `--warp-identity` names the identity file. Both flags work in `ferrox-cli.sh` and `ferrox-cli.exe`.
+            - **Foxy sign-in over WARP.** On the Foxy lane `--warp` is applied before the account plane, so the Firefox sign-in and the carrier catalogue see a WARP exit instead of a region block. An explicit `--upstream` still wins; when none is set, a 451 from the sign-in moves the lane onto WARP by itself once. `--vpn --warp` pins the tagged WARP edge rather than looping.
             - **The Foxy lane.** A Firefox account is the only input; the edge comes from Mozilla's catalogue with `locations`, `location` and `--country`, and `--carrier` picks h1, h2 or the QUIC-h3 carrier that also carries UDP natively.
             - **VeePN, with nothing typed.** Anonymous and serverless: the plane launches this device, names the region and lists the upstream pairs that answer, with `--region` to pin one.
             - **Native Psiphon.** No account and no `psiphon-tunnel-core`: the lane fetches the signed server list and speaks OSSH/SSH itself. `--psiphon-cdn` adds CDN fronting and the wider establishment race, while `--psiphon-conduit-mode private` names the WebRTC path that needs volunteer relays.
             - **Share links and custom configs.** VLESS, VMess (v2rayN base64-JSON and URI forms; the native Windows launcher takes the `HOST:PORT` and `--uuid ID` form only), Trojan, Shadowsocks/Shadowsocks-2022 and `--config` all use the same launcher. VLESS maps every carrier, early data, `alpn`, fingerprint, `allowInsecure`, certificate pins, verify names and REALITY's `pbk`/`sid`/`spx`/`pqv`.
             - **Routing and ports.** `--exclude-domains` and `--exclude-ports` take named targets out of the tunnel; named `--instance` lanes keep separate configs, pids, logs and ports; every lane serves SOCKS5, HTTP+HTTPS and mixed fronts.
-            - **Carriers.** xHTTP (including h2/h3 and stream modes), HTTP/3, MASQUE/Connect-UDP, REALITY over QUIC and KCP, and the tree's own Linux TUN engine; the launcher still refuses `--tun` by name and says what that costs.
+            - **Carriers.** xHTTP (including h2/h3 and stream modes), HTTP/3, MASQUE/Connect-UDP, REALITY over QUIC and KCP, and the tree's own TUN engine on macOS, Linux and Windows.
 
             These packages are rebuilt from the commit that carries this release; `SHA256SUMS` is regenerated for every asset, so a download from an older date cannot be mixed with this one.
 
@@ -263,7 +272,7 @@ jobs:
             ```powershell
             Expand-Archive ferrox-VERSION_PLACEHOLDER-x86_64-pc-windows-msvc.zip -DestinationPath .
             cd ferrox-VERSION_PLACEHOLDER-x86_64-pc-windows-msvc
-            .\ferrox-cli.exe up --foxy --vpn
+            .\ferrox-cli.exe up --foxy --vpn    # run from an elevated terminal for the TUN device
             .\ferrox-cli.exe status
             .\ferrox-cli.exe down
             ```
@@ -275,14 +284,14 @@ jobs:
             ```bash
             tar xzf ferrox-VERSION_PLACEHOLDER-x86_64-apple-darwin.tar.gz   # choose your package
             cd ferrox-VERSION_PLACEHOLDER-x86_64-apple-darwin
-            ./ferrox-cli.sh up --foxy
+            ./ferrox-cli.sh up --foxy --vpn    # sudo prompt for the app, then whole-device capture
             ./ferrox-cli.sh status
-            ./ferrox-cli.sh down
+            ./ferrox-cli.sh down               # restores the routes
             ```
 
-            On macOS, add `--vpn` to `up` to point the system proxy at the fronts. On Linux, use the loopback fronts directly.
+            Without `--vpn`, point apps at the loopback fronts. `--vpn-proxy` keeps the old system-proxy behaviour.
 
-            On Windows, replace `./ferrox-cli.sh` with `.\ferrox-cli.exe` in the Foxy, VeePN and protocol lane commands below. The Windows launcher does not accept the Psiphon flags, `--warp`, `--udp-via`, or the lane-specific `locations`/`location` selectors; it also needs `--vmess HOST:PORT --uuid ID` rather than a `vmess://` link. Use the macOS/Linux package for those.
+            On Windows, replace `./ferrox-cli.sh` with `.\ferrox-cli.exe` in the Foxy, VeePN, Psiphon and protocol lane commands below. The native launcher accepts `--psiphon`, `--psiphon-cdn`, `locations --psiphon`, `location --psiphon CC`, `locations --veepn`, `location --veepn CC`, `--warp`, `--warp-mode`, `--warp-identity` and `--udp-via foxy|warp|psiphon|psiphon-cdn|direct|block`. It also needs `--vmess HOST:PORT --uuid ID` rather than a `vmess://` link.
 
             ### Lanes
 
@@ -297,7 +306,7 @@ jobs:
             | Shadowsocks | `HOST:PORT`, method, and password | `ferrox-cli up --ss host:8388 --method aes-256-gcm --password PW` |
             | Any config | a JSON config the binary serves | `ferrox-cli up --config mine.json` |
 
-            Every Foxy command above also accepts `--udp-via foxy|warp|psiphon|psiphon-cdn|direct|block` to split TCP and UDP inside one lane. This option is available in `ferrox-cli.sh` only; the Windows launcher rejects it.
+            Every Foxy command above also accepts `--udp-via foxy|warp|psiphon|psiphon-cdn|direct|block` to split TCP and UDP inside one lane; both launchers carry every lane.
 
             Psiphon is native: the lane fetches the signed server list and speaks OSSH/SSH itself, with no `psiphon-tunnel-core` and no account.
 
@@ -317,7 +326,7 @@ jobs:
 
             `--psiphon-fronted` is the same shortcut. To ask for one half only, use `--psiphon-cdn-profile fronted` for the CDN front or `--psiphon-aggressive` for the wider race. `--psiphon-conduit-mode private` is a separate in-proxy WebRTC path, not the CDN shortcut, and it needs volunteer relays.
 
-            On macOS, add `--vpn` to either command. On Linux, point apps at the local fronts: SOCKS5 `127.0.0.1:10808`, HTTP `127.0.0.1:8080`, or mixed `127.0.0.1:10809`.
+            Add `--vpn` to either command on any platform to capture the whole host. Without it, point apps at the local fronts: SOCKS5 `127.0.0.1:10808`, HTTP `127.0.0.1:8080`, or mixed `127.0.0.1:10809`.
 
             Every lane takes the same country spelling. `--country DE` and `--psiphon-region DE` are the same on this lane; `--region nl` is the VeePN spelling. List before you pick:
 
@@ -333,7 +342,7 @@ jobs:
             ```bash
             ./ferrox-cli.sh locations --foxy              # countries and cities
             ./ferrox-cli.sh locations --veepn             # VeePN region ids (ferrox-cli.sh only)
-            ./ferrox-cli.sh locations --psiphon           # regions in the signed list (ferrox-cli.sh only)
+            ./ferrox-cli.sh locations --psiphon           # regions in the signed list
             ./ferrox-cli.sh location DE --foxy
             ./ferrox-cli.sh location nl --veepn
             ./ferrox-cli.sh location US --psiphon
@@ -341,7 +350,7 @@ jobs:
 
             All lanes serve the same loopback fronts: SOCKS5 `127.0.0.1:10808`, HTTP and HTTPS `127.0.0.1:8080`, and mixed `127.0.0.1:10809`.
 
-            `--vpn` points the system proxy at those fronts only after a real flow answers. It is supported on macOS by `ferrox-cli.sh` and on Windows by `ferrox-cli.exe`. Without `--vpn`, point apps at a front directly. The launcher does not offer a TUN device: `--tun` and `ferrox-cli tun` refuse by name and explain the cost. `--udp-via` only routes datagrams that reach the proxy; an app that sends raw UDP around the proxy still bypasses the lane, even with `--udp-via block`.
+            `--vpn` opens a TUN device and routes the whole host; it waits for the app's readiness line before reporting the lane up. `--vpn-proxy` points the macOS system proxy (or the Windows WinINET proxy) at the fronts only after a real flow answers. Without either, point apps at a front directly. `--udp-via` only routes datagrams that reach the proxy; `--vpn` captures raw UDP as well.
 
             | package | platform |
             | --- | --- |

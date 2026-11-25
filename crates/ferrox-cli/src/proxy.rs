@@ -1,4 +1,4 @@
-//! The one machine-wide setting `--vpn` touches. On Windows that is `WinINET`'s
+//! The one machine-wide setting `--vpn-proxy` touches. On Windows that is `WinINET`'s
 //! Internet Settings: the same proxy Chrome, Edge and most desktop apps read.
 //! A snapshot is taken before the first arm and restored on `down`.
 
@@ -50,7 +50,7 @@ pub fn preflight(list: &str, ports: Ports) -> Result<(), String> {
     #[cfg(not(windows))]
     {
         Err(format!(
-            "ferrox-cli: --vpn sets the Windows system proxy; on {} nothing was started.\n  point the app at the fronts instead: ferrox-cli ports",
+            "ferrox-cli: --vpn-proxy sets the Windows system proxy; on {} nothing was started.\n  use --vpn for a TUN device, or point the app at the fronts: ferrox-cli ports",
             std::env::consts::OS
         ))
     }

@@ -524,6 +524,9 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, tes
         // The startup record both pinned interop harnesses scan the server log for; not this binary's name.
         println!("ferrox-app serving; harness readiness token: core: Xray 26.11.9 started");
     }
+    if !test {
+        crate::shutdown::watch();
+    }
     loop {
         thread::park();
         report_dial_failures();
@@ -21228,6 +21231,17 @@ fn tun_mode(stack: &str) -> crate::tun_stack::Mode {
     }
 }
 
+/// The line the CLI and the launcher wait for: the device is open and its routes are in.
+fn tun_ready(interface: &str, stack: &str) {
+    let shown = if interface.is_empty() {
+        "inherited"
+    } else {
+        interface
+    };
+    println!("tun inbound: interface {shown} up (stack {stack})");
+    let _ = std::io::stdout().flush();
+}
+
 /// Install the `auto_route` guard for `interface`; the caller holds it until the handler and its
 /// workers have drained, so the table goes back only after the last packet is relayed.
 fn tun_routes(
@@ -21403,6 +21417,7 @@ fn serve_tun_inbound(
             }
         });
     }
+    tun_ready(&interface, stack);
     drop(route_guard);
     Some(true)
 }
@@ -21447,6 +21462,7 @@ fn serve_tun_non_native(
                     }
                 }
             };
+            tun_ready(&interface, stack);
             let stoppable = workers.is_some();
             match (stop.cloned(), workers) {
                 (stop, Some(workers)) => {
@@ -42961,7 +42977,7 @@ fn send_parts(
             msg.msg_namelen = len;
         }
         msg.msg_iov = parts.as_mut_ptr();
-        msg.msg_iovlen = parts.len() as _;
+        msg.msg_iovlen = parts.len().try_into().unwrap_or(0);
         loop {
             // SAFETY: `msg` names `parts` and the `sockaddr` storage, both live and sized as the call reads them.
             let sent = unsafe { libc::sendmsg(socket.as_raw_fd(), &raw const msg, 0) };

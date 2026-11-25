@@ -31,6 +31,9 @@ use paths::{read_trim, read_trim_checked, Paths};
 
 fn main() {
     let mut options = args::parse();
+    if options.vpn && matches!(options.action, Action::Up | Action::Serve) {
+        args::require_vpn_admin();
+    }
     let mut paths = Paths::new(options.instance.as_deref());
     let code = match options.action {
         Action::Up => up(&mut options, &mut paths, false),
@@ -54,12 +57,12 @@ fn main() {
         }
         Action::Logout => logout(&paths),
         Action::Locations => {
-            locations::list(&paths, &options.loc_filter, options.ping)
+            locations::list(&options, &paths, &options.loc_filter, options.ping)
                 .unwrap_or_else(|error| args::die(&error));
             0
         }
         Action::Location => {
-            locations::remember(&paths, &options.loc_country, &options.loc_city)
+            locations::remember(&options, &paths, &options.loc_country, &options.loc_city)
                 .unwrap_or_else(|error| args::die(&error));
             0
         }
@@ -144,7 +147,7 @@ fn load_saved_fronts(options: &mut Options, paths: &Paths) {
     let path = paths.cfg.to_string_lossy();
     if let Ok(saved) = config::config_fronts(
         &path,
-        options.vpn,
+        options.vpn_proxy,
         options.fronts_set,
         options.fronts.as_str(),
     ) {
@@ -183,9 +186,12 @@ fn reject_duplicate_ports(options: &Options) {
 }
 
 fn reject_empty_fronts(options: &Options) -> Result<(), String> {
-    if options.outbound != Some(Outbound::Config) && fronts(&options.fronts).is_empty() {
+    if options.outbound != Some(Outbound::Config)
+        && fronts(&options.fronts).is_empty()
+        && !options.vpn
+    {
         return Err(
-            "--fronts names no front; give socks, http, mixed, or a combination; nothing was started.".to_owned(),
+            "--fronts names no front; give socks, http, mixed, a combination, or --vpn; nothing was started.".to_owned(),
         );
     }
     Ok(())
@@ -195,9 +201,17 @@ fn prepare(options: &mut Options, paths: &mut Paths) -> (Ports, bool) {
     let user_config = options.outbound == Some(Outbound::Config);
     if user_config {
         ensure_config(options);
+        if options.vpn
+            && !config::config_has_tun(&options.config_file)
+                .unwrap_or_else(|error| args::die(&error))
+        {
+            args::die(
+                "--vpn adds a TUN inbound to a generated config; this --config has none. Add a `tun` inbound to it, or drop --config and let the launcher generate one; nothing was started.",
+            );
+        }
         let list = config::config_fronts(
             &options.config_file,
-            options.vpn,
+            options.vpn_proxy,
             options.fronts_set,
             &options.fronts,
         )
@@ -231,37 +245,70 @@ fn user_config_at_default(paths: &Paths) -> bool {
 }
 
 fn write_lane_config(
-    options: &Options,
+    options: &mut Options,
     paths: &Paths,
     ports: Ports,
     account: Option<&FoxyAccount>,
-) {
+) -> Result<Option<u16>, String> {
     if options.outbound == Some(Outbound::Config) {
-        lane::remember_user_config(paths).unwrap_or_else(|error| args::die(&error));
-        return;
+        lane::remember_user_config(paths)?;
+        return Ok(None);
     }
     if user_config_at_default(paths) {
-        args::die(&format!(
+        return Err(format!(
             "{} is a user config started with --config; refusing to overwrite it. Pass --config again or remove the file.",
             paths.cfg.display()
         ));
     }
-    let outbound =
-        config::build_outbound(options, paths, account).unwrap_or_else(|error| args::die(&error));
-    config::write_config(&paths.cfg, &outbound, &options.fronts, ports)
-        .unwrap_or_else(|error| args::die(&error));
+    let generated = config::lane_plan(options, paths)?;
+    let outbound = config::build_outbound(options, paths, account)?;
+    let vpn = options.vpn.then(|| config::Vpn::from_options(options));
+    config::write_config(
+        &paths.cfg,
+        &outbound,
+        &options.fronts,
+        ports,
+        vpn.as_ref(),
+        Some(&generated),
+    )?;
     lane::forget_user_config(paths);
     if options.outbound == Some(Outbound::Foxy) {
-        config::save_foxy_location(options, paths).unwrap_or_else(|error| args::die(&error));
+        config::save_foxy_location(options, paths)?;
+    } else if options.outbound == Some(Outbound::Psiphon) {
+        config::save_psiphon_location(options, paths)?;
+    } else if options.outbound == Some(Outbound::Veepn) {
+        config::save_veepn_location(options, paths)?;
     }
+    Ok(generated.hidden_socks)
 }
 
 fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
+    let code = up_once(options, paths, serve);
+    if code == 3
+        && options.outbound == Some(Outbound::Foxy)
+        && !options.warp
+        && options.upstream.is_empty()
+        && std::fs::read_to_string(&paths.log)
+            .is_ok_and(|text| text.contains("the account plane answered 451"))
+    {
+        println!("the account plane answered 451 from this region: retrying once through WARP.");
+        options.warp = true;
+        return up_once(options, paths, serve);
+    }
+    code
+}
+
+fn up_once(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
     if let Err(error) = reconcile(paths) {
         eprintln!("ferrox-cli: {error}");
         return 1;
     }
     ensure_config(options);
+    match options.outbound {
+        Some(Outbound::Psiphon) => config::load_psiphon_location(options, paths),
+        Some(Outbound::Veepn) => config::load_veepn_location(options, paths),
+        _ => {}
+    }
     reject_duplicate_ports(options);
     reject_empty_fronts(options).unwrap_or_else(|error| args::die(&error));
     config::validate_exclusions(options).unwrap_or_else(|error| args::die(&error));
@@ -287,13 +334,24 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
         }
     };
     let (ports, user_config) = prepare(options, paths);
-    if options.vpn {
+    if options.vpn_proxy {
         if let Err(error) = proxy::preflight(&options.fronts, ports) {
             eprintln!("{error}");
             return 1;
         }
     }
-    write_lane_config(options, paths, ports, account.as_ref());
+    if options.warp && !options.upstream.is_empty() {
+        println!(
+            "--upstream names the hop, so --warp is not applied; WARP rides --udp-via warp only."
+        );
+    }
+    let hidden_socks = match write_lane_config(options, paths, ports, account.as_ref()) {
+        Ok(port) => port,
+        Err(error) => {
+            eprintln!("ferrox-cli: {error}");
+            return 1;
+        }
+    };
     if lane::running(paths) {
         println!(
             "a lane{} is already running (pid {}); stopping it first.",
@@ -312,7 +370,13 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
             return 1;
         }
     }
-    let pid = lane::start(&bin, paths, options.debug).unwrap_or_else(|error| args::die(&error));
+    let pid = match lane::start(&bin, paths, options.debug, options.vpn) {
+        Ok(pid) => pid,
+        Err(error) => {
+            eprintln!("ferrox-cli: {error}");
+            return 1;
+        }
+    };
     let interrupted = Arc::new(AtomicBool::new(false));
     let cancelled = Arc::new(Mutex::new(false));
     let flag = Arc::clone(&interrupted);
@@ -363,6 +427,23 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
     if interrupted.load(Ordering::SeqCst) {
         return stop_with_cancellation(&cancelled, &interrupted, paths, user_config, 3);
     }
+    if hidden_socks.is_some_and(|port| !lane::wait_port(port)) {
+        println!(
+            "the lane did not open its WARP hop; last lines of {}:",
+            paths.log.display()
+        );
+        tail(&paths.log, 20);
+        return stop_with_cancellation(&cancelled, &interrupted, paths, user_config, 3);
+    }
+    if options.vpn && !lane::wait_tun(paths) {
+        println!(
+            "the lane did not bring up its TUN device; last lines of {}:",
+            paths.log.display()
+        );
+        tail(&paths.log, 20);
+        let code = stop_with_cancellation(&cancelled, &interrupted, paths, user_config, 3);
+        return code;
+    }
     println!(
         "lane{} up (pid {pid}), fronts:",
         options
@@ -371,6 +452,12 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
             .map_or_else(String::new, |name| format!(" '{name}'"))
     );
     port_map(options, ports);
+    if options.vpn {
+        println!(
+            "tun: {} engine, whole-device capture; down restores the routes.",
+            options.vpn_engine
+        );
+    }
     if options.outbound == Some(Outbound::Foxy) {
         println!("carrier: {}", options.carrier);
     }
@@ -379,7 +466,7 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
         match verify_flow(options, ports, paths) {
             Flow::Carry => {}
             Flow::Skip => {
-                if options.vpn {
+                if options.vpn_proxy {
                     println!("not arming the system proxy; the lane keeps its own routing.");
                 }
                 arm = false;
@@ -392,7 +479,7 @@ fn up(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
     if interrupted.load(Ordering::SeqCst) {
         return stop_with_cancellation(&cancelled, &interrupted, paths, user_config, 3);
     }
-    if options.vpn && arm {
+    if options.vpn_proxy && arm {
         // Hold the cancellation lock across the arm and handoff so a Ctrl-C either owns cleanup or looks at a finished start.
         let mut state = cancelled
             .lock()
@@ -988,19 +1075,25 @@ fn port_map(options: &Options, ports: Ports) {
 }
 
 fn tun() {
-    println!("TUN mode is refused by this binary, by name, not by silence.");
+    println!("--vpn opens a TUN device and captures the whole host, UDP included.");
+    println!("It needs root (Unix) or Administrator (Windows); the launcher elevates");
+    println!("on Unix, and on Windows run it from an elevated terminal.");
     println!();
-    println!("What TUN would be: a virtual network device that takes every IP packet,");
-    println!("so apps that ignore proxies are captured too, UDP included. That needs a");
-    println!("device driver, a userspace IP stack, and administrator rights.");
+    println!("engines (--vpn-engine):");
+    println!("  native      this tree's own device front; the default and the `hev` name");
+    println!("  userspace   smoltcp stack; alias smoltcp or gvisor");
+    println!("  system      the kernel's own TCP/IP stack (Linux; falls back elsewhere)");
+    println!("  hybrid      kernel TCP plus userspace UDP (Linux; alias mixed)");
     println!();
-    println!("What this binary has: no tun inbound and no tun2socks engine. A config");
-    println!("naming one is refused with that reason, and `--tun` here refuses before");
-    println!("anything starts.");
+    println!("also:");
+    println!("  --vpn-ipv6            carry IPv6 as well as IPv4");
+    println!("  --vpn-mtu N           device MTU, default 1500");
+    println!("  --vpn-name NAME       device name (default ferrox0; macOS picks utunN)");
+    println!("  --vpn-dns ADDR        resolver for port 53, default 1.1.1.1; 'none' leaves it");
+    println!("  --vpn-proxy           the old behaviour: the Windows system proxy, not TUN");
     println!();
-    println!("What you get instead:");
-    println!("  ferrox-cli up --vpn      the Windows proxy: TCP apps that honour it");
-    println!("  ferrox-cli up --fronts socks   UDP for apps that speak SOCKS5");
+    println!("  ferrox-cli up --foxy --vpn");
+    println!("  ferrox-cli up --foxy --vpn --vpn-engine userspace --vpn-ipv6");
 }
 
 fn version(paths: &Paths) -> i32 {
