@@ -77662,13 +77662,13 @@ mod tests {
         id: [u8; 16],
         obfs: &str,
         masq: ferrox_core::hysteria::Masquerade,
-        identity: Arc<ferrox_core::tls::TlsServerConfig>,
+        identity: &Arc<ferrox_core::tls::TlsServerConfig>,
         roots: Vec<Vec<u8>>,
     ) -> (u16, Vec<Vec<u8>>) {
         let serve: crate::hysteria::Serve = Arc::new(move |flow| {
             serve_vless_hysteria(flow, &one_vless_user(&id), true);
         });
-        hysteria_loop_with_identity(auth, obfs, masq, &identity, roots, serve)
+        hysteria_loop_with_identity(auth, obfs, masq, identity, roots, serve)
     }
 
     fn hysteria_loop_with_identity(
@@ -79693,12 +79693,13 @@ mod tests {
         let (second, roots) = minted_tls_identity("second.test");
         let mut identity = (*first).clone();
         identity.certs.push(second.certs[0].clone());
+        let identity = Arc::new(identity);
         let (port, roots) = hysteria_loop_identity(
             "test-auth",
             id,
             "",
             ferrox_core::hysteria::Masquerade::NotFound,
-            Arc::new(identity),
+            &identity,
             roots,
         );
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
