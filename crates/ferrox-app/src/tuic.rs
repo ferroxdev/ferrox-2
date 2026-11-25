@@ -443,7 +443,6 @@ impl TuicOut {
             let lane = held
                 .get(&key)?
                 .iter()
-                .filter(|lane| live(lane))
                 .min_by_key(|lane| lane.leases.load(Ordering::Acquire))?;
             lane.leases.fetch_add(1, Ordering::AcqRel);
             Some(LaneLease(Arc::clone(lane)))
