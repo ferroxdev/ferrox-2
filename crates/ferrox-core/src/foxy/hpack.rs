@@ -1465,7 +1465,7 @@ mod tests {
     /// instead of growing it a field at a time.
     #[test]
     fn qpack_literal_many_sizes_its_block_once() {
-        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+        let ((), counts) = crate::alloc_count::measure(|| {
             let mut block = Vec::new();
             qpack_literal_many(
                 &[
