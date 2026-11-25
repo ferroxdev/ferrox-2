@@ -342,20 +342,14 @@ impl BufferPool {
     }
 
     fn take(&mut self, len: usize) -> Option<Vec<u8>> {
-        let mut at = 0;
-        while at < self.classes.len() {
-            #[cfg(test)]
-            {
-                self.probes += 1;
-            }
-            if self.classes[at].0 == len {
-                let bytes = self.classes[at].1.pop()?;
-                self.cached -= bytes.len();
-                return Some(bytes);
-            }
-            at += 1;
+        #[cfg(test)]
+        {
+            self.probes += self.classes.len();
         }
-        None
+        let at = self.classes.iter().position(|(class, _)| *class == len)?;
+        let bytes = self.classes[at].1.pop()?;
+        self.cached -= bytes.len();
+        Some(bytes)
     }
 
     fn put(&mut self, bytes: Vec<u8>) {
