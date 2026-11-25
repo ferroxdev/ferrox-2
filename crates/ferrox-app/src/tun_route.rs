@@ -46,13 +46,10 @@ pub(crate) fn capture_generation() -> u64 {
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub(crate) fn release_all() {
     let _operation = route_operation();
-    let guards: Vec<Arc<Guard>> = capture()
-        .lock()
-        .map(|mut slot| {
-            slot.retain(|weak| weak.strong_count() > 0);
-            slot.iter().filter_map(Weak::upgrade).collect()
-        })
-        .unwrap_or_default();
+    let guards: Vec<Arc<Guard>> = capture().lock().map_or_default(|mut slot| {
+        slot.retain(|weak| weak.strong_count() > 0);
+        slot.iter().filter_map(Weak::upgrade).collect()
+    });
     for guard in guards {
         guard.release_now();
     }
@@ -230,10 +227,10 @@ pub(crate) fn stage_dial(address: IpAddr) -> io::Result<bool> {
     let address = route_address(address);
     DIAL_UNDERLAY.with(|slot| *slot.borrow_mut() = None);
     let route = dial_route(address)?;
-    if route.captured {
-        if let Some((interface, index)) = route.underlay {
-            DIAL_UNDERLAY.with(|slot| *slot.borrow_mut() = Some((address, interface, index)));
-        }
+    if route.captured
+        && let Some((interface, index)) = route.underlay
+    {
+        DIAL_UNDERLAY.with(|slot| *slot.borrow_mut() = Some((address, interface, index)));
     }
     Ok(route.captured)
 }
@@ -556,14 +553,14 @@ impl Guard {
                 continue;
             }
             let route = Route::new(*destination, *prefix).with_if_name(interface.to_owned());
-            if let Some(holder) = capture_holder(*destination, *prefix) {
-                if holder != interface {
-                    retire(&mut manager, &mut added, &mut pinned);
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        format!("{destination}/{prefix} is already captured by {holder}"),
-                    ));
-                }
+            if let Some(holder) = capture_holder(*destination, *prefix)
+                && holder != interface
+            {
+                retire(&mut manager, &mut added, &mut pinned);
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("{destination}/{prefix} is already captured by {holder}"),
+                ));
             }
             if let Some(holder) = foreign_route(&mut manager, *destination, *prefix, interface) {
                 retire(&mut manager, &mut added, &mut pinned);
@@ -669,8 +666,7 @@ impl Guard {
             let held: Vec<(IpAddr, u8)> = self
                 .pinned
                 .lock()
-                .map(|pinned| pinned.keys().copied().collect())
-                .unwrap_or_default();
+                .map_or_default(|pinned| pinned.keys().copied().collect());
             best_underlay_from(&routes, address, &interfaces, &held).and_then(|route| {
                 let name = route.if_name().cloned().unwrap_or_default();
                 if name.is_empty() && route.if_index().is_none() {
@@ -714,8 +710,7 @@ impl Guard {
             .pinned
             .lock()
             .ok()
-            .map(|pinned| pinned.keys().copied().collect())
-            .unwrap_or_default();
+            .map_or_default(|pinned| pinned.keys().copied().collect());
         if let Ok(global) = installed_pins().lock() {
             held.extend(global.keys().copied());
         }
@@ -804,10 +799,10 @@ impl Guard {
                     if let Ok(mut pinned) = self.pinned.lock() {
                         pinned.remove(&key);
                     }
-                    if let Ok(mut global) = installed_pins().lock() {
-                        if global.get(&key) == existing.as_ref() {
-                            global.remove(&key);
-                        }
+                    if let Ok(mut global) = installed_pins().lock()
+                        && global.get(&key) == existing.as_ref()
+                    {
+                        global.remove(&key);
                     }
                     if let Ok(mut routes) = self.added.lock() {
                         routes
@@ -820,10 +815,10 @@ impl Guard {
         };
         if added {
             self.keep_pin(key, address, bits, route);
-        } else if let Some(installed) = installed {
-            if existing.as_ref() != Some(&installed) {
-                self.keep_pin(key, address, bits, installed);
-            }
+        } else if let Some(installed) = installed
+            && existing.as_ref() != Some(&installed)
+        {
+            self.keep_pin(key, address, bits, installed);
         }
         Some(added)
     }
@@ -846,15 +841,12 @@ impl Guard {
         if let Ok(mut routes) = self.added.lock() {
             routes.retain(|held| held.destination() != address || held.prefix() != bits);
         }
-        let others: Vec<Arc<Self>> = capture()
-            .lock()
-            .map(|slot| {
-                slot.iter()
-                    .filter_map(Weak::upgrade)
-                    .filter(|guard| !std::ptr::eq(Arc::as_ptr(guard), self))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let others: Vec<Arc<Self>> = capture().lock().map_or_default(|slot| {
+            slot.iter()
+                .filter_map(Weak::upgrade)
+                .filter(|guard| !std::ptr::eq(Arc::as_ptr(guard), self))
+                .collect()
+        });
         if another_pin_holds(key, &others) {
             return true;
         }
@@ -886,13 +878,11 @@ impl Guard {
         let routes: Vec<Route> = self
             .added
             .lock()
-            .map(|mut added| added.drain(..).collect())
-            .unwrap_or_default();
+            .map_or_default(|mut added| added.drain(..).collect());
         let pinned: Vec<((IpAddr, u8), Route)> = self
             .pinned
             .lock()
-            .map(|mut pinned| pinned.drain().collect())
-            .unwrap_or_default();
+            .map_or_default(|mut pinned| pinned.drain().collect());
         let Ok(mut manager) = self.manager.lock() else {
             return;
         };
@@ -921,8 +911,7 @@ fn retire(
 ) {
     let others: Vec<Arc<Guard>> = capture()
         .lock()
-        .map(|slot| slot.iter().filter_map(Weak::upgrade).collect())
-        .unwrap_or_default();
+        .map_or_default(|slot| slot.iter().filter_map(Weak::upgrade).collect());
     for route in added.drain(..).rev() {
         if !another_holds(route.destination(), route.prefix(), &others) {
             defer_delete(manager, &route);
@@ -930,10 +919,10 @@ fn retire(
     }
     if let Ok(mut global) = installed_pins().lock() {
         for key in pinned.keys() {
-            if !another_pin_holds(*key, &others) {
-                if let Some(route) = global.remove(key) {
-                    defer_delete(manager, &route);
-                }
+            if !another_pin_holds(*key, &others)
+                && let Some(route) = global.remove(key)
+            {
+                defer_delete(manager, &route);
             }
         }
     }
@@ -966,8 +955,7 @@ fn foreign_route(
 fn capture_holder(destination: IpAddr, prefix: u8) -> Option<String> {
     let guards: Vec<Arc<Guard>> = capture()
         .lock()
-        .map(|slot| slot.iter().filter_map(Weak::upgrade).collect())
-        .unwrap_or_default();
+        .map_or_default(|slot| slot.iter().filter_map(Weak::upgrade).collect());
     guards.into_iter().find_map(|guard| {
         guard.added.lock().ok().and_then(|held| {
             held.iter()
@@ -1143,13 +1131,10 @@ fn pending_targets(destination: IpAddr, prefix: u8, interface: &str) -> bool {
 /// guard stays unowned, so closing one capture cannot delete it.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn held_by_another(destination: IpAddr, prefix: u8) -> bool {
-    let guards: Vec<Arc<Guard>> = capture()
-        .lock()
-        .map(|mut slot| {
-            slot.retain(|weak| weak.strong_count() > 0);
-            slot.iter().filter_map(Weak::upgrade).collect()
-        })
-        .unwrap_or_default();
+    let guards: Vec<Arc<Guard>> = capture().lock().map_or_default(|mut slot| {
+        slot.retain(|weak| weak.strong_count() > 0);
+        slot.iter().filter_map(Weak::upgrade).collect()
+    });
     guards.into_iter().any(|guard| {
         guard.added.lock().is_ok_and(|held| {
             held.iter()
@@ -1161,13 +1146,10 @@ fn held_by_another(destination: IpAddr, prefix: u8) -> bool {
 /// The same ownership check ignoring `me`, whose stale record was just deleted before a re-add.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn held_by_another_except(destination: IpAddr, prefix: u8, me: &Guard) -> bool {
-    let guards: Vec<Arc<Guard>> = capture()
-        .lock()
-        .map(|mut slot| {
-            slot.retain(|weak| weak.strong_count() > 0);
-            slot.iter().filter_map(Weak::upgrade).collect()
-        })
-        .unwrap_or_default();
+    let guards: Vec<Arc<Guard>> = capture().lock().map_or_default(|mut slot| {
+        slot.retain(|weak| weak.strong_count() > 0);
+        slot.iter().filter_map(Weak::upgrade).collect()
+    });
     guards.into_iter().any(|guard| {
         !std::ptr::eq(guard.as_ref(), me)
             && guard.added.lock().is_ok_and(|held| {
@@ -1182,8 +1164,7 @@ fn held_by_another_except(destination: IpAddr, prefix: u8, me: &Guard) -> bool {
 fn capture_interfaces() -> Vec<String> {
     let guards: Vec<Arc<Guard>> = capture()
         .lock()
-        .map(|slot| slot.iter().filter_map(Weak::upgrade).collect())
-        .unwrap_or_default();
+        .map_or_default(|slot| slot.iter().filter_map(Weak::upgrade).collect());
     guards
         .into_iter()
         .map(|guard| guard.interface.clone())
@@ -1337,13 +1318,13 @@ fn edge_route(base: &Route, address: IpAddr, bits: u8) -> Route {
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn defer_delete(manager: &mut RouteManager, route: &Route) {
-    if let Err(error) = manager.delete(route) {
-        if error.kind() != io::ErrorKind::NotFound {
-            if let Ok(mut pending) = pending_deletes().lock() {
-                pending.push(route.clone());
-            }
-            schedule_retry();
+    if let Err(error) = manager.delete(route)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        if let Ok(mut pending) = pending_deletes().lock() {
+            pending.push(route.clone());
         }
+        schedule_retry();
     }
 }
 
@@ -1351,12 +1332,10 @@ fn defer_delete(manager: &mut RouteManager, route: &Route) {
 fn retry_pending(manager: &mut RouteManager) {
     let routes = pending_deletes()
         .lock()
-        .map(|mut pending| std::mem::take(&mut *pending))
-        .unwrap_or_default();
+        .map_or_default(|mut pending| std::mem::take(&mut *pending));
     let pinned = pending_pinned()
         .lock()
-        .map(|mut pending| std::mem::take(&mut *pending))
-        .unwrap_or_default();
+        .map_or_default(|mut pending| std::mem::take(&mut *pending));
     cleanup_routes(manager, routes, pinned);
 }
 
@@ -1368,8 +1347,7 @@ fn cleanup_routes(
 ) {
     let others: Vec<Arc<Guard>> = capture()
         .lock()
-        .map(|slot| slot.iter().filter_map(Weak::upgrade).collect())
-        .unwrap_or_default();
+        .map_or_default(|slot| slot.iter().filter_map(Weak::upgrade).collect());
     let Ok(mut global) = installed_pins().lock() else {
         return;
     };
@@ -1426,35 +1404,37 @@ fn schedule_retry() {
     for attempt in 0..3 {
         let result = std::thread::Builder::new()
             .name("ferrox-route-cleanup".to_owned())
-            .spawn(|| loop {
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                let empty = pending_deletes()
-                    .lock()
-                    .is_ok_and(|pending| pending.is_empty())
-                    && pending_pinned()
-                        .lock()
-                        .is_ok_and(|pending| pending.is_empty());
-                if empty {
-                    RETRY.store(false, std::sync::atomic::Ordering::Release);
-                    let still_empty = pending_deletes()
+            .spawn(|| {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    let empty = pending_deletes()
                         .lock()
                         .is_ok_and(|pending| pending.is_empty())
                         && pending_pinned()
                             .lock()
                             .is_ok_and(|pending| pending.is_empty());
-                    if still_empty {
-                        return;
+                    if empty {
+                        RETRY.store(false, std::sync::atomic::Ordering::Release);
+                        let still_empty = pending_deletes()
+                            .lock()
+                            .is_ok_and(|pending| pending.is_empty())
+                            && pending_pinned()
+                                .lock()
+                                .is_ok_and(|pending| pending.is_empty());
+                        if still_empty {
+                            return;
+                        }
+                        if RETRY.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                            return;
+                        }
                     }
-                    if RETRY.swap(true, std::sync::atomic::Ordering::AcqRel) {
-                        return;
-                    }
+                    let _routes = route_write();
+                    let _operation = route_operation();
+                    let Ok(mut manager) = RouteManager::new() else {
+                        continue;
+                    };
+                    retry_pending(&mut manager);
                 }
-                let _routes = route_write();
-                let _operation = route_operation();
-                let Ok(mut manager) = RouteManager::new() else {
-                    continue;
-                };
-                retry_pending(&mut manager);
             });
         if result.is_ok() {
             return;
@@ -1477,16 +1457,12 @@ impl Drop for Guard {
         drop(added);
         // A dial can drop the last guard while holding `route_read`, and a capture can be released inside an install: waiting for the operation lock here would deadlock, so a helper takes both locks in install order once they are free.
         let Ok(_operation) = route_operation_lock().try_lock() else {
-            let pinned: Vec<((IpAddr, u8), Route)> = self
-                .pinned
-                .lock()
-                .map(|pinned| {
-                    pinned
-                        .iter()
-                        .map(|(key, route)| (*key, route.clone()))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let pinned: Vec<((IpAddr, u8), Route)> = self.pinned.lock().map_or_default(|pinned| {
+                pinned
+                    .iter()
+                    .map(|(key, route)| (*key, route.clone()))
+                    .collect()
+            });
             let routes_queued = routes.clone();
             let pinned_queued = pinned.clone();
             if std::thread::Builder::new()
@@ -1503,13 +1479,10 @@ impl Drop for Guard {
             }
             return;
         };
-        let others: Vec<Arc<Self>> = capture()
-            .lock()
-            .map(|mut slot| {
-                slot.retain(|weak| weak.strong_count() > 0 && !std::ptr::eq(weak.as_ptr(), self));
-                slot.iter().filter_map(Weak::upgrade).collect()
-            })
-            .unwrap_or_default();
+        let others: Vec<Arc<Self>> = capture().lock().map_or_default(|mut slot| {
+            slot.retain(|weak| weak.strong_count() > 0 && !std::ptr::eq(weak.as_ptr(), self));
+            slot.iter().filter_map(Weak::upgrade).collect()
+        });
         let Ok(mut manager) = self.manager.lock() else {
             return;
         };
@@ -1720,19 +1693,26 @@ mod tests {
             ],
             &keep,
         );
-        assert!(plan
-            .routes()
-            .contains(&(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0)), 16)));
-        assert!(!plan
-            .routes()
-            .contains(&(IpAddr::V4(Ipv4Addr::new(10, 1, 0, 0)), 16)));
+        assert!(
+            plan.routes()
+                .contains(&(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0)), 16))
+        );
+        assert!(
+            !plan
+                .routes()
+                .contains(&(IpAddr::V4(Ipv4Addr::new(10, 1, 0, 0)), 16))
+        );
         let kept_half = Plan::new(true, false, &[], &[(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 1)]);
-        assert!(!kept_half
-            .routes()
-            .contains(&(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 1)));
-        assert!(kept_half
-            .routes()
-            .contains(&(IpAddr::V4(Ipv4Addr::new(128, 0, 0, 0)), 1)));
+        assert!(
+            !kept_half
+                .routes()
+                .contains(&(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 1))
+        );
+        assert!(
+            kept_half
+                .routes()
+                .contains(&(IpAddr::V4(Ipv4Addr::new(128, 0, 0, 0)), 1))
+        );
     }
 
     #[test]
@@ -1743,9 +1723,10 @@ mod tests {
             &[(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)), 16)],
             &[(IpAddr::V4(Ipv4Addr::new(10, 2, 3, 4)), 16)],
         );
-        assert!(plan
-            .routes()
-            .contains(&(IpAddr::V4(Ipv4Addr::new(10, 1, 0, 0)), 16)));
+        assert!(
+            plan.routes()
+                .contains(&(IpAddr::V4(Ipv4Addr::new(10, 1, 0, 0)), 16))
+        );
         assert_eq!(plan.keep(), &[(IpAddr::V4(Ipv4Addr::new(10, 2, 0, 0)), 16)]);
     }
 
@@ -1901,8 +1882,10 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn a_route_that_carries_the_whole_exclusion_stays_one_pin() {
-        let routes = vec![Route::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0)), 24)
-            .with_gateway(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))];
+        let routes = vec![
+            Route::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0)), 24)
+                .with_gateway(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+        ];
         let mut edges = Vec::new();
         keep_edges_for(
             &routes,

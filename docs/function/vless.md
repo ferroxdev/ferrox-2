@@ -53,7 +53,7 @@ Both directions ride the relay lanes, and one direction ending does not end the 
 | sealed-record-sizes-swept | 12 | ferrox-core-vless::tests::a_record_of_any_size_reads_back_the_octets_that_were_written |
 | sealed-record-writes-per-batch | 1 | ferrox-core-vless::tests::a_batched_record_write_is_one_call_and_the_same_bytes |
 | sealed-record-copies | 2 | ferrox-core-vless::tests::a_record_inside_one_part_is_sealed_from_that_part |
-| sealed-record-write-instructions | 50874900 | scripts/count-ops.sh |
+| sealed-record-write-instructions | 50877299 | scripts/count-ops.sh |
 <!-- counts:end -->
 
 The relay buffer's zero-fills are prose, not a row. `RelayBuf::with_len` allocates `vec![0u8; len]` on a pool miss, and `ensure` and `filled` allocate the larger window the same way when a pool miss grows it, so every byte a read may touch is initialised before `as_mut` hands the window over. What the pool removes is paying that fill per flow: a finished window returns to the thread-local then shared pool, and the next flow takes the same zeroed allocation, which `a_reused_relay_window_is_not_zeroed` holds at zero zeroed allocations for a pool hit and for a promotion drawn from the large pool. No blessed count carries it, so the sentence is prose and that test is its checker.

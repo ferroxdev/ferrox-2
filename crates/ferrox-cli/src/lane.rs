@@ -9,8 +9,8 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::args::die;
-use crate::config::{front_listeners, fronts, port_of, Ports};
-use crate::paths::{read_trim, read_trim_checked, secure_dir, write_private, Paths};
+use crate::config::{Ports, front_listeners, fronts, port_of};
+use crate::paths::{Paths, read_trim, read_trim_checked, secure_dir, write_private};
 
 fn bin_name() -> &'static str {
     if cfg!(windows) {
@@ -24,8 +24,7 @@ fn project_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .unwrap_or_default()
+        .map_or_default(Path::to_path_buf)
 }
 
 fn candidate_bin() -> PathBuf {
@@ -147,7 +146,7 @@ fn process_exe(pid: u32) -> Option<PathBuf> {
     {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Threading::{
-            OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
         };
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if handle.is_null() {
@@ -271,7 +270,7 @@ pub fn kill(paths: &Paths, pid: u32) -> Result<(), String> {
     {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Threading::{
-            OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+            OpenProcess, PROCESS_TERMINATE, TerminateProcess,
         };
         let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
         if handle.is_null() {
@@ -599,14 +598,14 @@ fn wait_pid_file(_paths: &Paths, _child: &mut std::process::Child) -> Result<u32
 }
 
 pub fn stop(paths: &Paths) -> Result<(), String> {
-    if let Some(pid) = pid(paths) {
-        if alive(pid) {
-            // The app restores the routes and exits on its own; an older process is killed after the grace period.
-            let _ = write_private(&paths.stop_file, "stop\n");
-            #[cfg(any(unix, windows))]
-            if !wait_exit(pid, 300) {
-                kill(paths, pid)?;
-            }
+    if let Some(pid) = pid(paths)
+        && alive(pid)
+    {
+        // The app restores the routes and exits on its own; an older process is killed after the grace period.
+        let _ = write_private(&paths.stop_file, "stop\n");
+        #[cfg(any(unix, windows))]
+        if !wait_exit(pid, 300) {
+            kill(paths, pid)?;
         }
     }
     let _ = std::fs::remove_file(&paths.stop_file);
@@ -648,8 +647,7 @@ impl Listener {
                 let _ = std::thread::spawn(move || {
                     let addresses = (host.as_str(), port)
                         .to_socket_addrs()
-                        .map(std::iter::Iterator::collect::<Vec<_>>)
-                        .unwrap_or_default();
+                        .map_or_default(std::iter::Iterator::collect::<Vec<_>>);
                     let _ = sender.send(addresses);
                 });
                 Self::Pending(receiver)
@@ -729,12 +727,12 @@ pub fn wait_fronts(list: &str, ports: Ports, paths: &Paths) -> bool {
 /// Wait for the app's readiness line: the device is open and its routes are in.
 pub fn wait_tun(paths: &Paths) -> bool {
     for _ in 0..600 {
-        if let Some(text) = read_trim(&paths.log) {
-            if text.lines().any(|line| {
+        if let Some(text) = read_trim(&paths.log)
+            && text.lines().any(|line| {
                 line.starts_with("tun inbound: interface ") && line.contains(" up (stack ")
-            }) {
-                return true;
-            }
+            })
+        {
+            return true;
         }
         if !running(paths) {
             return false;

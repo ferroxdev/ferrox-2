@@ -3,7 +3,7 @@
 use crate::conn::Connection;
 use crate::foxy_challenge::{self, Jar};
 use ferrox_core::foxy::account::{self, Signed};
-use ferrox_core::foxy::{edge_peer, Failure, Pass};
+use ferrox_core::foxy::{Failure, Pass, edge_peer};
 use ferrox_core::tls::{TlsConfig, TlsProvider as _};
 use std::borrow::Cow;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
@@ -1186,7 +1186,7 @@ struct H2Connection {
 
 impl H2Connection {
     fn connect(endpoint: &Endpoint) -> Result<Self, String> {
-        use crate::h2::{frame_head, MAGIC, S_HEADER_LIST, S_PUSH, T_SETTINGS};
+        use crate::h2::{MAGIC, S_HEADER_LIST, S_PUSH, T_SETTINGS, frame_head};
         let mut tls = endpoint.connect_h2()?;
         let mut out = Vec::with_capacity(24 + 9 + 12);
         out.extend_from_slice(MAGIC);
@@ -1219,8 +1219,8 @@ impl H2Connection {
         body: &[u8],
     ) -> Result<Reply, String> {
         use crate::h2::{
-            block_encode, frame_head, read_head_bounded, F_ACK, F_END, F_END_HEADERS, F_PADDED,
-            F_PRIORITY, T_CONT, T_DATA, T_GOAWAY, T_HEADERS, T_PING, T_RST, T_SETTINGS, T_WINDOW,
+            F_ACK, F_END, F_END_HEADERS, F_PADDED, F_PRIORITY, T_CONT, T_DATA, T_GOAWAY, T_HEADERS,
+            T_PING, T_RST, T_SETTINGS, T_WINDOW, block_encode, frame_head, read_head_bounded,
         };
         let mut fields: Vec<(String, String)> = Vec::with_capacity(headers.len() + 4);
         fields.push((":method".to_owned(), method.to_owned()));
@@ -1373,7 +1373,7 @@ impl H2Connection {
                     return Err(format!(
                         "reading {} {path}: connection closed",
                         endpoint.host
-                    ))
+                    ));
                 }
                 _ => {}
             }
@@ -1935,8 +1935,11 @@ mod tests {
             b"{}",
         );
         let text = String::from_utf8(raw).expect("ascii");
-        assert!(text
-            .starts_with("POST /v1/account/login HTTP/1.1\r\nHost: api.accounts.firefox.com\r\n"));
+        assert!(
+            text.starts_with(
+                "POST /v1/account/login HTTP/1.1\r\nHost: api.accounts.firefox.com\r\n"
+            )
+        );
         assert!(text.contains("\r\nUser-Agent: MozillaVPN/2.35.0 (sys:linux; iap:true)\r\n"));
         assert!(text.contains("\r\nAccept: application/json\r\n"));
         assert!(text.contains("\r\nX-A: 1\r\n"));
@@ -2182,10 +2185,12 @@ mod tests {
         assert_eq!(Denied::of(406), Some(Denied::Challenged(406)));
         assert_eq!(Denied::of(429), Some(Denied::Quota(0)));
         assert_eq!(Denied::of(500), None);
-        assert!(Denied::of(406)
-            .expect("challenged")
-            .to_string()
-            .contains("challenge"));
+        assert!(
+            Denied::of(406)
+                .expect("challenged")
+                .to_string()
+                .contains("challenge")
+        );
     }
 
     /// The wait only a head can name, read where the status is decided.
@@ -3081,9 +3086,7 @@ mod loopback {
 
     fn session_answer(method: Option<&str>) -> String {
         let verified = method.is_none();
-        let method = method
-            .map(|method| format!(r#","verificationMethod":"{method}""#))
-            .unwrap_or_default();
+        let method = method.map_or_default(|method| format!(r#","verificationMethod":"{method}""#));
         format!(r#"{{"sessionToken":"{SESSION}","verified":{verified}{method}}}"#)
     }
 

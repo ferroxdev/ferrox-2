@@ -4,7 +4,7 @@ use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketA
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -1262,8 +1262,7 @@ fn measure_once(
     let startup_samples = sample_for(pid, Phase::Startup, PRE_SLEEP)?;
     let startup_cpu_millis = startup_samples
         .first()
-        .map(|(_, s)| s.cpu_millis)
-        .unwrap_or_default();
+        .map_or_default(|(_, s)| s.cpu_millis);
 
     if request.warmup {
         warmup(socks, &bulk_pattern_template(request.payload_size))?;
@@ -1558,8 +1557,7 @@ fn summarise(samples: &[(Phase, ps::Sample)], moved: &Moved, startup_cpu_millis:
             .max()
             .unwrap_or_default(),
         cpu_millis: last
-            .map(|s| s.cpu_millis)
-            .unwrap_or_default()
+            .map_or_default(|s| s.cpu_millis)
             .saturating_sub(startup_cpu_millis),
         user_millis: split(|s| s.user_millis),
         sys_millis: split(|s| s.sys_millis),
@@ -1852,7 +1850,7 @@ impl SinkThread {
     }
 
     fn reasons(&self) -> Vec<String> {
-        self.reasons.lock().map(|r| r.clone()).unwrap_or_default()
+        self.reasons.lock().map_or_default(|r| r.clone())
     }
 }
 
@@ -2878,10 +2876,9 @@ fn spawn_sink(
                         download_bytes,
                         &sink_desync,
                         &thread_received,
-                    ) {
-                        if let Ok(mut slot) = sink_reasons.lock() {
-                            slot.push(reason);
-                        }
+                    ) && let Ok(mut slot) = sink_reasons.lock()
+                    {
+                        slot.push(reason);
                     }
                     return;
                 }
@@ -3135,7 +3132,7 @@ pub fn inject_inbound(
         _ => {
             return Err(Error::Invalid(
                 "`inbounds` must be an array when present".into(),
-            ))
+            ));
         }
     };
     list.push(inbound);
@@ -4318,7 +4315,7 @@ mod tests {
     #[cfg(windows)]
     fn close_abortively(stream: &TcpStream) {
         use std::os::windows::io::AsRawSocket;
-        use windows_sys::Win32::Networking::WinSock::{setsockopt, LINGER, SOL_SOCKET, SO_LINGER};
+        use windows_sys::Win32::Networking::WinSock::{LINGER, SO_LINGER, SOL_SOCKET, setsockopt};
         let linger = LINGER {
             l_onoff: 1,
             l_linger: 0,
@@ -4875,14 +4872,16 @@ mod tests {
 
     #[test]
     fn an_inbound_that_is_not_an_array_is_an_error() {
-        assert!(inject_inbound(
-            r#"{"inbounds":7}"#,
-            Ipv4Addr::LOCALHOST,
-            1,
-            Dialect::Xray,
-            false,
-        )
-        .is_err());
+        assert!(
+            inject_inbound(
+                r#"{"inbounds":7}"#,
+                Ipv4Addr::LOCALHOST,
+                1,
+                Dialect::Xray,
+                false,
+            )
+            .is_err()
+        );
     }
 
     #[test]

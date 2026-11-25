@@ -47,10 +47,10 @@ fn conf_root() -> PathBuf {
     if let Some(dir) = std::env::var_os("FERROX_CONF_DIR") {
         return PathBuf::from(dir);
     }
-    if cfg!(windows) {
-        if let Some(base) = std::env::var_os("APPDATA") {
-            return PathBuf::from(base).join("ferrox");
-        }
+    if cfg!(windows)
+        && let Some(base) = std::env::var_os("APPDATA")
+    {
+        return PathBuf::from(base).join("ferrox");
     }
     if let Some(base) = std::env::var_os("XDG_CONFIG_HOME") {
         return PathBuf::from(base).join("ferrox");
@@ -62,10 +62,10 @@ fn state_root() -> PathBuf {
     if let Some(dir) = std::env::var_os("FERROX_STATE_DIR") {
         return PathBuf::from(dir);
     }
-    if cfg!(windows) {
-        if let Some(base) = std::env::var_os("LOCALAPPDATA") {
-            return PathBuf::from(base).join("ferrox");
-        }
+    if cfg!(windows)
+        && let Some(base) = std::env::var_os("LOCALAPPDATA")
+    {
+        return PathBuf::from(base).join("ferrox");
     }
     if let Some(base) = std::env::var_os("XDG_STATE_HOME") {
         return PathBuf::from(base).join("ferrox");

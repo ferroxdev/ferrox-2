@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError, Weak};
 use std::time::{Duration, Instant};
-use x25519_dalek::{x25519, X25519_BASEPOINT_BYTES};
+use x25519_dalek::{X25519_BASEPOINT_BYTES, x25519};
 
 pub(crate) const MAGIC: u32 = 0x0BF5_CA7E;
 pub(crate) const HASH_ITERATIONS: usize = 6000;
@@ -731,12 +731,10 @@ impl TlsShape {
         if !stock.is_empty()
             && self.randomized_probability > 0.0
             && draw < self.randomized_probability
-        {
-            if let Some(profile) = Fingerprint::resolve("randomized")
+            && let Some(profile) = Fingerprint::resolve("randomized")
                 .filter(|profile| profile_enabled(*profile, disabled))
-            {
-                return profile;
-            }
+        {
+            return profile;
         }
 
         let mut candidates = custom;
@@ -1579,7 +1577,7 @@ fn read_exact_until(
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "failed to fill whole buffer",
-                ))
+                ));
             }
             Ok(read) => buf = &mut buf[read..],
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -1597,7 +1595,7 @@ fn write_all_until(stream: &mut TcpStream, deadline: Instant, mut bytes: &[u8]) 
                 return Err(io::Error::new(
                     io::ErrorKind::WriteZero,
                     "failed to write whole buffer",
-                ))
+                ));
             }
             Ok(written) => bytes = &bytes[written..],
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -1620,14 +1618,13 @@ fn percent_decode(text: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut at = 0;
     while at < bytes.len() {
-        if bytes[at] == b'%' {
-            if let Some(hex) = bytes.get(at + 1..at + 3) {
-                if let Some(byte) = hex_pair(hex[0], hex[1]) {
-                    out.push(byte);
-                    at += 3;
-                    continue;
-                }
-            }
+        if bytes[at] == b'%'
+            && let Some(hex) = bytes.get(at + 1..at + 3)
+            && let Some(byte) = hex_pair(hex[0], hex[1])
+        {
+            out.push(byte);
+            at += 3;
+            continue;
         }
         out.push(bytes[at]);
         at += 1;
@@ -2766,20 +2763,20 @@ impl Inner {
     /// Add an upstream write to the counters and the burst monitor.
     fn record_up(&self, started: Option<Instant>, bytes: u64) {
         self.bytes_up.fetch_add(bytes, Ordering::Relaxed);
-        if let Some(started) = started {
-            if let Ok(mut burst) = self.burst.lock() {
-                burst.upstream(started, Instant::now(), bytes);
-            }
+        if let Some(started) = started
+            && let Ok(mut burst) = self.burst.lock()
+        {
+            burst.upstream(started, Instant::now(), bytes);
         }
     }
 
     /// Add a downstream read to the counters and the burst monitor.
     fn record_down(&self, started: Option<Instant>, bytes: u64) {
         self.bytes_down.fetch_add(bytes, Ordering::Relaxed);
-        if let Some(started) = started {
-            if let Ok(mut burst) = self.burst.lock() {
-                burst.downstream(started, Instant::now(), bytes);
-            }
+        if let Some(started) = started
+            && let Ok(mut burst) = self.burst.lock()
+        {
+            burst.downstream(started, Instant::now(), bytes);
         }
     }
 
@@ -2790,10 +2787,10 @@ impl Inner {
         }
         let age = u64::try_from(self.opened_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.closed_at.store(age, Ordering::Relaxed);
-        if let Ok(burst) = self.burst.lock() {
-            if let Some(metrics) = burst.metrics() {
-                eprintln!("psiphon: {} bursts:{metrics}", self.server);
-            }
+        if let Ok(burst) = self.burst.lock()
+            && let Some(metrics) = burst.metrics()
+        {
+            eprintln!("psiphon: {} bursts:{metrics}", self.server);
         }
         let _ = self.socket.shutdown();
         let _ = lock(&self.pending_request).take();
@@ -4416,13 +4413,13 @@ impl PacketReader {
         if let Some(cipher) = self.cipher.as_mut() {
             cipher.apply_keystream(&mut buffer[self.block..total]);
         }
-        if let Some(mac) = self.mac.as_ref() {
-            if !constant_time_eq(
+        if let Some(mac) = self.mac.as_ref()
+            && !constant_time_eq(
                 &mac.tag(self.sequence, &buffer[..total]),
                 &buffer[total..framed],
-            ) {
-                return Err(io::Error::other("ssh packet mac mismatch"));
-            }
+            )
+        {
+            return Err(io::Error::other("ssh packet mac mismatch"));
         }
         self.sequence = self.sequence.wrapping_add(1);
         let padding = usize::from(buffer[4]);
@@ -4542,7 +4539,7 @@ fn read_exact_deadline(
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "failed to fill whole buffer",
-                ))
+                ));
             }
             Ok(read) => out = &mut out[read..],
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -4565,7 +4562,7 @@ fn write_all_deadline(
                 return Err(io::Error::new(
                     io::ErrorKind::WriteZero,
                     "failed to write whole buffer",
-                ))
+                ));
             }
             Ok(written) => bytes = &bytes[written..],
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -5359,7 +5356,7 @@ fn handshake(
             }
             Some(MSG_EXT_INFO | MSG_IGNORE | MSG_DEBUG) => {}
             Some(other) => {
-                return Err(format!("psiphon ssh expected handshake reply, got {other}"))
+                return Err(format!("psiphon ssh expected handshake reply, got {other}"));
             }
             None => return Err("psiphon ssh empty packet".to_owned()),
         }
@@ -5554,14 +5551,13 @@ fn parse_handshake(body: &[u8]) -> HandshakeState {
     let strings = |key: &str| {
         json.get(key)
             .and_then(crate::json::Json::as_arr)
-            .map(|items| {
+            .map_or_default(|items| {
                 items
                     .iter()
                     .filter_map(crate::json::Json::as_str)
                     .map(str::to_owned)
                     .collect()
             })
-            .unwrap_or_default()
     };
     let value = |key: &str| {
         json.get(key)
@@ -5689,8 +5685,7 @@ fn dispatch(inner: &Arc<Inner>, packet: Packet) -> Dispatch {
             };
             let reason = take_u32(body, &mut at).unwrap_or(0);
             let description = take_str(body, &mut at)
-                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
-                .unwrap_or_default();
+                .map_or_default(|bytes| String::from_utf8_lossy(bytes).into_owned());
             if let Some(state) = lock(&inner.channels).remove(&local) {
                 if reason == CHANNEL_REJECT_SPLIT_TUNNEL {
                     state.split_tunnel();
@@ -7132,9 +7127,11 @@ mod tests {
         let name = random_hostname(r"[a-z0-9]{5,10}\.example\.org").expect("host name");
         let label = name.strip_suffix(".example.org").expect("suffix");
         assert!((5..=10).contains(&label.len()), "{name}");
-        assert!(label
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()));
+        assert!(
+            label
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        );
         assert!(random_hostname(r"(a|b)+").is_none());
     }
 
@@ -7215,11 +7212,13 @@ mod tests {
         assert_eq!(proxy.port, 8080);
         assert_eq!(proxy.user, "user");
         assert_eq!(proxy.pass, "p@ss");
-        assert!(Proxy::parse(
-            "socks4://127.0.0.1:1",
-            &crate::psiphon_dns::Config::from_servers(&[])
-        )
-        .is_err());
+        assert!(
+            Proxy::parse(
+                "socks4://127.0.0.1:1",
+                &crate::psiphon_dns::Config::from_servers(&[])
+            )
+            .is_err()
+        );
     }
 
     #[test]

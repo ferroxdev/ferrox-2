@@ -195,9 +195,7 @@ pub(crate) fn parse_inbound(node: Option<&Json>) -> Result<Option<SocketOptions>
 /// The transparent mode an inbound's `streamSettings.sockopt` names.
 pub(crate) fn inbound_tproxy(settings: Option<&Json>) -> Result<Tproxy, String> {
     let node = settings.and_then(|settings| settings.get("sockopt"));
-    Ok(parse_with(node, "the inbound")?
-        .map(|options| options.tproxy)
-        .unwrap_or_default())
+    Ok(parse_with(node, "the inbound")?.map_or_default(|options| options.tproxy))
 }
 
 fn parse_with(node: Option<&Json>, dialer: &str) -> Result<Option<SocketOptions>, String> {
@@ -532,10 +530,9 @@ impl SocketOptions {
         let set = match self.domain {
             // AsIs leaves the order to the resolver, as xray's system dialer does.
             DomainStrategy::AsIs => {
-                return all
-                    .first()
-                    .copied()
-                    .ok_or_else(|| format!("ech: {host} resolved to nothing this strategy allows"))
+                return all.first().copied().ok_or_else(|| {
+                    format!("ech: {host} resolved to nothing this strategy allows")
+                });
             }
             DomainStrategy::UseIp => all,
             DomainStrategy::UseIp4 | DomainStrategy::ForceIp4 => v4,
@@ -658,10 +655,9 @@ impl SocketOptions {
                 if custom.applies(network)
                     && custom.level == libc::SOL_SOCKET
                     && custom.opt == libc::SO_MARK
+                    && let CustomValue::Int(value) = &custom.value
                 {
-                    if let CustomValue::Int(value) = &custom.value {
-                        mark = Some(*value);
-                    }
+                    mark = Some(*value);
                 }
             }
             mark
@@ -1027,10 +1023,8 @@ mod platform {
                     let value = if listen { tfo } else { tfo * 2 };
                     set_int(socket, libc::IPPROTO_TCP, libc::TCP_FASTOPEN, value)?;
                 }
-                if !listen {
-                    if let Some(max_seg) = options.max_seg {
-                        set_int(socket, libc::IPPROTO_TCP, libc::TCP_MAXSEG, max_seg)?;
-                    }
+                if !listen && let Some(max_seg) = options.max_seg {
+                    set_int(socket, libc::IPPROTO_TCP, libc::TCP_MAXSEG, max_seg)?;
                 }
                 let _ = (
                     &options.congestion,
@@ -1110,7 +1104,7 @@ mod platform {
     use std::net::SocketAddr;
     use std::os::windows::io::AsRawSocket as _;
     use windows_sys::Win32::Networking::WinSock::{
-        setsockopt, IPPROTO_IP, IPPROTO_IPV6, IPV6_UNICAST_IF, IP_UNICAST_IF, SOCKET,
+        IP_UNICAST_IF, IPPROTO_IP, IPPROTO_IPV6, IPV6_UNICAST_IF, SOCKET, setsockopt,
     };
 
     pub(super) const GOOS: &str = "windows";
@@ -1291,8 +1285,10 @@ mod tests {
             parsed(r#"{"addressPortStrategy":"TxtPortAndAddress"}"#).address_port,
             AddressPortStrategy::TxtPortAndAddress
         );
-        assert!(refused(r#"{"addressPortStrategy":"preferIp"}"#)
-            .contains("unsupported address and port strategy"));
+        assert!(
+            refused(r#"{"addressPortStrategy":"preferIp"}"#)
+                .contains("unsupported address and port strategy")
+        );
     }
 
     #[test]

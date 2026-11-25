@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use crate::markdown::{is_placeholder_name, Addon, Library, Prompt};
+use crate::markdown::{Addon, Library, Prompt, is_placeholder_name};
 use crate::worktree::{Place, Worktree};
 
 /// What to include beyond the prompt itself.
@@ -906,9 +906,11 @@ with {target=core}
         let gap = rendered.text.find("## Inputs required").unwrap();
         let protocol = rendered.text.find("prove it or do not say it").unwrap();
         assert!(gap < protocol, "the gap is the first thing read");
-        assert!(rendered
-            .text
-            .contains("ferrox-prompt render P1 --set scope=<value>"));
+        assert!(
+            rendered
+                .text
+                .contains("ferrox-prompt render P1 --set scope=<value>")
+        );
         assert!(!rendered.text.contains("--set len="), "{}", rendered.text);
     }
 
@@ -1426,9 +1428,11 @@ body
         );
         assert!(rendered.text.contains("# P2 · Two"), "{}", rendered.text);
         assert!(rendered.text.contains("depends on P1"));
-        assert!(rendered
-            .text
-            .contains("status todo · leverage 4 · effort large"));
+        assert!(
+            rendered
+                .text
+                .contains("status todo · leverage 4 · effort large")
+        );
     }
 
     #[test]

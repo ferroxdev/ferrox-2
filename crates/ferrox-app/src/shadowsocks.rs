@@ -5,12 +5,12 @@ use std::time::{Duration, Instant};
 
 use ferrox_core::failure::Kind;
 use ferrox_core::shadowsocks::{
-    rc4_md5_key, Cipher, MasterKey, Method, Rc4, LENGTH_LEN, MAX_CHUNK, TAG_LEN,
+    Cipher, LENGTH_LEN, MAX_CHUNK, MasterKey, Method, Rc4, TAG_LEN, rc4_md5_key,
 };
 
 use crate::budgets::RELAY_POLL;
 use crate::conn::Connection;
-use crate::proxy::{read_exact, under_handshake, write_all_runs, Destination, RelayPoll, UDP_BUF};
+use crate::proxy::{Destination, RelayPoll, UDP_BUF, read_exact, under_handshake, write_all_runs};
 
 const SALT_LEN: usize = 32;
 const STOP_POLL: Duration = Duration::from_millis(100);
@@ -1341,10 +1341,10 @@ fn aead_step<R: Read>(
         return (crate::proxy::lane_pool::Next::Done, Downlink::Running);
     }
     // Only bytes that reached the target are progress: an authenticated empty frame keeps a lane, not its grace.
-    if batch[..opened.chunks].iter().any(|&(_, len)| len > 0) {
-        if let Some(flow) = flow {
-            flow.mark_progress();
-        }
+    if batch[..opened.chunks].iter().any(|&(_, len)| len > 0)
+        && let Some(flow) = flow
+    {
+        flow.mark_progress();
     }
     if opened.forged {
         return (crate::proxy::lane_pool::Next::Done, Downlink::Running);
@@ -1363,10 +1363,8 @@ fn aead_step<R: Read>(
                 return (crate::proxy::lane_pool::Next::Done, Downlink::Running);
             }
             let moved = batch[..rest.chunks].iter().any(|&(_, len)| len > 0);
-            if moved {
-                if let Some(flow) = flow {
-                    flow.mark_progress();
-                }
+            if moved && let Some(flow) = flow {
+                flow.mark_progress();
             }
             if rest.forged {
                 return (crate::proxy::lane_pool::Next::Done, Downlink::Running);
@@ -1504,7 +1502,7 @@ mod poll_set {
     use std::net::UdpSocket;
     use std::os::windows::io::AsRawSocket;
     use windows_sys::Win32::Networking::WinSock::{
-        WSAGetLastError, WSAPoll, POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLRDNORM, SOCKET, WSAPOLLFD,
+        POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLRDNORM, SOCKET, WSAGetLastError, WSAPOLLFD, WSAPoll,
     };
 
     pub(crate) type Row = WSAPOLLFD;
@@ -1671,11 +1669,7 @@ fn serve_udp_aead(
             });
         let timeout = if stop.is_some() {
             let poll = i32::try_from(STOP_POLL.as_millis()).unwrap_or(i32::MAX);
-            if timeout < 0 {
-                poll
-            } else {
-                timeout.min(poll)
-            }
+            if timeout < 0 { poll } else { timeout.min(poll) }
         } else {
             timeout
         };
@@ -2043,7 +2037,7 @@ impl<R: Read> ChunkReader<R> {
                     return Opened {
                         chunks,
                         forged: true,
-                    }
+                    };
                 }
             }
         }

@@ -334,12 +334,11 @@ impl Client {
             if line == "\r\n" || line == "\n" {
                 break;
             }
-            if let Some((name, value)) = line.split_once(':') {
-                if name.trim().eq_ignore_ascii_case("transfer-encoding")
-                    && value.to_ascii_lowercase().contains("chunked")
-                {
-                    chunked = true;
-                }
+            if let Some((name, value)) = line.split_once(':')
+                && name.trim().eq_ignore_ascii_case("transfer-encoding")
+                && value.to_ascii_lowercase().contains("chunked")
+            {
+                chunked = true;
             }
         }
         let source: Box<dyn Read + Send> = if chunked {
@@ -779,10 +778,10 @@ fn split_server(server: &str) -> (String, u16) {
     if let Ok(addr) = server.parse::<SocketAddr>() {
         return (addr.ip().to_string(), addr.port());
     }
-    if let Some((host, port)) = server.rsplit_once(':') {
-        if let Ok(port) = port.parse::<u16>() {
-            return (host.trim_matches(['[', ']']).to_owned(), port);
-        }
+    if let Some((host, port)) = server.rsplit_once(':')
+        && let Ok(port) = port.parse::<u16>()
+    {
+        return (host.trim_matches(['[', ']']).to_owned(), port);
     }
     (server.to_owned(), 3478)
 }
@@ -871,10 +870,10 @@ impl RealmState {
     pub(crate) fn interrupt_events(&self) {
         self.events_stopped
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Ok(mut slot) = self.events.lock() {
-            if let Some(stream) = slot.take() {
-                let _ = stream.shutdown(std::net::Shutdown::Both);
-            }
+        if let Ok(mut slot) = self.events.lock()
+            && let Some(stream) = slot.take()
+        {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
         }
     }
 }
@@ -1006,13 +1005,12 @@ pub(crate) fn demux(
         else {
             return false;
         };
-        if let Some(mapped) = ferrox_core::stun::decode_binding_response(packet, &transaction) {
-            if let Ok(mut map) = state.stun.lock() {
-                if let Some(tx) = map.remove(&transaction) {
-                    let _ = tx.send(mapped);
-                    return true;
-                }
-            }
+        if let Some(mapped) = ferrox_core::stun::decode_binding_response(packet, &transaction)
+            && let Ok(mut map) = state.stun.lock()
+            && let Some(tx) = map.remove(&transaction)
+        {
+            let _ = tx.send(mapped);
+            return true;
         }
         // Even if no transaction is waiting, a STUN message the peer spoke is not a QUIC packet.
         return false;
@@ -1114,7 +1112,9 @@ pub(crate) fn serve_registration(
                     locals.dedup();
                 }
             } else {
-                eprintln!("hysteria realm port mapping: gateway unreachable; serving without a gateway address");
+                eprintln!(
+                    "hysteria realm port mapping: gateway unreachable; serving without a gateway address"
+                );
             }
         }
         let shared_locals = std::sync::Arc::new(std::sync::Mutex::new(locals.clone()));
@@ -1285,16 +1285,14 @@ fn heartbeat_loop(
         let mut next = stun_discover_via_state(&state, &sock, &servers, family)
             .or_else(|| locals.lock().ok().map(|locals| locals.to_vec()))
             .unwrap_or_default();
-        if let Some(mapping) = mapping.filter(|mapping| mapping.enabled) {
-            if let Some(external) =
+        if let Some(mapping) = mapping.filter(|mapping| mapping.enabled)
+            && let Some(external) =
                 port_mapping_external(sock.local_addr().ok(), mapping.timeout, mapping.lifetime)
-            {
-                if !next.contains(&external) {
-                    next.push(external);
-                    next.sort_unstable();
-                    next.dedup();
-                }
-            }
+            && !next.contains(&external)
+        {
+            next.push(external);
+            next.sort_unstable();
+            next.dedup();
         }
         let moved = locals.lock().is_ok_and(|guard| *guard != next);
         let sent = if moved {
@@ -1302,10 +1300,11 @@ fn heartbeat_loop(
         } else {
             client.heartbeat(id, session, None, &requests)
         };
-        if sent.is_some() && moved {
-            if let Ok(mut guard) = locals.lock() {
-                guard.clone_from(&next);
-            }
+        if sent.is_some()
+            && moved
+            && let Ok(mut guard) = locals.lock()
+        {
+            guard.clone_from(&next);
         }
     }
 }
@@ -1420,17 +1419,17 @@ fn ssdp_discover(deadline: Instant) -> Option<String> {
         let mut reply = [0u8; 2048];
         if let Ok((len, from)) = sock.recv_from(&mut reply) {
             let reply = &reply[..len];
-            if ssdp_response(reply) {
-                if let Some(location) = ferrox_core::portmap::ssdp_location(reply) {
-                    let Some((host, _, _)) = ferrox_core::portmap::split_url(&location) else {
-                        continue;
-                    };
-                    if host
-                        .parse::<std::net::IpAddr>()
-                        .is_ok_and(|host| host == from.ip())
-                    {
-                        return Some(location);
-                    }
+            if ssdp_response(reply)
+                && let Some(location) = ferrox_core::portmap::ssdp_location(reply)
+            {
+                let Some((host, _, _)) = ferrox_core::portmap::split_url(&location) else {
+                    continue;
+                };
+                if host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|host| host == from.ip())
+                {
+                    return Some(location);
                 }
             }
         }
@@ -1631,10 +1630,10 @@ mod tests {
                         {
                             break;
                         }
-                        if let Some((name, value)) = header.split_once(':') {
-                            if name.trim().eq_ignore_ascii_case("content-length") {
-                                content_length = value.trim().parse().unwrap_or(0);
-                            }
+                        if let Some((name, value)) = header.split_once(':')
+                            && name.trim().eq_ignore_ascii_case("content-length")
+                        {
+                            content_length = value.trim().parse().unwrap_or(0);
                         }
                         request.push_str(&header);
                     }

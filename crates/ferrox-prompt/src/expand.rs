@@ -523,15 +523,17 @@ update the pins, nothing per-method here
         .expect("still open rows");
         assert_eq!(row.key(), "C45");
         // And once both open rows are served there is nothing left for this class.
-        assert!(next_target(
-            prompt,
-            &made,
-            &["A13".to_owned(), "C45".to_owned()],
-            &[],
-            &BTreeMap::new(),
-            false
-        )
-        .is_none());
+        assert!(
+            next_target(
+                prompt,
+                &made,
+                &["A13".to_owned(), "C45".to_owned()],
+                &[],
+                &BTreeMap::new(),
+                false
+            )
+            .is_none()
+        );
     }
 
     #[test]

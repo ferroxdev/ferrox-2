@@ -1,5 +1,5 @@
 use super::padding::{
-    random_index, DelayRange, Direction, Turn, Variant, MAX_PADDING_CHUNK_LENGTH,
+    DelayRange, Direction, MAX_PADDING_CHUNK_LENGTH, Turn, Variant, random_index,
 };
 use std::io;
 

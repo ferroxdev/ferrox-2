@@ -16,7 +16,7 @@ use ferrox_core::tls::{CertEntry, ServerKeyKind, TlsConfig, TlsProvider as _, Tl
 use crate::conn::Connection;
 use crate::h2::{self, Decoder};
 use crate::masque::{
-    self, deliver, withdrawn, Granted, ListenerDone, ServerSpec, Shared, AUTH_REALM,
+    self, AUTH_REALM, Granted, ListenerDone, ServerSpec, Shared, deliver, withdrawn,
 };
 use crate::wg_stack::{Packet, UdpRoutes};
 
@@ -1544,10 +1544,10 @@ impl Session {
                     return;
                 }
                 if Some(id) != self.request {
-                    if let Ok(length) = u32::try_from(body.len()) {
-                        if length != 0 {
-                            wire.send(h2::T_WINDOW, 0, 0, &length.to_be_bytes());
-                        }
+                    if let Ok(length) = u32::try_from(body.len())
+                        && length != 0
+                    {
+                        wire.send(h2::T_WINDOW, 0, 0, &length.to_be_bytes());
                     }
                     return;
                 }
@@ -1611,10 +1611,10 @@ impl Session {
 
     /// A stream's request half is already closed: account the bytes at connection scope, then reset the stream without forwarding them.
     fn reject_data(&mut self, wire: &mut Wire, id: u32, length: usize) {
-        if let Ok(length) = u32::try_from(length) {
-            if length != 0 {
-                wire.send(h2::T_WINDOW, 0, 0, &length.to_be_bytes());
-            }
+        if let Ok(length) = u32::try_from(length)
+            && length != 0
+        {
+            wire.send(h2::T_WINDOW, 0, 0, &length.to_be_bytes());
         }
         wire.send(h2::T_RST, 0, id, &5u32.to_be_bytes());
         self.end = true;
@@ -2013,14 +2013,13 @@ impl Session {
             && (origin_closed || udp_drained)
             && self.queued.is_empty()
             && !wire.closed
+            && let Some(id) = self.request
         {
-            if let Some(id) = self.request {
-                self.granted = None;
-                self.outgoing = None;
-                self.udp = None;
-                wire.send(h2::T_DATA, h2::F_END, id, &[]);
-                self.end = true;
-            }
+            self.granted = None;
+            self.outgoing = None;
+            self.udp = None;
+            wire.send(h2::T_DATA, h2::F_END, id, &[]);
+            self.end = true;
         }
         if self.request.is_some() && !wire.closed && self.queued.is_empty() {
             wire.deadline.clear();
@@ -2128,9 +2127,11 @@ mod tests {
                 ("pq-enabled", "false"),
             ]
         );
-        assert!(!fields
-            .iter()
-            .any(|(name, _)| *name == ":protocol" || *name == "capsule-protocol"));
+        assert!(
+            !fields
+                .iter()
+                .any(|(name, _)| *name == ":protocol" || *name == "capsule-protocol")
+        );
     }
 
     #[test]
@@ -2934,10 +2935,11 @@ mod tests {
         let client = TcpStream::connect(address).expect("a client");
         let (server, _) = listener.accept().expect("a server");
         let wire = cleartext_wire(server.into());
-        assert!(wire
-            .deadline
-            .remaining()
-            .is_some_and(|left| left > Duration::ZERO));
+        assert!(
+            wire.deadline
+                .remaining()
+                .is_some_and(|left| left > Duration::ZERO)
+        );
         drop(client);
     }
 
@@ -3869,10 +3871,10 @@ mod tests {
             let mut at = 0;
             while let Some((used, capsule)) = connectip::capsule_split(&body[at..]) {
                 at += used;
-                if let connectip::Capsule::Datagram(packet) = capsule {
-                    if let Some(datagram) = connectip::udp_from_packet(packet) {
-                        answered = Some(datagram.payload.to_vec());
-                    }
+                if let connectip::Capsule::Datagram(packet) = capsule
+                    && let Some(datagram) = connectip::udp_from_packet(packet)
+                {
+                    answered = Some(datagram.payload.to_vec());
                 }
             }
         }
@@ -3925,10 +3927,10 @@ mod tests {
             let mut at = 0;
             while let Some((used, capsule)) = connectip::capsule_split_bare(&body[at..]) {
                 at += used;
-                if let connectip::Capsule::Datagram(packet) = capsule {
-                    if let Some(datagram) = connectip::udp_from_packet(packet) {
-                        answered = Some(datagram.payload.to_vec());
-                    }
+                if let connectip::Capsule::Datagram(packet) = capsule
+                    && let Some(datagram) = connectip::udp_from_packet(packet)
+                {
+                    answered = Some(datagram.payload.to_vec());
                 }
             }
         }

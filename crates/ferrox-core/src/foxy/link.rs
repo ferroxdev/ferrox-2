@@ -131,12 +131,13 @@ fn percent_decode(text: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut at = 0;
     while at < bytes.len() {
-        if bytes[at] == b'%' && at + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (hex(bytes[at + 1]), hex(bytes[at + 2])) {
-                out.push(hi << 4 | lo);
-                at += 3;
-                continue;
-            }
+        if bytes[at] == b'%'
+            && at + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex(bytes[at + 1]), hex(bytes[at + 2]))
+        {
+            out.push(hi << 4 | lo);
+            at += 3;
+            continue;
         }
         if bytes[at] == b'+' {
             out.push(b' ');

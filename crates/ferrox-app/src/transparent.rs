@@ -101,7 +101,7 @@ fn storage_address(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::{storage_address, SocketAddr};
+    use super::{SocketAddr, storage_address};
     use std::io;
     use std::mem::{size_of, zeroed};
     use std::net::UdpSocket;
@@ -294,7 +294,7 @@ mod linux {
 
 #[cfg(target_os = "macos")]
 mod darwin {
-    use super::{storage_address, SocketAddr};
+    use super::{SocketAddr, storage_address};
     use std::io;
     use std::mem::zeroed;
     use std::os::fd::AsRawFd;

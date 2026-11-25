@@ -3,8 +3,8 @@ use crate::stats;
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -443,9 +443,11 @@ mod tests {
     #[test]
     fn a_metrics_section_that_is_not_an_object_is_refused() {
         let root = crate::json::parse(r#"{"metrics":[]}"#).expect("parses");
-        assert!(parse(&root)
-            .expect_err("metrics is an object")
-            .contains("metrics"));
+        assert!(
+            parse(&root)
+                .expect_err("metrics is an object")
+                .contains("metrics")
+        );
     }
 
     #[test]

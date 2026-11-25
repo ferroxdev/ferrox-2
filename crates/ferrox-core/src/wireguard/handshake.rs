@@ -19,7 +19,7 @@ use super::kdf;
 use crate::aead::{
     chacha20_poly1305_decrypt_in_place, chacha20_poly1305_seal_in_place, chacha20_poly1305_tag,
 };
-use crate::blake2s::{hash, Blake2s};
+use crate::blake2s::{Blake2s, hash};
 use zeroize::Zeroize as _;
 
 /// The construction name, hashed into the initial chain key.

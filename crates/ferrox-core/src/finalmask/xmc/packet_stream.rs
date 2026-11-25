@@ -1,10 +1,10 @@
 #[cfg(test)]
-use super::protocol::write_long;
-#[cfg(test)]
 use super::protocol::Packet;
+#[cfg(test)]
+use super::protocol::write_long;
 use super::protocol::{
-    encode_packet, read_long, read_varint, read_varint_with_length, varint_size, write_string,
-    write_varint, MAX_PACKET_BODY_LENGTH, MAX_PACKET_DATA_LENGTH, MAX_STRING_LENGTH,
+    MAX_PACKET_BODY_LENGTH, MAX_PACKET_DATA_LENGTH, MAX_STRING_LENGTH, encode_packet, read_long,
+    read_varint, read_varint_with_length, varint_size, write_string, write_varint,
 };
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -168,7 +168,7 @@ impl<R: Read> ReadState<R> {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "minecraft packet stream closed",
-                    ))
+                    ));
                 }
                 Ok(read) => {
                     self.buffer.extend_from_slice(&self.chunk[..read]);

@@ -577,24 +577,28 @@ mod tests {
     #[test]
     fn a_socks4_name_the_reader_would_refuse_is_not_written() {
         let too_long = vec![b'a'; NAME4_MAX + 1];
-        assert!(request4_into(
-            CMD4_CONNECT,
-            80,
-            [0, 0, 0, 1],
-            b"user",
-            Some(&too_long),
-            &mut [0u8; 600],
-        )
-        .is_none());
-        assert!(request4_into(
-            CMD4_CONNECT,
-            80,
-            [0, 0, 0, 1],
-            &too_long,
-            None,
-            &mut [0u8; 600],
-        )
-        .is_none());
+        assert!(
+            request4_into(
+                CMD4_CONNECT,
+                80,
+                [0, 0, 0, 1],
+                b"user",
+                Some(&too_long),
+                &mut [0u8; 600],
+            )
+            .is_none()
+        );
+        assert!(
+            request4_into(
+                CMD4_CONNECT,
+                80,
+                [0, 0, 0, 1],
+                &too_long,
+                None,
+                &mut [0u8; 600],
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -713,7 +717,9 @@ mod tests {
         datagram(&Target::V4([198, 51, 100, 7], 53), b"who-is", &mut out);
         assert_eq!(
             out,
-            vec![0, 0, 0, 1, 198, 51, 100, 7, 0, 53, b'w', b'h', b'o', b'-', b'i', b's']
+            vec![
+                0, 0, 0, 1, 198, 51, 100, 7, 0, 53, b'w', b'h', b'o', b'-', b'i', b's'
+            ]
         );
 
         let (source, payload) = parse_datagram(&out).expect("the frame round trips");

@@ -17,18 +17,18 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ferrox_core::dns::{build_query, parse_answer, Answer};
+use ferrox_core::dns::{Answer, build_query, parse_answer};
 use ferrox_core::foxy::connectip::{
-    udp_datagram, udp_from_packet, UdpDatagram, IPV4_HEADER, IPV6_HEADER, UDP_HEADER,
+    IPV4_HEADER, IPV6_HEADER, UDP_HEADER, UdpDatagram, udp_datagram, udp_from_packet,
 };
-use ferrox_core::wireguard::device::{tai64n, Event, Tunnel};
+use ferrox_core::wireguard::device::{Event, Tunnel, tai64n};
 use ferrox_core::wireguard::handshake::{
-    check_mac1, INITIATION_SIZE, TYPE_INITIATION, TYPE_RESPONSE,
+    INITIATION_SIZE, TYPE_INITIATION, TYPE_RESPONSE, check_mac1,
 };
 use ferrox_core::wireguard::transport::{
-    check_mac2, clear_reserved, cookie_encryption_key, create_reply, COOKIE_NONCE_SIZE,
-    HEADER_SIZE as WG_HEADER_SIZE, MIN_SIZE as WG_MIN_SIZE, TAG_SIZE as WG_TAG_SIZE,
-    TYPE_TRANSPORT,
+    COOKIE_NONCE_SIZE, HEADER_SIZE as WG_HEADER_SIZE, MIN_SIZE as WG_MIN_SIZE,
+    TAG_SIZE as WG_TAG_SIZE, TYPE_TRANSPORT, check_mac2, clear_reserved, cookie_encryption_key,
+    create_reply,
 };
 
 use crate::conn::Connection;
@@ -36,7 +36,7 @@ use crate::json::Json;
 use crate::proxy::{Destination, Outbound};
 #[cfg(target_os = "linux")]
 use crate::wg_kernel::KernelWireGuard;
-use crate::wg_stack::{self, ip_bytes, ClientFlow, Packet, UdpRoutes};
+use crate::wg_stack::{self, ClientFlow, Packet, UdpRoutes, ip_bytes};
 use crate::wireguard::{DeviceConfig, PeerConfig};
 
 /// The reader's wait for a datagram: it also bounds how long a queued inner
@@ -601,19 +601,19 @@ impl WireGuardOut {
                 }
                 continue;
             }
-            if let Some(key) = &key {
-                if let Ok(mut slot) = winner.lock() {
-                    match slot.get(key) {
-                        Some((pin, at))
-                            if at.elapsed() < KERNEL_RACE_AGAIN && targets.contains(pin) =>
-                        {
-                            targets = vec![*pin];
-                        }
-                        Some(_) => {
-                            slot.remove(key);
-                        }
-                        None => {}
+            if let Some(key) = &key
+                && let Ok(mut slot) = winner.lock()
+            {
+                match slot.get(key) {
+                    Some((pin, at))
+                        if at.elapsed() < KERNEL_RACE_AGAIN && targets.contains(pin) =>
+                    {
+                        targets = vec![*pin];
                     }
+                    Some(_) => {
+                        slot.remove(key);
+                    }
+                    None => {}
                 }
             }
             for target in targets.into_iter().take(KERNEL_RACES) {
@@ -715,12 +715,11 @@ impl WireGuardOut {
         } else {
             std::borrow::Cow::Borrowed(trimmed)
         };
-        if let Ok(cache) = self.resolved.lock() {
-            if let Some(entry) = cache.get(key.as_ref()) {
-                if entry.until > Instant::now() {
-                    return entry.addrs.clone();
-                }
-            }
+        if let Ok(cache) = self.resolved.lock()
+            && let Some(entry) = cache.get(key.as_ref())
+            && entry.until > Instant::now()
+        {
+            return entry.addrs.clone();
         }
         #[cfg(target_os = "linux")]
         let answer = if self.kernel.is_some() {
@@ -2180,10 +2179,11 @@ fn retire_learned(peers: &[Peer], index: usize, current: IpAddr, owner: usize) {
         .map(|endpoint| canonical_endpoint(*endpoint).ip())
         .collect();
     let roamed: Vec<IpAddr> = PEER_ENDPOINTS.with(|seen| seen.borrow().values().copied().collect());
-    if let Some(previous) = previous {
-        if !configured.contains(&previous) && !roamed.contains(&previous) {
-            release_endpoint_owner(previous, owner);
-        }
+    if let Some(previous) = previous
+        && !configured.contains(&previous)
+        && !roamed.contains(&previous)
+    {
+        release_endpoint_owner(previous, owner);
     }
     let stale: Vec<IpAddr> = LEARNED.with(|seen| {
         seen.borrow()
@@ -2234,20 +2234,16 @@ fn flush(
                 if is_initiation(&packet) {
                     flush_sends(socket, ipv6_socket, endpoint, sends);
                     endpoint = None;
-                    if primary {
-                        if let Some(index) = peer {
-                            peers[index].noise.before_handshake(|noise| {
-                                send_noise(socket, ipv6_socket, to, noise);
-                            });
-                        }
+                    if primary && let Some(index) = peer {
+                        peers[index].noise.before_handshake(|noise| {
+                            send_noise(socket, ipv6_socket, to, noise);
+                        });
                     }
                     send_packet(socket, ipv6_socket, to, primary, &packet, candidates, owner);
-                    if primary {
-                        if let Some(index) = peer {
-                            peers[index].noise.after_handshake(|noise| {
-                                send_noise(socket, ipv6_socket, to, noise);
-                            });
-                        }
+                    if primary && let Some(index) = peer {
+                        peers[index].noise.after_handshake(|noise| {
+                            send_noise(socket, ipv6_socket, to, noise);
+                        });
                     }
                 } else if ipv6_socket || to.is_ipv4() {
                     if endpoint != Some(to) {
@@ -2314,26 +2310,24 @@ fn deliver_data(
         recycle_slot(inner, at, recycle);
         return;
     }
-    if let Some(routes) = routes {
-        if !wg_stack::ipv4_fragment(&inner[at..]) {
-            if let Some(port) = ferrox_core::foxy::connectip::udp_from_packet(&inner[at..])
-                .map(|datagram| datagram.destination_port)
-            {
-                if let Ok(table) = routes.lock() {
-                    if let Some(lane) = table.get(&port) {
-                        let packet = wg_stack::LanePacket {
-                            bytes: inner,
-                            at,
-                            recycle: recycle.filter(|_| at != 0).cloned(),
-                        };
-                        let _ = lane.send(packet);
-                        return;
-                    }
-                }
-                recycle_slot(inner, at, recycle);
-                return;
-            }
+    if let Some(routes) = routes
+        && !wg_stack::ipv4_fragment(&inner[at..])
+        && let Some(port) = ferrox_core::foxy::connectip::udp_from_packet(&inner[at..])
+            .map(|datagram| datagram.destination_port)
+    {
+        if let Ok(table) = routes.lock()
+            && let Some(lane) = table.get(&port)
+        {
+            let packet = wg_stack::LanePacket {
+                bytes: inner,
+                at,
+                recycle: recycle.filter(|_| at != 0).cloned(),
+            };
+            let _ = lane.send(packet);
+            return;
         }
+        recycle_slot(inner, at, recycle);
+        return;
     }
     let _ = to_stack.send(Packet {
         peer: peers[index].config.public,
@@ -2808,7 +2802,7 @@ fn bind_dual_stack() -> Result<UdpSocket, String> {
 fn wait_readable(socket: &UdpSocket, timeout: Duration) -> std::io::Result<bool> {
     use std::os::windows::io::AsRawSocket as _;
     use windows_sys::Win32::Networking::WinSock::{
-        WSAPoll, POLLERR, POLLIN, POLLNVAL, POLLRDNORM, SOCKET, SOCKET_ERROR, WSAPOLLFD,
+        POLLERR, POLLIN, POLLNVAL, POLLRDNORM, SOCKET, SOCKET_ERROR, WSAPOLLFD, WSAPoll,
     };
     let mut row = WSAPOLLFD {
         fd: socket.as_raw_socket() as SOCKET,

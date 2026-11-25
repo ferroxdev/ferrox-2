@@ -1,4 +1,4 @@
-use super::{as_i32_bits, Lanes};
+use super::{Lanes, as_i32_bits};
 #[allow(
     clippy::wildcard_imports,
     reason = "arch intrinsics: the module's whole API is register operations"

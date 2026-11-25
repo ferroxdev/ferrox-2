@@ -2,11 +2,11 @@ use super::cfb8::Cfb8;
 use super::packet_stream::PacketStream;
 use super::padding::run_stream;
 use super::padding_preset::{new_client_schedule, new_server_schedule};
-use super::profile::{find_profile, profiles_from_config, read_login_success, Profile};
+use super::profile::{Profile, find_profile, profiles_from_config, read_login_success};
 use super::protocol::{
-    read_bytes, read_packet, read_packet_with_length, read_string, read_unsigned_short, read_uuid,
-    read_varint, write_boolean, write_bytes, write_packet, write_packet_with_length, write_string,
-    write_unsigned_short, write_uuid, write_varint, MAX_STRING_LENGTH,
+    MAX_STRING_LENGTH, read_bytes, read_packet, read_packet_with_length, read_string,
+    read_unsigned_short, read_uuid, read_varint, write_boolean, write_bytes, write_packet,
+    write_packet_with_length, write_string, write_unsigned_short, write_uuid, write_varint,
 };
 use boring::pkey::PKey;
 use boring::rsa::{Padding, Rsa};
@@ -17,8 +17,7 @@ const PROTOCOL_VERSION: i32 = 775;
 const DEFAULT_PORT: u16 = 25565;
 const LOGIN_STATE: i32 = 2;
 const STATUS_STATE: i32 = 1;
-const STATUS_RESPONSE: &str =
-    "{\"description\":\"A Minecraft Server\",\"players\":{\"max\":20,\"online\":0},\"version\":{\"name\":\"26.1.2\",\"protocol\":775},\"enforcesSecureChat\":true}";
+const STATUS_RESPONSE: &str = "{\"description\":\"A Minecraft Server\",\"players\":{\"max\":20,\"online\":0},\"version\":{\"name\":\"26.1.2\",\"protocol\":775},\"enforcesSecureChat\":true}";
 const AUTH_FAILURE: &str =
     "{\"type\":\"translatable\",\"translate\":\"multiplayer.disconnect.authservers_down\"}";
 const NOT_WHITELISTED: &str = "{\"text\":\"You are not white-listed on this server!\"}";

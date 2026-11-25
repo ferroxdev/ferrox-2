@@ -172,31 +172,31 @@ impl Burst {
 
     /// Record an upstream write when the upstream half is enabled.
     pub(crate) fn upstream(&mut self, start: Instant, end: Instant, bytes: u64) {
-        if let Some(config) = self.config {
-            if config.up_enabled() {
-                self.upstream.update(
-                    start,
-                    end,
-                    bytes,
-                    config.upstream_target,
-                    config.upstream_deadline,
-                );
-            }
+        if let Some(config) = self.config
+            && config.up_enabled()
+        {
+            self.upstream.update(
+                start,
+                end,
+                bytes,
+                config.upstream_target,
+                config.upstream_deadline,
+            );
         }
     }
 
     /// Record a downstream read when the downstream half is enabled.
     pub(crate) fn downstream(&mut self, start: Instant, end: Instant, bytes: u64) {
-        if let Some(config) = self.config {
-            if config.down_enabled() {
-                self.downstream.update(
-                    start,
-                    end,
-                    bytes,
-                    config.downstream_target,
-                    config.downstream_deadline,
-                );
-            }
+        if let Some(config) = self.config
+            && config.down_enabled()
+        {
+            self.downstream.update(
+                start,
+                end,
+                bytes,
+                config.downstream_target,
+                config.downstream_deadline,
+            );
         }
     }
 

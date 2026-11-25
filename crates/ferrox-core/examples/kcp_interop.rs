@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use ferrox_core::kcp::{dial, Config, Listener};
+use ferrox_core::kcp::{Config, Listener, dial};
 
 fn usage() -> ! {
     eprintln!("usage: kcp_interop server <port> | kcp_interop client <peer> <payload>");

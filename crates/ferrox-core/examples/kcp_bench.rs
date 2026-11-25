@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ferrox_core::kcp::{read_segment, Config, ConnError, ConnMetadata, Connection};
+use ferrox_core::kcp::{Config, ConnError, ConnMetadata, Connection, read_segment};
 
 fn payload_megabytes() -> usize {
     let megabytes = std::env::args()

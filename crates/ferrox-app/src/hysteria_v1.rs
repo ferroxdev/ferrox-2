@@ -13,7 +13,7 @@ use ferrox_core::hysteria_v1::{Defrag, UdpMessage, XPlus};
 
 use crate::conn::Connection;
 use crate::hysteria::{Dial, Driver, Flow, Session, StreamWake};
-use crate::quic::{Mask, QuicheConnection, Unfilled, RECV_ROOM};
+use crate::quic::{Mask, QuicheConnection, RECV_ROOM, Unfilled};
 
 const FIRST_FLOW_STREAM: u64 = 4;
 
@@ -1009,10 +1009,10 @@ fn host_of(ip: IpAddr, room: &mut [u8; HOST_ROOM]) -> Option<&str> {
 }
 
 fn target_addr(sock: &UdpSocket, peer: SocketAddr) -> SocketAddr {
-    if sock.local_addr().is_ok_and(|local| local.is_ipv6()) {
-        if let SocketAddr::V4(v4) = peer {
-            return SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port());
-        }
+    if sock.local_addr().is_ok_and(|local| local.is_ipv6())
+        && let SocketAddr::V4(v4) = peer
+    {
+        return SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port());
     }
     peer
 }
@@ -1279,20 +1279,20 @@ fn resolve_pending(
     })
     .and_then(|addrs| addrs.into_iter().next());
     let Some(peer) = peer else {
-        if let Ok(mut lane) = lane.lock() {
-            if lane.pending.get(&session).is_some_and(|p| p.token == token) {
-                lane.pending.remove(&session);
-            }
+        if let Ok(mut lane) = lane.lock()
+            && lane.pending.get(&session).is_some_and(|p| p.token == token)
+        {
+            lane.pending.remove(&session);
         }
         resolving.release();
         resume_lane(&lane);
         return;
     };
     let Some(mut flow) = open_udp(&shared, &sock, session, peer) else {
-        if let Ok(mut lane) = lane.lock() {
-            if lane.pending.get(&session).is_some_and(|p| p.token == token) {
-                lane.pending.remove(&session);
-            }
+        if let Ok(mut lane) = lane.lock()
+            && lane.pending.get(&session).is_some_and(|p| p.token == token)
+        {
+            lane.pending.remove(&session);
         }
         resolving.release();
         resume_lane(&lane);
@@ -1374,19 +1374,19 @@ fn resolve_dest(handle: Arc<Mutex<UdpLane>>, session: u32, host: String, port: u
     let Ok(mut lane) = handle.lock() else {
         return;
     };
-    if let Some(flow) = lane.flows.get_mut(&session) {
-        if let Some(at) = flow.assocs.find(&host, port) {
-            flow.assocs.list[at].resolving = false;
-            if let Some(peer) = peer {
-                flow.assocs.list[at].dest = Some(peer);
-                flow.assocs.drain(at, |payload| {
-                    let _ = flow
-                        .target
-                        .send_to(payload, target_addr(&flow.target, peer));
-                });
-            } else {
-                flow.assocs.evict(at);
-            }
+    if let Some(flow) = lane.flows.get_mut(&session)
+        && let Some(at) = flow.assocs.find(&host, port)
+    {
+        flow.assocs.list[at].resolving = false;
+        if let Some(peer) = peer {
+            flow.assocs.list[at].dest = Some(peer);
+            flow.assocs.drain(at, |payload| {
+                let _ = flow
+                    .target
+                    .send_to(payload, target_addr(&flow.target, peer));
+            });
+        } else {
+            flow.assocs.evict(at);
         }
     }
     resolving.release_in(&mut lane);

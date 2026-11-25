@@ -741,7 +741,7 @@ impl crate::proxy::LaneWrite for H3Writer {
                     self.moved = true;
                 }
                 Err(error) if crate::proxy::is_timeout(&error) => {
-                    return crate::proxy::Push::Parked
+                    return crate::proxy::Push::Parked;
                 }
                 Err(_) => {
                     self.pending.clear();
@@ -795,7 +795,7 @@ impl crate::proxy::LaneWrite for H3Writer {
                     self.moved = true;
                 }
                 Err(error) if crate::proxy::is_timeout(&error) => {
-                    return crate::proxy::Push::Parked
+                    return crate::proxy::Push::Parked;
                 }
                 Err(_) => {
                     self.pending.clear();
@@ -1600,10 +1600,7 @@ impl H3Client {
         if !tls.cert_pins.is_empty() {
             let chain: Vec<Vec<u8>> = match conn.peer_cert_chain() {
                 Some(chain) => chain.iter().map(|cert| cert.to_vec()).collect(),
-                None => conn
-                    .peer_cert()
-                    .map(|cert| vec![cert.to_vec()])
-                    .unwrap_or_default(),
+                None => conn.peer_cert().map_or_default(|cert| vec![cert.to_vec()]),
             };
             if !ferrox_core::tls::verify_cert_pinned(&chain, &tls.cert_pins, server_name) {
                 return None;
@@ -1824,11 +1821,11 @@ impl H3Client {
             return false;
         };
         reader.set_deadline(deadline);
-        if let Some(body) = body {
-            if !out.data(body) {
-                out.reset();
-                return false;
-            }
+        if let Some(body) = body
+            && !out.data(body)
+        {
+            out.reset();
+            return false;
         }
         out.end();
         let mut sink = [0u8; 64];
@@ -2372,21 +2369,21 @@ fn pump_connection(
     let mut batch = quic::Batch::new();
     loop {
         let now = quic::network_generation();
-        if now != generation {
-            if let Ok(mut conn) = conn.lock() {
-                match quic::rebind_path(&mut conn, sock, peer) {
-                    quic::Rebind::Moved(at) => {
-                        local = at;
-                        moved = true;
-                        generation = now;
-                    }
-                    quic::Rebind::Same | quic::Rebind::Retry | quic::Rebind::Unsupported => {
-                        generation = now;
-                    }
-                    quic::Rebind::Failed => {
-                        let _ = conn.close(false, 0, b"rebind");
-                        break;
-                    }
+        if now != generation
+            && let Ok(mut conn) = conn.lock()
+        {
+            match quic::rebind_path(&mut conn, sock, peer) {
+                quic::Rebind::Moved(at) => {
+                    local = at;
+                    moved = true;
+                    generation = now;
+                }
+                quic::Rebind::Same | quic::Rebind::Retry | quic::Rebind::Unsupported => {
+                    generation = now;
+                }
+                quic::Rebind::Failed => {
+                    let _ = conn.close(false, 0, b"rebind");
+                    break;
                 }
             }
         }

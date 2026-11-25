@@ -621,8 +621,8 @@ fn read_close(stream: &mut std::net::TcpStream, closed: &std::sync::atomic::Atom
 #[test]
 #[allow(clippy::too_many_lines)]
 fn http_config_is_fetched_and_a_missing_one_is_refused() {
-    use flate2::write::GzEncoder;
     use flate2::Compression;
+    use flate2::write::GzEncoder;
     use std::io::Write as _;
 
     let body = configuration("json");

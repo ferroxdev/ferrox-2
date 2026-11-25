@@ -1,6 +1,6 @@
 //! Sixteen blocks over `__m512i`: `vprold` makes each of the four rotations one instruction, and the transpose one gather per register per stage — sixty-four for sixteen blocks.
 
-use super::wide::{wide_blocks, Wide16, IDX};
+use super::wide::{IDX, Wide16, wide_blocks};
 #[allow(
     clippy::wildcard_imports,
     reason = "arch intrinsics: the module's whole API is register operations"
@@ -146,8 +146,8 @@ pub(crate) unsafe fn xor_blocks_from(
 
 #[cfg(test)]
 mod tests {
-    use super::{xor_blocks, Z16};
-    use crate::chacha::wide::{wide_blocks, PASS_BYTES};
+    use super::{Z16, xor_blocks};
+    use crate::chacha::wide::{PASS_BYTES, wide_blocks};
     use crate::chacha::{avx2, xor_ladder};
 
     /// The pass against the ladder at every boundary length and counter end, key and block count beside the ciphertext; `avx512f` gates this and `fill_exact`'s dispatch alike, and Miri interprets no SIMD intrinsics, so native CI runs it on every ISA.

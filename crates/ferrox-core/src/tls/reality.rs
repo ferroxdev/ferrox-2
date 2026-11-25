@@ -510,13 +510,13 @@ impl<S> Replay<S> {
 
 impl<S: Read> Read for Replay<S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if let Some(rest) = self.prefix.get(self.at..) {
-            if !rest.is_empty() {
-                let n = rest.len().min(buf.len());
-                buf[..n].copy_from_slice(&rest[..n]);
-                self.at += n;
-                return Ok(n);
-            }
+        if let Some(rest) = self.prefix.get(self.at..)
+            && !rest.is_empty()
+        {
+            let n = rest.len().min(buf.len());
+            buf[..n].copy_from_slice(&rest[..n]);
+            self.at += n;
+            return Ok(n);
         }
         self.io.read(buf)
     }
@@ -1551,14 +1551,13 @@ fn spki_key(tbs: &[u8]) -> Option<[u8; 32]> {
             .position(|w| w == OID_ED25519)?;
         at += OID_ED25519.len();
         let candidate = rest.get(at..)?;
-        if candidate.first() == Some(&0x03) {
-            if let Some((header, len)) = der_len(candidate) {
-                if let Some(body) = candidate.get(header..header + len) {
-                    if body.first() == Some(&0x00) && body.len() == 33 {
-                        return body[1..].try_into().ok();
-                    }
-                }
-            }
+        if candidate.first() == Some(&0x03)
+            && let Some((header, len)) = der_len(candidate)
+            && let Some(body) = candidate.get(header..header + len)
+            && body.first() == Some(&0x00)
+            && body.len() == 33
+        {
+            return body[1..].try_into().ok();
         }
         rest = rest.get(at + 1..)?;
     }
@@ -2893,7 +2892,9 @@ mod tests {
         assert_eq!(got, 28, "the header is a fixed twenty-eight bytes");
         assert_eq!(
             &head[..12],
-            &[0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a]
+            &[
+                0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a
+            ]
         );
         assert_eq!(head[12], 0x21, "the version-and-command byte is 1.3");
         assert_eq!(head[13], 0x11, "the family is TCP over IPv4");
@@ -3904,8 +3905,8 @@ mod tests {
     )]
     #[test]
     fn a_client_record_split_by_a_poll_timeout_is_resumed_not_lost() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         struct StallOnce {
             io: TcpStream,

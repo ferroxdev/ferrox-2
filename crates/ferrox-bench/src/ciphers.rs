@@ -1,9 +1,9 @@
 use std::fmt::Write as _;
 
-use ferrox_core::shadowsocks::{Cipher, MasterKey, Method, MAX_CHUNK};
+use ferrox_core::shadowsocks::{Cipher, MAX_CHUNK, MasterKey, Method};
 
 use crate::count;
-use crate::framing::{best_of, Row};
+use crate::framing::{Row, best_of};
 
 const ITERS: u64 = 100_000;
 

@@ -104,11 +104,7 @@ impl DeviceConfig {
             .get("mtu")
             .and_then(Json::as_u32)
             .map_or(DEFAULT_MTU, |mtu| {
-                if mtu == 0 {
-                    DEFAULT_MTU
-                } else {
-                    mtu as usize
-                }
+                if mtu == 0 { DEFAULT_MTU } else { mtu as usize }
             });
         let reserved = reserved_from_json(settings.get("reserved"))?;
         let dns = strings(settings.get("remoteDNS").or_else(|| settings.get("DNS")))
@@ -222,10 +218,10 @@ pub(crate) fn parse_key(text: &str) -> Result<[u8; 32], String> {
     if text.is_empty() {
         return Err("wireguard key: empty".to_owned());
     }
-    if text.len() == 64 {
-        if let Some(key) = hex_key(text) {
-            return Ok(key);
-        }
+    if text.len() == 64
+        && let Some(key) = hex_key(text)
+    {
+        return Ok(key);
     }
     let mut decoded = None;
     for engine in [

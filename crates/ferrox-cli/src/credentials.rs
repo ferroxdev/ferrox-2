@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::args::Options;
 use crate::config::FoxyAccount;
-use crate::paths::{read_trim, write_private, Paths};
+use crate::paths::{Paths, read_trim, write_private};
 
 fn unquote(raw: &str) -> Option<String> {
     let mut out = String::new();

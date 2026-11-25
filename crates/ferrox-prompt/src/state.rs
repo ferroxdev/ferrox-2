@@ -443,14 +443,14 @@ pub fn pins_from_text(text: &str) -> Vec<Pin> {
             if let Some(value) = value.trim_start().strip_prefix('=') {
                 pin.always = value.trim() == "true";
             }
-        } else if let Some(value) = trimmed.strip_prefix("topics") {
-            if let Some(value) = value.trim_start().strip_prefix('=') {
-                pin.topics = unquote(value.trim())
-                    .split(',')
-                    .map(|topic| topic.trim().to_ascii_lowercase())
-                    .filter(|topic| !topic.is_empty())
-                    .collect();
-            }
+        } else if let Some(value) = trimmed.strip_prefix("topics")
+            && let Some(value) = value.trim_start().strip_prefix('=')
+        {
+            pin.topics = unquote(value.trim())
+                .split(',')
+                .map(|topic| topic.trim().to_ascii_lowercase())
+                .filter(|topic| !topic.is_empty())
+                .collect();
         }
     }
     if let Some(pin) = current.take() {
@@ -611,9 +611,11 @@ mod tests {
                 "section {letter} not read"
             );
         }
-        assert!(!rows
-            .iter()
-            .any(|row| row.section == 'G' || row.section == 'H'));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.section == 'G' || row.section == 'H')
+        );
     }
 
     #[test]
@@ -642,7 +644,9 @@ mod tests {
             "sing-box, leaf"
         );
         // A row that matches nothing falls back to the full list rather than a blank.
-        let no_core = pins_from_text("[sources.quiche]\ntopics        = \"quic\"\n\n[sources.leaf]\ntopics        = \"tun2socks\"\n");
+        let no_core = pins_from_text(
+            "[sources.quiche]\ntopics        = \"quic\"\n\n[sources.leaf]\ntopics        = \"tun2socks\"\n",
+        );
         assert_eq!(references_for(&no_core, "no topic here"), "quiche, leaf");
         // The no-row fallback is the core set.
         assert_eq!(references_for(&pins, ""), "sing-box");

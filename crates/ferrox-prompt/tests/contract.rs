@@ -595,18 +595,20 @@ fn the_issue_template_takes_a_number_and_names_the_bugfix_branch() {
         rendered.text.contains("P0 or P1"),
         "the default priority names the class the slice serves"
     );
-    assert!(render::suggested_command(
-        prompt,
-        &["issue".to_owned()],
-        &std::collections::BTreeMap::new(),
-        &[],
-        &[],
-        None,
-        None,
-        false,
-    )
-    .starts_with(&format!(
-        "ferrox-prompt render P{} --issue <number>",
-        prompt.id
-    )));
+    assert!(
+        render::suggested_command(
+            prompt,
+            &["issue".to_owned()],
+            &std::collections::BTreeMap::new(),
+            &[],
+            &[],
+            None,
+            None,
+            false,
+        )
+        .starts_with(&format!(
+            "ferrox-prompt render P{} --issue <number>",
+            prompt.id
+        ))
+    );
 }

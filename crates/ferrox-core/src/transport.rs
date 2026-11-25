@@ -168,11 +168,7 @@ fn atoi(text: &str) -> i64 {
         };
         value = next;
     }
-    if negative {
-        -value
-    } else {
-        value
-    }
+    if negative { -value } else { value }
 }
 
 const URL_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";

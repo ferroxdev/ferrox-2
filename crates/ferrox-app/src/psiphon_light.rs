@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use ferrox_core::tls::{TlsConfig, TlsProvider as _};
 
-use crate::psiphon_broker::{decode, encode, Value};
+use crate::psiphon_broker::{Value, decode, encode};
 
 const PROTOCOL: &str = "TLS";
 const VERSION: u8 = 0x01;
@@ -462,12 +462,11 @@ fn collect_subject_common_name(der: &[u8], out: &mut Option<String>) {
             let Some((0x30, pair, pair_end)) = element(der, attribute) else {
                 return;
             };
-            if let Some((0x06, oid, oid_end)) = element(der, pair) {
-                if der.get(oid..oid_end) == Some(&[0x55, 0x04, 0x03][..]) {
-                    if let Some((0x0c | 0x13 | 0x16, body, end)) = element(der, oid_end) {
-                        *out = Some(String::from_utf8_lossy(&der[body..end]).into_owned());
-                    }
-                }
+            if let Some((0x06, oid, oid_end)) = element(der, pair)
+                && der.get(oid..oid_end) == Some(&[0x55, 0x04, 0x03][..])
+                && let Some((0x0c | 0x13 | 0x16, body, end)) = element(der, oid_end)
+            {
+                *out = Some(String::from_utf8_lossy(&der[body..end]).into_owned());
             }
             attribute = pair_end;
         }
@@ -649,15 +648,17 @@ fn loopback<T: Read + Write + Queued + HalfClose + Send + 'static>(
         .map_err(|error| format!("psiphon light loopback local address: {error}"))?;
     std::thread::Builder::new()
         .name("psiphon-light-relay".to_owned())
-        .spawn(move || loop {
-            let Ok((peer, _)) = listener.accept() else {
+        .spawn(move || {
+            loop {
+                let Ok((peer, _)) = listener.accept() else {
+                    return;
+                };
+                if peer.peer_addr().ok() != Some(local_address) {
+                    continue;
+                }
+                relay(stream, peer);
                 return;
-            };
-            if peer.peer_addr().ok() != Some(local_address) {
-                continue;
             }
-            relay(stream, peer);
-            return;
         })
         .map_err(|error| format!("psiphon light loopback thread: {error}"))?;
     Ok(local)

@@ -3,7 +3,7 @@
 
 use crate::json::{self, Json};
 use crate::psiphon_meek::{self, Meek};
-use crate::psiphon_ssh::{derive_key, random, Identity, Proxy, Rc4, MAGIC, SEED_LENGTH};
+use crate::psiphon_ssh::{Identity, MAGIC, Proxy, Rc4, SEED_LENGTH, derive_key, random};
 use crypto_box::aead::{Aead, OsRng};
 use crypto_box::{PublicKey, SalsaBox, SecretKey};
 use std::time::Duration;
@@ -358,20 +358,17 @@ fn stun_list(parameters: Option<&Json>, client: &str, generic: &str) -> Vec<Stri
 pub(crate) fn brokers_from(specs: Option<&Json>) -> Vec<Broker> {
     specs
         .and_then(Json::as_arr)
-        .map(|specs| specs.iter().filter_map(broker).collect())
-        .unwrap_or_default()
+        .map_or_default(|specs| specs.iter().filter_map(broker).collect())
 }
 
 /// Parse a configured `InproxyCommonCompartmentIDs` value, with the same validation as tactics.
 pub(crate) fn compartments_from(ids: Option<&Json>) -> Vec<String> {
-    ids.and_then(Json::as_arr)
-        .map(|ids| {
-            ids.iter()
-                .filter_map(Json::as_str)
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
+    ids.and_then(Json::as_arr).map_or_default(|ids| {
+        ids.iter()
+            .filter_map(Json::as_str)
+            .map(str::to_owned)
+            .collect()
+    })
 }
 
 fn broker(spec: &Json) -> Option<Broker> {
@@ -388,8 +385,7 @@ fn broker(spec: &Json) -> Option<Broker> {
     let fronts: Vec<Fronting> = spec
         .get("BrokerFrontingSpecs")
         .and_then(Json::as_arr)
-        .map(|specs| specs.iter().filter_map(fronting).collect())
-        .unwrap_or_default();
+        .map_or_default(|specs| specs.iter().filter_map(fronting).collect());
     if fronts.is_empty() {
         return None;
     }
@@ -405,14 +401,13 @@ fn fronting(spec: &Json) -> Option<Fronting> {
     let addresses = spec
         .get("Addresses")
         .and_then(Json::as_arr)
-        .map(|addresses| {
+        .map_or_default(|addresses| {
             addresses
                 .iter()
                 .filter_map(Json::as_str)
                 .map(str::to_owned)
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     let disable_sni = spec
         .get("DisableSNI")
         .and_then(Json::as_bool)

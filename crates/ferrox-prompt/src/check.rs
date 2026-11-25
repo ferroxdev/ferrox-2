@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
-use crate::markdown::{escaped, Addon, Diagnostic, Library, Prompt, Touch};
+use crate::markdown::{Addon, Diagnostic, Library, Prompt, Touch, escaped};
 
 /// A run of this many content words that the shared protocol already carries is a restatement, not a coincidence.
 const RESTATEMENT_RUN: usize = 5;
@@ -25,11 +25,11 @@ fn content_tokens(text: &str) -> Vec<String> {
     let mut index = 0;
     let mut in_blank = false;
     while index < bytes.len() {
-        if bytes[index] == b'{' {
-            if let Some(close) = blank_end(bytes, index + 1) {
-                index = close + 1;
-                continue;
-            }
+        if bytes[index] == b'{'
+            && let Some(close) = blank_end(bytes, index + 1)
+        {
+            index = close + 1;
+            continue;
         }
         match bytes[index] {
             b'`' if !escaped(bytes, index) => {
@@ -172,11 +172,11 @@ fn code_spans(text: &str) -> Vec<String> {
     let mut spans = Vec::new();
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index] == b'{' {
-            if let Some(close) = blank_end(bytes, index + 1) {
-                index = close + 1;
-                continue;
-            }
+        if bytes[index] == b'{'
+            && let Some(close) = blank_end(bytes, index + 1)
+        {
+            index = close + 1;
+            continue;
         }
         if bytes[index] != b'`' || escaped(bytes, index) {
             index += 1;
@@ -203,11 +203,11 @@ fn instructions(text: &str) -> Vec<&str> {
     let mut start = 0;
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index] == b'{' {
-            if let Some(close) = blank_end(bytes, index + 1) {
-                index = close + 1;
-                continue;
-            }
+        if bytes[index] == b'{'
+            && let Some(close) = blank_end(bytes, index + 1)
+        {
+            index = close + 1;
+            continue;
         }
         match bytes[index] {
             b'`' if !escaped(bytes, index) => {
@@ -469,8 +469,7 @@ fn check_gates(prompt: &Prompt, root: &Path, verify_paths: bool, findings: &mut 
             // Case-insensitive: `CI.yml` and `ci.yml` are one workflow to the author, two strings to a byte compare.
             let extension = Path::new(name)
                 .extension()
-                .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
-                .unwrap_or_default();
+                .map_or_default(|extension| extension.to_string_lossy().to_ascii_lowercase());
             let names_a_workflow =
                 matches!(extension.as_str(), "yml" | "yaml") && !name.contains('/');
             if names_a_workflow && !workflow_exists(&workflows, name) {
@@ -1294,9 +1293,11 @@ body
             .filter(|finding| finding.message.contains("missing; prompt ids"))
             .collect();
         assert_eq!(holes.len(), 2, "{findings:#?}");
-        assert!(holes
-            .iter()
-            .any(|finding| finding.message.contains("P3..=P999999999")));
+        assert!(
+            holes
+                .iter()
+                .any(|finding| finding.message.contains("P3..=P999999999"))
+        );
     }
 
     #[test]
@@ -1346,9 +1347,11 @@ body
         let library = load(GOOD);
         let root = crate::manifest_root();
         let findings = run(&library, &root, true);
-        assert!(findings
-            .iter()
-            .all(|finding| !finding.message.contains("does not exist")));
+        assert!(
+            findings
+                .iter()
+                .all(|finding| !finding.message.contains("does not exist"))
+        );
     }
 
     #[test]

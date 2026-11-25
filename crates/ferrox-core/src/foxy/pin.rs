@@ -92,10 +92,10 @@ impl Pins {
         let mut entries = Vec::new();
         for pin in pins {
             let raw = pin.strip_prefix("sha256/").unwrap_or(&pin);
-            if let Some(bytes) = b64::decode(raw.as_bytes()) {
-                if let Ok(entry) = <[u8; 32]>::try_from(bytes.as_slice()) {
-                    entries.push(entry);
-                }
+            if let Some(bytes) = b64::decode(raw.as_bytes())
+                && let Ok(entry) = <[u8; 32]>::try_from(bytes.as_slice())
+            {
+                entries.push(entry);
             }
         }
         Self {

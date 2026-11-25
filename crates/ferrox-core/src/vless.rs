@@ -98,11 +98,7 @@ impl VlessLink {
     #[must_use]
     pub fn flow(&self) -> &str {
         let f = self.param("flow");
-        if f.is_empty() {
-            "none"
-        } else {
-            f
-        }
+        if f.is_empty() { "none" } else { f }
     }
 
     #[must_use]
@@ -133,11 +129,7 @@ impl VlessLink {
     #[must_use]
     pub fn encryption(&self) -> &str {
         let e = self.param("encryption");
-        if e.is_empty() {
-            "none"
-        } else {
-            e
-        }
+        if e.is_empty() { "none" } else { e }
     }
 
     #[must_use]
@@ -199,8 +191,7 @@ impl VlessLink {
                     Security::NoneToPublic if opt_in.plaintext_to_public() => Security::None,
                     Security::NoneToPublic => {
                         return Support::UnsafeRequiresOptIn {
-                            reason:
-                                "security=none to a public address (`PattNG` extension): explicit opt-in required",
+                            reason: "security=none to a public address (`PattNG` extension): explicit opt-in required",
                         };
                     }
                     other => other,
@@ -235,8 +226,7 @@ impl VlessLink {
             Security::NoneToPublic if opt_in.plaintext_to_public() => Security::None,
             Security::NoneToPublic => {
                 return Support::UnsafeRequiresOptIn {
-                    reason:
-                        "security=none to a public address (`PattNG` extension): explicit opt-in required",
+                    reason: "security=none to a public address (`PattNG` extension): explicit opt-in required",
                 };
             }
             other => other,
@@ -254,10 +244,8 @@ impl VlessLink {
         let session = security == Security::None
             && self.param("encryption") == "none"
             && self.flow() == "none";
-        if session {
-            if let Some(method) = carrier_method(self.transport_kind()) {
-                return Support::Implemented { method };
-            }
+        if session && let Some(method) = carrier_method(self.transport_kind()) {
+            return Support::Implemented { method };
         }
         if self.transport_kind() == TransportKind::Tcp && security == Security::Tls {
             if self.is_vision_flow() {
@@ -326,11 +314,7 @@ impl VlessLink {
 
     #[inline]
     fn addons_len(&self) -> usize {
-        if self.is_vision() {
-            19
-        } else {
-            1
-        }
+        if self.is_vision() { 19 } else { 1 }
     }
 
     #[inline]
@@ -1017,12 +1001,13 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
-                out.push(h << 4 | l);
-                i += 3;
-                continue;
-            }
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+        {
+            out.push(h << 4 | l);
+            i += 3;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;
@@ -1315,7 +1300,9 @@ mod tests {
             let l = VlessLink::parse(link).expect("parses");
             assert_ne!(
                 l.support(),
-                Support::Implemented { method: "vless-tcp" },
+                Support::Implemented {
+                    method: "vless-tcp"
+                },
                 "{link}"
             );
         }
@@ -1517,7 +1504,10 @@ mod tests {
         ] {
             let l = VlessLink::parse(link).expect("parses");
             assert!(!l.is_none_private_method(), "{link}");
-            assert!(!matches!(l.support(), Support::Implemented { .. }), "{link}");
+            assert!(
+                !matches!(l.support(), Support::Implemented { .. }),
+                "{link}"
+            );
         }
         let unsafe_private = VlessLink::parse(
             "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@127.0.0.1:80?security=none&encryption=none&type=tcp&fp=unsafe-chrome#unsafe",

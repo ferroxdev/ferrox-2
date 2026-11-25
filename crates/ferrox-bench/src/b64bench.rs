@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 
 use ferrox_core::b64;
 
-use crate::framing::{timed_row_at, Row};
+use crate::framing::{Row, timed_row_at};
 
 /// The row's claim: the shipped coder is no slower than the loop it replaced, so a first reading under parity is re-measured before it can fail.
 pub(crate) const PARITY: f64 = 1.0;

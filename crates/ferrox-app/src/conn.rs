@@ -31,8 +31,8 @@ use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 #[cfg(windows)]
 use winunix::{
-    get_socket_timeout, set_socket_timeout, unix_peek, UnixListener, UnixStream, SO_RCVTIMEO,
-    SO_SNDTIMEO,
+    SO_RCVTIMEO, SO_SNDTIMEO, UnixListener, UnixStream, get_socket_timeout, set_socket_timeout,
+    unix_peek,
 };
 
 /// A live proxy connection: a TCP stream, that stream under a post-TLS write mask, or an
@@ -444,17 +444,17 @@ impl Masked {
     /// makes a writer, so a leg drained by reference masks exactly as one moved by value. An xmc
     /// session carries the same plaintext, so the record shape is applied before it too.
     fn send(&self, buf: &[u8]) -> io::Result<usize> {
-        if let Some(sni) = self.sni.as_deref() {
-            if let Some(sent) = self.try_urgent(sni, buf)? {
-                return Ok(sent);
-            }
+        if let Some(sni) = self.sni.as_deref()
+            && let Some(sent) = self.try_urgent(sni, buf)?
+        {
+            return Ok(sent);
         }
         if let Some(session) = self.xmc_session()? {
             let armed = self.sni.as_deref().map(|sni| sni.arm(buf));
-            if let Some(SniArm::Empty) = &armed {
-                if let Err(error) = (&*session).write_all(&ferrox_core::evasion::EMPTY_RECORD) {
-                    return self.keep_shape(armed.as_ref(), Err(error));
-                }
+            if let Some(SniArm::Empty) = &armed
+                && let Err(error) = (&*session).write_all(&ferrox_core::evasion::EMPTY_RECORD)
+            {
+                return self.keep_shape(armed.as_ref(), Err(error));
             }
             let buf = match &armed {
                 Some(SniArm::Rewrite(record)) => record.as_slice(),
@@ -468,10 +468,10 @@ impl Masked {
             return Err(io::Error::other("the mask chain is gone"));
         };
         let armed = self.sni.as_deref().map(|sni| sni.arm(buf));
-        if let Some(SniArm::Empty) = &armed {
-            if let Err(error) = self.write_empty_record(&mut chain) {
-                return self.keep_shape(armed.as_ref(), Err(error));
-            }
+        if let Some(SniArm::Empty) = &armed
+            && let Err(error) = self.write_empty_record(&mut chain)
+        {
+            return self.keep_shape(armed.as_ref(), Err(error));
         }
         let buf = match &armed {
             Some(SniArm::Rewrite(record)) => record.as_slice(),
@@ -608,10 +608,9 @@ impl Masked {
     fn keep_shape(&self, armed: Option<&SniArm>, outcome: io::Result<usize>) -> io::Result<usize> {
         if matches!(outcome, Err(_) | Ok(0))
             && matches!(armed, Some(SniArm::Rewrite(_) | SniArm::Empty))
+            && let Some(sni) = self.sni.as_deref()
         {
-            if let Some(sni) = self.sni.as_deref() {
-                sni.done.store(false, std::sync::atomic::Ordering::Release);
-            }
+            sni.done.store(false, std::sync::atomic::Ordering::Release);
         }
         outcome
     }
@@ -644,10 +643,10 @@ impl Masked {
                 .as_deref()
                 .filter(|_| Some(index) == first)
                 .map(|sni| sni.arm(part));
-            if let Some(SniArm::Empty) = &armed {
-                if let Err(error) = self.write_empty_record(&mut chain) {
-                    return self.keep_shape(armed.as_ref(), Err(error));
-                }
+            if let Some(SniArm::Empty) = &armed
+                && let Err(error) = self.write_empty_record(&mut chain)
+            {
+                return self.keep_shape(armed.as_ref(), Err(error));
             }
             let part = match &armed {
                 Some(SniArm::Rewrite(record)) => record.as_slice(),
@@ -1750,7 +1749,7 @@ impl Read for &Connection {
                 inner.read(buf)
             }
             Connection::Masked(masked) => masked.recv(buf),
-            Connection::Metered(ref metered) => {
+            Connection::Metered(metered) => {
                 let mut inner = &*metered.inner;
                 match inner.read(buf) {
                     Ok(n) => {
@@ -1760,7 +1759,7 @@ impl Read for &Connection {
                     Err(error) => Err(error),
                 }
             }
-            Connection::Proxied { ref inner, .. } | Connection::Policied { ref inner, .. } => {
+            Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
                 let mut inner = &**inner;
                 inner.read(buf)
             }
@@ -1783,7 +1782,7 @@ impl Read for &Connection {
                 inner.read_vectored(bufs)
             }
             Connection::Masked(masked) => masked.recv_vectored(bufs),
-            Connection::Metered(ref metered) => {
+            Connection::Metered(metered) => {
                 let mut inner = &*metered.inner;
                 match inner.read_vectored(bufs) {
                     Ok(n) => {
@@ -1793,7 +1792,7 @@ impl Read for &Connection {
                     Err(error) => Err(error),
                 }
             }
-            Connection::Proxied { ref inner, .. } | Connection::Policied { ref inner, .. } => {
+            Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
                 let mut inner = &**inner;
                 inner.read_vectored(bufs)
             }
@@ -1818,13 +1817,13 @@ impl Write for &Connection {
                 inner.write(buf)
             }
             Connection::Masked(masked) => masked.send(buf),
-            Connection::Metered(ref metered) => {
+            Connection::Metered(metered) => {
                 let mut inner = &*metered.inner;
                 let n = inner.write(buf)?;
                 metered.meter.write(n);
                 Ok(n)
             }
-            Connection::Proxied { ref inner, .. } | Connection::Policied { ref inner, .. } => {
+            Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
                 let mut inner = &**inner;
                 inner.write(buf)
             }
@@ -1843,13 +1842,13 @@ impl Write for &Connection {
                 inner.write_vectored(bufs)
             }
             Connection::Masked(masked) => masked.send_vectored(bufs),
-            Connection::Metered(ref metered) => {
+            Connection::Metered(metered) => {
                 let mut inner = &*metered.inner;
                 let n = inner.write_vectored(bufs)?;
                 metered.meter.write(n);
                 Ok(n)
             }
-            Connection::Proxied { ref inner, .. } | Connection::Policied { ref inner, .. } => {
+            Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
                 let mut inner = &**inner;
                 inner.write_vectored(bufs)
             }
@@ -1868,11 +1867,11 @@ impl Write for &Connection {
                 inner.flush()
             }
             Connection::Masked(masked) => masked.flush(),
-            Connection::Metered(ref metered) => {
+            Connection::Metered(metered) => {
                 let mut inner = &*metered.inner;
                 inner.flush()
             }
-            Connection::Proxied { ref inner, .. } | Connection::Policied { ref inner, .. } => {
+            Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
                 let mut inner = &**inner;
                 inner.flush()
             }
@@ -1952,10 +1951,10 @@ impl Connection {
         match self {
             Connection::Tcp(stream) => stream.shutdown(how),
             Connection::Masked(masked) => {
-                if let Some(state) = &masked.xmc {
-                    if let Some(Ok(session)) = state.session.get() {
-                        session.stop();
-                    }
+                if let Some(state) = &masked.xmc
+                    && let Some(Ok(session)) = state.session.get()
+                {
+                    session.stop();
                 }
                 masked.stream.shutdown(how)
             }
@@ -2067,7 +2066,7 @@ impl Connection {
     pub(crate) fn writable(&self, timeout: Duration) -> io::Result<bool> {
         use std::os::windows::io::AsRawSocket as _;
         use windows_sys::Win32::Networking::WinSock::{
-            select, FD_SET, FD_SETSIZE, SOCKET_ERROR, TIMEVAL,
+            FD_SET, FD_SETSIZE, SOCKET_ERROR, TIMEVAL, select,
         };
         let socket = match self {
             Connection::Tcp(stream) => stream.as_raw_socket(),
@@ -2234,7 +2233,7 @@ impl Connection {
     pub(crate) fn wait_readable(&self, timeout: Duration) -> io::Result<bool> {
         use std::os::windows::io::AsRawSocket;
         use windows_sys::Win32::Networking::WinSock::{
-            WSAGetLastError, WSAPoll, POLLERR, POLLHUP, POLLIN, POLLRDNORM, SOCKET, WSAPOLLFD,
+            POLLERR, POLLHUP, POLLIN, POLLRDNORM, SOCKET, WSAGetLastError, WSAPOLLFD, WSAPoll,
         };
         let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
         let mut row = WSAPOLLFD {
@@ -2274,7 +2273,7 @@ fn read_exact_within(
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "the PROXY header ended early",
-                ))
+                ));
             }
             Ok(n) => filled += n,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -2810,30 +2809,30 @@ fn macos_table_names(table: &[u8], path: &std::path::Path) -> Option<bool> {
                 continue;
             }
             let raw = &record[PATH_OFFSET..];
-            if let Some(end) = raw.iter().position(|byte| *byte == 0) {
-                if let Ok(listed) = std::str::from_utf8(&raw[..end]) {
-                    match staged_claim(listed.as_bytes(), path) {
-                        StagedClaim::Owned => return Some(true),
-                        StagedClaim::Other => {}
-                        StagedClaim::Unknown => {
-                            // A current name lookup cannot prove the PCB's bind identity, so a matching row is inconclusive rather than live.
-                            let row = std::path::Path::new(listed);
-                            // A case-insensitive volume reaches a moved entry through a different spelling, so compare names folded.
-                            let same_name = row.file_name().is_some_and(|name| {
-                                path.file_name().is_some_and(|path_name| {
-                                    name.to_string_lossy().to_lowercase()
-                                        == path_name.to_string_lossy().to_lowercase()
-                                })
-                            });
-                            // A relative bind resolves against the binder's directory, not this process's, so its row cannot be attributed from here.
-                            let moved = same_name && std::fs::symlink_metadata(row).is_err();
-                            if (row.is_relative() && same_name)
-                                || same_socket_object(row, path)
-                                || (listening && staged_sibling(listed, path))
-                                || moved
-                            {
-                                unknown_staged = true;
-                            }
+            if let Some(end) = raw.iter().position(|byte| *byte == 0)
+                && let Ok(listed) = std::str::from_utf8(&raw[..end])
+            {
+                match staged_claim(listed.as_bytes(), path) {
+                    StagedClaim::Owned => return Some(true),
+                    StagedClaim::Other => {}
+                    StagedClaim::Unknown => {
+                        // A current name lookup cannot prove the PCB's bind identity, so a matching row is inconclusive rather than live.
+                        let row = std::path::Path::new(listed);
+                        // A case-insensitive volume reaches a moved entry through a different spelling, so compare names folded.
+                        let same_name = row.file_name().is_some_and(|name| {
+                            path.file_name().is_some_and(|path_name| {
+                                name.to_string_lossy().to_lowercase()
+                                    == path_name.to_string_lossy().to_lowercase()
+                            })
+                        });
+                        // A relative bind resolves against the binder's directory, not this process's, so its row cannot be attributed from here.
+                        let moved = same_name && std::fs::symlink_metadata(row).is_err();
+                        if (row.is_relative() && same_name)
+                            || same_socket_object(row, path)
+                            || (listening && staged_sibling(listed, path))
+                            || moved
+                        {
+                            unknown_staged = true;
                         }
                     }
                 }
@@ -3046,11 +3045,7 @@ impl HttpUrl {
                 .split_once(']')
                 .ok_or_else(|| "URL has an unclosed IPv6 host".to_owned())?;
             let port = if tail.is_empty() {
-                if tls {
-                    443
-                } else {
-                    80
-                }
+                if tls { 443 } else { 80 }
             } else {
                 let port = tail
                     .strip_prefix(':')
@@ -3472,7 +3467,7 @@ fn bind_unix(path: &std::path::Path) -> io::Result<Listener> {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
                 "a unix listen path names a file that is not a socket",
-            ))
+            ));
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
@@ -3561,10 +3556,13 @@ fn apply_socket_mode(
     #[cfg(target_vendor = "apple")]
     let applied = {
         use std::os::unix::ffi::OsStrExt as _;
+        unsafe extern "C" {
+            fn lchmod(path: *const std::ffi::c_char, mode: libc::mode_t) -> libc::c_int;
+        }
         let text = std::ffi::CString::new(path.as_os_str().as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the unix path has a NUL"))?;
         // SAFETY: `text` is a live NUL-terminated path and `lchmod` never follows the last link.
-        let rc = unsafe { libc::lchmod(text.as_ptr(), mode as libc::mode_t) };
+        let rc = unsafe { lchmod(text.as_ptr(), mode as libc::mode_t) };
         if rc == 0 {
             Ok(())
         } else {
@@ -3714,14 +3712,14 @@ fn bind_unix(path: &std::path::Path) -> io::Result<Listener> {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
                 "a unix listen path names a file that is not a socket",
-            ))
+            ));
         }
         Ok(_) => match UnixStream::connect(path) {
             Ok(_) => {
                 return Err(io::Error::new(
                     io::ErrorKind::AddrInUse,
                     "a unix listen path names a live socket",
-                ))
+                ));
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
@@ -3799,7 +3797,7 @@ fn windows_file_id_handle(file: &std::fs::File) -> io::Result<(u32, u64, u32)> {
         index_low: u32,
     }
     #[link(name = "kernel32")]
-    extern "system" {
+    unsafe extern "system" {
         fn GetFileInformationByHandle(
             handle: *mut core::ffi::c_void,
             info: *mut ByHandleFileInformation,
@@ -3861,7 +3859,7 @@ fn windows_delete_stale(path: &std::path::Path, before: Option<&(u32, u64)>) -> 
     const FILE_DISPOSITION_FLAG_DELETE: u32 = 0x1;
     const FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE: u32 = 0x10;
     #[link(name = "kernel32")]
-    extern "system" {
+    unsafe extern "system" {
         fn SetFileInformationByHandle(
             handle: *mut core::ffi::c_void,
             class: i32,
@@ -3882,7 +3880,7 @@ fn windows_delete_stale(path: &std::path::Path, before: Option<&(u32, u64)>) -> 
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
                 "a unix listen path refused but may still be live",
-            ))
+            ));
         }
         Err(error) => return Err(error),
     };
@@ -3904,7 +3902,7 @@ fn windows_delete_stale(path: &std::path::Path, before: Option<&(u32, u64)>) -> 
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
                 "a unix listen path was replaced while binding",
-            ))
+            ));
         }
     };
     let disposition = FileDispositionInfoEx {
@@ -3997,7 +3995,7 @@ fn is_unix_socket_handle(file: &std::fs::File) -> io::Result<bool> {
         tag: u32,
     }
     #[link(name = "kernel32")]
-    extern "system" {
+    unsafe extern "system" {
         fn GetFileInformationByHandleEx(
             handle: *mut core::ffi::c_void,
             class: i32,
@@ -4279,7 +4277,7 @@ fn connect_cancellable(
 ) -> io::Result<()> {
     use std::os::windows::io::AsRawSocket as _;
     use windows_sys::Win32::Networking::WinSock::{
-        WSAGetLastError, WSAPoll, POLLERR, POLLHUP, POLLNVAL, POLLWRNORM, SOCKET, WSAPOLLFD,
+        POLLERR, POLLHUP, POLLNVAL, POLLWRNORM, SOCKET, WSAGetLastError, WSAPOLLFD, WSAPoll,
     };
     if !crate::proxy::dial_cancellable() {
         return socket.connect_timeout(address, timeout);
@@ -4465,12 +4463,12 @@ mod winunix {
     use std::sync::{Arc, Once};
     use std::time::Duration;
     use windows_sys::Win32::Networking::WinSock::{
-        accept, bind, closesocket, connect, getsockopt, listen, recv, send, setsockopt, shutdown,
-        socket, WSAGetLastError, WSARecv, WSASend, WSAStartup, AF_UNIX, INVALID_SOCKET, MSG_PEEK,
-        SD_BOTH, SD_RECEIVE, SD_SEND, SOCKADDR, SOCKADDR_UN, SOCKET, SOCKET_ERROR, SOCK_STREAM,
-        SOL_SOCKET, WSABUF, WSADATA, WSAESHUTDOWN,
+        AF_UNIX, INVALID_SOCKET, MSG_PEEK, SD_BOTH, SD_RECEIVE, SD_SEND, SOCK_STREAM, SOCKADDR,
+        SOCKADDR_UN, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSABUF, WSADATA, WSAESHUTDOWN,
+        WSAGetLastError, WSARecv, WSASend, WSAStartup, accept, bind, closesocket, connect,
+        getsockopt, listen, recv, send, setsockopt, shutdown, socket,
     };
-    use windows_sys::Win32::Networking::WinSock::{ioctlsocket, FIONBIO};
+    use windows_sys::Win32::Networking::WinSock::{FIONBIO, ioctlsocket};
 
     pub(crate) use windows_sys::Win32::Networking::WinSock::{SO_RCVTIMEO, SO_SNDTIMEO};
 
@@ -6062,13 +6060,15 @@ mod tests {
         // Queue connections until a blocking dial stops answering: the next dial then has no room.
         let filler_path = path.clone();
         let (progress, filled) = mpsc::channel();
-        std::thread::spawn(move || loop {
-            match std::os::unix::net::UnixStream::connect(&filler_path) {
-                // A queued connection keeps its slot; dropping it would free the room the dial needs to find full.
-                Ok(stream) => std::mem::forget(stream),
-                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+        std::thread::spawn(move || {
+            loop {
+                match std::os::unix::net::UnixStream::connect(&filler_path) {
+                    // A queued connection keeps its slot; dropping it would free the room the dial needs to find full.
+                    Ok(stream) => std::mem::forget(stream),
+                    Err(_) => std::thread::sleep(Duration::from_millis(50)),
+                }
+                let _ = progress.send(());
             }
-            let _ = progress.send(());
         });
         let started = Instant::now();
         while filled.recv_timeout(Duration::from_millis(150)).is_ok() {

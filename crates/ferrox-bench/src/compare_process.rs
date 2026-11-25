@@ -1313,18 +1313,18 @@ fn participant_names(
                 ));
                 return false;
             }
-            if let Some(protocol) = protocol.filter(|_| !e.protocols.is_empty()) {
-                if !e.protocols.contains(&protocol) {
-                    skipped.push((
-                        e.name.to_owned(),
-                        format!(
-                            "{protocol} is not served by {} at its pin; it accepts {}",
-                            e.name,
-                            e.protocols.join(", ")
-                        ),
-                    ));
-                    return false;
-                }
+            if let Some(protocol) = protocol.filter(|_| !e.protocols.is_empty())
+                && !e.protocols.contains(&protocol)
+            {
+                skipped.push((
+                    e.name.to_owned(),
+                    format!(
+                        "{protocol} is not served by {} at its pin; it accepts {}",
+                        e.name,
+                        e.protocols.join(", ")
+                    ),
+                ));
+                return false;
             }
             if let Some(carrier) = carrier.filter(|carrier| !carries(e.name, carrier)) {
                 skipped.push((
@@ -1826,7 +1826,7 @@ fn check_io(root: &Json, moved: f64) -> Result<(), Error> {
 fn read_samples(root: &Json) -> Vec<(parity::Phase, crate::ps::Sample)> {
     root.get("samples")
         .and_then(Json::as_arr)
-        .map(|items| {
+        .map_or_default(|items| {
             items
                 .iter()
                 .map(|item| {
@@ -1857,7 +1857,6 @@ fn read_samples(root: &Json) -> Vec<(parity::Phase, crate::ps::Sample)> {
                 })
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 /// The kernel tally under the names `/proc/<pid>/io` prints it. Half a tally is no tally: a sample
@@ -2353,9 +2352,11 @@ mod tests {
             participant_names(&engines, &scenario_workload("vless-hysteria-down-8"));
         assert_eq!(names, vec!["xray-core"]);
         assert_eq!(skipped.len(), 4);
-        assert!(skipped
-            .iter()
-            .all(|(_, reason)| reason.contains("hysteria")));
+        assert!(
+            skipped
+                .iter()
+                .all(|(_, reason)| reason.contains("hysteria"))
+        );
         let (names, skipped) =
             participant_names(&engines, &scenario_workload("vless-xhttp-down-8"));
         assert_eq!(names, vec!["xray-rust", "zeronet", "xray-core"]);
@@ -2948,10 +2949,11 @@ mod tests {
             "a cell names what it counted: {:?}",
             pairs[3].0,
         );
-        assert!(root
-            .get("gate_passed")
-            .and_then(Json::as_bool)
-            .unwrap_or(false));
+        assert!(
+            root.get("gate_passed")
+                .and_then(Json::as_bool)
+                .unwrap_or(false)
+        );
         let engines = root.get("engines").expect("engines");
         let first_run = match engines {
             Json::Arr(items) => match items.first().expect("an engine").get("runs") {

@@ -58,7 +58,7 @@ impl ApiConfig {
                 (_, value) => {
                     return Err(format!(
                         "xray.app.commander.Config: field {field} {value:?}"
-                    ))
+                    ));
                 }
             }
         }
@@ -314,17 +314,17 @@ impl Api {
             return;
         }
         if let Ok(mut state) = self.state.lock() {
-            if !tag.is_empty() {
-                if let Some(existing) = state.inbounds.iter_mut().find(|entry| entry.tag == tag) {
-                    existing.stops.extend(stops);
-                    if existing.raw.is_none() {
-                        existing.raw = raw;
-                    }
-                    if existing.users.is_none() {
-                        existing.users = users;
-                    }
-                    return;
+            if !tag.is_empty()
+                && let Some(existing) = state.inbounds.iter_mut().find(|entry| entry.tag == tag)
+            {
+                existing.stops.extend(stops);
+                if existing.raw.is_none() {
+                    existing.raw = raw;
                 }
+                if existing.users.is_none() {
+                    existing.users = users;
+                }
+                return;
             }
             state.inbounds.push(Inbound {
                 tag: tag.to_owned(),
@@ -342,8 +342,10 @@ impl Api {
             return Ok(());
         };
         let targets = if address.starts_with("unix:") {
-            vec![crate::conn::parse_target(&address)
-                .map_err(|error| format!("cannot resolve {address}: {error}"))?]
+            vec![
+                crate::conn::parse_target(&address)
+                    .map_err(|error| format!("cannot resolve {address}: {error}"))?,
+            ]
         } else {
             address
                 .to_socket_addrs()
@@ -687,25 +689,23 @@ impl Api {
                         };
                         if flags & h2::F_END_HEADERS != 0 {
                             continuation = None;
-                            if trailers {
-                                if let Some(call) = calls.remove(&id) {
-                                    if invalid || !call.end_stream {
-                                        if !reset(&mut stream, id, h2::E_PROTOCOL) {
-                                            return;
-                                        }
-                                        responses.remove(&id);
-                                        flow.close(id);
-                                    } else {
-                                        last_id = last_id.max(id);
-                                        if !self.answer(
-                                            id,
-                                            &call,
-                                            &mut stream,
-                                            &mut flow,
-                                            &mut responses,
-                                        ) {
-                                            return;
-                                        }
+                            if trailers && let Some(call) = calls.remove(&id) {
+                                if invalid || !call.end_stream {
+                                    if !reset(&mut stream, id, h2::E_PROTOCOL) {
+                                        return;
+                                    }
+                                    responses.remove(&id);
+                                    flow.close(id);
+                                } else {
+                                    last_id = last_id.max(id);
+                                    if !self.answer(
+                                        id,
+                                        &call,
+                                        &mut stream,
+                                        &mut flow,
+                                        &mut responses,
+                                    ) {
+                                        return;
                                     }
                                 }
                             }
@@ -2093,10 +2093,10 @@ impl RoutingContext {
                     .any(|selector| name.starts_with(selector.as_str()))
         };
         let mut out = Vec::new();
-        if wanted("inbound") {
-            if let Some(inbound) = self.inbound.as_deref().filter(|raw| !raw.is_empty()) {
-                field_bytes(&mut out, 1, inbound);
-            }
+        if wanted("inbound")
+            && let Some(inbound) = self.inbound.as_deref().filter(|raw| !raw.is_empty())
+        {
+            field_bytes(&mut out, 1, inbound);
         }
         if wanted("network") && self.network != 0 {
             field_varint(&mut out, 2, self.network);
@@ -2117,20 +2117,20 @@ impl RoutingContext {
         if wanted("port_target") && self.target_port != 0 {
             field_varint(&mut out, 6, self.target_port);
         }
-        if wanted("domain") {
-            if let Some(domain) = self.domain.as_deref().filter(|raw| !raw.is_empty()) {
-                field_bytes(&mut out, 7, domain);
-            }
+        if wanted("domain")
+            && let Some(domain) = self.domain.as_deref().filter(|raw| !raw.is_empty())
+        {
+            field_bytes(&mut out, 7, domain);
         }
-        if wanted("protocol") {
-            if let Some(protocol) = self.protocol.as_deref().filter(|raw| !raw.is_empty()) {
-                field_bytes(&mut out, 8, protocol);
-            }
+        if wanted("protocol")
+            && let Some(protocol) = self.protocol.as_deref().filter(|raw| !raw.is_empty())
+        {
+            field_bytes(&mut out, 8, protocol);
         }
-        if wanted("user") {
-            if let Some(user) = self.user.as_deref().filter(|raw| !raw.is_empty()) {
-                field_bytes(&mut out, 9, user);
-            }
+        if wanted("user")
+            && let Some(user) = self.user.as_deref().filter(|raw| !raw.is_empty())
+        {
+            field_bytes(&mut out, 9, user);
         }
         if wanted("attributes") {
             for (name, value) in &self.attrs {
@@ -2171,12 +2171,11 @@ fn request_strs(bytes: &[u8], field: u64) -> Vec<String> {
     let mut out = Vec::new();
     let mut reader = Pb::new(bytes);
     while let Ok(Some((number, value))) = reader.next() {
-        if number == field {
-            if let Value::Bytes(raw) = value {
-                if let Ok(text) = std::str::from_utf8(raw) {
-                    out.push(text.to_owned());
-                }
-            }
+        if number == field
+            && let Value::Bytes(raw) = value
+            && let Ok(text) = std::str::from_utf8(raw)
+        {
+            out.push(text.to_owned());
         }
     }
     out
@@ -2289,10 +2288,10 @@ fn field_str(out: &mut Vec<u8>, field: u64, text: &str) {
 fn request_varint(bytes: &[u8], field: u64) -> Option<u64> {
     let mut reader = Pb::new(bytes);
     while let Ok(Some((number, value))) = reader.next() {
-        if number == field {
-            if let Value::Varint(value) = value {
-                return Some(value);
-            }
+        if number == field
+            && let Value::Varint(value) = value
+        {
+            return Some(value);
         }
     }
     None
@@ -2301,10 +2300,10 @@ fn request_varint(bytes: &[u8], field: u64) -> Option<u64> {
 fn request_bytes(bytes: &[u8], field: u64) -> Option<&[u8]> {
     let mut reader = Pb::new(bytes);
     while let Ok(Some((number, value))) = reader.next() {
-        if number == field {
-            if let Value::Bytes(value) = value {
-                return Some(value);
-            }
+        if number == field
+            && let Value::Bytes(value) = value
+        {
+            return Some(value);
         }
     }
     None
@@ -2317,11 +2316,13 @@ fn request_str(bytes: &[u8], field: u64) -> Option<String> {
 #[cfg(test)]
 fn all_bytes(bytes: &[u8], field: u64) -> impl Iterator<Item = &[u8]> {
     let mut reader = Pb::new(bytes);
-    std::iter::from_fn(move || loop {
-        match reader.next() {
-            Ok(Some((number, Value::Bytes(raw)))) if number == field => return Some(raw),
-            Ok(Some(_)) => {}
-            _ => return None,
+    std::iter::from_fn(move || {
+        loop {
+            match reader.next() {
+                Ok(Some((number, Value::Bytes(raw)))) if number == field => return Some(raw),
+                Ok(Some(_)) => {}
+                _ => return None,
+            }
         }
     })
 }
@@ -2663,9 +2664,11 @@ mod tests {
             .write_all(&envelope)
             .expect("writes the accepted call's envelope");
         let (_, trailers) = reply(client, 1);
-        assert!(trailers
-            .iter()
-            .any(|(name, value)| name == "grpc-status" && value == "0"));
+        assert!(
+            trailers
+                .iter()
+                .any(|(name, value)| name == "grpc-status" && value == "0")
+        );
         assert!(waited.recv_timeout(Duration::from_secs(2)).is_ok());
     }
 
@@ -2750,9 +2753,11 @@ mod tests {
             let block = h2::block_encode(&[("x-check", "ok")]);
             send_trailers(&mut client, 1, &block, split);
             let (_, trailers) = reply(client, 1);
-            assert!(trailers
-                .iter()
-                .any(|(name, value)| name == "grpc-status" && value == "0"));
+            assert!(
+                trailers
+                    .iter()
+                    .any(|(name, value)| name == "grpc-status" && value == "0")
+            );
             assert!(waited.recv_timeout(Duration::from_secs(2)).is_ok());
         }
     }
@@ -2778,9 +2783,11 @@ mod tests {
             let block = h2::block_encode(&[("x-check", "ok")]);
             send_trailers(&mut client, 3, &block, false);
             let (_, trailers) = reply(client, 3);
-            assert!(trailers
-                .iter()
-                .any(|(name, value)| name == "grpc-status" && value == "0"));
+            assert!(
+                trailers
+                    .iter()
+                    .any(|(name, value)| name == "grpc-status" && value == "0")
+            );
             assert!(waited.recv_timeout(Duration::from_secs(2)).is_ok());
         }
     }
@@ -2891,9 +2898,11 @@ mod tests {
             ))
             .expect("writes");
         let (message, trailers) = reply(client, 1);
-        assert!(trailers
-            .iter()
-            .any(|(name, value)| name == "grpc-status" && value == "0"));
+        assert!(
+            trailers
+                .iter()
+                .any(|(name, value)| name == "grpc-status" && value == "0")
+        );
         assert_eq!(request_bytes(&message, 1), Some(inbound.as_slice()));
     }
 

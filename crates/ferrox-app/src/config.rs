@@ -145,12 +145,12 @@ pub(crate) fn server_fallbacks(inbound: &Json) -> Result<Option<Vec<Fallback>>, 
     let decryption = inbound
         .get("settings")
         .and_then(|settings| settings.get("decryption").and_then(Json::as_str));
-    if let Some(decryption) = decryption {
-        if decryption.is_empty() {
-            return Err(
-                r#"VLESS settings: please add/set "decryption":"none" to every settings"#.into(),
-            );
-        }
+    if let Some(decryption) = decryption
+        && decryption.is_empty()
+    {
+        return Err(
+            r#"VLESS settings: please add/set "decryption":"none" to every settings"#.into(),
+        );
     }
     let rows = inbound
         .get("settings")
@@ -417,8 +417,7 @@ fn fallback_dest_text(node: Option<&Json>) -> String {
         Some(Json::Str(text)) => text.clone(),
         Some(Json::Num(_)) => node
             .and_then(Json::as_port)
-            .map(|port| port.to_string())
-            .unwrap_or_default(),
+            .map_or_default(|port| port.to_string()),
         _ => String::new(),
     }
 }
@@ -514,10 +513,11 @@ fn rate_limit(node: &Json) -> Option<ferrox_core::tls::RateLimit> {
 }
 
 fn as_uint(node: &Json) -> Option<u64> {
-    if let Json::Num(n) = node {
-        if *n >= 0.0 && n.fract() == 0.0 {
-            return u64::try_from(*n as i64).ok();
-        }
+    if let Json::Num(n) = node
+        && *n >= 0.0
+        && n.fract() == 0.0
+    {
+        return u64::try_from(*n as i64).ok();
     }
     None
 }
@@ -633,22 +633,18 @@ pub(crate) fn reality_mldsa(node: &Json, server: bool) -> Result<bool, String> {
         Some(Json::Str(_)) | None => return Ok(false),
         Some(_) => return Err(format!(r#""{field}" is not a string"#)),
     };
-    if server {
-        if let Some(private) = reality.get("privateKey").and_then(Json::as_str) {
-            let decode = |value: &str| {
-                let unwrapped: String = value
-                    .chars()
-                    .filter(|ch| !matches!(*ch, '\r' | '\n'))
-                    .collect();
-                key32(unwrapped.as_str())
-            };
-            if let Some(private) = decode(private) {
-                if Some(private) == decode(text) {
-                    return Err(
-                        r#""mldsa65Seed" and "privateKey" can not be the same value"#.to_owned(),
-                    );
-                }
-            }
+    if server && let Some(private) = reality.get("privateKey").and_then(Json::as_str) {
+        let decode = |value: &str| {
+            let unwrapped: String = value
+                .chars()
+                .filter(|ch| !matches!(*ch, '\r' | '\n'))
+                .collect();
+            key32(unwrapped.as_str())
+        };
+        if let Some(private) = decode(private)
+            && Some(private) == decode(text)
+        {
+            return Err(r#""mldsa65Seed" and "privateKey" can not be the same value"#.to_owned());
         }
     }
     if b64url_len(text) != Some(length) {
@@ -767,12 +763,14 @@ fn start_cert_ticker(identity: &Arc<ferrox_core::tls::TlsServerConfig>) {
         return;
     };
     let identity = Arc::downgrade(identity);
-    std::thread::spawn(move || loop {
-        std::thread::sleep(period);
-        let Some(identity) = identity.upgrade() else {
-            return;
-        };
-        identity.renew();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(period);
+            let Some(identity) = identity.upgrade() else {
+                return;
+            };
+            identity.renew();
+        }
     });
 }
 
@@ -971,25 +969,24 @@ fn tls_cert_entries(settings: &Json) -> Option<Vec<ferrox_core::tls::CertEntry>>
             continue;
         };
         let paths = certificate.zip(key);
-        if let Some((certificate, key)) = paths {
-            if !cert
+        if let Some((certificate, key)) = paths
+            && !cert
                 .get("oneTimeLoading")
                 .and_then(Json::as_bool)
                 .unwrap_or(false)
-            {
-                let seconds = cert
-                    .get("ocspStapling")
-                    .and_then(as_whole)
-                    .filter(|seconds| *seconds != 0)
-                    .unwrap_or(3600);
-                entry.reload = Some(ferrox_core::tls::CertReload {
-                    certificate: certificate.to_owned(),
-                    key: key.to_owned(),
-                    interval: Duration::from_secs(seconds),
-                    read: read_cert_file,
-                    now: std::time::Instant::now,
-                });
-            }
+        {
+            let seconds = cert
+                .get("ocspStapling")
+                .and_then(as_whole)
+                .filter(|seconds| *seconds != 0)
+                .unwrap_or(3600);
+            entry.reload = Some(ferrox_core::tls::CertReload {
+                certificate: certificate.to_owned(),
+                key: key.to_owned(),
+                interval: Duration::from_secs(seconds),
+                read: read_cert_file,
+                now: std::time::Instant::now,
+            });
         }
         // `ocspStapling` names the staple ticker too, so an inline entry staples without a file.
         let one_time = cert
@@ -1000,15 +997,15 @@ fn tls_cert_entries(settings: &Json) -> Option<Vec<ferrox_core::tls::CertEntry>>
             .get("ocspStapling")
             .and_then(as_whole)
             .filter(|seconds| *seconds != 0);
-        if !one_time {
-            if let Some(seconds) = ocsp_interval {
-                let interval = Duration::from_secs(seconds);
-                let response = ferrox_core::tls::ocsp_staple_for(&entry.cert_chain);
-                if response.is_none() {
-                    eprintln!("ocspStapling: no OCSP response for the served chain; serving without a staple");
-                }
-                entry.ocsp = Some(ferrox_core::tls::OcspStaple { interval, response });
+        if !one_time && let Some(seconds) = ocsp_interval {
+            let interval = Duration::from_secs(seconds);
+            let response = ferrox_core::tls::ocsp_staple_for(&entry.cert_chain);
+            if response.is_none() {
+                eprintln!(
+                    "ocspStapling: no OCSP response for the served chain; serving without a staple"
+                );
             }
+            entry.ocsp = Some(ferrox_core::tls::OcspStaple { interval, response });
         }
         entries.push(entry);
     }
@@ -1169,14 +1166,13 @@ fn tls_verify_names(settings: Option<&Json>) -> std::sync::Arc<[String]> {
     settings
         .and_then(|s| s.get("verifyPeerCertByName"))
         .and_then(Json::as_str)
-        .map(|text| {
+        .map_or_default(|text| {
             text.split(',')
                 .map(str::trim)
                 .filter(|name| !name.is_empty())
                 .map(str::to_owned)
                 .collect::<Vec<_>>()
         })
-        .unwrap_or_default()
         .into()
 }
 
@@ -1992,21 +1988,21 @@ pub(crate) fn tcp_http_paths(settings: Option<&Json>) -> Option<Vec<String>> {
     let Some(request) = tcp_http_request(settings) else {
         return Some(vec!["/".to_owned()]);
     };
-    let mut paths: Vec<String> = request
-        .get("path")
-        .and_then(Json::as_arr)
-        .map(|paths| {
-            paths
-                .iter()
-                .filter_map(Json::as_str)
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
-    if paths.is_empty() {
-        if let Some(path) = request.get("path").and_then(Json::as_str) {
-            paths.push(path.to_owned());
-        }
+    let mut paths: Vec<String> =
+        request
+            .get("path")
+            .and_then(Json::as_arr)
+            .map_or_default(|paths| {
+                paths
+                    .iter()
+                    .filter_map(Json::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            });
+    if paths.is_empty()
+        && let Some(path) = request.get("path").and_then(Json::as_str)
+    {
+        paths.push(path.to_owned());
     }
     if paths.is_empty() {
         paths.push("/".to_owned());
@@ -3049,21 +3045,20 @@ pub(crate) fn hysteria_inbound_auths(
             .filter(|value| !matches!(value, Json::Null))
             .or_else(|| node.get("users"))
     });
-    if let Some(users) = users.and_then(Json::as_arr) {
-        if !users.is_empty() {
-            return users
-                .iter()
-                .filter_map(|user| user.get("auth").and_then(Json::as_str).map(str::to_owned))
-                .collect();
-        }
+    if let Some(users) = users.and_then(Json::as_arr)
+        && !users.is_empty()
+    {
+        return users
+            .iter()
+            .filter_map(|user| user.get("auth").and_then(Json::as_str).map(str::to_owned))
+            .collect();
     }
     stream
         .and_then(|node| node.get("hysteriaSettings"))
         .and_then(|hy| hy.get("auth"))
         .and_then(Json::as_str)
         .filter(|auth| !auth.is_empty())
-        .map(|auth| vec![auth.to_owned()])
-        .unwrap_or_default()
+        .map_or_default(|auth| vec![auth.to_owned()])
 }
 
 /// A JSON integer, as a number or a decimal string; a fractional or non-numeric value names nothing.
@@ -3195,7 +3190,7 @@ pub(crate) fn hysteria_quic_params(
         _ => {
             return Err(format!(
                 "unknown congestion control: {congestion_text}, valid values: reno, cubic, bbr, brutal, force-brutal"
-            ))
+            ));
         }
     };
     let window = |key: &str| -> Result<u64, String> {
@@ -3283,10 +3278,10 @@ fn hysteria_carrier_with_version(
             };
         }
     };
-    if let Some(params) = &quic {
-        if let Some(named) = params.cc {
-            cc = named;
-        }
+    if let Some(params) = &quic
+        && let Some(named) = params.cc
+    {
+        cc = named;
     }
     let udp_idle = match hysteria_udp_idle(hy) {
         Ok(idle) => idle,
@@ -3540,15 +3535,13 @@ fn hysteria_realm(
     let id = field("realm_id", "realmId")
         .or_else(|| field("ID", "id"))
         .and_then(Json::as_str)
-        .map(str::to_owned)
-        .unwrap_or_default();
+        .map_or_default(str::to_owned);
     if !ferrox_core::realm::valid_realm_id(&id) {
         return Err("realm id is missing or malformed".to_owned());
     }
     let token = field("token", "token")
         .and_then(Json::as_str)
-        .map(str::to_owned)
-        .unwrap_or_default();
+        .map_or_default(str::to_owned);
     let mut stun_servers = Vec::new();
     if let Some(servers) = field("stun_servers", "stunServers") {
         if let Some(items) = servers.as_arr() {
@@ -3886,7 +3879,9 @@ pub(crate) fn outbound_carrier(outbound: &Json, address: &str) -> (Carrier, Stri
                     && !crate::xhttp_h3::is_h3(&alpn)
                     && crate::proxy::tls_offers_h2(&alpn)));
         if xhttp.xmux.is_some() && !pooled {
-            eprintln!("xhttp: \"xmux\" bounds are checked, and this tree pools only a stream-one H2 session, so an H1 or packet-up/stream-up dial keeps its own connection");
+            eprintln!(
+                "xhttp: \"xmux\" bounds are checked, and this tree pools only a stream-one H2 session, so an H1 or packet-up/stream-up dial keeps its own connection"
+            );
         }
     }
     let key = match &carrier {
@@ -4980,15 +4975,17 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous = std::env::var_os("XRAY_LOCATION_CERT");
-        std::env::set_var("XRAY_LOCATION_CERT", &dir);
+        unsafe {
+            std::env::set_var("XRAY_LOCATION_CERT", &dir);
+        }
         let config = crate::json::parse(&format!(
             r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{"certificates": [{{"certificateFile": "{cert}", "keyFile": "{key}"}}]}}}}}}"#
         ))
         .expect("parses");
         let identity = inbound_tls_identity(&config);
         match previous {
-            Some(value) => std::env::set_var("XRAY_LOCATION_CERT", value),
-            None => std::env::remove_var("XRAY_LOCATION_CERT"),
+            Some(value) => unsafe { std::env::set_var("XRAY_LOCATION_CERT", value) },
+            None => unsafe { std::env::remove_var("XRAY_LOCATION_CERT") },
         }
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
@@ -5384,11 +5381,13 @@ mod tests {
             "{}: the backend serializes the mixed name",
             tls.server_name
         );
-        assert!(!outbound_tls(&outbound(""), "127.0.0.1")
-            .expect("builds")
-            .sni
-            .as_ref()
-            .is_some_and(|sni| sni.mixed_case));
+        assert!(
+            !outbound_tls(&outbound(""), "127.0.0.1")
+                .expect("builds")
+                .sni
+                .as_ref()
+                .is_some_and(|sni| sni.mixed_case)
+        );
         for evasion in [
             r#""sniSpoof":{"method":"nope"}"#,
             r#""sniSpoof":{"method":"decoy","fakeSni":""}"#,
@@ -5412,10 +5411,12 @@ mod tests {
             ))
             .expect("parses")
         };
-        assert!(outbound_tls(&outbound(""), "127.0.0.1")
-            .expect("builds")
-            .fragment
-            .is_none());
+        assert!(
+            outbound_tls(&outbound(""), "127.0.0.1")
+                .expect("builds")
+                .fragment
+                .is_none()
+        );
         for tls in [
             r#","fragment":true"#,
             r#","recordFragment":true"#,
@@ -5430,25 +5431,31 @@ mod tests {
                 "{tls} arms a cut"
             );
         }
-        assert!(outbound_tls(
-            &outbound(r#","fragment":true,"fragmentFallbackDelay":-1"#),
-            "127.0.0.1"
-        )
-        .is_err());
-        assert!(outbound_tls(
-            &outbound(r#","fragment":true,"fragmentFallbackDelay":"soon""#),
-            "127.0.0.1"
-        )
-        .is_err());
+        assert!(
+            outbound_tls(
+                &outbound(r#","fragment":true,"fragmentFallbackDelay":-1"#),
+                "127.0.0.1"
+            )
+            .is_err()
+        );
+        assert!(
+            outbound_tls(
+                &outbound(r#","fragment":true,"fragmentFallbackDelay":"soon""#),
+                "127.0.0.1"
+            )
+            .is_err()
+        );
 
         let evasion = crate::json::parse(
             r#"{"evasion":{"fragment":{"packets":"tlssni","lengths":[40],"delays":[1]}},"streamSettings":{"security":"tls","tlsSettings":{"serverName":"tls.test","allowInsecure":true}}}"#,
         )
         .expect("parses");
-        assert!(outbound_tls(&evasion, "127.0.0.1")
-            .expect("builds")
-            .fragment
-            .is_some());
+        assert!(
+            outbound_tls(&evasion, "127.0.0.1")
+                .expect("builds")
+                .fragment
+                .is_some()
+        );
     }
 
     #[test]
@@ -5623,9 +5630,8 @@ mod tests {
             )
         };
         let client = |names: Option<&str>| {
-            let named = names
-                .map(|names| format!(r#""verifyPeerCertByName": "{names}","#))
-                .unwrap_or_default();
+            let named =
+                names.map_or_default(|names| format!(r#""verifyPeerCertByName": "{names}","#));
             crate::json::parse(&format!(
                 r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{"serverName": "b.test", {named} "certificates": [{{"certificate": {}}}]}}}}}}"#,
                 pem_json(&ca_pem)
@@ -6267,17 +6273,21 @@ mod tests {
             r#"{"echConfigList":"not base64","echSockopt":{"domainStrategy":"useipv4"}}"#,
         )
         .expect("parses");
-        assert!(tls_ech_config(Some(&settings), "hidden.test")
-            .expect("options parse")
-            .is_some());
+        assert!(
+            tls_ech_config(Some(&settings), "hidden.test")
+                .expect("options parse")
+                .is_some()
+        );
 
         let alias = crate::json::parse(
             r#"{"echConfigList":"not base64","echSocketSettings":{"tcpFastOpen":true}}"#,
         )
         .expect("parses");
-        assert!(tls_ech_config(Some(&alias), "hidden.test")
-            .expect("options parse")
-            .is_some());
+        assert!(
+            tls_ech_config(Some(&alias), "hidden.test")
+                .expect("options parse")
+                .is_some()
+        );
 
         let bad = crate::json::parse(
             r#"{"echConfigList":"not base64","echSockopt":{"domainStrategy":"nearest"}}"#,
@@ -6302,9 +6312,11 @@ mod tests {
             r#"{"streamSettings":{"network":"quic","security":"tls","tlsSettings":{}}}"#,
         )
         .expect("parses");
-        assert!(quic_ech_config(&absent, "hidden.test")
-            .expect("parses options")
-            .is_none());
+        assert!(
+            quic_ech_config(&absent, "hidden.test")
+                .expect("parses options")
+                .is_none()
+        );
     }
 
     #[test]

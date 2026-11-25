@@ -1,5 +1,5 @@
 // The pinned uTLS shapes, GREASE as the 0x0a0a sentinel; generated, never hand-edited.
-use super::{Body, Ext, Profile, GREASE};
+use super::{Body, Ext, GREASE, Profile};
 
 static P_360: Profile = Profile {
     name: "360",

@@ -28,8 +28,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use args::{Action, Options, Outbound};
-use config::{fronts, port_of, FoxyAccount, Ports};
-use paths::{read_trim, read_trim_checked, Paths};
+use config::{FoxyAccount, Ports, fronts, port_of};
+use paths::{Paths, read_trim, read_trim_checked};
 
 fn main() {
     let mut options = args::parse();
@@ -374,11 +374,11 @@ fn up_once(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
         }
     };
     let (ports, user_config) = prepare(options, paths);
-    if options.vpn_proxy {
-        if let Err(error) = proxy::preflight(&options.fronts, ports) {
-            eprintln!("{error}");
-            return 1;
-        }
+    if options.vpn
+        && let Err(error) = proxy::preflight(&options.fronts, ports)
+    {
+        eprintln!("{error}");
+        return 1;
     }
     if options.warp && !options.upstream.is_empty() {
         println!(
@@ -615,11 +615,7 @@ fn stop_with_cancellation(
     *cancelled = true;
     let interrupted = interrupted.load(Ordering::SeqCst);
     stop_and_forget(paths, user_config);
-    if interrupted {
-        130
-    } else {
-        failure
-    }
+    if interrupted { 130 } else { failure }
 }
 
 fn stop_and_forget(paths: &Paths, user_config: bool) -> i32 {
@@ -724,14 +720,22 @@ fn diagnose(options: &Options, paths: &Paths) {
     );
     tail(&paths.log, 8);
     if options.outbound == Some(Outbound::Veepn) {
-        println!("diagnosis: the plane answered no list this lane can dial; the lines above name the region and the reason.");
+        println!(
+            "diagnosis: the plane answered no list this lane can dial; the lines above name the region and the reason."
+        );
     } else if log.contains("handshake with the edge failed") {
-        println!("diagnosis: TLS to the edge never completed. That is the network, not the account: chain the dial through a proxy this network does allow:");
+        println!(
+            "diagnosis: TLS to the edge never completed. That is the network, not the account: chain the dial through a proxy this network does allow:"
+        );
         println!("  ferrox-cli up --foxy --upstream socks5://127.0.0.1:PORT");
     } else if log.contains("did not sign in") || log.contains("token was refused") {
-        println!("diagnosis: the lane never signed in. Check the account, or pass --code 123456 for two-factor.");
+        println!(
+            "diagnosis: the lane never signed in. Check the account, or pass --code 123456 for two-factor."
+        );
     } else if log.contains("no quota left") || log.contains("answered 429") {
-        println!("diagnosis: the plane is refusing this account for quota; wait for the reset, or move the exit with --country.");
+        println!(
+            "diagnosis: the plane is refusing this account for quota; wait for the reset, or move the exit with --country."
+        );
     } else {
         println!("diagnosis: none of the known shapes; the lines above are all there is.");
     }
@@ -756,15 +760,17 @@ fn down(options: &Options, paths: &mut Paths) -> i32 {
             }
         }
         let mut rc = stop_all_lanes(paths);
-        if rc == 0 {
-            if let Err(error) = proxy::clear(paths) {
-                eprintln!("ferrox-cli: {error}");
-                rc = 1;
-            }
+        if rc == 0
+            && let Err(error) = proxy::clear(paths)
+        {
+            eprintln!("ferrox-cli: {error}");
+            rc = 1;
         }
         if rc == 0 {
             let _ = std::fs::remove_file(&paths.lanes_file);
-            println!("every lane is stopped; generated configs are removed and a user config is kept. The stored foxy session is kept; 'ferrox-cli logout' forgets it.");
+            println!(
+                "every lane is stopped; generated configs are removed and a user config is kept. The stored foxy session is kept; 'ferrox-cli logout' forgets it."
+            );
         }
         return rc;
     }
@@ -776,10 +782,8 @@ fn down(options: &Options, paths: &mut Paths) -> i32 {
         }
     };
     adopt_lane_config(options, paths);
-    if explicit_config {
-        if let Err(error) = lane::remember_user_config(paths) {
-            eprintln!("ferrox-cli: {error}");
-        }
+    if explicit_config && let Err(error) = lane::remember_user_config(paths) {
+        eprintln!("ferrox-cli: {error}");
     }
     let user_config = lane::user_config(paths).is_some();
     let rc = stop_lane_locked(paths);
@@ -840,8 +844,7 @@ fn forget_config(paths: &Paths) {
     let name = paths
         .cfg
         .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .map_or_default(|name| name.to_string_lossy().into_owned());
     let is_json = paths
         .cfg
         .extension()
@@ -982,7 +985,9 @@ fn status(options: &mut Options, paths: &mut Paths) -> i32 {
                 .map_or_else(String::new, |name| format!(" '{name}'"))
         );
         if let Some(endpoint) = proxy::armed_endpoint(paths) {
-            println!("system proxy points at {endpoint} but no lane owns it; run 'ferrox-cli down' to clear it.");
+            println!(
+                "system proxy points at {endpoint} but no lane owns it; run 'ferrox-cli down' to clear it."
+            );
         }
         for (name, pid) in lane::other_lanes(paths) {
             println!("instance {name} is running (pid {pid}).");
@@ -1034,7 +1039,9 @@ fn status(options: &mut Options, paths: &mut Paths) -> i32 {
             paths.log.display()
         );
     } else if lane::foxy_configured(paths) {
-        println!("quota: the plane named no allowance for the pass this lane carries: that is silence, not zero.");
+        println!(
+            "quota: the plane named no allowance for the pass this lane carries: that is silence, not zero."
+        );
     }
     let front = fronts(&options.fronts)
         .first()
@@ -1187,7 +1194,9 @@ fn logout(paths: &Paths) -> i32 {
         return rc;
     }
     forget_config(paths);
-    println!("signed out: every lane is stopped, generated configs are removed and a user config is kept; the stored session and saved account are gone.");
+    println!(
+        "signed out: every lane is stopped, generated configs are removed and a user config is kept; the stored session and saved account are gone."
+    );
     println!(
         "the remembered exit stays in {}; 'ferrox-cli login' signs in again.",
         paths.location_file.display()

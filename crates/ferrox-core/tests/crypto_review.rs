@@ -1,6 +1,6 @@
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use ferrox_core::alloc_count::{measure, Counts};
+use ferrox_core::alloc_count::{Counts, measure};
 use ferrox_core::blake2s::Blake2s;
 use ferrox_core::poly1305::Poly1305;
 

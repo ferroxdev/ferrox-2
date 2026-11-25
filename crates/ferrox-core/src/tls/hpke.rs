@@ -595,15 +595,21 @@ mod tests {
         let plaintext = hex("4265617574792069732074727574682c20747275746820626561757479");
         assert_eq!(
             context.seal(b"Count-0", &plaintext, 0).unwrap(),
-            hex("f938558b5d72f1a23810b4be2ab4f84331acc02fc97babc53a52ae8218a355a96d8770ac83d07bea87e13c512a")
+            hex(
+                "f938558b5d72f1a23810b4be2ab4f84331acc02fc97babc53a52ae8218a355a96d8770ac83d07bea87e13c512a"
+            )
         );
         assert_eq!(
             context.seal(b"Count-1", &plaintext, 1).unwrap(),
-            hex("af2d7e9ac9ae7e270f46ba1f975be53c09f8d875bdc8535458c2494e8a6eab251c03d0c22a56b8ca42c2063b84")
+            hex(
+                "af2d7e9ac9ae7e270f46ba1f975be53c09f8d875bdc8535458c2494e8a6eab251c03d0c22a56b8ca42c2063b84"
+            )
         );
         assert_eq!(
             context.seal(b"Count-256", &plaintext, 256).unwrap(),
-            hex("957f9800542b0b8891badb026d79cc54597cb2d225b54c00c5238c25d05c30e3fbeda97d2e0e1aba483a2df9f2")
+            hex(
+                "957f9800542b0b8891badb026d79cc54597cb2d225b54c00c5238c25d05c30e3fbeda97d2e0e1aba483a2df9f2"
+            )
         );
     }
 
@@ -637,7 +643,9 @@ mod tests {
         let plaintext = hex("4265617574792069732074727574682c20747275746820626561757479");
         assert_eq!(
             context.seal(b"Count-0", &plaintext, 0).unwrap(),
-            hex("1c5250d8034ec2b784ba2cfd69dbdb8af406cfe3ff938e131f0def8c8b60b4db21993c62ce81883d2dd1b51a28")
+            hex(
+                "1c5250d8034ec2b784ba2cfd69dbdb8af406cfe3ff938e131f0def8c8b60b4db21993c62ce81883d2dd1b51a28"
+            )
         );
     }
 

@@ -2,11 +2,11 @@
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use ferrox_core::vless_encryption::{
-    generate_pair, Client, ClientConfig, Clock, Server, ServerConfig,
+    Client, ClientConfig, Clock, Server, ServerConfig, generate_pair,
 };
 
 fn round_trip(server: &Arc<Server>, client: &Arc<Client>) {

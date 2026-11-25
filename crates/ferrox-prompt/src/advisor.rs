@@ -549,12 +549,12 @@ impl Ledger {
                 "`how` must be non-empty and free of a line break, ` t=` and the frame delimiter",
             ));
         }
-        if let Some(key) = target {
-            if !valid_target(key) {
-                return Err(invalid(
-                    "a target key must be a section letter and a numeric id, like A13",
-                ));
-            }
+        if let Some(key) = target
+            && !valid_target(key)
+        {
+            return Err(invalid(
+                "a target key must be a section letter and a numeric id, like A13",
+            ));
         }
         let entry = Entry {
             at: now_utc(),

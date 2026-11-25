@@ -2,11 +2,11 @@ use std::fmt::Write as _;
 
 use ferrox_core::addr::{self, Addr};
 use ferrox_core::mux::{
-    self, decode, Network, NewTail, Outgoing, Reflection, Status, Target, DATA, GLOBAL_ID,
+    self, DATA, GLOBAL_ID, Network, NewTail, Outgoing, Reflection, Status, Target, decode,
 };
 
 use crate::count;
-use crate::framing::{best_of, timed_row, Row};
+use crate::framing::{Row, best_of, timed_row};
 
 const ITERS: u64 = 200_000;
 

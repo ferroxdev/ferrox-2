@@ -13,7 +13,7 @@ const DATAGRAM_MAX: usize = 65_536;
 
 use super::connection::{ConnMetadata, Connection};
 use super::mask::Encoder;
-use super::segment::{read_segment, Command, Segment};
+use super::segment::{Command, Segment, read_segment};
 
 type Writer = Box<dyn FnMut(&[u8]) -> io::Result<()> + Send>;
 

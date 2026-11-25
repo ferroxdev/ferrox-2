@@ -667,22 +667,26 @@ mod tests {
         let before = frame;
         assert!(decode_punch(&frame[..10], &meta()).is_none());
         assert_eq!(frame, before, "a refusal never rewrote the input");
-        assert!(encode_punch_with_salt_and_padding(
-            PacketType::Hello,
-            &meta(),
-            &SALT,
-            &[],
-            &mut [0u8; 4]
-        )
-        .is_none());
-        assert!(encode_punch_with_salt_and_padding(
-            PacketType::Hello,
-            &meta(),
-            &SALT,
-            &vec![0u8; MAX_PADDING + 1],
-            &mut [0u8; MAX_WIRE_LEN + 1],
-        )
-        .is_none());
+        assert!(
+            encode_punch_with_salt_and_padding(
+                PacketType::Hello,
+                &meta(),
+                &SALT,
+                &[],
+                &mut [0u8; 4]
+            )
+            .is_none()
+        );
+        assert!(
+            encode_punch_with_salt_and_padding(
+                PacketType::Hello,
+                &meta(),
+                &SALT,
+                &vec![0u8; MAX_PADDING + 1],
+                &mut [0u8; MAX_WIRE_LEN + 1],
+            )
+            .is_none()
+        );
     }
 
     /// The random form agrees with the deterministic one at its own draw: the packet it writes

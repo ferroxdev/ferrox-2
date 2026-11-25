@@ -34,10 +34,8 @@ impl<'a> Addr<'a> {
             if let Ok(ip) = host.parse::<std::net::Ipv6Addr>() {
                 return Self::V6(ip.octets());
             }
-        } else if !non_v4 {
-            if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
-                return Self::V4(ip.octets());
-            }
+        } else if !non_v4 && let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+            return Self::V4(ip.octets());
         }
         Self::Name(&bytes[..bytes.len().min(MAX_DOMAIN)])
     }
@@ -129,7 +127,9 @@ mod tests {
         assert_eq!(v6.encode_into(&mut buf), 17);
         assert_eq!(
             &buf[..17],
-            &[IPV6, 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+            &[
+                IPV6, 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
+            ]
         );
 
         let name = Addr::of("example.com");

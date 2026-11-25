@@ -1,7 +1,7 @@
 // The shaped TLS 1.2 listener: the suites a stock Go server would pick, with the flight and the record layer it builds itself.
 use super::client::{
-    message, seal_chunks, Reader, APPLICATION, CCS, HANDSHAKE, MAX_HANDSHAKE, MAX_PLAINTEXT,
-    MAX_RECORD,
+    APPLICATION, CCS, HANDSHAKE, MAX_HANDSHAKE, MAX_PLAINTEXT, MAX_RECORD, Reader, message,
+    seal_chunks,
 };
 use super::keys;
 use super::record::{self, Direction, Suite};
@@ -141,10 +141,10 @@ impl Hello {
                 "the client does not offer TLS 1.2".to_owned(),
             ));
         }
-        if let Some(versions) = &self.versions {
-            if !versions.contains(&0x0303) {
-                return Err(TlsError::NoSharedCipher);
-            }
+        if let Some(versions) = &self.versions
+            && !versions.contains(&0x0303)
+        {
+            return Err(TlsError::NoSharedCipher);
         }
         Ok(())
     }
@@ -639,7 +639,7 @@ impl<S: Stream> Server<S> {
                 _ => {
                     return Err(TlsError::Other(format!(
                         "expected handshake, got record {kind}"
-                    )))
+                    )));
                 }
             }
         }
@@ -895,10 +895,10 @@ impl<S: Stream> Read for Server<S> {
             return Ok(0);
         }
         self.handshake().map_err(std::io::Error::other)?;
-        if let Err(error) = self.flush_out() {
-            if !TlsError::is_timeout(&error) {
-                return Err(error);
-            }
+        if let Err(error) = self.flush_out()
+            && !TlsError::is_timeout(&error)
+        {
+            return Err(error);
         }
         loop {
             if self.plain_at < self.plain_end {

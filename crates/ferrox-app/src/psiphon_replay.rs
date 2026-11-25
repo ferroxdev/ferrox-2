@@ -7,7 +7,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use crate::psiphon_ssh::{random, Server, Session};
+use crate::psiphon_ssh::{Server, Session, random};
 
 /// The `Replay*` fields, with the reference defaults.
 #[derive(Clone, Debug)]
@@ -182,25 +182,24 @@ impl Cache {
             && profile.ttl > Duration::ZERO
             && candidates_left
             && coin(profile.probability)
+            && let Some(entry) = state.entries.get(&key)
         {
-            if let Some(entry) = state.entries.get(&key) {
-                let config_ok = entry.config_state == config_state
-                    || coin(self.settings.ignore_changed_config_state);
-                if entry.succeeded
-                    && entry.server_hash == server_hash
-                    && entry.last_used.elapsed() <= profile.ttl
-                    && config_ok
-                {
-                    selected = entry.server.clone();
-                    match entry.next_seed {
-                        Some(pending) if entry.probe_session.is_none() => {
-                            seed = pending;
-                            probe = true;
-                        }
-                        _ => {
-                            seed = entry.seed;
-                            is_replay = true;
-                        }
+            let config_ok = entry.config_state == config_state
+                || coin(self.settings.ignore_changed_config_state);
+            if entry.succeeded
+                && entry.server_hash == server_hash
+                && entry.last_used.elapsed() <= profile.ttl
+                && config_ok
+            {
+                selected = entry.server.clone();
+                match entry.next_seed {
+                    Some(pending) if entry.probe_session.is_none() => {
+                        seed = pending;
+                        probe = true;
+                    }
+                    _ => {
+                        seed = entry.seed;
+                        is_replay = true;
                     }
                 }
             }
@@ -335,10 +334,11 @@ impl Lease {
         let now = Instant::now();
         let mut state = lock(&self.cache.state);
         if self.probe {
-            if let Some(entry) = state.entries.get_mut(&self.key) {
-                if entry.next_seed == Some(self.seed) && entry.server_hash == self.server_hash {
-                    entry.probe_session = Some(session_id);
-                }
+            if let Some(entry) = state.entries.get_mut(&self.key)
+                && entry.next_seed == Some(self.seed)
+                && entry.server_hash == self.server_hash
+            {
+                entry.probe_session = Some(session_id);
             }
             return;
         }
@@ -384,11 +384,11 @@ impl Lease {
     pub(crate) fn failed(&self) {
         if self.probe {
             let mut state = lock(&self.cache.state);
-            if let Some(entry) = state.entries.get_mut(&self.key) {
-                if entry.next_seed == Some(self.seed) {
-                    entry.next_seed = None;
-                    entry.probe_session = None;
-                }
+            if let Some(entry) = state.entries.get_mut(&self.key)
+                && entry.next_seed == Some(self.seed)
+            {
+                entry.next_seed = None;
+                entry.probe_session = None;
             }
             return;
         }
@@ -479,8 +479,8 @@ fn coin(probability: f64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{lock, Cache, Settings};
-    use crate::psiphon_ssh::{dial_random, dial_seed_scope, Server};
+    use super::{Cache, Settings, lock};
+    use crate::psiphon_ssh::{Server, dial_random, dial_seed_scope};
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
     use std::time::{Duration, Instant};

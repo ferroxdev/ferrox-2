@@ -1,5 +1,5 @@
 use super::protocol::{
-    read_boolean, read_string, read_uuid, read_varint, Packet, MAX_STRING_LENGTH,
+    MAX_STRING_LENGTH, Packet, read_boolean, read_string, read_uuid, read_varint,
 };
 use std::io;
 

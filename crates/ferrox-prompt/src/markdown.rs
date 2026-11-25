@@ -667,9 +667,7 @@ fn single_fenced_block(
                 ));
                 return String::new();
             }
-            let info = fence_body(section_line)
-                .map(|body| body[width..].trim())
-                .unwrap_or_default();
+            let info = fence_body(section_line).map_or_default(|body| body[width..].trim());
             let info = info.split_whitespace().next().unwrap_or_default();
             if !info.eq_ignore_ascii_case(expected_info) {
                 diagnostics.push(Diagnostic::error(
@@ -1107,10 +1105,10 @@ fn section_has_field(section: &[&str], key: &str) -> bool {
         if inside_fence(&mut fence, line) {
             continue;
         }
-        if let Some((found, _)) = field(line) {
-            if found == key {
-                return true;
-            }
+        if let Some((found, _)) = field(line)
+            && found == key
+        {
+            return true;
         }
     }
     false
@@ -1410,10 +1408,12 @@ b
         let text = format!("```text\n## P9 · Example\n```\n{LIBRARY}");
         let library = load(&text);
         assert!(library.prompt(9).is_none());
-        assert!(!library
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.message.contains("P9")));
+        assert!(
+            !library
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("P9"))
+        );
     }
 
     #[test]
@@ -1422,9 +1422,11 @@ b
             "```text\ndo the first thing with {len=40}\n```",
             "```\ndo the first thing with {len=40}\n```",
         ));
-        assert!(library
-            .errors()
-            .any(|error| error.message.contains("must open with ```text")));
+        assert!(
+            library
+                .errors()
+                .any(|error| error.message.contains("must open with ```text"))
+        );
     }
 
     #[test]
@@ -1461,9 +1463,11 @@ b
             .replace("**Status:** done", "**Status:** todo")
             .replace("**Effort:** small", "**Effort:** small\n**Status:** done");
         let library = load(&text);
-        assert!(library
-            .errors()
-            .any(|error| error.message.contains("**Status:** is declared twice")));
+        assert!(
+            library
+                .errors()
+                .any(|error| error.message.contains("**Status:** is declared twice"))
+        );
         assert_eq!(library.prompt(1).unwrap().status, Status::Todo);
     }
 
@@ -1481,9 +1485,11 @@ b
     #[test]
     fn an_out_of_range_leverage_is_an_error() {
         let library = load(&LIBRARY.replace("**Leverage:** 5", "**Leverage:** 9"));
-        assert!(library
-            .errors()
-            .any(|error| error.message.contains("1 to 5")));
+        assert!(
+            library
+                .errors()
+                .any(|error| error.message.contains("1 to 5"))
+        );
         let word = load(&LIBRARY.replace("**Leverage:** 5", "**Leverage:** high"));
         assert!(word.errors().any(|error| error.message.contains("1 to 5")));
     }
@@ -1491,9 +1497,11 @@ b
     #[test]
     fn a_prompt_with_no_gates_is_an_error() {
         let library = load(&LIBRARY.replace("**Gates:** `cargo test`\n", ""));
-        assert!(library
-            .errors()
-            .any(|error| error.message.contains("**Gates:**")));
+        assert!(
+            library
+                .errors()
+                .any(|error| error.message.contains("**Gates:**"))
+        );
     }
 
     #[test]
@@ -1568,9 +1576,11 @@ b
             "do the second thing with {scope}",
             "do {scope=one} and {scope=two}",
         ));
-        assert!(library
-            .errors()
-            .any(|error| error.message.contains("two defaults")));
+        assert!(
+            library
+                .errors()
+                .any(|error| error.message.contains("two defaults"))
+        );
     }
 
     #[test]

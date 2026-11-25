@@ -3,7 +3,7 @@ use super::hello::{Hello, TLS12};
 use super::kdf::{self, Hash};
 use super::record::{self, Direction, Suite};
 use super::{Fingerprint, Profile};
-use crate::tls::{ktls, RawFd, RecordAlignment, Stream, TlsConfig, TlsError, TlsProvider};
+use crate::tls::{RawFd, RecordAlignment, Stream, TlsConfig, TlsError, TlsProvider, ktls};
 use rustls::client::danger::ServerCertVerifier;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use std::io::{Read, Write};
@@ -789,10 +789,8 @@ impl<S: Stream> Session<S> {
         let session_hash = sh.ems.then(|| hash.hash(&self.transcript));
 
         // The certificate's proof follows the key exchange, over the transcript that now holds both.
-        if presenting {
-            if let Some(offered) = &asked {
-                self.send_client_verify12(offered)?;
-            }
+        if presenting && let Some(offered) = &asked {
+            self.send_client_verify12(offered)?;
         }
 
         let (master, directions) = super::tls12::keys(
@@ -1275,10 +1273,10 @@ impl<S: Stream> Session<S> {
             at += 5 + len;
             let body = &ciphertext[at - len..at];
             let (kind, bytes) = if header[0] == CCS {
-                if self.version == Some(Version::Tls12) {
-                    if let Some(keys) = self.server12.take() {
-                        self.read_key = Some(keys);
-                    }
+                if self.version == Some(Version::Tls12)
+                    && let Some(keys) = self.server12.take()
+                {
+                    self.read_key = Some(keys);
                 }
                 (CCS, 0)
             } else {
@@ -1755,10 +1753,10 @@ impl<S: Stream> Read for Session<S> {
         if let Some(layer) = &mut self.ktls {
             return layer.read(&mut self.io, buf);
         }
-        if let Err(error) = self.flush_reply() {
-            if !TlsError::is_timeout(&error) {
-                return Err(error);
-            }
+        if let Err(error) = self.flush_reply()
+            && !TlsError::is_timeout(&error)
+        {
+            return Err(error);
         }
         self.pump(buf).map_err(std::io::Error::other)
     }
@@ -2303,10 +2301,10 @@ fn decrypt(
     body: &mut [u8],
 ) -> Result<(u8, usize, usize), TlsError> {
     if header[0] == CCS {
-        if version == Some(Version::Tls12) {
-            if let Some(keys) = server12.take() {
-                *read_key = Some(keys);
-            }
+        if version == Some(Version::Tls12)
+            && let Some(keys) = server12.take()
+        {
+            *read_key = Some(keys);
         }
         return Ok((CCS, 0, 0));
     }
@@ -2477,7 +2475,7 @@ fn verify_signature(
         other => {
             return Err(TlsError::BadCertificate(format!(
                 "unsupported signature scheme {other:#06x}"
-            )))
+            )));
         }
     };
     ring::signature::UnparsedPublicKey::new(algorithm, key.key)
@@ -2488,11 +2486,11 @@ fn verify_signature(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tls::shaped::profiles;
     use crate::tls::shaped::Fingerprint;
-    use rustls::client::danger::HandshakeSignatureValid;
+    use crate::tls::shaped::profiles;
     use rustls::DigitallySignedStruct;
     use rustls::SignatureScheme;
+    use rustls::client::danger::HandshakeSignatureValid;
     use std::io::{Read, Write};
 
     struct Sink;

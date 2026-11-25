@@ -252,16 +252,15 @@ impl Shared {
         let Ok(mut pending) = self.pending.lock() else {
             return;
         };
-        if opcode == OP_PONG {
-            if let Some((_, queued)) = pending
+        if opcode == OP_PONG
+            && let Some((_, queued)) = pending
                 .iter_mut()
                 .rev()
                 .find(|(opcode, _)| *opcode == OP_PONG)
-            {
-                queued.clear();
-                queued.extend_from_slice(payload);
-                return;
-            }
+        {
+            queued.clear();
+            queued.extend_from_slice(payload);
+            return;
         }
         pending.push((opcode, payload.to_vec()));
     }
@@ -555,10 +554,10 @@ impl<R: Read> WsReader<R> {
                 return Ok(false);
             }
             // A close or pong echoes the control payload as sent, not as the client masked it.
-            if matches!(frame.opcode, OP_CLOSE | OP_PING) {
-                if let Some(mask) = frame.mask {
-                    apply_mask(&mut self.have[frame.payload.clone()], mask);
-                }
+            if matches!(frame.opcode, OP_CLOSE | OP_PING)
+                && let Some(mask) = frame.mask
+            {
+                apply_mask(&mut self.have[frame.payload.clone()], mask);
             }
             match frame.opcode {
                 OP_CLOSE => {
@@ -2729,8 +2728,8 @@ mod tests {
     #[test]
     fn an_idle_carrier_lane_parks_instead_of_reading() {
         use crate::proxy::{CarrierSink, Window, WindowRead};
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::{Duration, Instant};
 
         struct Counting<R> {

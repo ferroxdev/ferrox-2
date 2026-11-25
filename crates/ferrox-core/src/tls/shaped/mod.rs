@@ -12,8 +12,8 @@ pub(crate) mod server;
 pub(crate) mod ticket;
 pub(crate) mod tls12;
 
-pub(crate) use client::seal_chunks;
 pub use client::Session;
+pub(crate) use client::seal_chunks;
 
 use crate::tls::TlsConfig;
 use std::borrow::Cow;
@@ -605,7 +605,9 @@ mod tests {
         let ids = hello_ids(&parse(list), 0x0303, 0x0304, true);
         assert_eq!(
             ids,
-            vec![0xc012, 0x003c, 0xc007, 0xc011, 0x0005, 0x1301, 0x1302, 0x1303]
+            vec![
+                0xc012, 0x003c, 0xc007, 0xc011, 0x0005, 0x1301, 0x1302, 0x1303
+            ]
         );
         let mut hello = hello::Hello::build(&GO_STOCK, "example.com", &[], false, &[], None)
             .expect("the stock hello builds");

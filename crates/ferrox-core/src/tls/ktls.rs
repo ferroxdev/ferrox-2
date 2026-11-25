@@ -663,7 +663,7 @@ impl Layer {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "ktls: record header truncated",
-                    ))
+                    ));
                 }
                 Ok(n) => self.inbuf.extend_from_slice(&head[..n]),
                 Err(error) => return Err(error),
@@ -685,7 +685,7 @@ impl Layer {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "ktls: record body truncated",
-                    ))
+                    ));
                 }
                 Ok(n) => self.inbuf.extend_from_slice(&chunk[..n]),
                 Err(error) => return Err(error),

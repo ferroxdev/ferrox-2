@@ -1113,12 +1113,11 @@ impl AnyTlsOut {
     }
 
     fn release(&self, session: Arc<Session>) {
-        if session.alive() {
-            if let Ok(mut pool) = self.pool.lock() {
-                if pool.len() < 8 {
-                    pool.push(session);
-                }
-            }
+        if session.alive()
+            && let Ok(mut pool) = self.pool.lock()
+            && pool.len() < 8
+        {
+            pool.push(session);
         }
     }
 }
@@ -1201,14 +1200,13 @@ pub(crate) fn serve_inbound(
             }
         }
     }
-    if passwords.is_empty() {
-        if let Some(password) = settings
+    if passwords.is_empty()
+        && let Some(password) = settings
             .and_then(|node| node.get("password"))
             .and_then(Json::as_str)
             .filter(|value| !value.is_empty())
-        {
-            passwords.push(password_hash(password));
-        }
+    {
+        passwords.push(password_hash(password));
     }
     if passwords.is_empty() {
         eprintln!("anytls inbound in {path} names no password: serves nothing");
@@ -1445,12 +1443,12 @@ fn read_server(reader: &mut dyn Read, session: &Arc<Session>, context: &Arc<Serv
                 {
                     let _ = shared.write_frame(UPDATE_PADDING, 0, &padding.raw);
                 }
-                if let Some(version) = settings.get("v").and_then(|text| text.parse::<u32>().ok()) {
-                    if version >= VERSION {
-                        shared.peer_version.store(version, Ordering::Relaxed);
-                        let answer = settings_bytes(VERSION, None, None);
-                        let _ = shared.write_frame(SERVER_SETTINGS, 0, &answer);
-                    }
+                if let Some(version) = settings.get("v").and_then(|text| text.parse::<u32>().ok())
+                    && version >= VERSION
+                {
+                    shared.peer_version.store(version, Ordering::Relaxed);
+                    let answer = settings_bytes(VERSION, None, None);
+                    let _ = shared.write_frame(SERVER_SETTINGS, 0, &answer);
                 }
             }
             HEART_REQUEST => {
@@ -2173,10 +2171,12 @@ mod tests {
         };
         let duplicate = stream.clone();
         drop(stream);
-        assert!(written
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_empty());
+        assert!(
+            written
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        );
         drop(duplicate);
         let bytes = written.lock().unwrap_or_else(PoisonError::into_inner);
         assert_eq!(bytes[0], FIN);
@@ -2211,10 +2211,12 @@ mod tests {
         ));
         let stream = test_stream(&shared, 1);
         stream.synack(&[]);
-        assert!(written
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_empty());
+        assert!(
+            written
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        );
         shared.peer_version.store(VERSION, Ordering::Relaxed);
         stream.synack(&[]);
         let bytes = written.lock().unwrap_or_else(PoisonError::into_inner);

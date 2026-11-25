@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -582,12 +582,14 @@ impl Manager {
             return;
         };
         let idle = self.idle;
-        std::thread::spawn(move || loop {
-            std::thread::sleep(idle);
-            let Some(manager) = weak.upgrade() else {
-                return;
-            };
-            manager.retire_idle();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(idle);
+                let Some(manager) = weak.upgrade() else {
+                    return;
+                };
+                manager.retire_idle();
+            }
         });
     }
 
@@ -733,7 +735,7 @@ impl Manager {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixStream;
-    use std::sync::mpsc::{channel, Sender};
+    use std::sync::mpsc::{Sender, channel};
 
     fn target() -> mux::Target<'static> {
         mux::Target {

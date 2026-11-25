@@ -4,10 +4,10 @@
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::args::{Options, Outbound};
-use crate::paths::{read_trim, read_trim_checked, write_private, Paths};
+use crate::paths::{Paths, read_trim, read_trim_checked, write_private};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Ports {
@@ -260,10 +260,10 @@ pub fn load_foxy_location(options: &mut Options, paths: &Paths) {
         return;
     };
     options.country = country.to_uppercase();
-    if !options.city_set {
-        if let Some(city) = parts.next() {
-            options.city = city.to_uppercase();
-        }
+    if !options.city_set
+        && let Some(city) = parts.next()
+    {
+        options.city = city.to_uppercase();
     }
 }
 
@@ -292,10 +292,10 @@ pub fn load_psiphon_location(options: &mut Options, paths: &Paths) {
     if !options.psiphon.region.is_empty() {
         return;
     }
-    if let Some(line) = read_trim(&paths.psiphon_location) {
-        if let Some(country) = line.split_whitespace().next() {
-            options.psiphon.region = country.to_uppercase();
-        }
+    if let Some(line) = read_trim(&paths.psiphon_location)
+        && let Some(country) = line.split_whitespace().next()
+    {
+        options.psiphon.region = country.to_uppercase();
     }
 }
 
@@ -1435,10 +1435,10 @@ mod tests {
             strict["streamSettings"]["tlsSettings"]["allowInsecure"],
             false
         );
-        assert!(vless_outbound(
-            "vless://uuid@host.test:443?type=tcp&security=tls&allowInsecure=maybe"
-        )
-        .is_err());
+        assert!(
+            vless_outbound("vless://uuid@host.test:443?type=tcp&security=tls&allowInsecure=maybe")
+                .is_err()
+        );
     }
 
     #[test]

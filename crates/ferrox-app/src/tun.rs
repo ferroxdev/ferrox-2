@@ -17,7 +17,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, UdpSocket};
 #[cfg(any(not(unix), test))]
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed, Ordering::SeqCst};
-use std::sync::{mpsc, Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, Weak, mpsc};
 
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
@@ -104,18 +104,19 @@ fn explicit_live(fd: RawFd) -> bool {
 #[cfg(unix)]
 impl Drop for ExplicitOwner {
     fn drop(&mut self) {
-        if let Ok(mut live) = EXPLICIT_LIVE.lock() {
-            if let Some(live) = live.as_mut() {
-                live.remove(&self.fd);
-            }
+        if let Ok(mut live) = EXPLICIT_LIVE.lock()
+            && let Some(live) = live.as_mut()
+        {
+            live.remove(&self.fd);
         }
     }
 }
 
 use crate::conn::Connection;
 use ferrox_core::foxy::connectip::{
-    icmp_echo_reply, ipv4_checksum, ipv4_head, ipv6_head, pseudo_header_checksum, tcp_checksum,
-    udp_datagram, udp_head, UdpDatagram, IPV4_HEADER, IPV6_HEADER, PROTOCOL_UDP, UDP_HEADER,
+    IPV4_HEADER, IPV6_HEADER, PROTOCOL_UDP, UDP_HEADER, UdpDatagram, icmp_echo_reply,
+    ipv4_checksum, ipv4_head, ipv6_head, pseudo_header_checksum, tcp_checksum, udp_datagram,
+    udp_head,
 };
 
 const DEFAULT_MTU: usize = 1500;
@@ -433,12 +434,12 @@ pub(crate) fn parse_address(
         None => None,
     };
     let Some(value) = value else {
-        if let Some(prefix) = explicit {
-            if prefix > 32 {
-                return Err(format!(
-                    "tun prefix /{prefix} is outside /0../32 for the default IPv4 address"
-                ));
-            }
+        if let Some(prefix) = explicit
+            && prefix > 32
+        {
+            return Err(format!(
+                "tun prefix /{prefix} is outside /0../32 for the default IPv4 address"
+            ));
         }
         return Ok((None, explicit));
     };
@@ -755,11 +756,7 @@ fn path_mss(mtu: u32, ipv6: bool) -> u32 {
 
 /// How much a response read may take: one segment without offload, the whole buffer when the descriptor can split a GSO packet.
 fn read_limit(gso: bool, mss: usize, room: usize) -> usize {
-    if gso {
-        room
-    } else {
-        mss.min(room)
-    }
+    if gso { room } else { mss.min(room) }
 }
 
 /// How long a queue waits for an answer that follows its own upload: an echo replies inside this window on this bench's own p50, and past it the response thread's read is the cheaper waiter, so a queue that carries a second flow holds it for less.
@@ -2144,10 +2141,10 @@ impl SendWindow {
     }
 
     fn wake(&self) {
-        if self.parked.swap(false, SeqCst) {
-            if let Some(thread) = self.thread.get() {
-                thread.unpark();
-            }
+        if self.parked.swap(false, SeqCst)
+            && let Some(thread) = self.thread.get()
+        {
+            thread.unpark();
         }
     }
 
@@ -2388,8 +2385,7 @@ impl Workers {
             let handles: Vec<std::thread::JoinHandle<()>> = self
                 .handles
                 .lock()
-                .map(|mut handles| handles.drain(..).collect())
-                .unwrap_or_default();
+                .map_or_default(|mut handles| handles.drain(..).collect());
             if handles.is_empty() {
                 break;
             }
@@ -2677,10 +2673,11 @@ impl Handler {
     pub(crate) fn serve(&mut self) -> io::Result<()> {
         let mut buf = vec![0u8; MAX_PACKET + 64];
         #[cfg(target_os = "macos")]
-        if self.stopping.is_some() && self.device.bridge.is_some() {
-            if let Handle::Session(device) = &self.device.handle {
-                device.set_nonblocking(true)?;
-            }
+        if self.stopping.is_some()
+            && self.device.bridge.is_some()
+            && let Handle::Session(device) = &self.device.handle
+        {
+            device.set_nonblocking(true)?;
         }
         #[cfg(windows)]
         if self.stopping.is_some() {
@@ -3883,21 +3880,31 @@ mod tests {
     fn the_tun_spec_defaults_ipv6_and_bounds_its_values() {
         let spec = Spec::with(None, None, Some("2001:db8::1".parse().unwrap()), None, None);
         assert_eq!(spec.prefix(), 64);
-        assert!(Spec::with(None, Some(65_536), None, None, None)
-            .validate()
-            .is_err());
-        assert!(Spec::with(None, None, None, Some(33), None)
-            .validate()
-            .is_err());
-        assert!(Spec::with(None, None, None, None, Some(0))
-            .validate()
-            .is_err());
-        assert!(Spec::with(None, None, None, None, Some(5))
-            .validate()
-            .is_err());
-        assert!(Spec::with(None, None, None, Some(0), None)
-            .validate()
-            .is_ok());
+        assert!(
+            Spec::with(None, Some(65_536), None, None, None)
+                .validate()
+                .is_err()
+        );
+        assert!(
+            Spec::with(None, None, None, Some(33), None)
+                .validate()
+                .is_err()
+        );
+        assert!(
+            Spec::with(None, None, None, None, Some(0))
+                .validate()
+                .is_err()
+        );
+        assert!(
+            Spec::with(None, None, None, None, Some(5))
+                .validate()
+                .is_err()
+        );
+        assert!(
+            Spec::with(None, None, None, Some(0), None)
+                .validate()
+                .is_ok()
+        );
     }
 
     #[cfg(unix)]
@@ -4172,27 +4179,25 @@ mod tests {
                         break;
                     }
                     // The SYN-ACK carries no GSO header; answer it so the flow's receive cursor moves, then wait for the response.
-                    if header == [0u8; VIRTIO_NET_HDR_LEN] {
-                        if let Some((_ip, body)) = ipv4_head(&buf[VIRTIO_NET_HDR_LEN..n]) {
-                            if let Some((tcp, _)) = tcp_head(body) {
-                                if tcp.flags == FLAG_SYN | FLAG_ACK {
-                                    let ack = build_tcp_packet(
-                                        client,
-                                        endpoint,
-                                        7001,
-                                        tcp.seq.wrapping_add(1),
-                                        FLAG_ACK,
-                                        65535,
-                                        &[],
-                                    );
-                                    let mut frame = vec![0u8; VIRTIO_NET_HDR_LEN];
-                                    frame.extend_from_slice(&ack);
-                                    peer.write_all(&frame).unwrap();
-                                    let m = handler.device.read_packet(&mut buf).unwrap();
-                                    handler.dispatch(&buf[..m]).unwrap();
-                                }
-                            }
-                        }
+                    if header == [0u8; VIRTIO_NET_HDR_LEN]
+                        && let Some((_ip, body)) = ipv4_head(&buf[VIRTIO_NET_HDR_LEN..n])
+                        && let Some((tcp, _)) = tcp_head(body)
+                        && tcp.flags == (FLAG_SYN | FLAG_ACK)
+                    {
+                        let ack = build_tcp_packet(
+                            client,
+                            endpoint,
+                            7001,
+                            tcp.seq.wrapping_add(1),
+                            FLAG_ACK,
+                            65535,
+                            &[],
+                        );
+                        let mut frame = vec![0u8; VIRTIO_NET_HDR_LEN];
+                        frame.extend_from_slice(&ack);
+                        peer.write_all(&frame).unwrap();
+                        let m = handler.device.read_packet(&mut buf).unwrap();
+                        handler.dispatch(&buf[..m]).unwrap();
                     }
                 }
                 Ok(_) => {}
@@ -6839,12 +6844,11 @@ mod tests {
         for _ in 0..1_000 {
             match peer.read(&mut reply) {
                 Ok(n) => {
-                    if let Some((_ip, body)) = ipv4_head(&reply[..n]) {
-                        if let Some((tcp, _)) = tcp_head(body) {
-                            if tcp.flags == FLAG_SYN | FLAG_ACK {
-                                return Written::of(&tcp);
-                            }
-                        }
+                    if let Some((_ip, body)) = ipv4_head(&reply[..n])
+                        && let Some((tcp, _)) = tcp_head(body)
+                        && tcp.flags == FLAG_SYN | FLAG_ACK
+                    {
+                        return Written::of(&tcp);
                     }
                 }
                 Err(ref e)
@@ -6867,10 +6871,10 @@ mod tests {
             match peer.read(buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if let Some((_ip, body)) = ipv4_head(&buf[..n]) {
-                        if let Some((tcp, payload)) = tcp_head(body) {
-                            return (Written::of(&tcp), payload.to_vec());
-                        }
+                    if let Some((_ip, body)) = ipv4_head(&buf[..n])
+                        && let Some((tcp, payload)) = tcp_head(body)
+                    {
+                        return (Written::of(&tcp), payload.to_vec());
                     }
                 }
                 Err(ref e)
@@ -6912,10 +6916,10 @@ mod tests {
             match peer.read(&mut reply) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if let Some((_ip, body)) = ipv4_head(&reply[..n]) {
-                        if let Some((_, pl)) = tcp_head(body) {
-                            payload.extend_from_slice(pl);
-                        }
+                    if let Some((_ip, body)) = ipv4_head(&reply[..n])
+                        && let Some((_, pl)) = tcp_head(body)
+                    {
+                        payload.extend_from_slice(pl);
                     }
                     if payload.windows(5).any(|w| w == b"pong\n") {
                         break;
@@ -6994,10 +6998,10 @@ mod tests {
             match peer.read(&mut reply) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if let Some((_ip, body)) = ipv4_head(&reply[..n]) {
-                        if let Some((_, pl)) = tcp_head(body) {
-                            payload.extend_from_slice(pl);
-                        }
+                    if let Some((_ip, body)) = ipv4_head(&reply[..n])
+                        && let Some((_, pl)) = tcp_head(body)
+                    {
+                        payload.extend_from_slice(pl);
                     }
                     if payload.windows(4).any(|w| w == b"ping") {
                         break;

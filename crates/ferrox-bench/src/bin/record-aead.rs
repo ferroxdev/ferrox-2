@@ -7,7 +7,7 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use ferrox_core::aesgcm::Aes128Gcm;
-use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_128_GCM};
+use ring::aead::{AES_128_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 
 const LENGTHS: [usize; 3] = [16_383, 8_192, 4_096];
 const BYTE_BUDGET: u64 = 32 * 1024 * 1024;

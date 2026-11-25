@@ -249,10 +249,8 @@ impl Bridge {
                 false
             }
         };
-        if !queued {
-            if let Some(mut slot) = slot {
-                hang_up(&mut slot.writer);
-            }
+        if !queued && let Some(mut slot) = slot {
+            hang_up(&mut slot.writer);
         }
     }
 
@@ -384,11 +382,7 @@ fn read_ack(reader: &mut WsReader<Connection>, deadline: Instant) -> Ack {
             Ok(n) => at += n,
         }
     }
-    if buf == *b"ok" {
-        Ack::Ok
-    } else {
-        Ack::Fail
-    }
+    if buf == *b"ok" { Ack::Ok } else { Ack::Fail }
 }
 
 pub(crate) struct WsTarget<'a> {

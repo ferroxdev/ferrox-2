@@ -47,16 +47,18 @@ pub(crate) fn watch() {
     let stop_file = std::env::var_os("FERROX_STOP_FILE").map(std::path::PathBuf::from);
     let spawned = std::thread::Builder::new()
         .name("ferrox-shutdown".to_owned())
-        .spawn(move || loop {
-            let asked = stop_file.as_deref().is_some_and(Path::exists);
-            if asked || signalled() {
-                if let Some(path) = stop_file.as_deref() {
-                    let _ = std::fs::remove_file(path);
+        .spawn(move || {
+            loop {
+                let asked = stop_file.as_deref().is_some_and(Path::exists);
+                if asked || signalled() {
+                    if let Some(path) = stop_file.as_deref() {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    crate::tun_route::release_all();
+                    std::process::exit(0);
                 }
-                crate::tun_route::release_all();
-                std::process::exit(0);
+                std::thread::sleep(Duration::from_millis(100));
             }
-            std::thread::sleep(Duration::from_millis(100));
         });
     if let Err(error) = spawned {
         eprintln!("ferrox-app: could not start the shutdown watcher: {error}");

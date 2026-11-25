@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::conn::Connection;
 use crate::proxy::lane_pool::Next;
-use crate::proxy::{read_exact, under_handshake, FrameWrite};
+use crate::proxy::{FrameWrite, read_exact, under_handshake};
 
 const AUTH_LEN: usize = 16;
 const TAG_LEN: usize = 16;
@@ -404,8 +404,8 @@ fn cached_keys(uuid: &[u8; 16]) -> CachedUserKeys {
 }
 
 fn seal_header(key: &[u8; 16], nonce: &[u8; 12], plain: &[u8], aad: &[u8]) -> Option<Vec<u8>> {
-    use aes_gcm::aead::AeadInOut as _;
     use aes_gcm::KeyInit as _;
+    use aes_gcm::aead::AeadInOut as _;
     let cipher = aes_gcm::Aes128Gcm::new_from_slice(key).ok()?;
     let mut body = plain.to_vec();
     let tag = cipher
@@ -426,8 +426,8 @@ fn open_header_into<'a>(
     aad: &[u8],
     out: &'a mut [u8],
 ) -> Option<&'a [u8]> {
-    use aes_gcm::aead::AeadInOut as _;
     use aes_gcm::KeyInit as _;
+    use aes_gcm::aead::AeadInOut as _;
     let split = sealed.len().checked_sub(TAG_LEN)?;
     let body = out.get_mut(..split)?;
     body.copy_from_slice(&sealed[..split]);
@@ -523,11 +523,7 @@ impl Shake {
         u16::from_be_bytes(bytes)
     }
     fn pad_len(&mut self) -> u16 {
-        if self.padding {
-            self.draw() % 64
-        } else {
-            0
-        }
+        if self.padding { self.draw() % 64 } else { 0 }
     }
     fn pad_and_mask(&mut self, wire: u16) -> (usize, u16) {
         if self.padding {
@@ -1295,11 +1291,7 @@ impl<R: Read> Wire<R> {
                 len: self.plain,
             };
         }
-        if self.last {
-            Opened::End
-        } else {
-            Opened::Idle
-        }
+        if self.last { Opened::End } else { Opened::Idle }
     }
 
     /// The plaintext spans the last batch opened, into `held`: the shape a vectored write takes.
@@ -1921,7 +1913,7 @@ impl Users {
     }
 
     fn snapshot(&self) -> Vec<User> {
-        self.entries.lock().map(|e| e.clone()).unwrap_or_default()
+        self.entries.lock().map_or_default(|e| e.clone())
     }
 
     fn authenticate(&self, auth_id: &[u8; AUTH_LEN]) -> Option<([u8; 16], User)> {
@@ -2632,10 +2624,11 @@ pub(crate) fn serve_grpc_muxed(
 ) {
     reader.arm_mux_poll();
     let decoded = under_handshake(&mut reader, |read| accept_request(read, users));
-    if let Some(Accepted { cmd, .. }) = &decoded {
-        if freedom && matches!(*cmd, 1 | 2) {
-            opened.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
+    if let Some(Accepted { cmd, .. }) = &decoded
+        && freedom
+        && matches!(*cmd, 1 | 2)
+    {
+        opened.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let reset = reader.reset_handle();
     let closer = writer.clone();
@@ -3090,13 +3083,13 @@ pub(crate) fn pump_relay(
     });
     let mut recv = recv;
     let mut sealed_reader = Wire::new(sealed_read);
-    if let Some((response_key, response_iv, auth)) = pending {
-        if !read_response(&mut sealed_reader, &response_key, &response_iv, auth) {
-            let _ = sealed.shutdown(Shutdown::Both);
-            let _ = plain_write.shutdown(Shutdown::Both);
-            let _ = done.join();
-            return;
-        }
+    if let Some((response_key, response_iv, auth)) = pending
+        && !read_response(&mut sealed_reader, &response_key, &response_iv, auth)
+    {
+        let _ = sealed.shutdown(Shutdown::Both);
+        let _ = plain_write.shutdown(Shutdown::Both);
+        let _ = done.join();
+        return;
     }
     while let Some(chunk) = sealed_reader.batch(&mut recv) {
         if plain_write.write_all(chunk).is_err() {

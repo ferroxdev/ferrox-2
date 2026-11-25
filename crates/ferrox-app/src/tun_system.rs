@@ -11,7 +11,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
-use ferrox_core::foxy::connectip::{checksum_update, ipv6_head, IPV4_HEADER, IPV6_HEADER};
+use ferrox_core::foxy::connectip::{IPV4_HEADER, IPV6_HEADER, checksum_update, ipv6_head};
 
 const FLAG_FIN: u8 = 0x01;
 const FLAG_SYN: u8 = 0x02;
@@ -122,14 +122,14 @@ impl Nat {
         } else {
             None
         };
-        if let Some(fallback) = fallback {
-            if let Some(last) = self.fallback.get_mut(&fallback) {
-                *last = now;
-                if view.flags & (FLAG_FIN | FLAG_RST) != 0 {
-                    self.fallback.remove(&fallback);
-                }
-                return Outcome::UnhandledTcp;
+        if let Some(fallback) = fallback
+            && let Some(last) = self.fallback.get_mut(&fallback)
+        {
+            *last = now;
+            if view.flags & (FLAG_FIN | FLAG_RST) != 0 {
+                self.fallback.remove(&fallback);
             }
+            return Outcome::UnhandledTcp;
         }
         if view.source == local && view.destination == peer && view.source_port == listener_port {
             let Some(mapping) = self.ports.get_mut(&view.destination_port) else {
@@ -273,11 +273,11 @@ impl Nat {
     }
 
     fn closed(&mut self, port: u16, generation: u64) {
-        if let Some(mapping) = self.ports.get_mut(&port) {
-            if mapping.generation == generation {
-                mapping.closed = true;
-                mapping.last = Instant::now();
-            }
+        if let Some(mapping) = self.ports.get_mut(&port)
+            && mapping.generation == generation
+        {
+            mapping.closed = true;
+            mapping.last = Instant::now();
         }
     }
 }

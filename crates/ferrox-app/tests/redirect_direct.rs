@@ -2,14 +2,14 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use ferrox_core::mux;
 use ferrox_core::tls::{TlsConfig, TlsProvider as _};
 use ferrox_core::vless::{Command as VlessCommand, VlessLink};
-use ferrox_core::vless_encryption::{generate_pair, Client, ClientConfig};
+use ferrox_core::vless_encryption::{Client, ClientConfig, generate_pair};
 
 trait ReadWrite: Read + Write {}
 

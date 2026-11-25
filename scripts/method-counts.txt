@@ -148,10 +148,10 @@ vless sealed-record-buffer-growth 0 ferrox-core-vless::tests::a_record_is_opened
 vless sealed-record-sizes-swept 12 ferrox-core-vless::tests::a_record_of_any_size_reads_back_the_octets_that_were_written
 vless sealed-record-writes-per-batch 1 ferrox-core-vless::tests::a_batched_record_write_is_one_call_and_the_same_bytes
 vless sealed-record-copies 2 ferrox-core-vless::tests::a_record_inside_one_part_is_sealed_from_that_part
-vless sealed-record-write-instructions 50874900 scripts/count-ops.sh
+vless sealed-record-write-instructions 50877299 scripts/count-ops.sh
 
 # --- Trojan -----------------------------------------------------------------
-trojan ops-retired-instructions 1292 scripts/count-ops.sh
+trojan ops-retired-instructions 1285 scripts/count-ops.sh
 trojan syscalls-per-handshake UNBLESSED scripts/count-ops.sh
 trojan trojan-tls-raw-down-8-ubuntu-x86-64-mib-per-second 2814.1 CI benchmark-matrix.yml trojan-tls-raw-down-8
 trojan password-bytes-on-the-wire 56 ferrox-app-proxy::tests::trojan_key_is_sha224_hex
@@ -304,9 +304,9 @@ carrier-httpheader user-space-copies-per-byte-relayed 1 ferrox-app-proxy::tests:
 carrier-httpheader pinned-threads-per-silent-vmess-request 0 ferrox-app-vmess::tests::a_silent_peer_cannot_pin_an_httpheader_vmess_request
 
 carrier-grpc ops-retired-instructions 73251 scripts/count-ops.sh
-carrier-grpc wide-hunk-probe-ops 332283 scripts/count-ops.sh
+carrier-grpc wide-hunk-probe-ops 332295 scripts/count-ops.sh
 carrier-grpc varint-write-probe-ops 102414 scripts/count-ops.sh
-carrier-grpc multi-payload-probe-ops 147461 scripts/count-ops.sh
+carrier-grpc multi-payload-probe-ops 196613 scripts/count-ops.sh
 carrier-grpc hunk-payload-bytes 16375 ferrox-app-grpc::tests::a_hunk_fits_the_frame_that_carries_it
 carrier-grpc user-space-copies-per-byte-written 0 ferrox-app-grpc::tests::the_uplink_hands_the_payload_to_the_writer_by_pointer
 carrier-grpc writes-per-relay-read 1 ferrox-app-grpc::tests::a_relay_read_gathers_its_frames_into_one_write
@@ -1055,7 +1055,7 @@ carrier-foxy edge-strike-lookup-allocations 0 ferrox-core-foxy::tests::an_edge_s
 carrier-foxy carrier-alpn-allocations-per-dial 0 ferrox-app-foxy::tests::a_carriers_alpn_list_is_shared_rather_than_built_per_dial
 
 # --- the DNS outbound -------------------------------------------------------
-dns-outbound ops-retired-instructions 52343912 scripts/count-ops.sh
+dns-outbound ops-retired-instructions 52835258 scripts/count-ops.sh
 dns-outbound syscalls-per-forwarded-question UNBLESSED scripts/count-ops.sh
 dns-outbound user-space-copies-per-forwarded-question UNBLESSED no copy checker yet
 dns-outbound seconds-per-forwarded-question UNBLESSED CI bench.yml (no cell yet)
@@ -1081,7 +1081,7 @@ engine-dns fake-name-allocations 1 ferrox-app-dnsapp::resolver_tests::a_fake_nam
 engine-dns seconds-per-lookup UNBLESSED CI bench.yml (no cell yet)
 
 # --- the reverse tunnel -----------------------------------------------------
-reverse ops-retired-instructions 80066 scripts/count-ops.sh
+reverse ops-retired-instructions 90338 scripts/count-ops.sh
 reverse tcp-echo-bytes-preserved 5 ferrox-app-proxy::reverse_tests::a_portal_flow_reaches_the_bridge_and_comes_back
 reverse fixed-bridge-route-allocations-per-datagram 0 ferrox-app-proxy::tests::a_bridge_datagram_route_borrows_its_lane
 
@@ -1229,7 +1229,7 @@ carrier-psiphon move-to-front-allocations 0 ferrox-app-psiphon::tests::a_live_se
 carrier-psiphon capability-name-allocations 0 ferrox-app-psiphon::tests::capability_names_borrow_when_no_mask_is_needed
 carrier-psiphon preresolved-pick-allocations 0 ferrox-app-psiphon-dns::tests::a_preresolved_pick_takes_no_heap
 carrier-psiphon ss-direct-write-probe-ops UNBLESSED scripts/count-ops.sh
-carrier-psiphon ss-flatten-write-probe-ops 49776272 scripts/count-ops.sh
+carrier-psiphon ss-flatten-write-probe-ops 49812779 scripts/count-ops.sh
 carrier-psiphon quic-varint-probe-ops 131079 scripts/count-ops.sh
 carrier-psiphon seconds-per-live-transfer UNBLESSED .github/workflows/psiphon-live.yml
 carrier-psiphon rc4-passes-per-byte 1 ferrox-app-psiphon-ssh::tests::rc4_apply_matches_the_stream_across_every_length

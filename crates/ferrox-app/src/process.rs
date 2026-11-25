@@ -107,12 +107,12 @@ fn inodes_in(table: &str, address: &str, port: Option<&str>) -> (Option<String>,
         if local == address {
             return (Some(inode.to_owned()), wildcard);
         }
-        if let Some(suffix) = port {
-            if let Some(bound) = local.strip_suffix(suffix) {
-                if matches!(bound.len(), 8 | 32) && bound.bytes().all(|byte| byte == b'0') {
-                    wildcard = Some(inode.to_owned());
-                }
-            }
+        if let Some(suffix) = port
+            && let Some(bound) = local.strip_suffix(suffix)
+            && matches!(bound.len(), 8 | 32)
+            && bound.bytes().all(|byte| byte == b'0')
+        {
+            wildcard = Some(inode.to_owned());
         }
     }
     (None, wildcard)

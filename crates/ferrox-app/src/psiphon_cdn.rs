@@ -1554,7 +1554,7 @@ impl ScanState {
 
 #[cfg(test)]
 mod tests {
-    use super::{select, snis, CdnSet, CDN_SETS};
+    use super::{CDN_SETS, CdnSet, select, snis};
 
     #[test]
     fn the_hint_cache_keeps_a_bounded_set_of_outcomes() {
@@ -1612,11 +1612,11 @@ mod tests {
         ranges.sort_unstable();
         let mut merged: Vec<(u32, u32)> = Vec::new();
         for (first, last) in ranges {
-            if let Some(previous) = merged.last_mut() {
-                if first <= previous.1.saturating_add(1) {
-                    previous.1 = previous.1.max(last);
-                    continue;
-                }
+            if let Some(previous) = merged.last_mut()
+                && first <= previous.1.saturating_add(1)
+            {
+                previous.1 = previous.1.max(last);
+                continue;
             }
             merged.push((first, last));
         }
@@ -1738,16 +1738,17 @@ mod tests {
     fn a_scan_spec_rejects_what_the_reference_rejects() {
         assert!(super::ScanSpec::from_config(&["2001:db8::1".to_owned()], &[]).is_err());
         assert!(super::ScanSpec::from_config(&["192.0.2.0/33".to_owned()], &[]).is_err());
-        assert!(super::ScanSpec::from_config(
-            &["192.0.2.0/24".to_owned()],
-            &["-bad.example".to_owned()]
-        )
-        .is_err());
-        assert!(super::ScanSpec::from_config(
-            &["192.0.2.0/24".to_owned()],
-            &["192.0.2.4".to_owned()]
-        )
-        .is_err());
+        assert!(
+            super::ScanSpec::from_config(
+                &["192.0.2.0/24".to_owned()],
+                &["-bad.example".to_owned()]
+            )
+            .is_err()
+        );
+        assert!(
+            super::ScanSpec::from_config(&["192.0.2.0/24".to_owned()], &["192.0.2.4".to_owned()])
+                .is_err()
+        );
     }
 
     #[test]

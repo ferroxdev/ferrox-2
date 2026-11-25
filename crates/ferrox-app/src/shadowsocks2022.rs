@@ -6,7 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ferrox_core::failure::Kind;
-use ferrox_core::shadowsocks2022::{self, Cipher, Method, BLOCK_LEN, MAX_CHUNK, TAG_LEN};
+use ferrox_core::shadowsocks2022::{self, BLOCK_LEN, Cipher, MAX_CHUNK, Method, TAG_LEN};
 
 use crate::budgets::RELAY_POLL;
 use crate::conn::Connection;
@@ -64,11 +64,7 @@ fn fresh_salt(key_len: usize) -> Option<Vec<u8>> {
 }
 
 fn padding_for(payload_len: usize) -> usize {
-    if payload_len > 0 {
-        0
-    } else {
-        16
-    }
+    if payload_len > 0 { 0 } else { 16 }
 }
 
 /// Read and open the fixed+variable header of an already-salted request, returning the target and any early data; the request path says whether it names a mux session and the tests keep the direct reading.
@@ -381,8 +377,7 @@ fn accept_on(
     // The identity header names one account: the flow line reads that user and the counters ride both legs.
     let meter = identities
         .get(idx)
-        .map(|(email, level)| authenticate(email, *level))
-        .unwrap_or_default();
+        .map_or_default(|(email, level)| authenticate(email, *level));
     let mut recv = Cipher::from_psk(method, &user, &salt_probe)?;
     let (target, early) = read_request(reader, &mut recv)?;
     if salt_seen(&salt_probe) {
@@ -1065,10 +1060,11 @@ fn uplink_step(
     let read = plain_read.read(&mut buf[SEAL_HEAD..SEAL_HEAD + READ_CHUNK]);
     let sealed = match read {
         Ok(0) => {
-            if let Outbound::Server(response) = outbound {
-                if response.first_owed && response.seal_first(buf, 0, writer).is_err() {
-                    close();
-                }
+            if let Outbound::Server(response) = outbound
+                && response.first_owed
+                && response.seal_first(buf, 0, writer).is_err()
+            {
+                close();
             }
             return crate::proxy::lane_pool::Next::Done;
         }
@@ -2211,10 +2207,10 @@ impl Datagrams {
             if !peer_check(&mut self.peers, session, packet_id, now) {
                 return None;
             }
-            if let Some(cipher) = derived {
-                if let Some(peer) = self.peers.get_mut(&session) {
-                    peer.cipher.get_or_insert(cipher);
-                }
+            if let Some(cipher) = derived
+                && let Some(peer) = self.peers.get_mut(&session)
+            {
+                peer.cipher.get_or_insert(cipher);
             }
             Some((target, &packet[16 + 19 + pad + used..16 + len]))
         }
@@ -2475,10 +2471,10 @@ pub(crate) fn serve_udp_relay(
                 let Some((dest_psk, _)) = dests.get(idx) else {
                     continue;
                 };
-                if let Some(session) = relay_udp_client_of(dest_psk, &mut body, &buf[..n]) {
-                    if let Some(client) = client_of.get(&session) {
-                        let _ = clients.send_to(&buf[..n], client);
-                    }
+                if let Some(session) = relay_udp_client_of(dest_psk, &mut body, &buf[..n])
+                    && let Some(client) = client_of.get(&session)
+                {
+                    let _ = clients.send_to(&buf[..n], client);
                 }
             }
         }
@@ -3770,12 +3766,16 @@ mod tests {
             assert_eq!(idx, 1);
             assert_eq!(payload, b"multi-payload");
             assert!(server.open_multi(method, &list, &mut packet).is_none());
-            assert!(client
-                .seal_list(method, &list[..1], &target, b"x")
-                .is_none());
-            assert!(Datagrams::new()
-                .open_multi(Method::Chacha20Poly1305, &list, &mut packet)
-                .is_none());
+            assert!(
+                client
+                    .seal_list(method, &list[..1], &target, b"x")
+                    .is_none()
+            );
+            assert!(
+                Datagrams::new()
+                    .open_multi(Method::Chacha20Poly1305, &list, &mut packet)
+                    .is_none()
+            );
         }
         assert!(
             Datagrams::new()

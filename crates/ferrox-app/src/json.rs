@@ -609,11 +609,7 @@ fn classify(bytes: &[u8]) -> Shape {
             }
         }
     }
-    if comma {
-        Shape::Comma
-    } else {
-        Shape::Clean
-    }
+    if comma { Shape::Comma } else { Shape::Clean }
 }
 
 /// Whether a comment sits outside a string: read-only, and it stops at the first one.
@@ -1410,9 +1406,7 @@ mod tests {
         }
 
         fn byte(&mut self) -> u8 {
-            {
-                self.next_u64() as u8
-            }
+            self.next_u64() as u8
         }
 
         fn below(&mut self, bound: usize) -> usize {

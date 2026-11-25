@@ -360,7 +360,9 @@ mod tests {
             .expect("window");
             assert_eq!(
                 std::str::from_utf8(body).expect("ascii"),
-                format!("{{\"udid\": \"3f2b1c00-0000-4000-8000-000000000000\", \"appVersion\": \"5.0.2\", \"platform\": \"chrome\", \"platformVersion\": \"{USER_AGENT}\", \"timeZone\": \"Europe/Berlin\", \"deviceName\": \"Chrome 130\"}}")
+                format!(
+                    "{{\"udid\": \"3f2b1c00-0000-4000-8000-000000000000\", \"appVersion\": \"5.0.2\", \"platform\": \"chrome\", \"platformVersion\": \"{USER_AGENT}\", \"timeZone\": \"Europe/Berlin\", \"deviceName\": \"Chrome 130\"}}"
+                )
             );
             assert_eq!(
                 body.as_ptr() as usize - base as usize,

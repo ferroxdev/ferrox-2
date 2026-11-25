@@ -132,10 +132,10 @@ impl Legacy {
             match key.as_str() {
                 "subjectSelector" => selectors = selectors_of(field, "observatory")?,
                 "probeURL" => {
-                    if let Some(text) = field.as_str() {
-                        if !text.is_empty() {
-                            url = Some(text.to_owned());
-                        }
+                    if let Some(text) = field.as_str()
+                        && !text.is_empty()
+                    {
+                        url = Some(text.to_owned());
                     }
                 }
                 "probeInterval" => interval = crate::config::go_duration(field)?,

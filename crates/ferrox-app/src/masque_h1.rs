@@ -5,16 +5,16 @@
 use std::borrow::Cow;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ferrox_core::foxy::{connectip, frames, head_end};
 use ferrox_core::tls::{TlsConfig, TlsProvider as _};
 
 use crate::httpupgrade::HEAD_LIMIT;
-use crate::masque::{self, deliver, withdrawn, ServerSpec, Shared, AUTH_REALM};
+use crate::masque::{self, AUTH_REALM, ServerSpec, Shared, deliver, withdrawn};
 use crate::wg_stack::{Packet, UdpRoutes};
 
 const HANDSHAKE: Duration = Duration::from_secs(10);
@@ -441,7 +441,7 @@ fn connect_edge(
     }
     Err(format!(
         "cannot reach {edge}: {}",
-        last.map(|error| error.to_string()).unwrap_or_default()
+        last.map_or_default(|error| error.to_string())
     ))
 }
 

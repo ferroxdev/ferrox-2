@@ -290,10 +290,10 @@ impl Group {
             let delay = readings.and_then(|readings| History::read(readings, &leaf, revision));
             if stored == at {
                 current = Some((at, leaf, out, revision, delay));
-            } else if let Some(delay) = delay {
-                if best.as_ref().is_none_or(|(fastest, ..)| delay < *fastest) {
-                    best = Some((delay, at, leaf, out, revision));
-                }
+            } else if let Some(delay) = delay
+                && best.as_ref().is_none_or(|(fastest, ..)| delay < *fastest)
+            {
+                best = Some((delay, at, leaf, out, revision));
             }
         }
         let takeover = match &current {
@@ -548,25 +548,25 @@ impl Group {
         let mut tolerance = DEFAULT_TOLERANCE;
         match kind {
             Kind::Selector => {
-                if let Some(named) = text(config, "default", tag)? {
-                    if !named.is_empty() {
-                        let at = members
-                            .iter()
-                            .position(|member| member == named)
-                            .ok_or_else(|| {
-                                format!(
-                                    "selector `{tag}` default `{named}` is not one of its outbounds"
-                                )
-                            })?;
-                        default = Some(at);
-                    }
+                if let Some(named) = text(config, "default", tag)?
+                    && !named.is_empty()
+                {
+                    let at = members
+                        .iter()
+                        .position(|member| member == named)
+                        .ok_or_else(|| {
+                            format!(
+                                "selector `{tag}` default `{named}` is not one of its outbounds"
+                            )
+                        })?;
+                    default = Some(at);
                 }
             }
             Kind::UrlTest => {
-                if let Some(named) = text(config, "url", tag)? {
-                    if !named.is_empty() {
-                        named.clone_into(&mut url);
-                    }
+                if let Some(named) = text(config, "url", tag)?
+                    && !named.is_empty()
+                {
+                    named.clone_into(&mut url);
                 }
                 crate::conn::HttpUrl::parse(&url)
                     .map_err(|error| format!("urltest `{tag}` url `{url}`: {error}"))?;

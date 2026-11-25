@@ -2165,10 +2165,7 @@ fn verify_edge(spec: &ClientSpec, conn: &QuicheConnection) -> Result<(), String>
     }
     let chain: Vec<Vec<u8>> = match conn.peer_cert_chain() {
         Some(chain) => chain.iter().map(|cert| cert.to_vec()).collect(),
-        None => conn
-            .peer_cert()
-            .map(|cert| vec![cert.to_vec()])
-            .unwrap_or_default(),
+        None => conn.peer_cert().map_or_default(|cert| vec![cert.to_vec()]),
     };
     if ferrox_core::tls::verify_cert_pinned(&chain, &tls.cert_pins, &tls.server_name) {
         Ok(())
@@ -2542,10 +2539,10 @@ impl Stream {
         }
         self.buf.drain(..at);
         self.at = 0;
-        if let Some((_, declared)) = connectip::capsule_header(&self.capsules[self.capsule_at..]) {
-            if declared > CAPSULE_CAP as u64 {
-                return Err("masque: capsule exceeds the cap".to_owned());
-            }
+        if let Some((_, declared)) = connectip::capsule_header(&self.capsules[self.capsule_at..])
+            && declared > CAPSULE_CAP as u64
+        {
+            return Err("masque: capsule exceeds the cap".to_owned());
         }
         while let Some((used, capsule)) =
             connectip::capsule_split(&self.capsules[self.capsule_at..])
@@ -2660,11 +2657,11 @@ fn io(
         }
         let mut withdrew = false;
         for capsule in control.take_capsules() {
-            if let Owned::AddressAssign(body) = capsule {
-                if let Some(address) = withdrawn(&body, &addresses) {
-                    eprintln!("masque: the proxy withdrew {address}");
-                    withdrew = true;
-                }
+            if let Owned::AddressAssign(body) = capsule
+                && let Some(address) = withdrawn(&body, &addresses)
+            {
+                eprintln!("masque: the proxy withdrew {address}");
+                withdrew = true;
             }
         }
         if withdrew || control.done {
@@ -2851,10 +2848,10 @@ impl ListenerDone {
     }
 
     pub(crate) fn finish(&self) {
-        if self.remaining.fetch_sub(1, Ordering::SeqCst) == 1 {
-            if let Some(stop) = &self.stop {
-                stop.mark_closed();
-            }
+        if self.remaining.fetch_sub(1, Ordering::SeqCst) == 1
+            && let Some(stop) = &self.stop
+        {
+            stop.mark_closed();
         }
     }
 }
@@ -2930,12 +2927,12 @@ pub(crate) fn serve_inbound(
             .apply_to_udp(&sock, local)
             .map_err(|error| format!("masque sockopt on `{address}`: {error}"))?;
     }
-    if let Some(listener) = &h2_listener {
-        if let Some(options) = &spec.sockopt {
-            options
-                .apply_to_listener(listener)
-                .map_err(|error| format!("masque sockopt on `{address}`: {error}"))?;
-        }
+    if let Some(listener) = &h2_listener
+        && let Some(options) = &spec.sockopt
+    {
+        options
+            .apply_to_listener(listener)
+            .map_err(|error| format!("masque sockopt on `{address}`: {error}"))?;
     }
     let sock = match &spec.udp_mask {
         Some(mask) => Datagram::masked(sock, mask.clone(), spec.udp_filters.clone()),
@@ -3105,7 +3102,7 @@ impl ServerSpec {
             .get("users")
             .or_else(|| settings.get("clients"))
             .and_then(Json::as_arr)
-            .map(|users| {
+            .map_or_default(|users| {
                 users
                     .iter()
                     .filter_map(|user| {
@@ -3119,8 +3116,7 @@ impl ServerSpec {
                         Some((email, password))
                     })
                     .collect()
-            })
-            .unwrap_or_default();
+            });
         let warp = settings
             .get("warp")
             .and_then(Json::as_bool)
@@ -3572,11 +3568,11 @@ impl Family {
             .range(address..)
             .next()
             .map(|(&run_start, &run_end)| (run_start, run_end));
-        if let Some((run_start, run_end)) = after {
-            if address.checked_add(1) == Some(run_start) {
-                self.free.remove(&run_start);
-                end = run_end;
-            }
+        if let Some((run_start, run_end)) = after
+            && address.checked_add(1) == Some(run_start)
+        {
+            self.free.remove(&run_start);
+            end = run_end;
         }
         self.free.insert(start, end);
     }
@@ -3633,10 +3629,10 @@ fn dispatch(shared: &Shared, from_stack: Receiver<Vec<u8>>, stop: Option<Arc<Ato
             // A full queue drops the packet; the dispatcher must keep serving other tunnels.
             if tunnel.sender.try_send(packet).is_ok() {
                 // Wake after the packet is visible, so a worker that cleared `pending` finds it.
-                if let Some(wake) = &tunnel.wake {
-                    if !tunnel.pending.swap(true, Ordering::Release) {
-                        let _ = wake.send(Arrival::Ready);
-                    }
+                if let Some(wake) = &tunnel.wake
+                    && !tunnel.pending.swap(true, Ordering::Release)
+                {
+                    let _ = wake.send(Arrival::Ready);
                 }
             }
         }
@@ -4443,10 +4439,10 @@ fn drain_capsules(tunnel: &mut Tunnel, mtu: usize) -> Option<Vec<Vec<u8>>> {
     }
     tunnel.buf.drain(..at);
     tunnel.at = 0;
-    if let Some((_, declared)) = connectip::capsule_header(&tunnel.capsules[tunnel.capsule_at..]) {
-        if declared > CAPSULE_CAP as u64 {
-            return None;
-        }
+    if let Some((_, declared)) = connectip::capsule_header(&tunnel.capsules[tunnel.capsule_at..])
+        && declared > CAPSULE_CAP as u64
+    {
+        return None;
     }
     let mut answers = Vec::new();
     while let Some((used, capsule)) =
@@ -4616,13 +4612,13 @@ fn forward_to(
     if dropped_destination(destination) {
         return None;
     }
-    if let Ok(tunnels) = shared.tunnels.lock() {
-        if let Some(other) = tunnels.get(&destination) {
-            if !addrs.contains(&destination) {
-                return Some(Forward::Tunnel(other.sender.clone()));
-            }
-            return None;
+    if let Ok(tunnels) = shared.tunnels.lock()
+        && let Some(other) = tunnels.get(&destination)
+    {
+        if !addrs.contains(&destination) {
+            return Some(Forward::Tunnel(other.sender.clone()));
         }
+        return None;
     }
     if spec.pool.holds(destination) && !shared.local.contains(&destination) {
         return None;
@@ -5316,18 +5312,22 @@ mod tests {
         let masque = MasqueOut::new(&outbound(0)).expect("outbound");
         let start = Instant::now();
         let mut dials = 0;
-        assert!(masque
-            .ensure_at(start, || {
-                dials += 1;
-                Err("no edge".to_owned())
-            })
-            .is_err());
-        assert!(masque
-            .ensure_at(start + Duration::from_millis(999), || {
-                dials += 1;
-                Ok(dead_lane(false))
-            })
-            .is_err());
+        assert!(
+            masque
+                .ensure_at(start, || {
+                    dials += 1;
+                    Err("no edge".to_owned())
+                })
+                .is_err()
+        );
+        assert!(
+            masque
+                .ensure_at(start + Duration::from_millis(999), || {
+                    dials += 1;
+                    Ok(dead_lane(false))
+                })
+                .is_err()
+        );
         assert_eq!(dials, 1, "the second dial ran before its second");
         let due = start + Duration::from_secs(1);
         masque
@@ -5344,18 +5344,22 @@ mod tests {
             })
             .expect("a lane that stayed up clears the history");
         assert_eq!(dials, 3);
-        assert!(masque
-            .ensure_at(proven, || {
-                dials += 1;
-                Ok(dead_lane(false))
-            })
-            .is_err());
-        assert!(masque
-            .ensure_at(proven + Duration::from_millis(999), || {
-                dials += 1;
-                Ok(dead_lane(false))
-            })
-            .is_err());
+        assert!(
+            masque
+                .ensure_at(proven, || {
+                    dials += 1;
+                    Ok(dead_lane(false))
+                })
+                .is_err()
+        );
+        assert!(
+            masque
+                .ensure_at(proven + Duration::from_millis(999), || {
+                    dials += 1;
+                    Ok(dead_lane(false))
+                })
+                .is_err()
+        );
         let retry = proven + Duration::from_secs(1);
         masque
             .ensure_at(retry, || {
@@ -6668,14 +6672,16 @@ mod tests {
         )
         .expect("the reference outbound");
         let spec = ClientSpec::from(&outbound).expect("the reference spec");
-        assert!(spec
-            .headers
-            .iter()
-            .any(|(name, value)| name == "authorization" && value == "Basic dTpwOnE="));
-        assert!(spec
-            .headers
-            .iter()
-            .any(|(name, value)| name == "x-token" && value == "a"));
+        assert!(
+            spec.headers
+                .iter()
+                .any(|(name, value)| name == "authorization" && value == "Basic dTpwOnE=")
+        );
+        assert!(
+            spec.headers
+                .iter()
+                .any(|(name, value)| name == "x-token" && value == "a")
+        );
         let conflict = crate::json::parse(
             r#"{"settings":{"address":"127.0.0.1","port":8443},"streamSettings":{"security":"tls","tlsSettings":{"serverName":"localhost","allowInsecure":true},"masqueSettings":{"user":"u","pass":"p","headers":{"Authorization":"Bearer x"}}}}"#,
         )
@@ -7336,9 +7342,11 @@ mod tests {
                 .any(|window| window == [0x42, 0x76, 0x01]),
             "the draft-datagram setting is absent"
         );
-        assert!(!h3_settings(false)
-            .windows(3)
-            .any(|window| window == [0x42, 0x76, 0x01]));
+        assert!(
+            !h3_settings(false)
+                .windows(3)
+                .any(|window| window == [0x42, 0x76, 0x01])
+        );
     }
 
     #[test]

@@ -55,10 +55,10 @@ impl std::fmt::Display for Method {
 #[must_use]
 pub fn parse_psk(password: &str, key_len: usize) -> Option<Vec<u8>> {
     let clean = password.trim();
-    if let Some(decoded) = crate::b64::decode(clean.as_bytes()) {
-        if decoded.len() == key_len {
-            return Some(decoded);
-        }
+    if let Some(decoded) = crate::b64::decode(clean.as_bytes())
+        && decoded.len() == key_len
+    {
+        return Some(decoded);
     }
     let raw = clean.as_bytes();
     if raw.len() == key_len {
@@ -490,8 +490,8 @@ impl std::fmt::Debug for SlidingWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aes_gcm::aead::AeadInOut as _;
     use aes_gcm::KeyInit as _;
+    use aes_gcm::aead::AeadInOut as _;
 
     #[test]
     fn the_method_table_is_the_2022_spellings() {

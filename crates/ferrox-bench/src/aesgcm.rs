@@ -1,12 +1,12 @@
 use std::fmt::Write as _;
 
-use aes_gcm::aead::AeadInOut as _;
 use aes_gcm::KeyInit as _;
+use aes_gcm::aead::AeadInOut as _;
 
 use ferrox_core::aesgcm::{Aes128Gcm, Aes256Gcm};
 
 use crate::count;
-use crate::framing::{timed_row, Row};
+use crate::framing::{Row, timed_row};
 
 fn payloads() -> Vec<usize> {
     vec![64, 256, 512, 1400, 4096, 8171, 16_383]

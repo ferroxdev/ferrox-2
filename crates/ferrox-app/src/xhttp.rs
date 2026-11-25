@@ -463,10 +463,10 @@ impl<R: Read> Reader<R> {
             let size = match read_chunk_line(self)? {
                 SizeLine::Size(size) => size,
                 SizeLine::Invalid => {
-                    return Err(std::io::Error::from(std::io::ErrorKind::InvalidData))
+                    return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
                 }
                 SizeLine::End => {
-                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
+                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
                 }
             };
             if size == 0 {
@@ -540,7 +540,7 @@ impl<R: Read> Reader<R> {
             let size = match xhttp_chunk_line(&self.prefix, &mut self.at) {
                 ChunkLine::Size(size) => size,
                 ChunkLine::Invalid => {
-                    return Err(std::io::Error::from(std::io::ErrorKind::InvalidData))
+                    return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
                 }
                 ChunkLine::Need => {
                     if self.prefix.len() - self.at >= 129 {
@@ -1891,10 +1891,10 @@ fn padding_valid(value: &str, from: u32, to: u32, method: PadMethod) -> bool {
 fn query_param<'a>(target: &'a str, key: &str) -> Option<&'a str> {
     let q = target.split_once('?')?.1;
     for part in q.split('&') {
-        if let Some((k, v)) = part.split_once('=') {
-            if k == key {
-                return Some(v);
-            }
+        if let Some((k, v)) = part.split_once('=')
+            && k == key
+        {
+            return Some(v);
         }
     }
     None
@@ -2062,10 +2062,10 @@ fn extract_padding<'a>(
     settings: &XhttpSettings,
 ) -> Option<&'a str> {
     if !settings.x_padding_obfs {
-        if let Some(remark) = crate::proxy::header_value_in(text, "referer") {
-            if let Some(v) = query_param(remark, "x_padding") {
-                return Some(v);
-            }
+        if let Some(remark) = crate::proxy::header_value_in(text, "referer")
+            && let Some(v) = query_param(remark, "x_padding")
+        {
+            return Some(v);
         }
         return query_param(target, "x_padding");
     }
@@ -3328,10 +3328,11 @@ pub(crate) fn accept_core<
         resp.push_str("Access-Control-Allow-Methods: *\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Origin: *\r\n");
         resp.push_str("Content-Length: 0\r\nConnection: keep-alive\r\n\r\n");
         let _ = write.write_all(resp.as_bytes());
-        if h2.is_none() && alive {
-            if let Some(read) = upload.into_h1() {
-                return Served::Again(read, write, prefix);
-            }
+        if h2.is_none()
+            && alive
+            && let Some(read) = upload.into_h1()
+        {
+            return Served::Again(read, write, prefix);
         }
         return Served::Closed;
     }
@@ -3559,10 +3560,12 @@ pub(crate) fn accept_core<
                 return Served::Closed;
             }
             plain_ok(&mut write, settings, &padded);
-            if resumable && h2.is_none() && keeps_alive(text) {
-                if let Some(read) = upload.into_h1() {
-                    return Served::Again(read, write, carry);
-                }
+            if resumable
+                && h2.is_none()
+                && keeps_alive(text)
+                && let Some(read) = upload.into_h1()
+            {
+                return Served::Again(read, write, carry);
             }
             Served::Closed
         }
@@ -3845,7 +3848,10 @@ pub(crate) fn dial_head(
             normalized_path(settings)
         )
     };
-    format!("{} {target} HTTP/1.1\r\nHost: {host}\r\n{headers}{extra}{padding}{referer_line}Transfer-Encoding: chunked\r\nContent-Type: {content_type}\r\nConnection: close\r\n\r\n", settings.uplink_method)
+    format!(
+        "{} {target} HTTP/1.1\r\nHost: {host}\r\n{headers}{extra}{padding}{referer_line}Transfer-Encoding: chunked\r\nContent-Type: {content_type}\r\nConnection: close\r\n\r\n",
+        settings.uplink_method
+    )
 }
 
 /// The downlink a packet-up or stream-up dial opens beside its upload (dialer.go:411).
@@ -3868,7 +3874,9 @@ pub(crate) fn downlink_head(host: &str, settings: &XhttpSettings, session: &str)
             normalized_path(settings)
         )
     };
-    format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n{headers}{extra}{padding}{referer_line}Connection: close\r\n\r\n")
+    format!(
+        "GET {target} HTTP/1.1\r\nHost: {host}\r\n{headers}{extra}{padding}{referer_line}Connection: close\r\n\r\n"
+    )
 }
 
 /// The referer's pad the dial-side heads draw: a run in the configured range and method, the shape the hub's own check validates (`xpadding.go`'s `MakeXPadding`).
@@ -3971,11 +3979,11 @@ pub(crate) fn packet_head<'a>(
                 format!("Referer: http://{host}{}{referer}\r\n", settings.path)
             };
             (
-            format!(
-                "{method} {target} HTTP/1.1\r\nHost: {host}\r\n{headers}{extra}{padding}Content-Length: {}\r\n{referer_line}Connection: keep-alive\r\n\r\n",
-                piece.len()
-            ),
-            Some(piece),
+                format!(
+                    "{method} {target} HTTP/1.1\r\nHost: {host}\r\n{headers}{extra}{padding}Content-Length: {}\r\n{referer_line}Connection: keep-alive\r\n\r\n",
+                    piece.len()
+                ),
+                Some(piece),
             )
         }
     }
@@ -6218,9 +6226,11 @@ mod tests {
             .flat_map(|(_, body)| body.iter().copied())
             .collect();
         assert_eq!(got, want);
-        assert!(posts
-            .iter()
-            .all(|(_, body)| !body.is_empty() && body.len() <= 7));
+        assert!(
+            posts
+                .iter()
+                .all(|(_, body)| !body.is_empty() && body.len() <= 7)
+        );
     }
 
     /// A stream-up dial uploads the whole payload before the downlink carries a byte: the two halves are independent, and the upload's `0` terminator ends the session the downlink reads from.
@@ -7759,9 +7769,11 @@ mod tests {
                 "the relay writes the upload's own bytes"
             );
         }
-        assert!(crate::proxy::WindowRead::read_window(&mut reader)
-            .expect("empty")
-            .is_empty());
+        assert!(
+            crate::proxy::WindowRead::read_window(&mut reader)
+                .expect("empty")
+                .is_empty()
+        );
         close_session(&session);
     }
 
