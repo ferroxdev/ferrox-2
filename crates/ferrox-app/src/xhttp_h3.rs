@@ -1075,7 +1075,7 @@ fn synth_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Option<Vec<u8>> {
     if !h1_token(method) || !h1_token(target) {
         return None;
     }
-    room += method.len() + target.len() + b" HTTP/3\r\n".len();
+    room += method.len() + target.len() + 1 + b" HTTP/3\r\n".len();
     if let Some(authority) = authority {
         room += authority.len() + b"Host: \r\n".len();
     }
