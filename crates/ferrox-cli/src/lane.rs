@@ -88,7 +88,11 @@ pub fn alive(pid: u32) -> bool {
         let Ok(pid) = i32::try_from(pid) else {
             return false;
         };
-        unsafe { libc::kill(pid, 0) == 0 }
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return true;
+        }
+        // A TUN lane runs as root; an unprivileged `down` sees EPERM, and the pid still exists.
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
     #[cfg(windows)]
     {
@@ -108,7 +112,16 @@ pub fn alive(pid: u32) -> bool {
 }
 
 pub fn running(paths: &Paths) -> bool {
-    pid(paths).is_some_and(|pid| alive(pid) && is_ferrox(paths, pid))
+    pid(paths).is_some_and(|pid| {
+        if !alive(pid) {
+            return false;
+        }
+        match process_exe(pid) {
+            Some(actual) => recognises(&actual, &recorded_bin(paths), env_bin().as_deref()),
+            // An unreadable `/proc/<pid>/exe` is another uid: the lane's own pid file still names it.
+            None => cfg!(any(target_os = "linux", target_os = "macos")),
+        }
+    })
 }
 
 fn process_exe(pid: u32) -> Option<PathBuf> {
@@ -418,7 +431,7 @@ pub fn adopt_config(paths: &mut Paths) {
     }
 }
 
-pub fn start(bin: &Path, paths: &Paths, debug: bool) -> Result<u32, String> {
+pub fn start(bin: &Path, paths: &Paths, debug: bool, vpn: bool) -> Result<u32, String> {
     secure_dir(&paths.conf_dir)
         .map_err(|error| format!("cannot create the config dir: {error}"))?;
     secure_dir(&paths.state_dir)
@@ -445,17 +458,25 @@ pub fn start(bin: &Path, paths: &Paths, debug: bool) -> Result<u32, String> {
     let err = out
         .try_clone()
         .map_err(|error| format!("cannot open {}: {error}", paths.log.display()))?;
-    let mut command = Command::new(&bin);
-    command
-        .arg("run")
-        .arg("-c")
-        .arg(&paths.cfg)
-        .stdin(Stdio::null())
-        .stdout(out)
-        .stderr(err);
-    if debug {
-        command.env("FOXY_DEBUG", "1");
+    let _ = std::fs::remove_file(&paths.stop_file);
+    #[cfg(unix)]
+    let sudo = vpn && unsafe { libc::geteuid() } != 0;
+    #[cfg(not(unix))]
+    let sudo = {
+        let _ = vpn;
+        false
+    };
+    if sudo {
+        authenticate_sudo()?;
+        write_private(&paths.pid_file, "")
+            .map_err(|error| format!("cannot prepare {}: {error}", paths.pid_file.display()))?;
     }
+    let mut command = if sudo {
+        sudo_command(&bin, paths, debug)
+    } else {
+        direct_command(&bin, paths, debug)
+    };
+    command.stdin(Stdio::null()).stdout(out).stderr(err);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
@@ -464,12 +485,25 @@ pub fn start(bin: &Path, paths: &Paths, debug: bool) -> Result<u32, String> {
     let mut child = command
         .spawn()
         .map_err(|error| format!("cannot start {}: {error}", bin.display()))?;
-    let pid = child.id();
-    if let Err(error) = write_private(&paths.pid_file, &format!("{pid}\n")) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(format!("cannot write the pid file: {error}"));
-    }
+    let pid = if sudo {
+        match wait_pid_file(paths, &mut child) {
+            Ok(pid) => pid,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(&paths.pid_file);
+                return Err(format!("{error}; see {}", paths.log.display()));
+            }
+        }
+    } else {
+        let pid = child.id();
+        if let Err(error) = write_private(&paths.pid_file, &format!("{pid}\n")) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("cannot write the pid file: {error}"));
+        }
+        pid
+    };
     // Reap the engine when it exits, so `serve` sees it leave instead of looping on a zombie.
     std::thread::spawn(move || {
         let _ = child.wait();
@@ -477,12 +511,105 @@ pub fn start(bin: &Path, paths: &Paths, debug: bool) -> Result<u32, String> {
     Ok(pid)
 }
 
+#[cfg(unix)]
+fn authenticate_sudo() -> Result<(), String> {
+    let status = Command::new("sudo").arg("-v").status().map_err(|error| {
+        format!("--vpn needs root and sudo could not run: {error}; nothing was started.")
+    })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(
+            "--vpn needs root; sudo could not authenticate, so the lane was not started."
+                .to_owned(),
+        )
+    }
+}
+
+#[cfg(not(unix))]
+fn authenticate_sudo() -> Result<(), String> {
+    Ok(())
+}
+
+fn direct_command(bin: &Path, paths: &Paths, debug: bool) -> Command {
+    let mut command = Command::new(bin);
+    command
+        .arg("run")
+        .arg("-c")
+        .arg(&paths.cfg)
+        .env("FERROX_STOP_FILE", &paths.stop_file);
+    if debug {
+        command.env("FOXY_DEBUG", "1");
+    }
+    command
+}
+
+/// The app is the only privileged process: `sudo` runs a shell that records its
+/// own pid (the app after `exec`) into the user-owned pid file and hands over.
+#[cfg(unix)]
+fn sudo_command(bin: &Path, paths: &Paths, debug: bool) -> Command {
+    let mut command = Command::new("sudo");
+    command.arg("/usr/bin/env");
+    command.arg(format!("FERROX_STOP_FILE={}", paths.stop_file.display()));
+    if debug {
+        command.arg("FOXY_DEBUG=1");
+    }
+    command
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg("echo $$ > \"$1\"; shift; exec \"$@\"")
+        .arg("ferrox-sudo")
+        .arg(&paths.pid_file)
+        .arg(bin)
+        .arg("run")
+        .arg("-c")
+        .arg(&paths.cfg);
+    command
+}
+
+#[cfg(not(unix))]
+fn sudo_command(bin: &Path, paths: &Paths, debug: bool) -> Command {
+    direct_command(bin, paths, debug)
+}
+
+#[cfg(unix)]
+fn wait_pid_file(paths: &Paths, child: &mut std::process::Child) -> Result<u32, String> {
+    for _ in 0..1200 {
+        if let Some(pid) = pid(paths) {
+            if alive(pid) {
+                return Ok(pid);
+            }
+            return Err(format!(
+                "the privileged app exited before it served (pid {pid}); the TUN device may be unavailable"
+            ));
+        }
+        if child.try_wait().ok().flatten().is_some() {
+            return Err(
+                "sudo did not start the app (a password prompt needs a terminal)".to_owned(),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err("sudo did not start the app (a password prompt needs a terminal)".to_owned())
+}
+
+#[cfg(not(unix))]
+fn wait_pid_file(_paths: &Paths, _child: &mut std::process::Child) -> Result<u32, String> {
+    Err("privileged start is Unix-only".to_owned())
+}
+
 pub fn stop(paths: &Paths) -> Result<(), String> {
     if let Some(pid) = pid(paths) {
         if alive(pid) {
-            kill(paths, pid)?;
+            // The app restores the routes and exits on its own; an older process is killed after the grace period.
+            let _ = write_private(&paths.stop_file, "stop\n");
+            #[cfg(any(unix, windows))]
+            if !wait_exit(pid, 300) {
+                kill(paths, pid)?;
+            }
         }
     }
+    let _ = std::fs::remove_file(&paths.stop_file);
     match std::fs::remove_file(&paths.pid_file) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -561,6 +688,17 @@ pub fn port_open(addresses: &[SocketAddr]) -> bool {
         .any(|address| TcpStream::connect_timeout(address, Duration::from_millis(300)).is_ok())
 }
 
+pub fn wait_port(port: u16) -> bool {
+    let addresses = loopback_addresses(port);
+    for _ in 0..90 {
+        if port_open(&addresses) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    false
+}
+
 pub fn wait_fronts(list: &str, ports: Ports, paths: &Paths) -> bool {
     let listeners = front_listeners(&paths.cfg, list);
     for front in fronts(list) {
@@ -586,6 +724,24 @@ pub fn wait_fronts(list: &str, ports: Ports, paths: &Paths) -> bool {
         }
     }
     true
+}
+
+/// Wait for the app's readiness line: the device is open and its routes are in.
+pub fn wait_tun(paths: &Paths) -> bool {
+    for _ in 0..600 {
+        if let Some(text) = read_trim(&paths.log) {
+            if text.lines().any(|line| {
+                line.starts_with("tun inbound: interface ") && line.contains(" up (stack ")
+            }) {
+                return true;
+            }
+        }
+        if !running(paths) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
 }
 
 pub fn uptime(paths: &Paths) -> Option<String> {

@@ -40,6 +40,30 @@ pub(crate) fn capture_generation() -> u64 {
     }
 }
 
+/// Restore every live capture's routes for a process that is exiting. A signal
+/// or `TerminateProcess` skips `Drop`, so the CLI's stop file and the signal
+/// handler both call this before `exit`.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+pub(crate) fn release_all() {
+    let _operation = route_operation();
+    let guards: Vec<Arc<Guard>> = capture()
+        .lock()
+        .map(|mut slot| {
+            slot.retain(|weak| weak.strong_count() > 0);
+            slot.iter().filter_map(Weak::upgrade).collect()
+        })
+        .unwrap_or_default();
+    for guard in guards {
+        guard.release_now();
+    }
+    if let Ok(mut manager) = RouteManager::new() {
+        retry_pending(&mut manager);
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub(crate) fn release_all() {}
+
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn installed_pins() -> &'static Mutex<HashMap<(IpAddr, u8), Route>> {
     static PINS: OnceLock<Mutex<HashMap<(IpAddr, u8), Route>>> = OnceLock::new();
@@ -856,6 +880,35 @@ impl Guard {
         if let Ok(mut pinned) = self.pinned.lock() {
             pinned.insert(key, route);
         }
+    }
+
+    fn release_now(&self) {
+        let routes: Vec<Route> = self
+            .added
+            .lock()
+            .map(|mut added| added.drain(..).collect())
+            .unwrap_or_default();
+        let pinned: Vec<((IpAddr, u8), Route)> = self
+            .pinned
+            .lock()
+            .map(|mut pinned| pinned.drain().collect())
+            .unwrap_or_default();
+        let Ok(mut manager) = self.manager.lock() else {
+            return;
+        };
+        if let Ok(mut global) = installed_pins().lock() {
+            for (key, _) in &pinned {
+                global.remove(key);
+            }
+            global.clear();
+        }
+        for route in routes.into_iter().rev() {
+            defer_delete(&mut manager, &route);
+        }
+        for (_, route) in pinned {
+            defer_delete(&mut manager, &route);
+        }
+        CAPTURE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

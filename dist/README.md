@@ -17,12 +17,14 @@ USAGE.md              the manual: every lane, every port, what to do when it doe
 ```powershell
 Expand-Archive ferrox-*-x86_64-pc-windows-msvc.zip -DestinationPath .
 cd ferrox-*-x86_64-pc-windows-msvc
-.\ferrox-cli.exe up --foxy --vpn
+.\ferrox-cli.exe up --foxy --vpn    # TUN: run this from an elevated terminal
 .\ferrox-cli.exe status
 .\ferrox-cli.exe down
 ```
 
 **macOS and Linux:** run `ferrox-cli.sh`, as shown below. The shell launcher needs `python3` and `curl` on `PATH`: Python writes and plans the config even for `ports`, and curl proves the connection before traffic is routed. The native Windows launcher needs neither.
+
+`--vpn` opens a TUN device on all three platforms: root on macOS/Linux (only the app process runs under `sudo`; the CLI and its files stay user-owned), Administrator plus the bundled `wintun.dll` on Windows. `--vpn-proxy` keeps the old system-proxy behaviour.
 
 ## 30-second start — the Foxy lane
 
@@ -31,13 +33,13 @@ The Foxy lane needs a Firefox account: an email and a password, nothing else. Th
 ```bash
 tar xzf ferrox-*-aarch64-apple-darwin.tar.gz   # or your platform's package
 cd ferrox-*-aarch64-apple-darwin
-./ferrox-cli.sh up --foxy --vpn    # macOS: asks email + password, then arms the system proxy
-./ferrox-cli.sh up --foxy          # Linux: same lane, no --vpn; point apps at the fronts
+./ferrox-cli.sh up --foxy --vpn    # asks email + password, then opens the TUN device
+./ferrox-cli.sh up --foxy          # same lane, ports only; point apps at the fronts
 ./ferrox-cli.sh status             # uptime, carrier, quota left, exit IP and country
-./ferrox-cli.sh down               # stop and clear the system proxy
+./ferrox-cli.sh down               # stop and restore the routes
 ```
 
-On Linux there is no `--vpn`: use the command without it and point apps at the fronts as shown under Ports below. The prompts are identical on Windows; use `.\ferrox-cli.exe` in place of `./ferrox-cli.sh`.
+`--vpn` is the same command on macOS and Linux: the launcher starts the app through `sudo`, which opens a TUN device, installs the default routes and restores them on `down` (or on SIGTERM/Ctrl-C). The prompts are identical on Windows; use `.\ferrox-cli.exe` in place of `./ferrox-cli.sh`, from an elevated terminal.
 
 On Windows the native launcher keeps config and account files under `%APPDATA%\ferrox` and pid/log/system-proxy state under `%LOCALAPPDATA%\ferrox`, owner-only through NTFS ACLs. The `~/.config/ferrox` paths below describe macOS and Linux.
 
@@ -46,7 +48,7 @@ The answer is stored once, in `~/.config/ferrox/credentials`, mode 0600, outside
 ```bash
 ./ferrox-cli.sh login --email you@example.com   # prompts for the password, hidden
 ./ferrox-cli.sh login --email you@example.com --password 'the-password'
-./ferrox-cli.sh up --foxy --country DE          # any exit country, no --vpn for ports-only
+./ferrox-cli.sh up --foxy --country DE          # any exit country; omit --vpn for ports-only
 ./ferrox-cli.sh logout                          # forget the account and the saved session
 ```
 
@@ -63,7 +65,12 @@ Pick an exit before connecting — the catalogue is public, so this needs no acc
 ./ferrox-cli.sh location --veepn nl # remember a VeePN region
 ./ferrox-cli.sh location --psiphon US
 ./ferrox-cli.sh up --foxy --exclude-ports 22 --exclude-domains printer.lan   # these leave the tunnel
-./ferrox-cli.sh up --foxy --udp-via warp        # TCP on foxy, UDP on a separate WARP lane
+./ferrox-cli.sh up --warp                       # the WARP (Aether) lane by itself
+./ferrox-cli.sh up --warp --warp-mode gool-classic   # WARP in WARP
+./ferrox-cli.sh up --warp --vpn                 # whole-device capture through WARP
+./ferrox-cli.sh up --foxy --udp-via warp        # TCP on foxy, UDP on the WARP outbound
+./ferrox-cli.sh up --foxy --vpn --warp          # TUN capture pinned to the WARP edge
+./ferrox-cli.sh up --psiphon --warp             # the native Psiphon lane through WARP
 ```
 
 Run more than one lane at once — each named instance owns its config, pid, log, ports and remembered exit, while the account and catalogue stay shared; ports left unnamed are the first free ones near the defaults:
@@ -81,8 +88,8 @@ Run more than one lane at once — each named instance owns its config, pid, log
 VeePN needs nothing typed in: no account, no server. The plane launches this device anonymously, names a region, and lists the upstreams that answer for the pair it printed, so one command starts the lane:
 
 ```bash
-./ferrox-cli.sh up --veepn --vpn    # macOS: anonymous, no account, no server
-./ferrox-cli.sh up --veepn          # Linux: same lane, no --vpn; point apps at the fronts
+./ferrox-cli.sh up --veepn --vpn    # anonymous, no account, no server; TUN (sudo)
+./ferrox-cli.sh up --veepn          # same lane, ports only; point apps at the fronts
 ./ferrox-cli.sh status
 ./ferrox-cli.sh down
 ```
@@ -101,25 +108,25 @@ Every share link this build dials goes through the same one command; anything be
 ./ferrox-cli.sh up --config mine.json
 ```
 
-Add `--vpn` on macOS to arm the system proxy; on Linux run them as shown and point apps at the fronts.
+Add `--vpn` on any platform to capture the whole host (it needs root/Administrator); without it, point apps at the fronts.
 
 Here the server is in the link or the `HOST:PORT` — unlike Foxy, these lanes dial the server you name. An invocation that cannot start the lane it names is refused before anything runs: `up --vless` with no link prints the example, `up --vmess` without `--uuid` names the missing id, and a rejected `up` leaves a lane that is already carrying traffic untouched.
 
-The Psiphon lane is native: `./ferrox-cli.sh up --psiphon --vpn` on macOS (or `./ferrox-cli.sh up --psiphon` on Linux, with apps pointed at the fronts) fetches the signed server list and speaks OSSH/SSH itself, with no `psiphon-tunnel-core` and no account. `--psiphon-cdn` asks for CDN fronting and beast mode in one flag; `--psiphon-conduit-mode private` and `--psiphon-cdn-profile fronted` name the two settings directly. A fronted entry is dialled through its CDN front with the version-4 meek cookie; a list with no fronted entry falls back to SSH/OSSH with one line, and conduit still needs volunteer relays. The public private-compartment id is the default; `--psiphon-compartment ID` overrides it.
+The Psiphon lane is native: `./ferrox-cli.sh up --psiphon --vpn` (or `./ferrox-cli.sh up --psiphon` with apps pointed at the fronts) fetches the signed server list and speaks OSSH/SSH itself, with no `psiphon-tunnel-core` and no account. `--psiphon-cdn` asks for CDN fronting and beast mode in one flag; `--psiphon-conduit-mode private` and `--psiphon-cdn-profile fronted` name the two settings directly. A fronted entry is dialled through its CDN front with the version-4 meek cookie; a list with no fronted entry falls back to SSH/OSSH with one line, and conduit still needs volunteer relays. The public private-compartment id is the default; `--psiphon-compartment ID` overrides it.
 
 ## Ports, on every platform
 
 The fronts are loopback-only: SOCKS5 `127.0.0.1:10808`, HTTP+HTTPS `127.0.0.1:8080`, mixed `127.0.0.1:10809` (`--socks`/`--http`/`--mixed` move them, `./ferrox-cli.sh ports` prints the map).
 
-- **macOS** — `--vpn` arms and clears the system proxy for you.
-- **Linux** — point apps at the fronts by hand: `ALL_PROXY=socks5h://127.0.0.1:10808 <app>`, or set GNOME/KDE network proxy to `127.0.0.1:8080`.
-- **Windows** — `.\ferrox-cli.exe up --foxy --vpn` arms the system proxy through the WinINET Internet Settings that Chrome, Edge and most desktop apps read, and `.\ferrox-cli.exe down` restores the previous settings. `ferrox-cli.cmd` forwards to the same launcher. From Git Bash only, `./ferrox-cli.sh up --foxy` is the ports-only fallback; use the native launcher for `--vpn`. Without `--vpn`, set Settings > Network & Internet > Proxy to `127.0.0.1:8080`, or use the fronts per app.
+- **macOS** — `--vpn` opens a TUN device and routes the whole host; `--vpn-proxy` arms the system proxy instead.
+- **Linux** — `--vpn` opens a TUN device (the app runs under `sudo`); or point apps at the fronts: `ALL_PROXY=socks5h://127.0.0.1:10808 <app>`, or set GNOME/KDE network proxy to `127.0.0.1:8080`.
+- **Windows** — `.\ferrox-cli.exe up --foxy --vpn` from an elevated terminal opens a TUN device (the zip ships `wintun.dll` beside the binary) and `down` restores the routes. `--vpn-proxy` arms the WinINET system proxy that Chrome, Edge and most desktop apps read. `ferrox-cli.cmd` forwards to the same launcher.
 
 Use `socks5h://` (the `h`) so names resolve at the exit, not on your machine.
 
 ## What VPN mode is, and is not
 
-`--vpn` routes every app that honours the system proxy (browsers, most Electron apps) over the lane. It is not a device-wide tunnel: this build carries no TUN device, so apps that ignore proxies and raw UDP are not captured — `./ferrox-cli.sh tun` prints the full reason and what to use instead (SOCKS5 UDP rides the lane for apps that speak it).
+`--vpn` opens a TUN device and captures the whole host: TCP, UDP and ICMP, including apps that ignore proxies. It needs root on macOS/Linux or Administrator on Windows. Pick the engine with `--vpn-engine`: `native` (default, the `hev` translator), `userspace` (smoltcp/gvisor), `system` (Linux kernel stack) or `hybrid` (Linux kernel TCP plus userspace UDP). `--vpn-ipv6`, `--vpn-mtu`, `--vpn-name` and `--vpn-dns` tune it. `--vpn-proxy` is the old behaviour: only apps that honour the system proxy, and no UDP.
 
 ## Verify the download
 
