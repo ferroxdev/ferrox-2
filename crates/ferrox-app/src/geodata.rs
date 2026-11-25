@@ -5,6 +5,7 @@ use crate::conn::HttpUrl;
 use crate::json::Json;
 use crate::proxy::{Destination, Outbound, RouteShared};
 use ferrox_core::tls::TlsProvider as _;
+use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::path::{Path, PathBuf};
@@ -654,6 +655,7 @@ pub(crate) fn start(
         });
 }
 
+#[allow(clippy::too_many_lines)]
 fn run(
     assets: &[Asset],
     route: Option<&RouteShared>,
@@ -661,8 +663,11 @@ fn run(
     tag: &str,
     root: &Json,
 ) -> Result<(), String> {
+    let remote = route.map_or_else(std::collections::HashMap::new, |_| {
+        crate::router::Routing::prefetch_remote_sets(root)
+    });
     if assets.is_empty() {
-        return reload(route, root);
+        return reload(route, root, &remote);
     }
     let outbound = match route {
         Some(route) => route.outbound_for(tag),
@@ -670,27 +675,205 @@ fn run(
     };
     let outbound = outbound.ok_or_else(|| format!("geodata outbound `{tag}` is not found"))?;
     let staged = download_all(assets, &outbound)?;
-    let transaction = match swap_all(&staged) {
-        Ok(transaction) => transaction,
-        Err(reason) => {
-            clean(&staged);
-            return Err(reason);
+    // One directory entry can be named twice; both spellings publish the last download, so the candidate matches the file that lands.
+    let mut final_temp = std::collections::HashMap::with_capacity(staged.len());
+    for stage in &staged {
+        if let Some(key) = crate::router::entry_key(&stage.target) {
+            final_temp.insert(key, stage.temp.clone());
         }
+    }
+    let mut candidates = std::collections::HashMap::with_capacity(staged.len() * 2);
+    for stage in &staged {
+        let temp = crate::router::entry_key(&stage.target)
+            .and_then(|key| final_temp.get(&key))
+            .cloned()
+            .unwrap_or_else(|| stage.temp.clone());
+        candidates.insert(stage.target.clone(), temp.clone());
+        if let Some(key) = crate::router::entry_key(&stage.target) {
+            candidates.insert(key, temp);
+        }
+    }
+    let (next, cache_writes, cache_inputs) = match route {
+        Some(route) => {
+            let (next, writes, inputs) = crate::router::with_candidate_assets(candidates, || {
+                route.prepare_routing(root, &remote)
+            });
+            match next {
+                Ok(next) => (next, writes, inputs),
+                Err(reason) => {
+                    clean(&staged);
+                    return Err(reason);
+                }
+            }
+        }
+        None => (None, Vec::new(), crate::router::CacheInputs::new()),
     };
-    if let Err(reason) = reload(route, root) {
-        return match transaction.rollback() {
+    // A cache and a geodata asset that name one entry would overwrite each other; refuse before either write.
+    for write in &cache_writes {
+        let path = &write.target;
+        let Some(key) = crate::router::entry_key(path) else {
+            continue;
+        };
+        if staged
+            .iter()
+            .any(|stage| crate::router::entry_key(&stage.target).as_ref() == Some(&key))
+        {
+            clean(&staged);
+            return Err(format!(
+                "routing rule set cache `{}` is also a geodata asset",
+                path.display()
+            ));
+        }
+    }
+    // Cache files the candidate read must land before its rules do, or an offline restart routes by the old bytes. The swap stays open so a failed routing publication can put them back.
+    let (cache, cache_failed) = write_cache(cache_writes);
+    if let Some((_, path)) = cache_failed
+        .iter()
+        .find(|(id, _)| cache_inputs.contains(id))
+    {
+        let reason = format!(
+            "routing rule set cache `{}` could not be written after the candidate read it",
+            path.display()
+        );
+        let rollback = cache.rollback();
+        clean(&staged);
+        return match rollback {
             Ok(()) => Err(reason),
-            Err(rollback) => Err(format!("{reason}; rollback failed: {rollback}")),
+            Err(error) => Err(format!("{reason}; cache rollback failed: {error}")),
         };
     }
-    transaction.commit()
+    let transaction = crate::router_script::refresh_assets(|| {
+        let transaction = swap_all(&staged)?;
+        if let Some(route) = route {
+            if let Some(next) = next {
+                if let Err(reason) = route.publish_routing(Some(next)) {
+                    return match transaction.rollback() {
+                        Ok(()) => Err(reason),
+                        Err(rollback) => Err(format!("{reason}; rollback failed: {rollback}")),
+                    };
+                }
+            }
+        }
+        Ok(transaction)
+    });
+    match transaction {
+        Ok(transaction) => {
+            // The new files and table are live; removing an obsolete backup stays best-effort.
+            if let Some(error) = transaction.cleanup() {
+                eprintln!("geodata: asset backup cleanup failed: {error}");
+            }
+            if let Some(error) = cache.cleanup() {
+                eprintln!("geodata: routing rule set cache backup cleanup failed: {error}");
+            }
+            Ok(())
+        }
+        Err(reason) => {
+            let rollback = cache.rollback();
+            clean(&staged);
+            match rollback {
+                Ok(()) => Err(reason),
+                Err(error) => Err(format!("{reason}; cache rollback failed: {error}")),
+            }
+        }
+    }
 }
 
-fn reload(route: Option<&RouteShared>, root: &Json) -> Result<(), String> {
+fn reload(
+    route: Option<&RouteShared>,
+    root: &Json,
+    remote: &crate::router::RemoteSetCache,
+) -> Result<(), String> {
     if let Some(route) = route {
-        route.reload_routing(root)?;
+        // Parse before either writer lock, then publish under the asset write guard so a flow's router clone reads one generation.
+        let (prepared, cache_writes, cache_inputs) =
+            crate::router::with_candidate_assets(HashMap::new(), || {
+                route.prepare_routing(root, remote)
+            });
+        let next = prepared?;
+        let (cache, cache_failed) = write_cache(cache_writes);
+        if let Some((_, path)) = cache_failed
+            .iter()
+            .find(|(id, _)| cache_inputs.contains(id))
+        {
+            let reason = format!(
+                "routing rule set cache `{}` could not be written after the candidate read it",
+                path.display()
+            );
+            return match cache.rollback() {
+                Ok(()) => Err(reason),
+                Err(error) => Err(format!("{reason}; cache rollback failed: {error}")),
+            };
+        }
+        if let Err(reason) = crate::router_script::refresh_assets(|| route.publish_routing(next)) {
+            return match cache.rollback() {
+                Ok(()) => Err(reason),
+                Err(error) => Err(format!("{reason}; cache rollback failed: {error}")),
+            };
+        }
+        if let Some(error) = cache.cleanup() {
+            eprintln!("geodata: routing rule set cache backup cleanup failed: {error}");
+        }
     }
     Ok(())
+}
+
+/// Publish each cache independently and best-effort, as the reference does: one unwritable path is named and skipped, while every writable cache still lands for an offline restart.
+fn write_cache(writes: crate::router::CacheWrites) -> (Transaction, Vec<(u64, PathBuf)>) {
+    let mut transaction = Transaction { swaps: Vec::new() };
+    let mut failed = Vec::new();
+    for write in writes {
+        let target = write.target;
+        let stage = match stage_cache(&target, write.body) {
+            Ok(stage) => stage,
+            Err(reason) => {
+                eprintln!("geodata: routing rule set cache not written: {reason}");
+                failed.push((write.id, target));
+                continue;
+            }
+        };
+        match swap_one(&stage) {
+            Ok(swap) => transaction.swaps.push(swap),
+            Err(reason) => {
+                let _ = std::fs::remove_file(&stage.temp);
+                eprintln!("geodata: routing rule set cache not written: {reason}");
+                failed.push((write.id, target));
+            }
+        }
+    }
+    (transaction, failed)
+}
+
+fn stage_cache(target: &std::path::Path, body: crate::router::CacheBody) -> Result<Stage, String> {
+    let bytes = body
+        .into_bytes()
+        .map_err(|reason| format!("routing rule set cache: {reason}"))?;
+    if target.is_dir() {
+        return Err(format!(
+            "routing rule set cache: {} is a directory",
+            target.display()
+        ));
+    }
+    let temp = unique_path(target, ".tmp")
+        .map_err(|reason| format!("routing rule set cache: {reason}"))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .map_err(|error| format!("cannot create {}: {error}", temp.display()))?;
+    let result = (|| {
+        file.write_all(&bytes)
+            .map_err(|error| format!("cannot write {}: {error}", target.display()))?;
+        file.flush()
+            .map_err(|error| format!("cannot flush {}: {error}", target.display()))
+    })();
+    if let Err(reason) = result {
+        let _ = std::fs::remove_file(&temp);
+        return Err(format!("routing rule set cache: {reason}"));
+    }
+    Ok(Stage {
+        target: target.to_owned(),
+        temp,
+    })
 }
 
 #[derive(Debug)]
@@ -805,18 +988,104 @@ fn swap_all(staged: &[Stage]) -> Result<Transaction, String> {
     Ok(transaction)
 }
 
+#[allow(clippy::too_many_lines)]
 fn swap_one(stage: &Stage) -> Result<Swap, String> {
-    let backup = if stage.target.exists() {
+    let meta = match std::fs::symlink_metadata(&stage.target) {
+        Ok(meta) => Some(meta),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect {}: {error}",
+                stage.target.display()
+            ));
+        }
+    };
+    let backup = if let Some(meta) = meta {
         let backup = unique_path(&stage.target, ".bak")?;
-        std::fs::rename(&stage.target, &backup)
-            .map_err(|error| format!("cannot move {} aside: {error}", stage.target.display()))?;
+        // Swap the old inode into the temporary path, then move it to the backup, so the public path changes atomically even when a hard link is refused for a root-owned asset.
+        if exchange_paths(&stage.temp, &stage.target).is_ok() {
+            match std::fs::rename(&stage.temp, &backup) {
+                Ok(()) => {
+                    return Ok(Swap {
+                        target: stage.target.clone(),
+                        backup: Some(backup),
+                    });
+                }
+                Err(error) => {
+                    if exchange_paths(&stage.temp, &stage.target).is_err() {
+                        let kept = unique_path(&stage.target, ".bak")?;
+                        if std::fs::rename(&stage.temp, &kept).is_err() {
+                            std::fs::copy(&stage.temp, &kept).map_err(|copy| {
+                                format!(
+                                    "cannot move the old {} aside: {error}; cannot keep it at {}: {copy}",
+                                    stage.target.display(),
+                                    kept.display()
+                                )
+                            })?;
+                            let _ = std::fs::remove_file(&stage.temp);
+                        }
+                        return Err(format!(
+                            "cannot move the old {} aside: {error}; kept it at {}",
+                            stage.target.display(),
+                            kept.display()
+                        ));
+                    }
+                }
+            }
+        }
+        // Link or copy the old entry aside, so the public path keeps a complete entry until the atomic replace; a crash cannot leave it absent.
+        if std::fs::hard_link(&stage.target, &backup).is_err() {
+            if meta.file_type().is_symlink() {
+                #[cfg(unix)]
+                {
+                    let target = std::fs::read_link(&stage.target).map_err(|error| {
+                        format!("cannot back up {}: {error}", stage.target.display())
+                    })?;
+                    if let Err(error) = std::os::unix::fs::symlink(&target, &backup) {
+                        let _ = std::fs::remove_file(&backup);
+                        return Err(format!(
+                            "cannot back up {}: {error}",
+                            stage.target.display()
+                        ));
+                    }
+                }
+                #[cfg(not(unix))]
+                return Err(format!(
+                    "cannot back up the symlink {}",
+                    stage.target.display()
+                ));
+            } else {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    let meta = std::fs::metadata(&stage.target).map_err(|error| {
+                        format!("cannot back up {}: {error}", stage.target.display())
+                    })?;
+                    let owned = meta.uid() == unsafe { libc::geteuid() }
+                        && meta.gid() == unsafe { libc::getegid() };
+                    if !owned {
+                        return Err(format!(
+                            "cannot back up {}: hard link refused and a copy would change its owner",
+                            stage.target.display()
+                        ));
+                    }
+                }
+                if let Err(error) = std::fs::copy(&stage.target, &backup) {
+                    let _ = std::fs::remove_file(&backup);
+                    return Err(format!(
+                        "cannot back up {}: {error}",
+                        stage.target.display()
+                    ));
+                }
+            }
+        }
         Some(backup)
     } else {
         None
     };
-    if let Err(error) = std::fs::rename(&stage.temp, &stage.target) {
+    if let Err(error) = replace_file(&stage.temp, &stage.target) {
         if let Some(backup) = &backup {
-            let _ = std::fs::rename(backup, &stage.target);
+            let _ = std::fs::remove_file(backup);
         }
         return Err(format!(
             "cannot move {} into place: {error}",
@@ -833,34 +1102,46 @@ impl Transaction {
     fn rollback(self) -> Result<(), String> {
         let mut failure = None;
         for swap in self.swaps.into_iter().rev() {
-            if let Err(error) = std::fs::remove_file(&swap.target) {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    failure.get_or_insert(error);
+            match swap.backup {
+                Some(backup) => {
+                    if let Err(error) = replace_file(&backup, &swap.target) {
+                        failure.get_or_insert(format!(
+                            "cannot restore {} from {}: {error}",
+                            swap.target.display(),
+                            backup.display()
+                        ));
+                    }
                 }
-            }
-            if let Some(backup) = swap.backup {
-                if let Err(error) = std::fs::rename(&backup, &swap.target) {
-                    failure.get_or_insert(error);
-                }
-            }
-        }
-        match failure {
-            Some(error) => Err(error.to_string()),
-            None => Ok(()),
-        }
-    }
-
-    fn commit(self) -> Result<(), String> {
-        for swap in self.swaps {
-            if let Some(backup) = swap.backup {
-                if let Err(error) = std::fs::remove_file(&backup) {
-                    if error.kind() != std::io::ErrorKind::NotFound {
-                        return Err(error.to_string());
+                None => {
+                    if let Err(error) = std::fs::remove_file(&swap.target) {
+                        if error.kind() != std::io::ErrorKind::NotFound {
+                            failure.get_or_insert(format!(
+                                "cannot remove {}: {error}",
+                                swap.target.display()
+                            ));
+                        }
                     }
                 }
             }
         }
-        Ok(())
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn cleanup(self) -> Option<String> {
+        let mut failure = None;
+        for swap in self.swaps {
+            if let Some(backup) = swap.backup {
+                if let Err(error) = std::fs::remove_file(&backup) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        failure.get_or_insert(error);
+                    }
+                }
+            }
+        }
+        failure.map(|error| error.to_string())
     }
 }
 
@@ -943,6 +1224,54 @@ pub(crate) fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), String> {
         return Err(format!("cannot replace {}: {error}", target.display()));
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn exchange_paths(left: &Path, right: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+    let left = CString::new(left.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL"))?;
+    let right = CString::new(right.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL"))?;
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            left.as_ptr(),
+            libc::AT_FDCWD,
+            right.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn exchange_paths(left: &Path, right: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+    let left = CString::new(left.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL"))?;
+    let right = CString::new(right.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL"))?;
+    let result = unsafe { libc::renamex_np(left.as_ptr(), right.as_ptr(), libc::RENAME_SWAP) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn exchange_paths(_left: &Path, _right: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic exchange is not supported",
+    ))
 }
 
 #[cfg(not(windows))]

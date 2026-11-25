@@ -90,9 +90,11 @@ mod stats;
 mod transparent;
 mod tuic;
 mod tun;
+mod tun_route;
 mod tun_stack;
 #[cfg(unix)]
 mod tun_system;
+mod tun_tap;
 mod veepn;
 mod vision;
 mod vmess;

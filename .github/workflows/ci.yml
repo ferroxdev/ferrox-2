@@ -217,6 +217,35 @@ jobs:
           if [[ -z "$RUST_TEST_THREADS" ]]; then unset RUST_TEST_THREADS; fi
           ./scripts/watch-test.sh --out "target/ci/test-${{ matrix.os }}.log" -- \
             cargo test --workspace --locked 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: open the privileged device and the route table
+        id: privileged
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          filter=a_real_
+          bin=$(cargo test --locked -p ferrox-app --bin ferrox-app --no-run --message-format=json | python3 -c 'import json,sys
+          for line in sys.stdin:
+              try: message = json.loads(line)
+              except ValueError: continue
+              if message.get("reason") == "compiler-message":
+                  rendered = message.get("message", {}).get("rendered")
+                  if rendered: print(rendered, file=sys.stderr, end="")
+              elif message.get("reason") == "compiler-artifact" and message.get("target", {}).get("kind") == ["bin"] and message.get("executable"): print(message["executable"])')
+          test -n "$bin"
+          case "${{ runner.os }}" in
+            Linux) expected=(a_real_guard_installs_pins_and_retires_a_route a_real_tun_device_opens_and_names_itself) ;;
+            macOS) expected=(a_real_feth_pair_carries_an_arp_request_to_the_bridge) ;;
+            *) expected=() ;;
+          esac
+          listed=$("$bin" --ignored --list)
+          for name in "${expected[@]}"; do
+            if ! grep -q "$name: test" <<<"$listed"; then
+              echo "missing privileged test: $name" >&2
+              exit 1
+            fi
+          done
+          sudo --preserve-env=PATH "$bin" --ignored --nocapture --test-threads=1 "$filter"
+
       - name: publish the log the stall was cut from
         if: always()
         uses: actions/upload-artifact@v4
@@ -230,6 +259,7 @@ jobs:
         shell: bash
         env:
           OUTCOME: ${{ steps.test.outcome }}
+          PRIVILEGED: ${{ runner.os == 'Windows' && 'skipped' || steps.privileged.outcome }}
         run: |
           {
             echo "### test (${{ matrix.name }})"
@@ -238,9 +268,14 @@ jobs:
             rustc -vV
             echo '```'
             echo "cargo test --workspace --locked: $OUTCOME"
+            echo "privileged device and route table: $PRIVILEGED"
           } >> "$GITHUB_STEP_SUMMARY"
           if [ "$OUTCOME" != "success" ]; then
             echo "::error::cargo test on ${{ matrix.name }} did not succeed (outcome: $OUTCOME)"
+            exit 1
+          fi
+          if [ "$PRIVILEGED" != "success" ] && [ "$PRIVILEGED" != "skipped" ]; then
+            echo "::error::the privileged device and route table on ${{ matrix.name }} did not succeed (outcome: $PRIVILEGED)"
             exit 1
           fi
 

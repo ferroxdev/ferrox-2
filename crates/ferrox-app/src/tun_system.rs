@@ -505,11 +505,13 @@ fn listener_address(local: IpAddr, name: &str) -> io::Result<SocketAddr> {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_lines)]
 pub(crate) fn serve(
     spec: &crate::tun::Spec,
     out: &crate::proxy::Outbound,
     hybrid: bool,
-) -> io::Result<()> {
+    stopping: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> io::Result<(String, Vec<std::thread::JoinHandle<()>>)> {
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
@@ -536,7 +538,9 @@ pub(crate) fn serve(
         );
     }
     let device = Arc::new(tun_stack::build(spec, false, false)?.0);
-    let listener = std::net::TcpListener::bind(listener_address(local, &device.name()?)?)?;
+    device.set_nonblocking(true)?;
+    let name = device.name()?;
+    let listener = std::net::TcpListener::bind(listener_address(local, &name)?)?;
     listener.set_nonblocking(true)?;
     let listener_port = listener.local_addr()?.port();
     if spec.queues() > 1 {
@@ -547,18 +551,21 @@ pub(crate) fn serve(
     let (outgoing, writes) = mpsc::sync_channel(TX_QUEUE);
     let (to_stack, stack_rx) = mpsc::sync_channel(RX_QUEUE);
     let (recycle, reused) = mpsc::sync_channel(RX_QUEUE);
-    let failed = Arc::new(AtomicBool::new(false));
+    let failed = stopping
+        .cloned()
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let nat = Arc::new(Mutex::new(Nat::new(local, peer, listener_port, hybrid)));
 
     let (wake_read, wake_write) = UnixStream::pair()?;
     wake_write.set_nonblocking(true)?;
     let stack_wake = wake_write.try_clone()?;
     let config = tun_stack::device_config(spec);
+    let dns_hijack = spec.dns_hijack();
     let stack_out = out.clone();
     let stack_failed = Arc::clone(&failed);
     let stack_recycle = recycle.clone();
     let stack_outgoing = outgoing.clone();
-    thread::spawn(move || {
+    let stack_worker = thread::spawn(move || {
         crate::wg_stack::serve_tun_device(
             config,
             stack_rx,
@@ -566,6 +573,7 @@ pub(crate) fn serve(
             stack_out,
             Some(stack_recycle),
             0,
+            dns_hijack,
             wake_read,
             stack_failed,
         );
@@ -574,12 +582,14 @@ pub(crate) fn serve(
     let accept_nat = Arc::clone(&nat);
     let accept_out = out.clone();
     let accept_failed = Arc::clone(&failed);
-    thread::spawn(move || accept_loop(listener, accept_nat, accept_out, accept_failed));
+    let accept_worker = thread::spawn(move || {
+        accept_loop(listener, accept_nat, accept_out, accept_failed, dns_hijack);
+    });
 
     let loop_nat = Arc::clone(&nat);
     let loop_failed = Arc::clone(&failed);
     let loop_recycle = recycle.clone();
-    thread::spawn(move || {
+    let packet_worker = thread::spawn(move || {
         packet_loop(
             incoming,
             to_stack,
@@ -594,13 +604,41 @@ pub(crate) fn serve(
 
     let write_device = Arc::clone(&device);
     let write_failed = Arc::clone(&failed);
-    thread::spawn(move || {
-        tun_stack::send_plain(write_device, writes, &write_failed, Some(recycle));
+    let write_worker = thread::spawn(move || {
+        tun_stack::send_plain(
+            write_device,
+            writes,
+            &write_failed,
+            Some(recycle),
+            Some(write_failed.as_ref()),
+        );
     });
 
     let mtu = spec.mtu();
-    thread::spawn(move || tun_stack::recv_loop(device, packets, reused, mtu, 0, wake_write));
-    Ok(())
+    let recv_failed = Arc::clone(&failed);
+    let recv_worker = thread::spawn(move || {
+        tun_stack::recv_loop(
+            device,
+            packets,
+            reused,
+            mtu,
+            0,
+            wake_write,
+            Some(Arc::clone(&recv_failed)),
+            None,
+            &recv_failed,
+        );
+    });
+    Ok((
+        name,
+        vec![
+            stack_worker,
+            accept_worker,
+            packet_worker,
+            write_worker,
+            recv_worker,
+        ],
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -657,12 +695,15 @@ fn accept_loop(
     nat: std::sync::Arc<std::sync::Mutex<Nat>>,
     out: crate::proxy::Outbound,
     failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    dns_hijack: Option<IpAddr>,
 ) {
     use std::sync::atomic::Ordering;
     use std::thread;
     use std::time::Duration;
 
+    let mut flows: Vec<thread::JoinHandle<()>> = Vec::new();
     while !failed.load(Ordering::Relaxed) {
+        flows.retain(|flow| !flow.is_finished());
         match listener.accept() {
             Ok((stream, peer)) => {
                 let destination = match nat.lock() {
@@ -675,14 +716,22 @@ fn accept_loop(
                 let out = out.clone();
                 let nat = std::sync::Arc::clone(&nat);
                 let port = peer.port();
-                thread::spawn(move || {
+                flows.push(thread::spawn(move || {
                     let conn = crate::conn::Connection::Tcp(stream);
                     let destination = crate::proxy::Destination::Address(destination);
-                    let _ = crate::proxy::serve_device_flow(conn, None, &out, &destination);
+                    let dial = match (dns_hijack, &destination) {
+                        (Some(dns), crate::proxy::Destination::Address(asked))
+                            if asked.port() == 53 =>
+                        {
+                            crate::proxy::Destination::Address(SocketAddr::new(dns, 53))
+                        }
+                        _ => destination.clone(),
+                    };
+                    let _ = crate::proxy::serve_device_flow(conn, None, &out, &destination, &dial);
                     if let Ok(mut nat) = nat.lock() {
                         nat.closed(port, generation);
                     }
-                });
+                }));
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(1));
@@ -693,6 +742,9 @@ fn accept_loop(
                 thread::sleep(Duration::from_millis(10));
             }
         }
+    }
+    for flow in flows {
+        let _ = flow.join();
     }
 }
 

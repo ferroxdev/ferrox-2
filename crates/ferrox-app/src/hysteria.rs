@@ -3006,6 +3006,13 @@ pub(crate) struct Prepared {
     template: quiche::Config,
 }
 
+impl Prepared {
+    #[cfg(test)]
+    pub(crate) fn local_addr(&self) -> std::net::SocketAddr {
+        self.local
+    }
+}
+
 pub(crate) fn prepare(
     address: &str,
     identity: &ferrox_core::tls::TlsServerConfig,

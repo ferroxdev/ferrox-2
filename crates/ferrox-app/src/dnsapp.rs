@@ -11,7 +11,7 @@ use crate::router::{add_domain, asset_dirs, ip_matcher, Assets, DomainMatcher, I
 use ferrox_core::dns::{build_query, parse_answer, Edns};
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread;
@@ -208,6 +208,13 @@ impl Lookup {
     }
 }
 
+fn run_bounded<T>(deadline: Option<Instant>, run: impl FnOnce() -> T) -> T {
+    match deadline {
+        Some(deadline) => with_system_deadline(deadline, run),
+        None => run(),
+    }
+}
+
 /// One server query, run by the pool instead of by a thread of the lookup's own.
 #[allow(clippy::struct_excessive_bools)]
 struct Job {
@@ -218,6 +225,8 @@ struct Job {
     v6: bool,
     fake_enabled: bool,
     force_local: bool,
+    dns_held: bool,
+    deadline: Option<Instant>,
     answers: mpsc::Sender<(usize, Lookup)>,
 }
 
@@ -333,14 +342,52 @@ impl Pool {
             };
             #[cfg(test)]
             let _running = self.running.enter();
-            let result = resolver.query_server(
-                job.index,
-                &job.name,
-                job.v4,
-                job.v6,
-                job.fake_enabled,
-                job.force_local,
-            );
+            let server = &resolver.servers[job.index];
+            let direct =
+                job.force_local || server.local_dial || server.transport == Transport::Local;
+            // Resolve a routed UDP hostname before the asset read guard, so a slow system resolver cannot hold a refresh out.
+            let target: Result<Option<SocketAddr>, ()> = if !direct
+                && server.transport == Transport::Udp
+                && !resolver.cached(job.index, &job.name, job.v4, job.v6)
+            {
+                match server.endpoint.as_ref() {
+                    Some(endpoint) => {
+                        let budget = job
+                            .deadline
+                            .map_or_else(
+                                || server.timeout,
+                                |deadline| deadline.saturating_duration_since(Instant::now()),
+                            )
+                            .max(Duration::from_millis(1));
+                        crate::proxy::dns_socket_bounded(&endpoint.host, endpoint.port, budget)
+                            .map_or(Err(()), |target| Ok(Some(target)))
+                    }
+                    None => Err(()),
+                }
+            } else {
+                Ok(None)
+            };
+            let _assets = (!job.dns_held && !direct).then(crate::router_script::dns_read_assets);
+            let run = || {
+                crate::router_script::with_assets_held(true, || {
+                    resolver.query_server(
+                        job.index,
+                        &job.name,
+                        job.v4,
+                        job.v6,
+                        job.fake_enabled,
+                        job.force_local,
+                        target,
+                    )
+                })
+            };
+            let _on_pool = OnPool::enter();
+            let bounded = || run_bounded(job.deadline, run);
+            let result = if job.dns_held {
+                crate::router_script::with_dns_held(bounded)
+            } else {
+                bounded()
+            };
             let _ = job.answers.send((job.slot, result));
         }
     }
@@ -498,6 +545,7 @@ impl Resolver {
         self.strategy.families()
     }
 
+    #[cfg(test)]
     pub(crate) fn lookup_families(
         self: &Arc<Self>,
         name: &str,
@@ -506,6 +554,17 @@ impl Resolver {
         fake: bool,
     ) -> Option<(Vec<IpAddr>, u32)> {
         self.lookup_with(name, v4, v6, fake, false).records()
+    }
+
+    /// The configured resolver's annotated answer, so a script sees an authoritative negative rather than an OS fallback.
+    pub(crate) fn lookup_outcome(
+        self: &Arc<Self>,
+        name: &str,
+        v4: bool,
+        v6: bool,
+        fake: bool,
+    ) -> Lookup {
+        self.lookup_with(name, v4, v6, fake, false)
     }
 
     pub(crate) fn script_servers(&self) -> Vec<(String, usize)> {
@@ -524,7 +583,17 @@ impl Resolver {
         v6: bool,
         fake: bool,
     ) -> Lookup {
-        self.query_server(index, name, v4, v6, fake, false)
+        self.query_server(index, name, v4, v6, fake, false, Ok(None))
+    }
+
+    pub(crate) fn script_lookup(
+        self: &Arc<Self>,
+        name: &str,
+        v4: bool,
+        v6: bool,
+        fake: bool,
+    ) -> Lookup {
+        self.lookup_with(name, v4, v6, fake, false)
     }
 
     #[cfg(test)]
@@ -633,7 +702,7 @@ impl Resolver {
         fake_enabled: bool,
         force_local: bool,
     ) -> Lookup {
-        if self.parallel {
+        if self.parallel && !crate::router_script::dns_held() && !on_pool() {
             self.ask_parallel(order, name, v4, v6, fake_enabled, force_local)
         } else {
             self.ask_serial(order, name, v4, v6, fake_enabled, force_local)
@@ -654,7 +723,10 @@ impl Resolver {
         let mut empty = false;
         let mut skipped = false;
         for &index in order {
-            match self.query_server(index, name, v4, v6, fake_enabled, force_local) {
+            if system_deadline().is_some_and(|deadline| Instant::now() >= deadline) {
+                break;
+            }
+            match self.query_server(index, name, v4, v6, fake_enabled, force_local, Ok(None)) {
                 Lookup::Records(ips, ttl) if !ips.is_empty() => return Lookup::Records(ips, ttl),
                 Lookup::Records(_, _) | Lookup::Empty => empty = true,
                 Lookup::Rcode(code) => last_rcode = Some(code),
@@ -687,12 +759,17 @@ impl Resolver {
             .pool
             .get_or_init(|| Pool::spawn(&Arc::downgrade(self), self.servers.len().max(1)));
         let (sender, receiver) = mpsc::channel();
+        // A nested lookup inherits its ancestor's guard, so it must drain before that ancestor can release it.
+        let nested = crate::router_script::dns_held();
         let mut results: Vec<Option<Lookup>> = (0..order.len()).map(|_| None).collect();
         let mut last_rcode = None;
         let mut empty = false;
         let mut skipped = false;
         let mut start = 0;
         while start < order.len() {
+            if system_deadline().is_some_and(|deadline| Instant::now() >= deadline) {
+                break;
+            }
             let mut end = start + 1;
             while end < order.len()
                 && self.servers[order[end]].policy_id == self.servers[order[start]].policy_id
@@ -709,6 +786,8 @@ impl Resolver {
                     v6,
                     fake_enabled,
                     force_local,
+                    dns_held: nested,
+                    deadline: system_deadline(),
                     answers: sender.clone(),
                 });
             }
@@ -719,6 +798,24 @@ impl Resolver {
                         Some(Lookup::Records(ips, _)) if !ips.is_empty()
                     )
                 }) {
+                    if nested {
+                        while results[start..end].iter().any(Option::is_none) {
+                            let answer = match system_deadline() {
+                                Some(deadline) => receiver.recv_timeout(
+                                    deadline
+                                        .saturating_duration_since(Instant::now())
+                                        .max(Duration::from_millis(1)),
+                                ),
+                                None => receiver
+                                    .recv()
+                                    .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+                            };
+                            let Ok((late, result)) = answer else {
+                                break;
+                            };
+                            results[late] = Some(result);
+                        }
+                    }
                     if let Some(Lookup::Records(ips, ttl)) = results[slot].take() {
                         return Lookup::Records(ips, ttl);
                     }
@@ -726,7 +823,17 @@ impl Resolver {
                 if results[start..end].iter().all(Option::is_some) {
                     break;
                 }
-                let Ok((slot, result)) = receiver.recv() else {
+                let answer = match system_deadline() {
+                    Some(deadline) => receiver.recv_timeout(
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .max(Duration::from_millis(1)),
+                    ),
+                    None => receiver
+                        .recv()
+                        .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+                };
+                let Ok((slot, result)) = answer else {
                     break;
                 };
                 results[slot] = Some(result);
@@ -750,7 +857,28 @@ impl Resolver {
         })
     }
 
+    fn cached(&self, index: usize, name: &str, v4: bool, v6: bool) -> bool {
+        let server = &self.servers[index];
+        if server.cache.disable {
+            return false;
+        }
+        let Ok(held) = self.cache[index].lock() else {
+            return false;
+        };
+        let Some(entry) = held.get(name) else {
+            return false;
+        };
+        let now = Instant::now();
+        let live = |family: Family| {
+            family
+                .cached(entry)
+                .is_some_and(|record| record.expires > now)
+        };
+        (!v4 || !server.v4 || live(Family::A)) && (!v6 || !server.v6 || live(Family::Aaaa))
+    }
+
     #[allow(clippy::fn_params_excessive_bools)]
+    #[allow(clippy::too_many_arguments)]
     fn query_server(
         &self,
         index: usize,
@@ -759,6 +887,7 @@ impl Resolver {
         v6: bool,
         fake_enabled: bool,
         force_local: bool,
+        target: Result<Option<SocketAddr>, ()>,
     ) -> Lookup {
         let server = &self.servers[index];
         if server.transport == Transport::Fake && !fake_enabled {
@@ -771,7 +900,7 @@ impl Resolver {
         let mut empty = false;
         let mut failed = false;
         if v4 && server.v4 {
-            match self.family(index, name, Family::A, force_local) {
+            match self.family(index, name, Family::A, force_local, target) {
                 Lookup::Records(mut found, found_ttl) => {
                     ttl = ttl.min(found_ttl);
                     ips.append(&mut found);
@@ -784,7 +913,7 @@ impl Resolver {
             }
         }
         if v6 && server.v6 {
-            match self.family(index, name, Family::Aaaa, force_local) {
+            match self.family(index, name, Family::Aaaa, force_local, target) {
                 Lookup::Records(mut found, found_ttl) => {
                     ttl = ttl.min(found_ttl);
                     ips.append(&mut found);
@@ -856,7 +985,14 @@ impl Resolver {
         ips
     }
 
-    fn family(&self, index: usize, name: &str, family: Family, force_local: bool) -> Lookup {
+    fn family(
+        &self,
+        index: usize,
+        name: &str,
+        family: Family,
+        force_local: bool,
+        target: Result<Option<SocketAddr>, ()>,
+    ) -> Lookup {
         let server = &self.servers[index];
         if server.transport == Transport::Fake {
             return match self
@@ -887,7 +1023,7 @@ impl Resolver {
                 }
             }
         }
-        let fetched = self.fetch(index, name, family, force_local);
+        let fetched = self.fetch(index, name, family, force_local, target);
         let cacheable = match &fetched {
             Lookup::Records(ips, ttl) => Some((ips.clone(), 0, *ttl)),
             Lookup::Rcode(code) => Some((Vec::new(), *code, DEFAULT_TTL)),
@@ -918,7 +1054,14 @@ impl Resolver {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn fetch(&self, index: usize, name: &str, family: Family, force_local: bool) -> Lookup {
+    fn fetch(
+        &self,
+        index: usize,
+        name: &str,
+        family: Family,
+        force_local: bool,
+        target: Result<Option<SocketAddr>, ()>,
+    ) -> Lookup {
         let server = &self.servers[index];
         if server.transport == Transport::Local {
             return match family {
@@ -929,6 +1072,10 @@ impl Resolver {
         let Some(endpoint) = server.endpoint.as_ref() else {
             return Lookup::Failed;
         };
+        let timeout = system_budget(server.timeout);
+        if timeout.is_zero() {
+            return Lookup::Failed;
+        }
         let qtype = family.qtype();
         let id = match server.transport {
             Transport::Doh { .. } | Transport::Doq => 0,
@@ -951,25 +1098,43 @@ impl Resolver {
         };
         let response = match &server.transport {
             Transport::Udp => {
-                let Ok(answer) = crate::dnsnet::udp(
-                    &endpoint.host,
-                    endpoint.port,
-                    &query,
-                    server.tag.as_deref(),
-                    None,
-                    server.timeout,
-                    server.local_dial || force_local,
-                ) else {
+                let routed = match target {
+                    Ok(Some(target)) => match crate::proxy::dns_udp_target(
+                        target,
+                        server.tag.as_deref(),
+                        &query,
+                        timeout,
+                    ) {
+                        Ok(Some(answer)) => Ok(answer),
+                        Ok(None) => crate::dnsnet::udp_target(target, &query, timeout),
+                        Err(error) => Err(error),
+                    },
+                    Ok(None) => crate::dnsnet::udp(
+                        &endpoint.host,
+                        endpoint.port,
+                        &query,
+                        server.tag.as_deref(),
+                        None,
+                        timeout,
+                        server.local_dial || force_local,
+                    ),
+                    Err(()) => Err("dns endpoint lookup failed".to_owned()),
+                };
+                let Ok(answer) = routed else {
                     return Lookup::Failed;
                 };
                 if parse_answer(&answer).is_some_and(|answer| answer.truncated) {
+                    let timeout = system_budget(server.timeout);
+                    if timeout.is_zero() {
+                        return Lookup::Failed;
+                    }
                     let Ok(answer) = crate::dnsnet::tcp(
                         &endpoint.host,
                         endpoint.port,
                         &query,
                         server.tag.as_deref(),
                         None,
-                        server.timeout,
+                        timeout,
                         server.local_dial || force_local,
                     ) else {
                         return Lookup::Failed;
@@ -986,7 +1151,7 @@ impl Resolver {
                     &query,
                     server.tag.as_deref(),
                     None,
-                    server.timeout,
+                    timeout,
                     server.local_dial || force_local,
                 ) {
                     Ok(answer) => answer,
@@ -1000,7 +1165,7 @@ impl Resolver {
                     &query,
                     server.tag.as_deref(),
                     None,
-                    server.timeout,
+                    timeout,
                     server.local_dial || force_local,
                 ) {
                     Ok(answer) => answer,
@@ -1015,14 +1180,14 @@ impl Resolver {
                 &query,
                 server.tag.as_deref(),
                 None,
-                server.timeout,
+                timeout,
                 server.local_dial || force_local,
             ) {
                 Ok(answer) => answer,
                 Err(_) => return Lookup::Failed,
             },
             Transport::Doq => {
-                match crate::dnsnet::doq(&endpoint.host, endpoint.port, &query, server.timeout) {
+                match crate::dnsnet::doq(&endpoint.host, endpoint.port, &query, timeout) {
                     Ok(answer) => answer,
                     Err(_) => return Lookup::Failed,
                 }
@@ -1100,6 +1265,62 @@ impl Resolver {
     }
 }
 
+thread_local! {
+    static ON_POOL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct OnPool(bool);
+
+impl OnPool {
+    fn enter() -> Self {
+        let previous = ON_POOL.with(|flag| flag.replace(true));
+        Self(previous)
+    }
+}
+
+impl Drop for OnPool {
+    fn drop(&mut self) {
+        ON_POOL.with(|flag| flag.set(self.0));
+    }
+}
+
+fn on_pool() -> bool {
+    ON_POOL.with(std::cell::Cell::get)
+}
+
+thread_local! {
+    static SYSTEM_DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// A cold routing-script load runs inside one absolute budget: an OS lookup it starts must answer inside it, not hold the asset read guard.
+pub(crate) fn with_system_deadline<T>(deadline: Instant, run: impl FnOnce() -> T) -> T {
+    let previous = SYSTEM_DEADLINE.with(|slot| slot.replace(Some(deadline)));
+    let _restore = SystemDeadline(previous);
+    run()
+}
+
+struct SystemDeadline(Option<Instant>);
+
+impl Drop for SystemDeadline {
+    fn drop(&mut self) {
+        SYSTEM_DEADLINE.with(|slot| slot.set(self.0));
+    }
+}
+
+/// The absolute cold-load deadline when one is set.
+pub(crate) fn system_deadline() -> Option<Instant> {
+    SYSTEM_DEADLINE.with(std::cell::Cell::get)
+}
+
+/// The remaining cold-load budget when one is set, else `default`.
+pub(crate) fn system_budget(default: Duration) -> Duration {
+    SYSTEM_DEADLINE
+        .with(std::cell::Cell::get)
+        .map_or(default, |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        })
+}
+
 #[derive(Debug)]
 enum HostAnswer {
     Ips(Vec<IpAddr>),
@@ -1108,10 +1329,29 @@ enum HostAnswer {
 }
 
 fn system_lookup(name: &str, v4: bool, v6: bool) -> Lookup {
-    let Ok(addrs) = (name, 0u16).to_socket_addrs() else {
-        return Lookup::Failed;
+    let bounded = SYSTEM_DEADLINE.with(std::cell::Cell::get);
+    let addrs: Vec<std::net::SocketAddr> = if let Some(deadline) = bounded {
+        let budget = deadline.saturating_duration_since(Instant::now());
+        if budget.is_zero() {
+            return Lookup::Failed;
+        }
+        let Some(addrs) = crate::proxy::resolve_bounded(name, 0, budget, |name, _| {
+            use std::net::ToSocketAddrs;
+            (name, 0u16)
+                .to_socket_addrs()
+                .map(std::iter::Iterator::collect)
+        }) else {
+            return Lookup::Failed;
+        };
+        addrs
+    } else {
+        let Ok(addrs) = (name, 0u16).to_socket_addrs() else {
+            return Lookup::Failed;
+        };
+        addrs.collect()
     };
     let mut ips: Vec<IpAddr> = addrs
+        .into_iter()
         .map(|addr| addr.ip())
         .filter(|ip| (ip.is_ipv4() && v4) || (ip.is_ipv6() && v6))
         .collect();
@@ -2021,6 +2261,45 @@ mod resolver_tests {
         .expect("configured");
         assert_eq!(
             resolver.script_query(0, "example.com", true, false, false),
+            Lookup::Records(vec!["192.0.2.9".parse().unwrap()], 60)
+        );
+    }
+
+    #[test]
+    fn a_script_lookup_falls_through_to_the_next_server() {
+        let empty = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let answer = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+        empty
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        answer
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let empty_port = empty.local_addr().expect("addr").port();
+        let answer_port = answer.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            let (len, peer) = empty.recv_from(&mut buf).expect("query");
+            let question = parse_query(&buf[..len]).expect("question");
+            let reply = ip_answer(&question, 0, 60, &[]).expect("empty answer");
+            empty.send_to(&reply, peer).expect("reply");
+        });
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            let (len, peer) = answer.recv_from(&mut buf).expect("query");
+            let question = parse_query(&buf[..len]).expect("question");
+            let reply = ip_answer(&question, 0, 60, &[vec![192, 0, 2, 9]]).expect("answer");
+            answer.send_to(&reply, peer).expect("reply");
+        });
+        let resolver = Arc::new(
+            Resolver::from_root(&root(&format!(
+                r#"{{"dns":{{"servers":[{{"address":"udp://127.0.0.1:{empty_port}","id":"empty"}},{{"address":"udp://127.0.0.1:{answer_port}","id":"answer"}}]}}}}"#
+            )))
+            .expect("resolver")
+            .expect("configured"),
+        );
+        assert_eq!(
+            resolver.script_lookup("example.com", true, false, false),
             Lookup::Records(vec!["192.0.2.9".parse().unwrap()], 60)
         );
     }

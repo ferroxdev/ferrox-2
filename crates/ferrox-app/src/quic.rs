@@ -2077,6 +2077,7 @@ pub(crate) fn network_generation() -> u64 {
     NETWORK
         .get_or_init(|| {
             let generation = Arc::new(AtomicU64::new(1));
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             let bump = Arc::clone(&generation);
             let poll = Arc::clone(&generation);
             let _ = std::thread::Builder::new()
@@ -2085,6 +2086,7 @@ pub(crate) fn network_generation() -> u64 {
                     std::thread::sleep(Duration::from_secs(10));
                     poll.fetch_add(1, Ordering::Relaxed);
                 });
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             let _ = std::thread::Builder::new()
                 .name("ferrox-routes".to_owned())
                 .spawn(move || loop {
@@ -7657,7 +7659,7 @@ mod tests {
         let client = UdpSocket::bind("0.0.0.0:0").expect("binds");
         let client_port = client.local_addr().expect("addr").port();
         let writer = Datagram::gecked(client, gecko_salamander(), gecko_window()).expect("geckos");
-        let mut packet: Vec<u8> = vec![0xab; 900];
+        let mut packet: Vec<u8> = (0..900).map(|at| (at % 251) as u8).collect();
         packet[0] = ferrox_core::hysteria::GECKO_FLAG;
         writer.send_to(&packet, server_addr).expect("sends");
         let mut datagrams = 0usize;

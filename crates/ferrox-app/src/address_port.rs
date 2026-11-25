@@ -1,13 +1,20 @@
 use std::io::{Read as _, Write as _};
-use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
-use std::time::Duration;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
+use std::time::{Duration, Instant};
+
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use crate::sockopt::AddressPortStrategy;
 
 const SRV: u16 = 33;
 const TXT: u16 = 16;
 const TIMEOUT: Duration = Duration::from_secs(2);
+const POLL: Duration = Duration::from_millis(100);
 const ANSWER_MAX: usize = 4096;
+
+fn cancelled() -> bool {
+    crate::proxy::dial_cancelled()
+}
 
 /// The destination a strategy takes a named edge to, or `None` when the lookup
 /// answers nothing usable and the original name is dialled as configured.
@@ -17,7 +24,7 @@ pub(crate) fn replace(
     port: u16,
 ) -> Option<(String, u16)> {
     let (by_srv, port_of, address_of) = strategy.overrides()?;
-    if host.parse::<IpAddr>().is_ok() {
+    if cancelled() || host.parse::<IpAddr>().is_ok() {
         return None;
     }
     let servers = nameservers();
@@ -200,11 +207,19 @@ fn query_records(servers: &[SocketAddr], name: &str, qtype: u16) -> Option<Vec<V
     let id = u16::from_be_bytes(id);
     let query = ferrox_core::dns::build_query(id, name.as_bytes(), qtype, None)?;
     for server in servers {
-        let Some(answer) = ask_udp(*server, &query, id).or_else(|| ask_tcp(*server, &query, id))
-        else {
+        if cancelled() {
+            return None;
+        }
+        let Some(answer) = ask_udp(*server, &query, id).or_else(|| {
+            if cancelled() {
+                None
+            } else {
+                ask_tcp(*server, &query, id)
+            }
+        }) else {
             continue;
         };
-        if answer.id != id || answer.rcode != 0 {
+        if cancelled() || answer.id != id || answer.rcode != 0 {
             continue;
         }
         let records = answer
@@ -220,17 +235,56 @@ fn query_records(servers: &[SocketAddr], name: &str, qtype: u16) -> Option<Vec<V
 
 fn ask_udp(server: SocketAddr, query: &[u8], id: u16) -> Option<ferrox_core::dns::Answer> {
     let bind = if server.is_ipv6() {
-        "[::]:0"
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
     } else {
-        "0.0.0.0:0"
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
     };
-    let socket = UdpSocket::bind(bind).ok()?;
-    socket.set_read_timeout(Some(TIMEOUT)).ok()?;
-    socket.set_write_timeout(Some(TIMEOUT)).ok()?;
-    socket.connect(server).ok()?;
-    socket.send(query).ok()?;
+    let socket = Socket::new(
+        Domain::for_address(server),
+        Type::DGRAM,
+        Some(Protocol::UDP),
+    )
+    .ok()?;
+    {
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        let _routes = crate::tun_route::route_read();
+        crate::sockopt::apply_underlay(None, &socket, server, false).ok()?;
+        socket.bind(&SockAddr::from(bind)).ok()?;
+        socket.connect(&SockAddr::from(server)).ok()?;
+        socket.set_read_timeout(Some(POLL)).ok()?;
+        socket.set_write_timeout(Some(TIMEOUT)).ok()?;
+        if cancelled() {
+            return None;
+        }
+        socket.send(query).ok()?;
+    }
+    let socket: UdpSocket = socket.into();
     let mut answer = vec![0u8; ANSWER_MAX];
-    let read = socket.recv(&mut answer).ok()?;
+    let deadline = Instant::now() + TIMEOUT;
+    let read = loop {
+        if cancelled() {
+            return None;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        socket.set_read_timeout(Some(remaining.min(POLL))).ok()?;
+        match socket.recv(&mut answer) {
+            Ok(read) => {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                break read;
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => return None,
+        }
+    };
     let parsed = ferrox_core::dns::parse_answer(&answer[..read])?;
     if parsed.id != id {
         return None;
@@ -242,18 +296,66 @@ fn ask_udp(server: SocketAddr, query: &[u8], id: u16) -> Option<ferrox_core::dns
 }
 
 fn ask_tcp(server: SocketAddr, query: &[u8], id: u16) -> Option<ferrox_core::dns::Answer> {
-    let mut stream = TcpStream::connect_timeout(&server, TIMEOUT).ok()?;
-    stream.set_read_timeout(Some(TIMEOUT)).ok()?;
+    if cancelled() {
+        return None;
+    }
+    let socket = Socket::new(
+        Domain::for_address(server),
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )
+    .ok()?;
+    {
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        let _routes = crate::tun_route::route_read();
+        crate::sockopt::apply_underlay(None, &socket, server, true).ok()?;
+        crate::conn::connect_bounded(&socket, &SockAddr::from(server), TIMEOUT).ok()?;
+    }
+    if cancelled() {
+        return None;
+    }
+    let mut stream: TcpStream = socket.into();
+    stream.set_read_timeout(Some(POLL)).ok()?;
     stream.set_write_timeout(Some(TIMEOUT)).ok()?;
     let length = u16::try_from(query.len()).ok()?;
     stream.write_all(&length.to_be_bytes()).ok()?;
     stream.write_all(query).ok()?;
+    let deadline = Instant::now() + TIMEOUT;
     let mut head = [0u8; 2];
-    stream.read_exact(&mut head).ok()?;
+    read_cancellable(&mut stream, &mut head, deadline)?;
     let mut answer = vec![0u8; usize::from(u16::from_be_bytes(head))];
-    stream.read_exact(&mut answer).ok()?;
+    read_cancellable(&mut stream, &mut answer, deadline)?;
     let parsed = ferrox_core::dns::parse_answer(&answer)?;
     (parsed.id == id).then_some(parsed)
+}
+
+fn read_cancellable(stream: &mut TcpStream, buffer: &mut [u8], deadline: Instant) -> Option<()> {
+    let mut at = 0;
+    while at < buffer.len() {
+        if cancelled() {
+            return None;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        stream.set_read_timeout(Some(remaining.min(POLL))).ok()?;
+        match stream.read(&mut buffer[at..]) {
+            Ok(0) => return None,
+            Ok(read) => at += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => return None,
+        }
+    }
+    if cancelled() || Instant::now() >= deadline {
+        return None;
+    }
+    Some(())
 }
 
 #[cfg(test)]

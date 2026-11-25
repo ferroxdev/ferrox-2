@@ -1277,7 +1277,7 @@ fn client_reply(
     let target = match destination {
         Destination::Address(target) => target,
         Destination::Name(host, port) => {
-            let Some(target) = proxy::resolve_outbound(&host, port) else {
+            let Some(target) = proxy::resolve_outbound_with(None, &host, port) else {
                 return;
             };
             target
@@ -2464,9 +2464,13 @@ fn serve_tcp(mut stream: QuicStream, freedom: bool, worker: LiveWorker) {
         drop(stream);
         return;
     };
-    let Some(upstream) =
-        proxy::resolve_outbound(&host, port).and_then(|target| proxy::dial_or_report(&target))
-    else {
+    let Some(target) = proxy::resolve_outbound_with(None, &host, port) else {
+        stream.close();
+        drop(stream);
+        return;
+    };
+    crate::tun_route::bind_dial(target.ip());
+    let Some(upstream) = proxy::dial_or_report(&target) else {
         stream.close();
         drop(stream);
         return;
