@@ -1878,8 +1878,8 @@ local function all(list)
 end
 local kept = all(kept)
 local rest = all(rest)
-assert(#kept == 1 and kept[1] == "192.0.2.1", table.concat(kept, ","))
-assert(#rest == 1 and rest[1] == "2001:db8::1", table.concat(rest, ","))
+assert(#kept == 2 and kept[1] == "192.0.2.1" and kept[2] == "2001:db8::1", table.concat(kept, ","))
+assert(#rest == 0, table.concat(rest, ","))
 "#,
         )
         .exec()
