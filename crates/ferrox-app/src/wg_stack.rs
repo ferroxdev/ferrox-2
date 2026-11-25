@@ -49,7 +49,7 @@ const TCP_SEND_BUFFER: usize = 1024 * 1024;
 /// A server's reply buffer bounds how much it keeps in flight per flow. The tunnel
 /// client is a userspace stack without SACK or pacing, so a full peer window dumped
 /// in one burst overruns it; this cap lets the window govern without that overrun.
-const SERVER_SEND_BUFFER: usize = 512 * 1024;
+const SERVER_SEND_BUFFER: usize = 128 * 1024;
 /// One turn drains at most this many local reads into a flow, so a download
 /// does not wait a whole tick for each buffer when the peer is far ahead.
 const UP_BURST: usize = 64;
