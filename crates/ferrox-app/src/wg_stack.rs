@@ -3156,24 +3156,16 @@ pub(crate) fn client_udp_forward<T: Clone + Into<ToTunnel>>(
     if let Some(ready) = ready {
         let _ = ready.send(Ok(()));
     }
-    let _ = relay.set_read_timeout(Some(LANE_TICK));
+    if relay.set_nonblocking(true).is_err() {
+        let _ = relay.set_read_timeout(Some(LANE_TICK));
+    }
     let mut buf = crate::proxy::udp_buffer();
     let mut app: Option<SocketAddr> = None;
     while !stop.load(Ordering::Relaxed) {
+        let mut idle = true;
         while let Ok(packet) = reply_rx.try_recv() {
-            'packet: {
-                let Some(datagram) = udp_from_packet(packet.packet()) else {
-                    break 'packet;
-                };
-                if datagram.destination_port != port {
-                    break 'packet;
-                }
-                let Some(app) = app else {
-                    break 'packet;
-                };
-                let _ = relay.send_to(datagram.payload, app);
-                drop(packet);
-            }
+            idle &= !forward_downlink(&packet, port, app, relay);
+            drop(packet);
         }
         match relay.recv_from(&mut buf) {
             Ok((n, sender)) => {
@@ -3185,6 +3177,7 @@ pub(crate) fn client_udp_forward<T: Clone + Into<ToTunnel>>(
                 if !lane_send(config, port, target, &buf[..n], &to_tunnel, headroom) {
                     break;
                 }
+                idle = false;
             }
             Err(error)
                 if matches!(
@@ -3194,10 +3187,41 @@ pub(crate) fn client_udp_forward<T: Clone + Into<ToTunnel>>(
             Err(error) if crate::proxy::is_udp_gone(&error) => {}
             Err(_) => break,
         }
+        // Wait on the downlink channel when both are quiet, so an idle uplink never stalls it.
+        if idle {
+            match reply_rx.recv_timeout(LANE_TICK) {
+                Ok(packet) => {
+                    forward_downlink(&packet, port, app, relay);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
     }
     if let Ok(mut table) = routes.lock() {
         table.remove(&port);
     }
+    true
+}
+
+/// Write one downlink datagram to the pinned app; false when it is not this lane's
+/// or the app has not spoken yet.
+fn forward_downlink(
+    packet: &LanePacket,
+    port: u16,
+    app: Option<SocketAddr>,
+    relay: &UdpSocket,
+) -> bool {
+    let Some(datagram) = udp_from_packet(packet.packet()) else {
+        return false;
+    };
+    if datagram.destination_port != port {
+        return false;
+    }
+    let Some(app) = app else {
+        return false;
+    };
+    let _ = relay.send_to(datagram.payload, app);
     true
 }
 
