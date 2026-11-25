@@ -25,8 +25,6 @@ const EDGE_RETRY: Duration = Duration::from_secs(1);
 const READ_WAIT: Duration = Duration::from_millis(10);
 /// The read a burst takes: shorter than the idle wait, so egress the stack produces right after data lands leaves without it, the same re-arm the QUIC pump takes.
 const READ_TAIL: Duration = Duration::from_micros(250);
-/// The wait the first datagram of a batch takes after a client frame, so the stack's reply leaves on this turn instead of the next one.
-const GATHER_WAIT: Duration = Duration::from_micros(200);
 const CLOSE_WAIT: Duration = Duration::from_millis(100);
 const UDP_DRAIN: Duration = Duration::from_secs(1);
 const WARP_ASSIGN_WAIT: Duration = Duration::from_millis(250);
@@ -1342,10 +1340,6 @@ struct Session {
     warp: bool,
     half_closed: bool,
     udp_quiet: Option<Instant>,
-    fed: bool,
-    diag_at: Instant,
-    ping_at: Option<Instant>,
-    next_ping: Instant,
     end: bool,
 }
 
@@ -1374,10 +1368,6 @@ impl Session {
             warp: false,
             half_closed: false,
             udp_quiet: None,
-            fed: false,
-            diag_at: Instant::now(),
-            ping_at: None,
-            next_ping: Instant::now() + Duration::from_secs(1),
             end: false,
         }
     }
@@ -1460,12 +1450,6 @@ impl Session {
                 self.end = true;
                 break;
             }
-            if self.request.is_some() && self.ping_at.is_none() && Instant::now() >= self.next_ping {
-                if wire.send(h2::T_PING, 0, 0, &[0u8; 8]) {
-                    self.ping_at = Some(Instant::now());
-                    self.next_ping = Instant::now() + Duration::from_secs(1);
-                }
-            }
             self.flush(wire);
             if wire.closed || self.end {
                 break;
@@ -1505,15 +1489,9 @@ impl Session {
                 } else if Some(id) == self.request {
                     self.send_window += i64::from(increment);
                 }
-                self.fed = true;
             }
             h2::T_PING if flags & h2::F_ACK == 0 => {
                 wire.send(h2::T_PING, h2::F_ACK, 0, body);
-            }
-            h2::T_PING => {
-                if let Some(at) = self.ping_at.take() {
-                    eprintln!("h2ping rtt_us={}", at.elapsed().as_micros());
-                }
             }
             h2::T_HEADERS => self.headers(wire, flags, id, body),
             h2::T_CONT => {
@@ -1563,7 +1541,6 @@ impl Session {
                 let data = strip_padding(flags, body, false);
                 self.window(wire, length);
                 self.capsules(wire, data);
-                self.fed = true;
                 if flags & h2::F_END != 0 {
                     self.half_close();
                 }
@@ -1873,32 +1850,16 @@ impl Session {
             if wire.closed || self.end || self.queued.len() + 1 >= QUEUED_CAP {
                 break;
             }
-            let wait = if pulled == 0 && self.fed {
-                self.fed = false;
-                Some(GATHER_WAIT)
-            } else {
-                None
-            };
             let packet = if let Some(udp) = &self.udp {
                 udp.try_recv()
             } else if let Some(rx) = self.outgoing.as_ref() {
-                match wait {
-                    Some(limit) => match rx.recv_timeout(limit) {
-                        Ok(packet) => Some(packet),
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                            origin_closed = true;
-                            None
-                        }
-                    },
-                    None => match rx.try_recv() {
-                        Ok(packet) => Some(packet),
-                        Err(std::sync::mpsc::TryRecvError::Empty) => None,
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                            origin_closed = true;
-                            None
-                        }
-                    },
+                match rx.try_recv() {
+                    Ok(packet) => Some(packet),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        origin_closed = true;
+                        None
+                    }
                 }
             } else {
                 None
@@ -1924,23 +1885,8 @@ impl Session {
         if !blocked && frame.len() > FRAME_HEAD {
             let _ = self.frame_body(wire, frame, id);
         }
-        frame.clear();
-        frame.resize(FRAME_HEAD, 0);
         if pulled > 0 {
             self.udp_quiet = Some(Instant::now());
-        }
-        let now = Instant::now();
-        if now >= self.diag_at {
-            eprintln!(
-                "h2diag win={} conn={} send={} queued={} pulled={} closed={}",
-                self.send_window.min(self.connection_window),
-                self.connection_window,
-                self.send_window,
-                self.queued.len(),
-                pulled,
-                origin_closed
-            );
-            self.diag_at = now + Duration::from_millis(250);
         }
         origin_closed
     }

@@ -45,7 +45,6 @@ const TCP_RECV_BUFFER: usize = 1024 * 1024;
 /// The send side of one flow: a stream moves this queue per round trip, and a
 /// tunnel's round trip is milliseconds, so the queue bounds a fast link.
 const TCP_SEND_BUFFER: usize = 1024 * 1024;
-
 /// One turn drains at most this many local reads into a flow, so a download
 /// does not wait a whole tick for each buffer when the peer is far ahead.
 const UP_BURST: usize = 64;
@@ -1462,7 +1461,6 @@ fn retire(
 
 /// Run the server stack until its inbound is dropped.
 #[allow(clippy::needless_pass_by_value)]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn server(
     config: DeviceConfig,
     to_tunnel: impl Into<ToTunnel>,
@@ -1939,15 +1937,6 @@ struct ServerStack {
     reassembly: Reassembly,
     fragment: usize,
     started: StdInstant,
-    diag_at: StdInstant,
-    cli_wscale: u8,
-    win_min: u32,
-    win_max: u32,
-    flight: HashMap<u16, (u32, u32)>,
-    retx: u64,
-    dup: u64,
-    retx_seen: u64,
-    dup_seen: u64,
 }
 
 impl ServerStack {
@@ -2010,59 +1999,7 @@ impl ServerStack {
             reassembly: Reassembly::default(),
             fragment,
             started: StdInstant::now(),
-            diag_at: StdInstant::now(),
-            cli_wscale: 0,
-            win_min: 0,
-            win_max: 0,
-            flight: HashMap::new(),
-            retx: 0,
-            dup: 0,
-            retx_seen: 0,
-            dup_seen: 0,
         }
-    }
-
-    fn diag(&mut self) {
-        let now = StdInstant::now();
-        if now.duration_since(self.diag_at) < Duration::from_millis(500) {
-            return;
-        }
-        self.diag_at = now;
-        let (mut est, mut queued, mut can, mut recv) = (0u32, 0usize, 0u32, 0usize);
-        for flow in &self.flows {
-            let socket = self.sockets.get::<TcpSocket>(flow.handle);
-            if socket.state() == State::Established {
-                est += 1;
-                queued += socket.send_queue();
-                recv += socket.recv_queue();
-                if socket.can_send() {
-                    can += 1;
-                }
-            }
-        }
-        let inflight: u64 = self
-            .flight
-            .values()
-            .map(|&(end, ack)| end.wrapping_sub(ack))
-            .filter(|&gap| gap < 32 << 20)
-            .map(u64::from)
-            .sum();
-        let retx = self.retx - self.retx_seen;
-        let dup = self.dup - self.dup_seen;
-        self.retx_seen = self.retx;
-        self.dup_seen = self.dup;
-        eprintln!(
-            "wgdiag est={est} flows={} queued={queued} recv={recv} can={can} cli=[{}..{}] ws={} inflight={inflight} links={} retx={retx} dup={dup} tx={} rx={}",
-            self.flows.len(),
-            self.win_min,
-            self.win_max,
-            self.cli_wscale,
-            self.flight.len(),
-            self.device.tx.len(),
-            self.device.rx.len()
-        );
-        self.win_min = 0;
-        self.win_max = 0;
     }
 
     /// Route one packet to TCP, a UDP lane, or the server echo path.
@@ -2082,23 +2019,6 @@ impl ServerStack {
         let protocol = inner_protocol(&bytes[at..]);
         match protocol {
             Some(PROTOCOL_TCP) => {
-                if let Some(probe) = tcp_probe(&bytes, at) {
-                    if let Some(shift) = probe.shift {
-                        self.cli_wscale = shift;
-                    }
-                    if probe.flags & 0x10 != 0 && probe.flags & 0x02 == 0 {
-                        let eff = u32::from(probe.window) << self.cli_wscale;
-                        if eff > 0 {
-                            self.win_min = if self.win_min == 0 { eff } else { self.win_min.min(eff) };
-                            self.win_max = self.win_max.max(eff);
-                        }
-                        let entry = self.flight.entry(probe.dst).or_insert((probe.ack, probe.ack));
-                        if probe.payload == 0 && probe.ack == entry.1 {
-                            self.dup += 1;
-                        }
-                        entry.1 = probe.ack;
-                    }
-                }
                 lower_syn_mss(&mut bytes, at, self.mtu);
                 self.device.push(bytes, at);
             }
@@ -2197,21 +2117,10 @@ impl ServerStack {
             moved |= pump(flow, &mut self.sockets, up_ready);
         }
         self.iface.poll(now, &mut self.device, &mut self.sockets);
-        self.diag();
         for _ in 0..TX_BURST {
             let Some(mut packet) = self.device.tx.pop_front() else {
                 break;
             };
-            if let Some(probe) = tcp_probe(&packet, self.headroom) {
-                if probe.payload > 0 {
-                    let end = probe.seq.wrapping_add(probe.payload as u32);
-                    let entry = self.flight.entry(probe.src).or_insert((end, end));
-                    if end.wrapping_sub(entry.0) > 0x8000_0000 || end <= entry.0 {
-                        self.retx += 1;
-                    }
-                    entry.0 = end;
-                }
-            }
             lower_syn_ack_mss(&mut packet, self.headroom, self.mtu);
             match try_send_packet(&self.to_tunnel, packet, self.headroom, self.fragment) {
                 Flush::Sent => {}
@@ -2617,70 +2526,6 @@ fn tcp_syn_port(packet: &[u8]) -> Option<u16> {
 
 /// Whether an inner packet carries TCP, which the stack takes, or UDP, which
 /// the datagram lane takes.
-/// The peer's TCP window field and, on a SYN, its window-scale shift.
-struct TcpProbe {
-    src: u16,
-    dst: u16,
-    seq: u32,
-    ack: u32,
-    flags: u8,
-    window: u16,
-    payload: usize,
-    shift: Option<u8>,
-}
-
-/// The TCP header fields the server reads to log the peer's window and the bytes still in flight.
-fn tcp_probe(packet: &[u8], at: usize) -> Option<TcpProbe> {
-    let ip = packet.get(at..)?;
-    let (header, total) = match ip.first()? >> 4 {
-        4 => (
-            usize::from(ip[0] & 0x0f) * 4,
-            usize::from(u16::from_be_bytes([*ip.get(2)?, *ip.get(3)?])),
-        ),
-        6 => (
-            IPV6_HEADER,
-            IPV6_HEADER + usize::from(u16::from_be_bytes([*ip.get(4)?, *ip.get(5)?])),
-        ),
-        _ => return None,
-    };
-    let tcp = ip.get(header..)?;
-    let src = u16::from_be_bytes([*tcp.first()?, *tcp.get(1)?]);
-    let dst = u16::from_be_bytes([*tcp.get(2)?, *tcp.get(3)?]);
-    let seq = u32::from_be_bytes(tcp.get(4..8)?.try_into().ok()?);
-    let ack = u32::from_be_bytes(tcp.get(8..12)?.try_into().ok()?);
-    let flags = *tcp.get(13)?;
-    let window = u16::from_be_bytes([*tcp.get(14)?, *tcp.get(15)?]);
-    let tcp_header = usize::from(*tcp.get(12)? >> 4) * 4;
-    let payload = total
-        .saturating_sub(header + tcp_header)
-        .min(tcp.len().saturating_sub(tcp_header));
-    let shift = if flags & 0x02 != 0 {
-        let data = tcp_header;
-        let mut i = 20;
-        let mut shift = None;
-        while i + 1 < data && i + 1 < tcp.len() {
-            match tcp[i] {
-                0 => break,
-                1 => i += 1,
-                kind => {
-                    let len = usize::from(tcp[i + 1]);
-                    if len < 2 {
-                        break;
-                    }
-                    if kind == 3 {
-                        shift = tcp.get(i + 2).copied().map(|value| value.min(14));
-                    }
-                    i += len;
-                }
-            }
-        }
-        shift
-    } else {
-        None
-    };
-    Some(TcpProbe { src, dst, seq, ack, flags, window, payload, shift })
-}
-
 pub(crate) fn inner_protocol(packet: &[u8]) -> Option<u8> {
     match packet.first()? >> 4 {
         4 => packet.get(9).copied(),

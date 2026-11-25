@@ -2495,9 +2495,8 @@ fn replace_file(path: &Path, contents: &str) -> std::io::Result<()> {
     }
     #[cfg(target_os = "macos")]
     if metadata.is_some() {
-        preserve_acl(path, &temp).map_err(|error| {
+        preserve_acl(path, &temp).inspect_err(|_| {
             let _ = std::fs::remove_file(&temp);
-            error
         })?;
     }
     let written = file
