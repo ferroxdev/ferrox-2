@@ -1,7 +1,8 @@
 [package]
 name = "tun-oracle"
 version = "0.0.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.100"
 description = "Records the (target, payload) dial set a pinned userspace stack produces from scripts/tun-oracle/script.txt"
 
 [workspace]

@@ -2141,12 +2141,7 @@ mod tests {
                 vec![0xffu8; 33],
                 "deadbeef010203044d93a2b9dff325f4824954d90aae66cdf9e5af5edcd7322c2d54c1c5f14484bf4d",
             ),
-            (
-                "hy2!",
-                [9u8; 8],
-                vec![0xa5],
-                "090909090909090929",
-            ),
+            ("hy2!", [9u8; 8], vec![0xa5], "090909090909090929"),
         ];
         for (password, salt, plain, want) in cases {
             let salamander = Salamander::new(password).expect("password");
@@ -2221,9 +2216,11 @@ mod tests {
         let n = wrong.deobfuscate_in_place(&mut sealed).expect("length");
         assert_ne!(&sealed[..n], &plain[..], "wrong key is noise");
         // A datagram that cannot hold a salt and one byte de-obfuscates to nothing.
-        assert!(right
-            .deobfuscate_in_place(&mut [0u8; SALAMANDER_SALT])
-            .is_none());
+        assert!(
+            right
+                .deobfuscate_in_place(&mut [0u8; SALAMANDER_SALT])
+                .is_none()
+        );
         assert!(right.deobfuscate_in_place(&mut []).is_none());
         // And a password below the floor the server accepts is refused at construction.
         assert!(Salamander::new("abc").is_none());

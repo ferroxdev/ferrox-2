@@ -754,15 +754,14 @@ fn run(
     }
     let transaction = crate::router_script::refresh_assets(|| {
         let transaction = swap_all(&staged)?;
-        if let Some(route) = route {
-            if let Some(next) = next {
-                if let Err(reason) = route.publish_routing(Some(next)) {
-                    return match transaction.rollback() {
-                        Ok(()) => Err(reason),
-                        Err(rollback) => Err(format!("{reason}; rollback failed: {rollback}")),
-                    };
-                }
-            }
+        if let Some(route) = route
+            && let Some(next) = next
+            && let Err(reason) = route.publish_routing(Some(next))
+        {
+            return match transaction.rollback() {
+                Ok(()) => Err(reason),
+                Err(rollback) => Err(format!("{reason}; rollback failed: {rollback}")),
+            };
         }
         Ok(transaction)
     });
@@ -1123,13 +1122,13 @@ impl Transaction {
                     }
                 }
                 None => {
-                    if let Err(error) = std::fs::remove_file(&swap.target) {
-                        if error.kind() != std::io::ErrorKind::NotFound {
-                            failure.get_or_insert(format!(
-                                "cannot remove {}: {error}",
-                                swap.target.display()
-                            ));
-                        }
+                    if let Err(error) = std::fs::remove_file(&swap.target)
+                        && error.kind() != std::io::ErrorKind::NotFound
+                    {
+                        failure.get_or_insert(format!(
+                            "cannot remove {}: {error}",
+                            swap.target.display()
+                        ));
                     }
                 }
             }
@@ -1143,12 +1142,11 @@ impl Transaction {
     fn cleanup(self) -> Option<String> {
         let mut failure = None;
         for swap in self.swaps {
-            if let Some(backup) = swap.backup {
-                if let Err(error) = std::fs::remove_file(&backup) {
-                    if error.kind() != std::io::ErrorKind::NotFound {
-                        failure.get_or_insert(error);
-                    }
-                }
+            if let Some(backup) = swap.backup
+                && let Err(error) = std::fs::remove_file(&backup)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                failure.get_or_insert(error);
             }
         }
         failure.map(|error| error.to_string())
@@ -1293,7 +1291,7 @@ fn replace_file(temp: &Path, target: &Path) -> io::Result<()> {
 fn replace_file(temp: &Path, target: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt as _;
     use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
     let from: Vec<u16> = temp
         .as_os_str()

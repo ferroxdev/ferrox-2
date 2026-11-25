@@ -265,13 +265,12 @@ impl QuicPool {
 
     /// Drop this lane and no other: a concurrent dial can have put a fresh connection under the same key while we were reading the old one.
     fn retire(&self, key: &PoolKey, entry: &PooledConn) {
-        if let Ok(mut pool) = self.inner.lock() {
-            if pool
+        if let Ok(mut pool) = self.inner.lock()
+            && pool
                 .get(key)
                 .is_some_and(|live| Arc::ptr_eq(&live.conn, &entry.conn))
-            {
-                pool.remove(key);
-            }
+        {
+            pool.remove(key);
         }
         // A lane still carrying flows leaves the pool without a goodbye: a `done` frame here would end streams a flow is mid-write to. Its own last lease parks it, and the connection goes with the leases that held it.
         let Ok(mut conn) = entry.conn.lock() else {
@@ -538,11 +537,7 @@ fn base64_encode_block(out: &mut [u8; 64], bytes: &[u8]) -> usize {
 
 fn base64_value(byte: u8) -> Option<u8> {
     let v = B64_TABLE[byte as usize];
-    if v == 255 {
-        None
-    } else {
-        Some(v)
-    }
+    if v == 255 { None } else { Some(v) }
 }
 
 fn base64_decode(text: &[u8], out: &mut Vec<u8>) -> bool {
@@ -2029,12 +2024,12 @@ fn platform_roots() -> Vec<Vec<u8>> {
     if !roots.is_empty() {
         return roots;
     }
-    if let Ok(path) = std::env::var("SSL_CERT_FILE") {
-        if let Ok(pem) = std::fs::read(&path) {
-            let roots = parse_ca_pem(&pem);
-            if !roots.is_empty() {
-                return roots;
-            }
+    if let Ok(path) = std::env::var("SSL_CERT_FILE")
+        && let Ok(pem) = std::fs::read(&path)
+    {
+        let roots = parse_ca_pem(&pem);
+        if !roots.is_empty() {
+            return roots;
         }
     }
     for path in BUNDLES {
@@ -2104,22 +2099,26 @@ pub(crate) fn network_generation() -> u64 {
             let poll = Arc::clone(&generation);
             let _ = std::thread::Builder::new()
                 .name("ferrox-routes-poll".to_owned())
-                .spawn(move || loop {
-                    std::thread::sleep(Duration::from_secs(10));
-                    poll.fetch_add(1, Ordering::Relaxed);
+                .spawn(move || {
+                    loop {
+                        std::thread::sleep(Duration::from_secs(10));
+                        poll.fetch_add(1, Ordering::Relaxed);
+                    }
                 });
             #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             let _ = std::thread::Builder::new()
                 .name("ferrox-routes".to_owned())
-                .spawn(move || loop {
-                    let Ok(mut listener) = route_manager::RouteManager::listener() else {
+                .spawn(move || {
+                    loop {
+                        let Ok(mut listener) = route_manager::RouteManager::listener() else {
+                            std::thread::sleep(Duration::from_secs(1));
+                            continue;
+                        };
+                        while listener.listen().is_ok() {
+                            bump.fetch_add(1, Ordering::Relaxed);
+                        }
                         std::thread::sleep(Duration::from_secs(1));
-                        continue;
-                    };
-                    while listener.listen().is_ok() {
-                        bump.fetch_add(1, Ordering::Relaxed);
                     }
-                    std::thread::sleep(Duration::from_secs(1));
                 });
             generation
         })
@@ -2185,10 +2184,10 @@ pub(crate) fn rebind_path(
     let Ok(fresh) = UdpSocket::bind(at) else {
         return Rebind::Retry;
     };
-    if let Some(options) = options {
-        if options.apply_to_udp(&fresh, peer).is_err() {
-            return Rebind::Retry;
-        }
+    if let Some(options) = options
+        && options.apply_to_udp(&fresh, peer).is_err()
+    {
+        return Rebind::Retry;
     }
     set_gro(&fresh, sock.gro && sock.gso && sock.whole_datagrams());
     set_receive_buffer(&fresh, DATAGRAM_BUFFER);
@@ -2348,11 +2347,7 @@ fn get_buffer(sock: &UdpSocket, option: libc::c_int) -> i32 {
             std::ptr::addr_of_mut!(len),
         )
     };
-    if ok == 0 {
-        got
-    } else {
-        0
-    }
+    if ok == 0 { got } else { 0 }
 }
 
 #[cfg(all(test, unix))]
@@ -2414,7 +2409,7 @@ pub(crate) fn set_send_buffer(sock: &UdpSocket, bytes: i32) {
 #[cfg(all(test, windows))]
 fn get_buffer(sock: &UdpSocket, option: i32) -> i32 {
     use std::os::windows::io::AsRawSocket as _;
-    use windows_sys::Win32::Networking::WinSock::{getsockopt, SOL_SOCKET};
+    use windows_sys::Win32::Networking::WinSock::{SOL_SOCKET, getsockopt};
     let mut got: i32 = 0;
     let mut len = i32::try_from(std::mem::size_of::<i32>()).unwrap_or(i32::MAX);
     // SAFETY: `got` and `len` are the buffer and the length the kernel writes through, on the socket's own handle.
@@ -2427,11 +2422,7 @@ fn get_buffer(sock: &UdpSocket, option: i32) -> i32 {
             std::ptr::addr_of_mut!(len),
         )
     };
-    if ok == 0 {
-        got
-    } else {
-        0
-    }
+    if ok == 0 { got } else { 0 }
 }
 
 /// What a datagram socket is armed to wait for: `Some(None)` blocks forever, `Some(Some(d))` waits `d`, and `None` records no arm yet.
@@ -3750,11 +3741,11 @@ impl Datagram {
     /// clears. A QUIC DATAGRAM frame is never retransmitted, so a held datagram is
     /// the difference between a pacing blip and a hole the inner TCP must time out.
     fn send_or_hold(&self, buf: &[u8], to: SocketAddr) -> bool {
-        if let Err(error) = self.send_to(buf, to) {
-            if refused(&error) {
-                self.hold(buf, to);
-                return false;
-            }
+        if let Err(error) = self.send_to(buf, to)
+            && refused(&error)
+        {
+            self.hold(buf, to);
+            return false;
         }
         true
     }
@@ -3780,11 +3771,11 @@ impl Datagram {
             return;
         };
         while let Some((bytes, to)) = queue.pop_front() {
-            if let Err(error) = self.send_to(&bytes, to) {
-                if refused(&error) {
-                    queue.push_front((bytes, to));
-                    return;
-                }
+            if let Err(error) = self.send_to(&bytes, to)
+                && refused(&error)
+            {
+                queue.push_front((bytes, to));
+                return;
             }
         }
         self.held.holding.store(false, Ordering::Relaxed);
@@ -3814,10 +3805,10 @@ impl Datagram {
     /// flag keeps a lane that never roams on the direct path.
     pub(crate) fn rebind(&self, sock: UdpSocket) -> std::io::Result<()> {
         set_gro(&sock, self.gro && self.gso && self.whole_datagrams());
-        if let Ok(armed) = self.armed.lock() {
-            if let Some(Some(timeout)) = *armed {
-                sock.set_read_timeout(Some(timeout))?;
-            }
+        if let Ok(armed) = self.armed.lock()
+            && let Some(Some(timeout)) = *armed
+        {
+            sock.set_read_timeout(Some(timeout))?;
         }
         let mut rebound = self
             .rebound
@@ -4024,7 +4015,7 @@ impl Datagram {
     pub(crate) fn wait_readable(&self, timeout: Duration) -> std::io::Result<bool> {
         use std::os::windows::io::AsRawSocket as _;
         use windows_sys::Win32::Networking::WinSock::{
-            WSAGetLastError, WSAPoll, POLLERR, POLLHUP, POLLIN, POLLRDNORM, SOCKET, WSAPOLLFD,
+            POLLERR, POLLHUP, POLLIN, POLLRDNORM, SOCKET, WSAGetLastError, WSAPOLLFD, WSAPoll,
         };
         let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
         let mut row = WSAPOLLFD {
@@ -4295,10 +4286,10 @@ pub(crate) fn handshake_within(
         conn.as_mut().set_ech_config_list(list).ok()?;
     }
     // The session is offered before the first packet, or the dialer reads no 0-RTT for it.
-    if let Some(key) = resume {
-        if let Some(blob) = resumption_entry(key) {
-            let _ = conn.set_session(&blob);
-        }
+    if let Some(key) = resume
+        && let Some(blob) = resumption_entry(key)
+    {
+        let _ = conn.set_session(&blob);
     }
     // Emit the handshake first: `is_in_early_data` turns after it, then the h3 opening rides 0-RTT.
     let mut first = [0u8; MAX_DATAGRAM];
@@ -4519,10 +4510,10 @@ fn pump(
         if !rebind_if_moved(shared, sock, peer, net, local) {
             return;
         }
-        if *local != before {
-            if let Ok(mut state) = table.lock() {
-                state.local = *local;
-            }
+        if *local != before
+            && let Ok(mut state) = table.lock()
+        {
+            state.local = *local;
         }
         // The lock covers quiche calls only: a stalled peer must not stall the sessions sharing the connection.
         let timeout = {
@@ -4737,11 +4728,11 @@ struct PumpOwner {
 
 impl Drop for PumpOwner {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.table.lock() {
-            if state.pump == self.generation {
-                state.pump = 0;
-                state.parked = Some(Instant::now());
-            }
+        if let Ok(mut state) = self.table.lock()
+            && state.pump == self.generation
+        {
+            state.pump = 0;
+            state.parked = Some(Instant::now());
         }
     }
 }
@@ -6353,9 +6344,11 @@ mod tests {
         }
         assert_eq!(entries.len(), RESUMPTION_CAP);
         assert!(!entries.iter().any(|(k, _)| k == &key(0)));
-        assert!(entries
-            .iter()
-            .any(|(k, _)| k == &key(RESUMPTION_CAP as u16)));
+        assert!(
+            entries
+                .iter()
+                .any(|(k, _)| k == &key(RESUMPTION_CAP as u16))
+        );
         remember(&mut entries, &key(1), vec![0xAA]);
         assert_eq!(entries.len(), RESUMPTION_CAP);
         let updated = entries
@@ -7431,9 +7424,11 @@ mod tests {
             hysteria_client_cid(None).expect("no block").is_empty(),
             "a stream with no quicParams block parrots too"
         );
-        assert!(hysteria_client_cid(Some(&parrot))
-            .expect("parrot")
-            .is_empty());
+        assert!(
+            hysteria_client_cid(Some(&parrot))
+                .expect("parrot")
+                .is_empty()
+        );
         assert_eq!(
             hysteria_client_cid(Some(&masked)).expect("masked").len(),
             SCID_LEN

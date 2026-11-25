@@ -74,10 +74,8 @@ pub(crate) fn edges_via(
     }
     let (stamp, listed, fetched) = settled(known, now, fetch(roots, upstream));
     remember(&(stamp, listed.clone()));
-    if fetched {
-        if let Some(path) = &path {
-            write_at(path, &listed);
-        }
+    if fetched && let Some(path) = &path {
+        write_at(path, &listed);
     }
     listed
 }

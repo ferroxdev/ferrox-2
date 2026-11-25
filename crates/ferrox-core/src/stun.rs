@@ -333,13 +333,10 @@ mod tests {
             &CHANGE_REQUEST.to_be_bytes()
         );
         assert_eq!(&request[HEADER_LEN + 4..], &0x0000_0006u32.to_be_bytes());
-        assert!(binding_request_with_change_into(
-            &mut [0u8; HEADER_LEN],
-            &transaction,
-            true,
-            false
-        )
-        .is_none());
+        assert!(
+            binding_request_with_change_into(&mut [0u8; HEADER_LEN], &transaction, true, false)
+                .is_none()
+        );
 
         let plain = |address: [u8; 4], port: u16| {
             let mut value = vec![0, 0x01];

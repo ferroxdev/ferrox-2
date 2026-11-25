@@ -13,8 +13,8 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read as _, Write as _};
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) enum CacheBody {
@@ -228,7 +228,7 @@ fn windows_case_sensitive(dir: &Path) -> bool {
         flags: u32,
     }
     #[link(name = "kernel32")]
-    extern "system" {
+    unsafe extern "system" {
         fn GetFileInformationByHandleEx(
             handle: *mut core::ffi::c_void,
             class: i32,
@@ -411,10 +411,10 @@ fn publish_cache(target: PathBuf, body: CacheBody) -> Result<(), String> {
         body,
     });
     CANDIDATE_CACHE_WRITES.with(|slot| {
-        if let Some(writes) = slot.borrow_mut().as_mut() {
-            if let Some(item) = queued.take() {
-                writes.push(item);
-            }
+        if let Some(writes) = slot.borrow_mut().as_mut()
+            && let Some(item) = queued.take()
+        {
+            writes.push(item);
         }
     });
     match queued {
@@ -914,10 +914,10 @@ impl Balancer {
         candidates: &'a [String],
         observed: Option<&[Observed]>,
     ) -> Option<Cow<'a, str>> {
-        if let Ok(forced) = self.forced.lock() {
-            if let Some(forced) = forced.as_deref() {
-                return Some(Cow::Owned(forced.to_owned()));
-            }
+        if let Ok(forced) = self.forced.lock()
+            && let Some(forced) = forced.as_deref()
+        {
+            return Some(Cow::Owned(forced.to_owned()));
         }
         if candidates.is_empty() {
             return None;
@@ -1122,7 +1122,7 @@ fn parse_strategy(value: &Json) -> Result<Strategy, String> {
                     other => {
                         return Err(format!(
                             "routing balancer strategy field `{other}` is not carried"
-                        ))
+                        ));
                     }
                 }
             }
@@ -1163,10 +1163,10 @@ impl LeastLoad {
                 }
                 "baselines" => {
                     for baseline in field.as_arr().unwrap_or(&[]) {
-                        if let Some(nanos) = crate::config::go_duration(baseline)? {
-                            if nanos > 0 {
-                                baselines.push(nanos);
-                            }
+                        if let Some(nanos) = crate::config::go_duration(baseline)?
+                            && nanos > 0
+                        {
+                            baselines.push(nanos);
                         }
                     }
                 }
@@ -1208,13 +1208,12 @@ impl LeastLoad {
         if !candidates.iter().any(|candidate| candidate == &status.tag) {
             return false;
         }
-        if let Some(health) = status.health {
-            if health.all > 0
-                && self.tolerance > 0.0
-                && health.fail as f64 / health.all as f64 > f64::from(self.tolerance)
-            {
-                return false;
-            }
+        if let Some(health) = status.health
+            && health.all > 0
+            && self.tolerance > 0.0
+            && health.fail as f64 / health.all as f64 > f64::from(self.tolerance)
+        {
+            return false;
         }
         true
     }
@@ -1663,7 +1662,7 @@ impl Routing {
                         _ => {
                             return Err(format!(
                                 "routing domainStrategy `{named}` is not AsIs, IpIfNonMatch or IpOnDemand"
-                            ))
+                            ));
                         }
                     };
                 }
@@ -1679,30 +1678,30 @@ impl Routing {
             }
         }
         let mut rule_sets = Vec::new();
-        if let Some(value) = raw_sets {
-            if !matches!(value, Json::Null) {
-                let items = value
-                    .as_arr()
-                    .ok_or_else(|| "routing rule set is not an array".to_owned())?;
-                let mut prepared: Vec<Option<RuleSet>> = Vec::with_capacity(items.len());
-                for item in items {
-                    prepared.push(
-                        Self::rule_set_is_remote(item)
-                            .then(|| RuleSet::parse(item, &mut assets, &dirs, remote))
-                            .transpose()?,
-                    );
+        if let Some(value) = raw_sets
+            && !matches!(value, Json::Null)
+        {
+            let items = value
+                .as_arr()
+                .ok_or_else(|| "routing rule set is not an array".to_owned())?;
+            let mut prepared: Vec<Option<RuleSet>> = Vec::with_capacity(items.len());
+            for item in items {
+                prepared.push(
+                    Self::rule_set_is_remote(item)
+                        .then(|| RuleSet::parse(item, &mut assets, &dirs, remote))
+                        .transpose()?,
+                );
+            }
+            let mut tags = HashSet::new();
+            for (at, item) in items.iter().enumerate() {
+                let set = match prepared[at].take() {
+                    Some(set) => set,
+                    None => RuleSet::parse(item, &mut assets, &dirs, remote)?,
+                };
+                if !tags.insert(set.tag.clone()) {
+                    return Err(format!("duplicate rule set tag `{}`", set.tag));
                 }
-                let mut tags = HashSet::new();
-                for (at, item) in items.iter().enumerate() {
-                    let set = match prepared[at].take() {
-                        Some(set) => set,
-                        None => RuleSet::parse(item, &mut assets, &dirs, remote)?,
-                    };
-                    if !tags.insert(set.tag.clone()) {
-                        return Err(format!("duplicate rule set tag `{}`", set.tag));
-                    }
-                    rule_sets.push(Arc::new(set));
-                }
+                rule_sets.push(Arc::new(set));
             }
         }
         let script = match raw_script {
@@ -1734,39 +1733,39 @@ impl Routing {
             _ => None,
         };
         let mut balancers = Vec::new();
-        if let Some(value) = raw_balancers {
-            if !matches!(value, Json::Null) {
-                let items = value
-                    .as_arr()
-                    .ok_or_else(|| "routing balancers is not an array".to_owned())?;
-                let mut tags = HashSet::new();
-                for (at, item) in items.iter().enumerate() {
-                    let balancer = Balancer::parse(item, at)?;
-                    if !tags.insert(balancer.tag.clone()) {
-                        return Err(format!("duplicate balancer tag `{}`", balancer.tag));
-                    }
-                    balancers.push(balancer);
+        if let Some(value) = raw_balancers
+            && !matches!(value, Json::Null)
+        {
+            let items = value
+                .as_arr()
+                .ok_or_else(|| "routing balancers is not an array".to_owned())?;
+            let mut tags = HashSet::new();
+            for (at, item) in items.iter().enumerate() {
+                let balancer = Balancer::parse(item, at)?;
+                if !tags.insert(balancer.tag.clone()) {
+                    return Err(format!("duplicate balancer tag `{}`", balancer.tag));
                 }
+                balancers.push(balancer);
             }
         }
         let mut rules = Vec::new();
-        if let Some(value) = raw_rules {
-            if !matches!(value, Json::Null) {
-                let items = value
-                    .as_arr()
-                    .ok_or_else(|| "routing rules is not an array".to_owned())?;
-                let mut tags = HashSet::new();
-                for item in items {
-                    let Some(rule) = Rule::parse(item, &mut assets, &rule_sets)? else {
-                        continue;
-                    };
-                    if let Some(tag) = &rule.tag {
-                        if !tags.insert(tag.clone()) {
-                            return Err(format!("duplicate ruleTag `{tag}`"));
-                        }
-                    }
-                    rules.push(rule);
+        if let Some(value) = raw_rules
+            && !matches!(value, Json::Null)
+        {
+            let items = value
+                .as_arr()
+                .ok_or_else(|| "routing rules is not an array".to_owned())?;
+            let mut tags = HashSet::new();
+            for item in items {
+                let Some(rule) = Rule::parse(item, &mut assets, &rule_sets)? else {
+                    continue;
+                };
+                if let Some(tag) = &rule.tag
+                    && !tags.insert(tag.clone())
+                {
+                    return Err(format!("duplicate ruleTag `{tag}`"));
                 }
+                rules.push(rule);
             }
         }
         for rule in &rules {
@@ -1926,10 +1925,10 @@ impl Routing {
             };
             rule.added = true;
             rule.raw = Some(item.clone());
-            if let Some(tag) = &rule.tag {
-                if !tags.insert(tag.clone()) {
-                    return Err(format!("duplicate ruleTag `{tag}`"));
-                }
+            if let Some(tag) = &rule.tag
+                && !tags.insert(tag.clone())
+            {
+                return Err(format!("duplicate ruleTag `{tag}`"));
             }
             if rule.balancer {
                 if !(append
@@ -2719,10 +2718,10 @@ impl Rule {
     }
 
     fn base_matches(&self, flow: &Flow, names: Option<Names<'_>>) -> bool {
-        if let Some(networks) = &self.networks {
-            if !networks.contains(&flow.network) {
-                return false;
-            }
+        if let Some(networks) = &self.networks
+            && !networks.contains(&flow.network)
+        {
+            return false;
         }
         if let Some(tags) = &self.inbound_tags {
             let Some(tag) = flow.inbound_tag else {
@@ -2743,20 +2742,20 @@ impl Rule {
                 return false;
             }
         }
-        if let Some(ports) = &self.ports {
-            if !flow.port.is_some_and(|port| ports.contains(port)) {
-                return false;
-            }
+        if let Some(ports) = &self.ports
+            && !flow.port.is_some_and(|port| ports.contains(port))
+        {
+            return false;
         }
-        if let Some(ports) = &self.source_ports {
-            if !ports.contains(flow.source_port) {
-                return false;
-            }
+        if let Some(ports) = &self.source_ports
+            && !ports.contains(flow.source_port)
+        {
+            return false;
         }
-        if let Some(ports) = &self.local_ports {
-            if !ports.contains(flow.local_port) {
-                return false;
-            }
+        if let Some(ports) = &self.local_ports
+            && !ports.contains(flow.local_port)
+        {
+            return false;
         }
         if let Some(domains) = &self.domains {
             let Some(names) = names else {
@@ -2766,35 +2765,35 @@ impl Rule {
                 return false;
             }
         }
-        if let Some(users) = &self.users {
-            if !users.matches(flow.user) {
-                return false;
-            }
+        if let Some(users) = &self.users
+            && !users.matches(flow.user)
+        {
+            return false;
         }
-        if let Some(attrs) = &self.attrs {
-            if !attrs.matches(flow.attrs) {
-                return false;
-            }
+        if let Some(attrs) = &self.attrs
+            && !attrs.matches(flow.attrs)
+        {
+            return false;
         }
-        if let Some(process) = &self.process {
-            if !process.matches(flow.process) {
-                return false;
-            }
+        if let Some(process) = &self.process
+            && !process.matches(flow.process)
+        {
+            return false;
         }
-        if let Some(routes) = &self.vless_routes {
-            if !routes.contains(flow.vless_route) {
-                return false;
-            }
+        if let Some(routes) = &self.vless_routes
+            && !routes.contains(flow.vless_route)
+        {
+            return false;
         }
-        if let Some(matcher) = &self.source_ips {
-            if !flow.source.is_some_and(|ip| matcher.matches(ip)) {
-                return false;
-            }
+        if let Some(matcher) = &self.source_ips
+            && !flow.source.is_some_and(|ip| matcher.matches(ip))
+        {
+            return false;
         }
-        if let Some(matcher) = &self.local_ips {
-            if !flow.local.is_some_and(|ip| matcher.matches(ip)) {
-                return false;
-            }
+        if let Some(matcher) = &self.local_ips
+            && !flow.local.is_some_and(|ip| matcher.matches(ip))
+        {
+            return false;
         }
         true
     }
@@ -2846,16 +2845,16 @@ impl Rule {
 }
 
 fn parse_source_rules(body: &Json, tag: &str, assets: &mut Assets) -> Result<Vec<SetRule>, String> {
-    if let Json::Obj(pairs) = body {
-        if let Some((_, version)) = pairs.iter().find(|(key, _)| key == "version") {
-            let version = version
-                .as_u32()
-                .ok_or_else(|| format!("routing rule set `{tag}` version is not a number"))?;
-            if !(1..=5).contains(&version) {
-                return Err(format!(
-                    "routing rule set `{tag}` version {version} is not carried"
-                ));
-            }
+    if let Json::Obj(pairs) = body
+        && let Some((_, version)) = pairs.iter().find(|(key, _)| key == "version")
+    {
+        let version = version
+            .as_u32()
+            .ok_or_else(|| format!("routing rule set `{tag}` version is not a number"))?;
+        if !(1..=5).contains(&version) {
+            return Err(format!(
+                "routing rule set `{tag}` version {version} is not carried"
+            ));
         }
     }
     match body {
@@ -3494,12 +3493,12 @@ impl RuleSet {
                 "local".to_owned()
             }
         });
-        if let Some(format) = format.as_deref() {
-            if !matches!(format, "binary" | "srs" | "source" | "json") {
-                return Err(format!(
-                    "routing rule set `{tag}` format `{format}` is not carried"
-                ));
-            }
+        if let Some(format) = format.as_deref()
+            && !matches!(format, "binary" | "srs" | "source" | "json")
+        {
+            return Err(format!(
+                "routing rule set `{tag}` format `{format}` is not carried"
+            ));
         }
         let mut body = None;
         let mut bytes = None;
@@ -3696,16 +3695,16 @@ impl SetRule {
                 "domain_suffix" => {
                     let matcher = domains.get_or_insert_with(DomainMatcher::new);
                     for item in string_list(value, "domain_suffix")?.unwrap_or_default() {
-                        if !has_domain_prefix(&item) {
-                            if let Some(rest) = item.strip_prefix('.') {
-                                if rest.is_empty() {
-                                    return Err(
-                                        "routing rule set rule domain_suffix is empty".to_owned()
-                                    );
-                                }
-                                matcher.add(DomainKind::SuffixOnly, lower_arc(rest))?;
-                                continue;
+                        if !has_domain_prefix(&item)
+                            && let Some(rest) = item.strip_prefix('.')
+                        {
+                            if rest.is_empty() {
+                                return Err(
+                                    "routing rule set rule domain_suffix is empty".to_owned()
+                                );
                             }
+                            matcher.add(DomainKind::SuffixOnly, lower_arc(rest))?;
+                            continue;
                         }
                         let item = if has_domain_prefix(&item) {
                             item
@@ -3788,7 +3787,7 @@ impl SetRule {
                 other => {
                     return Err(format!(
                         "routing rule set rule field `{other}` is not carried"
-                    ))
+                    ));
                 }
             }
         }
@@ -3819,7 +3818,7 @@ impl SetRule {
                 other => {
                     return Err(format!(
                         "routing logical rule mode `{other}` is not carried"
-                    ))
+                    ));
                 }
             };
             let items = nested
@@ -3965,20 +3964,20 @@ impl SetRule {
             }
             return verdict;
         }
-        if let Some(networks) = &self.networks {
-            if !networks.contains(&flow.network) {
-                return Verdict::No;
-            }
+        if let Some(networks) = &self.networks
+            && !networks.contains(&flow.network)
+        {
+            return Verdict::No;
         }
-        if let Some(ports) = &self.ports {
-            if !flow.port.is_some_and(|port| ports.contains(port)) {
-                return Verdict::No;
-            }
+        if let Some(ports) = &self.ports
+            && !flow.port.is_some_and(|port| ports.contains(port))
+        {
+            return Verdict::No;
         }
-        if let Some(ports) = &self.source_ports {
-            if !ports.contains(flow.source_port) {
-                return Verdict::No;
-            }
+        if let Some(ports) = &self.source_ports
+            && !ports.contains(flow.source_port)
+        {
+            return Verdict::No;
         }
         let mut destination_unknown = false;
         if self.domains.is_some() || self.ips.is_some() {
@@ -3993,17 +3992,15 @@ impl SetRule {
                     None => destination_unknown = true,
                 }
             }
-            if !matched {
-                if let Some(matcher) = &self.ips {
-                    match flow.ip {
-                        Some(ip) => matched = matcher.matches(ip),
-                        None => match addrs {
-                            Some(addrs) => {
-                                matched = addrs.iter().any(|ip| matcher.matches(*ip));
-                            }
-                            None => destination_unknown = true,
-                        },
-                    }
+            if !matched && let Some(matcher) = &self.ips {
+                match flow.ip {
+                    Some(ip) => matched = matcher.matches(ip),
+                    None => match addrs {
+                        Some(addrs) => {
+                            matched = addrs.iter().any(|ip| matcher.matches(*ip));
+                        }
+                        None => destination_unknown = true,
+                    },
                 }
             }
             if matched {
@@ -4012,15 +4009,15 @@ impl SetRule {
                 return Verdict::No;
             }
         }
-        if let Some(matcher) = &self.source_ips {
-            if !flow.source.is_some_and(|ip| matcher.matches(ip)) {
-                return Verdict::No;
-            }
+        if let Some(matcher) = &self.source_ips
+            && !flow.source.is_some_and(|ip| matcher.matches(ip))
+        {
+            return Verdict::No;
         }
-        if let Some(process) = &self.process {
-            if !process.matches(flow.process) {
-                return Verdict::No;
-            }
+        if let Some(process) = &self.process
+            && !process.matches(flow.process)
+        {
+            return Verdict::No;
         }
         if destination_unknown {
             return Verdict::Unknown;
@@ -4063,10 +4060,8 @@ impl SetRule {
                 && self.ips.is_none()
                 && self.source_ips.is_none()
                 && self.process.is_none();
-            if network_only {
-                if let Some(networks) = &self.networks {
-                    return !networks.contains(&network);
-                }
+            if network_only && let Some(networks) = &self.networks {
+                return !networks.contains(&network);
             }
             return true;
         }
@@ -5071,7 +5066,7 @@ pub(crate) fn add_domain(
             _ => {
                 return Err(format!(
                     "domain rule `{value}`: the substr cannot contain a dot"
-                ))
+                ));
             }
         };
         let regex = regex::Regex::new(&pattern)
@@ -5751,10 +5746,8 @@ fn geosite_entry(
                 let raw = reader.bytes()?;
                 if !known {
                     deferred.push(raw);
-                } else if matched {
-                    if let Some(entry) = domain_entry(raw, wanted)? {
-                        entries.push(entry);
-                    }
+                } else if matched && let Some(entry) = domain_entry(raw, wanted)? {
+                    entries.push(entry);
                 }
             }
             _ => reader.skip(wire)?,
@@ -5858,10 +5851,8 @@ fn geoip_entry(bytes: &[u8], code: &str, cidrs: &mut Vec<(IpAddr, u32)>) -> Resu
                 let raw = reader.bytes()?;
                 if !known {
                     deferred.push(raw);
-                } else if matched {
-                    if let Some(cidr) = geoip_cidr(raw)? {
-                        cidrs.push(cidr);
-                    }
+                } else if matched && let Some(cidr) = geoip_cidr(raw)? {
+                    cidrs.push(cidr);
                 }
             }
             _ => reader.skip(wire)?,
@@ -9200,8 +9191,10 @@ mod tests {
         let _env = crate::router::ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::env::set_var("FERROX_ROUTING_ENV_IP", "198.51.100.7");
-        std::env::set_var("FERROX_ROUTING_ENV_PORT", "101-102");
+        unsafe {
+            std::env::set_var("FERROX_ROUTING_ENV_IP", "198.51.100.7");
+            std::env::set_var("FERROX_ROUTING_ENV_PORT", "101-102");
+        }
         let root = crate::json::parse(
             r#"{"routing": {"rules": [{"outboundTag": "direct",
                 "ip": ["env:FERROX_ROUTING_ENV_IP"], "port": "100, env:FERROX_ROUTING_ENV_PORT"}]}}"#,
@@ -9247,8 +9240,10 @@ mod tests {
         flow.ip = None;
         flow.port = Some(102);
         assert_eq!(parsed.route(&flow), Some("direct"));
-        std::env::remove_var("FERROX_ROUTING_ENV_IP");
-        std::env::remove_var("FERROX_ROUTING_ENV_PORT");
+        unsafe {
+            std::env::remove_var("FERROX_ROUTING_ENV_IP");
+            std::env::remove_var("FERROX_ROUTING_ENV_PORT");
+        }
     }
 
     #[test]

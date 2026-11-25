@@ -11,7 +11,7 @@ use ferrox_core::hysteria::{self, Defrag, Masquerade, UdpMessage};
 
 use crate::conn::Connection;
 use crate::proxy::lane_pool::Next;
-use crate::quic::{QuicheConnection, Unfilled, RECV_ROOM};
+use crate::quic::{QuicheConnection, RECV_ROOM, Unfilled};
 
 const AUTH_STREAM: u64 = 0;
 
@@ -68,24 +68,24 @@ pub(crate) struct Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        if let Some(driver) = &self.driver {
-            if Arc::strong_count(driver) == 1 {
-                driver.stop();
-            }
+        if let Some(driver) = &self.driver
+            && Arc::strong_count(driver) == 1
+        {
+            driver.stop();
         }
     }
 }
 
 /// One stream's latch: the pump bumps it when a datagram filled the stream, and the flow reading it parks until then instead of waiting on the shared socket with the others.
 pub(crate) struct StreamWake {
-    gen: Mutex<u64>,
+    generation: Mutex<u64>,
     cv: Condvar,
 }
 
 impl StreamWake {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
-            gen: Mutex::new(0),
+            generation: Mutex::new(0),
             cv: Condvar::new(),
         })
     }
@@ -93,22 +93,22 @@ impl StreamWake {
 
 impl StreamWake {
     fn seen(&self) -> u64 {
-        self.gen.lock().map_or(0, |gen| *gen)
+        self.generation.lock().map_or(0, |generation| *generation)
     }
 
     pub(crate) fn bump(&self) {
-        if let Ok(mut gen) = self.gen.lock() {
-            *gen = gen.wrapping_add(1);
+        if let Ok(mut generation) = self.generation.lock() {
+            *generation = generation.wrapping_add(1);
         }
         self.cv.notify_all();
     }
 
     fn wait(&self, seen: u64, timeout: Duration) {
-        let Ok(gen) = self.gen.lock() else {
+        let Ok(generation) = self.generation.lock() else {
             return;
         };
-        if *gen == seen {
-            let _ = self.cv.wait_timeout(gen, timeout);
+        if *generation == seen {
+            let _ = self.cv.wait_timeout(generation, timeout);
         }
     }
 }
@@ -174,10 +174,10 @@ impl Driver {
     }
 
     fn wake(&self, stream: u64) {
-        if let Ok(streams) = self.streams.lock() {
-            if let Some(wake) = streams.get(&stream) {
-                wake.bump();
-            }
+        if let Ok(streams) = self.streams.lock()
+            && let Some(wake) = streams.get(&stream)
+        {
+            wake.bump();
         }
     }
 
@@ -1650,10 +1650,10 @@ fn read_h3_request(
         if Instant::now() >= deadline {
             return assemble_request(&buf).filter(|request| request_complete(request, fin));
         }
-        if let Some(request) = assemble_request(&buf) {
-            if request_complete(&request, fin) {
-                return Some(request);
-            }
+        if let Some(request) = assemble_request(&buf)
+            && request_complete(&request, fin)
+        {
+            return Some(request);
         }
         if buf.len() >= HEAD_CAP {
             return assemble_request(&buf).filter(|request| request_complete(request, fin));
@@ -1781,11 +1781,11 @@ fn serve_file(dir: &str, request: &hysteria::H3Request, out: &mut Vec<u8>) {
     };
     if path.is_dir() {
         let index = path.join("index.html");
-        if let Some(index) = contained(&root, &index) {
-            if let Ok(bytes) = std::fs::read(&index) {
-                let kind = hysteria::content_type(&index.to_string_lossy());
-                return hysteria::encode_h3_response(200, &[("content-type", kind)], &bytes, out);
-            }
+        if let Some(index) = contained(&root, &index)
+            && let Ok(bytes) = std::fs::read(&index)
+        {
+            let kind = hysteria::content_type(&index.to_string_lossy());
+            return hysteria::encode_h3_response(200, &[("content-type", kind)], &bytes, out);
         }
         let listing = directory_listing(&path);
         return hysteria::encode_h3_response(
@@ -1831,7 +1831,9 @@ fn safe_path(root: &str, path: &str) -> Option<std::path::PathBuf> {
 /// A minimal HTML directory listing, used only when a masquerade directory has no `index.html`: enough of a page to pass as a static site's index.
 fn directory_listing(dir: &std::path::Path) -> String {
     let name = dir.to_string_lossy();
-    let mut html = format!("<!doctype html><html><head><title>Index of {name}</title></head><body><h1>Index of {name}</h1><ul>");
+    let mut html = format!(
+        "<!doctype html><html><head><title>Index of {name}</title></head><body><h1>Index of {name}</h1><ul>"
+    );
     let Ok(entries) = std::fs::read_dir(dir) else {
         html.push_str("</ul></body></html>");
         return html;
@@ -2486,12 +2488,11 @@ fn relay_datagrams(
             Ok(None) => {}
             Err(_) => flow.stop.store(true, Ordering::Relaxed),
         }
-        if forged {
-            if let Some(mut flow) = inbound.udp.remove(&session) {
-                if let Some(reader) = flow.reader.take() {
-                    retired.push(reader);
-                }
-            }
+        if forged
+            && let Some(mut flow) = inbound.udp.remove(&session)
+            && let Some(reader) = flow.reader.take()
+        {
+            retired.push(reader);
         }
     }
 }
@@ -2716,14 +2717,14 @@ impl Router<'_> {
             self.by_initial_dcid
                 .insert(initial_dcid.to_vec(), key.clone());
         }
-        if let Some(inbound) = self.routes.get_mut(&key) {
-            if let Ok(guard) = inbound.conn.lock() {
-                let ids: Vec<_> = guard.source_ids().collect();
-                for id in ids {
-                    let raw = id.as_ref().to_vec();
-                    self.by_initial_dcid.insert(raw.clone(), key.clone());
-                    inbound.source_ids.push(raw);
-                }
+        if let Some(inbound) = self.routes.get_mut(&key)
+            && let Ok(guard) = inbound.conn.lock()
+        {
+            let ids: Vec<_> = guard.source_ids().collect();
+            for id in ids {
+                let raw = id.as_ref().to_vec();
+                self.by_initial_dcid.insert(raw.clone(), key.clone());
+                inbound.source_ids.push(raw);
             }
         }
     }

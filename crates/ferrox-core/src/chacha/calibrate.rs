@@ -1,7 +1,7 @@
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use super::{base, base_state, portable, xor_groups_impl, Wide};
+use super::{Wide, base, base_state, portable, xor_groups_impl};
 
 static ONE_BLOCK: OnceLock<bool> = OnceLock::new();
 
@@ -59,7 +59,7 @@ fn measure() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{base, base_state, portable, verdict, xor_groups_impl, Wide, ONE_BLOCK};
+    use super::{ONE_BLOCK, Wide, base, base_state, portable, verdict, xor_groups_impl};
     use crate::chacha::one_block_impl;
 
     #[test]

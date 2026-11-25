@@ -3,7 +3,7 @@
 use ferrox_core::foxy::Candidate;
 use std::net::{TcpStream, ToSocketAddrs as _};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 /// An edge that has not answered a handshake by now is not a location to pin a flow to.
@@ -26,13 +26,15 @@ pub(crate) fn readings(edges: &[Candidate]) -> Vec<Option<u64>> {
         let sender = sender.clone();
         let targets = Arc::clone(&targets);
         let next = Arc::clone(&next);
-        std::thread::spawn(move || loop {
-            let index = next.fetch_add(1, Ordering::Relaxed);
-            let Some((index, host, port)) = targets.get(index) else {
-                break;
-            };
-            if sender.send((*index, probe(host, *port, BUDGET))).is_err() {
-                break;
+        std::thread::spawn(move || {
+            loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some((index, host, port)) = targets.get(index) else {
+                    break;
+                };
+                if sender.send((*index, probe(host, *port, BUDGET))).is_err() {
+                    break;
+                }
             }
         });
     }

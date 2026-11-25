@@ -301,16 +301,13 @@ fn cipher_ids(list: &str) -> Result<Vec<u16>, String> {
     builder
         .set_strict_cipher_list(list)
         .map_err(|_| format!("warp: --tls-ciphers `{list}` is no cipher list BoringSSL takes"))?;
-    let ids: Vec<u16> = builder
-        .ciphers()
-        .map(|ciphers| {
-            ciphers
-                .iter()
-                .map(boring::ssl::SslCipherRef::protocol_id)
-                .filter(|id| *id != GREASE && !tls13(*id))
-                .collect()
-        })
-        .unwrap_or_default();
+    let ids: Vec<u16> = builder.ciphers().map_or_default(|ciphers| {
+        ciphers
+            .iter()
+            .map(boring::ssl::SslCipherRef::protocol_id)
+            .filter(|id| *id != GREASE && !tls13(*id))
+            .collect()
+    });
     if ids.is_empty() {
         return Err(format!(
             "warp: --tls-ciphers `{list}` names no TLS 1.2 suite"

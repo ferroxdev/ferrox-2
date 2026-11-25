@@ -10,9 +10,9 @@ use std::io;
 use std::net::IpAddr;
 #[cfg(unix)]
 use std::os::fd::AsRawFd as _;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::Arc;
 use std::thread;
 
 #[cfg(not(any(
@@ -198,10 +198,8 @@ fn open(spec: &Spec) -> io::Result<(SyncDevice, bool, usize)> {
                 if let Ok((device, offload, multi)) = build(spec, multi, false) {
                     return Ok((device, offload, if multi { spec.queues() } else { 1 }));
                 }
-                if multi {
-                    if let Ok((device, offload, _)) = build(spec, false, spec.gso()) {
-                        return Ok((device, offload, 1));
-                    }
+                if multi && let Ok((device, offload, _)) = build(spec, false, spec.gso()) {
+                    return Ok((device, offload, 1));
                 }
                 if let Ok((device, offload, _)) = build(spec, false, false) {
                     return Ok((device, offload, 1));
@@ -457,10 +455,10 @@ fn spawn_queue(
             &failed,
             send_stopping.as_deref(),
         );
-        if failed.load(std::sync::atomic::Ordering::Relaxed) {
-            if let Some(flag) = &send_stopping {
-                flag.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
+        if failed.load(std::sync::atomic::Ordering::Relaxed)
+            && let Some(flag) = &send_stopping
+        {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     });
     let mtu = spec.mtu();
@@ -477,10 +475,10 @@ fn spawn_queue(
             None,
             &recv_failed,
         );
-        if recv_failed.load(std::sync::atomic::Ordering::Relaxed) {
-            if let Some(flag) = &recv_stopping {
-                flag.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
+        if recv_failed.load(std::sync::atomic::Ordering::Relaxed)
+            && let Some(flag) = &recv_stopping
+        {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     });
     vec![stack, send, recv]

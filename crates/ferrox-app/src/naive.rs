@@ -97,7 +97,7 @@ impl PaddingRead {
                     let take = self.skip.min(discard.len());
                     match reader.read(&mut discard[..take]) {
                         Ok(0) => {
-                            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
+                            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
                         }
                         Ok(n) => self.skip -= n,
                         Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
@@ -639,7 +639,7 @@ fn wait_uot_readable(sockets: &[Option<&UdpSocket>], timeout: Duration) -> bool 
 #[cfg(windows)]
 fn wait_uot_readable(sockets: &[Option<&UdpSocket>], timeout: Duration) -> bool {
     use std::os::windows::io::AsRawSocket as _;
-    use windows_sys::Win32::Networking::WinSock::{WSAPoll, POLLIN, POLLRDNORM, SOCKET, WSAPOLLFD};
+    use windows_sys::Win32::Networking::WinSock::{POLLIN, POLLRDNORM, SOCKET, WSAPOLLFD, WSAPoll};
     let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
     let mut rows = [WSAPOLLFD {
         fd: 0,
@@ -888,10 +888,10 @@ fn uot_out_reader(
         let (from, payload) = packet;
         let destination = if connect { target.clone() } else { from };
         let frame = uot_socks_frame(&destination, &payload);
-        if let Err(error) = relay.send_to(&frame, client) {
-            if !crate::tun_stack::refused(&error) {
-                break;
-            }
+        if let Err(error) = relay.send_to(&frame, client)
+            && !crate::tun_stack::refused(&error)
+        {
+            break;
         }
     }
     done.store(true, Ordering::Relaxed);
@@ -2192,11 +2192,11 @@ impl NaiveOut {
                                     .iter()
                                     .min_by_key(|(_, lane)| lane.used)
                                     .map(|(key, _)| key.clone());
-                                if let Some(oldest) = oldest {
-                                    if let Some(lane) = lanes.remove(&oldest) {
-                                        lane.done.store(true, Ordering::Relaxed);
-                                        lane.abort.abort();
-                                    }
+                                if let Some(oldest) = oldest
+                                    && let Some(lane) = lanes.remove(&oldest)
+                                {
+                                    lane.done.store(true, Ordering::Relaxed);
+                                    lane.abort.abort();
                                 }
                             }
                             lanes.insert(
@@ -2243,11 +2243,10 @@ impl NaiveOut {
             if lanes
                 .get(&key)
                 .is_some_and(|lane| lane.done.load(Ordering::Relaxed))
+                && let Some(lane) = lanes.remove(&key)
             {
-                if let Some(lane) = lanes.remove(&key) {
-                    lane.done.store(true, Ordering::Relaxed);
-                    lane.abort.abort();
-                }
+                lane.done.store(true, Ordering::Relaxed);
+                lane.abort.abort();
             }
             if !lanes.contains_key(&key) {
                 if let Some(lane) = pending.get_mut(&key) {
@@ -2342,11 +2341,11 @@ impl NaiveOut {
                                 return;
                             }
                             let cancel = UotCancel::new(&stream, &done);
-                            if let Err(error) = tx.send(Ok((open_key, stream, done, cancel))) {
-                                if let Ok((_, stream, done, _cancel)) = error.0 {
-                                    done.store(true, Ordering::Relaxed);
-                                    stream.abort();
-                                }
+                            if let Err(error) = tx.send(Ok((open_key, stream, done, cancel)))
+                                && let Ok((_, stream, done, _cancel)) = error.0
+                            {
+                                done.store(true, Ordering::Relaxed);
+                                stream.abort();
                             }
                         });
                     });
@@ -2372,11 +2371,9 @@ impl NaiveOut {
                     Err(TrySendError::Disconnected(_)) => true,
                 }
             });
-            if failed {
-                if let Some(lane) = lanes.remove(&key) {
-                    lane.done.store(true, Ordering::Relaxed);
-                    lane.abort.abort();
-                }
+            if failed && let Some(lane) = lanes.remove(&key) {
+                lane.done.store(true, Ordering::Relaxed);
+                lane.abort.abort();
             }
         }
         closing.store(true, Ordering::Relaxed);
@@ -3206,24 +3203,24 @@ fn inbound_users(inbound: &Json, settings: Option<&Json>) -> Result<Users, Strin
             }
         }
     }
-    if users.is_empty() {
-        if let Some(settings) = settings {
-            let username = settings
-                .get("username")
-                .and_then(Json::as_str)
-                .unwrap_or_default();
-            let password = settings
-                .get("password")
-                .and_then(Json::as_str)
-                .unwrap_or_default();
-            if !password.is_empty() {
-                if username.contains(':') {
-                    return Err(format!(
-                        "naive inbound user `{username}` contains `:`, which Basic authentication cannot carry"
-                    ));
-                }
-                users.push((username.to_owned(), password.to_owned()));
+    if users.is_empty()
+        && let Some(settings) = settings
+    {
+        let username = settings
+            .get("username")
+            .and_then(Json::as_str)
+            .unwrap_or_default();
+        let password = settings
+            .get("password")
+            .and_then(Json::as_str)
+            .unwrap_or_default();
+        if !password.is_empty() {
+            if username.contains(':') {
+                return Err(format!(
+                    "naive inbound user `{username}` contains `:`, which Basic authentication cannot carry"
+                ));
             }
+            users.push((username.to_owned(), password.to_owned()));
         }
     }
     Ok(Arc::new(users))
@@ -3263,7 +3260,7 @@ fn inbound_networks(inbound: &Json, settings: Option<&Json>) -> Result<(bool, bo
             _ => {
                 return Err(format!(
                     "naive inbound network `{name}` is not tcp, udp, or quic"
-                ))
+                ));
             }
         },
         Json::Arr(items) => {
@@ -3274,10 +3271,10 @@ fn inbound_networks(inbound: &Json, settings: Option<&Json>) -> Result<(bool, bo
                     Some(name) => {
                         return Err(format!(
                             "naive inbound network `{name}` is not tcp, udp, or quic"
-                        ))
+                        ));
                     }
                     None => {
-                        return Err("naive inbound network list must contain strings".to_owned())
+                        return Err("naive inbound network list must contain strings".to_owned());
                     }
                 }
             }
@@ -3328,10 +3325,11 @@ struct ListenerExit {
 
 impl Drop for ListenerExit {
     fn drop(&mut self) {
-        if self.committed.load(Ordering::SeqCst) && self.left.fetch_sub(1, Ordering::SeqCst) == 1 {
-            if let Some(stop) = &self.stop {
-                stop.mark_closed();
-            }
+        if self.committed.load(Ordering::SeqCst)
+            && self.left.fetch_sub(1, Ordering::SeqCst) == 1
+            && let Some(stop) = &self.stop
+        {
+            stop.mark_closed();
         }
     }
 }
@@ -3722,9 +3720,11 @@ mod tests {
         for _ in 0..64 {
             let header = padding_header();
             assert!((30..=61).contains(&header.len()));
-            assert!(header.as_bytes()[..16]
-                .iter()
-                .all(|byte| PADDING_ALPHABET.contains(byte)));
+            assert!(
+                header.as_bytes()[..16]
+                    .iter()
+                    .all(|byte| PADDING_ALPHABET.contains(byte))
+            );
             assert!(header.as_bytes()[16..].iter().all(|byte| *byte == b'~'));
         }
     }

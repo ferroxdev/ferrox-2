@@ -57,11 +57,7 @@ enum RelayMode {
 }
 
 fn quiche_cc(name: &str) -> &str {
-    if name == "new_reno" {
-        "reno"
-    } else {
-        name
-    }
+    if name == "new_reno" { "reno" } else { name }
 }
 
 #[derive(Clone)]
@@ -294,27 +290,29 @@ impl ResolverPool {
                 let pending = Arc::clone(&pending);
                 let spawned = thread::Builder::new()
                     .name(format!("tuic-resolve-{index}"))
-                    .spawn(move || loop {
-                        let job = match pending.lock() {
-                            Ok(pending) => match pending.recv() {
-                                Ok(job) => job,
+                    .spawn(move || {
+                        loop {
+                            let job = match pending.lock() {
+                                Ok(pending) => match pending.recv() {
+                                    Ok(job) => job,
+                                    Err(_) => return,
+                                },
                                 Err(_) => return,
-                            },
-                            Err(_) => return,
-                        };
-                        let target = proxy::resolve_outbound_with(
-                            job.options.as_deref(),
-                            &job.host,
-                            job.port,
-                        );
-                        let _ = job.reply.send(ResolveDone {
-                            association: job.association,
-                            host: job.host,
-                            port: job.port,
-                            target,
-                            payload: job.payload,
-                            generation: job.generation,
-                        });
+                            };
+                            let target = proxy::resolve_outbound_with(
+                                job.options.as_deref(),
+                                &job.host,
+                                job.port,
+                            );
+                            let _ = job.reply.send(ResolveDone {
+                                association: job.association,
+                                host: job.host,
+                                port: job.port,
+                                target,
+                                payload: job.payload,
+                                generation: job.generation,
+                            });
+                        }
                     });
                 if spawned.is_ok() {
                     workers += 1;
@@ -421,12 +419,11 @@ impl TuicOut {
             &mut config,
         )
         .ok()?;
-        if self.zero_rtt {
-            if let Ok(session) = self.session.lock() {
-                if let Some(blob) = session.as_deref() {
-                    let _ = conn.set_session(blob);
-                }
-            }
+        if self.zero_rtt
+            && let Ok(session) = self.session.lock()
+            && let Some(blob) = session.as_deref()
+        {
+            let _ = conn.set_session(blob);
         }
         quic::flush_egress(&mut conn, &socket);
         let early = self.zero_rtt && conn.is_in_early_data();
@@ -678,14 +675,13 @@ impl TuicOut {
         if let Some(watcher) = watcher {
             let _ = watcher.join();
         }
-        if let Ok(mut conn) = lane.conn.lock() {
-            if !conn.is_closed() {
-                if let Ok(mut pending) = lane.pending.lock() {
-                    queue_dissociate(&mut pending, association);
-                    flush_pending(&mut conn, &lane.sock, &mut pending, &lane.next_uni);
-                }
-            }
-        };
+        if let Ok(mut conn) = lane.conn.lock()
+            && !conn.is_closed()
+            && let Ok(mut pending) = lane.pending.lock()
+        {
+            queue_dissociate(&mut pending, association);
+            flush_pending(&mut conn, &lane.sock, &mut pending, &lane.next_uni);
+        }
     }
 }
 
@@ -718,11 +714,7 @@ fn destination_of(address: wire::Address<'_>, port: u16) -> Destination {
 
 fn next_packet(packet: u16) -> u16 {
     let next = packet.wrapping_add(1);
-    if next == u16::MAX {
-        0
-    } else {
-        next
-    }
+    if next == u16::MAX { 0 } else { next }
 }
 
 /// A pin is the handshake's own verifier, so a chain that does not match never reaches the
@@ -1458,10 +1450,10 @@ pub(crate) fn outbound(root: &Json) -> Result<Option<TuicOut>, String> {
         .and_then(Json::as_str)
         .filter(|value| !value.is_empty())
         .map(|name| quiche_cc(name).to_owned());
-    if let Some(name) = cc.as_deref() {
-        if !matches!(name, "cubic" | "reno" | "bbr") {
-            return Err(format!("tuic congestion_control `{name}` is not carried"));
-        }
+    if let Some(name) = cc.as_deref()
+        && !matches!(name, "cubic" | "reno" | "bbr")
+    {
+        return Err(format!("tuic congestion_control `{name}` is not carried"));
     }
     let heartbeat = field("heartbeat")
         .or_else(|| field("heartbeat_interval"))
@@ -1554,8 +1546,8 @@ fn users(inbound: &Json) -> Vec<User> {
             });
         }
     }
-    if users.is_empty() {
-        if let (Some(uuid), Some(password)) = (
+    if users.is_empty()
+        && let (Some(uuid), Some(password)) = (
             settings
                 .and_then(|node| node.get("uuid"))
                 .and_then(Json::as_str)
@@ -1564,12 +1556,12 @@ fn users(inbound: &Json) -> Vec<User> {
                 .and_then(|node| node.get("password"))
                 .and_then(Json::as_str)
                 .filter(|value| !value.is_empty()),
-        ) {
-            users.push(User {
-                uuid,
-                password: password.to_owned(),
-            });
-        }
+        )
+    {
+        users.push(User {
+            uuid,
+            password: password.to_owned(),
+        });
     }
     users
 }
@@ -2145,10 +2137,10 @@ impl Server {
         state.readable = ids;
         let now = Instant::now();
         while let Ok(data) = conn.dgram_recv_buf() {
-            if self.freedom {
-                if let Ok(packet) = wire::parse_packet(&data) {
-                    accept_packet(&mut inner, &packet, false, now);
-                }
+            if self.freedom
+                && let Ok(packet) = wire::parse_packet(&data)
+            {
+                accept_packet(&mut inner, &packet, false, now);
             }
         }
         drain_resolved(&mut inner, now);
@@ -2204,19 +2196,19 @@ impl Server {
                 continue;
             }
             if !conn.is_established() {
-                if let Some(at) = conn.timeout_instant() {
-                    if at <= now {
-                        conn.on_timeout();
-                    }
+                if let Some(at) = conn.timeout_instant()
+                    && at <= now
+                {
+                    conn.on_timeout();
                 }
                 quic::flush_egress(&mut conn, &self.sock);
                 continue;
             }
             self.beat(session, &mut conn, now);
-            if let Some(at) = conn.timeout_instant() {
-                if at <= now {
-                    conn.on_timeout();
-                }
+            if let Some(at) = conn.timeout_instant()
+                && at <= now
+            {
+                conn.on_timeout();
             }
             let Ok(mut inner) = session.inner.lock() else {
                 continue;
@@ -2976,15 +2968,15 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(5);
             while Instant::now() < deadline {
                 let mut data = [0u8; 64];
-                if let Ok((read, _)) = second.stream_recv(0, &mut data) {
-                    if read > 0 {
-                        assert!(
-                            !second.is_established(),
-                            "the server read early data only after the handshake"
-                        );
-                        early.send(data[..read].to_vec()).expect("reports");
-                        break;
-                    }
+                if let Ok((read, _)) = second.stream_recv(0, &mut data)
+                    && read > 0
+                {
+                    assert!(
+                        !second.is_established(),
+                        "the server read early data only after the handshake"
+                    );
+                    early.send(data[..read].to_vec()).expect("reports");
+                    break;
                 }
                 if let Some((n, from)) = quic::server_poll(&sock, &mut buf) {
                     second

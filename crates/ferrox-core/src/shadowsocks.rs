@@ -405,8 +405,8 @@ pub fn reference_master_key(password: &str, key_len: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aes_gcm::aead::AeadInOut as _;
     use aes_gcm::KeyInit as _;
+    use aes_gcm::aead::AeadInOut as _;
     use aes_gcm::{Aes128Gcm, Aes256Gcm};
 
     #[test]

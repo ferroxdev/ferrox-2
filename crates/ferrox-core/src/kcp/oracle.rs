@@ -1,7 +1,7 @@
 use std::fmt::Write as _;
 
-use aes_gcm::aead::{AeadInOut, KeyInit};
 use aes_gcm::Aes128Gcm;
+use aes_gcm::aead::{AeadInOut, KeyInit};
 use sha2::{Digest as _, Sha256};
 
 use super::mask::{Encoder, HeaderKind, Mask, Spec};

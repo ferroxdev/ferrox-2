@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use aes::Aes256;
 use chacha20poly1305::aead::AeadInOut as _;
 use ctr::cipher::{KeyIvInit as _, StreamCipher as _};
-use ml_kem::kem::{Decapsulate as _, Kem as _, Key as MlKemKey};
 use ml_kem::KeyExport as _;
+use ml_kem::kem::{Decapsulate as _, Kem as _, Key as MlKemKey};
 use ml_kem::{EncapsulationKey768, MlKem768};
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -468,7 +468,7 @@ impl ServerConfig {
                 other => {
                     return Err(format!(
                         "VLESS decryption key is {other} bytes; expected 32 or 64"
-                    ))
+                    ));
                 }
             };
             hash32s.push(*blake3::hash(&public).as_bytes());
@@ -693,27 +693,27 @@ impl Client {
         }
         let mut nfs_aead = Aead::new(&iv, &nfs_key);
 
-        if config.zero_rtt {
-            if let Some((pfs_key, ticket)) = self.valid_ticket() {
-                nfs_aead.seal_into(None, &encode_length(32), &[], &mut hello);
-                nfs_aead.seal_into(None, &ticket, &[], &mut hello);
-                let ticket_context = hello[iv_and_relays_len + 18..].to_vec();
-                let mut united_key = pfs_key.clone();
-                united_key.extend_from_slice(&nfs_key);
-                let aead = Aead::new(&ticket_context, &united_key);
-                let out_ctr = (config.xor_mode == 2).then(|| new_ctr(&united_key, &iv));
-                let in_ctr = (config.xor_mode == 2).then(|| new_ctr(&united_key, &iv));
-                let skip = hello.len();
-                let mut stream =
-                    EncryptedStream::new(inner, united_key, aead, None, ReadStage::ServerRandom);
-                stream.set_out_mask(HeaderMask::new(out_ctr, skip));
-                if let Some(in_ctr) = in_ctr {
-                    stream.set_in_mask(HeaderMask::new(Some(in_ctr), 0));
-                }
-                stream.set_zero_rtt(Arc::clone(self), pfs_key);
-                stream.set_pre_write(hello);
-                return Ok(stream);
+        if config.zero_rtt
+            && let Some((pfs_key, ticket)) = self.valid_ticket()
+        {
+            nfs_aead.seal_into(None, &encode_length(32), &[], &mut hello);
+            nfs_aead.seal_into(None, &ticket, &[], &mut hello);
+            let ticket_context = hello[iv_and_relays_len + 18..].to_vec();
+            let mut united_key = pfs_key.clone();
+            united_key.extend_from_slice(&nfs_key);
+            let aead = Aead::new(&ticket_context, &united_key);
+            let out_ctr = (config.xor_mode == 2).then(|| new_ctr(&united_key, &iv));
+            let in_ctr = (config.xor_mode == 2).then(|| new_ctr(&united_key, &iv));
+            let skip = hello.len();
+            let mut stream =
+                EncryptedStream::new(inner, united_key, aead, None, ReadStage::ServerRandom);
+            stream.set_out_mask(HeaderMask::new(out_ctr, skip));
+            if let Some(in_ctr) = in_ctr {
+                stream.set_in_mask(HeaderMask::new(Some(in_ctr), 0));
             }
+            stream.set_zero_rtt(Arc::clone(self), pfs_key);
+            stream.set_pre_write(hello);
+            return Ok(stream);
         }
 
         let pfs_len = MLKEM_EK_LEN + X25519_LEN;
@@ -741,10 +741,10 @@ impl Client {
                 inner.flush()?;
                 sent += len;
             }
-            if let Some(gap) = gaps.get(i) {
-                if !gap.is_zero() {
-                    std::thread::sleep(*gap);
-                }
+            if let Some(gap) = gaps.get(i)
+                && !gap.is_zero()
+            {
+                std::thread::sleep(*gap);
             }
         }
 
@@ -773,18 +773,19 @@ impl Client {
         inner.read_exact(&mut ticket)?;
         peer_aead.open_in_place(None, &mut ticket, &[])?;
         let seconds = decode_length(&ticket);
-        if config.zero_rtt && seconds > 0 {
-            if let Some(clock) = self.clock.as_ref() {
-                let mut guard = self
-                    .ticket
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                *guard = Some(Ticket {
-                    expires: clock().saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX)),
-                    pfs_key: pfs_key.clone(),
-                    value: ticket[..16].try_into().unwrap(),
-                });
-            }
+        if config.zero_rtt
+            && seconds > 0
+            && let Some(clock) = self.clock.as_ref()
+        {
+            let mut guard = self
+                .ticket
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *guard = Some(Ticket {
+                expires: clock().saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX)),
+                pfs_key: pfs_key.clone(),
+                value: ticket[..16].try_into().unwrap(),
+            });
         }
 
         let mut length = [0u8; 18];
@@ -1035,10 +1036,10 @@ impl Server {
                 inner.flush()?;
                 sent += len;
             }
-            if let Some(gap) = gaps.get(i) {
-                if !gap.is_zero() {
-                    std::thread::sleep(*gap);
-                }
+            if let Some(gap) = gaps.get(i)
+                && !gap.is_zero()
+            {
+                std::thread::sleep(*gap);
             }
         }
 
@@ -1311,10 +1312,10 @@ impl ReadSide {
         self.plain_from = 0;
         self.plain_to = 0;
         while self.wire.len() - self.wire_pos < len {
-            if let Err(error) = self.pull(inner) {
-                if error.kind() != io::ErrorKind::Interrupted {
-                    return Err(error);
-                }
+            if let Err(error) = self.pull(inner)
+                && error.kind() != io::ErrorKind::Interrupted
+            {
+                return Err(error);
             }
         }
         Ok(self.wire_pos)

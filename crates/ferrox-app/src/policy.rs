@@ -304,13 +304,17 @@ mod tests {
     fn a_level_that_is_not_a_number_or_an_object_is_refused() {
         let _guard = crate::stats::test_lock();
         let root = crate::json::parse(r#"{"policy":{"levels":{"user":{}}}}"#).expect("parses");
-        assert!(parse(&root)
-            .expect_err("a level is a number")
-            .contains("user"));
+        assert!(
+            parse(&root)
+                .expect_err("a level is a number")
+                .contains("user")
+        );
         let root = crate::json::parse(r#"{"policy":{"levels":{"0":1}}}"#).expect("parses");
-        assert!(parse(&root)
-            .expect_err("a level is an object")
-            .contains("level `0`"));
+        assert!(
+            parse(&root)
+                .expect_err("a level is an object")
+                .contains("level `0`")
+        );
     }
 
     #[test]

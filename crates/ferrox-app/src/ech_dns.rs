@@ -39,10 +39,10 @@ pub(crate) fn resolve(
         let kept = cache.lock().map_err(|_| "ech: cache poisoned")?;
         kept.get(&key).cloned()
     };
-    if let Some((expires, bytes)) = &stale {
-        if *expires > Instant::now() {
-            return Ok(bytes.clone());
-        }
+    if let Some((expires, bytes)) = &stale
+        && *expires > Instant::now()
+    {
+        return Ok(bytes.clone());
     }
     let queried = query(&name, server, options).and_then(|(bytes, ttl)| {
         ferrox_core::tls::normalize_ech_config_list(bytes).map(|list| (list, ttl))
@@ -275,10 +275,10 @@ fn parse_answer(packet: &[u8], id: Option<u16>, name: &str) -> Result<Answer, St
         return Err("ech: short DNS response".to_owned());
     }
     let got_id = u16::from_be_bytes([packet[0], packet[1]]);
-    if let Some(id) = id {
-        if got_id != id {
-            return Err("ech: DNS response id mismatch".to_owned());
-        }
+    if let Some(id) = id
+        && got_id != id
+    {
+        return Err("ech: DNS response id mismatch".to_owned());
     }
     let flags = u16::from_be_bytes([packet[2], packet[3]]);
     if flags & 0x8000 == 0 {
@@ -357,10 +357,9 @@ fn parse_answer(packet: &[u8], id: Option<u16>, name: &str) -> Result<Answer, St
             && !redirected
                 .iter()
                 .any(|seen| seen.eq_ignore_ascii_case(owner))
+            && let Some(ech) = svcb_ech(packet, *start, *end)?
         {
-            if let Some(ech) = svcb_ech(packet, *start, *end)? {
-                return Ok(Answer::Found(ech, (*ttl).min(alias_ttl), names.len() - 1));
-            }
+            return Ok(Answer::Found(ech, (*ttl).min(alias_ttl), names.len() - 1));
         }
     }
     if let Some(alias) = names.into_iter().nth(1) {

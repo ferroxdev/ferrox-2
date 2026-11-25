@@ -4,7 +4,7 @@ use crate::conn::Connection;
 use crate::quic::QuicheConnection;
 use ferrox_core::foxy::connectip;
 use ferrox_core::foxy::{
-    self, authority, edge_authority, edge_peer, frames, hpack, masque, Failure, Pass,
+    self, Failure, Pass, authority, edge_authority, edge_peer, frames, hpack, masque,
 };
 use ferrox_core::tls::RecordAlignment;
 use ferrox_core::tls::TlsProvider;
@@ -1221,10 +1221,10 @@ fn take_status(inner: &mut SessionInner, stream: u32) -> Result<Option<u16>, Fai
         return Err(Failure::Stream);
     }
     let status = status_of(inner, stream)?;
-    if status.is_some() {
-        if let Some(entry) = inner.streams.get_mut(&stream) {
-            entry.head.clear();
-        }
+    if status.is_some()
+        && let Some(entry) = inner.streams.get_mut(&stream)
+    {
+        entry.head.clear();
     }
     Ok(status)
 }
@@ -2146,15 +2146,15 @@ fn stage_datagram(
             };
             entry.fin = end;
             // A capsule is usually whole inside one DATA frame, so it is handed over where it lies and only the ones behind it staged; nothing is handed over while a split capsule waits, because stream order is datagram order.
-            if entry.capsule_buf.is_empty() {
-                if let Some((used, datagram)) = masque::datagram_split(payload) {
-                    // A buffer shorter than the datagram stages it instead, so the walk above can finish it one read at a time.
-                    if buf.len() >= datagram.len() {
-                        buf[..datagram.len()].copy_from_slice(datagram);
-                        entry.capsule_buf.extend_from_slice(&payload[used..]);
-                        let _ = credit(inner, stream, wire);
-                        return Ok(datagram.len());
-                    }
+            if entry.capsule_buf.is_empty()
+                && let Some((used, datagram)) = masque::datagram_split(payload)
+            {
+                // A buffer shorter than the datagram stages it instead, so the walk above can finish it one read at a time.
+                if buf.len() >= datagram.len() {
+                    buf[..datagram.len()].copy_from_slice(datagram);
+                    entry.capsule_buf.extend_from_slice(&payload[used..]);
+                    let _ = credit(inner, stream, wire);
+                    return Ok(datagram.len());
                 }
             }
             entry.capsule_buf.extend_from_slice(payload);
@@ -2968,31 +2968,31 @@ impl H3 {
         self.deadline = started + HEADER_TIMEOUT;
         loop {
             // A DATA frame that is exactly one DATAGRAM capsule is handed straight to the caller once its packet is queued: the capsule header is spent in the peek window, the packet lands in the caller's own buffer, and the frame never enters `capsule_buf`.
-            if self.capsule_buf.len() == self.capsule_at && self.pending.is_none() {
-                if let Some((frame, head)) = self.peek().map_err(io)? {
-                    let body = self
-                        .carried
-                        .checked_add(head)
-                        .ok_or_else(|| io(Failure::Frame))?;
-                    if frame.kind == frames::H3_DATA && body < self.filled {
-                        let length =
-                            usize::try_from(frame.length).map_err(|_| io(Failure::Stream))?;
-                        if let Some((capsule_head, payload)) =
-                            connectip::packet_header(&self.head[body..self.filled])
+            if self.capsule_buf.len() == self.capsule_at
+                && self.pending.is_none()
+                && let Some((frame, head)) = self.peek().map_err(io)?
+            {
+                let body = self
+                    .carried
+                    .checked_add(head)
+                    .ok_or_else(|| io(Failure::Frame))?;
+                if frame.kind == frames::H3_DATA && body < self.filled {
+                    let length = usize::try_from(frame.length).map_err(|_| io(Failure::Stream))?;
+                    if let Some((capsule_head, payload)) =
+                        connectip::packet_header(&self.head[body..self.filled])
+                    {
+                        let here = self.filled - (body + capsule_head);
+                        let id = self.quic.id;
+                        let queued = self
+                            .with_conn_read(|conn| conn.stream_readable_len(id, payload))
+                            .unwrap_or(0);
+                        if length == capsule_head + payload
+                            && payload > 0
+                            && payload <= DATAGRAM_BUF_MAX
+                            && here + queued >= payload
                         {
-                            let here = self.filled - (body + capsule_head);
-                            let id = self.quic.id;
-                            let queued = self
-                                .with_conn_read(|conn| conn.stream_readable_len(id, payload))
-                                .unwrap_or(0);
-                            if length == capsule_head + payload
-                                && payload > 0
-                                && payload <= DATAGRAM_BUF_MAX
-                                && here + queued >= payload
-                            {
-                                self.carried = body + capsule_head;
-                                return self.direct_packet(into, payload);
-                            }
+                            self.carried = body + capsule_head;
+                            return self.direct_packet(into, payload);
                         }
                     }
                 }
@@ -3111,27 +3111,25 @@ impl H3 {
         }
         loop {
             // A DATA frame that is exactly one DATAGRAM capsule is handed straight to the caller: the capsule header is spent in the peek window, the payload lands in the caller's own buffer, and the frame never enters `capsule_buf`.
-            if self.capsule_buf.len() == self.capsule_at && self.pending.is_none() {
-                if let Some((frame, head)) = self.peek().map_err(io)? {
-                    let body = self
-                        .carried
-                        .checked_add(head)
-                        .ok_or_else(|| io(Failure::Frame))?;
-                    if frame.kind == frames::H3_DATA && body < self.filled {
-                        let length =
-                            usize::try_from(frame.length).map_err(|_| io(Failure::Stream))?;
-                        if let Some((capsule_head, payload)) =
-                            masque::datagram_header(&self.head[body..self.filled])
-                        {
-                            if length == capsule_head + payload
-                                && payload > 0
-                                && payload <= DATAGRAM_BUF_MAX
-                            {
-                                self.carried = body + capsule_head;
-                                self.direct = payload;
-                                return self.direct_into(buf, started);
-                            }
-                        }
+            if self.capsule_buf.len() == self.capsule_at
+                && self.pending.is_none()
+                && let Some((frame, head)) = self.peek().map_err(io)?
+            {
+                let body = self
+                    .carried
+                    .checked_add(head)
+                    .ok_or_else(|| io(Failure::Frame))?;
+                if frame.kind == frames::H3_DATA && body < self.filled {
+                    let length = usize::try_from(frame.length).map_err(|_| io(Failure::Stream))?;
+                    if let Some((capsule_head, payload)) =
+                        masque::datagram_header(&self.head[body..self.filled])
+                        && length == capsule_head + payload
+                        && payload > 0
+                        && payload <= DATAGRAM_BUF_MAX
+                    {
+                        self.carried = body + capsule_head;
+                        self.direct = payload;
+                        return self.direct_into(buf, started);
                     }
                 }
             }
@@ -4214,11 +4212,11 @@ impl Tls2 {
             }
             {
                 let mut inner = self.inner()?;
-                if let Some(entry) = inner.streams.get_mut(&own) {
-                    if entry.capsule_buf.len() > DATAGRAM_BUF_MAX {
-                        entry.capsule_buf.clear();
-                        return Err(Failure::Frame);
-                    }
+                if let Some(entry) = inner.streams.get_mut(&own)
+                    && entry.capsule_buf.len() > DATAGRAM_BUF_MAX
+                {
+                    entry.capsule_buf.clear();
+                    return Err(Failure::Frame);
                 }
             }
             let read = self.with_frame(&mut [], |inner, frame, payload, _| {
@@ -4345,13 +4343,13 @@ impl Tls2 {
             }
             {
                 let mut inner = self.inner().map_err(io)?;
-                if let Some(entry) = inner.streams.get_mut(&own) {
-                    if entry.capsule_buf.len() > DATAGRAM_BUF_MAX {
-                        entry.capsule_buf.clear();
-                        return Err(std::io::Error::other(
-                            "foxy: a capsule stream that never parses",
-                        ));
-                    }
+                if let Some(entry) = inner.streams.get_mut(&own)
+                    && entry.capsule_buf.len() > DATAGRAM_BUF_MAX
+                {
+                    entry.capsule_buf.clear();
+                    return Err(std::io::Error::other(
+                        "foxy: a capsule stream that never parses",
+                    ));
                 }
             }
             let read = self.with_frame(&mut [], |inner, frame, payload, _| {
@@ -4521,10 +4519,11 @@ impl Drop for Tls2 {
 impl Drop for Tunnel {
     /// Ends a lane no settle handed back — a client gone before its grant, a failed write — because an h3 stream half-open is still being filled; an h2 stream is ended by its own `Tls2`.
     fn drop(&mut self) {
-        if let Self::H3(lane) = self {
-            if !lane.closed && !lane.fin {
-                lane.quic.cancel();
-            }
+        if let Self::H3(lane) = self
+            && !lane.closed
+            && !lane.fin
+        {
+            lane.quic.cancel();
         }
     }
 }
@@ -6303,60 +6302,62 @@ pub(crate) mod loopback {
         server: ferrox_core::tls::TlsServerConfig,
         accepts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) -> std::thread::JoinHandle<()> {
-        std::thread::spawn(move || loop {
-            let Ok((stream, _)) = listener.accept() else {
-                return;
-            };
-            accepts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(20)));
-            let Ok(mut tls) =
-                ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
-            else {
-                continue;
-            };
-            if tls.handshake().is_err() {
-                continue;
-            }
-            let mut preface = vec![0u8; frames::PREFACE.len()];
-            if !read_exact_poll(&mut tls, &mut preface) || preface != frames::PREFACE {
-                continue;
-            }
-            let mut ack = Vec::new();
-            h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut ack);
-            tls.write_all(&ack).ok();
+        std::thread::spawn(move || {
             loop {
-                let mut header = [0u8; frames::H2_HEADER];
-                if !read_exact_poll(&mut tls, &mut header) {
-                    break;
-                }
-                let Some(frame) = frames::H2Frame::parse(&header) else {
-                    break;
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
                 };
-                let mut payload = vec![0u8; frame.length as usize];
-                if !read_exact_poll(&mut tls, &mut payload) {
-                    break;
+                accepts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(20)));
+                let Ok(mut tls) =
+                    ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+                else {
+                    continue;
+                };
+                if tls.handshake().is_err() {
+                    continue;
                 }
-                let mut out = Vec::new();
-                match frame.kind {
-                    frames::SETTINGS if frame.flags & 0x1 == 0 => {
-                        h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut out);
-                    }
-                    frames::HEADERS => {
-                        h2_frame(frames::HEADERS, 0x4, frame.stream, &[0x88], &mut out);
-                    }
-                    frames::DATA => {
-                        h2_frame(
-                            frames::DATA,
-                            frame.flags & frames::END_STREAM,
-                            frame.stream,
-                            &payload,
-                            &mut out,
-                        );
-                    }
-                    _ => {}
+                let mut preface = vec![0u8; frames::PREFACE.len()];
+                if !read_exact_poll(&mut tls, &mut preface) || preface != frames::PREFACE {
+                    continue;
                 }
-                if !out.is_empty() && tls.write_all(&out).is_err() {
-                    break;
+                let mut ack = Vec::new();
+                h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut ack);
+                tls.write_all(&ack).ok();
+                loop {
+                    let mut header = [0u8; frames::H2_HEADER];
+                    if !read_exact_poll(&mut tls, &mut header) {
+                        break;
+                    }
+                    let Some(frame) = frames::H2Frame::parse(&header) else {
+                        break;
+                    };
+                    let mut payload = vec![0u8; frame.length as usize];
+                    if !read_exact_poll(&mut tls, &mut payload) {
+                        break;
+                    }
+                    let mut out = Vec::new();
+                    match frame.kind {
+                        frames::SETTINGS if frame.flags & 0x1 == 0 => {
+                            h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut out);
+                        }
+                        frames::HEADERS => {
+                            h2_frame(frames::HEADERS, 0x4, frame.stream, &[0x88], &mut out);
+                        }
+                        frames::DATA => {
+                            h2_frame(
+                                frames::DATA,
+                                frame.flags & frames::END_STREAM,
+                                frame.stream,
+                                &payload,
+                                &mut out,
+                            );
+                        }
+                        _ => {}
+                    }
+                    if !out.is_empty() && tls.write_all(&out).is_err() {
+                        break;
+                    }
                 }
             }
         })
@@ -9231,9 +9232,10 @@ pub(crate) mod loopback {
             ([203, 0, 113, 1], &b"first"[..]),
             ([203, 0, 113, 2], &b"second"[..]),
         ] {
-            assert!(lane
-                .write(&[198, 51, 100, 9], &host, 40_000, 443, payload)
-                .expect("writes"));
+            assert!(
+                lane.write(&[198, 51, 100, 9], &host, 40_000, 443, payload)
+                    .expect("writes")
+            );
             lane.flush().expect("flushes");
         }
         for (host, payload) in [
@@ -11874,9 +11876,10 @@ pub(crate) mod loopback {
             .expect("a connection");
         let (mut lane, _) = Ip::open(&dial, Some(quic)).expect("opens");
         let wide = vec![0x5a; 1_300];
-        assert!(lane
-            .write(&[198, 51, 100, 9], &[203, 0, 113, 9], 40_000, 443, &wide)
-            .expect("writes"));
+        assert!(
+            lane.write(&[198, 51, 100, 9], &[203, 0, 113, 9], 40_000, 443, &wide)
+                .expect("writes")
+        );
         lane.flush().expect("flushes");
         udp_rx
             .recv_timeout(Duration::from_secs(60))
@@ -11943,7 +11946,9 @@ pub(crate) mod loopback {
         let read = loop {
             assert!(std::time::Instant::now() < until, "the two halves arrive");
             match lane.read_datagram(&mut back) {
-                Ok(0) => panic!("the capsule reader called the end of the stream with its second half still owed"),
+                Ok(0) => panic!(
+                    "the capsule reader called the end of the stream with its second half still owed"
+                ),
                 Ok(read) => break read,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(error) => panic!("the capsule failed: {error}"),

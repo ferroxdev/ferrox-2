@@ -99,8 +99,7 @@ pub fn exit_country(answer: &str) -> String {
     answer
         .lines()
         .find_map(|line| line.strip_prefix("loc="))
-        .map(str::to_uppercase)
-        .unwrap_or_default()
+        .map_or_default(str::to_uppercase)
 }
 
 pub fn carries_trace(answer: &str) -> bool {

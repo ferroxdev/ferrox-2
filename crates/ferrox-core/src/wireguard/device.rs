@@ -23,7 +23,7 @@ use zeroize::Zeroize as _;
 
 use super::handshake::{self, Handshake, MAC_SIZE};
 use super::transport::{
-    self, Action, Counter, ReplayWindow, COOKIE_REPLY_SIZE, HEADER_SIZE, TAG_SIZE,
+    self, Action, COOKIE_REPLY_SIZE, Counter, HEADER_SIZE, ReplayWindow, TAG_SIZE,
 };
 
 /// The interval a sent initiation waits before a fresh attempt.
@@ -893,9 +893,10 @@ mod tests {
         let base = record.as_ptr();
         let capacity = record.capacity();
         let mut received = Vec::new();
-        assert!(bob
-            .receive_owned(NOW + 4, ALICE.parse().unwrap(), record, &mut received)
-            .is_none());
+        assert!(
+            bob.receive_owned(NOW + 4, ALICE.parse().unwrap(), record, &mut received)
+                .is_none()
+        );
         let Event::DataPrefixed(payload) = &received[0] else {
             panic!("a prefixed data event");
         };

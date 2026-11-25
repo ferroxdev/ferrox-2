@@ -25,11 +25,11 @@ libc = "0.2"
 md5 = "0.8"
 regex = "1"
 serde_yaml_ng = "0.10"
-toml = "0.9"
+toml = "1.2"
 ring = "0.17"
 base64 = "0.23"
-boring = "5.4"
-boring-sys = "5.4"
+boring = "5.6"
+boring-sys = "5.6"
 foreign-types = "0.5"
 ctr = "0.10"
 flate2 = "1"
@@ -47,9 +47,9 @@ tun-rs = "2.8.18"
 crypto_box = "0.9"
 crypto_secretbox = "0.1"
 snow = "0.10"
-curve25519-dalek = "4"
-str0m = { version = "0.24", default-features = false, features = ["aws-lc-rs"] }
-maxminddb = { version = "0.32.0", default-features = false }
+curve25519-dalek = "5"
+str0m = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
+maxminddb = { version = "0.33.0", default-features = false }
 rcgen = "0.14"
 
 [dev-dependencies]

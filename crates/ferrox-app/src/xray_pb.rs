@@ -939,8 +939,8 @@ fn domain_strategy(value: u64) -> Result<Option<&'static str>, String> {
         10 => "forceipv6v4",
         other => {
             return Err(format!(
-            "xray.transport.internet.SocketConfig: socket domain strategy {other} is not carried"
-        ))
+                "xray.transport.internet.SocketConfig: socket domain strategy {other} is not carried"
+            ));
         }
     }))
 }
@@ -957,7 +957,7 @@ fn address_port_strategy(value: u64) -> Result<Option<&'static str>, String> {
         other => {
             return Err(format!(
                 "xray.transport.internet.SocketConfig: socket address and port strategy {other} is not carried"
-            ))
+            ));
         }
     }))
 }
@@ -1041,13 +1041,14 @@ fn stream_settings(bytes: &[u8]) -> Result<Json, String> {
                 selected = Some(index);
                 break;
             }
-            if wanted == "kcp" && transport_lookup(name) == "tcp" {
-                if let Some(settings) = settings {
-                    let (message, _) = typed_message(settings)?;
-                    if message == "xray.transport.internet.kcp.Config" {
-                        selected = Some(index);
-                        break;
-                    }
+            if wanted == "kcp"
+                && transport_lookup(name) == "tcp"
+                && let Some(settings) = settings
+            {
+                let (message, _) = typed_message(settings)?;
+                if message == "xray.transport.internet.kcp.Config" {
+                    selected = Some(index);
+                    break;
                 }
             }
         }
@@ -1773,10 +1774,10 @@ fn masque_xmux(bytes: &[u8]) -> Result<Json, String> {
     ];
     let mut pairs = Vec::new();
     for (name, range) in names.into_iter().zip(ranges) {
-        if let Some((from, to)) = range {
-            if from != 0 || to != 0 {
-                pairs.push((name, Json::Str(format!("{from}-{to}"))));
-            }
+        if let Some((from, to)) = range
+            && (from != 0 || to != 0)
+        {
+            pairs.push((name, Json::Str(format!("{from}-{to}"))));
         }
     }
     if keepalive != 0 {
@@ -1955,7 +1956,7 @@ fn mask_stage(typed: &[u8], udp: bool) -> Result<Json, String> {
             return Err(format!(
                 "{} mask `{other}` is not carried",
                 if udp { "udp" } else { "tcp" }
-            ))
+            ));
         }
     };
     Ok(object(vec![
@@ -2972,7 +2973,7 @@ fn dokodemo_settings(bytes: &[u8]) -> Result<Json, String> {
             other => {
                 return Err(format!(
                     "xray.proxy.dokodemo.Config: network {other} is not carried"
-                ))
+                ));
             }
         });
     }
@@ -3346,7 +3347,7 @@ fn endpoint_parts(bytes: &[u8]) -> Result<(String, Option<u16>), String> {
         other => {
             return Err(format!(
                 "xray.common.net.Endpoint: network {other} is not carried"
-            ))
+            ));
         }
     };
     Ok((address, port.filter(|port| *port != 0)))
@@ -3447,7 +3448,7 @@ fn domain_rule_custom(bytes: &[u8]) -> Result<String, String> {
         other => {
             return Err(format!(
                 "xray.common.geodata.Domain: type {other} is not carried"
-            ))
+            ));
         }
     };
     Ok(format!("{prefix}{value}"))
@@ -3688,15 +3689,14 @@ fn balancing_rule(bytes: &[u8]) -> Result<Json, String> {
     if strategy
         .as_deref()
         .is_some_and(|name| name.eq_ignore_ascii_case("leastload"))
+        && let Some((name, value)) = settings
     {
-        if let Some((name, value)) = settings {
-            if name != "xray.app.router.StrategyLeastLoadConfig" {
-                return Err(format!(
-                    "balancer strategy settings `{name}` are not carried"
-                ));
-            }
-            strategy_pairs.push(("settings", least_load_settings(value)?));
+        if name != "xray.app.router.StrategyLeastLoadConfig" {
+            return Err(format!(
+                "balancer strategy settings `{name}` are not carried"
+            ));
         }
+        strategy_pairs.push(("settings", least_load_settings(value)?));
     }
     if !strategy_pairs.is_empty() {
         pairs.push(("strategy", object(strategy_pairs)));
@@ -4109,8 +4109,8 @@ fn vmess_account(bytes: &[u8]) -> Result<VmessAccount, String> {
                     4 => "chacha20-poly1305",
                     other => {
                         return Err(format!(
-                        "xray.common.protocol.SecurityConfig: security type {other} is not carried"
-                    ))
+                            "xray.common.protocol.SecurityConfig: security type {other} is not carried"
+                        ));
                     }
                 });
             }
@@ -4265,12 +4265,12 @@ fn vless_stripped_encryption(
         other => return Err(format!("VLESS encryption xorMode {other} is not carried")),
     };
     let mut full = format!("mlkem768x25519plus.{mode}.{seconds}.");
-    if let Some(padding) = padding {
-        if !padding.is_empty() {
-            let padding = std::str::from_utf8(padding).map_err(|_| "not utf-8".to_owned())?;
-            full.push_str(padding);
-            full.push('.');
-        }
+    if let Some(padding) = padding
+        && !padding.is_empty()
+    {
+        let padding = std::str::from_utf8(padding).map_err(|_| "not utf-8".to_owned())?;
+        full.push_str(padding);
+        full.push('.');
     }
     full.push_str(keys);
     Ok(full)
@@ -4321,7 +4321,7 @@ fn vless_account(bytes: &[u8]) -> Result<VlessAccount, String> {
         None => None,
         Some(keys) if keys == b"none" => Some("none".to_owned()),
         Some(keys) if keys.is_empty() => {
-            return Err(r#"VLESS users: please add/set "encryption":"none" for every user"#.into())
+            return Err(r#"VLESS users: please add/set "encryption":"none" for every user"#.into());
         }
         Some(keys) => {
             let full = vless_stripped_encryption(
@@ -4419,7 +4419,7 @@ fn vless_inbound_settings(bytes: &[u8]) -> Result<Json, String> {
         Some(shape) if shape.is_empty() => {
             return Err(
                 r#"VLESS settings: please add/set "decryption":"none" to every settings"#.into(),
-            )
+            );
         }
         Some(keys) => {
             let seconds = if seconds_to > 0 {
@@ -4833,8 +4833,10 @@ fn ss2022_multi_user_settings(bytes: &[u8]) -> Result<Json, String> {
             _ => return Err(reader.refuse(field, wire)),
         }
     }
-    let mut password = vec![master
-        .ok_or("xray.proxy.shadowsocks_2022.MultiUserServerConfig: no master key".to_owned())?];
+    let mut password =
+        vec![master.ok_or(
+            "xray.proxy.shadowsocks_2022.MultiUserServerConfig: no master key".to_owned(),
+        )?];
     password.extend(users.iter().map(|(key, _, _)| key.clone()));
     let mut pairs = vec![
         (
@@ -5072,7 +5074,7 @@ fn socks_inbound_settings(bytes: &[u8]) -> Result<Json, String> {
         other => {
             return Err(format!(
                 "xray.proxy.socks.ServerConfig: auth type {other} is not carried"
-            ))
+            ));
         }
     };
     let mut pairs = vec![("auth", Json::Str(auth.to_owned()))];

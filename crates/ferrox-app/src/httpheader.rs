@@ -951,11 +951,13 @@ mod tests {
         assert!(check_request(b"GET /two%2Fpart HTTP/1.1\r\nHost: h\r\n\r\n", &paths).is_some());
         assert!(check_request(b"GET /two/part HTTP/1.1\r\nHost: h\r\n\r\n", &paths).is_some());
         assert!(check_request(b"GET /two+part HTTP/1.1\r\nHost: h\r\n\r\n", &paths).is_some());
-        assert!(check_request(
-            b"GET /two%20part HTTP/1.1\r\nHost: h\r\n\r\n",
-            &["/two part".to_owned()]
-        )
-        .is_some());
+        assert!(
+            check_request(
+                b"GET /two%20part HTTP/1.1\r\nHost: h\r\n\r\n",
+                &["/two part".to_owned()]
+            )
+            .is_some()
+        );
         assert!(check_request(b"GET /two%zzpart HTTP/1.1\r\nHost: h\r\n\r\n", &paths).is_none());
     }
 
@@ -979,13 +981,15 @@ mod tests {
     fn a_framed_body_shares_the_head_deadline() {
         let response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 5\r\n\r\nerror";
         let at = response.len() - 5;
-        assert!(read_response(
-            std::io::Cursor::new(Vec::new()),
-            Vec::from(&response[..]),
-            at,
-            Instant::now(),
-        )
-        .is_none());
+        assert!(
+            read_response(
+                std::io::Cursor::new(Vec::new()),
+                Vec::from(&response[..]),
+                at,
+                Instant::now(),
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1029,15 +1033,17 @@ mod tests {
         let until = Instant::now() + full;
         let head = b"HTTP/1.1 404 Not Found\r\nContent-Length: 1\r\n\r\n";
         thread::sleep(std::time::Duration::from_millis(100));
-        assert!(read_response(
-            BodyRead {
-                armed: Arc::clone(&armed),
-            },
-            Vec::from(&head[..]),
-            head.len(),
-            until,
-        )
-        .is_none());
+        assert!(
+            read_response(
+                BodyRead {
+                    armed: Arc::clone(&armed),
+                },
+                Vec::from(&head[..]),
+                head.len(),
+                until,
+            )
+            .is_none()
+        );
         let armed = armed
             .lock()
             .expect("armed lock")
@@ -1147,14 +1153,16 @@ mod tests {
     #[test]
     fn an_unframed_error_body_is_not_tunnel_traffic() {
         let response = b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\nerror";
-        assert!(connect_split(
-            std::io::Cursor::new(Vec::from(&response[..])),
-            Vec::new(),
-            "oracle.example",
-            "/camouflage",
-            &[],
-        )
-        .is_none());
+        assert!(
+            connect_split(
+                std::io::Cursor::new(Vec::from(&response[..])),
+                Vec::new(),
+                "oracle.example",
+                "/camouflage",
+                &[],
+            )
+            .is_none()
+        );
     }
 
     #[test]

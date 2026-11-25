@@ -25,6 +25,12 @@
 # loopback test to the same ferrox-app bin, putting back the 13 Ir that
 # 3c878f5's took out; quic.rs untouched.
 
+# Re-blessed by the 1.100.0 migration (ops.yml run 45682374422): the measured
+# paths are unchanged except for edition-2024 let-chains and import order, so
+# the moves are the compiler's codegen and thin-LTO layout. The largest are
+# multi_payload_probe (+49152, 12 per cap) and merged_hello_probe (+24575,
+# ~96 per hello); both probe bodies are unchanged.
+
 # Re-blessed 2653 by opt-ss3: the downlink window and its bulk-read gate join
 # the same ferrox-app bin, putting back the 13 Ir the H2 landing took out;
 # quic.rs untouched.
@@ -176,7 +182,7 @@ append_pem 562
 # Re-blessed 51893238 on p2-socks: the SOCKS address and datagram writes move this
 # probe back under the grpc re-base; dns.rs is untouched and the five decisions
 # still walk 4096 times. ops.yml run 43344587778.
-# Measured with Rust 1.99.1, Ubuntu 24.04, glibc 2.39 and Valgrind 3.22.0;
+# Measured with Rust 1.100.0, Ubuntu 24.04, glibc 2.39 and Valgrind 3.22.0;
 # the identical binary reproduces CI in that userspace; other profiling userspaces differ.
 # Re-blessed 51893400 on main 96d147c9: the carried vless-encryption layout moved it; dns.rs is untouched. ops.yml run 43373102520.
 # Re-blessed 51893238 by the cover re-base: the in-place cover shifts this
@@ -198,7 +204,7 @@ append_pem 562
 # (aa2db45, feb11e7): the added code moved this test binary's thin-LTO layout;
 # dns.rs is untouched and the five decisions still walk 4096 times. ops.yml run
 # 44015809956.
-ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 52343912 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
+ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 52835258 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
 # Re-blessed 16896 by the Vision walk's local state: the parser probe (512
 # empty frames) read and wrote every Walk field through self each turn and
 # loaded the five header bytes one at a time. It now keeps the cursor and the
@@ -231,7 +237,7 @@ ferrox_app::vision::tests::Fake::pump 26304 vision::tests::the_frame_parser_prob
 # the wrapper the probe names now pays one call and a destructure: 1170 -> 1182.
 # Re-blessed 1292 by the proxy landings on main (a737c11, 4f4658a, ce26e56),
 # not by this branch: main's own ops is red on this row. ops.yml run 44245430676.
-proxy::decode_trojan_request 1292 proxy::tests::the_trojan_header_costs_two_reads_not_seven
+proxy::decode_trojan_request 1285 proxy::tests::the_trojan_header_costs_two_reads_not_seven
 
 # Blessed 73251 by grpc-common-varint: the probe's one-byte varints and sub-128
 # envelope lengths now take a straight path instead of the loop; the same row
@@ -246,7 +252,7 @@ grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else 73251 g
 # for the field walk in run 43298148854, so 98304 (22.8%) came out. The fast
 # read is compiled only into the wide monomorph, so the one-byte row above
 # keeps its 73251 walk.
-grpc::tests::the_wide_envelope_and_the_hunk_cost_their_length_and_nothing_else 332283 grpc::tests::the_wide_envelope_and_the_hunk_cost_their_length_and_nothing_else
+grpc::tests::the_wide_envelope_and_the_hunk_cost_their_length_and_nothing_else 332295 grpc::tests::the_wide_envelope_and_the_hunk_cost_their_length_and_nothing_else
 # Blessed 102414 by grpc-common-varint-write: 4096 two-byte Hunk lengths of
 # 16375 now take the direct write, against 118798 for the byte loop on the same
 # run, so the loop took 16384 (13.8%) out. The read keeps its loop: a direct
@@ -258,7 +264,7 @@ grpc::tests::direct_write_probe 102414 grpc::tests::the_direct_write_costs_the_s
 # lookups. The walk reads 311301 on the same probe (run 43408759589), so 163840
 # (52.6%) came out; the chosen payload is equal at every cap 8..=70000 and the
 # bytes, frames and window splits are unchanged.
-grpc::tests::multi_payload_probe 147461 grpc::tests::the_multi_payload_fixed_point_costs_less_than_the_walk
+grpc::tests::multi_payload_probe 196613 grpc::tests::the_multi_payload_fixed_point_costs_less_than_the_walk
 # sniff::Sniffing::inspect is reported in scripts/method-ops.txt, not gated:
 # its loopback probe's frame has read 1228 and 1231 on the same source, so an
 # exact row here would be a coin flip. The probe test still asserts the domain
@@ -331,7 +337,7 @@ ferrox_app::psiphon_quic::tests::word_varint_probe 131079 psiphon_quic::tests::t
 # Re-blessed 49775923 on 9725582 by the QUIC send-buffer pass: the same
 # ferrox-app thin-LTO layout moved 349 instructions; psiphon_shadowsocks.rs
 # is untouched. ops.yml run 45014795044.
-ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe 49775923 psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy
+ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe 49812779 psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy
 # The fused size-line walk: 256 turns over a twelve-byte line, the first digit
 # changed each turn so the call is not hoisted. The hex run is parsed in place
 # and only a non-closing terminator pays a second, CRLF-only pass; the line is
@@ -366,7 +372,7 @@ ferrox_app::xhttp::tests::xhttp_line_probe 33046 xhttp::tests::the_chunk_line_co
 # branch rebased onto ce26e56: 256 hellos, 10 instructions fewer than the 349989
 # the hello gate left, same bytes, same draws, same writes. ops.yml run
 # 44245430676.
-ferrox_core::finalmask::tests::merged_hello_probe 347421 finalmask::tests::the_merged_hello_costs_the_cuts_and_the_gather
+ferrox_core::finalmask::tests::merged_hello_probe 371996 finalmask::tests::the_merged_hello_costs_the_cuts_and_the_gather
 # The client request built by `request`: one address type byte, the address and
 # the port, written in one match with the vector's room reserved exactly once,
 # through `spare_capacity_mut` and one `copy_nonoverlapping` per field so no
@@ -380,7 +386,7 @@ ferrox_core::socks::request 895 socks::tests::the_client_writes_the_bytes_the_pi
 # The sealed record write: 256 turns over a four-part Vision frame (uuid, five-byte
 # head, seven 8 KiB payload records, trailer) through an AES engine and a discard
 # sink. A record wholly inside the payload part is sealed from that part, so only
-# the two records that cross a part boundary are copied; 50874900 is 198730.1 per turn.
+# the two records that cross a part boundary are copied; 50877299 is 198739.4 per turn.
 # Re-blessed from 50871336 by the KCP sockopt and ack-batch tests: the added code
 # links into the same ferrox-core test binary, moving its thin-LTO layout;
 # vless_encryption.rs is untouched and the seal still copies only the two
@@ -389,7 +395,7 @@ ferrox_core::socks::request 895 socks::tests::the_client_writes_the_bytes_the_pi
 # the rebase moved the same ferrox-core test binary's thin-LTO layout again;
 # vless_encryption.rs is untouched and the seal still copies only the two
 # crossing records. ops.yml run 43989485702.
-ferrox_core::vless_encryption::tests::sealed_write_probe 50874900 vless_encryption::tests::the_sealed_write_costs_the_seal_and_the_copy
+ferrox_core::vless_encryption::tests::sealed_write_probe 50877299 vless_encryption::tests::the_sealed_write_costs_the_seal_and_the_copy
 # The mux decode probe: 4096 decodes of one fixed New/domain frame, so the row
 # prices the frame walk and nothing else. The probe branch built from origin/main
 # read 634880 (155 a call); splitting the frame once and fusing the status with

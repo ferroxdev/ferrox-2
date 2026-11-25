@@ -7,13 +7,13 @@
 //! server's cache is its own. The transports are `dnsnet`'s.
 
 use crate::json::Json;
-use crate::router::{add_domain, asset_dirs, ip_matcher, Assets, DomainMatcher, IpMatcher};
-use ferrox_core::dns::{build_query, parse_answer, Edns};
+use crate::router::{Assets, DomainMatcher, IpMatcher, add_domain, asset_dirs, ip_matcher};
+use ferrox_core::dns::{Edns, build_query, parse_answer};
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1035,17 +1035,17 @@ impl Resolver {
             let Ok(held) = self.cache[index].lock() else {
                 return Lookup::Failed;
             };
-            if let Some(entry) = held.get(name) {
-                if let Some(record) = family.cached(entry) {
-                    if record.expires > Instant::now() {
-                        return record.answer();
-                    }
-                    if server.cache.serve_stale
-                        && (server.cache.serve_expired.is_zero()
-                            || record.expires + server.cache.serve_expired > Instant::now())
-                    {
-                        stale = Some(record.answer());
-                    }
+            if let Some(entry) = held.get(name)
+                && let Some(record) = family.cached(entry)
+            {
+                if record.expires > Instant::now() {
+                    return record.answer();
+                }
+                if server.cache.serve_stale
+                    && (server.cache.serve_expired.is_zero()
+                        || record.expires + server.cache.serve_expired > Instant::now())
+                {
+                    stale = Some(record.answer());
                 }
             }
         }
@@ -1057,21 +1057,21 @@ impl Resolver {
             Lookup::Failed | Lookup::Skipped => None,
         };
         if let Some((ips, rcode, ttl)) = cacheable {
-            if !server.cache.disable {
-                if let Ok(mut held) = self.cache[index].lock() {
-                    if held.len() >= RESOLVE_CACHE_CAP {
-                        held.clear();
-                    }
-                    let entry = held.entry(name.to_owned()).or_default();
-                    family.store(
-                        entry,
-                        CacheRecord {
-                            ips,
-                            rcode,
-                            expires: Instant::now() + Duration::from_secs(u64::from(ttl.max(1))),
-                        },
-                    );
+            if !server.cache.disable
+                && let Ok(mut held) = self.cache[index].lock()
+            {
+                if held.len() >= RESOLVE_CACHE_CAP {
+                    held.clear();
                 }
+                let entry = held.entry(name.to_owned()).or_default();
+                family.store(
+                    entry,
+                    CacheRecord {
+                        ips,
+                        rcode,
+                        expires: Instant::now() + Duration::from_secs(u64::from(ttl.max(1))),
+                    },
+                );
             }
             fetched
         } else {
@@ -1738,7 +1738,7 @@ fn parse_address(address: &str, port: Option<u16>) -> Result<AddressParts, Strin
                 String::new(),
                 false,
                 false,
-            ))
+            ));
         }
     };
     let (authority, path) = match rest.split_once('/') {
@@ -1755,7 +1755,7 @@ fn parse_address(address: &str, port: Option<u16>) -> Result<AddressParts, Strin
         other => {
             return Err(format!(
                 "dns: no available name server could be created from `{other}://{rest}`"
-            ))
+            ));
         }
     };
     // The local spellings and DoQ are the reference's direct dials; every other form is routed.
@@ -1778,11 +1778,11 @@ fn parse_address(address: &str, port: Option<u16>) -> Result<AddressParts, Strin
 }
 
 fn split_host_port(authority: &str) -> (&str, Option<u16>) {
-    if let Some(rest) = authority.strip_prefix('[') {
-        if let Some((host, tail)) = rest.split_once(']') {
-            let port = tail.strip_prefix(':').and_then(|port| port.parse().ok());
-            return (host, port);
-        }
+    if let Some(rest) = authority.strip_prefix('[')
+        && let Some((host, tail)) = rest.split_once(']')
+    {
+        let port = tail.strip_prefix(':').and_then(|port| port.parse().ok());
+        return (host, port);
     }
     match authority.rsplit_once(':') {
         Some((host, port)) if !host.contains(':') => match port.parse() {
@@ -1962,14 +1962,14 @@ impl FakePool {
             let ip = self.ip(candidate);
             if !self.by_ip.contains_key(&ip) {
                 // The oldest name makes room before the new one is linked, so the pool holds exactly `lru_size` names and evicts the one the queue's front would have.
-                if self.by_name.len() >= self.lru_size {
-                    if let Some(old) = self.head {
-                        self.unlink(old);
-                        if let Some(slot) = self.slots[old].take() {
-                            self.by_name.remove(&slot.name);
-                            self.by_ip.remove(&slot.ip);
-                            self.free.push(old);
-                        }
+                if self.by_name.len() >= self.lru_size
+                    && let Some(old) = self.head
+                {
+                    self.unlink(old);
+                    if let Some(slot) = self.slots[old].take() {
+                        self.by_name.remove(&slot.name);
+                        self.by_ip.remove(&slot.ip);
+                        self.free.push(old);
                     }
                 }
                 self.hold(name, ip);
@@ -2400,9 +2400,11 @@ mod resolver_tests {
                 .0,
             vec!["10.0.0.1".parse::<IpAddr>().unwrap()]
         );
-        assert!(resolver
-            .lookup_families("example.com", false, false, false)
-            .is_none());
+        assert!(
+            resolver
+                .lookup_families("example.com", false, false, false)
+                .is_none()
+        );
     }
 
     #[test]
@@ -2479,12 +2481,11 @@ mod resolver_tests {
             for _ in 0..span {
                 let ip = self.ip(candidate);
                 if !self.by_ip.contains_key(&ip) {
-                    if self.order.len() >= self.lru_size {
-                        if let Some(old) = self.order.pop_front() {
-                            if let Some(ip) = self.by_name.remove(&old) {
-                                self.by_ip.remove(&ip);
-                            }
-                        }
+                    if self.order.len() >= self.lru_size
+                        && let Some(old) = self.order.pop_front()
+                        && let Some(ip) = self.by_name.remove(&old)
+                    {
+                        self.by_ip.remove(&ip);
                     }
                     self.by_name.insert(name.to_owned(), ip);
                     self.by_ip.insert(ip, name.to_owned());
@@ -2808,9 +2809,11 @@ mod resolver_tests {
                 .expect("configured"),
         );
         assert!(resolver.lookup("example.com").is_some());
-        assert!(resolver
-            .host_lookup("www.example.com", "www.example.com", true, true)
-            .is_none());
+        assert!(
+            resolver
+                .host_lookup("www.example.com", "www.example.com", true, true)
+                .is_none()
+        );
         assert!(resolver.lookup("a.sub.test").is_some());
     }
 

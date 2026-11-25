@@ -1,7 +1,7 @@
 //! The Shadowsocks AEAD stream under `SHADOWSOCKS-OSSH`: a salt, then sealed
 //! length/payload chunks, carrying the OSSH seed and SSH session unchanged.
 
-use ferrox_core::shadowsocks::{Cipher, MasterKey, Method, LENGTH_LEN, MAX_CHUNK, TAG_LEN};
+use ferrox_core::shadowsocks::{Cipher, LENGTH_LEN, MAX_CHUNK, MasterKey, Method, TAG_LEN};
 use std::io::{self, IoSlice, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};

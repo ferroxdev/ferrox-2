@@ -184,11 +184,7 @@ fn pack_name(out: &mut Vec<u8>, name: &[u8]) -> Option<()> {
 /// where the name is the root, which the builder packed from its root
 /// shortcut, so no pointer entry was ever cached.
 fn packed_answer_name(name: &[u8]) -> &'static [u8] {
-    if name == b"." {
-        b"\x00"
-    } else {
-        b"\xC0\x0C"
-    }
+    if name == b"." { b"\x00" } else { b"\xC0\x0C" }
 }
 
 /// What the lane gets back for a hijack's lookup: the records and their TTL,
@@ -592,10 +588,10 @@ mod tests {
                     }
                 }
                 // Apply the TTL after `ips` has built the record it belongs to.
-                if let Some(ttl) = case.ttl {
-                    if let Some(Resolve::Records { ttl: named, .. }) = &mut case.lookup {
-                        *named = ttl;
-                    }
+                if let Some(ttl) = case.ttl
+                    && let Some(Resolve::Records { ttl: named, .. }) = &mut case.lookup
+                {
+                    *named = ttl;
                 }
             }
         }

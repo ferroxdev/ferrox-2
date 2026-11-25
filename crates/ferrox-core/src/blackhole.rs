@@ -88,7 +88,7 @@ mod tests {
                 "http" => Response::Http,
                 "none" => Response::None,
                 "custom" => {
-                    let data = fields.next().map(unhex).unwrap_or_default();
+                    let data = fields.next().map_or_default(unhex);
                     Response::Custom(data.into())
                 }
                 other => panic!("unknown case {other}"),

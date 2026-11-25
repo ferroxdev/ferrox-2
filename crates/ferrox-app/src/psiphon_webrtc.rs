@@ -1,8 +1,8 @@
 //! A str0m WebRTC data channel between the client and an in-proxy destination.
 
 use crate::psiphon_broker::{Broker, Client, Destination, Front, Metrics, OfferSettings};
-use crate::psiphon_ssh::dial_random;
 use crate::psiphon_ssh::Identity;
+use crate::psiphon_ssh::dial_random;
 use hkdf::Hkdf;
 use sha2::Sha256;
 use std::collections::VecDeque;
@@ -163,16 +163,16 @@ impl WebRtc {
                 .map_err(|error| format!("psiphon webrtc candidate: {error}"))?;
             let _ = rtc.add_local_candidate(host);
         }
-        if !disable_stun && !disable_inbound {
-            if let Some(server) = choose_stun(stun_servers) {
-                let stun_timeout = timeout.min(Duration::from_secs(3));
-                if let Ok(Some(mapped)) = stun_binding(&socket, local, server, stun_timeout, dns) {
-                    if !(disable_ipv6_ice && mapped.is_ipv6()) {
-                        if let Ok(candidate) = Candidate::server_reflexive(mapped, local, "udp") {
-                            let _ = rtc.add_local_candidate(candidate);
-                        }
-                    }
-                }
+        if !disable_stun
+            && !disable_inbound
+            && let Some(server) = choose_stun(stun_servers)
+        {
+            let stun_timeout = timeout.min(Duration::from_secs(3));
+            if let Ok(Some(mapped)) = stun_binding(&socket, local, server, stun_timeout, dns)
+                && !(disable_ipv6_ice && mapped.is_ipv6())
+                && let Ok(candidate) = Candidate::server_reflexive(mapped, local, "udp")
+            {
+                let _ = rtc.add_local_candidate(candidate);
             }
         }
         let mut changes = rtc.sdp_api();
@@ -391,12 +391,12 @@ impl WebRtc {
                     Event::ChannelData(data)
                         if self.channel.is_some_and(|channel| data.id == channel) =>
                     {
-                        return Ok(Some(data.data))
+                        return Ok(Some(data.data));
                     }
                     Event::ChannelClose(id)
                         if self.channel.is_some_and(|channel| id == channel) =>
                     {
-                        return Err("psiphon webrtc: data channel closed".to_owned())
+                        return Err("psiphon webrtc: data channel closed".to_owned());
                     }
                     Event::RtpPacket(packet) if self.media.is_some() => {
                         let payload = packet.payload.as_ref();
@@ -419,7 +419,7 @@ impl WebRtc {
                         return Ok(Some(data));
                     }
                     Event::IceConnectionStateChange(str0m::IceConnectionState::Disconnected) => {
-                        return Err("psiphon webrtc: ICE disconnected".to_owned())
+                        return Err("psiphon webrtc: ICE disconnected".to_owned());
                     }
                     _ => {}
                 }
@@ -453,10 +453,10 @@ impl WebRtc {
                         if !data.data.is_empty() {
                             backlog.push_back(Ok(data.data));
                         }
-                    } else if let Ok(Some(payload)) = unframe(data.data, padding_done) {
-                        if !payload.is_empty() {
-                            backlog.push_back(Ok(payload));
-                        }
+                    } else if let Ok(Some(payload)) = unframe(data.data, padding_done)
+                        && !payload.is_empty()
+                    {
+                        backlog.push_back(Ok(payload));
                     }
                 }
                 Event::RtpPacket(packet) if self.media.is_some() => {
@@ -787,14 +787,14 @@ fn stun_binding(
         let (length, source) = match socket.recv_from(&mut reply) {
             Ok(reply) => reply,
             Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                return Ok(None)
+                return Ok(None);
             }
             Err(error) => return Err(format!("psiphon webrtc STUN receive: {error}")),
         };
-        if source == target {
-            if let Some(mapped) = parse_stun(&reply[..length], &transaction) {
-                return Ok(Some(mapped));
-            }
+        if source == target
+            && let Some(mapped) = parse_stun(&reply[..length], &transaction)
+        {
+            return Ok(Some(mapped));
         }
     }
 }
@@ -893,7 +893,7 @@ fn nat_round_trip(
         let (length, _) = match socket.recv_from(&mut reply) {
             Ok(reply) => reply,
             Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                return Ok(None)
+                return Ok(None);
             }
             Err(error) => return Err(format!("psiphon NAT discovery receive: {error}")),
         };
@@ -1547,15 +1547,15 @@ fn drive(
                         Err(error) => backlog.push_back(Err(error)),
                     }
                 }
-                if let Some(shaping) = &shaping {
-                    if !wrote {
-                        let decoy =
-                            try_lock(shaping).and_then(|mut shaping| shaping.decoy(MAX_DATAGRAM));
-                        if let Some(message) = decoy {
-                            if let Err(error) = webrtc.send(&message) {
-                                backlog.push_back(Err(error));
-                            }
-                        }
+                if let Some(shaping) = &shaping
+                    && !wrote
+                {
+                    let decoy =
+                        try_lock(shaping).and_then(|mut shaping| shaping.decoy(MAX_DATAGRAM));
+                    if let Some(message) = decoy
+                        && let Err(error) = webrtc.send(&message)
+                    {
+                        backlog.push_back(Err(error));
                     }
                 }
             }
@@ -1958,15 +1958,16 @@ impl Conduit {
                 .min(allowance);
         let mut metrics = Metrics::from_identity(identity);
         let nat_deadline = deadline.min(Instant::now() + self.discover_nat_timeout);
-        if Instant::now() < nat_deadline && weighted(self.discover_nat, random_unit()) {
-            if let Some(nat) = discover_nat_type(
+        if Instant::now() < nat_deadline
+            && weighted(self.discover_nat, random_unit())
+            && let Some(nat) = discover_nat_type(
                 &self.rfc5780_stun_servers,
                 address,
                 nat_deadline,
                 &self.dns_config,
-            ) {
-                *lock(&self.nat_type) = Some(nat);
-            }
+            )
+        {
+            *lock(&self.nat_type) = Some(nat);
         }
         if let Some(nat) = *lock(&self.nat_type) {
             metrics.set_nat_type(nat);

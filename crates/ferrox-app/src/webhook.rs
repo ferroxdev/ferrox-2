@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ferrox_core::tls::TlsProvider as _;
@@ -120,14 +120,14 @@ pub(crate) fn parse(field: &Json) -> Result<Option<Arc<Webhook>>, String> {
     }
     let (url, socket) = split_socket(url);
     let mut headers = Vec::new();
-    if let Some(list) = field.get("headers") {
-        if !matches!(list, Json::Null) {
-            for (name, value) in crate::router::object(list, "webhook headers")? {
-                let value = value
-                    .as_str()
-                    .ok_or_else(|| format!("webhook header `{name}` is not a string"))?;
-                headers.push((name.clone(), value.to_owned()));
-            }
+    if let Some(list) = field.get("headers")
+        && !matches!(list, Json::Null)
+    {
+        for (name, value) in crate::router::object(list, "webhook headers")? {
+            let value = value
+                .as_str()
+                .ok_or_else(|| format!("webhook header `{name}` is not a string"))?;
+            headers.push((name.clone(), value.to_owned()));
         }
     }
     let deduplication = match field.get("deduplication") {

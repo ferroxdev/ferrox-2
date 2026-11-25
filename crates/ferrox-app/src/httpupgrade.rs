@@ -1600,10 +1600,7 @@ mod tests {
             let mut wire = head.clone();
             wire.extend_from_slice(&tail);
             let outcome = accept_split(std::io::Cursor::new(wire), Vec::new(), &case.path, "");
-            let answer = outcome
-                .as_ref()
-                .map(|(_, write)| write.clone())
-                .unwrap_or_default();
+            let answer = outcome.as_ref().map_or_default(|(_, write)| write.clone());
             let reference_took = fields[0] == "accept";
             let mut measured = Served {
                 verdict_differs: 0,
@@ -1718,7 +1715,7 @@ mod tests {
                 .events
                 .iter()
                 .enumerate()
-                .filter(|(_, &event)| event == 1)
+                .filter(|(_, event)| **event == 1)
                 .nth(1)
                 .map(|(at, _)| at);
             let tree_order = match (first_read, payload_write) {

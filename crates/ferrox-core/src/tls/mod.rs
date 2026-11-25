@@ -578,21 +578,17 @@ impl CertIssuer {
                 if let (Some(cert_pem), Some(key_pem)) = (
                     (reload.read)(&reload.certificate),
                     (reload.read)(&reload.key),
-                ) {
-                    if rustls_backend::issuer_usable(&cert_pem, &key_pem).is_ok() {
-                        if let Ok(entry) = parse_pem_entry(&cert_pem, &key_pem) {
-                            if entry.cert_chain != live.cert_chain
-                                || cert_pem != live.cert_pem
-                                || key_pem != live.key_pem
-                            {
-                                live.cert_chain = entry.cert_chain;
-                                live.cert_pem = cert_pem;
-                                live.key_pem = key_pem;
-                                self.generation
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        }
-                    }
+                ) && rustls_backend::issuer_usable(&cert_pem, &key_pem).is_ok()
+                    && let Ok(entry) = parse_pem_entry(&cert_pem, &key_pem)
+                    && (entry.cert_chain != live.cert_chain
+                        || cert_pem != live.cert_pem
+                        || key_pem != live.key_pem)
+                {
+                    live.cert_chain = entry.cert_chain;
+                    live.cert_pem = cert_pem;
+                    live.key_pem = key_pem;
+                    self.generation
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -989,7 +985,7 @@ pub fn decode_ech_keys(text: &str) -> Result<Vec<u8>, String> {
 mod legacy;
 mod rustls_backend;
 pub use rustls_backend::{
-    quic_server_context_builder, verify_cert_pinned, RustlsProvider, RustlsServerProvider,
+    RustlsProvider, RustlsServerProvider, quic_server_context_builder, verify_cert_pinned,
 };
 
 pub mod shaped;
@@ -1218,8 +1214,8 @@ impl<S: Stream> std::io::Write for ClientSession<S> {
 
 pub mod reality;
 pub use reality::{
-    write_proxy_protocol, Edges, Proxied, RateLimit, RealityAccept, RealityClientConfig,
-    RealityClientSession, RealityServer, RealityServerConfig,
+    Edges, Proxied, RateLimit, RealityAccept, RealityClientConfig, RealityClientSession,
+    RealityServer, RealityServerConfig, write_proxy_protocol,
 };
 
 pub fn connect<S: Stream + RecordAlignment>(

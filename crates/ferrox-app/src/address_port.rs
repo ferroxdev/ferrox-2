@@ -423,7 +423,7 @@ fn unix_nameservers() -> Vec<SocketAddr> {
 #[cfg(windows)]
 fn windows_nameservers() -> Vec<SocketAddr> {
     use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS};
-    use windows_sys::Win32::NetworkManagement::IpHelper::{GetNetworkParams, FIXED_INFO_W2KSP1};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{FIXED_INFO_W2KSP1, GetNetworkParams};
 
     let mut size = 0u32;
     let mut info = std::mem::MaybeUninit::<FIXED_INFO_W2KSP1>::zeroed();
@@ -502,13 +502,15 @@ mod tests {
         let socket = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let address = socket.local_addr().expect("has an address");
         let _ = socket.set_read_timeout(Some(Duration::from_millis(500)));
-        std::thread::spawn(move || loop {
-            let mut query = vec![0u8; ANSWER_MAX];
-            let Ok((read, from)) = socket.recv_from(&mut query) else {
-                return;
-            };
-            let answer = response(&query[..read], qtype, &records);
-            let _ = socket.send_to(&answer, from);
+        std::thread::spawn(move || {
+            loop {
+                let mut query = vec![0u8; ANSWER_MAX];
+                let Ok((read, from)) = socket.recv_from(&mut query) else {
+                    return;
+                };
+                let answer = response(&query[..read], qtype, &records);
+                let _ = socket.send_to(&answer, from);
+            }
         });
         address
     }

@@ -467,22 +467,28 @@ mod tests {
              &flow=xtls-rprx-vision&sni=example.com&sid=abcdef01#x",
         )
         .expect("parses");
-        assert!(engine_config(&no_pbk, EngineFamily::XrayCore, 10801)
-            .expect_err("no pbk is refused")
-            .contains("pbk"));
+        assert!(
+            engine_config(&no_pbk, EngineFamily::XrayCore, 10801)
+                .expect_err("no pbk is refused")
+                .contains("pbk")
+        );
         let quic = VlessLink::parse(
             "vless://11111111-2222-4333-8444-555555555555@198.51.100.7:443\
              ?security=none&encryption=none&type=quic#x",
         )
         .expect("parses");
-        assert!(engine_config(&quic, EngineFamily::XrayCore, 10801)
-            .expect_err("quic is refused")
-            .contains("tcp or ws"));
+        assert!(
+            engine_config(&quic, EngineFamily::XrayCore, 10801)
+                .expect_err("quic is refused")
+                .contains("tcp or ws")
+        );
         let mut unsafe_fp = reality_link();
         unsafe_fp.set_param("fp", "unsafe-chrome");
-        assert!(engine_config(&unsafe_fp, EngineFamily::XrayCore, 10801)
-            .expect_err("unsafe fp is refused")
-            .contains("unsafe"));
+        assert!(
+            engine_config(&unsafe_fp, EngineFamily::XrayCore, 10801)
+                .expect_err("unsafe fp is refused")
+                .contains("unsafe")
+        );
         assert!(EngineFamily::parse("quiche").is_err());
     }
 

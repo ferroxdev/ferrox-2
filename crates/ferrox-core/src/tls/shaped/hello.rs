@@ -1,9 +1,9 @@
 // The shaped ClientHello: a pinned parrot's ciphers, extension order and bodies, with the GREASE, key shares, ECH cover and padding a browser draws.
 use super::keys::{self, Share};
 use super::ticket::Ticket;
-use super::{Body, Ext, Profile, GREASE};
-use crate::tls::hpke::Sealer;
+use super::{Body, Ext, GREASE, Profile};
 use crate::tls::TlsError;
+use crate::tls::hpke::Sealer;
 
 /// The version this hello's legacy field names, which a static-RSA premaster repeats.
 pub(super) const TLS12: u16 = 0x0303;
@@ -756,10 +756,10 @@ impl Hello {
             msg.extend_from_slice(&(entry.len as u16).to_be_bytes());
             self.write_body(&entry.source, shares, &mut msg);
         }
-        if let Some(ticket) = &self.psk {
-            if ticket.tls13 {
-                super::ticket::complete_binder(&mut msg, &self.binder_prefix, &ticket.secret);
-            }
+        if let Some(ticket) = &self.psk
+            && ticket.tls13
+        {
+            super::ticket::complete_binder(&mut msg, &self.binder_prefix, &ticket.secret);
         }
         msg
     }
@@ -877,29 +877,28 @@ impl Hello {
         }
 
         // xray appends the forced ALPN after the preset's extensions, and patches it in place when the preset carries one.
-        if let Some(list) = self.alpn {
-            if !entries.iter().any(|entry| entry.kind == ALPN) {
-                let source = Source::Alpn(list);
-                let len = self.width_of(&source, shares);
-                entries.push(Entry::new(ALPN, len, true, source));
-            }
+        if let Some(list) = self.alpn
+            && !entries.iter().any(|entry| entry.kind == ALPN)
+        {
+            let source = Source::Alpn(list);
+            let len = self.width_of(&source, shares);
+            entries.push(Entry::new(ALPN, len, true, source));
         }
 
         // A stock profile has no GREASE slot, so the real offer is appended where RFC 9849 puts it.
-        if self.ech_slot && !entries.iter().any(|entry| entry.kind == 0xfe0d) {
-            if let Some(ech) = ech {
-                let source = ech.source();
-                let len = self.width_of(&source, shares);
-                entries.push(Entry::new(0xfe0d, len, false, source));
-            }
+        if self.ech_slot
+            && !entries.iter().any(|entry| entry.kind == 0xfe0d)
+            && let Some(ech) = ech
+        {
+            let source = ech.source();
+            let len = self.width_of(&source, shares);
+            entries.push(Entry::new(0xfe0d, len, false, source));
         }
 
         // RFC 9849 makes real ECH the last extension; the uTLS GREASE cover keeps the preset's slot.
-        if ech_last {
-            if let Some(at) = entries.iter().position(|entry| entry.kind == 0xfe0d) {
-                let entry = entries.remove(at);
-                entries.push(entry);
-            }
+        if ech_last && let Some(at) = entries.iter().position(|entry| entry.kind == 0xfe0d) {
+            let entry = entries.remove(at);
+            entries.push(entry);
         }
 
         // A client-made ticket rides its version's extension, and a TLS 1.3 PSK is always last.
@@ -1083,11 +1082,11 @@ impl Hello {
                 + 2;
             let pad = boring_padding(unpadded);
             entries.retain(|entry| entry.kind != PAD || pad.is_some());
-            if let Some(len) = pad {
-                if let Some(entry) = entries.iter_mut().find(|entry| entry.kind == PAD) {
-                    entry.source = Source::Zeros(len);
-                    entry.len = len;
-                }
+            if let Some(len) = pad
+                && let Some(entry) = entries.iter_mut().find(|entry| entry.kind == PAD)
+            {
+                entry.source = Source::Zeros(len);
+                entry.len = len;
             }
         }
         header + 4 + entries.iter().map(|entry| 4 + entry.len).sum::<usize>() + 2
@@ -1287,10 +1286,10 @@ fn sni_name(name: &str) -> Option<&str> {
     if host.len() > 1 && host.starts_with('[') && host.ends_with(']') {
         host = &host[1..host.len() - 1];
     }
-    if let Some(at) = host.rfind('%') {
-        if at > 0 {
-            host = &host[..at];
-        }
+    if let Some(at) = host.rfind('%')
+        && at > 0
+    {
+        host = &host[..at];
     }
     if host.parse::<std::net::IpAddr>().is_ok() {
         return None;
@@ -1353,11 +1352,7 @@ fn alpn_override(alpn: &[Vec<u8>], websocket: bool) -> Option<&'static [&'static
         return None;
     }
     let both = alpn.len() == 2 && alpn[0].as_slice() == BOTH[0] && alpn[1].as_slice() == BOTH[1];
-    if both {
-        Some(&BOTH)
-    } else {
-        Some(&HTTP11)
-    }
+    if both { Some(&BOTH) } else { Some(&HTTP11) }
 }
 
 #[cfg(test)]
@@ -2291,7 +2286,9 @@ mod tests {
             .expect("the carrier names its protocol");
         assert_eq!(
             alpn[2..],
-            [0, 11, 0, 9, 8, b'h', b't', b't', b'p', b'/', b'1', b'.', b'1'],
+            [
+                0, 11, 0, 9, 8, b'h', b't', b't', b'p', b'/', b'1', b'.', b'1'
+            ],
             "the forced ALPN's width beside its bytes"
         );
     }
@@ -2361,9 +2358,11 @@ mod tests {
             .set_obfuscated_ticket(&[0x66; 32], 0)
             .expect("a hello without ECH carries a ticket");
         assert!(hello.ticket().expect("a ticket").tls13);
-        assert!(extensions(&hello.msg[4..])
-            .iter()
-            .any(|entry| kind(entry) == PSK));
+        assert!(
+            extensions(&hello.msg[4..])
+                .iter()
+                .any(|entry| kind(entry) == PSK)
+        );
     }
 
     #[test]
@@ -2378,9 +2377,11 @@ mod tests {
             .set_obfuscated_ticket(&[0x44; 32], 0)
             .expect("the reference drops the ticket quietly");
         assert!(hello.ticket().is_none());
-        assert!(!extensions(&hello.msg[4..])
-            .iter()
-            .any(|entry| kind(entry) == PSK));
+        assert!(
+            !extensions(&hello.msg[4..])
+                .iter()
+                .any(|entry| kind(entry) == PSK)
+        );
     }
 
     #[test]
@@ -2420,9 +2421,11 @@ mod tests {
             .expect("the ticket follows the effective window");
         let ticket = hello.ticket().expect("a ticket");
         assert!(!ticket.tls13, "a 1.2 ceiling mints a TLS 1.2 ticket");
-        assert!(extensions(&hello.msg[4..])
-            .iter()
-            .any(|entry| kind(entry) == SESSION_TICKET));
+        assert!(
+            extensions(&hello.msg[4..])
+                .iter()
+                .any(|entry| kind(entry) == SESSION_TICKET)
+        );
     }
 
     #[test]

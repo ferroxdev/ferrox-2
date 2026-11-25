@@ -423,10 +423,10 @@ fn decode_entities(raw: &str) -> String {
 fn query_value(url: &str, key: &str) -> Option<String> {
     let query = url.split_once('?')?.1.split('#').next().unwrap_or("");
     for pair in query.split('&') {
-        if let Some((name, value)) = pair.split_once('=') {
-            if name == key {
-                return Some(percent_decode(value));
-            }
+        if let Some((name, value)) = pair.split_once('=')
+            && name == key
+        {
+            return Some(percent_decode(value));
         }
     }
     None
@@ -605,11 +605,7 @@ fn url_path(url: &str) -> &str {
         return "/";
     }
     let path = rest[start..].split(['?', '#']).next().unwrap_or("");
-    if path.is_empty() {
-        "/"
-    } else {
-        path
-    }
+    if path.is_empty() { "/" } else { path }
 }
 
 fn https_target(url: &str) -> Option<(String, String)> {
@@ -1386,10 +1382,11 @@ pub(crate) fn resolve_token(
             Err(poisoned) => poisoned.into_inner(),
         };
         let now = now();
-        if let Some((team, token)) = cached.as_ref() {
-            if *team == settings.team && jwt_expiry(token).is_some_and(|expiry| now < expiry) {
-                return Ok(token.clone());
-            }
+        if let Some((team, token)) = cached.as_ref()
+            && *team == settings.team
+            && jwt_expiry(token).is_some_and(|expiry| now < expiry)
+        {
+            return Ok(token.clone());
         }
     }
     let token = sign_in(settings, started, &https_exchange, prompt)?;

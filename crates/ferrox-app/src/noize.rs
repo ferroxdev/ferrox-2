@@ -377,10 +377,10 @@ impl WireGuardNoize {
         let extra = crate::psiphon_quic::noise_range(0, base);
         for _ in 0..base + extra {
             let mut junk = self.junk();
-            if let Some(first) = junk.first_mut() {
-                if (1..=4).contains(first) {
-                    *first = first.wrapping_add(0x40);
-                }
+            if let Some(first) = junk.first_mut()
+                && (1..=4).contains(first)
+            {
+                *first = first.wrapping_add(0x40);
             }
             let jitter = u64::try_from(crate::psiphon_quic::noise_range(0, 8)).unwrap_or(0);
             send(&junk);

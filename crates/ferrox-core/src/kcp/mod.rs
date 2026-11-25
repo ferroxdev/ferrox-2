@@ -12,10 +12,10 @@ mod oracle;
 
 pub use config::Config;
 pub use connection::{ConnError, ConnMetadata, Connection, State};
-pub use listener::{dial, dial_with, fresh_conversation, Listener};
+pub use listener::{Listener, dial, dial_with, fresh_conversation};
 pub use mask::{Encoder, HeaderKind, Mask, Spec, SpecError};
 pub use segment::{
-    AckSegment, CmdOnlySegment, Command, DataSegment, Segment, SegmentOption, DATA_SEGMENT_OVERHEAD,
+    AckSegment, CmdOnlySegment, Command, DATA_SEGMENT_OVERHEAD, DataSegment, Segment, SegmentOption,
 };
 
 pub use roundtrip::RoundTripInfo;

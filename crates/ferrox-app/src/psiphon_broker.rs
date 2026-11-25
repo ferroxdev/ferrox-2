@@ -4,7 +4,7 @@
 
 use crate::json::Json;
 use crate::psiphon_meek::{self, Meek};
-use crate::psiphon_ssh::{dial_random, random, Identity, Proxy};
+use crate::psiphon_ssh::{Identity, Proxy, dial_random, random};
 use crate::psiphon_webrtc::TrafficShapingParameters;
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -1066,8 +1066,7 @@ fn parse_offer(value: &Value) -> Offer {
         connection_id: value
             .get(3)
             .and_then(Value::bytes)
-            .map(<[u8]>::to_vec)
-            .unwrap_or_default(),
+            .map_or_default(<[u8]>::to_vec),
         protocol_version: value.get(4).and_then(Value::uint).unwrap_or(0),
         answer_sdp: value
             .get(5)
@@ -1078,8 +1077,7 @@ fn parse_offer(value: &Value) -> Offer {
         relay_packet_to_server: value
             .get(6)
             .and_then(Value::bytes)
-            .map(<[u8]>::to_vec)
-            .unwrap_or_default(),
+            .map_or_default(<[u8]>::to_vec),
         must_upgrade: value.get(7).and_then(Value::bool).unwrap_or(false),
     }
 }

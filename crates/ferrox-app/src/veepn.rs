@@ -3,7 +3,7 @@
 use crate::foxy::{Carrier, FoxyDial, Tunnel};
 use crate::foxy_account::{self, Endpoint};
 use crate::json::Json;
-use ferrox_core::foxy::{edge_peer, Pass};
+use ferrox_core::foxy::{Pass, edge_peer};
 use ferrox_core::veepn::{self, BASIC_HEAD};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -209,7 +209,7 @@ impl VeepnOut {
                         return Err(Refusal {
                             why: format!("{target} is refused by the edge ({status})"),
                             code: 0x04,
-                        })
+                        });
                     }
                     Err(ferrox_core::foxy::Failure::Rejected(status))
                         if ferrox_core::foxy::pass_is_rejected(status) =>
@@ -272,13 +272,13 @@ impl VeepnOut {
             Ok(reply) => reply,
             Err(miss) => {
                 if let (false, Some(named)) = (miss.answered, held) {
-                    if let Ok(mut plane) = self.plane.lock() {
-                        if plane.generation == generation {
-                            plane.region = Some((
-                                Arc::clone(&named),
-                                foxy_account::epoch().saturating_add(veepn::PLANE_RETRY),
-                            ));
-                        }
+                    if let Ok(mut plane) = self.plane.lock()
+                        && plane.generation == generation
+                    {
+                        plane.region = Some((
+                            Arc::clone(&named),
+                            foxy_account::epoch().saturating_add(veepn::PLANE_RETRY),
+                        ));
                     }
                     return Ok(named);
                 }
@@ -334,16 +334,16 @@ impl VeepnOut {
             Ok(found) => found,
             Err(miss) => {
                 if let (false, Some(list)) = (miss.answered, held) {
-                    if let Ok(mut plane) = self.plane.lock() {
-                        if plane.generation == generation {
-                            plane.lists.insert(
-                                region.to_owned(),
-                                (
-                                    Arc::clone(&list),
-                                    foxy_account::epoch().saturating_add(veepn::PLANE_RETRY),
-                                ),
-                            );
-                        }
+                    if let Ok(mut plane) = self.plane.lock()
+                        && plane.generation == generation
+                    {
+                        plane.lists.insert(
+                            region.to_owned(),
+                            (
+                                Arc::clone(&list),
+                                foxy_account::epoch().saturating_add(veepn::PLANE_RETRY),
+                            ),
+                        );
                     }
                     return Ok(list);
                 }
@@ -359,13 +359,13 @@ impl VeepnOut {
             dials: list,
             silence,
         });
-        if let Ok(mut plane) = self.plane.lock() {
-            if plane.generation == generation {
-                plane.lists.insert(
-                    region.to_owned(),
-                    (Arc::clone(&list), now.saturating_add(veepn::SERVERS_TTL)),
-                );
-            }
+        if let Ok(mut plane) = self.plane.lock()
+            && plane.generation == generation
+        {
+            plane.lists.insert(
+                region.to_owned(),
+                (Arc::clone(&list), now.saturating_add(veepn::SERVERS_TTL)),
+            );
         }
         Ok(list)
     }
@@ -382,16 +382,15 @@ impl VeepnOut {
     /// The token the plane answers with, launched when the cache has run out: one ask per 7 days, and a plane that refuses what it issued gets exactly one relaunch. A launch that reaches the plane but answers about this device is a refusal the cache cannot fix, so it is marked as one; a launch that reaches nothing is a miss a held list survives.
     fn access(&self, force: bool) -> Result<String, Miss> {
         let now = foxy_account::epoch();
-        if !force {
-            if let Some((value, _)) = self
+        if !force
+            && let Some((value, _)) = self
                 .plane
                 .lock()
                 .ok()
                 .and_then(|plane| plane.access.clone())
                 .filter(|(_, until)| *until > now)
-            {
-                return Ok(value);
-            }
+        {
+            return Ok(value);
         }
         let _refresh = self.access_refresh.lock();
         if !force {
@@ -425,10 +424,10 @@ impl VeepnOut {
             .filter(|token| !token.is_empty())
             .ok_or_else(|| Miss::spoken("launch answers no access token"))?;
         let value = format!("Bearer {token}");
-        if let Ok(mut plane) = self.plane.lock() {
-            if plane.generation == generation {
-                plane.access = Some((value.clone(), now.saturating_add(veepn::TOKEN_TTL)));
-            }
+        if let Ok(mut plane) = self.plane.lock()
+            && plane.generation == generation
+        {
+            plane.access = Some((value.clone(), now.saturating_add(veepn::TOKEN_TTL)));
         }
         Ok(value)
     }
@@ -494,7 +493,7 @@ impl VeepnOut {
                         return Ok(Walked::Refused(format!(
                             "{path} answers {other}: {}",
                             String::from_utf8_lossy(&reply.body)
-                        )))
+                        )));
                     }
                 },
             }
@@ -600,10 +599,10 @@ fn picked(dials: &[FoxyDial], at: usize) -> &FoxyDial {
 
 /// The zone the launch publishes: the `TZ` the operator set, else the name the machine's own localtime points at, else the one name that is always right.
 fn zone_name() -> String {
-    if let Ok(named) = std::env::var("TZ") {
-        if !named.is_empty() {
-            return named;
-        }
+    if let Ok(named) = std::env::var("TZ")
+        && !named.is_empty()
+    {
+        return named;
     }
     #[cfg(unix)]
     if let Ok(link) = std::fs::read_link("/etc/localtime") {
@@ -1310,10 +1309,7 @@ mod tests {
             .expect("the edge refuses this host");
         assert_eq!(
             (refusal.code, refusal.why.as_str()),
-            (
-                0x04,
-                "example.com:443 is refused by the edge (403)"
-            ),
+            (0x04, "example.com:443 is refused by the edge (403)"),
             "the client hears a host that cannot be reached, not a proxy that failed: edges answered {}+{}, plane asked {}",
             one_hits.load(Ordering::SeqCst),
             two_hits.load(Ordering::SeqCst),

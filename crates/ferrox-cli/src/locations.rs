@@ -7,10 +7,10 @@ use std::process::Command;
 
 use serde_json::Value;
 
-use crate::args::{die, Options, Outbound};
+use crate::args::{Options, Outbound, die};
 use crate::config::{build_outbound, remembered_city, remembered_country};
 use crate::lane::require_bin;
-use crate::paths::{read_trim, secure_dir, write_private, Paths};
+use crate::paths::{Paths, read_trim, secure_dir, write_private};
 
 fn rows(bin: &Path, ping: bool) -> String {
     let mut command = Command::new(bin);
@@ -22,8 +22,7 @@ fn rows(bin: &Path, ping: bool) -> String {
         .output()
         .ok()
         .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-        .unwrap_or_default()
+        .map_or_default(|output| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn plain(line: &str) -> String {
@@ -136,11 +135,17 @@ pub fn list(options: &Options, paths: &Paths, filter: &str, ping: bool) -> Resul
         "exit locations from Mozilla's catalogue: {} countries, {total} edges",
         places.len()
     );
-    println!("country and city are the codes --country and --city take; * is what this machine remembers.");
+    println!(
+        "country and city are the codes --country and --city take; * is what this machine remembers."
+    );
     if ping {
-        println!("ms is one TCP handshake from this machine to the edge (1.5 s budget); 'no answer' is an edge that did not take it.");
+        println!(
+            "ms is one TCP handshake from this machine to the edge (1.5 s budget); 'no answer' is an edge that did not take it."
+        );
         if !measured {
-            println!("latency not measured: this listing came from the offline copy; run 'locations --ping' again when the catalogue answers.");
+            println!(
+                "latency not measured: this listing came from the offline copy; run 'locations --ping' again when the catalogue answers."
+            );
         }
     }
 
@@ -233,8 +238,7 @@ fn veepn_regions(paths: &Paths, filter: &str) -> Result<(), String> {
     let mut text = output
         .ok()
         .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-        .unwrap_or_default();
+        .map_or_default(|output| String::from_utf8_lossy(&output.stdout).into_owned());
     if text.trim().is_empty() {
         let Some(saved) = read_trim(&paths.veepn_locations) else {
             return Err(
@@ -298,7 +302,9 @@ fn veepn_regions(paths: &Paths, filter: &str) -> Result<(), String> {
         places.len(),
         places.values().map(Vec::len).sum::<usize>()
     );
-    println!("the region id is what --region takes (lowercase); --country takes either it or the two-letter code.");
+    println!(
+        "the region id is what --region takes (lowercase); --country takes either it or the two-letter code."
+    );
     for (code, regions) in &places {
         let mark = if *code == current { "*" } else { " " };
         println!(" {mark} {code}  {:>3} regions", regions.len());
@@ -338,8 +344,7 @@ fn psiphon_regions(options: &Options, paths: &Paths, filter: &str) -> Result<(),
     let mut text = output
         .ok()
         .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-        .unwrap_or_default();
+        .map_or_default(|output| String::from_utf8_lossy(&output.stdout).into_owned());
     if text.trim().is_empty() {
         let Some(saved) = read_trim(&paths.psiphon_locations) else {
             return Err(
@@ -380,7 +385,9 @@ fn psiphon_regions(options: &Options, paths: &Paths, filter: &str) -> Result<(),
         "exit regions from the signed Psiphon server list: {} codes",
         rows.len()
     );
-    println!("the code is what --psiphon-region takes; a code with no entry is not dialable from that list.");
+    println!(
+        "the code is what --psiphon-region takes; a code with no entry is not dialable from that list."
+    );
     for (code, count) in &rows {
         let mark = if *code == current { "*" } else { " " };
         println!(" {mark} {code:<4} {count:>4} entries");
@@ -395,7 +402,9 @@ pub fn remember(options: &Options, paths: &Paths, country: &str, city: &str) -> 
     let country = country.trim().to_uppercase();
     let city = city.trim().to_uppercase();
     if country.is_empty() {
-        die("usage: ferrox-cli location [--foxy|--veepn|--psiphon] <CC> [CITY]   (see 'ferrox-cli locations')");
+        die(
+            "usage: ferrox-cli location [--foxy|--veepn|--psiphon] <CC> [CITY]   (see 'ferrox-cli locations')",
+        );
     }
     if options.outbound == Some(Outbound::Veepn) {
         if let Some(saved) = read_trim(&paths.veepn_locations) {
@@ -468,7 +477,9 @@ pub fn remember(options: &Options, paths: &Paths, country: &str, city: &str) -> 
     write_private(&paths.location_file, &format!("{country} {city}\n"))
         .map_err(|error| format!("cannot remember the exit: {error}"))?;
     if city.is_empty() {
-        println!("exit remembered: {country} (its catalogue order picks the city). The next 'up --foxy' moves there.");
+        println!(
+            "exit remembered: {country} (its catalogue order picks the city). The next 'up --foxy' moves there."
+        );
     } else {
         println!("exit remembered: {country} / {city}. The next 'up --foxy' moves there.");
     }

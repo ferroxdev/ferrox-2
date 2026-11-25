@@ -34,7 +34,7 @@ graph TD
 <!-- counts:begin -->
 | key | value | checked by |
 | --- | --- | --- |
-| ops-retired-instructions | 80066 | scripts/count-ops.sh |
+| ops-retired-instructions | 90338 | scripts/count-ops.sh |
 | tcp-echo-bytes-preserved | 5 | ferrox-app-proxy::reverse_tests::a_portal_flow_reaches_the_bridge_and_comes_back |
 | fixed-bridge-route-allocations-per-datagram | 0 | ferrox-app-proxy::tests::a_bridge_datagram_route_borrows_its_lane |
 <!-- counts:end -->

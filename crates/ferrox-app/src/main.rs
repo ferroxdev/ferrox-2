@@ -133,9 +133,13 @@ pub(crate) fn test_only() -> bool {
 
 fn usage() -> ! {
     eprintln!("usage:");
-    eprintln!("  ferrox-app check <vless://...|trojan://...> [--allow-unsafe-fp] [--allow-plaintext-public]");
+    eprintln!(
+        "  ferrox-app check <vless://...|trojan://...> [--allow-unsafe-fp] [--allow-plaintext-public]"
+    );
     eprintln!("                                parse + support + header len (no network)");
-    eprintln!("  ferrox-app run <vless://...|trojan://...> [same flags]   check + TCP reachability (sends nothing)");
+    eprintln!(
+        "  ferrox-app run <vless://...|trojan://...> [same flags]   check + TCP reachability (sends nothing)"
+    );
     eprintln!("  ferrox-app version                print the serving binary's version");
     eprintln!("  ferrox-app x25519                 print a fresh X25519 keypair");
     eprintln!("  ferrox-app run -c <config.json>   serve inbounds until killed");
@@ -156,8 +160,12 @@ fn usage() -> ! {
     eprintln!(
         "        [-o|--config FILE] [--wg-config FILE] [--masque-config FILE] [--api URL] [--api-address ADDR]"
     );
-    eprintln!("        [--mode auto|wireguard|masque|gool|gool-classic|mim] [--gool-classic] [--wiw-outer ADDR] [--wiw-inner ADDR] [--mim-outer ADDR] [--mim-inner ADDR] [--noize off|light|firewall|balanced|gfw|aggressive] [--no-profile-retry] [--no-quic-v2]");
-    eprintln!("        [--fragment] [--fragment-size N|A-B] [--fragment-delay N|A-B] [--tls-ciphers LIST] [--tls-groups LIST] [--disable-grease] [--ech auto|BASE64] [--ech-dns URL] [--ech-domain NAME] [--masque-sni NAME]");
+    eprintln!(
+        "        [--mode auto|wireguard|masque|gool|gool-classic|mim] [--gool-classic] [--wiw-outer ADDR] [--wiw-inner ADDR] [--mim-outer ADDR] [--mim-inner ADDR] [--noize off|light|firewall|balanced|gfw|aggressive] [--no-profile-retry] [--no-quic-v2]"
+    );
+    eprintln!(
+        "        [--fragment] [--fragment-size N|A-B] [--fragment-delay N|A-B] [--tls-ciphers LIST] [--tls-groups LIST] [--disable-grease] [--ech auto|BASE64] [--ech-dns URL] [--ech-domain NAME] [--masque-sni NAME]"
+    );
     eprintln!(
         "        [--team NAME] [--access-id ID] [--access-secret SECRET] [--access-token JWT] [--access-email ADDR] [--gateway]"
     );
@@ -297,7 +305,9 @@ fn cmd_check(link_str: &str, opt_in: UnsafeOptIn) {
         }
         Support::Planned { reason } => println!("not yet diallable: {reason}"),
         Support::UnsafeRequiresOptIn { reason } => {
-            println!("needs explicit opt-in (policy::UnsafeOptIn, or --allow-unsafe-fp / --allow-plaintext-public): {reason}");
+            println!(
+                "needs explicit opt-in (policy::UnsafeOptIn, or --allow-unsafe-fp / --allow-plaintext-public): {reason}"
+            );
         }
     }
 }
@@ -1056,10 +1066,10 @@ fn config_extension(source: &str) -> &str {
 
 fn http_target(source: &str) -> Option<&str> {
     if let Some(raw) = source.strip_prefix("http+unix://") {
-        if let Some((socket, target)) = raw.split_once(":/") {
-            if is_socket_endpoint(socket) {
-                return Some(without_query(target));
-            }
+        if let Some((socket, target)) = raw.split_once(":/")
+            && is_socket_endpoint(socket)
+        {
+            return Some(without_query(target));
         }
         return Some(without_query(source));
     }
@@ -1135,16 +1145,17 @@ fn remote_source(source: &str) -> Option<(String, Option<String>)> {
     if source.starts_with("http://") || source.starts_with("https://") {
         return Some((source.to_owned(), None));
     }
-    if let Some(raw) = source.strip_prefix("sock:") {
-        if is_socket_path(raw) {
-            return Some(split_http_unix_url(raw));
-        }
+    if let Some(raw) = source.strip_prefix("sock:")
+        && is_socket_path(raw)
+    {
+        return Some(split_http_unix_url(raw));
     }
     if std::path::Path::new(source).is_absolute() {
-        if let Some((head, _)) = source.split_once(":/") {
-            if !head.starts_with('@') && !std::path::Path::new(head).is_absolute() {
-                return None;
-            }
+        if let Some((head, _)) = source.split_once(":/")
+            && !head.starts_with('@')
+            && !std::path::Path::new(head).is_absolute()
+        {
+            return None;
         }
         if source.contains(":/") || is_unix_socket(source) {
             return Some(split_http_unix_url(source));
@@ -1348,20 +1359,19 @@ fn fetch_http(url: &str, socket: Option<&str>, redirects: usize) -> Result<Vec<u
         if status == 200 {
             return read_http_body(&mut *stream, body, &headers);
         }
-        if matches!(status, 301 | 302 | 303 | 307 | 308) {
-            if let Some(location) = headers
+        if matches!(status, 301 | 302 | 303 | 307 | 308)
+            && let Some(location) = headers
                 .iter()
                 .find(|(name, _)| name == "location")
                 .map(|(_, value)| value.as_str())
-            {
-                if remaining == 0 {
-                    return Err(format!(
-                        "failed to dial to {shown}: stopped after {redirects} redirects"
-                    ));
-                }
-                url = redirect_location(&parsed, location);
-                continue;
+        {
+            if remaining == 0 {
+                return Err(format!(
+                    "failed to dial to {shown}: stopped after {redirects} redirects"
+                ));
             }
+            url = redirect_location(&parsed, location);
+            continue;
         }
         return Err(format!("unexpected HTTP status code: {status}"));
     }
@@ -1456,8 +1466,7 @@ fn remove_last_segment(out: &mut String) {
 fn credentials(base: &crate::conn::HttpUrl) -> String {
     base.userinfo
         .as_deref()
-        .map(|userinfo| format!("{}@", encode_userinfo(userinfo)))
-        .unwrap_or_default()
+        .map_or_default(|userinfo| format!("{}@", encode_userinfo(userinfo)))
 }
 
 fn encode_userinfo(userinfo: &[u8]) -> String {
@@ -2096,11 +2105,12 @@ mod tests {
         let text = "policy:\n  levels:\n    0:\n      handshake: 1\n";
         let json = crate::config_text(text.as_bytes(), crate::SourceFormat::Yaml).expect("yaml");
         let root = crate::json::parse(&json).expect("json");
-        assert!(root
-            .get("policy")
-            .and_then(|policy| policy.get("levels"))
-            .and_then(|levels| levels.get("0"))
-            .is_some());
+        assert!(
+            root.get("policy")
+                .and_then(|policy| policy.get("levels"))
+                .and_then(|levels| levels.get("0"))
+                .is_some()
+        );
     }
 
     #[test]
@@ -2139,8 +2149,8 @@ mod tests {
 
     #[test]
     fn a_concatenated_gzip_body_is_read_to_the_end() {
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
         use std::io::Write as _;
 
         let mut gzip = Vec::new();
@@ -2222,13 +2232,15 @@ mod tests {
             .expect("a past instant");
         let error = std::io::Read::read(&mut timed, &mut [0u8; 1]).expect_err("deadline");
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-        assert!(crate::Timed::new(
-            Ready,
-            std::time::Instant::now()
-                .checked_sub(std::time::Duration::from_secs(1))
-                .expect("a past instant")
-        )
-        .is_err());
+        assert!(
+            crate::Timed::new(
+                Ready,
+                std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(1))
+                    .expect("a past instant")
+            )
+            .is_err()
+        );
     }
 
     #[test]

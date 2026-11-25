@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
-use super::go_rand::GoRand;
 use super::MaskRole;
+use super::go_rand::GoRand;
 
 /// One read asks for this many wire octets at a time; the reference's own reader buffer.
 const READ_CHUNK: usize = 32 * 1024;
@@ -228,11 +228,7 @@ impl Layout {
             }
             Mode::Ascii => {
                 let byte = 0x40 | (group & 0x3f);
-                if byte == 0x7f {
-                    b'\n'
-                } else {
-                    byte
-                }
+                if byte == 0x7f { b'\n' } else { byte }
             }
             Mode::Custom => {
                 let mut out = self.x_mask;
@@ -918,11 +914,7 @@ impl Sudoku {
 #[inline]
 fn next_slot(slot: usize, len: usize) -> usize {
     debug_assert!(slot < len);
-    if slot + 1 == len {
-        0
-    } else {
-        slot + 1
-    }
+    if slot + 1 == len { 0 } else { slot + 1 }
 }
 
 fn should_pad(

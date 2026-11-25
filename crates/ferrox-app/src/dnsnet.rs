@@ -5,8 +5,8 @@
 
 use crate::conn::Connection;
 use crate::h2::{
-    block_encode, frame_head, read_head_bounded, Decoder, F_ACK, F_END, F_END_HEADERS, F_PADDED,
-    F_PRIORITY, T_CONT, T_DATA, T_GOAWAY, T_HEADERS, T_PING, T_RST, T_SETTINGS,
+    Decoder, F_ACK, F_END, F_END_HEADERS, F_PADDED, F_PRIORITY, T_CONT, T_DATA, T_GOAWAY,
+    T_HEADERS, T_PING, T_RST, T_SETTINGS, block_encode, frame_head, read_head_bounded,
 };
 use crate::sockopt::SocketOptions;
 use ferrox_core::tls::TlsProvider as _;
@@ -602,7 +602,7 @@ fn frame(stream: &mut impl Write, kind: u8, flags: u8, id: u32, body: &[u8]) -> 
 mod tests {
     use super::{exchange, read_frame};
     use crate::h2::{
-        block_encode, frame_head, F_END, F_END_HEADERS, F_PADDED, T_DATA, T_HEADERS, T_SETTINGS,
+        F_END, F_END_HEADERS, F_PADDED, T_DATA, T_HEADERS, T_SETTINGS, block_encode, frame_head,
     };
     use std::io::{Cursor, Read, Write};
 

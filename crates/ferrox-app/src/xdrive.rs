@@ -148,10 +148,10 @@ impl SlotFrame {
             crc: u32::from_be_bytes(bytes[21..25].try_into().ok()?),
             data: (mode == SLOT_INLINE).then(|| bytes[SLOT_HEADER_LEN..].to_vec()),
         };
-        if let Some(data) = &frame.data {
-            if !frame.holds(data) {
-                return None;
-            }
+        if let Some(data) = &frame.data
+            && !frame.holds(data)
+        {
+            return None;
         }
         Some(frame)
     }
@@ -440,14 +440,13 @@ impl Settings {
         let secrets = drive
             .get("secrets")
             .and_then(Json::as_arr)
-            .map(|items| {
+            .map_or_default(|items| {
                 items
                     .iter()
                     .filter_map(Json::as_str)
                     .map(str::to_owned)
                     .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+            });
         let number = |name: &str| {
             drive
                 .get(name)
@@ -523,13 +522,13 @@ impl Settings {
         let storage = self.store(front)?;
         let storage = storage.session().unwrap_or(storage);
         let params = self.params_for(&storage);
-        if storage.slot_store().is_some() {
-            if let Ok(conn) = dial_slots(&storage, &params) {
-                if storage.slot_store().is_some() {
-                    self.warm_spares(front, key);
-                }
-                return Ok(conn);
+        if storage.slot_store().is_some()
+            && let Ok(conn) = dial_slots(&storage, &params)
+        {
+            if storage.slot_store().is_some() {
+                self.warm_spares(front, key);
             }
+            return Ok(conn);
         }
         dial(storage, &params)
     }
@@ -735,10 +734,10 @@ fn transport_tls(stream: &Json, security: &str) -> Result<Option<Arc<TlsConfig>>
     let mut stream = stream.clone();
     if let Json::Obj(pairs) = &mut stream {
         for (key, value) in pairs {
-            if key.as_str() == "tlsSettings" {
-                if let Json::Obj(tls) = value {
-                    tls.retain(|(key, _)| key.as_str() != "echConfigList");
-                }
+            if key.as_str() == "tlsSettings"
+                && let Json::Obj(tls) = value
+            {
+                tls.retain(|(key, _)| key.as_str() != "echConfigList");
             }
         }
     }
@@ -1653,14 +1652,14 @@ impl Rd {
 
         let mut advanced = false;
         loop {
-            if let Some(&index) = pending.get(seq) {
-                if listed[index].name.ends_with(ERR_SUFFIX) {
-                    let full = format!("{}/{}", self.prefix, listed[index].name);
-                    self.discard(full);
-                    return Err(carrier_error(format!(
-                        "the peer could not store segment {seq}"
-                    )));
-                }
+            if let Some(&index) = pending.get(seq)
+                && listed[index].name.ends_with(ERR_SUFFIX)
+            {
+                let full = format!("{}/{}", self.prefix, listed[index].name);
+                self.discard(full);
+                return Err(carrier_error(format!(
+                    "the peer could not store segment {seq}"
+                )));
             }
             let mut batch: Vec<usize> = Vec::with_capacity(self.params.concurrency);
             let mut done = false;
@@ -1786,10 +1785,10 @@ impl Rd {
                 Woke::Rung => {
                     active = Instant::now();
                     delay = self.params.min_poll;
-                    if let Some(rest) = self.params.min_poll.checked_sub(polled.elapsed()) {
-                        if matches!(self.wake.wait(rest), Woke::Stopped) {
-                            return;
-                        }
+                    if let Some(rest) = self.params.min_poll.checked_sub(polled.elapsed())
+                        && matches!(self.wake.wait(rest), Woke::Stopped)
+                    {
+                        return;
                     }
                 }
             }
@@ -1951,23 +1950,25 @@ impl SlotWriter {
         let every = params.flush;
         std::thread::Builder::new()
             .stack_size(WORKER_STACK)
-            .spawn(move || loop {
-                std::thread::sleep(every);
-                let Some(writer) = weak.upgrade() else {
-                    return;
-                };
-                if writer.done.load(Ordering::Acquire) {
-                    return;
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(every);
+                    let Some(writer) = weak.upgrade() else {
+                        return;
+                    };
+                    if writer.done.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let closed = writer
+                        .state
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .closed;
+                    if closed {
+                        return;
+                    }
+                    let _ = writer.cut(true, false);
                 }
-                let closed = writer
-                    .state
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .closed;
-                if closed {
-                    return;
-                }
-                let _ = writer.cut(true, false);
             })
             .map_err(|error| io::Error::other(error.to_string()))?;
         Ok(writer)
@@ -3654,8 +3655,7 @@ fn target_ips(target: &Target) -> Vec<std::net::IpAddr> {
     }
     (bare, target.port)
         .to_socket_addrs()
-        .map(|addresses| addresses.map(|address| address.ip()).collect())
-        .unwrap_or_default()
+        .map_or_default(|addresses| addresses.map(|address| address.ip()).collect())
 }
 
 /// The address a followed href connects to: resolved once and checked against the local ranges before the dial, so a name cannot answer a public address to the check and a private one to the socket. A local address is admitted only when it is one the configured endpoint resolved to.
@@ -4151,16 +4151,15 @@ impl Http {
         cfg: &TlsConfig,
         peer: Option<std::net::SocketAddr>,
     ) -> io::Result<Arc<H3Client>> {
-        if peer.is_none() {
-            if let Some(client) = self
+        if peer.is_none()
+            && let Some(client) = self
                 .h3
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .get(key)
                 .cloned()
-            {
-                return Ok(client);
-            }
+        {
+            return Ok(client);
         }
         let name = if cfg.server_name.is_empty() {
             address
@@ -4761,7 +4760,7 @@ impl Template {
         };
         let store = Target::parse(&store_url);
         let store_ips = if self.http.front.is_none() {
-            store.as_ref().map(target_ips).unwrap_or_default()
+            store.as_ref().map_or_default(target_ips)
         } else {
             Vec::new()
         };
@@ -5450,12 +5449,13 @@ fn percent_decode(text: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut at = 0;
     while at < bytes.len() {
-        if bytes[at] == b'%' && at + 2 < bytes.len() {
-            if let (Some(high), Some(low)) = (hex_digit(bytes[at + 1]), hex_digit(bytes[at + 2])) {
-                out.push(high << 4 | low);
-                at += 3;
-                continue;
-            }
+        if bytes[at] == b'%'
+            && at + 2 < bytes.len()
+            && let (Some(high), Some(low)) = (hex_digit(bytes[at + 1]), hex_digit(bytes[at + 2]))
+        {
+            out.push(high << 4 | low);
+            at += 3;
+            continue;
         }
         out.push(bytes[at]);
         at += 1;
@@ -6869,9 +6869,11 @@ mod tests {
         assert!(text.ends_with("\r\n--abc123--\r\n"));
         let chosen = pick_boundary(b"plain", b"\r\n--not-the-boundary").expect("chooses");
         let needle = format!("\r\n--{chosen}");
-        assert!(!b"plain"
-            .windows(needle.len())
-            .any(|window| window == needle.as_bytes()));
+        assert!(
+            !b"plain"
+                .windows(needle.len())
+                .any(|window| window == needle.as_bytes())
+        );
     }
 
     #[test]

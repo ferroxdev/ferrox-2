@@ -83,7 +83,7 @@ impl Notifier {
         Self::default()
     }
 
-    fn gen(&self) -> u64 {
+    fn generation(&self) -> u64 {
         *self.generation.lock().unwrap()
     }
 
@@ -155,13 +155,13 @@ fn scheduler_loop(weak: &Weak<Scheduler>) {
                     .max(Duration::from_millis(1)),
             );
         }
-        let generation = scheduler.wake.gen();
+        let generation = scheduler.wake.generation();
         if generation != seen {
             seen = generation;
             continue;
         }
         scheduler.wake.wait_since(generation, wait);
-        seen = scheduler.wake.gen();
+        seen = scheduler.wake.generation();
     }
 }
 
@@ -396,11 +396,7 @@ impl Connection {
         } else {
             // A pass that flushed nothing must still park for a tick: adding the tick to a stale `last_flush` returns an instant already past and spins the one scheduler thread every millisecond.
             let next = last_flush + tick;
-            if next > now {
-                next
-            } else {
-                now + tick
-            }
+            if next > now { next } else { now + tick }
         }
     }
 
@@ -668,7 +664,7 @@ impl Connection {
             {
                 return Err(ConnError::Closed);
             }
-            let snap = self.data_input.gen();
+            let snap = self.data_input.generation();
             let n = self.receiving.lock().unwrap().read(b);
             if n > 0 {
                 return Ok(n);
@@ -724,7 +720,7 @@ impl Connection {
             if self.state() != State::Active {
                 return Err(ConnError::Closed);
             }
-            let snap = self.data_output.gen();
+            let snap = self.data_output.generation();
             let n = (b.len() - offset).min(self.mss as usize);
             if !self.sending.lock().unwrap().push(&b[offset..offset + n]) {
                 if pushed {
@@ -805,8 +801,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        ping_due, CmdOnlySegment, Command, Config, ConnMetadata, Connection, Segment,
-        SegmentOption, State, PING_INTERVAL_MS, WRITE_ATTEMPTS,
+        CmdOnlySegment, Command, Config, ConnMetadata, Connection, PING_INTERVAL_MS, Segment,
+        SegmentOption, State, WRITE_ATTEMPTS, ping_due,
     };
 
     struct Recorder {
@@ -1343,7 +1339,7 @@ mod tests {
         }
     }
 
-    /// `Notifier::gen` is the counter `read` snapshots and `wait_since` compares, so its delta is the number of wakeups: this is the gate for one wakeup per datagram rather than a reading of it.
+    /// `Notifier::generation` is the counter `read` snapshots and `wait_since` compares, so its delta is the number of wakeups: this is the gate for one wakeup per datagram rather than a reading of it.
     #[test]
     fn a_datagram_wakes_the_reader_once_however_many_segments_it_carries() {
         for width in [1usize, 2, 3, 8] {
@@ -1352,19 +1348,19 @@ mod tests {
             for number in 0..width {
                 segs.push(data(number as u32, 0, b"payload"));
             }
-            let before = conn.data_input.gen();
+            let before = conn.data_input.generation();
             conn.input(&mut segs);
             assert_eq!(
-                conn.data_input.gen() - before,
+                conn.data_input.generation() - before,
                 1,
                 "width {width}: a {width}-segment datagram woke the reader more than once"
             );
         }
         let conn = echoing_connection();
-        let before = conn.data_input.gen();
+        let before = conn.data_input.generation();
         conn.input(&mut vec![data(9, 0, b"far away")]);
         assert_eq!(
-            conn.data_input.gen(),
+            conn.data_input.generation(),
             before,
             "a segment outside the receiving window is not a wakeup"
         );

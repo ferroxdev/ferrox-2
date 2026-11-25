@@ -9,7 +9,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -565,10 +565,10 @@ impl Session {
             let end = ferrox_core::mux::Outgoing::bare(id, ferrox_core::mux::Status::End, 0);
             let mut scratch = Vec::with_capacity(16);
             let _ = self.write_frame_to(&mut scratch, &end, None);
-            if !self.done.load(Ordering::Relaxed) {
-                if let Ok(mut ids) = self.ids.lock() {
-                    ids.give_back();
-                }
+            if !self.done.load(Ordering::Relaxed)
+                && let Ok(mut ids) = self.ids.lock()
+            {
+                ids.give_back();
             }
         }
     }
@@ -931,10 +931,11 @@ where
             let mut live = 0u32;
             let mut covered: Vec<Arc<WorkerState>> = Vec::new();
             for worker in &workers {
-                if let Some(original) = &worker.replaces {
-                    if worker.state.active() && !worker.state.stale(WORKER_IDLE) {
-                        covered.push(Arc::clone(original));
-                    }
+                if let Some(original) = &worker.replaces
+                    && worker.state.active()
+                    && !worker.state.stale(WORKER_IDLE)
+                {
+                    covered.push(Arc::clone(original));
                 }
             }
             let mut marks: Vec<(Arc<WorkerState>, u32)> = Vec::new();
@@ -951,14 +952,14 @@ where
                     }
                 }
             }
-            if live == 0 || !marks.is_empty() {
-                if let Some(mut handle) = start(&spawned) {
-                    if let Some((state, at)) = marks.into_iter().next() {
-                        state.mark_rotated(at);
-                        handle.replaces = Some(state);
-                    }
-                    workers.push(handle);
+            if (live == 0 || !marks.is_empty())
+                && let Some(mut handle) = start(&spawned)
+            {
+                if let Some((state, at)) = marks.into_iter().next() {
+                    state.mark_rotated(at);
+                    handle.replaces = Some(state);
                 }
+                workers.push(handle);
             }
             std::thread::sleep(MONITOR);
         }

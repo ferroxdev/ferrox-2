@@ -2,8 +2,8 @@
 //! Internet Settings: the same proxy Chrome, Edge and most desktop apps read.
 //! A snapshot is taken before the first arm and restored on `down`.
 
-use crate::config::{fronts, Ports};
-use crate::paths::{read_trim, read_trim_checked, Paths};
+use crate::config::{Ports, fronts};
+use crate::paths::{Paths, read_trim, read_trim_checked};
 
 pub struct Routes {
     pub socks: Option<u16>,
@@ -260,17 +260,17 @@ mod win {
     use std::ffi::c_void;
     use std::ptr;
 
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
     use windows_sys::Win32::Networking::WinInet::{
-        InternetSetOptionW, INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED,
+        INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED, InternetSetOptionW,
     };
     use windows_sys::Win32::System::Registry::{
-        RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
-        HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_SZ,
+        HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_SZ, RegCloseKey,
+        RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
     };
 
-    use crate::paths::{read_trim_checked, write_private, Paths};
+    use crate::paths::{Paths, read_trim_checked, write_private};
 
     const SETTINGS: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
     const MAX_VALUE: u32 = 1024 * 1024;
@@ -577,7 +577,9 @@ mod win {
         if let Some(port) = http {
             println!("system proxy on: HTTP and HTTPS 127.0.0.1:{port}");
         }
-        println!("scope: apps that honour the Windows proxy. Apps that ignore it (and raw UDP) are not captured: ferrox-cli tun says why.");
+        println!(
+            "scope: apps that honour the Windows proxy. Apps that ignore it (and raw UDP) are not captured: ferrox-cli tun says why."
+        );
         Ok(())
     }
 

@@ -652,7 +652,7 @@ const _: () = assert!(GROUP_STATES * <Wide as Lanes>::CHUNKS == 4);
 
 #[cfg(test)]
 mod counter_tests {
-    use super::{base, base_state, counters, portable, Lanes};
+    use super::{Lanes, base, base_state, counters, portable};
 
     #[test]
     fn a_pass_s_counters_are_the_words_base_state_put_there() {
@@ -695,8 +695,8 @@ mod counter_tests {
 #[cfg(test)]
 #[cfg(target_arch = "x86_64")]
 mod avx2_counter_tests {
-    use super::avx2::A8;
     use super::Lanes;
+    use super::avx2::A8;
 
     #[target_feature(enable = "avx2")]
     unsafe fn lanes(v: A8) -> [u32; 8] {
@@ -740,7 +740,7 @@ mod avx2_counter_tests {
 
 #[cfg(test)]
 mod tail_sizing_tests {
-    use super::{tail_group, TAIL_STATES};
+    use super::{TAIL_STATES, tail_group};
 
     /// The group stores only what the buffer holds and always takes some of it, so the sizing loop can neither store past the end nor spin.
     #[test]
@@ -775,8 +775,8 @@ mod tail_sizing_tests {
 #[cfg(test)]
 #[cfg(target_arch = "x86_64")]
 mod sse2_counter_tests {
-    use super::sse2::S4;
     use super::Lanes;
+    use super::sse2::S4;
 
     fn lanes(v: S4) -> [u32; 4] {
         let mut out = [0u32; 4];

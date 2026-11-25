@@ -3,7 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, IoSlice, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
 use crate::h2;
@@ -1363,10 +1363,10 @@ impl Inner {
     }
 
     fn add_window(&self, id: u32, delta: i64) {
-        if let Ok(sinks) = self.sinks.lock() {
-            if let Some(sink) = sinks.get(&id) {
-                sink.window.add(delta);
-            }
+        if let Ok(sinks) = self.sinks.lock()
+            && let Some(sink) = sinks.get(&id)
+        {
+            sink.window.add(delta);
         }
     }
 

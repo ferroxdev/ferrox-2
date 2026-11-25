@@ -163,7 +163,9 @@ pub(crate) fn pass_impl<V: Wide16, const FROM: bool>(
     let mut v15 = V::broadcast(state[15]);
 
     for _ in 0..10 {
-        double_round!(v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15);
+        double_round!(
+            v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15
+        );
     }
 
     // The initial state reloads from memory instead of sixteen more registers: a broadcast load is a cycle, and `state[12]` is zero.
@@ -385,7 +387,7 @@ fn xor_words(words: &[u32; 16], dst: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{wide_blocks, wide_blocks_from, IDX, P16, PASS_BLOCKS, PASS_BYTES};
+    use super::{IDX, P16, PASS_BLOCKS, PASS_BYTES, wide_blocks, wide_blocks_from};
     use crate::chacha::{portable::U4, xor_ladder, xor_ladder_from};
 
     /// The index network replayed in scalar code: element `b` of register `j` after four stages must be element `j` of register `b` before them.

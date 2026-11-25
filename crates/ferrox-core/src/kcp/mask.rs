@@ -24,7 +24,7 @@
 //! to its right as its own payload — the composition the reference's header
 //! manager performs with its per-connection buffer.
 
-use crate::hysteria::{Salamander, SALAMANDER_SALT};
+use crate::hysteria::{SALAMANDER_SALT, Salamander};
 use aes_gcm::aead::{AeadInOut, KeyInit};
 use aes_gcm::{Aes128Gcm, Nonce, Tag};
 use sha2::{Digest as _, Sha256};
@@ -398,11 +398,7 @@ impl Encoder {
 
 fn next_dtls_length(len: u16) -> u16 {
     let grown = len.wrapping_add(17);
-    if grown > 100 {
-        grown - 50
-    } else {
-        grown
-    }
+    if grown > 100 { grown - 50 } else { grown }
 }
 
 /// FNV-1a over 32 bits, the hash the `original` frame authenticates with.
@@ -707,7 +703,9 @@ mod tests {
         let frame = enc.encode(b"hi").expect("encodes").to_vec();
         assert_eq!(
             &frame[..13],
-            &[0xa1, 0x08, 0, 0, 0, 1, 0x00, 0x10, 0x11, 0x18, 0x30, 0x22, 0x30]
+            &[
+                0xa1, 0x08, 0, 0, 0, 1, 0x00, 0x10, 0x11, 0x18, 0x30, 0x22, 0x30
+            ]
         );
         assert_eq!(&frame[13..], b"hi");
     }

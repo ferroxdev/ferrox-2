@@ -20,9 +20,7 @@ impl Rng {
     }
 
     fn byte(&mut self) -> u8 {
-        {
-            self.next_u64() as u8
-        }
+        self.next_u64() as u8
     }
 
     fn below(&mut self, bound: u8) -> u8 {
@@ -51,7 +49,7 @@ const CASES: usize = 4_096;
 
 #[cfg(test)]
 mod parsers {
-    use super::{Rng, CASES, SEED_EARLY, SEED_LINK, SEED_MUX};
+    use super::{CASES, Rng, SEED_EARLY, SEED_LINK, SEED_MUX};
     use ferrox_core::addr::Addr;
     use ferrox_core::mux::{self, NewTail};
     use ferrox_core::transport::EarlyData;

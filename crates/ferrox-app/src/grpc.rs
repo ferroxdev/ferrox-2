@@ -1,17 +1,16 @@
 use crate::config::GrpcSettings;
 use crate::conn::Connection;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::proxy::{Accepted, FrameWrite, Settle};
 
 use crate::h2::{
-    block_encode, frame_head, write_frame, Decoder, E_REFUSED, FRAME_CAP, F_ACK, F_END,
-    F_END_HEADERS, F_PADDED, F_PRIORITY, HEAD_CAP, MAGIC, S_HEADER_TABLE, S_MAX_CONCURRENT,
-    S_MAX_FRAME, S_WINDOW, T_CONT, T_DATA, T_HEADERS, T_PING, T_RST, T_SETTINGS, T_WINDOW, WINDOW,
-    WINDOW_MAX,
+    Decoder, E_REFUSED, F_ACK, F_END, F_END_HEADERS, F_PADDED, F_PRIORITY, FRAME_CAP, HEAD_CAP,
+    MAGIC, S_HEADER_TABLE, S_MAX_CONCURRENT, S_MAX_FRAME, S_WINDOW, T_CONT, T_DATA, T_HEADERS,
+    T_PING, T_RST, T_SETTINGS, T_WINDOW, WINDOW, WINDOW_MAX, block_encode, frame_head, write_frame,
 };
 
 const MSG_CAP: usize = 16 * 1024 * 1024;
@@ -1654,12 +1653,11 @@ impl GrpcWriter {
         held: &mut usize,
     ) -> Option<crate::proxy::Push> {
         let total = 5 + inner;
-        if batch.used + lengths.len() > FRAMES_PER_WRITE
-            || (batch.used > 0 && batch.credit + total as u64 > self.send_room())
+        if (batch.used + lengths.len() > FRAMES_PER_WRITE
+            || (batch.used > 0 && batch.credit + total as u64 > self.send_room()))
+            && let Some(stop) = Self::flush_held(&self.shared, batch, flushed, held)
         {
-            if let Some(stop) = Self::flush_held(&self.shared, batch, flushed, held) {
-                return Some(stop);
-            }
+            return Some(stop);
         }
         if !take_window(&self.shared, total as u64, false) {
             if let Some(stop) = Self::flush_held(&self.shared, batch, flushed, held) {
@@ -2174,12 +2172,11 @@ fn read_len(msg: &[u8], at: &mut usize) -> Option<usize> {
 fn hunk_decode<const WIDE: bool>(msg: &[u8]) -> Option<(usize, &[u8])> {
     if WIDE && msg.first() == Some(&0x0A) {
         let mut at = 1;
-        if let Some(len) = read_len(msg, &mut at) {
-            if let Some(end) = at.checked_add(len) {
-                if end == msg.len() {
-                    return Some((at, &msg[at..end]));
-                }
-            }
+        if let Some(len) = read_len(msg, &mut at)
+            && let Some(end) = at.checked_add(len)
+            && end == msg.len()
+        {
+            return Some((at, &msg[at..end]));
         }
     }
     let mut at = 0;
@@ -3785,7 +3782,9 @@ mod tests {
         ferrox_core::foxy::hpack::huffman_encode(b"www.example.com", &mut coded);
         assert_eq!(
             coded,
-            [0xF1, 0xE3, 0xC2, 0xE5, 0xF2, 0x3A, 0x6B, 0xA0, 0xAB, 0x90, 0xF4, 0xFF]
+            [
+                0xF1, 0xE3, 0xC2, 0xE5, 0xF2, 0x3A, 0x6B, 0xA0, 0xAB, 0x90, 0xF4, 0xFF
+            ]
         );
         let mut plain = Vec::new();
         ferrox_core::foxy::hpack::huffman_decode(&coded, &mut plain).expect("decodes");
@@ -4358,10 +4357,10 @@ mod tests {
         impl Read for Fails {
             fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
                 let n = self.wire.read(buf)?;
-                if n == 0 {
-                    if let Some(kind) = self.error.take() {
-                        return Err(std::io::Error::from(kind));
-                    }
+                if n == 0
+                    && let Some(kind) = self.error.take()
+                {
+                    return Err(std::io::Error::from(kind));
                 }
                 Ok(n)
             }

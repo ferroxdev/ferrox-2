@@ -3,7 +3,7 @@ use std::fmt::Write as _;
 use ferrox_core::transport::{early_decode, early_encode_into};
 
 use crate::count;
-use crate::framing::{timed_row, Row};
+use crate::framing::{Row, timed_row};
 
 const ITERS: u64 = 200_000;
 

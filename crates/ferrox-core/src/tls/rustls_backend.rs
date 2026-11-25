@@ -847,7 +847,7 @@ fn ktls_material(
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("ktls: suite {other:?} is not TLS 1.3"),
-            ))
+            ));
         }
     };
     Ok(Material {
@@ -1544,10 +1544,10 @@ impl<S: Stream> RustlsServerProvider<S> {
             hsbuf,
             ..
         } = self;
-        if *ktls_tx || *ktls_rx {
-            if let ServerInner::Rustls { conn, io } = inner {
-                return drive_records(&mut **conn, io, hsbuf);
-            }
+        if (*ktls_tx || *ktls_rx)
+            && let ServerInner::Rustls { conn, io } = inner
+        {
+            return drive_records(&mut **conn, io, hsbuf);
         }
         match inner {
             ServerInner::Rustls { conn, io } => {
@@ -1717,10 +1717,10 @@ impl<S: Stream + super::RecordAlignment> super::RecordAlignment for RustlsServer
 
     fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
         self.handshake()?;
-        if let Some(layer) = &mut self.ktls {
-            if let ServerInner::Rustls { io, .. } = &mut self.inner {
-                return layer.write_all(io, parts);
-            }
+        if let Some(layer) = &mut self.ktls
+            && let ServerInner::Rustls { io, .. } = &mut self.inner
+        {
+            return layer.write_all(io, parts);
         }
         match &mut self.inner {
             ServerInner::Rustls { conn, io } => {
@@ -1995,10 +1995,10 @@ impl IdentityResolver {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(sni)
+                && *issued == generation
+                && today.is_none_or(|today| expires > &today)
             {
-                if *issued == generation && today.is_none_or(|today| expires > &today) {
-                    return Some(Arc::clone(key));
-                }
+                return Some(Arc::clone(key));
             }
             let issuer = &snapshot.material;
             let ca_pem = std::str::from_utf8(&issuer.cert_pem).ok()?;
@@ -2195,8 +2195,7 @@ pub(crate) fn server_config(cfg: super::TlsServerConfig) -> Result<rustls::Serve
             let names = entry
                 .cert_chain
                 .first()
-                .map(|leaf| certificate_names(leaf, cfg.issuer.is_some()))
-                .unwrap_or_default();
+                .map_or_default(|leaf| certificate_names(leaf, cfg.issuer.is_some()));
             let key = key_of(&entry);
             let mut key = rustls::sign::CertifiedKey::from_der(
                 chain_of(entry.cert_chain),
@@ -2225,10 +2224,10 @@ pub(crate) fn server_config(cfg: super::TlsServerConfig) -> Result<rustls::Serve
     } else {
         0
     };
-    if config.send_tls13_tickets > 0 {
-        if let Some(key) = ticket_key() {
-            config.ticketer = key;
-        }
+    if config.send_tls13_tickets > 0
+        && let Some(key) = ticket_key()
+    {
+        config.ticketer = key;
     }
     if let Some(log) = &cfg.master_key_log {
         let log: Arc<dyn rustls::KeyLog> = log.clone();
@@ -2355,10 +2354,10 @@ pub(crate) fn reality_server_config(
     config.alpn_protocols.extend(cfg.alpn.iter().cloned());
     // rustls sends two tickets by default; REALITY arrivals carry none.
     config.send_tls13_tickets = if cfg.send_tickets { 2 } else { 0 };
-    if cfg.send_tickets {
-        if let Some(key) = ticket_key() {
-            config.ticketer = key;
-        }
+    if cfg.send_tickets
+        && let Some(key) = ticket_key()
+    {
+        config.ticketer = key;
     }
     if let Some(log) = &cfg.master_key_log {
         let log: Arc<dyn rustls::KeyLog> = log.clone();
@@ -2556,10 +2555,10 @@ impl<S: Stream> TlsProvider for RustlsServerProvider<S> {
 impl<S: Stream> Read for RustlsServerProvider<S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.handshake()?;
-        if let Some(layer) = &mut self.ktls {
-            if let ServerInner::Rustls { io, .. } = &mut self.inner {
-                return layer.read(io, buf);
-            }
+        if let Some(layer) = &mut self.ktls
+            && let ServerInner::Rustls { io, .. } = &mut self.inner
+        {
+            return layer.read(io, buf);
         }
         match &mut self.inner {
             ServerInner::Rustls { conn, io } => loop {
@@ -2624,10 +2623,10 @@ impl<S: Stream> RustlsServerProvider<S> {
 impl<S: Stream> Write for RustlsServerProvider<S> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.handshake()?;
-        if let Some(layer) = &mut self.ktls {
-            if let ServerInner::Rustls { io, .. } = &mut self.inner {
-                return layer.write(io, buf);
-            }
+        if let Some(layer) = &mut self.ktls
+            && let ServerInner::Rustls { io, .. } = &mut self.inner
+        {
+            return layer.write(io, buf);
         }
         match &mut self.inner {
             ServerInner::Rustls { conn, io } => {
@@ -2656,10 +2655,10 @@ impl<S: Stream> Write for RustlsServerProvider<S> {
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.handshake()?;
-        if let Some(layer) = &mut self.ktls {
-            if let ServerInner::Rustls { io, .. } = &mut self.inner {
-                return layer.flush(io);
-            }
+        if let Some(layer) = &mut self.ktls
+            && let ServerInner::Rustls { io, .. } = &mut self.inner
+        {
+            return layer.flush(io);
         }
         match &mut self.inner {
             ServerInner::Rustls { conn, io } => {
@@ -2699,10 +2698,10 @@ fn cached_ech_server_context(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let current = guard.served.as_deref().unwrap_or(&cfg.certs);
-    if let Some((built_for, cached)) = guard.ech.as_ref() {
-        if built_for.as_slice() == current {
-            return Ok(Arc::clone(cached));
-        }
+    if let Some((built_for, cached)) = guard.ech.as_ref()
+        && built_for.as_slice() == current
+    {
+        return Ok(Arc::clone(cached));
     }
     let keys = cfg
         .ech_server_keys
@@ -2917,26 +2916,25 @@ fn idle(error: &std::io::Error) -> bool {
 }
 
 fn recover(e: std::io::Error) -> TlsError {
-    if e.kind() == std::io::ErrorKind::InvalidData {
-        if let Some(inner) = e.get_ref().and_then(|s| s.downcast_ref::<rustls::Error>()) {
-            return map_error(inner);
-        }
+    if e.kind() == std::io::ErrorKind::InvalidData
+        && let Some(inner) = e.get_ref().and_then(|s| s.downcast_ref::<rustls::Error>())
+    {
+        return map_error(inner);
     }
     TlsError::from(e)
 }
 
 fn map_error(e: &rustls::Error) -> TlsError {
     use rustls::Error as E;
-    if let E::PeerIncompatible(rustls::PeerIncompatible::ServerRejectedEncryptedClientHello(
-        Some(configs),
-    )) = e
+    if let E::PeerIncompatible(rustls::PeerIncompatible::ServerRejectedEncryptedClientHello(Some(
+        configs,
+    ))) = e
+        && !configs.is_empty()
     {
-        if !configs.is_empty() {
-            use rustls::internal::msgs::codec::Codec as _;
-            let mut list = Vec::new();
-            configs.encode(&mut list);
-            return TlsError::EchRetry(list.into());
-        }
+        use rustls::internal::msgs::codec::Codec as _;
+        let mut list = Vec::new();
+        configs.encode(&mut list);
+        return TlsError::EchRetry(list.into());
     }
     match e {
         // An untrusted chain, a name that does not match and an expired certificate are three different problems and the caller can act on each; the why rides with the kind, so matching the kind does not cost the why.
@@ -3065,12 +3063,16 @@ mod tests {
         let mut reader = Reader::init(&encoded);
         let dss = rustls::DigitallySignedStruct::read(&mut reader).unwrap();
         let cert = rustls::pki_types::CertificateDer::from(ANCHOR);
-        assert!(Unverified
-            .verify_tls13_signature(b"message", &cert, &dss)
-            .is_err());
-        assert!(Unverified
-            .verify_tls12_signature(b"message", &cert, &dss)
-            .is_err());
+        assert!(
+            Unverified
+                .verify_tls13_signature(b"message", &cert, &dss)
+                .is_err()
+        );
+        assert!(
+            Unverified
+                .verify_tls12_signature(b"message", &cert, &dss)
+                .is_err()
+        );
     }
 
     const ANCHOR: &[u8] = &[

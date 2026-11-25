@@ -11,14 +11,14 @@ use ferrox_prompt::check;
 use ferrox_prompt::expand::{self, ProjectState};
 use ferrox_prompt::json::Value;
 use ferrox_prompt::markdown::{
-    closes_fence, opens_fence, Addon, Diagnostic, Effort, Library, Prompt, Severity, Status,
-    Targets, Touch,
+    Addon, Diagnostic, Effort, Library, Prompt, Severity, Status, Targets, Touch, closes_fence,
+    opens_fence,
 };
 use ferrox_prompt::render::{self, Options, Rendered};
 use ferrox_prompt::state::{Gap, MethodRow};
 use ferrox_prompt::worktree::Worktree;
 use ferrox_prompt::{
-    clipboard, load_library, path_tag, workspace_root, LEDGER_RELATIVE, LIBRARY_RELATIVE,
+    LEDGER_RELATIVE, LIBRARY_RELATIVE, clipboard, load_library, path_tag, workspace_root,
 };
 
 const USAGE: &str = "\
@@ -585,7 +585,9 @@ fn run_list(args: &Args, library: &Library, root: &Path) -> ExitCode {
             "matrix: {} open ({} partial, {} unclassified, {} high priority) · {} implemented · {} rows served here",
             open.len(),
             open.iter().filter(|row| row.gap == Gap::Partial).count(),
-            open.iter().filter(|row| row.gap == Gap::Unclassified).count(),
+            open.iter()
+                .filter(|row| row.gap == Gap::Unclassified)
+                .count(),
             open.iter().filter(|row| row.high_priority).count(),
             state.candidates(Targets::Implemented).len(),
             ledger
@@ -1095,10 +1097,10 @@ fn choose_slice<'p>(
         let Some(prompt) = library.prompt(id) else {
             return Err((unknown_prompt(library, id), 2));
         };
-        if let Some(row) = named {
-            if let Err(reason) = row_fits_template(prompt, row, library) {
-                return Err((reason, 2));
-            }
+        if let Some(row) = named
+            && let Err(reason) = row_fits_template(prompt, row, library)
+        {
+            return Err((reason, 2));
         }
         return Ok((
             (
@@ -2051,8 +2053,7 @@ fn class_spent(
     let first = state
         .candidates(prompt.targets)
         .first()
-        .map(|row| row.key())
-        .unwrap_or_default();
+        .map_or_default(|row| row.key());
     let others: Vec<String> = library
         .prompts
         .iter()
@@ -2476,11 +2477,11 @@ fn replace_file(path: &Path, contents: &str) -> std::io::Result<()> {
     let mut file = create_staged(&temp)?;
     // Set the library's own owner, mode and ACL before any text lands, so an inherited grant cannot read it.
     #[cfg(target_os = "linux")]
-    if let Some(metadata) = &metadata {
-        if let Err(error) = stage_permissions(metadata, path, &temp) {
-            let _ = std::fs::remove_file(&temp);
-            return Err(error);
-        }
+    if let Some(metadata) = &metadata
+        && let Err(error) = stage_permissions(metadata, path, &temp)
+    {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
     }
     #[cfg(all(not(windows), not(target_os = "linux")))]
     if let Some(metadata) = &metadata {
@@ -2531,7 +2532,7 @@ fn create_staged(path: &Path) -> std::io::Result<std::fs::File> {
     }
 
     #[link(name = "advapi32")]
-    extern "system" {
+    unsafe extern "system" {
         fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
             sddl: *const u16,
             revision: u32,
@@ -2541,7 +2542,7 @@ fn create_staged(path: &Path) -> std::io::Result<std::fs::File> {
     }
 
     #[link(name = "kernel32")]
-    extern "system" {
+    unsafe extern "system" {
         fn CreateFileW(
             name: *const u16,
             access: u32,
@@ -2605,7 +2606,7 @@ fn create_staged(path: &Path) -> std::io::Result<std::fs::File> {
 /// Keep the owner, group, mode and access ACL, so a staged update is not broader than the library.
 #[cfg(target_os = "linux")]
 fn stage_permissions(source: &std::fs::Metadata, from: &Path, to: &Path) -> std::io::Result<()> {
-    use std::ffi::{c_char, c_int, c_void, CString};
+    use std::ffi::{CString, c_char, c_int, c_void};
     use std::os::unix::ffi::OsStrExt as _;
     use std::ptr;
 
@@ -2613,7 +2614,7 @@ fn stage_permissions(source: &std::fs::Metadata, from: &Path, to: &Path) -> std:
     const NO_DATA: i32 = 61;
     const NOT_SUPPORTED: i32 = 95;
 
-    extern "C" {
+    unsafe extern "C" {
         fn getxattr(
             path: *const c_char,
             name: *const c_char,
@@ -2675,13 +2676,13 @@ fn stage_permissions(source: &std::fs::Metadata, from: &Path, to: &Path) -> std:
 /// Copy the access ACL from the library to the staged file, so an inherited grant cannot read the update.
 #[cfg(target_os = "macos")]
 fn preserve_acl(from: &Path, to: &Path) -> std::io::Result<()> {
-    use std::ffi::{c_char, c_int, c_void, CString};
+    use std::ffi::{CString, c_char, c_int, c_void};
     use std::os::unix::ffi::OsStrExt as _;
     use std::ptr;
 
     const COPYFILE_ACL: c_int = 1;
 
-    extern "C" {
+    unsafe extern "C" {
         fn copyfile(
             from: *const c_char,
             to: *const c_char,
@@ -2712,11 +2713,11 @@ fn preserve_acl(from: &Path, to: &Path) -> std::io::Result<()> {
 /// Keep the owner and group of a staged update, so restoring the mode cannot widen access.
 #[cfg(unix)]
 fn preserve_owner(source: &std::fs::Metadata, to: &Path) -> std::io::Result<()> {
-    use std::ffi::{c_char, CString};
+    use std::ffi::{CString, c_char};
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::MetadataExt as _;
 
-    extern "C" {
+    unsafe extern "C" {
         fn chown(path: *const c_char, owner: u32, group: u32) -> i32;
     }
 
@@ -2741,7 +2742,7 @@ fn replace_path(from: &Path, to: &Path, backup: &Path) -> std::io::Result<()> {
     use std::ptr;
 
     #[link(name = "kernel32")]
-    extern "system" {
+    unsafe extern "system" {
         fn ReplaceFileW(
             replaced: *const u16,
             replacement: *const u16,
@@ -3341,9 +3342,11 @@ fix issue #{issue} at {priority=P0 or P1} priority
         std::fs::create_dir_all(&root).expect("scratch root");
         let worktree = slice_worktree(prompt, None, &values, &root);
         assert_eq!(worktree.name, "bugfix-661");
-        assert!(worktree
-            .brief()
-            .contains("./scripts/new-worktree.sh bugfix-661"));
+        assert!(
+            worktree
+                .brief()
+                .contains("./scripts/new-worktree.sh bugfix-661")
+        );
         std::fs::remove_dir_all(&scratch).ok();
     }
 

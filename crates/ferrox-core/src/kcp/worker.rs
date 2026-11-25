@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use super::config::Config;
 use super::connection::{Ctx, State};

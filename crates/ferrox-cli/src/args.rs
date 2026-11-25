@@ -1066,7 +1066,9 @@ pub fn parse() -> Options {
         }
     }
     if options.vpn && options.vpn_proxy {
-        die("--vpn opens a TUN device and captures the whole host; --vpn-proxy arms the Windows system proxy. Pick one; nothing was started.");
+        die(
+            "--vpn opens a TUN device and captures the whole host; --vpn-proxy arms the Windows system proxy. Pick one; nothing was started.",
+        );
     }
     if options.vpn_engine_set && !options.vpn {
         die("--vpn-engine belongs to --vpn; nothing was started.");
@@ -1122,10 +1124,14 @@ pub fn parse() -> Options {
             Some(Outbound::Foxy | Outbound::Psiphon | Outbound::Warp)
         )
     {
-        die("--warp starts the WARP lane by itself, or chains foxy or psiphon through it (up --warp, up --foxy --warp, up --psiphon --warp); nothing was started.");
+        die(
+            "--warp starts the WARP lane by itself, or chains foxy or psiphon through it (up --warp, up --foxy --warp, up --psiphon --warp); nothing was started.",
+        );
     }
     if options.outbound == Some(Outbound::Warp) && !options.upstream.is_empty() {
-        die("the WARP lane dials Cloudflare directly; --upstream belongs to the foxy or psiphon lane; nothing was started.");
+        die(
+            "the WARP lane dials Cloudflare directly; --upstream belongs to the foxy or psiphon lane; nothing was started.",
+        );
     }
     if !options.udp_via.is_empty()
         && options.udp_via != "foxy"
@@ -1137,7 +1143,9 @@ pub fn parse() -> Options {
         && !options.warp
         && options.udp_via != "warp"
     {
-        die("--warp-mode and --warp-identity belong to --warp or --udp-via warp; nothing was started.");
+        die(
+            "--warp-mode and --warp-identity belong to --warp or --udp-via warp; nothing was started.",
+        );
     }
     if options.warp_identity.contains(['\n', '\r']) {
         die("--warp-identity wants a single path; nothing was started.");
@@ -1163,7 +1171,9 @@ pub fn require_vpn_admin() {
         if unsafe { IsUserAnAdmin() } != 0 {
             return;
         }
-        die("--vpn opens a TUN device and needs Administrator: start ferrox-cli from an elevated Windows Terminal (or right-click > Run as administrator); nothing was started.");
+        die(
+            "--vpn opens a TUN device and needs Administrator: start ferrox-cli from an elevated Windows Terminal (or right-click > Run as administrator); nothing was started.",
+        );
     }
     #[cfg(not(windows))]
     {}

@@ -9,7 +9,7 @@
 //! shortest; the only room left is to drop the allocation-per-MAC the Go
 //! `hash.Hash` interface imposes and keep the whole thing on the stack.
 
-use crate::blake2s::{hash, Blake2s};
+use crate::blake2s::{Blake2s, hash};
 use zeroize::Zeroize as _;
 
 const BLOCK: usize = 64;

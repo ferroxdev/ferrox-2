@@ -17,8 +17,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use chacha20::cipher::{KeyIvInit, StreamCipher};
 use chacha20::ChaCha20;
+use chacha20::cipher::{KeyIvInit, StreamCipher};
 use hkdf::Hkdf;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::{
@@ -32,7 +32,7 @@ use rustls::sign::CertifiedKey;
 use rustls::{DigitallySignedStruct, Side, SignatureScheme};
 use sha2::{Digest, Sha256};
 
-use crate::psiphon_ssh::{tls_passthrough, tls_passthrough_key, Proxy, Server};
+use crate::psiphon_ssh::{Proxy, Server, tls_passthrough, tls_passthrough_key};
 use crate::psiphon_webrtc::WebRtcStream;
 
 const READ_WAIT: Duration = Duration::from_millis(2);
@@ -215,10 +215,10 @@ fn noise_length(arg: &str) -> usize {
     let Ok(mut length) = low.parse::<usize>() else {
         return 0;
     };
-    if let Some(high) = high.and_then(|high| high.parse::<usize>().ok()) {
-        if high > length {
-            length = noise_range(length, high);
-        }
+    if let Some(high) = high.and_then(|high| high.parse::<usize>().ok())
+        && high > length
+    {
+        length = noise_range(length, high);
     }
     length.min(NOISE_MAX_RANDOM)
 }
@@ -674,12 +674,11 @@ impl QuicStream {
             .set_read_timeout(Some(timeout))
             .and_then(|()| socket.set_write_timeout(Some(timeout)))
             .map_err(|error| format!("psiphon quic socket {remote}: {error}"))?;
-        if !obfuscated {
-            if let Some(noise) = server.quic_noise.as_deref().and_then(QuicNoise::lookup) {
-                noise
-                    .send(&socket)
-                    .map_err(|error| format!("psiphon quic noise {remote}: {error}"))?;
-            }
+        if !obfuscated && let Some(noise) = server.quic_noise.as_deref().and_then(QuicNoise::lookup)
+        {
+            noise
+                .send(&socket)
+                .map_err(|error| format!("psiphon quic noise {remote}: {error}"))?;
         }
         let udp = packet_io(
             PacketIo::Socket(socket),
@@ -816,10 +815,10 @@ impl QuicStream {
             match udp.recv(&mut datagram) {
                 Ok(count) => {
                     let now = Instant::now();
-                    if let Err(error) = engine.receive(&mut datagram[..count], now) {
-                        if !discardable(&error) {
-                            return Err(error);
-                        }
+                    if let Err(error) = engine.receive(&mut datagram[..count], now)
+                        && !discardable(&error)
+                    {
+                        return Err(error);
                     }
                 }
                 Err(error)
@@ -1177,15 +1176,16 @@ impl ObfuscatedUdp {
     fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
             let count = self.io.recv(buf)?;
-            if let Some(left) = self.decoy.as_mut() {
-                if *left > 0 && bounded_random(2) == 1 {
-                    *left -= 1;
-                    let length = 1 + bounded_random(PADDING_LIMIT);
-                    let mut decoy = [0u8; PADDING_LIMIT];
-                    getrandom::fill(&mut decoy[..length])
-                        .map_err(|_| io::Error::other("psiphon quic decoy"))?;
-                    let _ = self.io.send(&decoy[..length]);
-                }
+            if let Some(left) = self.decoy.as_mut()
+                && *left > 0
+                && bounded_random(2) == 1
+            {
+                *left -= 1;
+                let length = 1 + bounded_random(PADDING_LIMIT);
+                let mut decoy = [0u8; PADDING_LIMIT];
+                getrandom::fill(&mut decoy[..length])
+                    .map_err(|_| io::Error::other("psiphon quic decoy"))?;
+                let _ = self.io.send(&decoy[..length]);
             }
             if count < OBFUSCATION_OVERHEAD {
                 continue;
@@ -1496,11 +1496,11 @@ impl Engine {
                 None => break,
             }
         }
-        if !self.peer_params {
-            if let Some(params) = self.tls.quic_transport_parameters() {
-                let params = params.to_vec();
-                self.apply_peer_params(&params)?;
-            }
+        if !self.peer_params
+            && let Some(params) = self.tls.quic_transport_parameters()
+        {
+            let params = params.to_vec();
+            self.apply_peer_params(&params)?;
         }
         if self.early_attempted && !self.early_decided && !self.tls.is_handshaking() {
             self.early_decided = true;
@@ -1843,11 +1843,11 @@ impl Engine {
                     window_frame = true;
                     ack_eliciting = true;
                 }
-                if let Some((offset, len)) = self.retx.pop_front() {
-                    if let Some(frame) = self.write_stream_frame(&mut payload, offset, len) {
-                        stream_frame = Some(frame);
-                        ack_eliciting = true;
-                    }
+                if let Some((offset, len)) = self.retx.pop_front()
+                    && let Some(frame) = self.write_stream_frame(&mut payload, offset, len)
+                {
+                    stream_frame = Some(frame);
+                    ack_eliciting = true;
                 }
                 if stream_frame.is_none()
                     && self.opened
@@ -1860,14 +1860,13 @@ impl Engine {
                     let room = available
                         .min(limit)
                         .min(self.max_payload_room(space, payload.len() - head) as u64);
-                    if room > 0 {
-                        if let Some(frame) =
+                    if room > 0
+                        && let Some(frame) =
                             self.write_stream_frame(&mut payload, self.stream_sent, room)
-                        {
-                            self.stream_sent += frame.1;
-                            stream_frame = Some(frame);
-                            ack_eliciting = true;
-                        }
+                    {
+                        self.stream_sent += frame.1;
+                        stream_frame = Some(frame);
+                        ack_eliciting = true;
                     }
                 }
             }
@@ -2253,21 +2252,21 @@ impl Engine {
             (pn, header_end, space == ONE_RTT && first & 0x04 != 0)
         };
         let mut plain_len = None;
-        if key_phase != self.key_phase {
-            if let Some(mut secrets) = self.next_secrets.clone() {
-                let next = secrets.next_packet_keys();
-                let mut trial = packet.to_vec();
-                let (header, payload) = trial.split_at_mut(header_end);
-                if let Ok(plain) = next.remote.decrypt_in_place(pn, header, payload) {
-                    plain_len = Some(plain.len());
-                    if let Some(keys) = self.one_rtt.as_mut() {
-                        keys.local.packet = next.local;
-                        keys.remote.packet = next.remote;
-                    }
-                    self.next_secrets = Some(secrets);
-                    self.key_phase = key_phase;
-                    packet.copy_from_slice(&trial);
+        if key_phase != self.key_phase
+            && let Some(mut secrets) = self.next_secrets.clone()
+        {
+            let next = secrets.next_packet_keys();
+            let mut trial = packet.to_vec();
+            let (header, payload) = trial.split_at_mut(header_end);
+            if let Ok(plain) = next.remote.decrypt_in_place(pn, header, payload) {
+                plain_len = Some(plain.len());
+                if let Some(keys) = self.one_rtt.as_mut() {
+                    keys.local.packet = next.local;
+                    keys.remote.packet = next.remote;
                 }
+                self.next_secrets = Some(secrets);
+                self.key_phase = key_phase;
+                packet.copy_from_slice(&trial);
             }
         }
         let plain_len = if let Some(plain_len) = plain_len {
@@ -2409,10 +2408,10 @@ impl Engine {
                     }
                 }
                 0x12 | 0x13 => {
-                    if let Some(value) = get_varint(payload, &mut at) {
-                        if kind == 0x12 {
-                            self.bidi = self.bidi.max(value);
-                        }
+                    if let Some(value) = get_varint(payload, &mut at)
+                        && kind == 0x12
+                    {
+                        self.bidi = self.bidi.max(value);
                     }
                 }
                 0x14 => {
@@ -2751,11 +2750,11 @@ fn drive(shared: &Arc<Shared>, mut udp: Udp, mut engine: Engine) {
         match udp.recv(&mut datagram) {
             Ok(count) => {
                 let now = Instant::now();
-                if let Err(error) = engine.receive(&mut datagram[..count], now) {
-                    if !discardable(&error) {
-                        fail(shared, &mut engine, error);
-                        return;
-                    }
+                if let Err(error) = engine.receive(&mut datagram[..count], now)
+                    && !discardable(&error)
+                {
+                    fail(shared, &mut engine, error);
+                    return;
                 }
             }
             Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
@@ -2856,17 +2855,17 @@ static PASSTHROUGH_RANDOM: PassthroughRandom = PassthroughRandom;
 
 impl SecureRandom for PassthroughRandom {
     fn fill(&self, buf: &mut [u8]) -> Result<(), rustls::crypto::GetRandomFailed> {
-        if buf.len() == 32 {
-            if let Some(message) = PENDING_RANDOM.with(|slot| slot.borrow_mut().take()) {
-                buf.copy_from_slice(&message);
-                return Ok(());
-            }
+        if buf.len() == 32
+            && let Some(message) = PENDING_RANDOM.with(|slot| slot.borrow_mut().take())
+        {
+            buf.copy_from_slice(&message);
+            return Ok(());
         }
-        if buf.len() == 2 {
-            if let Some(seed) = PENDING_ORDER_SEED.with(|slot| slot.borrow_mut().take()) {
-                buf.copy_from_slice(&seed.to_be_bytes());
-                return Ok(());
-            }
+        if buf.len() == 2
+            && let Some(seed) = PENDING_ORDER_SEED.with(|slot| slot.borrow_mut().take())
+        {
+            buf.copy_from_slice(&seed.to_be_bytes());
+            return Ok(());
         }
         getrandom::fill(buf).map_err(|_| rustls::crypto::GetRandomFailed)
     }
@@ -3139,12 +3138,12 @@ fn long_header_len(initial: bool, dcid_len: usize, scid_len: usize, pn_len: usiz
 #[cfg(test)]
 mod tests {
     use super::{
-        discardable, get_varint, get_varint_byte, lock, mint_obfuscated_sessions, noise_expand,
-        quic_server_name, randomize_cipher_suites, randomize_kx_groups, sessions, transport_params,
-        Engine, ObfuscatedUdp, PacketIo, QuicNoise, SentPacket, Udp, HANDSHAKE, INITIAL,
-        INITIAL_CWND, INPROXY_PACKET_ADJUSTMENT, MAX_PACKET_SIZE, MAX_PAYLOAD, MIN_DATAGRAM,
-        OBFUSCATION_OVERHEAD, ONE_RTT, PASSTHROUGH_RANDOM, PENDING_ORDER_SEED, PMTU_BACKOFF,
-        PMTU_MIN_STEP, PMTU_STEP,
+        Engine, HANDSHAKE, INITIAL, INITIAL_CWND, INPROXY_PACKET_ADJUSTMENT, MAX_PACKET_SIZE,
+        MAX_PAYLOAD, MIN_DATAGRAM, OBFUSCATION_OVERHEAD, ONE_RTT, ObfuscatedUdp,
+        PASSTHROUGH_RANDOM, PENDING_ORDER_SEED, PMTU_BACKOFF, PMTU_MIN_STEP, PMTU_STEP, PacketIo,
+        QuicNoise, SentPacket, Udp, discardable, get_varint, get_varint_byte, lock,
+        mint_obfuscated_sessions, noise_expand, quic_server_name, randomize_cipher_suites,
+        randomize_kx_groups, sessions, transport_params,
     };
     use rustls::client::ClientSessionMemoryCache;
     use rustls::crypto::SecureRandom as _;
@@ -3433,9 +3432,10 @@ mod tests {
             for wanted in [0x01, 0x03, 0x04, 0x05, 0x06, 0x08, 0x0e, 0x0f] {
                 assert!(ids.contains(&wanted), "missing {wanted:#x}");
             }
-            assert!(ids
-                .iter()
-                .any(|id| *id >= 27 && *id <= 3096 && (*id - 27) % 31 == 0));
+            assert!(
+                ids.iter()
+                    .any(|id| *id >= 27 && *id <= 3096 && (*id - 27) % 31 == 0)
+            );
             orders.insert(format!("{ids:?}"));
         }
         assert!(orders.len() > 1, "the order never moved");
@@ -3450,10 +3450,12 @@ mod tests {
             .first()
             .expect("a TLS 1.3 suite survives");
         assert!(first.tls13().is_some());
-        assert!(provider
-            .cipher_suites
-            .iter()
-            .all(|suite| suite.tls13().is_some()));
+        assert!(
+            provider
+                .cipher_suites
+                .iter()
+                .all(|suite| suite.tls13().is_some())
+        );
     }
 
     #[test]
@@ -3502,9 +3504,11 @@ mod tests {
             let count = receiver.recv(&mut buffer).expect("receive");
             assert_eq!(&buffer[..count], &plain[..], "length {length}");
         }
-        assert!(sender
-            .send(&vec![0u8; MAX_PACKET_SIZE - OBFUSCATION_OVERHEAD + 1])
-            .is_err());
+        assert!(
+            sender
+                .send(&vec![0u8; MAX_PACKET_SIZE - OBFUSCATION_OVERHEAD + 1])
+                .is_err()
+        );
     }
 
     #[test]
@@ -3737,9 +3741,11 @@ mod tests {
             .connect(receiver.local_addr().expect("receiver address"))
             .expect("connect");
         let mut udp = Udp::Plain(PacketIo::Socket(socket));
-        assert!(engine
-            .send_space(ONE_RTT, &mut udp, Instant::now())
-            .expect("probe"));
+        assert!(
+            engine
+                .send_space(ONE_RTT, &mut udp, Instant::now())
+                .expect("probe")
+        );
         let mut datagram = [0u8; MAX_PACKET_SIZE + 64];
         assert_eq!(
             receiver.recv(&mut datagram).expect("probe datagram"),
@@ -3748,9 +3754,11 @@ mod tests {
         assert_eq!(engine.stream_sent, 0, "the probe carried stream bytes");
         assert_eq!(engine.sent.last().expect("probe packet").stream, None);
         assert!(engine.probe_inflight);
-        assert!(engine
-            .send_space(ONE_RTT, &mut udp, Instant::now())
-            .expect("data"));
+        assert!(
+            engine
+                .send_space(ONE_RTT, &mut udp, Instant::now())
+                .expect("data")
+        );
         assert!(
             engine.stream_sent > 0,
             "the stream did not follow the probe"
@@ -3770,14 +3778,18 @@ mod tests {
             .connect(receiver.local_addr().expect("receiver address"))
             .expect("connect");
         let mut udp = Udp::Plain(PacketIo::Socket(socket));
-        assert!(engine
-            .send_space(INITIAL, &mut udp, Instant::now())
-            .expect("first crypto frame"));
+        assert!(
+            engine
+                .send_space(INITIAL, &mut udp, Instant::now())
+                .expect("first crypto frame")
+        );
         let first = engine.crypto_sent[INITIAL];
         assert!(first > 0, "the first crypto frame sent nothing");
-        assert!(engine
-            .send_space(INITIAL, &mut udp, Instant::now())
-            .expect("second crypto frame"));
+        assert!(
+            engine
+                .send_space(INITIAL, &mut udp, Instant::now())
+                .expect("second crypto frame")
+        );
         assert!(
             engine.crypto_sent[INITIAL] > first,
             "the crypto cursor did not advance, so a multi-packet handshake stalls"
@@ -3796,9 +3808,11 @@ mod tests {
         engine.probe_target = Some((engine.max_datagram + PMTU_STEP).min(engine.packet_limit));
         let socket = UdpSocket::bind("127.0.0.1:0").expect("socket");
         let mut udp = Udp::Plain(PacketIo::Socket(socket));
-        assert!(!engine
-            .send_space(ONE_RTT, &mut udp, Instant::now())
-            .expect("the probe send is contained"));
+        assert!(
+            !engine
+                .send_space(ONE_RTT, &mut udp, Instant::now())
+                .expect("the probe send is contained")
+        );
         assert!(!engine.probe_failed);
         assert!(!engine.probe_inflight);
         assert_eq!(engine.probe_step, 50);

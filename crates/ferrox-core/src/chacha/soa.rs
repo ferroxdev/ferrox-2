@@ -1,6 +1,6 @@
 //! Eight blocks per pass as two sets of four, one state word per register with the blocks in the lanes: a diagonal round is a register rename, and the second set supplies the eight chains a half round's barrier needs to fill.
 
-use super::{base, base_state, xor_tail, xor_tail_from, Wide};
+use super::{Wide, base, base_state, xor_tail, xor_tail_from};
 #[allow(
     clippy::wildcard_imports,
     reason = "arch intrinsics: the module's whole API is register operations"
@@ -209,8 +209,12 @@ fn pass_impl<const FROM: bool>(
 
     // A loop, not ten written-out double rounds: the body holds both sets and thirty-two live registers leave the scheduler nothing.
     for _ in 0..10 {
-        double_round!(v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, table);
-        double_round!(w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11, w12, w13, w14, w15, table);
+        double_round!(
+            v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, table
+        );
+        double_round!(
+            w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11, w12, w13, w14, w15, table
+        );
     }
 
     // The initial state reloads from memory instead of thirty-two more registers that are not there to be had; a broadcast load is a cycle.
@@ -370,8 +374,8 @@ pub(crate) fn xor_blocks_from(
 
 #[cfg(test)]
 mod tests {
-    use super::{xor_blocks, PASS_BYTES};
-    use crate::chacha::{xor_ladder, Wide};
+    use super::{PASS_BYTES, xor_blocks};
+    use crate::chacha::{Wide, xor_ladder};
 
     /// The pass against the ladder it replaced, byte for byte, at every length around its boundaries and across the counter's ends.
     #[test]

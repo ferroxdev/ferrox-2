@@ -24,8 +24,7 @@ impl SlokStore {
         let keys = path
             .as_deref()
             .and_then(|path| std::fs::read_to_string(path).ok())
-            .map(|text| load(&text))
-            .unwrap_or_default();
+            .map_or_default(|text| load(&text));
         Arc::new(Self {
             path,
             keys: Mutex::new(keys),
@@ -592,9 +591,11 @@ mod tests {
         assert!(events.handle(b"psiphon-osl", payload.as_bytes()).is_ok());
         assert_eq!(store.get(&[1u8; 16]), Some(vec![2u8; 32]));
         assert!(seeded.load(Ordering::Acquire));
-        assert!(events
-            .handle(b"psiphon-osl", br#"{"clear_local_sloks":true}"#)
-            .is_ok());
+        assert!(
+            events
+                .handle(b"psiphon-osl", br#"{"clear_local_sloks":true}"#)
+                .is_ok()
+        );
         assert_eq!(store.get(&[1u8; 16]), None);
     }
 
@@ -606,12 +607,14 @@ mod tests {
             emit_alerts: false,
             emit_sloks: false,
         };
-        assert!(events
-            .handle(
-                b"psiphon-alert",
-                br#"{"reason":"r","subject":"s","action":["a"]}"#,
-            )
-            .is_ok());
+        assert!(
+            events
+                .handle(
+                    b"psiphon-alert",
+                    br#"{"reason":"r","subject":"s","action":["a"]}"#,
+                )
+                .is_ok()
+        );
         assert!(events.handle(b"unexpected", b"").is_err());
     }
 

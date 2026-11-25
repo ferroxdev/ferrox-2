@@ -2,8 +2,8 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 
 use super::segment::{
-    write_data_header, AckSegment, DataSegment, OutgoingHeader, SegmentOption,
-    DATA_SEGMENT_OVERHEAD,
+    AckSegment, DATA_SEGMENT_OVERHEAD, DataSegment, OutgoingHeader, SegmentOption,
+    write_data_header,
 };
 
 /// The data-segment header the arena keeps in front of every payload.

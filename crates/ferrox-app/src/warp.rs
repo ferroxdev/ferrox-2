@@ -1535,15 +1535,14 @@ fn parse_config(root: &crate::json::Json) -> Result<DeviceConfig, RegisterError>
     let ports: Vec<u16> = endpoint
         .get("ports")
         .and_then(crate::json::Json::as_arr)
-        .map(|ports| {
+        .map_or_default(|ports| {
             ports
                 .iter()
                 .filter_map(crate::json::Json::as_u32)
                 .filter_map(|port| u16::try_from(port).ok())
                 .filter(|port| *port != 0)
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     let port = if ports.is_empty() || ports.contains(&WIREGUARD_PORT) {
         WIREGUARD_PORT
     } else {
@@ -1864,10 +1863,9 @@ impl Identity {
             if let Some(parent) = path
                 .parent()
                 .filter(|parent| !parent.as_os_str().is_empty())
+                && let Ok(parent) = std::fs::File::open(parent)
             {
-                if let Ok(parent) = std::fs::File::open(parent) {
-                    let _ = parent.sync_all();
-                }
+                let _ = parent.sync_all();
             }
             Ok(())
         })();
@@ -1881,14 +1879,13 @@ impl Identity {
 fn wireguard_addresses(value: &crate::json::Json) -> Vec<IpAddr> {
     value
         .get("wireguard")
-        .map(|wireguard| json_addresses(wireguard.get("address")))
-        .unwrap_or_default()
+        .map_or_default(|wireguard| json_addresses(wireguard.get("address")))
 }
 
 fn json_addresses(value: Option<&crate::json::Json>) -> Vec<IpAddr> {
     value
         .and_then(crate::json::Json::as_arr)
-        .map(|items| {
+        .map_or_default(|items| {
             items
                 .iter()
                 .filter_map(crate::json::Json::as_str)
@@ -1896,7 +1893,6 @@ fn json_addresses(value: Option<&crate::json::Json>) -> Vec<IpAddr> {
                 .filter_map(|text| text.parse().ok())
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 fn address_json(addresses: &[IpAddr]) -> crate::json::Json {
@@ -1932,35 +1928,37 @@ fn resolve_edges(identity: &mut Identity, spec: &mut WarpSpec) -> Result<(), Str
     let mut scan = spec.scan;
     let now = Instant::now();
     if spec.quick_reconnect {
-        if wireguard.is_none() && want_wireguard {
-            if let Some((edge, profile)) = last.get("wireguard") {
-                let mut cached = spec.clone();
+        if wireguard.is_none()
+            && want_wireguard
+            && let Some((edge, profile)) = last.get("wireguard")
+        {
+            let mut cached = spec.clone();
+            if let Some(profile) = profile {
+                cached.noize.select_wireguard(profile);
+            }
+            if check_wireguard(identity, &cached, edge) {
                 if let Some(profile) = profile {
-                    cached.noize.select_wireguard(profile);
+                    spec.noize.select_wireguard(profile);
                 }
-                if check_wireguard(identity, &cached, edge) {
-                    if let Some(profile) = profile {
-                        spec.noize.select_wireguard(profile);
-                    }
-                    wireguard = Some(edge);
-                    println!("[+] selected WireGuard endpoint {edge}");
-                } else {
-                    cooldowns.hold(edge, now);
-                    scan.get_or_insert(ScanMode::Balanced);
-                    eprintln!("[-] last WireGuard edge {edge} did not answer; scanning");
-                }
+                wireguard = Some(edge);
+                println!("[+] selected WireGuard endpoint {edge}");
+            } else {
+                cooldowns.hold(edge, now);
+                scan.get_or_insert(ScanMode::Balanced);
+                eprintln!("[-] last WireGuard edge {edge} did not answer; scanning");
             }
         }
-        if masque.is_none() && want_masque {
-            if let Some((edge, _)) = last.get("masque") {
-                if check_masque(identity, spec, edge) {
-                    masque = Some(edge);
-                    println!("[+] selected MASQUE gateway {edge}");
-                } else {
-                    cooldowns.hold(edge, now);
-                    scan.get_or_insert(ScanMode::Balanced);
-                    eprintln!("[-] last MASQUE edge {edge} did not answer; scanning");
-                }
+        if masque.is_none()
+            && want_masque
+            && let Some((edge, _)) = last.get("masque")
+        {
+            if check_masque(identity, spec, edge) {
+                masque = Some(edge);
+                println!("[+] selected MASQUE gateway {edge}");
+            } else {
+                cooldowns.hold(edge, now);
+                scan.get_or_insert(ScanMode::Balanced);
+                eprintln!("[-] last MASQUE edge {edge} did not answer; scanning");
             }
         }
     }
@@ -2053,28 +2051,28 @@ fn resolve_classic_edges(
     let mut scan = spec.scan;
     let now = Instant::now();
     if spec.quick_reconnect {
-        if outer_edge.is_none() {
-            if let Some((edge, _)) = last.get("classic-outer") {
-                if check_wireguard(outer, spec, edge) {
-                    outer_edge = Some(edge);
-                    println!("[+] selected outer WireGuard endpoint {edge}");
-                } else {
-                    cooldowns.hold(edge, now);
-                    scan.get_or_insert(ScanMode::Balanced);
-                    eprintln!("[-] last outer WireGuard edge {edge} did not answer; scanning");
-                }
+        if outer_edge.is_none()
+            && let Some((edge, _)) = last.get("classic-outer")
+        {
+            if check_wireguard(outer, spec, edge) {
+                outer_edge = Some(edge);
+                println!("[+] selected outer WireGuard endpoint {edge}");
+            } else {
+                cooldowns.hold(edge, now);
+                scan.get_or_insert(ScanMode::Balanced);
+                eprintln!("[-] last outer WireGuard edge {edge} did not answer; scanning");
             }
         }
-        if inner_edge.is_none() {
-            if let Some((edge, _)) = last.get("classic-inner") {
-                if check_wireguard(inner, spec, edge) {
-                    inner_edge = Some(edge);
-                    println!("[+] selected inner WireGuard endpoint {edge}");
-                } else {
-                    cooldowns.hold(edge, now);
-                    scan.get_or_insert(ScanMode::Balanced);
-                    eprintln!("[-] last inner WireGuard edge {edge} did not answer; scanning");
-                }
+        if inner_edge.is_none()
+            && let Some((edge, _)) = last.get("classic-inner")
+        {
+            if check_wireguard(inner, spec, edge) {
+                inner_edge = Some(edge);
+                println!("[+] selected inner WireGuard endpoint {edge}");
+            } else {
+                cooldowns.hold(edge, now);
+                scan.get_or_insert(ScanMode::Balanced);
+                eprintln!("[-] last inner WireGuard edge {edge} did not answer; scanning");
             }
         }
     }
@@ -3671,8 +3669,7 @@ impl KeyPaths {
 fn named_slot(path: &Path, suffix: &str) -> bool {
     let name = path
         .file_name()
-        .map(|name| name.to_string_lossy())
-        .unwrap_or_default();
+        .map_or_default(|name| name.to_string_lossy());
     let stem = match name.rfind('.') {
         Some(dot) if dot > 0 => &name[..dot],
         _ => &name,
@@ -3699,8 +3696,7 @@ fn ensure_saved_team(
 fn derive_sibling_path(base: &Path, suffix: &str) -> PathBuf {
     let name = base
         .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_default();
+        .map_or_default(|name| name.to_string_lossy().to_string());
     let derived = match name.rfind('.') {
         Some(dot) if dot > 0 => format!("{}-{}{}", &name[..dot], suffix, &name[dot..]),
         _ => format!("{name}-{suffix}"),
@@ -3790,10 +3786,10 @@ fn provision_kind_with(
                         Ok(fresh) => (fresh, false),
                         Err(error) if error.refused && reprovision => {
                             eprintln!(
-                            "warp-register: the saved {} identity was refused: {}; registering a fresh one",
-                            slot.label(),
-                            error.reason
-                        );
+                                "warp-register: the saved {} identity was refused: {}; registering a fresh one",
+                                slot.label(),
+                                error.reason
+                            );
                             backup_corrupt(&path)?;
                             let identity = register_identity(spec, slot.enrolls_masque())?;
                             identity.save(&path)?;
@@ -4276,12 +4272,12 @@ pub(crate) fn register_command(args: &mut std::iter::Skip<std::env::Args>, usage
             std::process::exit(1);
         }
     };
-    if let Some(team) = &team {
-        if !base_named {
-            base = derive_sibling_path(Path::new(&base), &format!("team-{}~", team.team))
-                .to_string_lossy()
-                .into_owned();
-        }
+    if let Some(team) = &team
+        && !base_named
+    {
+        base = derive_sibling_path(Path::new(&base), &format!("team-{}~", team.team))
+            .to_string_lossy()
+            .into_owned();
     }
     let result = match kind {
         None => {
@@ -6236,8 +6232,8 @@ mod tests {
         use ferrox_core::wireguard::device::public_key;
         use std::io::{Read as _, Write as _};
         use std::net::{TcpListener, TcpStream};
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         struct EchoWorker {
             stop: Arc<AtomicBool>,
@@ -6779,24 +6775,32 @@ mod tests {
             "[2606:4700::1]:443".parse().expect("an address"),
         ))
         .expect("a valid authority");
-        assert!(String::from_utf8(v6)
-            .expect("utf8")
-            .starts_with("CONNECT [2606:4700::1]:443 HTTP/1.1"));
-        assert!(connect_request(&crate::proxy::Destination::Name(
-            "example.com\r\nHost: injected".to_owned(),
-            443
-        ))
-        .is_none());
-        assert!(connect_request(&crate::proxy::Destination::Name(
-            "bad]name:443".to_owned(),
-            443
-        ))
-        .is_none());
-        assert!(connect_request(&crate::proxy::Destination::Name(
-            "example.com".to_owned(),
-            0
-        ))
-        .is_none());
+        assert!(
+            String::from_utf8(v6)
+                .expect("utf8")
+                .starts_with("CONNECT [2606:4700::1]:443 HTTP/1.1")
+        );
+        assert!(
+            connect_request(&crate::proxy::Destination::Name(
+                "example.com\r\nHost: injected".to_owned(),
+                443
+            ))
+            .is_none()
+        );
+        assert!(
+            connect_request(&crate::proxy::Destination::Name(
+                "bad]name:443".to_owned(),
+                443
+            ))
+            .is_none()
+        );
+        assert!(
+            connect_request(&crate::proxy::Destination::Name(
+                "example.com".to_owned(),
+                0
+            ))
+            .is_none()
+        );
     }
 
     #[test]
@@ -6856,15 +6860,21 @@ mod tests {
     #[test]
     fn the_access_assertion_is_a_header_the_discard_and_read_back_do_not_carry() {
         let headers = registration_headers(None, Some("a-jwt"));
-        assert!(headers
-            .iter()
-            .any(|(key, value)| key == "CF-Access-Jwt-Assertion" && value == "a-jwt"));
+        assert!(
+            headers
+                .iter()
+                .any(|(key, value)| key == "CF-Access-Jwt-Assertion" && value == "a-jwt")
+        );
         let headers = registration_headers(Some("Bearer a-device-token"), None);
-        assert!(!headers
-            .iter()
-            .any(|(key, _)| key == "CF-Access-Jwt-Assertion"));
-        assert!(headers
-            .iter()
-            .any(|(key, value)| key == "Authorization" && value == "Bearer a-device-token"));
+        assert!(
+            !headers
+                .iter()
+                .any(|(key, _)| key == "CF-Access-Jwt-Assertion")
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|(key, value)| key == "Authorization" && value == "Bearer a-device-token")
+        );
     }
 }

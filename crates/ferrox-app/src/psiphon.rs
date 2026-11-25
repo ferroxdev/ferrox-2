@@ -4,14 +4,14 @@
 use crate::json::{self, Json};
 use crate::psiphon_broker::Value as Cbor;
 use crate::psiphon_ssh::{
-    ApiEncoding, Channel, ChannelChunk, Identity, KeepAlive, Proxy, Server, Session, TlsShape,
-    MAX_PADDING, MIN_PADDING,
+    ApiEncoding, Channel, ChannelChunk, Identity, KeepAlive, MAX_PADDING, MIN_PADDING, Proxy,
+    Server, Session, TlsShape,
 };
 use crate::psiphon_webrtc::is_bogon;
 use crate::socks::{Credential, Destination, Version};
 use crypto_secretbox::aead::{Aead as _, KeyInit as _};
-use ferrox_core::tls::shaped::{Body, Ext, Profile};
 use ferrox_core::tls::Fingerprint;
+use ferrox_core::tls::shaped::{Body, Ext, Profile};
 use flate2::read::ZlibDecoder;
 use ring::signature;
 use sha2::{Digest, Sha256};
@@ -1152,10 +1152,10 @@ impl PsiphonOut {
                 "psiphon: a custom compartment is set, but this transport dials SSH/OSSH only"
             );
         }
-        if let Some(config) = settings.light.clone() {
-            if let Err(error) = crate::psiphon_light::Client::new(config) {
-                eprintln!("psiphon: {error}");
-            }
+        if let Some(config) = settings.light.clone()
+            && let Err(error) = crate::psiphon_light::Client::new(config)
+        {
+            eprintln!("psiphon: {error}");
         }
         let endpoint = settings.listen;
         Ok(Self {
@@ -1325,10 +1325,10 @@ impl Inner {
         if max > 0 && i64::try_from(moved.len()).unwrap_or(i64::MAX) >= max {
             return;
         }
-        if let Some((name, port)) = affinity {
-            if move_to_front(Arc::make_mut(&mut *guard), name, port) {
-                moved.insert(host.to_owned());
-            }
+        if let Some((name, port)) = affinity
+            && move_to_front(Arc::make_mut(&mut *guard), name, port)
+        {
+            moved.insert(host.to_owned());
         }
     }
 
@@ -1659,19 +1659,19 @@ impl Inner {
                     self.apply_handshake(&session);
                     self.start_upgrade(&session);
                     let established = !lock(&self.sessions).is_empty();
-                    if let Some(probe) = self.settings.liveness.spec(protocol, established) {
-                        if let Err(why) = session.liveness_test(
+                    if let Some(probe) = self.settings.liveness.spec(protocol, established)
+                        && let Err(why) = session.liveness_test(
                             probe.min_upstream,
                             probe.max_upstream,
                             probe.min_downstream,
                             probe.max_downstream,
                             self.settings.dial_timeout(),
-                        ) {
-                            session.close();
-                            lease.failed();
-                            last = format!("psiphon: liveness test on {protocol}: {why}");
-                            continue;
-                        }
+                        )
+                    {
+                        session.close();
+                        lease.failed();
+                        last = format!("psiphon: liveness test on {protocol}: {why}");
+                        continue;
                     }
                     lease.succeeded(session.id());
                     let session = Arc::new(session);
@@ -1951,15 +1951,14 @@ impl Inner {
     /// Apply the server's handshake reply: a steering IP for the fronting provider and new entries.
     fn apply_handshake(&self, session: &Session) {
         let state = session.handshake();
-        if let Some(provider) = session.fronting_provider_id() {
-            if let Some(address) = state
+        if let Some(provider) = session.fronting_provider_id()
+            && let Some(address) = state
                 .steering_ip
                 .as_deref()
                 .and_then(|text| text.parse::<IpAddr>().ok())
                 .filter(|address| !is_bogon(*address))
-            {
-                self.settings.dns.remember_steering(provider, address);
-            }
+        {
+            self.settings.dns.remember_steering(provider, address);
         }
         if state.encoded_server_list.is_empty() {
             return;
@@ -2007,10 +2006,10 @@ impl Inner {
     #[allow(clippy::too_many_lines)]
     fn conduit(&self, until: Instant) -> Result<Arc<crate::psiphon_webrtc::Conduit>, String> {
         let mode = self.conduit_mode();
-        if let Some((cached, conduit)) = lock(&self.conduit).clone() {
-            if cached == mode {
-                return Ok(conduit);
-            }
+        if let Some((cached, conduit)) = lock(&self.conduit).clone()
+            && cached == mode
+        {
+            return Ok(conduit);
         }
         let geoip = if self.settings.reject_countries.is_empty() {
             None
@@ -2121,18 +2120,18 @@ impl Inner {
     }
 
     fn udp(&self) -> Result<Arc<UdpGateway>, String> {
-        if let Some(gateway) = lock(&self.udpgw).as_ref() {
-            if !gateway.is_closed() {
-                return Ok(Arc::clone(gateway));
-            }
+        if let Some(gateway) = lock(&self.udpgw).as_ref()
+            && !gateway.is_closed()
+        {
+            return Ok(Arc::clone(gateway));
         }
         let channel = self.dial_tunnel(UDPGW_HOST, UDPGW_PORT, self.split_tunnel_enabled())?;
         let mut slot = lock(&self.udpgw);
-        if let Some(gateway) = slot.as_ref() {
-            if !gateway.is_closed() {
-                channel.close();
-                return Ok(Arc::clone(gateway));
-            }
+        if let Some(gateway) = slot.as_ref()
+            && !gateway.is_closed()
+        {
+            channel.close();
+            return Ok(Arc::clone(gateway));
         }
         let gateway = UdpGateway::start(channel);
         *slot = Some(Arc::clone(&gateway));
@@ -2140,17 +2139,18 @@ impl Inner {
     }
 
     fn dial(&self, host: &str, port: u16) -> Result<Flow, String> {
-        if let Some(light) = self.light.as_ref() {
-            if light.routes(host, port) && !self.recent_tunnel(light.inactive()) {
-                match light.dial(host, port, self.settings.proxy.as_ref()) {
-                    Ok(stream) => {
-                        if std::env::var_os("AETHER_PSIPHON_TRACE_FLOWS").is_some() {
-                            eprintln!("psiphon: light proxy carried {host}:{port}");
-                        }
-                        return Ok(Flow::Direct(stream));
+        if let Some(light) = self.light.as_ref()
+            && light.routes(host, port)
+            && !self.recent_tunnel(light.inactive())
+        {
+            match light.dial(host, port, self.settings.proxy.as_ref()) {
+                Ok(stream) => {
+                    if std::env::var_os("AETHER_PSIPHON_TRACE_FLOWS").is_some() {
+                        eprintln!("psiphon: light proxy carried {host}:{port}");
                     }
-                    Err(error) => eprintln!("psiphon: {error}"),
+                    return Ok(Flow::Direct(stream));
                 }
+                Err(error) => eprintln!("psiphon: {error}"),
             }
         }
         if !self.split_tunnel_enabled() {
@@ -2243,14 +2243,13 @@ impl Inner {
         let mut cache = lock(&self.split_untunneled);
         if cache.len() >= SPLIT_TUNNEL_CLASSIFICATION_MAX && !cache.contains_key(key) {
             cache.retain(|_, at| at.elapsed() < SPLIT_TUNNEL_CLASSIFICATION_TTL);
-            if cache.len() >= SPLIT_TUNNEL_CLASSIFICATION_MAX {
-                if let Some(oldest) = cache
+            if cache.len() >= SPLIT_TUNNEL_CLASSIFICATION_MAX
+                && let Some(oldest) = cache
                     .iter()
                     .min_by_key(|(_, at)| **at)
                     .map(|(key, _)| key.clone())
-                {
-                    cache.remove(&oldest);
-                }
+            {
+                cache.remove(&oldest);
             }
         }
         cache.insert(key.to_owned(), Instant::now());
@@ -3608,10 +3607,10 @@ impl Settings {
             probability(settings, "InitialLimitTunnelProtocolsProbability");
         let quic_noise = text(settings, "QUICNoiseProfile").filter(|profile| !profile.is_empty());
         let mut sni_names = string_list(settings, "TLSOSSHSNIServerNames");
-        if sni_names.is_empty() {
-            if let Some(name) = text(settings, "TLSOSSHSNIServerName") {
-                sni_names.push(name);
-            }
+        if sni_names.is_empty()
+            && let Some(name) = text(settings, "TLSOSSHSNIServerName")
+        {
+            sni_names.push(name);
         }
         // Both reference coins must land, so one setting alone never turns a name into a random one.
         let transform_probability = decimal(settings, "TransformHostNameProbability")
@@ -5273,16 +5272,13 @@ fn transform_scopes(settings: Option<&Json>, field: &str) -> Vec<(String, Vec<St
         .map(|(scope, names)| {
             (
                 scope.clone(),
-                names
-                    .as_arr()
-                    .map(|names| {
-                        names
-                            .iter()
-                            .filter_map(Json::as_str)
-                            .map(str::to_owned)
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                names.as_arr().map_or_default(|names| {
+                    names
+                        .iter()
+                        .filter_map(Json::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                }),
             )
         })
         .collect()
@@ -5652,13 +5648,12 @@ fn protocol_list(settings: Option<&Json>) -> Vec<String> {
     if protocols.is_empty() {
         protocols = string_list(settings, "limitTunnelProtocols");
     }
-    if protocols.is_empty() {
-        if let Some(single) = text(settings, "TunnelProtocol")
+    if protocols.is_empty()
+        && let Some(single) = text(settings, "TunnelProtocol")
             .or_else(|| text(settings, "tunnelProtocol"))
             .or_else(|| text(settings, "tunnelProtocols"))
-        {
-            protocols = split_list(&single);
-        }
+    {
+        protocols = split_list(&single);
     }
     protocols
         .into_iter()
@@ -5771,19 +5766,18 @@ fn osl_roots(settings: Option<&Json>) -> Vec<TransferRoot> {
         Some(Json::Arr(items)) => transfer_roots(items, "ObfuscatedServerListRootURLs", &global),
         _ => Vec::new(),
     };
-    if roots.is_empty() {
-        if let Some(root) = text(settings, "ObfuscatedServerListRootURL") {
-            if let Some(url) = transfer_url(root.trim()) {
-                roots.push(TransferRoot {
-                    url,
-                    skip_verify: false,
-                    headers: global,
-                    key: None,
-                    only_after: 0,
-                    fronting: Vec::new(),
-                });
-            }
-        }
+    if roots.is_empty()
+        && let Some(root) = text(settings, "ObfuscatedServerListRootURL")
+        && let Some(url) = transfer_url(root.trim())
+    {
+        roots.push(TransferRoot {
+            url,
+            skip_verify: false,
+            headers: global,
+            key: None,
+            only_after: 0,
+            fronting: Vec::new(),
+        });
     }
     if !roots.is_empty() && !roots.iter().any(|root| root.only_after == 0) {
         eprintln!(
@@ -5802,19 +5796,18 @@ fn upgrade_roots(settings: Option<&Json>) -> Vec<TransferRoot> {
         Some(Json::Arr(items)) => transfer_roots(items, "UpgradeDownloadURLs", &global),
         _ => Vec::new(),
     };
-    if roots.is_empty() {
-        if let Some(root) = text(settings, "UpgradeDownloadUrl") {
-            if let Some(url) = transfer_url(root.trim()) {
-                roots.push(TransferRoot {
-                    url,
-                    skip_verify: false,
-                    headers: global,
-                    key: None,
-                    only_after: 0,
-                    fronting: Vec::new(),
-                });
-            }
-        }
+    if roots.is_empty()
+        && let Some(root) = text(settings, "UpgradeDownloadUrl")
+        && let Some(url) = transfer_url(root.trim())
+    {
+        roots.push(TransferRoot {
+            url,
+            skip_verify: false,
+            headers: global,
+            key: None,
+            only_after: 0,
+            fronting: Vec::new(),
+        });
     }
     roots
 }
@@ -5877,8 +5870,7 @@ fn transfer_roots(items: &[Json], label: &str, global: &[(String, String)]) -> V
                 let local = fields
                     .iter()
                     .find(|(name, _)| name.eq_ignore_ascii_case("RequestHeaders"))
-                    .map(|(_, value)| header_fields(value))
-                    .unwrap_or_default();
+                    .map_or_default(|(_, value)| header_fields(value));
                 let mut headers = global.to_vec();
                 headers.retain(|(name, _)| {
                     !local
@@ -6634,10 +6626,10 @@ fn light_duration(
     let Some(value) = settings.and_then(|settings| settings.get(duration_key)) else {
         return default;
     };
-    if let Some(text) = value.as_str() {
-        if let Some(duration) = go_duration(text) {
-            return duration.min(Duration::from_secs(600));
-        }
+    if let Some(text) = value.as_str()
+        && let Some(duration) = go_duration(text)
+    {
+        return duration.min(Duration::from_secs(600));
     }
     number(settings, duration_key).map_or(default, |nanos| {
         Duration::from_nanos(nanos).min(Duration::from_secs(600))
@@ -6711,9 +6703,7 @@ fn list_url(item: &str) -> String {
 }
 
 fn env_list(environment: &str) -> Vec<String> {
-    env(environment)
-        .map(|text| split_list(&text))
-        .unwrap_or_default()
+    env(environment).map_or_default(|text| split_list(&text))
 }
 
 fn split_list(text: &str) -> Vec<String> {
@@ -6944,7 +6934,9 @@ pub(crate) fn broker_offer(
         );
     }
     if settings.proxy.is_some() && sdp.is_none() {
-        eprintln!("psiphon broker: generated WebRTC uses direct UDP; the proxy carries only broker requests");
+        eprintln!(
+            "psiphon broker: generated WebRTC uses direct UDP; the proxy carries only broker requests"
+        );
     }
     let servers = load_tactics_entries(&settings)?;
     let session_id = hex(&random::<16>());
@@ -7077,15 +7069,15 @@ pub(crate) fn broker_offer(
                 .mul_f64(settings.latency.multiplier())
                 .min(Duration::from_secs(600))
                 .min(timeout);
-        if coin(settings.inproxy_discover_nat) {
-            if let Some(nat) = crate::psiphon_webrtc::discover_nat_type(
+        if coin(settings.inproxy_discover_nat)
+            && let Some(nat) = crate::psiphon_webrtc::discover_nat_type(
                 &inproxy_stun_servers_rfc5780(&settings, &tactics),
                 server.address,
                 nat_deadline,
                 &settings.dns,
-            ) {
-                client.set_nat_type(nat);
-            }
+            )
+        {
+            client.set_nat_type(nat);
         }
         let shaping = if media_secret.is_some() {
             coin(settings.inproxy_media_traffic_shaping)
@@ -7094,10 +7086,10 @@ pub(crate) fn broker_offer(
             coin(settings.inproxy_traffic_shaping)
                 .then(|| settings.inproxy_traffic_shaping_parameters.clone())
         };
-        if let Some(parameters) = shaping.as_ref() {
-            if let Some(webrtc) = webrtc.as_mut() {
-                webrtc.set_traffic_shaping(parameters.clone(), offer_secret);
-            }
+        if let Some(parameters) = shaping.as_ref()
+            && let Some(webrtc) = webrtc.as_mut()
+        {
+            webrtc.set_traffic_shaping(parameters.clone(), offer_secret);
         }
         let offer_settings = crate::psiphon_broker::OfferSettings {
             secret: offer_secret,
@@ -7113,13 +7105,12 @@ pub(crate) fn broker_offer(
             &offer_settings,
         ) {
             Ok(offer) => {
-                if let Some(webrtc) = webrtc.as_mut() {
-                    if let Err(error) =
+                if let Some(webrtc) = webrtc.as_mut()
+                    && let Err(error) =
                         webrtc_conduit(webrtc, &offer, settings.inproxy_await_ready_timeout)
-                    {
-                        why = error;
-                        continue;
-                    }
+                {
+                    why = error;
+                    continue;
                 }
                 return Ok(offer);
             }
@@ -7597,16 +7588,15 @@ fn load_all_entries(settings: &Settings, regional: bool) -> Result<Vec<Server>, 
         selected
     };
     let mut selected = choose(servers);
-    if selected.is_empty() {
-        if let Some(regional_servers) = regional_servers {
-            if regional_servers.len() < all.len() {
-                eprintln!(
-                    "psiphon: no server in region {} matches the protocol limit, using the whole list",
-                    settings.region.as_deref().unwrap_or("")
-                );
-                selected = choose(all);
-            }
-        }
+    if selected.is_empty()
+        && let Some(regional_servers) = regional_servers
+        && regional_servers.len() < all.len()
+    {
+        eprintln!(
+            "psiphon: no server in region {} matches the protocol limit, using the whole list",
+            settings.region.as_deref().unwrap_or("")
+        );
+        selected = choose(all);
     }
     let mut servers = selected;
     apply_session_settings(&mut servers, settings);
@@ -7658,23 +7648,24 @@ fn load_target_entry(
                 server.meek = None;
                 server.unfronted_meek = None;
             }
-            if shape.shadowsocks && !matches_limit(&server, shape, named_meek, limits) {
-                if let Some(variant) = server.shadowsocks_variant() {
-                    server = variant;
-                }
+            if shape.shadowsocks
+                && !matches_limit(&server, shape, named_meek, limits)
+                && let Some(variant) = server.shadowsocks_variant()
+            {
+                server = variant;
             }
-            if shape.quic && !matches_limit(&server, shape, named_meek, limits) {
-                if let Some(variant) = server.quic_variant() {
-                    server = variant;
-                }
+            if shape.quic
+                && !matches_limit(&server, shape, named_meek, limits)
+                && let Some(variant) = server.quic_variant()
+            {
+                server = variant;
             }
-            if !matches_limit(&server, shape, named_meek, limits) {
-                if let Some(variant) = cdn_variants(&server)
+            if !matches_limit(&server, shape, named_meek, limits)
+                && let Some(variant) = cdn_variants(&server)
                     .into_iter()
                     .find(|variant| matches_limit(variant, shape, named_meek, limits))
-                {
-                    server = variant;
-                }
+            {
+                server = variant;
             }
             if !matches_limit(&server, shape, named_meek, limits) {
                 let protocol = server.meek.as_ref().map_or_else(
@@ -7758,16 +7749,17 @@ fn load_source_entries(
             Err(why) => eprintln!("psiphon: {why}"),
         }
     }
-    if servers.is_empty() && state_is_ours(&settings.state) {
-        if let Ok(text) = std::fs::read_to_string(cache_path(settings)) {
-            absorb(
-                &text,
-                &mut servers,
-                &mut seen,
-                include_inproxy,
-                &settings.conduit_protocols,
-            );
-        }
+    if servers.is_empty()
+        && state_is_ours(&settings.state)
+        && let Ok(text) = std::fs::read_to_string(cache_path(settings))
+    {
+        absorb(
+            &text,
+            &mut servers,
+            &mut seen,
+            include_inproxy,
+            &settings.conduit_protocols,
+        );
     }
     apply_dial_parameters(settings, &mut servers);
     Ok(limit_quic_versions(servers, settings))
@@ -7975,13 +7967,13 @@ fn matches_direct_limit(server: &Server, shape: Shape, protocols: &[String]) -> 
         .iter()
         .any(|protocol| protocol.starts_with("INPROXY-"));
     if named_inproxy {
-        if let Some(destination) = &server.inproxy {
-            if protocols.iter().any(|protocol| {
+        if let Some(destination) = &server.inproxy
+            && protocols.iter().any(|protocol| {
                 protocol.starts_with("INPROXY-")
                     && inproxy_base(protocol) == inproxy_base(destination.base_protocol())
-            }) {
-                return true;
-            }
+            })
+        {
+            return true;
         }
         if !protocols
             .iter()
@@ -9302,25 +9294,25 @@ fn allowed_dial_variant(
         allowed_dial_port(limits, protocol, port)
             && filter.is_none_or(|shape| matches_limit(variant, shape, meek_named, protocols))
     };
-    if let Some(variant) = server.shadowsocks_variant() {
-        if allowed(&variant, "SHADOWSOCKS-OSSH", variant.port) {
-            return Some(variant);
-        }
+    if let Some(variant) = server.shadowsocks_variant()
+        && allowed(&variant, "SHADOWSOCKS-OSSH", variant.port)
+    {
+        return Some(variant);
     }
-    if let Some(variant) = server.quic_variant() {
-        if allowed(&variant, "QUIC-OSSH", variant.port) {
-            return Some(variant);
-        }
+    if let Some(variant) = server.quic_variant()
+        && allowed(&variant, "QUIC-OSSH", variant.port)
+    {
+        return Some(variant);
     }
-    if let Some(variant) = tls_variant(&server) {
-        if allowed(&variant, "TLS-OSSH", variant.port) {
-            return Some(variant);
-        }
+    if let Some(variant) = tls_variant(&server)
+        && allowed(&variant, "TLS-OSSH", variant.port)
+    {
+        return Some(variant);
     }
-    if let Some(variant) = ssh_variant(&server) {
-        if allowed(&variant, "SSH", variant.port) {
-            return Some(variant);
-        }
+    if let Some(variant) = ssh_variant(&server)
+        && allowed(&variant, "SSH", variant.port)
+    {
+        return Some(variant);
     }
     if let Some(unfronted) = server.unfronted_meek.clone() {
         let mut variant = server.clone();
@@ -9611,10 +9603,10 @@ fn absorb(
             if seen.insert((server.address, server.port)) {
                 servers.push(server);
             }
-            if let Some(variant) = variant {
-                if seen.insert((variant.address, variant.port)) {
-                    servers.push(variant);
-                }
+            if let Some(variant) = variant
+                && seen.insert((variant.address, variant.port))
+            {
+                servers.push(variant);
             }
         }
     }
@@ -9736,14 +9728,13 @@ pub(crate) fn server_from_entry_json(
     let quic_versions = entry
         .get("limitQUICVersions")
         .and_then(Json::as_arr)
-        .map(|versions| {
+        .map_or_default(|versions| {
             versions
                 .iter()
                 .filter_map(Json::as_str)
                 .map(str::to_owned)
                 .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+        });
     let tls_obfuscation_key = obfuscated_key.clone();
     let shadowsocks_key = entry
         .get("sshShadowsocksKey")
@@ -10125,7 +10116,7 @@ fn meek_hosts(entry: &Json, fallback: &str) -> (String, Vec<String>) {
     let hosts: Vec<String> = entry
         .get("meekFrontingHosts")
         .and_then(Json::as_arr)
-        .map(|hosts| {
+        .map_or_default(|hosts| {
             hosts
                 .iter()
                 .filter_map(Json::as_str)
@@ -10133,8 +10124,7 @@ fn meek_hosts(entry: &Json, fallback: &str) -> (String, Vec<String>) {
                 .filter(|host| !host.is_empty())
                 .map(str::to_owned)
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     let host = hosts
         .first()
         .cloned()
@@ -10216,7 +10206,7 @@ fn meek_entry(
     let addresses: Vec<String> = entry
         .get("meekFrontingAddresses")
         .and_then(Json::as_arr)
-        .map(|addresses| {
+        .map_or_default(|addresses| {
             addresses
                 .iter()
                 .filter_map(Json::as_str)
@@ -10224,8 +10214,7 @@ fn meek_entry(
                 .filter(|address| !address.is_empty())
                 .map(str::to_owned)
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     let default_port = if https { 443 } else { 80 };
     let raw = addresses
         .first()
@@ -10282,13 +10271,13 @@ fn split_fronting_address_with(raw: &str, default_port: u16) -> (String, u16) {
     if let Ok(ip) = raw.parse::<IpAddr>() {
         return (ip.to_string(), default_port);
     }
-    if let Some((host, port)) = raw.rsplit_once(':') {
-        if let Ok(port) = port.parse::<u16>() {
-            return (
-                host.trim_matches(|ch| ch == '[' || ch == ']').to_owned(),
-                port,
-            );
-        }
+    if let Some((host, port)) = raw.rsplit_once(':')
+        && let Ok(port) = port.parse::<u16>()
+    {
+        return (
+            host.trim_matches(|ch| ch == '[' || ch == ']').to_owned(),
+            port,
+        );
     }
     (raw.to_owned(), default_port)
 }
@@ -10450,13 +10439,13 @@ fn osl_body(
             None,
         ),
     };
-    if let Some(md5) = spec.md5 {
-        if md5::compute(&body).0 != md5 {
-            if let Some(cache) = cache {
-                let _ = std::fs::remove_file(cache.part());
-            }
-            return Err(format!("psiphon: {key}: MD5 sum does not match"));
+    if let Some(md5) = spec.md5
+        && md5::compute(&body).0 != md5
+    {
+        if let Some(cache) = cache {
+            let _ = std::fs::remove_file(cache.part());
         }
+        return Err(format!("psiphon: {key}: MD5 sum does not match"));
     }
     if let Some(cache) = cache {
         cache.save(&body, etag.as_deref());
@@ -10925,10 +10914,10 @@ pub(crate) fn exchange_import(settings: Option<&Json>, payload: &str) -> Result<
                 _ => None,
             });
     save_exchanged(&settings, &entry)?;
-    if let Some(protocol) = protocol {
-        if server_with_protocol(&server, protocol).is_some() {
-            save_dial_parameters(&settings, host, protocol);
-        }
+    if let Some(protocol) = protocol
+        && server_with_protocol(&server, protocol).is_some()
+    {
+        save_dial_parameters(&settings, host, protocol);
     }
     save_affinity(&settings, host);
     Ok(host.to_owned())
@@ -10975,10 +10964,10 @@ fn affinity_entry(settings: &Settings) -> Option<Json> {
 
 fn raw_entries(settings: &Settings) -> Vec<Json> {
     let mut texts = Vec::new();
-    if let Some(path) = settings.entries.as_deref() {
-        if let Ok(text) = std::fs::read_to_string(path) {
-            texts.push(text);
-        }
+    if let Some(path) = settings.entries.as_deref()
+        && let Ok(text) = std::fs::read_to_string(path)
+    {
+        texts.push(text);
     }
     if state_is_ours(&settings.state) {
         if let Ok(text) = std::fs::read_to_string(cache_path(settings)) {
@@ -11174,10 +11163,9 @@ fn absorb_exchanged(
         }
         if let Some(server) =
             server_from_entry_json(&entry, include_inproxy, &settings.conduit_protocols)
+            && seen.insert((server.address, server.port))
         {
-            if seen.insert((server.address, server.port)) {
-                servers.push(server);
-            }
+            servers.push(server);
         }
     }
 }
@@ -11600,10 +11588,10 @@ fn dsl_relayed_response(payload: &[u8]) -> Result<Cbor, String> {
     if used != payload.len() {
         return Err("psiphon DSL: response has trailing bytes".to_owned());
     }
-    if let Some(error) = wrapped.get(1).and_then(Cbor::uint) {
-        if error != 0 {
-            return Err(format!("psiphon DSL: backend error {error}"));
-        }
+    if let Some(error) = wrapped.get(1).and_then(Cbor::uint)
+        && error != 0
+    {
+        return Err(format!("psiphon DSL: backend error {error}"));
     }
     let compression = wrapped.get(2).and_then(Cbor::uint).unwrap_or(0);
     let response = wrapped.get(3).and_then(Cbor::bytes).unwrap_or(&[]);
@@ -12263,10 +12251,11 @@ fn udpgw_reader(gateway: Arc<UdpGateway>, mut channel: Channel) {
             )
         };
         let flow = lock(&gateway.flows).get(&id).and_then(Weak::upgrade);
-        if let Some(flow) = flow {
-            if flow.ip == ip && flow.port == port {
-                flow.push(body[start..size].to_vec());
-            }
+        if let Some(flow) = flow
+            && flow.ip == ip
+            && flow.port == port
+        {
+            flow.push(body[start..size].to_vec());
         }
     }
     gateway.close();
@@ -13279,12 +13268,16 @@ mod tests {
             .iter()
             .filter_map(|server| server.meek.as_ref())
             .collect();
-        assert!(meeks
-            .iter()
-            .any(|meek| meek.dial == "192.0.2.9" && meek.sni == "scan.example"));
-        assert!(meeks
-            .iter()
-            .any(|meek| meek.dial == "192.0.2.9" && meek.disable_sni && meek.sni.is_empty()));
+        assert!(
+            meeks
+                .iter()
+                .any(|meek| meek.dial == "192.0.2.9" && meek.sni == "scan.example")
+        );
+        assert!(
+            meeks
+                .iter()
+                .any(|meek| meek.dial == "192.0.2.9" && meek.disable_sni && meek.sni.is_empty())
+        );
     }
 
     #[test]
@@ -13489,10 +13482,12 @@ mod tests {
         let mut servers = vec![server];
         apply_fronting_overrides(&mut servers, &settings);
         assert!(servers.len() > 1);
-        assert!(servers
-            .iter()
-            .filter_map(|server| server.meek.as_ref())
-            .all(|meek| meek.disable_sni));
+        assert!(
+            servers
+                .iter()
+                .filter_map(|server| server.meek.as_ref())
+                .all(|meek| meek.disable_sni)
+        );
     }
 
     #[test]
@@ -13600,10 +13595,12 @@ mod tests {
             false,
             None,
         );
-        assert!(selected.iter().any(|server| server
-            .meek
-            .as_ref()
-            .is_some_and(|meek| meek.protocol == "FRONTED-MEEK-CDN-OSSH")));
+        assert!(selected.iter().any(|server| {
+            server
+                .meek
+                .as_ref()
+                .is_some_and(|meek| meek.protocol == "FRONTED-MEEK-CDN-OSSH")
+        }));
         server.cdn_protocols = CDN_PROTOCOL_OSSH;
         assert!(server_with_protocol(&server, "FRONTED-MEEK-CDN-HTTP-OSSH").is_none());
     }
@@ -13788,10 +13785,12 @@ mod tests {
         }
         apply_fronting_overrides(&mut servers, &settings);
         assert!(servers.len() <= FRONTED_SERVERS + 513);
-        assert!(servers
-            .iter()
-            .filter_map(|server| server.meek.as_ref())
-            .any(|meek| meek.dial == "198.51.100.7"));
+        assert!(
+            servers
+                .iter()
+                .filter_map(|server| server.meek.as_ref())
+                .any(|meek| meek.dial == "198.51.100.7")
+        );
         assert!(
             servers
                 .iter()
@@ -13935,12 +13934,16 @@ mod tests {
         let settings =
             Settings::from_json(Some(&json::parse(&config).expect("settings"))).expect("settings");
         let servers = load_entries(&settings).expect("entries");
-        assert!(servers
-            .iter()
-            .any(|server| server.region.as_deref() == Some("CA")));
-        assert!(servers
-            .iter()
-            .all(|server| server.region.as_deref() != Some("US")));
+        assert!(
+            servers
+                .iter()
+                .any(|server| server.region.as_deref() == Some("CA"))
+        );
+        assert!(
+            servers
+                .iter()
+                .all(|server| server.region.as_deref() != Some("US"))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -13976,9 +13979,11 @@ mod tests {
             Settings::from_json(Some(&json::parse(&config).expect("settings"))).expect("settings");
         let servers = load_entries(&settings).expect("entries");
         let sets = crate::psiphon_cdn::select(&["fastly".to_owned(), "bunny".to_owned()]);
-        assert!(servers
-            .iter()
-            .all(|server| server.region.as_deref() == Some("US")));
+        assert!(
+            servers
+                .iter()
+                .all(|server| server.region.as_deref() == Some("US"))
+        );
         for set in &sets {
             assert!(
                 servers
@@ -14221,10 +14226,12 @@ mod tests {
         .expect("settings");
         let first = Ipv4Addr::from(crate::psiphon_cdn::CDN_SETS[0].ranges[0].first).to_string();
         assert!(settings.cdn_ips.iter().any(|ip| ip == &first));
-        assert!(settings
-            .cdn_snis
-            .iter()
-            .any(|sni| sni == crate::psiphon_cdn::CDN_SETS[0].snis[0]));
+        assert!(
+            settings
+                .cdn_snis
+                .iter()
+                .any(|sni| sni == crate::psiphon_cdn::CDN_SETS[0].snis[0])
+        );
     }
 
     #[test]
@@ -14319,10 +14326,12 @@ mod tests {
         );
         assert_ne!(settings.cdn_ips, Vec::<String>::new());
         assert_ne!(settings.cdn_snis, Vec::<String>::new());
-        assert!(settings
-            .fronted_overrides
-            .iter()
-            .any(|fronted| fronted.dials.iter().any(|dial| dial.as_str() == "pypi.org")));
+        assert!(
+            settings
+                .fronted_overrides
+                .iter()
+                .any(|fronted| fronted.dials.iter().any(|dial| dial.as_str() == "pypi.org"))
+        );
     }
 
     #[test]
@@ -14344,32 +14353,39 @@ mod tests {
         assert_eq!(edge.snis, vec!["23.215.0.206"]);
         assert_eq!(edge.alpn, vec![b"http/1.1".to_vec()]);
         assert_eq!(edge.tls_profile.as_deref(), Some("Chrome-83"));
-        assert!(edge
-            .verify_server_names
-            .iter()
-            .any(|name| name == "23.215.0.206"));
-        assert!(edge
-            .verify_server_names
-            .iter()
-            .any(|name| name == "a248.e.akamai.net"));
-        assert!(edge
-            .match_dials
-            .iter()
-            .any(|pattern| pattern.is_match("front.example")));
+        assert!(
+            edge.verify_server_names
+                .iter()
+                .any(|name| name == "23.215.0.206")
+        );
+        assert!(
+            edge.verify_server_names
+                .iter()
+                .any(|name| name == "a248.e.akamai.net")
+        );
+        assert!(
+            edge.match_dials
+                .iter()
+                .any(|pattern| pattern.is_match("front.example"))
+        );
 
         let provider = settings
             .fronted_overrides
             .iter()
             .find(|fronted| fronted.override_id.as_deref() == Some("fastly-provider"))
             .expect("fastly provider override");
-        assert!(provider
-            .match_providers
-            .iter()
-            .any(|pattern| pattern.is_match("Fastly")));
-        assert!(provider
-            .verify_server_names
-            .iter()
-            .any(|name| name == "www.python.org"));
+        assert!(
+            provider
+                .match_providers
+                .iter()
+                .any(|pattern| pattern.is_match("Fastly"))
+        );
+        assert!(
+            provider
+                .verify_server_names
+                .iter()
+                .any(|name| name == "www.python.org")
+        );
     }
 
     #[test]
@@ -14389,10 +14405,11 @@ mod tests {
             edge.verify_server_names.first().map(String::as_str),
             Some("edge.custom")
         );
-        assert!(edge
-            .verify_server_names
-            .iter()
-            .any(|name| name == "23.215.0.206"));
+        assert!(
+            edge.verify_server_names
+                .iter()
+                .any(|name| name == "23.215.0.206")
+        );
     }
 
     #[test]
@@ -14433,10 +14450,11 @@ mod tests {
             .expect("edge candidate");
         assert_eq!(meek.alpn, vec![b"http/1.1".to_vec()]);
         assert_eq!(meek.alpn, vec![b"http/1.1".to_vec()]);
-        assert!(meek
-            .verify_server_names
-            .iter()
-            .any(|name| name == "a248.e.akamai.net"));
+        assert!(
+            meek.verify_server_names
+                .iter()
+                .any(|name| name == "a248.e.akamai.net")
+        );
         assert_eq!(
             meek.shape.profiles,
             vec![Fingerprint::resolve("Chrome-83").expect("profile")]
@@ -14742,14 +14760,18 @@ mod tests {
             settings.fronted_overrides.len(),
             2 + CDN_EDGE_ADDRESSES.len()
         );
-        assert!(settings
-            .fronted_overrides
-            .iter()
-            .any(|fronted| fronted.override_id.as_deref() == Some("edge-a-1")));
-        assert!(settings
-            .fronted_overrides
-            .iter()
-            .any(|fronted| fronted.dials.iter().any(|dial| dial.as_str() == "pypi.org")));
+        assert!(
+            settings
+                .fronted_overrides
+                .iter()
+                .any(|fronted| fronted.override_id.as_deref() == Some("edge-a-1"))
+        );
+        assert!(
+            settings
+                .fronted_overrides
+                .iter()
+                .any(|fronted| fronted.dials.iter().any(|dial| dial.as_str() == "pypi.org"))
+        );
     }
 
     #[test]
@@ -15083,10 +15105,12 @@ mod tests {
         });
         let mut servers = vec![server];
         apply_fronting_overrides(&mut servers, &settings);
-        assert!(servers.iter().all(|server| server
-            .meek
-            .as_ref()
-            .is_some_and(|meek| meek.dial == "front.example")));
+        assert!(servers.iter().all(|server| {
+            server
+                .meek
+                .as_ref()
+                .is_some_and(|meek| meek.dial == "front.example")
+        }));
     }
 
     #[test]
@@ -15303,9 +15327,11 @@ mod tests {
         });
         let selected = select_protocols(vec![test_server(false), unfronted], &[], &[], 0, false);
         assert_eq!(selected.len(), 2);
-        assert!(selected
-            .iter()
-            .any(|server| server.meek.as_ref().is_some_and(|meek| !meek.fronted)));
+        assert!(
+            selected
+                .iter()
+                .any(|server| server.meek.as_ref().is_some_and(|meek| !meek.fronted))
+        );
     }
 
     #[test]
@@ -15731,9 +15757,11 @@ mod tests {
                 .map(String::as_str),
             Some("SSH")
         );
-        assert!(raw_entries(&settings)
-            .iter()
-            .any(|entry| entry.get("ipAddress").and_then(Json::as_str) == Some("192.0.2.10")));
+        assert!(
+            raw_entries(&settings)
+                .iter()
+                .any(|entry| entry.get("ipAddress").and_then(Json::as_str) == Some("192.0.2.10"))
+        );
         save_exchanged(&settings, &signed).expect("replace");
         let stored = std::fs::read_to_string(exchanged_path(&settings)).expect("store");
         assert_eq!(stored.lines().count(), 1, "the same entry replaces itself");
@@ -15889,14 +15917,16 @@ mod tests {
         assert!(!selected[0].obfuscated());
         let obfuscated_only = vec!["OSSH".to_owned()];
         let filter = shape_filter(&obfuscated_only, "test");
-        assert!(apply_dial_port_limits(
-            vec![server.clone()],
-            &plain,
-            filter,
-            false,
-            &obfuscated_only
-        )
-        .is_empty());
+        assert!(
+            apply_dial_port_limits(
+                vec![server.clone()],
+                &plain,
+                filter,
+                false,
+                &obfuscated_only
+            )
+            .is_empty()
+        );
         let selected =
             select_protocols_with(vec![server.clone()], &[], &[], 0, false, true, Some(&plain));
         assert_eq!(selected.len(), 1);
@@ -16163,10 +16193,12 @@ mod tests {
             .map(|protocol| (*protocol).to_owned())
             .collect();
         let selected = select_protocols_with(servers, &protocols, &[], 0, true, false, None);
-        assert!(selected
-            .iter()
-            .filter_map(|server| server.meek.as_ref())
-            .all(|meek| meek.protocol != "FRONTED-MEEK-CDN-QUIC-OSSH"));
+        assert!(
+            selected
+                .iter()
+                .filter_map(|server| server.meek.as_ref())
+                .all(|meek| meek.protocol != "FRONTED-MEEK-CDN-QUIC-OSSH")
+        );
     }
 
     #[test]
@@ -16580,9 +16612,11 @@ mod tests {
             false,
         );
         assert_eq!(selected.len(), 2);
-        assert!(selected
-            .iter()
-            .any(|server| server.direct && server.meek.is_none() && server.port == 443));
+        assert!(
+            selected
+                .iter()
+                .any(|server| server.direct && server.meek.is_none() && server.port == 443)
+        );
         assert!(selected.iter().any(|server| {
             server
                 .meek
@@ -16953,10 +16987,12 @@ mod tests {
         assert_eq!(settings.stagger, Duration::from_millis(250));
         assert!(settings.keepalive.is_some());
         let quiet = json::parse(r#"{"DisablePeriodicSshKeepAlive":true}"#).expect("settings");
-        assert!(Settings::from_json(Some(&quiet))
-            .expect("settings")
-            .keepalive
-            .is_none());
+        assert!(
+            Settings::from_json(Some(&quiet))
+                .expect("settings")
+                .keepalive
+                .is_none()
+        );
     }
 
     #[test]
@@ -17359,14 +17395,18 @@ mod tests {
             .expect("settings"),
         ))
         .expect("settings");
-        assert!(settings
-            .tls_shape
-            .http_transform(true, Some("cdn"))
-            .is_some());
-        assert!(settings
-            .tls_shape
-            .http_transform(true, Some("other"))
-            .is_none());
+        assert!(
+            settings
+                .tls_shape
+                .http_transform(true, Some("cdn"))
+                .is_some()
+        );
+        assert!(
+            settings
+                .tls_shape
+                .http_transform(true, Some("other"))
+                .is_none()
+        );
         assert!(settings.tls_shape.http_transform(false, None).is_none());
     }
 
@@ -17519,10 +17559,12 @@ mod tests {
         ))
         .expect("settings");
         assert_eq!(settings.tls_shape.profiles.len(), 2);
-        assert!(settings
-            .tls_shape
-            .profiles
-            .contains(&Fingerprint::resolve("chrome_120").expect("chrome")));
+        assert!(
+            settings
+                .tls_shape
+                .profiles
+                .contains(&Fingerprint::resolve("chrome_120").expect("chrome"))
+        );
         let mut servers = vec![test_server(true)];
         servers[0].meek = Some(crate::psiphon_meek::Meek {
             dial: "front.example".to_owned(),
@@ -17648,12 +17690,14 @@ mod tests {
             &disabled.tls_shape.roots,
             crate::psiphon_ssh::TlsRoots::Empty
         ));
-        assert!(disabled
-            .tls_shape
-            .roots
-            .load()
-            .expect("empty roots")
-            .is_empty());
+        assert!(
+            disabled
+                .tls_shape
+                .roots
+                .load()
+                .expect("empty roots")
+                .is_empty()
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -17733,10 +17777,12 @@ mod tests {
                 .map(|protocol| (*protocol).to_owned())
                 .collect::<Vec<_>>()
         );
-        assert!(settings
-            .protocols
-            .iter()
-            .all(|protocol| protocol.starts_with("INPROXY-")));
+        assert!(
+            settings
+                .protocols
+                .iter()
+                .all(|protocol| protocol.starts_with("INPROXY-"))
+        );
     }
 
     #[test]
@@ -18415,10 +18461,12 @@ mod tests {
         assert!(settings.tls_shape.may_fragment("SSH"));
         assert!(!settings.tls_shape.may_fragment("TLS-OSSH"));
         let quiet = json::parse(r#"{"FragmentorMaxTotalBytes":0}"#).expect("settings");
-        assert!(!Settings::from_json(Some(&quiet))
-            .expect("settings")
-            .tls_shape
-            .may_fragment("SSH"));
+        assert!(
+            !Settings::from_json(Some(&quiet))
+                .expect("settings")
+                .tls_shape
+                .may_fragment("SSH")
+        );
     }
 
     #[test]
@@ -18428,15 +18476,19 @@ mod tests {
             r#"{"RateLimits":{"ReadBytesPerSecond":1000,"ReadUnthrottledBytes":10,"WriteBytesPerSecond":500}}"#,
         )
         .expect("settings");
-        assert!(Settings::from_json(Some(&settings))
-            .expect("settings")
-            .rate
-            .is_some());
+        assert!(
+            Settings::from_json(Some(&settings))
+                .expect("settings")
+                .rate
+                .is_some()
+        );
         let quiet = json::parse(r#"{"RateLimits":{"ReadBytesPerSecond":0}}"#).expect("settings");
-        assert!(Settings::from_json(Some(&quiet))
-            .expect("settings")
-            .rate
-            .is_none());
+        assert!(
+            Settings::from_json(Some(&quiet))
+                .expect("settings")
+                .rate
+                .is_none()
+        );
     }
 
     #[test]
@@ -18533,12 +18585,16 @@ mod tests {
             settings.holdoff_for("FRONTED-MEEK-OSSH", Some("P1"), None, Some("F9")),
             Duration::ZERO
         );
-        assert!(!settings
-            .holdoff_for("FRONTED-MEEK-OSSH", Some("P1"), None, Some("F1"))
-            .is_zero());
-        assert!(!settings
-            .holdoff_for("INPROXY-QUIC-OSSH", Some("P2"), Some("US"), None)
-            .is_zero());
+        assert!(
+            !settings
+                .holdoff_for("FRONTED-MEEK-OSSH", Some("P1"), None, Some("F1"))
+                .is_zero()
+        );
+        assert!(
+            !settings
+                .holdoff_for("INPROXY-QUIC-OSSH", Some("P2"), Some("US"), None)
+                .is_zero()
+        );
         assert_eq!(
             settings.holdoff_for("INPROXY-QUIC-OSSH", Some("P2"), Some("CA"), None),
             Duration::ZERO

@@ -2,8 +2,8 @@
 //! entries: a loopback TCP stream whose bytes are carried in `POST /` requests.
 
 use crate::psiphon_ssh::{
-    current_dial_seed, derive_key, dial_fill, dial_random, dial_seed_scope, random, Proxy, Rc4,
-    TlsShape, MAGIC, SEED_LENGTH,
+    MAGIC, Proxy, Rc4, SEED_LENGTH, TlsShape, current_dial_seed, derive_key, dial_fill,
+    dial_random, dial_seed_scope, random,
 };
 use crate::psiphon_webrtc::WebRtcStream;
 use aes::cipher::{KeyIvInit, StreamCipher};
@@ -29,8 +29,7 @@ const MAX_CONNECT_ATTEMPT: Duration = Duration::from_secs(2);
 const MAX_HANDSHAKE_ATTEMPT: Duration = Duration::from_secs(5);
 const POLL_GROWTH: f64 = 1.5;
 static RELAY_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-const USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36";
+const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36";
 
 const ALTERNATE_CONTENT_TYPES: &[&str] = &[
     "application/octet-stream",
@@ -276,11 +275,7 @@ fn response_read_chunk(limit: bool) -> usize {
 
 /// Choose the HTTP/3 response body chunk size for the active buffer limit.
 fn h3_read_chunk(limit: bool) -> usize {
-    if limit {
-        LIMITED_READ_CHUNK
-    } else {
-        16 * 1024
-    }
+    if limit { LIMITED_READ_CHUNK } else { 16 * 1024 }
 }
 
 /// One server entry's meek front.
@@ -1587,10 +1582,10 @@ impl MeekHttp {
                 continue;
             }
             let pair = value.split(';').next().unwrap_or(value);
-            if let Some((name, value)) = pair.split_once('=') {
-                if name.trim() == cookie_name {
-                    value.trim().clone_into(cookie_value);
-                }
+            if let Some((name, value)) = pair.split_once('=')
+                && name.trim() == cookie_name
+            {
+                value.trim().clone_into(cookie_value);
             }
         }
     }
@@ -1887,10 +1882,12 @@ mod tests {
         for _ in 0..64 {
             let chosen = profile(&shape, "FRONTED-MEEK-OSSH");
             assert!((2..=10).contains(&chosen.cookie_name.len()));
-            assert!(chosen
-                .cookie_name
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte == b'_'));
+            assert!(
+                chosen
+                    .cookie_name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+            );
         }
     }
 

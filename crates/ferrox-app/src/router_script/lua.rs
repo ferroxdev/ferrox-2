@@ -6,11 +6,11 @@
 use super::{Picker, Resolver, ScriptCallbacks};
 use crate::json::Json;
 use crate::router::{
-    add_domain, ip_matcher, AssetCache, Assets, DomainMatcher, Flow, IpMatcher, Network,
+    AssetCache, Assets, DomainMatcher, Flow, IpMatcher, Network, add_domain, ip_matcher,
 };
 use mlua::{
-    chunk::ChunkMode, AnyUserData, Error as LuaError, HookTriggers, Lua, LuaOptions, MetaMethod,
-    Result as LuaResult, StdLib, Table, UserData, UserDataMethods, Value, Variadic, VmState,
+    AnyUserData, Error as LuaError, HookTriggers, Lua, LuaOptions, MetaMethod, Result as LuaResult,
+    StdLib, Table, UserData, UserDataMethods, Value, Variadic, VmState, chunk::ChunkMode,
 };
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -296,9 +296,9 @@ impl ScriptRouter {
         let deadline = Instant::now() + TIMEOUT;
         let state = self.acquire(deadline)?;
         let context = ScriptContext {
-            source: flow.source.map(|ip| vec![ip]).unwrap_or_default(),
-            target: flow.ip.map(|ip| vec![ip]).unwrap_or_default(),
-            local: flow.local.map(|ip| vec![ip]).unwrap_or_default(),
+            source: flow.source.map_or_default(|ip| vec![ip]),
+            target: flow.ip.map_or_default(|ip| vec![ip]),
+            local: flow.local.map_or_default(|ip| vec![ip]),
             inbound: flow.inbound_tag.unwrap_or("").to_owned(),
             source_port: flow.source_port,
             target_port: flow.port.unwrap_or(0),
@@ -427,11 +427,7 @@ fn call(lua: &Lua, context: ScriptContext) -> Result<Option<String>, String> {
         Value::Nil => None,
         Value::String(tag) => {
             let tag = tag.to_string_lossy();
-            if tag.is_empty() {
-                None
-            } else {
-                Some(tag)
-            }
+            if tag.is_empty() { None } else { Some(tag) }
         }
         _ => return Err("routing script outboundTag must be a string or nil".into()),
     };
@@ -1743,18 +1739,22 @@ assert(#seen == 2 and seen[1] == "1:192.0.2.1" and seen[2] == "2:198.51.100.2")
             IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
             IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)),
         ];
-        assert!(!matcher
-            .matchers
-            .iter()
-            .any(|matcher| matcher.matches_all_override(&split, None, false)));
+        assert!(
+            !matcher
+                .matchers
+                .iter()
+                .any(|matcher| matcher.matches_all_override(&split, None, false))
+        );
         let one = [
             IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
             IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)),
         ];
-        assert!(matcher
-            .matchers
-            .iter()
-            .any(|matcher| matcher.matches_all_override(&one, None, false)));
+        assert!(
+            matcher
+                .matchers
+                .iter()
+                .any(|matcher| matcher.matches_all_override(&one, None, false))
+        );
     }
 
     #[test]
@@ -1782,10 +1782,12 @@ assert(#seen == 2 and seen[1] == "1:192.0.2.1" and seen[2] == "2:198.51.100.2")
             "192.0.2.1".parse().expect("address"),
             "198.51.100.2".parse().expect("address"),
         ];
-        assert!(matcher
-            .matchers
-            .iter()
-            .any(|matcher| matcher.matches_all_override(&ips, None, false)));
+        assert!(
+            matcher
+                .matchers
+                .iter()
+                .any(|matcher| matcher.matches_all_override(&ips, None, false))
+        );
     }
 
     #[test]

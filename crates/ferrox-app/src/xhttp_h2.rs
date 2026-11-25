@@ -7,10 +7,10 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::h2::{
-    block_encode, frame_head, write_frame, Decoder, E_CANCEL, E_COMPRESSION, E_FRAME_SIZE,
-    E_PROTOCOL, E_REFUSED, F_ACK, F_END, F_END_HEADERS, F_PADDED, F_PRIORITY, HEAD_CAP, MAGIC,
-    S_MAX_CONCURRENT, S_MAX_FRAME, S_WINDOW, T_CONT, T_DATA, T_GOAWAY, T_HEADERS, T_PING, T_RST,
-    T_SETTINGS, T_WINDOW, WINDOW, WINDOW_MAX,
+    Decoder, E_CANCEL, E_COMPRESSION, E_FRAME_SIZE, E_PROTOCOL, E_REFUSED, F_ACK, F_END,
+    F_END_HEADERS, F_PADDED, F_PRIORITY, HEAD_CAP, MAGIC, S_MAX_CONCURRENT, S_MAX_FRAME, S_WINDOW,
+    T_CONT, T_DATA, T_GOAWAY, T_HEADERS, T_PING, T_RST, T_SETTINGS, T_WINDOW, WINDOW, WINDOW_MAX,
+    block_encode, frame_head, write_frame,
 };
 use crate::proxy::{VlessUser, VlessUsers};
 use crate::xhttp::XhttpSettings;
@@ -3041,11 +3041,7 @@ impl H2Conn {
         if !alive {
             self.dead.store(true, Ordering::SeqCst);
         }
-        if alive {
-            Pumped::Alive
-        } else {
-            Pumped::Dead
-        }
+        if alive { Pumped::Alive } else { Pumped::Dead }
     }
 
     /// Reads the frames an idle peer already sent, one per pump, until a poll boundary or the
@@ -3537,11 +3533,11 @@ impl H2Client {
         let Some((mut reader, out)) = self.open_headers(&block, None, false) else {
             return false;
         };
-        if let Some(body) = body {
-            if !out.data(body) {
-                self.conn.fail_stream(reader.id);
-                return false;
-            }
+        if let Some(body) = body
+            && !out.data(body)
+        {
+            self.conn.fail_stream(reader.id);
+            return false;
         }
         self.conn.finish_stream(reader.id);
         let mut sink = [0u8; 64];
@@ -3550,7 +3546,7 @@ impl H2Client {
                 Ok(0) => {
                     return reader
                         .status()
-                        .is_some_and(|code| (200..300).contains(&code))
+                        .is_some_and(|code| (200..300).contains(&code));
                 }
                 Ok(_) => {}
                 Err(_) => return false,
@@ -4494,10 +4490,9 @@ pub(crate) fn serve_h2_service_until<
             && opened
                 .as_ref()
                 .is_some_and(|opened| opened.load(Ordering::Relaxed))
+            && let Some(callback) = on_open.take()
         {
-            if let Some(callback) = on_open.take() {
-                callback();
-            }
+            callback();
         }
     }
 }
@@ -4749,10 +4744,10 @@ fn pump_frame(
                 {
                     return apply_trailers(conn, sid, &block, end_stream);
                 }
-                if service.open(conn, sid, &block, end_stream) {
-                    if let Some(opened) = opened {
-                        opened.store(true, Ordering::Relaxed);
-                    }
+                if service.open(conn, sid, &block, end_stream)
+                    && let Some(opened) = opened
+                {
+                    opened.store(true, Ordering::Relaxed);
                 }
                 if conn.refused.load(Ordering::SeqCst) {
                     return false;
@@ -4782,10 +4777,11 @@ fn pump_frame(
                         .contains_key(&sid);
                     if attached && !apply_trailers(conn, sid, &gathered, end_stream) {
                         return false;
-                    } else if !attached && service.open(conn, sid, &gathered, end_stream) {
-                        if let Some(opened) = opened {
-                            opened.store(true, Ordering::Relaxed);
-                        }
+                    } else if !attached
+                        && service.open(conn, sid, &gathered, end_stream)
+                        && let Some(opened) = opened
+                    {
+                        opened.store(true, Ordering::Relaxed);
                     }
                     if conn.refused.load(Ordering::SeqCst) {
                         return false;
@@ -4899,8 +4895,8 @@ fn pump_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conn::{test_bind, Connection};
-    use crate::h2::{read_head, read_head_bounded, MAGIC};
+    use crate::conn::{Connection, test_bind};
+    use crate::h2::{MAGIC, read_head, read_head_bounded};
     use std::net::SocketAddr;
     use std::sync::atomic::AtomicUsize;
     use std::thread;
@@ -6696,16 +6692,18 @@ mod tests {
         conn.bind_session(sid, 1, false, &handle);
         conn.kill();
         assert!(!crate::xhttp::session_is_carried(sid));
-        assert!(conn
-            .session_of
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_empty());
-        assert!(conn
-            .upload_of
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_empty());
+        assert!(
+            conn.session_of
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        );
+        assert!(
+            conn.upload_of
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        );
     }
 
     /// A peer may reuse a stream id's session name after it ends; a later stream that binds the new
@@ -8004,17 +8002,20 @@ mod tests {
     fn aborting_an_open_stream_resets_it_and_frees_its_entry() {
         let (conn, written, _) = bare_conn();
         let (reader, _writer, _out) = conn.open(3, false).expect("opens");
-        assert!(conn
-            .streams
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .contains_key(&3));
+        assert!(
+            conn.streams
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(&3)
+        );
         reader.abort();
-        assert!(!conn
-            .streams
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .contains_key(&3));
+        assert!(
+            !conn
+                .streams
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(&3)
+        );
         let bytes = written.lock().unwrap_or_else(PoisonError::into_inner);
         assert_eq!(
             bytes[3], T_RST,

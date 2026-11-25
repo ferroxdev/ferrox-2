@@ -10,7 +10,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -640,14 +640,13 @@ impl Config {
         if cache.len() >= self.steering_max && !cache.contains_key(provider) {
             let now = Instant::now();
             cache.retain(|_, entry| entry.expires.is_none_or(|expires| expires > now));
-            if cache.len() >= self.steering_max {
-                if let Some(oldest) = cache
+            if cache.len() >= self.steering_max
+                && let Some(oldest) = cache
                     .iter()
                     .min_by_key(|(_, entry)| (entry.expires.is_none(), entry.expires))
                     .map(|(key, _)| key.clone())
-                {
-                    cache.remove(&oldest);
-                }
+            {
+                cache.remove(&oldest);
             }
         }
         let active = cache.get(provider).is_some_and(|entry| entry.active);
@@ -853,20 +852,18 @@ pub(crate) fn resolve_with_deadline(
         return Ok(addresses);
     }
     let prefer_alternate = coin(config.prefer_alternate_probability);
-    if !prefer_alternate {
-        if let Ok(addresses) = system_addresses(host, port, deadline) {
-            if !addresses.is_empty() {
-                return Ok(addresses);
-            }
-        }
+    if !prefer_alternate
+        && let Ok(addresses) = system_addresses(host, port, deadline)
+        && !addresses.is_empty()
+    {
+        return Ok(addresses);
     }
     let mut last = io::Error::new(io::ErrorKind::NotFound, "no alternate DNS server");
     let servers = alternate_servers(config);
     let transform = if coin(config.transform_probability) {
         let scope = servers
             .first()
-            .map(|(server, _)| server.ip().to_string())
-            .unwrap_or_default();
+            .map_or_default(|(server, _)| server.ip().to_string());
         config.transforms.select(&scope)
     } else {
         None
@@ -917,12 +914,11 @@ pub(crate) fn resolve_with_deadline(
             }
         }
     }
-    if prefer_alternate {
-        if let Ok(addresses) = system_addresses(host, port, deadline) {
-            if !addresses.is_empty() {
-                return Ok(addresses);
-            }
-        }
+    if prefer_alternate
+        && let Ok(addresses) = system_addresses(host, port, deadline)
+        && !addresses.is_empty()
+    {
+        return Ok(addresses);
     }
     Err(last)
 }
@@ -1266,20 +1262,21 @@ fn parse_reply(
     for index in 0..questions {
         let start = at;
         skip_name(reply, &mut at)?;
-        if index == 0 && question_match != QuestionMatch::None {
-            if let Some(sent) = sent_name {
-                let echo = &reply[start..at];
-                let matched = match question_match {
-                    QuestionMatch::Exact => echo == sent,
-                    QuestionMatch::CaseInsensitive => echo.eq_ignore_ascii_case(sent),
-                    QuestionMatch::None => true,
-                };
-                if !matched {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "DNS question changed",
-                    ));
-                }
+        if index == 0
+            && question_match != QuestionMatch::None
+            && let Some(sent) = sent_name
+        {
+            let echo = &reply[start..at];
+            let matched = match question_match {
+                QuestionMatch::Exact => echo == sent,
+                QuestionMatch::CaseInsensitive => echo.eq_ignore_ascii_case(sent),
+                QuestionMatch::None => true,
+            };
+            if !matched {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "DNS question changed",
+                ));
             }
         }
         at = at
@@ -1357,7 +1354,7 @@ fn skip_name(reply: &[u8], at: &mut usize) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_fronting, resolve_with, Config};
+    use super::{Config, resolve_fronting, resolve_with};
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
     use std::thread;
@@ -1656,12 +1653,16 @@ mod tests {
             Config::cidrs(&["203.0.113.0/24".to_owned()]),
         )]);
         config.preresolved_probability = 1.0;
-        assert!(config
-            .preresolve(Some("provider-b"), "psiphon.test", true)
-            .is_none());
-        assert!(config
-            .preresolve(Some("provider-a"), "psiphon.test", true)
-            .is_some());
+        assert!(
+            config
+                .preresolve(Some("provider-b"), "psiphon.test", true)
+                .is_none()
+        );
+        assert!(
+            config
+                .preresolve(Some("provider-a"), "psiphon.test", true)
+                .is_some()
+        );
     }
 
     #[test]
@@ -1732,14 +1733,16 @@ mod tests {
         reply.extend_from_slice(&[0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0]);
         reply.extend_from_slice(echo);
         reply.extend_from_slice(&[0, 1, 0, 1]);
-        assert!(super::parse_reply(
-            id,
-            &reply,
-            1,
-            Some(&sent[..]),
-            super::QuestionMatch::CaseInsensitive
-        )
-        .is_ok());
+        assert!(
+            super::parse_reply(
+                id,
+                &reply,
+                1,
+                Some(&sent[..]),
+                super::QuestionMatch::CaseInsensitive
+            )
+            .is_ok()
+        );
         assert!(
             super::parse_reply(id, &reply, 1, Some(&sent[..]), super::QuestionMatch::Exact)
                 .is_err()

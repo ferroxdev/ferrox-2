@@ -618,10 +618,10 @@ impl<S: Read + Write + RecordAlignment> Read for Link<S> {
             self.feeds += 1;
         }
         let n = self.drive_read(buf, feed.as_mut(), active)?;
-        if let Some(feed) = feed {
-            if feed.run > 0 {
-                self.spend(&feed);
-            }
+        if let Some(feed) = feed
+            && feed.run > 0
+        {
+            self.spend(&feed);
         }
         Ok(n)
     }
@@ -716,10 +716,11 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
 
     fn drain_tail(&mut self, buf: &mut [u8], feed: Option<&mut Feeding>, active: bool) -> usize {
         let n = (self.have.len() - self.dot).min(buf.len());
-        if n > 0 && active {
-            if let Some(feed) = feed {
-                feed_extent(&self.have[self.dot..self.dot + n], feed);
-            }
+        if n > 0
+            && active
+            && let Some(feed) = feed
+        {
+            feed_extent(&self.have[self.dot..self.dot + n], feed);
         }
         buf[..n].copy_from_slice(&self.have[self.dot..self.dot + n]);
         self.dot += n;
@@ -841,11 +842,9 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 if next <= end && cap - held >= content {
                     if content > 0 {
                         let fresh = &self.have[at..at + content];
-                        if active {
-                            if let Some(feed) = feed.as_deref_mut() {
-                                feed.run += content;
-                                feed_extent(fresh, feed);
-                            }
+                        if active && let Some(feed) = feed.as_deref_mut() {
+                            feed.run += content;
+                            feed_extent(fresh, feed);
                         }
                         if let Some(slot) = buf.as_deref_mut() {
                             slot[held..held + content].copy_from_slice(fresh);
@@ -861,10 +860,10 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                     }
                     self.session.disarm_record_alignment();
                     self.read.padding = false;
-                    if command == VisionCommand::Direct.byte() {
-                        if let Some(direct) = self.direct {
-                            direct(&mut self.session);
-                        }
+                    if command == VisionCommand::Direct.byte()
+                        && let Some(direct) = self.direct
+                    {
+                        direct(&mut self.session);
                     }
                     self.read.raw = command == VisionCommand::Direct.byte() && self.raw.is_some();
                     break 'frames held;
@@ -898,11 +897,9 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 let room = cap - held;
                 let take = walk.want_content.min(end - dot).min(room);
                 let fresh = &self.have[dot..dot + take];
-                if active {
-                    if let Some(feed) = feed.as_deref_mut() {
-                        feed.run += take;
-                        feed_extent(fresh, feed);
-                    }
+                if active && let Some(feed) = feed.as_deref_mut() {
+                    feed.run += take;
+                    feed_extent(fresh, feed);
                 }
                 if let Some(slot) = buf.as_deref_mut() {
                     slot[held..held + take].copy_from_slice(fresh);
@@ -932,10 +929,10 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             // a command that is not a continue ends the framing; its tail is content
             self.session.disarm_record_alignment();
             self.read.padding = false;
-            if walk.command == VisionCommand::Direct.byte() {
-                if let Some(direct) = self.direct {
-                    direct(&mut self.session);
-                }
+            if walk.command == VisionCommand::Direct.byte()
+                && let Some(direct) = self.direct
+            {
+                direct(&mut self.session);
             }
             self.read.raw = walk.command == VisionCommand::Direct.byte() && self.raw.is_some();
             break 'frames held;
@@ -1066,10 +1063,10 @@ impl<S: Read + Write + RecordAlignment> Write for Link<S> {
             at += content;
             if command != 0 {
                 self.write.padding = false;
-                if command == VisionCommand::Direct.byte() {
-                    if let Some(direct) = self.direct {
-                        direct(&mut self.session);
-                    }
+                if command == VisionCommand::Direct.byte()
+                    && let Some(direct) = self.direct
+                {
+                    direct(&mut self.session);
                 }
                 self.write.raw = self.raw.is_some()
                     && tls.enable_xtls

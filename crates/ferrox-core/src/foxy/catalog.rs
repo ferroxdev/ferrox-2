@@ -1,6 +1,6 @@
 //! The catalogue a lane picks an edge from: Remote Settings publishes it unauthenticated, so a link can carry only a country code and reach an edge, with envelope parsing left to the app and the choice — the part worth proving — here.
 
-use crate::foxy::{candidates_for_country, Candidate};
+use crate::foxy::{Candidate, candidates_for_country};
 
 /// "Wherever is best" is a real country in the list rather than a mode: `REC` is a row like any other.
 pub const RECOMMENDED: &str = "REC";

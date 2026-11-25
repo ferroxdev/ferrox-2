@@ -636,7 +636,9 @@ mod tests {
         );
         assert_eq!(
             tcp,
-            [0, 0, 11, b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'o', b'r', b'g', 1, 187]
+            [
+                0, 0, 11, b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'o', b'r', b'g', 1, 187
+            ]
         );
         let (request, used) = decode_client_request(&tcp).expect("decodes");
         assert_eq!(used, tcp.len());

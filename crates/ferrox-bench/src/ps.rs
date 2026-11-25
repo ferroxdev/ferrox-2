@@ -387,10 +387,10 @@ const FIXTURE_HZ: u64 = 100;
 #[cfg(target_os = "windows")]
 mod win32 {
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, FILETIME, HANDLE, INVALID_HANDLE_VALUE,
+        CloseHandle, FILETIME, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
     };
     use windows_sys::Win32::System::ProcessStatus::{
         GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,

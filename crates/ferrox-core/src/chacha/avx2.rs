@@ -1,6 +1,6 @@
 //! Eight blocks per pass, one state word per register with the blocks in the lanes: the pass's sixteen registers are the whole file, so shorter lengths and remainders go to the ladder.
 
-use super::{as_i32_bits, base, base_state, xor_tail, xor_tail_from, Lanes};
+use super::{Lanes, as_i32_bits, base, base_state, xor_tail, xor_tail_from};
 #[allow(
     clippy::wildcard_imports,
     reason = "arch intrinsics: the module's whole API is register operations"
@@ -461,7 +461,7 @@ pub(crate) unsafe fn xor_blocks_from(
 
 #[cfg(test)]
 mod tests {
-    use super::{xor_blocks, A8, PASS_BYTES};
+    use super::{A8, PASS_BYTES, xor_blocks};
     use crate::chacha::xor_ladder;
 
     /// The pass against the ladder it replaced, byte for byte, at every length around its boundaries and across the counter's ends; Miri interprets no SIMD intrinsics, so native CI runs this on every ISA.

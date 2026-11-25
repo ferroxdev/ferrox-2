@@ -25,7 +25,7 @@ pub use sudoku::Sudoku;
 pub use xmc::cfb8::Cfb8;
 pub use xmc::derivation::{derive_rsa_key, private_key_der, public_key_der};
 pub use xmc::packet_stream::PacketStream;
-pub use xmc::profile::{find_profile, read_login_success, Profile};
+pub use xmc::profile::{Profile, find_profile, read_login_success};
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
@@ -317,11 +317,11 @@ impl Fragment {
 
     /// Put the retained burst on the wire without a new plaintext write.
     fn flush<W: Write>(&mut self, raw: &mut W) -> io::Result<()> {
-        if let Some(mut gathered) = self.gathered.take() {
-            if let Err(error) = flush_gathered(raw, &mut gathered, self.deadline.as_deref()) {
-                self.gathered = Some(gathered);
-                return Err(error);
-            }
+        if let Some(mut gathered) = self.gathered.take()
+            && let Err(error) = flush_gathered(raw, &mut gathered, self.deadline.as_deref())
+        {
+            self.gathered = Some(gathered);
+            return Err(error);
         }
         Ok(())
     }
@@ -913,11 +913,7 @@ impl Fragment {
                         ) =>
                     {
                         self.piece_resume = Some((p.len() - from, segment, bound));
-                        if from > 0 {
-                            Ok(from)
-                        } else {
-                            Err(error)
-                        }
+                        if from > 0 { Ok(from) } else { Err(error) }
                     }
                     Err(error) => Err(error),
                 };
@@ -1061,16 +1057,16 @@ fn flush_gathered<W: Write>(
                 Err(error) => return Err(error),
             }
         }
-        if let Some((_, wait)) = gathered.parks.pop_front() {
-            if wait > 0 {
-                if READY.with(std::cell::Cell::get) {
-                    READY_WAIT.with(|left| left.set(left.get().max(wait as u64)));
-                    return Err(io::ErrorKind::WouldBlock.into());
-                } else if !DRAINING.with(std::cell::Cell::get) {
-                    #[cfg(test)]
-                    SLEEPS.with(|count| count.set(count.get() + 1));
-                    wait_for(deadline, Duration::from_millis(wait as u64))?;
-                }
+        if let Some((_, wait)) = gathered.parks.pop_front()
+            && wait > 0
+        {
+            if READY.with(std::cell::Cell::get) {
+                READY_WAIT.with(|left| left.set(left.get().max(wait as u64)));
+                return Err(io::ErrorKind::WouldBlock.into());
+            } else if !DRAINING.with(std::cell::Cell::get) {
+                #[cfg(test)]
+                SLEEPS.with(|count| count.set(count.get() + 1));
+                wait_for(deadline, Duration::from_millis(wait as u64))?;
             }
         }
     }
@@ -1799,9 +1795,11 @@ mod tests {
             bytes: Vec::new(),
             calls: 0,
         };
-        assert!(write_record(&mut sink, &[HANDSHAKE, 3, 1, 0, 3], b"abc")
-            .expect("retries the body")
-            .is_none());
+        assert!(
+            write_record(&mut sink, &[HANDSHAKE, 3, 1, 0, 3], b"abc")
+                .expect("retries the body")
+                .is_none()
+        );
         assert_eq!(
             sink.bytes,
             [HANDSHAKE, 3, 1, 0, 3, b'a', b'b', b'c'],

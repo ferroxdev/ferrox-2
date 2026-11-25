@@ -369,35 +369,37 @@ where
             let candidates = &candidates;
             let early = &early;
             let verify = &verify;
-            scope.spawn(move || loop {
-                if done.load(Ordering::Relaxed) || Instant::now() >= deadline {
-                    break;
-                }
-                let edge = if early_lane {
-                    early
-                        .get(early_index.fetch_add(1, Ordering::Relaxed))
-                        .copied()
-                        .or_else(|| {
-                            candidates
-                                .get(index.fetch_add(1, Ordering::Relaxed))
-                                .copied()
-                        })
-                } else {
-                    candidates
-                        .get(index.fetch_add(1, Ordering::Relaxed))
-                        .copied()
-                        .or_else(|| {
-                            early
-                                .get(early_index.fetch_add(1, Ordering::Relaxed))
-                                .copied()
-                        })
-                };
-                let Some(edge) = edge else {
-                    break;
-                };
-                let result = verify(edge);
-                if sender.send((edge, result)).is_err() {
-                    break;
+            scope.spawn(move || {
+                loop {
+                    if done.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                        break;
+                    }
+                    let edge = if early_lane {
+                        early
+                            .get(early_index.fetch_add(1, Ordering::Relaxed))
+                            .copied()
+                            .or_else(|| {
+                                candidates
+                                    .get(index.fetch_add(1, Ordering::Relaxed))
+                                    .copied()
+                            })
+                    } else {
+                        candidates
+                            .get(index.fetch_add(1, Ordering::Relaxed))
+                            .copied()
+                            .or_else(|| {
+                                early
+                                    .get(early_index.fetch_add(1, Ordering::Relaxed))
+                                    .copied()
+                            })
+                    };
+                    let Some(edge) = edge else {
+                        break;
+                    };
+                    let result = verify(edge);
+                    if sender.send((edge, result)).is_err() {
+                        break;
+                    }
                 }
             });
         }

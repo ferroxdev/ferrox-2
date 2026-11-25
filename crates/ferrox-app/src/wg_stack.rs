@@ -22,8 +22,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant as StdInstant};
 
 use ferrox_core::foxy::connectip::{
-    icmp_echo_reply, ipv4_checksum, tcp_checksum, udp_datagram, udp_from_packet, UdpDatagram,
-    IPV4_HEADER, IPV6_HEADER, PROTOCOL_UDP,
+    IPV4_HEADER, IPV6_HEADER, PROTOCOL_UDP, UdpDatagram, icmp_echo_reply, ipv4_checksum,
+    tcp_checksum, udp_datagram, udp_from_packet,
 };
 #[cfg(test)]
 use ferrox_core::wireguard::transport::HEADER_SIZE as WG_HEADER_SIZE;
@@ -37,7 +37,7 @@ use smoltcp::time::Instant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint};
 
 use crate::conn::Connection;
-use crate::proxy::{serve_device_flow, serve_udp_lane, Destination, Outbound};
+use crate::proxy::{Destination, Outbound, serve_device_flow, serve_udp_lane};
 use crate::wireguard::{DeviceConfig, PeerConfig};
 
 /// The receive side of one flow: a peer may have this much in flight before a
@@ -171,12 +171,11 @@ impl FlowLease {
 
 impl Drop for FlowLease {
     fn drop(&mut self) {
-        if self.active.fetch_sub(1, Ordering::SeqCst) == 1 {
-            if let Some((retire, alive)) = &self.retiring {
-                if retire.load(Ordering::SeqCst) {
-                    alive.store(false, Ordering::Release);
-                }
-            }
+        if self.active.fetch_sub(1, Ordering::SeqCst) == 1
+            && let Some((retire, alive)) = &self.retiring
+            && retire.load(Ordering::SeqCst)
+        {
+            alive.store(false, Ordering::Release);
         }
     }
 }
@@ -241,10 +240,10 @@ impl QueueDevice {
 
     /// Queue an inner packet, recycling the oldest slot when the queue is full.
     fn push(&mut self, packet: Vec<u8>, at: usize) {
-        if self.rx.len() >= RX_PACKETS {
-            if let Some((buffer, at)) = self.rx.pop_front() {
-                self.recycle(buffer, at);
-            }
+        if self.rx.len() >= RX_PACKETS
+            && let Some((buffer, at)) = self.rx.pop_front()
+        {
+            self.recycle(buffer, at);
         }
         self.rx.push_back((packet, at));
     }
@@ -906,11 +905,11 @@ impl Reassembly {
         for (&peer, usage) in &self.peers {
             let mut sets = usage.sets;
             let mut bytes = usage.bytes;
-            if let Some(keep) = keep {
-                if keep.peer() == peer {
-                    sets = sets.saturating_sub(1);
-                    bytes -= self.parts.get(keep).map_or(0, |part| part.payload.len());
-                }
+            if let Some(keep) = keep
+                && keep.peer() == peer
+            {
+                sets = sets.saturating_sub(1);
+                bytes -= self.parts.get(keep).map_or(0, |part| part.payload.len());
             }
             if sets == 0 {
                 continue;
@@ -2299,12 +2298,11 @@ impl ServerStack {
         for (port, listeners) in &self.listeners {
             for listener in listeners {
                 let socket = self.sockets.get::<TcpSocket>(listener.handle);
-                if socket.state() == State::Established {
-                    if let (Some(local), Some(remote)) =
+                if socket.state() == State::Established
+                    && let (Some(local), Some(remote)) =
                         (socket.local_endpoint(), socket.remote_endpoint())
-                    {
-                        ready.push((*port, listener.handle, local, remote));
-                    }
+                {
+                    ready.push((*port, listener.handle, local, remote));
                 }
             }
         }
@@ -2796,10 +2794,10 @@ pub(crate) fn resolve_over_tunnel(
             {
                 continue;
             }
-            if let Some(ip) = query_tunnel(to_tunnel, routes, source, *server, &name, qtype) {
-                if family == ip.is_ipv4() {
-                    return Some(SocketAddr::new(ip, port));
-                }
+            if let Some(ip) = query_tunnel(to_tunnel, routes, source, *server, &name, qtype)
+                && family == ip.is_ipv4()
+            {
+                return Some(SocketAddr::new(ip, port));
             }
         }
     }

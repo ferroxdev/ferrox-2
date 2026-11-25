@@ -49,11 +49,7 @@ impl Assigned {
     /// The bytes one address of this version occupies on the wire.
     #[must_use]
     pub const fn width(&self) -> usize {
-        if self.version == 4 {
-            4
-        } else {
-            16
-        }
+        if self.version == 4 { 4 } else { 16 }
     }
 }
 
@@ -69,11 +65,7 @@ pub struct Route {
 impl Route {
     #[must_use]
     pub const fn width(&self) -> usize {
-        if self.version == 4 {
-            4
-        } else {
-            16
-        }
+        if self.version == 4 { 4 } else { 16 }
     }
 }
 
@@ -814,8 +806,8 @@ unsafe fn sse2_block_sum(bytes: &[u8]) -> u64 {
 #[target_feature(enable = "neon")]
 unsafe fn neon_block_sum(bytes: &[u8]) -> u64 {
     use core::arch::aarch64::{
-        uint64x2_t, vaddvq_u64, vdupq_n_u64, vld1q_u8, vpadalq_u32, vpaddlq_u16, vpaddlq_u8,
-        vreinterpretq_u16_u8, vreinterpretq_u8_u16, vshrq_n_u16,
+        uint64x2_t, vaddvq_u64, vdupq_n_u64, vld1q_u8, vpadalq_u32, vpaddlq_u8, vpaddlq_u16,
+        vreinterpretq_u8_u16, vreinterpretq_u16_u8, vshrq_n_u16,
     };
     let (mut every, mut odd): (uint64x2_t, uint64x2_t) = (vdupq_n_u64(0), vdupq_n_u64(0));
     let mut at = 0usize;
@@ -933,11 +925,7 @@ pub fn udp_checksum(
     sum = (sum & 0xffff) + (sum >> 16);
     sum += word_sum(payload);
     let answer = !fold(sum);
-    if answer == 0 {
-        0xffff
-    } else {
-        answer
-    }
+    if answer == 0 { 0xffff } else { answer }
 }
 
 /// The smallest MTU each family may name, RFC 791 and RFC 8200 §5.

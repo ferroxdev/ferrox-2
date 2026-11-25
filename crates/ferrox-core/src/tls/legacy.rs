@@ -274,10 +274,10 @@ fn build_context(cfg: &TlsConfig) -> Result<SslContext, TlsError> {
         let mut rest = Vec::new();
         if let Some(chain) = store.untrusted().or_else(|| store.chain()) {
             for cert in chain {
-                if let Ok(der) = cert.to_der() {
-                    if der != leaf {
-                        rest.push(rustls::pki_types::CertificateDer::from(der));
-                    }
+                if let Ok(der) = cert.to_der()
+                    && der != leaf
+                {
+                    rest.push(rustls::pki_types::CertificateDer::from(der));
                 }
             }
         }
@@ -360,10 +360,10 @@ pub(crate) fn server_context(cfg: &TlsServerConfig) -> Result<Arc<SslContext>, T
         ech_server_keys: cfg.ech_server_keys.clone(),
         master_key_log: cfg.master_key_log.clone(),
     };
-    if let Some((built_for, ctx)) = guard.legacy.as_ref() {
-        if built_for == &key {
-            return Ok(Arc::clone(ctx));
-        }
+    if let Some((built_for, ctx)) = guard.legacy.as_ref()
+        && built_for == &key
+    {
+        return Ok(Arc::clone(ctx));
     }
     let mut fresh = cfg.clone();
     fresh.certs.clone_from(&served);
@@ -493,15 +493,11 @@ impl<S: Stream> TlsProvider for Session<S> {
                     .peer_certificate()
                     .and_then(|cert| cert.to_der().ok())
                     .unwrap_or_default();
-                self.ocsp = done
-                    .ssl()
-                    .ocsp_status()
-                    .map(<[u8]>::to_vec)
-                    .unwrap_or_default();
-                if let Some(key) = &self.resume {
-                    if let Some(session) = done.ssl().session() {
-                        keep_session(key, session.to_owned());
-                    }
+                self.ocsp = done.ssl().ocsp_status().map_or_default(<[u8]>::to_vec);
+                if let Some(key) = &self.resume
+                    && let Some(session) = done.ssl().session()
+                {
+                    keep_session(key, session.to_owned());
                 }
                 self.stream = Some(done);
                 Ok(())

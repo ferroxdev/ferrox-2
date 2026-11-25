@@ -543,13 +543,15 @@ mod tests {
             inner: Script::new(reply),
             polls: 3,
         };
-        assert!(connect(
-            &mut stream,
-            &Credential::default(),
-            &Destination::V4([127, 0, 0, 1], 80),
-            Version::V5,
-        )
-        .is_some());
+        assert!(
+            connect(
+                &mut stream,
+                &Credential::default(),
+                &Destination::V4([127, 0, 0, 1], 80),
+                Version::V5,
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -787,9 +789,11 @@ mod tests {
                 .expect("the refusal");
         });
         let mut session = Session::open4(client);
-        assert!(session
-            .connect4(&Destination::V4([10, 0, 0, 1], 80), &Credential::default())
-            .is_none());
+        assert!(
+            session
+                .connect4(&Destination::V4([10, 0, 0, 1], 80), &Credential::default())
+                .is_none()
+        );
     }
 
     #[test]
@@ -800,9 +804,11 @@ mod tests {
             let _ = server.read(&mut sink);
         });
         let mut session = Session::open4(client);
-        assert!(session
-            .connect4(&Destination::V6([0; 16], 80), &Credential::default())
-            .is_none());
+        assert!(
+            session
+                .connect4(&Destination::V6([0; 16], 80), &Credential::default())
+                .is_none()
+        );
     }
 
     #[test]
@@ -863,9 +869,11 @@ mod tests {
                 .expect("the refusal");
         });
         let mut session = Session::open(client, &Credential::default()).expect("a session");
-        assert!(session
-            .connect(&Destination::V4([10, 0, 0, 1], 80))
-            .is_none());
+        assert!(
+            session
+                .connect(&Destination::V4([10, 0, 0, 1], 80))
+                .is_none()
+        );
     }
 
     #[test]

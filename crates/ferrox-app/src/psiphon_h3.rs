@@ -686,15 +686,12 @@ mod tests {
     #[test]
     fn a_refused_front_drives_the_quic_timeout_path() {
         let mut dead = DeadFront::default();
-        assert!(dead
-            .receive(io_error(io::ErrorKind::ConnectionRefused), "receive", true)
-            .is_ok());
+        assert!(
+            dead.receive(io_error(io::ErrorKind::ConnectionRefused), "receive", true)
+                .is_ok()
+        );
         assert!(dead.0.is_some(), "the dead-front window is armed");
-        let why = dead
-            .0
-            .as_ref()
-            .map(|(_, why)| why.as_str())
-            .unwrap_or_default();
+        let why = dead.0.as_ref().map_or_default(|(_, why)| why.as_str());
         assert!(why.starts_with("psiphon h3 dead front: "));
         assert!(!why.contains("psiphon h3 receive:"));
     }

@@ -41,7 +41,7 @@ graph TD
 <!-- counts:begin -->
 | key | value | checked by |
 | --- | --- | --- |
-| ops-retired-instructions | 1292 | scripts/count-ops.sh |
+| ops-retired-instructions | 1285 | scripts/count-ops.sh |
 | syscalls-per-handshake | UNBLESSED | scripts/count-ops.sh |
 | trojan-tls-raw-down-8-ubuntu-x86-64-mib-per-second | 2814.1 | CI benchmark-matrix.yml trojan-tls-raw-down-8 |
 | password-bytes-on-the-wire | 56 | ferrox-app-proxy::tests::trojan_key_is_sha224_hex |
@@ -68,7 +68,7 @@ graph TD
   proxy::tests::the_trojan_header_costs_two_reads_not_seven 'proxy::decode_trojan_request'
 ```
 
-The frame is `decode_trojan_request` over three fixed in-memory headers. The domain form carries the literal `127.0.0.1`, so the byte-level IPv4 reader returns the address directly and neither `resolve_name` nor `getaddrinfo` is entered; the count is the header parse alone and reproduces across runs. It is **1292** retired instructions, blessed in `scripts/expected-ops.txt`; main's proxy landings added 110 while no line of the wrapper or of `decode_trojan_request_index` is younger than #44, so the inliner folded more of the callee into the wrapper and the work moved between symbols, not into the parse; `expected-ops.txt` blesses it as that tree's reading, not this branch's. The stats landing's indexed parser split added twelve when the wrapper the probe names began calling and destructuring `decode_trojan_request_index`, the domain arm's mux rendezvous comparison added three before that, three instructions on every domain header, and before that the frame read `1167`, before the literal arm and the word fold `80397` then `80812` across two runs of one binary because the resolver was inside it, and before the byte-level IPv4 reader `1315`. The wire bytes and the three-read domain parse are unchanged.
+The frame is `decode_trojan_request` over three fixed in-memory headers. The domain form carries the literal `127.0.0.1`, so the byte-level IPv4 reader returns the address directly and neither `resolve_name` nor `getaddrinfo` is entered; the count is the header parse alone and reproduces across runs. It is **1285** retired instructions under the 1.100 toolchain, blessed in `scripts/expected-ops.txt`; that toolchain moved the same frame from 1292 by seven with no line of the wrapper or of `decode_trojan_request_index` younger than #44, so codegen moved it, not the parse; main's proxy landings added 110 while no line of the wrapper or of `decode_trojan_request_index` is younger than #44, so the inliner folded more of the callee into the wrapper and the work moved between symbols, not into the parse; `expected-ops.txt` blesses it as that tree's reading, not this branch's. The stats landing's indexed parser split added twelve when the wrapper the probe names began calling and destructuring `decode_trojan_request_index`, the domain arm's mux rendezvous comparison added three before that, three instructions on every domain header, and before that the frame read `1167`, before the literal arm and the word fold `80397` then `80812` across two runs of one binary because the resolver was inside it, and before the byte-level IPv4 reader `1315`. The wire bytes and the three-read domain parse are unchanged.
 
 ## Time
 

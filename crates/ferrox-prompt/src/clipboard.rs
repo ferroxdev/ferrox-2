@@ -126,7 +126,7 @@ fn write_within(
                             return Err(std::io::Error::new(
                                 ErrorKind::TimedOut,
                                 format!("{program} exited before reading the text"),
-                            ))
+                            ));
                         }
                     }
                 }

@@ -302,9 +302,10 @@ mod tests {
         assert_eq!(plan.name, "bugfix-661");
         assert_eq!(plan.place, Place::Absent);
         assert_eq!(plan.path, scratch.0.join(format!("{DIR_PREFIX}bugfix-661")));
-        assert!(plan
-            .brief()
-            .contains("./scripts/new-worktree.sh bugfix-661"));
+        assert!(
+            plan.brief()
+                .contains("./scripts/new-worktree.sh bugfix-661")
+        );
     }
 
     #[test]
