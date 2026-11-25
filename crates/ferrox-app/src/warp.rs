@@ -1348,7 +1348,7 @@ fn should_reprovision(register: bool, refused: bool, enabled: bool) -> bool {
     register && refused && enabled
 }
 
-fn quarantine(path: &Path) {
+fn corrupt_target(path: &Path) -> PathBuf {
     let mut target = path.to_path_buf();
     let name = target.file_name().map_or_else(
         || "warp-identity.json".to_owned(),
@@ -1366,12 +1366,71 @@ fn quarantine(path: &Path) {
         }
         ordinal += 1;
     }
+    target
+}
+
+fn quarantine(path: &Path) {
+    let target = corrupt_target(path);
     if let Err(error) = std::fs::rename(path, &target) {
         eprintln!(
             "warp: the damaged identity at {} could not be moved aside: {error}",
             path.display()
         );
     }
+}
+
+fn backup_corrupt(path: &Path) -> Result<(), String> {
+    let target = corrupt_target(path);
+    let bytes = std::fs::read(path).map_err(|error| {
+        format!(
+            "warp: cannot read the damaged identity `{}`: {error}",
+            path.display()
+        )
+    })?;
+    let mut created = false;
+    let result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&target).map_err(|error| {
+            format!(
+                "warp: cannot preserve the damaged identity `{}`: {error}",
+                target.display()
+            )
+        })?;
+        created = true;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| {
+                    format!(
+                        "warp: cannot lock the damaged identity `{}`: {error}",
+                        target.display()
+                    )
+                })?;
+        }
+        file.write_all(&bytes).map_err(|error| {
+            format!(
+                "warp: cannot preserve the damaged identity `{}`: {error}",
+                target.display()
+            )
+        })?;
+        file.sync_all().map_err(|error| {
+            format!(
+                "warp: cannot sync the damaged identity `{}`: {error}",
+                target.display()
+            )
+        })
+    })();
+    if result.is_err() && created {
+        let _ = std::fs::remove_file(&target);
+    }
+    result
 }
 
 fn borrow_headers(headers: &[(String, String)]) -> Vec<(&str, &str)> {
@@ -1603,10 +1662,11 @@ impl Identity {
             .and_then(crate::json::Json::as_str)
             .unwrap_or_default()
             .to_owned();
-        let team = value
-            .get("team")
-            .and_then(crate::json::Json::as_str)
-            .map(str::to_owned);
+        let team = match value.get("team") {
+            None => None,
+            Some(crate::json::Json::Str(team)) => Some(team.clone()),
+            Some(_) => return Err("warp identity's `team` is not a string".to_owned()),
+        };
         let wireguard = value
             .get("wireguard")
             .ok_or("warp identity has no `wireguard`")?;
@@ -2498,7 +2558,10 @@ fn connect_status(head: &[u8]) -> Option<u16> {
     let dot = version.iter().position(|byte| *byte == b'.')?;
     let (major, minor) = version.split_at(dot);
     let minor = minor.get(1..)?;
-    if major.is_empty() || minor.is_empty() || !major.iter().chain(minor).all(u8::is_ascii_digit) {
+    if major.len() != 1
+        || minor.len() != 1
+        || !major.iter().chain(minor).all(u8::is_ascii_digit)
+    {
         return None;
     }
     if status.len() != 3 || !status.iter().all(u8::is_ascii_digit) {
@@ -2685,8 +2748,8 @@ fn resolve_for_mode(
 
 fn gateway_for(raw: Option<&str>, enabled: bool) -> Option<Gateway> {
     match raw {
-        Some(text) => match text.parse::<SocketAddr>() {
-            Ok(proxy) if enabled => {
+        Some(text) => match parse_endpoint(text) {
+            Some(proxy) if enabled => {
                 eprintln!(
                     "[+] gateway filtering active: http and https will traverse {proxy} inside the tunnel"
                 );
@@ -2695,14 +2758,14 @@ fn gateway_for(raw: Option<&str>, enabled: bool) -> Option<Gateway> {
                     healthy: AtomicBool::new(true),
                 })
             }
-            Ok(proxy) => {
+            Some(proxy) => {
                 eprintln!(
                     "warp: the organization publishes a gateway proxy at {proxy}; set `gateway: true` to send http and https through it"
                 );
                 None
             }
-            Err(_) => {
-                eprintln!("warp: ignoring malformed gateway proxy address {text}");
+            None => {
+                eprintln!("warp: ignoring malformed or unusable gateway proxy address {text}");
                 None
             }
         },
@@ -2898,19 +2961,42 @@ impl WarpOut {
         deadline: Instant,
     ) -> bool {
         let (ready, wait) = std::sync::mpsc::sync_channel(1);
+        let cancelled = Arc::new(AtomicBool::new(false));
         let queued = if let Some(masque) = &self.masque {
-            masque.serve_tcp(client, asked, prefix, Some(ready))
+            masque.serve_tcp_cancellable(
+                client,
+                asked,
+                prefix,
+                Some(ready),
+                Some(Arc::clone(&cancelled)),
+            )
         } else if let Some(gool) = &self.gool {
-            gool.outer.serve_tcp(client, asked, prefix, Some(ready))
+            gool.outer.serve_tcp_cancellable(
+                client,
+                asked,
+                prefix,
+                Some(ready),
+                Some(Arc::clone(&cancelled)),
+            )
         } else if let Some(mim) = &self.mim {
-            mim.outer.serve_tcp(client, asked, prefix, Some(ready))
+            mim.outer.serve_tcp_cancellable(
+                client,
+                asked,
+                prefix,
+                Some(ready),
+                Some(Arc::clone(&cancelled)),
+            )
         } else {
             false
         };
-        queued
+        let ready = queued
             && wait
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .unwrap_or(false)
+                .unwrap_or(false);
+        if !ready {
+            cancelled.store(true, Ordering::Release);
+        }
+        ready
     }
 
     pub(crate) fn edge(&self) -> Option<SocketAddr> {
@@ -3720,6 +3806,7 @@ fn provision_kind_with(
                         error.into_message(),
                         slot.label()
                     );
+                    backup_corrupt(&path)?;
                     let identity = register_identity(spec, slot.enrolls_masque())?;
                     identity.save(&path)?;
                     (identity, true)
@@ -4827,12 +4914,21 @@ mod tests {
         let paths = KeyPaths::new(&base, None, Some(&masque));
         let first = Slot::Masque.allocation(&paths);
         let mut saved = sample_identity();
+        saved.team = Some("acme".to_owned());
         saved.gateway = Some("http://gateway.example".to_owned());
         saved.save(&first).expect("the saved identity");
+        assert_eq!(
+            Identity::load(&first).expect("the saved identity").gateway,
+            Some("http://gateway.example".to_owned())
+        );
         let spec = WarpSpec {
             mode: Mode::Gool,
             identity_file: Some(base.clone()),
             masque_identity_file: Some(masque.clone()),
+            team: Some(crate::zerotrust::TeamSettings {
+                team: "acme".to_owned(),
+                ..crate::zerotrust::TeamSettings::default()
+            }),
             ..sample_spec()
         };
         let refresh = |_: &WarpSpec, saved: &Identity| {
@@ -5125,6 +5221,13 @@ mod tests {
     }
 
     #[test]
+    fn a_zero_port_gateway_is_not_a_proxy() {
+        assert!(gateway_for(Some("192.0.2.7:0"), true).is_none());
+        assert!(gateway_for(Some("[2001:db8::1]:0"), true).is_none());
+        assert!(gateway_for(Some("192.0.2.7:8080"), true).is_some());
+    }
+
+    #[test]
     fn a_personal_read_back_does_not_touch_the_gateway() {
         let spec = WarpSpec::for_command(Mode::Auto, None, None);
         let mut saved = sample_identity();
@@ -5310,6 +5413,19 @@ mod tests {
     }
 
     #[test]
+    fn a_non_string_identity_team_is_corrupt() {
+        let mut value = sample_identity().to_json();
+        match &mut value {
+            crate::json::Json::Obj(pairs) => {
+                pairs.push(("team".to_owned(), crate::json::Json::Num(42.0)));
+            }
+            _ => panic!("an identity is an object"),
+        }
+        let error = Identity::from_json(&value).expect_err("a non-string team");
+        assert!(error.contains("`team` is not a string"), "{error}");
+    }
+
+    #[test]
     fn a_refused_identity_is_replaced_only_when_registration_is_allowed() {
         assert!(should_reprovision(true, true, true));
         assert!(!should_reprovision(false, true, true));
@@ -5425,15 +5541,63 @@ mod tests {
         assert!(KeyKind::parse("other").is_err());
     }
 
+    fn without_access_env<T>(f: impl FnOnce() -> T) -> T {
+        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (name, value) in &self.0 {
+                    match value {
+                        Some(value) => std::env::set_var(*name, value),
+                        None => std::env::remove_var(*name),
+                    }
+                }
+            }
+        }
+        let _lock = crate::router::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let names = [
+            "AETHER_SCAN",
+            "AETHER_PEER",
+            "AETHER_WG_PEER",
+            "AETHER_IRONCLAD_PORT",
+            "AETHER_QUICK_RECONNECT",
+            "AETHER_WG_STALE_SECS",
+            "AETHER_WG_ENDPOINT_COOLDOWN_SECS",
+            "AETHER_WIW_OUTER_PEER",
+            "AETHER_WIW_INNER_PEER",
+            "AETHER_MIM_OUTER_PEER",
+            "AETHER_MIM_INNER_PEER",
+            "AETHER_MIM_PEERS",
+            "AETHER_QUIC_V2",
+            "AETHER_TEAM",
+            "AETHER_ACCESS_CLIENT_ID",
+            "AETHER_ACCESS_CLIENT_SECRET",
+            "AETHER_ACCESS_TOKEN",
+            "AETHER_ACCESS_EMAIL",
+            "AETHER_NOIZE",
+            "AETHER_WG_NO_PROFILE_RETRY",
+        ];
+        let restore = Restore(names.iter().map(|name| (*name, std::env::var_os(*name))).collect());
+        for name in names {
+            std::env::remove_var(name);
+        }
+        let result = f();
+        drop(restore);
+        result
+    }
+
     #[test]
     fn a_gool_mode_parses_the_inner_hop() {
-        let spec = WarpSpec::from(
-            &crate::json::parse(
-                r#"{"mode":"gool","register":true,"mtu":1500,"goolPeer":"192.0.2.9:2408","goolIdentityFile":"inner.json"}"#,
+        let spec = without_access_env(|| {
+            WarpSpec::from(
+                &crate::json::parse(
+                    r#"{"mode":"gool","register":true,"mtu":1500,"goolPeer":"192.0.2.9:2408","goolIdentityFile":"inner.json"}"#,
+                )
+                .expect("settings"),
             )
-            .expect("settings"),
-        )
-        .expect("a gool spec");
+            .expect("a gool spec")
+        });
         assert_eq!(spec.mode, Mode::Gool);
         assert_eq!(spec.mode.label(), "gool");
         assert_eq!(spec.mtu, 1500);
@@ -5453,13 +5617,15 @@ mod tests {
 
     #[test]
     fn a_gool_classic_mode_parses_both_hops() {
-        let spec = WarpSpec::from(
-            &crate::json::parse(
-                r#"{"mode":"gool-classic","register":true,"wiwOuter":"192.0.2.1:2408","wiwInner":"192.0.2.2:2408","goolIdentityFile":"inner.json"}"#,
+        let spec = without_access_env(|| {
+            WarpSpec::from(
+                &crate::json::parse(
+                    r#"{"mode":"gool-classic","register":true,"wiwOuter":"192.0.2.1:2408","wiwInner":"192.0.2.2:2408","goolIdentityFile":"inner.json"}"#,
+                )
+                .expect("settings"),
             )
-            .expect("settings"),
-        )
-        .expect("a gool-classic spec");
+            .expect("a gool-classic spec")
+        });
         assert_eq!(spec.mode, Mode::GoolClassic);
         assert_eq!(spec.mode.label(), "gool-classic");
         assert_eq!(
@@ -5753,6 +5919,25 @@ mod tests {
         let outbound = mim_outbound(&identity, &spec, local, 1182, 1252).expect("the inner hop");
         let budgets = crate::masque::parsed_budgets(&outbound).expect("the emitted outbound");
         assert_eq!(budgets, (1182, 1252));
+    }
+
+    #[test]
+    fn a_corrupt_identity_is_backed_up_without_moving_it() {
+        let dir = std::env::temp_dir().join(format!("ferrox-warp-backup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let path = dir.join("warp-identity.json");
+        std::fs::write(&path, b"damaged").expect("a damaged identity");
+        backup_corrupt(&path).expect("the backup");
+        assert_eq!(std::fs::read(&path).expect("the original"), b"damaged");
+        let backup = dir.join("warp-identity.json.corrupt");
+        assert_eq!(std::fs::read(&backup).expect("the backup"), b"damaged");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&backup).expect("the backup").permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        std::fs::remove_dir_all(&dir).expect("the scratch directory is removed");
     }
 
     #[test]
@@ -6569,6 +6754,8 @@ mod tests {
         );
         assert_eq!(connect_status(b"HTTP/1.1 200 \xff\r\n\r\n"), Some(200));
         assert_eq!(connect_status(b"HTTP/1.1 200 a\x01b\r\n\r\n"), None);
+        assert_eq!(connect_status(b"HTTP/11.1 200 OK\r\n\r\n"), None);
+        assert_eq!(connect_status(b"HTTP/1.11 200 OK\r\n\r\n"), None);
     }
 
     #[test]

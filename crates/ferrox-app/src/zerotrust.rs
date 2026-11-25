@@ -96,6 +96,18 @@ impl TeamSettings {
         })?;
         let ambient_team = env("AETHER_TEAM").and_then(|raw| normalize_team(&raw));
         let ambient_credentials = !explicit_team || ambient_team.as_deref() == Some(team.as_str());
+        let token = token
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                env("AETHER_ACCESS_TOKEN")
+                    .map(|text| text.trim().to_owned())
+                    .filter(|text| !text.is_empty())
+                    .filter(|token| {
+                        !explicit_team || jwt_team(token).as_deref() == Some(team.as_str())
+                    })
+            });
         Ok(Some(Self {
             team,
             client_id: if ambient_credentials {
@@ -108,7 +120,7 @@ impl TeamSettings {
             } else {
                 client_secret.map(str::to_owned)
             },
-            token: pick(token, "AETHER_ACCESS_TOKEN", &env),
+            token,
             email: pick(email, "AETHER_ACCESS_EMAIL", &env),
         }))
     }
@@ -397,6 +409,14 @@ fn query_value(url: &str, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn team_nonce(url: &str, team_domain: &str) -> Option<String> {
+    let expected = origin(team_domain)?;
+    if origin(url)? != expected {
+        return None;
+    }
+    query_value(url, "nonce")
 }
 
 fn percent_decode(raw: &str) -> String {
@@ -1199,8 +1219,8 @@ fn with_email_code(
             settings.team, sent.reply.status
         ));
     }
-    let nonce = query_value(&sent.url, "nonce")
-        .or_else(|| query_value(&landing.url, "nonce"))
+    let nonce = team_nonce(&landing.url, &settings.team_domain())
+        .or_else(|| team_nonce(&sent.url, &settings.team_domain()))
         .ok_or_else(|| {
             "warp: cloudflare did not return a nonce for the login code; the enrolment flow may have changed".to_owned()
         })?;
@@ -1429,6 +1449,48 @@ mod tests {
             .expect("the matching team")
             .expect("settings");
         assert!(matching.has_service_token());
+    }
+
+    #[test]
+    fn another_teams_ambient_token_is_not_used() {
+        let token = team_jwt("ambient", 4_102_444_800);
+        let env = |key: &str| match key {
+            "AETHER_TEAM" => Some("ambient".to_owned()),
+            "AETHER_ACCESS_TOKEN" => Some(token.clone()),
+            _ => None,
+        };
+        let explicit = TeamSettings::from_parts_with(Some("chosen"), None, None, None, None, &env)
+            .expect("the explicit team")
+            .expect("settings");
+        assert_eq!(explicit.token, None);
+        let matching = TeamSettings::from_parts_with(Some("ambient"), None, None, None, None, &env)
+            .expect("the matching team")
+            .expect("settings");
+        assert_eq!(matching.token.as_deref(), Some(token.as_str()));
+        let supplied = TeamSettings::from_parts_with(
+            Some("explicit"),
+            None,
+            None,
+            Some("supplied"),
+            None,
+            &env,
+        )
+        .expect("the supplied token")
+        .expect("settings");
+        assert_eq!(supplied.token.as_deref(), Some("supplied"));
+    }
+
+    #[test]
+    fn a_nonce_is_taken_only_from_the_team_origin() {
+        let domain = "https://acme.cloudflareaccess.com";
+        assert_eq!(
+            team_nonce("https://acme.cloudflareaccess.com/warp?nonce=abc", domain).as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            team_nonce("https://other.example/warp?nonce=abc", domain),
+            None
+        );
     }
 
     #[test]

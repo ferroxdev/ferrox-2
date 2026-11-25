@@ -143,6 +143,7 @@ pub(crate) struct ClientFlow {
     pub(crate) prefix: Vec<u8>,
     pub(crate) lease: Option<FlowLease>,
     pub(crate) ready: Option<std::sync::mpsc::SyncSender<bool>>,
+    pub(crate) cancelled: Option<Arc<AtomicBool>>,
 }
 
 /// Counts a live flow against the lane that carried it, and gives the count back when the
@@ -1723,6 +1724,13 @@ impl ClientStack {
     /// Race a client flow's destinations and keep the first connected socket.
     fn connect(&mut self, mut flow: ClientFlow) -> std::io::Result<()> {
         let ready = flow.ready.take();
+        if flow
+            .cancelled
+            .as_ref()
+            .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
+        {
+            return Ok(());
+        }
         let result = self.connect_flow(flow);
         if let Some(ready) = ready {
             let _ = ready.send(result.is_ok());
@@ -3681,6 +3689,7 @@ mod tests {
                 prefix: Vec::new(),
                 lease: None,
                 ready: None,
+                cancelled: None,
             })
             .expect("connect");
         stack.poll();
@@ -3714,6 +3723,7 @@ mod tests {
             prefix: Vec::new(),
             lease: None,
             ready: Some(ready),
+            cancelled: None,
         });
         assert!(result.is_err(), "port zero is not a TCP endpoint");
         assert!(
@@ -3722,6 +3732,25 @@ mod tests {
                 .expect("the setup result"),
             "the stack reported a failed flow as ready"
         );
+    }
+
+    /// An abandoned flow releases its client without opening a tunnel socket.
+    #[test]
+    fn an_abandoned_flow_does_not_open_a_socket() {
+        let (_app, proxy) = loopback().expect("pair");
+        let (to_tunnel, packets) = std::sync::mpsc::channel();
+        let mut stack = ClientStack::new(&device(&["10.0.0.2"], true), to_tunnel, 0);
+        let result = stack.connect(ClientFlow {
+            client: proxy,
+            destinations: vec!["192.0.2.1:80".parse().expect("destination")],
+            prefix: Vec::new(),
+            lease: None,
+            ready: None,
+            cancelled: Some(Arc::new(AtomicBool::new(true))),
+        });
+        assert!(result.is_ok(), "an abandoned flow is not a setup failure");
+        assert!(stack.flows.is_empty(), "no socket was opened");
+        assert!(packets.try_recv().is_err(), "no SYN was sent");
     }
 
     /// An upload is read straight into the socket's transmit ring: the reader
@@ -3868,6 +3897,7 @@ mod tests {
                 prefix: Vec::new(),
                 lease: None,
                 ready: None,
+                cancelled: None,
             })
             .expect("connect");
         stack.poll();
@@ -4712,6 +4742,7 @@ mod tests {
                 prefix: Vec::new(),
                 lease: None,
                 ready: None,
+                cancelled: None,
             })
             .expect("connect");
         stack.poll();
@@ -4735,6 +4766,7 @@ mod tests {
                 prefix: Vec::new(),
                 lease: None,
                 ready: None,
+                cancelled: None,
             })
             .expect("connect");
         stack.poll();
@@ -5975,6 +6007,7 @@ mod client_tests {
                 prefix: Vec::new(),
                 lease: None,
                 ready: None,
+                cancelled: None,
             })
             .expect("connect");
         stack.poll();

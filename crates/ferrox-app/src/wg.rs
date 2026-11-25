@@ -361,6 +361,7 @@ impl WireGuardOut {
                 prefix: prefix.to_vec(),
                 lease: None,
                 ready: None,
+                cancelled: None,
             })
             .is_err()
         {
@@ -1004,6 +1005,7 @@ impl WireGuardOut {
                 prefix: Vec::new(),
                 lease: None,
                 ready: None,
+                cancelled: None,
             })
             .is_err()
         {

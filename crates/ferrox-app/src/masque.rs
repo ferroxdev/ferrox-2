@@ -589,6 +589,17 @@ impl MasqueOut {
         prefix: &[u8],
         ready: Option<std::sync::mpsc::SyncSender<bool>>,
     ) -> bool {
+        self.serve_tcp_cancellable(client, asked, prefix, ready, None)
+    }
+
+    pub(crate) fn serve_tcp_cancellable(
+        &self,
+        client: Connection,
+        asked: &Destination,
+        prefix: &[u8],
+        ready: Option<std::sync::mpsc::SyncSender<bool>>,
+        cancelled: Option<Arc<AtomicBool>>,
+    ) -> bool {
         let (inner, lease) = match self.ensure_flow_at(Instant::now(), || open(&self.spec, false)) {
             Ok(lane) => lane,
             Err(reason) => {
@@ -608,6 +619,7 @@ impl MasqueOut {
                 prefix: prefix.to_vec(),
                 lease: Some(lease),
                 ready,
+                cancelled,
             })
             .is_err()
         {
