@@ -75,6 +75,8 @@ pub(crate) struct QuicDial {
     pub(crate) ech_config_list: Option<std::sync::Arc<[u8]>>,
     /// The controller this lane dials with when it names none: the Foxy service takes the reference's BBR, the raw QUIC transports keep quiche's CUBIC as the reference's do.
     pub(crate) default_cc: Option<ferrox_core::hysteria::Congestion>,
+    /// The v2 opener: a Foxy h3 dial sends a v2 Initial before the real handshake so a path that filters v1 sees the version it allows; every other dial keeps the wire it had.
+    pub(crate) quic_v2: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -4893,6 +4895,63 @@ fn peek(dial: &QuicDial) -> Option<PooledConn> {
         .and_then(|pool| pool.get(&key).cloned())
 }
 
+/// The long-header version a v1-only path is primed with: a bait carries the v2 version and the minimum Initial size, and a v1 server answers it with a version negotiation instead of a handshake.
+pub(crate) const QUIC_V2_VERSION: u32 = 0x6b33_43cf;
+pub(crate) const QUIC_V2_BAIT_LEN: usize = 1200;
+pub(crate) const QUIC_V2_BAIT_WAIT: Duration = Duration::from_millis(600);
+pub(crate) const QUIC_V2_VERIFY_WAIT: Duration = Duration::from_millis(500);
+pub(crate) const QUIC_V2_BAIT_TRIES: usize = 2;
+
+fn quic_varint2(value: u64) -> [u8; 2] {
+    (((value & 0x3fff) as u16) | 0x4000).to_be_bytes()
+}
+
+pub(crate) fn build_version_bait() -> [u8; QUIC_V2_BAIT_LEN] {
+    let mut dcid = [0u8; 8];
+    let mut scid = [0u8; 8];
+    let mut packet_number = [0u8; 4];
+    let _ = getrandom::fill(&mut dcid);
+    let _ = getrandom::fill(&mut scid);
+    let _ = getrandom::fill(&mut packet_number);
+
+    let mut bait = [0u8; QUIC_V2_BAIT_LEN];
+    let mut at = 0;
+    bait[at] = 0xc3;
+    at += 1;
+    bait[at..at + 4].copy_from_slice(&QUIC_V2_VERSION.to_be_bytes());
+    at += 4;
+    bait[at] = dcid.len() as u8;
+    at += 1;
+    bait[at..at + dcid.len()].copy_from_slice(&dcid);
+    at += dcid.len();
+    bait[at] = scid.len() as u8;
+    at += 1;
+    bait[at..at + scid.len()].copy_from_slice(&scid);
+    at += scid.len();
+    bait[at] = 0;
+    at += 1;
+    let remaining = QUIC_V2_BAIT_LEN - at - 2;
+    bait[at..at + 2].copy_from_slice(&quic_varint2(remaining as u64));
+    at += 2;
+    bait[at..at + packet_number.len()].copy_from_slice(&packet_number);
+    bait
+}
+
+pub(crate) fn send_version_bait(sock: &Datagram, peer: SocketAddr, wait: Duration, tries: usize) {
+    let bait = build_version_bait();
+    let mut answer = [0u8; 2048];
+    for _ in 0..tries.max(1) {
+        if sock.send_to(&bait, peer).is_err() {
+            return;
+        }
+        let _ = sock.set_read_timeout(Some(wait));
+        match sock.recv_from(&mut answer) {
+            Err(error) if crate::proxy::is_timeout(&error) => {}
+            _ => return,
+        }
+    }
+}
+
 fn build_pooled(dial: &QuicDial) -> Option<PooledConn> {
     build_pooled_within(dial, HANDSHAKE_TIMEOUT)
 }
@@ -4949,6 +5008,10 @@ fn build_pooled_within(dial: &QuicDial, budget: Duration) -> Option<PooledConn> 
         .with_options(flow.clone())
         .with_source(source);
         let bound = resolved.map(|_| Instant::now());
+        // One bait bounds the opener to a single wait: a path that answers the v2 Initial ends it early, and one that ignores it costs the wait once, not once per retry.
+        if dial.quic_v2 {
+            send_version_bait(&sock, peer, QUIC_V2_BAIT_WAIT, 1);
+        }
         let Some((conn, _early)) = handshake_within(
             &sock,
             peer,
@@ -7032,6 +7095,7 @@ mod tests {
             roots: None,
             ech_config_list: None,
             default_cc,
+            quic_v2: false,
         };
         let bbr = Some(ferrox_core::hysteria::Congestion::Bbr);
         assert_eq!(

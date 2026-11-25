@@ -10632,6 +10632,7 @@ pub(crate) mod loopback {
             roots: Some(roots.clone().into()),
             ech_config_list: None,
             default_cc: Some(ferrox_core::hysteria::Congestion::Bbr),
+            quic_v2: false,
         };
         let first = crate::quic::pooled_stream_within(&dial, crate::quic::HANDSHAKE_TIMEOUT)
             .expect("a pooled stream");
@@ -10706,6 +10707,7 @@ pub(crate) mod loopback {
             roots: Some(roots.clone().into()),
             ech_config_list: None,
             default_cc: Some(ferrox_core::hysteria::Congestion::Bbr),
+            quic_v2: false,
         };
         let mut last = None;
         for flow in 1..=crate::quic::MAX_FLOWS_ON_LANE {
