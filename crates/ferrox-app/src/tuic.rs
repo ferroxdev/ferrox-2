@@ -1154,6 +1154,7 @@ fn drive_client(weak: &std::sync::Weak<Lane>, direct: Receiver<DirectStream>) {
     let mut finished: Vec<DirectStream> = Vec::new();
     while let Some(lane) = weak.upgrade() {
         while let Ok(stream) = direct.try_recv() {
+            eprintln!("tuic entry {} entries {}", stream.id, entries.len() + 1);
             entries.push(stream);
         }
         if lane.stop.load(Ordering::Relaxed) {
