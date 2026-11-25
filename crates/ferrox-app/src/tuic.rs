@@ -453,7 +453,20 @@ impl TuicOut {
             return Some(lease);
         }
         if !self.reserve_expansion(&key, &held) {
-            return select(&held, true);
+            drop(held);
+            let deadline = Instant::now() + crate::budgets::dial();
+            loop {
+                let mut held = self.lanes.lock().ok()?;
+                prune_lanes(&mut held);
+                if let Some(lease) = select(&held, true) {
+                    return Some(lease);
+                }
+                drop(held);
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
         }
         drop(held);
         let expansion = Expansion {
