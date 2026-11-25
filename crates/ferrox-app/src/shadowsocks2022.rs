@@ -1573,12 +1573,13 @@ fn seal_all(
     }
     debug_assert!(buf.len() >= SEAL_HEAD + n + TAG_LEN);
     let end = SEAL_HEAD + n;
-    let mut length = (n as u16).to_be_bytes();
-    let length_tag = send.seal_piece_in_place(&mut length).ok_or_else(invalid)?;
+    buf[..LENGTH_LEN].copy_from_slice(&(n as u16).to_be_bytes());
+    let length_tag = send
+        .seal_piece_in_place(&mut buf[..LENGTH_LEN])
+        .ok_or_else(invalid)?;
     let tag = send
         .seal_piece_in_place(&mut buf[SEAL_HEAD..end])
         .ok_or_else(invalid)?;
-    buf[..LENGTH_LEN].copy_from_slice(&length);
     buf[LENGTH_LEN..SEAL_HEAD].copy_from_slice(&length_tag);
     buf[end..end + TAG_LEN].copy_from_slice(&tag);
     out.write_all(&buf[..end + TAG_LEN])
@@ -1611,6 +1612,9 @@ pub(crate) struct Datagrams {
     client_session: [u8; 8],
     list_psks: Vec<Vec<u8>>,
     list_hashes: Vec<[u8; BLOCK_LEN]>,
+    list_index: HashMap<[u8; BLOCK_LEN], usize>,
+    list_key_len: usize,
+    list_uniform: bool,
     #[cfg(test)]
     ledger: Ledger,
 }
@@ -1647,9 +1651,16 @@ impl Datagrams {
         }
         self.list_psks.clear();
         self.list_psks.extend_from_slice(psks);
+        self.list_key_len = psks.first().map_or(0, Vec::len);
+        self.list_uniform = psks.iter().all(|psk| psk.len() == self.list_key_len);
         self.list_hashes.clear();
-        for psk in psks {
-            self.list_hashes.push(shadowsocks2022::user_hash(psk));
+        self.list_index.clear();
+        for (at, psk) in psks.iter().enumerate() {
+            let hash = shadowsocks2022::user_hash(psk);
+            self.list_hashes.push(hash);
+            if at > 0 {
+                self.list_index.entry(hash).or_insert(at);
+            }
         }
         #[cfg(test)]
         {
@@ -1679,6 +1690,9 @@ impl Datagrams {
             client_session: [0u8; 8],
             list_psks: Vec::new(),
             list_hashes: Vec::new(),
+            list_index: HashMap::new(),
+            list_key_len: 0,
+            list_uniform: false,
             #[cfg(test)]
             ledger: Ledger::default(),
         }
@@ -1944,11 +1958,11 @@ impl Datagrams {
         psks: &[Vec<u8>],
         packet: &'a mut [u8],
     ) -> Option<(SocketAddr, &'a [u8], usize, u64)> {
-        if method.is_chacha() || psks.len() < 2 {
+        if method.is_chacha() || psks.len() < 2 || packet.len() < 32 + TAG_LEN {
             return None;
         }
-        let key_len = method.key_len();
-        if psks.iter().any(|p| p.len() != key_len) || packet.len() < 32 + TAG_LEN {
+        self.refresh_user_hashes(psks);
+        if !self.list_uniform || self.list_key_len != method.key_len() {
             return None;
         }
         let mut enc = [0u8; BLOCK_LEN];
@@ -1959,11 +1973,7 @@ impl Datagrams {
         let mut eih = [0u8; BLOCK_LEN];
         eih.copy_from_slice(&packet[16..32]);
         let hash = shadowsocks2022::decrypt_udp_eih(&psks[0], &raw, &eih)?;
-        self.refresh_user_hashes(psks);
-        let idx = self.list_hashes[1..]
-            .iter()
-            .position(|held| *held == hash)?
-            + 1;
+        let idx = *self.list_index.get(&hash)?;
         let mut nonce = [0u8; 12];
         nonce.copy_from_slice(&raw[4..16]);
         let held = self.sessions.get(&session);
@@ -2296,7 +2306,7 @@ fn parse_addr_header(buf: &[u8]) -> Option<(SocketAddr, usize)> {
 
 pub(crate) fn relay_udp_forward(
     relay_psk: &[u8],
-    dests: &[RelayDest<'_>],
+    dests: &RelayDests<'_>,
     packet: &[u8],
     out: &mut Vec<u8>,
 ) -> Option<(SocketAddr, u64)> {
@@ -2310,7 +2320,7 @@ pub(crate) fn relay_udp_forward(
     let mut eih = [0u8; BLOCK_LEN];
     eih.copy_from_slice(&packet[16..32]);
     let hash = shadowsocks2022::decrypt_udp_eih(relay_psk, &raw, &eih)?;
-    let dest = dests.iter().find(|dest| dest.hash == hash)?;
+    let dest = dests.get(hash)?;
     let re_enc = shadowsocks2022::block_encrypt(dest.psk, &raw)?;
     out.clear();
     out.reserve(16 + packet.len() - 32);
@@ -2319,23 +2329,33 @@ pub(crate) fn relay_udp_forward(
     Some((dest.addr, session))
 }
 
-/// One relay destination carrying the hash its key is matched by: `user_hash` reads only that key, so a forwarded datagram compares hashes it already has instead of deriving one per destination it might yet reach.
+/// One relay destination and the key it answers by: `user_hash` reads only that key, so a forwarded datagram compares the hash it already has instead of deriving one per destination it might yet reach.
 pub(crate) struct RelayDest<'a> {
-    hash: [u8; BLOCK_LEN],
     psk: &'a [u8],
     addr: SocketAddr,
 }
 
-/// The destinations as one relay sees them, hashed once for its whole life.
-pub(crate) fn relay_dests(dests: &[(Vec<u8>, SocketAddr)]) -> Vec<RelayDest<'_>> {
-    dests
-        .iter()
-        .map(|(psk, addr)| RelayDest {
-            hash: shadowsocks2022::user_hash(psk),
-            psk,
-            addr: *addr,
-        })
-        .collect()
+/// The destinations as one relay sees them, hashed once for its whole life and indexed by that hash
+/// so a forwarded datagram names its destination in one lookup instead of a walk.
+pub(crate) struct RelayDests<'a> {
+    hashed: Vec<RelayDest<'a>>,
+    by_hash: HashMap<[u8; BLOCK_LEN], usize>,
+}
+
+impl<'a> RelayDests<'a> {
+    fn get(&self, hash: [u8; BLOCK_LEN]) -> Option<&RelayDest<'a>> {
+        self.hashed.get(*self.by_hash.get(&hash)?)
+    }
+}
+
+pub(crate) fn relay_dests(dests: &[(Vec<u8>, SocketAddr)]) -> RelayDests<'_> {
+    let mut hashed = Vec::with_capacity(dests.len());
+    let mut by_hash = HashMap::with_capacity(dests.len());
+    for (at, (psk, addr)) in dests.iter().enumerate() {
+        by_hash.entry(shadowsocks2022::user_hash(psk)).or_insert(at);
+        hashed.push(RelayDest { psk, addr: *addr });
+    }
+    RelayDests { hashed, by_hash }
 }
 
 pub(crate) fn relay_udp_client_of(
@@ -4006,6 +4026,33 @@ mod tests {
             "a repeat size allocated no new buffer"
         );
         assert_eq!(out.capacity(), room, "a repeat size reallocated nothing");
+    }
+
+    /// The EIH names the destination, not its seat: a relocated entry still forwards to its own address, and two entries that hash alike keep the first.
+    #[test]
+    fn a_relayed_datagram_finds_its_destination_by_hash_not_by_walk() {
+        let method = Method::Aes256Gcm;
+        let relay_psk = vec![0x44u8; 32];
+        let dest_psk = vec![0x55u8; 32];
+        let first: SocketAddr = "127.0.0.1:8388".parse().expect("addr");
+        let second: SocketAddr = "127.0.0.1:8389".parse().expect("addr");
+        let target: SocketAddr = "127.0.0.1:53".parse().expect("addr");
+        let list = vec![relay_psk.clone(), dest_psk.clone()];
+        let mut client = Datagrams::new();
+        client.session = 0x2b2b_2b2b_2b2b_2b2b;
+        let packet = client
+            .seal_list(method, &list, &target, b"a-relayed-datagram")
+            .expect("seals")
+            .to_vec();
+        let mut out = Vec::new();
+        let dests = [(vec![0x99u8; 32], second), (dest_psk.clone(), first)];
+        let (got, _) =
+            relay_udp_forward(&relay_psk, &relay_dests(&dests), &packet, &mut out).expect("relays");
+        assert_eq!(got, first, "the hash names the entry, not its seat");
+        let dests = [(dest_psk.clone(), first), (dest_psk.clone(), second)];
+        let (got, _) =
+            relay_udp_forward(&relay_psk, &relay_dests(&dests), &packet, &mut out).expect("relays");
+        assert_eq!(got, first, "a repeated hash keeps the first entry");
     }
 
     #[test]
