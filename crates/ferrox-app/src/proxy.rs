@@ -76349,23 +76349,25 @@ mod tests {
         roots: Vec<Vec<u8>>,
         serve: crate::hysteria::Serve,
     ) -> (u16, Vec<Vec<u8>>) {
-        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
-        let port = probe.local_addr().expect("addr").port();
-        drop(probe);
-        let address = format!("127.0.0.1:{port}");
         let auths = vec![auth.to_owned()];
-        let obfs = obfs.to_owned();
+        let prepared = crate::hysteria::prepare(
+            "127.0.0.1:0",
+            &identity,
+            ferrox_core::hysteria::Congestion::Bbr,
+            obfs,
+            None,
+        )
+        .expect("prepares");
+        let port = prepared.local_addr().port();
 
         thread::spawn(move || {
-            crate::hysteria::serve_loop(
-                &address,
+            crate::hysteria::serve_prepared(
+                prepared,
                 &auths,
-                &identity,
-                ferrox_core::hysteria::Congestion::Bbr,
-                &obfs,
                 &masq,
                 &serve,
                 std::time::Duration::from_secs(60),
+                None,
                 None,
                 None,
             );
