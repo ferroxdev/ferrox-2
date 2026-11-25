@@ -616,6 +616,9 @@ impl TuicOut {
             quic::quiche_config_alpn(roots, self.cc.as_deref(), &[wire::ALPN])?
         };
         quic::tune_transport(&mut config);
+        if self.cc.is_none() {
+            let _ = config.set_cc_algorithm_name("bbr");
+        }
         config.enable_dgram(true, quic::MAX_DATAGRAM, DGRAM_SEND_QUEUE);
         if self.zero_rtt {
             config.enable_early_data();
@@ -625,7 +628,6 @@ impl TuicOut {
 
     pub(crate) fn dial(&self, client: &Connection, target: &Destination) {
         let Some(lane) = self.lane() else {
-            eprintln!("tuic dial no lane");
             return;
         };
         let (host, port): (Cow<'_, str>, u16) = match target {
@@ -634,37 +636,28 @@ impl TuicOut {
         };
         let mut header = Vec::with_capacity(host.len() + 5);
         if wire::encode_connect(host.as_ref(), port, &mut header).is_err() {
-            eprintln!("tuic dial header");
             return;
         }
         let deadline = Instant::now() + crate::budgets::dial();
         let Ok(mut next) = lane.next_bidi.lock() else {
-            eprintln!("tuic dial next lock");
             return;
         };
         let id = loop {
             if Instant::now() >= deadline {
-                eprintln!("tuic dial deadline");
                 return;
             }
             let credit = match lane.conn.lock() {
                 Ok(conn) if !conn.is_closed() => conn.peer_streams_left_bidi(),
-                _ => {
-                    eprintln!("tuic dial closed");
-                    return;
-                }
+                _ => return,
             };
             if credit > 0 {
-                eprintln!("tuic dial credit {credit} next {next}");
                 break *next;
             }
-            eprintln!("tuic dial wait credit {credit} next {next}");
             thread::sleep(Duration::from_millis(5));
         };
         *next = next.wrapping_add(4);
         drop(next);
         let Ok(tcp) = client.try_clone() else {
-            eprintln!("tuic dial tcp clone");
             return;
         };
         if tcp.set_nonblocking(true).is_err() {
@@ -1176,7 +1169,6 @@ fn drive_client(weak: &std::sync::Weak<Lane>, direct: Receiver<DirectStream>) {
     let mut finished: Vec<DirectStream> = Vec::new();
     while let Some(lane) = weak.upgrade() {
         while let Ok(stream) = direct.try_recv() {
-            eprintln!("tuic entry {} entries {}", stream.id, entries.len() + 1);
             entries.push(stream);
         }
         if lane.stop.load(Ordering::Relaxed) {
