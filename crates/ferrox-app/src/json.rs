@@ -490,6 +490,80 @@ fn next_in(bytes: &[u8], needles: &[u8]) -> Option<(usize, u8)> {
     None
 }
 
+/// What one walk finds: a comment or a comma that closes its array. A backslash outside a string
+/// is the one byte where the two quote rules disagree, and the caller settles it with both walks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shape {
+    Clean,
+    Comments,
+    Comma,
+    Diverged,
+}
+
+/// One walk answers both questions the strip asks, where two walks asked them one after the other.
+/// The state machine is `has_comments`'s, so a comma is only read outside a string under that same
+/// rule; the pass-2 answer differs only after an outside backslash, which returns `Diverged`.
+fn classify(bytes: &[u8]) -> Shape {
+    let mut at = 0usize;
+    let mut quote = 0u8;
+    let mut escaped = false;
+    let mut comma = false;
+    while at < bytes.len() {
+        if quote != 0 {
+            let escape = escaped;
+            escaped = false;
+            let Some((offset, special)) = next_in(&bytes[at..], &[quote, b'\\']) else {
+                break;
+            };
+            at += offset;
+            if escape && offset == 0 {
+                at += 1;
+                continue;
+            }
+            if special == b'\\' {
+                escaped = true;
+            } else {
+                quote = 0;
+            }
+            at += 1;
+            continue;
+        }
+        let Some((offset, special)) = next_in(&bytes[at..], b"\"'\\#/,") else {
+            break;
+        };
+        at += offset;
+        match special {
+            b'"' | b'\'' => {
+                quote = special;
+                at += 1;
+            }
+            b'#' => return Shape::Comments,
+            b'\\' => return Shape::Diverged,
+            b'/' => {
+                if matches!(bytes.get(at + 1), Some(b'/' | b'*')) {
+                    return Shape::Comments;
+                }
+                at += 1;
+            }
+            _ => {
+                if !comma {
+                    let mut next = at + 1;
+                    while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+                        next += 1;
+                    }
+                    comma = matches!(bytes.get(next), Some(b'}' | b']'));
+                }
+                at += 1;
+            }
+        }
+    }
+    if comma {
+        Shape::Comma
+    } else {
+        Shape::Clean
+    }
+}
+
 /// Whether a comment sits outside a string: read-only, and it stops at the first one.
 fn has_comments(bytes: &[u8]) -> bool {
     let mut at = 0usize;
@@ -744,15 +818,24 @@ fn compact_trailing(out: &mut [u8]) -> usize {
 }
 
 /// JSONC (also `.json5`): `//`, `/* */` and `#` comments and trailing commas, stripped outside
-/// strings so the strict parser sees the JSON the reference's permissive reader would. Two
-/// read-only walks find a comment and a comma that closes its array; a text with neither keeps its
-/// borrow, so an untouched config is allocated or copied zero times.
+/// strings so the strict parser sees the JSON the reference's permissive reader would. One
+/// read-only walk finds a comment or a comma that closes its array, and only a backslash outside a
+/// string sends the text to both exact walks; a text with neither keeps its borrow, so an untouched
+/// config is allocated or copied zero times.
 pub(crate) fn strip_jsonc(text: &str) -> std::borrow::Cow<'_, str> {
     let bytes = text.as_bytes();
-    let comments = has_comments(bytes);
-    if !comments && !has_trailing_comma(bytes) {
-        return std::borrow::Cow::Borrowed(text);
-    }
+    let comments = match classify(bytes) {
+        Shape::Clean => return std::borrow::Cow::Borrowed(text),
+        Shape::Comments => true,
+        Shape::Comma => false,
+        Shape::Diverged => {
+            let comments = has_comments(bytes);
+            if !comments && !has_trailing_comma(bytes) {
+                return std::borrow::Cow::Borrowed(text);
+            }
+            comments
+        }
+    };
     let mut out = if comments {
         let mut out = Vec::with_capacity(bytes.len());
         strip_comments(bytes, &mut out);
@@ -1360,6 +1443,44 @@ mod tests {
         );
     }
 
+    /// A 96-member array with no comment and no trailing comma; a const, so the frame is the pass.
+    const CLEAN_ARRAY: &str = r#"[{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":443},{"type":"field","port":1}]"#;
+
+    /// The same 96 members, each carrying a block comment, for the comment pass's frame.
+    const COMMENTED_ARRAY: &str = r#"{"k0":0 /* note 0 */,"k1":1 /* note 1 */,"k2":2 /* note 2 */,"k3":3 /* note 3 */,"k4":4 /* note 4 */,"k5":5 /* note 5 */,"k6":6 /* note 6 */,"k7":7 /* note 7 */,"k8":8 /* note 8 */,"k9":9 /* note 9 */,"k10":10 /* note 10 */,"k11":11 /* note 11 */,"k12":12 /* note 12 */,"k13":13 /* note 13 */,"k14":14 /* note 14 */,"k15":15 /* note 15 */,"k16":16 /* note 16 */,"k17":17 /* note 17 */,"k18":18 /* note 18 */,"k19":19 /* note 19 */,"k20":20 /* note 20 */,"k21":21 /* note 21 */,"k22":22 /* note 22 */,"k23":23 /* note 23 */,"k24":24 /* note 24 */,"k25":25 /* note 25 */,"k26":26 /* note 26 */,"k27":27 /* note 27 */,"k28":28 /* note 28 */,"k29":29 /* note 29 */,"k30":30 /* note 30 */,"k31":31 /* note 31 */,"k32":32 /* note 32 */,"k33":33 /* note 33 */,"k34":34 /* note 34 */,"k35":35 /* note 35 */,"k36":36 /* note 36 */,"k37":37 /* note 37 */,"k38":38 /* note 38 */,"k39":39 /* note 39 */,"k40":40 /* note 40 */,"k41":41 /* note 41 */,"k42":42 /* note 42 */,"k43":43 /* note 43 */,"k44":44 /* note 44 */,"k45":45 /* note 45 */,"k46":46 /* note 46 */,"k47":47 /* note 47 */,"k48":48 /* note 48 */,"k49":49 /* note 49 */,"k50":50 /* note 50 */,"k51":51 /* note 51 */,"k52":52 /* note 52 */,"k53":53 /* note 53 */,"k54":54 /* note 54 */,"k55":55 /* note 55 */,"k56":56 /* note 56 */,"k57":57 /* note 57 */,"k58":58 /* note 58 */,"k59":59 /* note 59 */,"k60":60 /* note 60 */,"k61":61 /* note 61 */,"k62":62 /* note 62 */,"k63":63 /* note 63 */,"k64":64 /* note 64 */,"k65":65 /* note 65 */,"k66":66 /* note 66 */,"k67":67 /* note 67 */,"k68":68 /* note 68 */,"k69":69 /* note 69 */,"k70":70 /* note 70 */,"k71":71 /* note 71 */,"k72":72 /* note 72 */,"k73":73 /* note 73 */,"k74":74 /* note 74 */,"k75":75 /* note 75 */,"k76":76 /* note 76 */,"k77":77 /* note 77 */,"k78":78 /* note 78 */,"k79":79 /* note 79 */,"k80":80 /* note 80 */,"k81":81 /* note 81 */,"k82":82 /* note 82 */,"k83":83 /* note 83 */,"k84":84 /* note 84 */,"k85":85 /* note 85 */,"k86":86 /* note 86 */,"k87":87 /* note 87 */,"k88":88 /* note 88 */,"k89":89 /* note 89 */,"k90":90 /* note 90 */,"k91":91 /* note 91 */,"k92":92 /* note 92 */,"k93":93 /* note 93 */,"k94":94 /* note 94 */,"k95":95 /* note 95 */,"z":0}"#;
+
+    /// The clean strip over a fixed buffer, kept out of line so `ops.yml` sees its frame.
+    #[inline(never)]
+    fn clean_strip_probe() -> usize {
+        let mut total = 0usize;
+        for _ in 0..64 {
+            total += strip_jsonc(std::hint::black_box(CLEAN_ARRAY)).len();
+        }
+        total
+    }
+
+    /// The comment-bearing strip over a fixed buffer, kept out of line for `ops.yml`.
+    #[inline(never)]
+    fn comment_strip_probe() -> usize {
+        let mut total = 0usize;
+        for _ in 0..64 {
+            total += strip_jsonc(std::hint::black_box(COMMENTED_ARRAY)).len();
+        }
+        total
+    }
+
+    /// Marks the clean strip's walk for the `ops.yml` report: one pass over a fixed buffer, no fixture.
+    #[test]
+    fn the_clean_strip_costs_no_walk() {
+        std::hint::black_box(clean_strip_probe());
+    }
+
+    /// Marks the comment-bearing strip's walk for the `ops.yml` report, the same way.
+    #[test]
+    fn the_comment_strip_costs_one_walk() {
+        std::hint::black_box(comment_strip_probe());
+    }
+
     /// The byte walk this file carried before it scanned runs, so a sweep proves the spans copy
     /// the same bytes the one-at-a-time loop did.
     #[allow(clippy::too_many_lines)]
@@ -1464,6 +1585,20 @@ mod tests {
         }
         out.truncate(write);
         String::from_utf8_lossy(&out).into_owned()
+    }
+
+    #[test]
+    fn one_walk_classifies_a_comment_a_comma_a_clean_text_and_a_divergence() {
+        assert_eq!(classify(br#"{"a":1}"#), Shape::Clean);
+        assert_eq!(classify(br#"{"a":1,}"#), Shape::Comma);
+        assert_eq!(classify(br#"{"a":[1,2,],"b":3}"#), Shape::Comma);
+        assert_eq!(classify(br#"{"a":","}"#), Shape::Clean);
+        assert_eq!(classify(br#"{"a":"x,}"#), Shape::Clean);
+        assert_eq!(classify(b"{} // note"), Shape::Comments);
+        assert_eq!(classify(b"{} /* note */"), Shape::Comments);
+        assert_eq!(classify(b"{}\n# note"), Shape::Comments);
+        assert_eq!(classify(br#"{"a":1\,}"#), Shape::Diverged);
+        assert_eq!(classify(b"{'a': ','}"), Shape::Clean);
     }
 
     #[test]
