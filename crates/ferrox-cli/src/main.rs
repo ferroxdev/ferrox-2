@@ -20,7 +20,9 @@ mod proxy;
 use std::fs::File;
 use std::io::{IsTerminal as _, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{exit, Command, Stdio};
+use std::process::exit;
+#[cfg(unix)]
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
