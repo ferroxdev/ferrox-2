@@ -27,6 +27,12 @@ const READ_WAIT: Duration = Duration::from_millis(10);
 const READ_TAIL: Duration = Duration::from_micros(250);
 /// The wait the first datagram of a batch takes after a client frame, so the stack's reply leaves on this turn instead of the next one.
 const GATHER_WAIT: Duration = Duration::from_micros(200);
+/// The rate the session spreads DATA writes over, so a window's worth of inner
+/// packets reaches the peer as a paced stream instead of one burst its stack
+/// drops: gVisor paces its sender, smoltcp emits the whole window at once.
+const PACE_RATE: f64 = 256.0 * 1024.0 * 1024.0;
+/// The credit a quiet session may burst before the rate binds.
+const PACE_BURST: f64 = 64.0 * 1024.0;
 const CLOSE_WAIT: Duration = Duration::from_millis(100);
 const UDP_DRAIN: Duration = Duration::from_secs(1);
 const WARP_ASSIGN_WAIT: Duration = Duration::from_millis(250);
@@ -454,6 +460,38 @@ fn cleartext_wire(stream: Connection) -> Wire {
         init: 0,
         closed: false,
         deadline,
+    }
+}
+
+/// A token bucket that spreads inner DATA over time, so the peer's stack never
+/// sees a burst larger than it can process before its next read.
+struct Pacer {
+    tokens: f64,
+    last: Instant,
+}
+
+impl Pacer {
+    fn new() -> Self {
+        Self {
+            tokens: PACE_BURST,
+            last: Instant::now(),
+        }
+    }
+
+    fn wait(&mut self, bytes: usize) {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.tokens = (self.tokens + PACE_RATE * elapsed).min(PACE_BURST);
+        let need = bytes as f64;
+        if self.tokens < need {
+            let pause = Duration::from_secs_f64((need - self.tokens) / PACE_RATE);
+            std::thread::sleep(pause);
+            self.tokens = 0.0;
+            self.last = Instant::now();
+        } else {
+            self.tokens -= need;
+        }
     }
 }
 
@@ -1346,6 +1384,7 @@ struct Session {
     diag_at: Instant,
     ping_at: Option<Instant>,
     next_ping: Instant,
+    pacer: Pacer,
     end: bool,
 }
 
@@ -1378,6 +1417,7 @@ impl Session {
             diag_at: Instant::now(),
             ping_at: None,
             next_ping: Instant::now() + Duration::from_secs(1),
+            pacer: Pacer::new(),
             end: false,
         }
     }
@@ -1843,6 +1883,7 @@ impl Session {
             frame.resize(FRAME_HEAD, 0);
             frame.extend_from_slice(&answer[start..start + take]);
             frame[..FRAME_HEAD].copy_from_slice(&h2::frame_head(take, h2::T_DATA, 0, id));
+            self.pacer.wait(frame.len());
             if !wire.send_frame(frame) {
                 return;
             }
@@ -1963,6 +2004,7 @@ impl Session {
             && body.len() <= MAX_FRAME_BODY
             && length <= self.send_window.min(self.connection_window)
         {
+            self.pacer.wait(frame.len());
             if wire.send_frame(frame) {
                 self.send_window -= length;
                 self.connection_window -= length;
