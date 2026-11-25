@@ -2558,10 +2558,7 @@ fn connect_status(head: &[u8]) -> Option<u16> {
     let dot = version.iter().position(|byte| *byte == b'.')?;
     let (major, minor) = version.split_at(dot);
     let minor = minor.get(1..)?;
-    if major.len() != 1
-        || minor.len() != 1
-        || !major.iter().chain(minor).all(u8::is_ascii_digit)
-    {
+    if major.len() != 1 || minor.len() != 1 || !major.iter().chain(minor).all(u8::is_ascii_digit) {
         return None;
     }
     if status.len() != 3 || !status.iter().all(u8::is_ascii_digit) {
@@ -5578,7 +5575,12 @@ mod tests {
             "AETHER_NOIZE",
             "AETHER_WG_NO_PROFILE_RETRY",
         ];
-        let restore = Restore(names.iter().map(|name| (*name, std::env::var_os(*name))).collect());
+        let restore = Restore(
+            names
+                .iter()
+                .map(|name| (*name, std::env::var_os(*name)))
+                .collect(),
+        );
         for name in names {
             std::env::remove_var(name);
         }
@@ -5934,7 +5936,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            let mode = std::fs::metadata(&backup).expect("the backup").permissions().mode();
+            let mode = std::fs::metadata(&backup)
+                .expect("the backup")
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
         std::fs::remove_dir_all(&dir).expect("the scratch directory is removed");
