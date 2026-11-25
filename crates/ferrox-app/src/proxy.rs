@@ -42958,6 +42958,7 @@ pub(crate) fn send_to_two(
 }
 
 /// The platform call behind `send_two` and `send_to_two`.
+#[allow(clippy::cast_possible_wrap)] // `msg_iovlen` is `i32` on Apple/BSD; two iovecs never wrap it.
 fn send_parts(
     socket: &UdpSocket,
     first: &[u8],
