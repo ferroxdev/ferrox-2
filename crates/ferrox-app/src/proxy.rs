@@ -76324,7 +76324,7 @@ mod tests {
         serve: crate::hysteria::Serve,
     ) -> (u16, Vec<Vec<u8>>) {
         let (identity, roots) = minted_tls_identity("localhost");
-        hysteria_loop_with_identity(auth, obfs, masq, identity, roots, serve)
+        hysteria_loop_with_identity(auth, obfs, masq, &identity, roots, serve)
     }
 
     fn hysteria_loop_identity(
@@ -76338,21 +76338,21 @@ mod tests {
         let serve: crate::hysteria::Serve = Arc::new(move |flow| {
             serve_vless_hysteria(flow, &one_vless_user(&id), true);
         });
-        hysteria_loop_with_identity(auth, obfs, masq, identity, roots, serve)
+        hysteria_loop_with_identity(auth, obfs, masq, &identity, roots, serve)
     }
 
     fn hysteria_loop_with_identity(
         auth: &str,
         obfs: &str,
         masq: ferrox_core::hysteria::Masquerade,
-        identity: Arc<ferrox_core::tls::TlsServerConfig>,
+        identity: &Arc<ferrox_core::tls::TlsServerConfig>,
         roots: Vec<Vec<u8>>,
         serve: crate::hysteria::Serve,
     ) -> (u16, Vec<Vec<u8>>) {
         let auths = vec![auth.to_owned()];
         let prepared = crate::hysteria::prepare(
             "127.0.0.1:0",
-            &identity,
+            identity,
             ferrox_core::hysteria::Congestion::Bbr,
             obfs,
             None,
