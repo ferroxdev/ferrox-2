@@ -1397,7 +1397,7 @@ fn pump_direct(
     streams: &mut Vec<DirectStream>,
     finished: &mut Vec<DirectStream>,
 ) {
-    let mut buf = [0u8; 64 * 1024];
+    let mut buf = [0u8; DIRECT_BUFFER];
     let mut at = 0;
     while at < streams.len() {
         if pump_direct_stream(conn, &mut streams[at], &mut buf) {
@@ -1416,27 +1416,27 @@ fn pump_direct_stream(
     if stream.closed {
         return true;
     }
-    send_direct(conn, stream);
+    send_pending(conn, stream);
     if stream.closed {
         return true;
     }
-    read_tcp(conn, stream, buf);
+    if stream.out.is_empty() {
+        pump_upload(conn, stream, buf);
+    }
     if stream.closed {
         return true;
     }
-    send_direct(conn, stream);
+    write_pending(conn, stream);
     if stream.closed {
         return true;
     }
-    write_tcp(conn, stream);
+    if stream.inbound.is_empty() && !stream.peer_fin {
+        pump_download(conn, stream, buf);
+    }
     if stream.closed {
         return true;
     }
-    read_quic(conn, stream, buf);
-    if stream.closed {
-        return true;
-    }
-    write_tcp(conn, stream);
+    write_pending(conn, stream);
     if stream.closed {
         return true;
     }
@@ -1462,7 +1462,7 @@ fn pump_direct_stream(
         && stream.inbound.is_empty()
 }
 
-fn send_direct(conn: &mut QuicheConnection, stream: &mut DirectStream) {
+fn send_pending(conn: &mut QuicheConnection, stream: &mut DirectStream) {
     while !stream.out.is_empty() {
         let sent = conn.stream_send(stream.id, &stream.out, false);
         match sent {
@@ -1479,63 +1479,87 @@ fn send_direct(conn: &mut QuicheConnection, stream: &mut DirectStream) {
     }
 }
 
-fn read_tcp(conn: &mut QuicheConnection, stream: &mut DirectStream, buf: &mut [u8]) {
-    while !stream.read_eof && stream.out.len() < DIRECT_BUFFER {
-        let want = (DIRECT_BUFFER - stream.out.len()).min(buf.len());
-        let read = stream.tcp.read(&mut buf[..want]);
-        match read {
-            Ok(0) => {
-                stream.read_eof = true;
-                break;
+fn pump_upload(conn: &mut QuicheConnection, stream: &mut DirectStream, buf: &mut [u8]) {
+    if stream.read_eof {
+        return;
+    }
+    let read = stream.tcp.read(buf);
+    match read {
+        Ok(0) => stream.read_eof = true,
+        Ok(n) => {
+            let mut at = 0;
+            while at < n {
+                let sent = conn.stream_send(stream.id, &buf[at..n], false);
+                match sent {
+                    Ok(0) | Err(quiche::Error::Done) => {
+                        stream.out.extend_from_slice(&buf[at..n]);
+                        break;
+                    }
+                    Ok(sent) => {
+                        at += sent;
+                        stream.meter.write(sent);
+                    }
+                    Err(_) => {
+                        abort_direct(conn, stream);
+                        return;
+                    }
+                }
             }
-            Ok(n) => stream.out.extend_from_slice(&buf[..n]),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => {
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+        Err(_) => abort_direct(conn, stream),
+    }
+}
+
+fn pump_download(conn: &mut QuicheConnection, stream: &mut DirectStream, buf: &mut [u8]) {
+    if stream.peer_fin {
+        return;
+    }
+    let received = conn.stream_recv(stream.id, buf);
+    match received {
+        Ok((0, fin)) => {
+            if fin {
+                stream.peer_fin = true;
+            }
+        }
+        Ok((n, fin)) => {
+            stream.meter.read(n);
+            if fin {
+                stream.peer_fin = true;
+            }
+            let mut at = 0;
+            while at < n {
+                let written = stream.tcp.write(&buf[at..n]);
+                match written {
+                    Ok(0) => {
+                        abort_direct(conn, stream);
+                        return;
+                    }
+                    Ok(written) => at += written,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        stream.inbound.extend_from_slice(&buf[at..n]);
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => {
+                        abort_direct(conn, stream);
+                        return;
+                    }
+                }
+            }
+        }
+        Err(quiche::Error::Done) => {}
+        Err(quiche::Error::StreamReset(_)) => abort_direct(conn, stream),
+        Err(_) => {
+            if conn.is_closed() || conn.is_draining() {
                 abort_direct(conn, stream);
-                return;
             }
         }
     }
 }
 
-fn read_quic(conn: &mut QuicheConnection, stream: &mut DirectStream, buf: &mut [u8]) {
-    while !stream.peer_fin && stream.inbound.len() < DIRECT_BUFFER {
-        let want = (DIRECT_BUFFER - stream.inbound.len()).min(buf.len());
-        let received = conn.stream_recv(stream.id, &mut buf[..want]);
-        match received {
-            Ok((0, fin)) => {
-                if fin {
-                    stream.peer_fin = true;
-                }
-                break;
-            }
-            Ok((n, fin)) => {
-                stream.inbound.extend_from_slice(&buf[..n]);
-                stream.meter.read(n);
-                if fin {
-                    stream.peer_fin = true;
-                }
-                if n < want {
-                    break;
-                }
-            }
-            Err(quiche::Error::Done) => break,
-            Err(quiche::Error::StreamReset(_)) => {
-                abort_direct(conn, stream);
-                return;
-            }
-            Err(_) => {
-                if conn.is_closed() || conn.is_draining() {
-                    abort_direct(conn, stream);
-                }
-                break;
-            }
-        }
-    }
-}
-
-fn write_tcp(conn: &mut QuicheConnection, stream: &mut DirectStream) {
+fn write_pending(conn: &mut QuicheConnection, stream: &mut DirectStream) {
     while !stream.inbound.is_empty() {
         let written = stream.tcp.write(&stream.inbound);
         match written {
