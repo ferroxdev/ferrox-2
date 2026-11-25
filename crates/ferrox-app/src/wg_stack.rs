@@ -3813,7 +3813,10 @@ mod tests {
         stack.poll();
         assert_eq!(stack.flows.len(), 1);
         let port = stack.flows[0].local_port;
-        stack.started = StdInstant::now() - crate::budgets::dial() - Duration::from_millis(1);
+        stack.started = StdInstant::now()
+            .checked_sub(crate::budgets::dial())
+            .and_then(|past| past.checked_sub(Duration::from_millis(1)))
+            .expect("the dial timeout fits before now");
         stack.poll();
         assert!(stack.flows.is_empty(), "the unanswered connect timed out");
         assert!(!stack.ports.contains(&port), "its local port was released");
