@@ -844,7 +844,7 @@ warp_classic_client_settings() {
   inner_private="$(matrix_wireguard_inner_engine_private "$engine")" || return 1
   inner_v4="$(matrix_wireguard_inner_engine_v4 "$engine")" || return 1
   inner_v6="$(matrix_wireguard_inner_engine_v6 "$engine")" || return 1
-  echo "\"tag\": \"proxy\", \"protocol\": \"warp\", \"settings\": {\"mode\": \"gool-classic\", \"identity\": $(wireguard_identity "$outer_private" "$(matrix_wireguard_server_public)" "127.0.0.1:$outer_port" "${outer_v4%/32}" "${outer_v6%/128}"), \"goolIdentity\": $(wireguard_identity "$inner_private" "$(matrix_wireguard_inner_server_public)" "127.0.0.1:$inner_port" "${inner_v4%/32}" "${inner_v6%/128}"), \"wiwOuter\": \"127.0.0.1:$outer_port\", \"wiwInner\": \"127.0.0.1:$inner_port\", \"mtu\": 1280}"
+  echo "\"tag\": \"proxy\", \"protocol\": \"warp\", \"settings\": {\"mode\": \"gool-classic\", \"identity\": $(wireguard_identity "$outer_private" "$(matrix_wireguard_server_public)" "127.0.0.1:$outer_port" "${outer_v4%/32}" "${outer_v6%/128}"), \"goolIdentity\": $(wireguard_identity "$inner_private" "$(matrix_wireguard_inner_server_public)" "127.0.0.2:$inner_port" "${inner_v4%/32}" "${inner_v6%/128}"), \"wiwOuter\": \"127.0.0.1:$outer_port\", \"wiwInner\": \"127.0.0.2:$inner_port\", \"mtu\": 1280}"
 }
 
 warp_gool_client_settings() {
@@ -1080,7 +1080,7 @@ scenario_config() {
     masque-h2-*) server_config "$(masque_server_settings h2)" "$(masque_client_settings "$port" h2)" "$port" ;;
     masque-*) server_config "$(masque_server_settings)" "$(masque_client_settings "$port")" "$port" ;;
     warp-masque-*) server_config "$(masque_server_settings)" "$(warp_client_settings "$port")" "$port" ;;
-    warp-gool-classic-*) nested_server_config "$port" "$inner" "$(wireguard_classic_server)" "$(wireguard_inner_server)" "$(warp_classic_client_settings "$port" "$inner")" ;;
+    warp-gool-classic-*) nested_server_config "$port" "$inner" "$(wireguard_classic_server)" "$(wireguard_inner_server)" "$(warp_classic_client_settings "$port" "$inner")" "127.0.0.2" ;;
     warp-gool-*) nested_server_config "$port" "$inner" "$(masque_server_settings)" "$(wireguard_inner_server)" "$(warp_gool_client_settings "$port" "$inner")" ;;
     warp-mim-*) nested_server_config "$port" "$inner" "$(masque_server_settings)" "$(masque_inner_server_settings)" "$(warp_mim_client_settings "$port" "$inner")" "127.0.0.2" ;;
     socks-raw-*) server_config "$(socks_server)" "$(socks_client "$port")" "$port" ;;
