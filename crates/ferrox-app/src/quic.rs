@@ -3,7 +3,7 @@ use bytes::BufMut as _;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
-use std::net::{IpAddr, Shutdown, SocketAddr, ToSocketAddrs as _, UdpSocket};
+use std::net::{IpAddr, Shutdown, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -5129,10 +5129,7 @@ fn build_pooled_within(dial: &QuicDial, budget: Duration) -> Option<PooledConn> 
     let roots = dial.roots.as_deref().unwrap_or(&[]);
     let built = crate::foxy::debug_on().then(Instant::now);
     // One attempt per resolved address: the first answer is not always the reachable one.
-    let peers: Vec<SocketAddr> = format!("{}:{}", dial.address, dial.port)
-        .to_socket_addrs()
-        .ok()?
-        .collect();
+    let peers = crate::proxy::resolve_edge_addrs(&dial.address, dial.port)?;
     let resolved = built.map(|_| Instant::now());
     // One hop per connection, not per address. An HTTP hop is TCP-only: refusing beats bypassing the proxy.
     let relay = match dial.upstream.as_ref() {

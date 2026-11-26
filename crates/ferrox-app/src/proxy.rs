@@ -16039,6 +16039,30 @@ pub(crate) fn resolve_outbound(address: &str, port: u16) -> Option<SocketAddr> {
     resolve_outbound_stopping(address, port, stop.as_deref())
 }
 
+/// Every address an outbound edge names, resolved through the relay's own resolver on
+/// the local dial. A domain edge must resolve before the outbound that would carry a
+/// routed query is open, or a captured stub resolver deadlocks against the proxy.
+pub(crate) fn resolve_edge_addrs(host: &str, port: u16) -> Option<Vec<SocketAddr>> {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Some(vec![SocketAddr::new(ip, port)]);
+    }
+    let addrs: Vec<SocketAddr> = if let Some(resolver) = crate::dnsapp::installed() {
+        let (ips, _) = resolver.lookup_local(host)?;
+        ips.into_iter()
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect()
+    } else {
+        (host, port).to_socket_addrs().ok()?.collect()
+    };
+    if addrs.is_empty() {
+        return None;
+    }
+    for addr in &addrs {
+        crate::tun_route::pin_dialled(addr.ip());
+    }
+    Some(addrs)
+}
+
 fn resolve_outbound_stopping(
     address: &str,
     port: u16,
