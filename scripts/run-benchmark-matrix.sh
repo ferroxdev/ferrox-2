@@ -591,7 +591,8 @@ while read -r id traffic connections iterations payload duration_ms; do
     continue
   fi
   if matrix_warp_needs_external_reference "$id" \
-    && ! engine_path aether >/dev/null; then
+    && ! engine_path aether >/dev/null \
+    && [[ -z "${PROFILE_DIR:-}" ]]; then
     skip_scenario_cells "$id" "no external WARP reference on this host"
     continue
   fi
