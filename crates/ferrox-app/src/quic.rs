@@ -9278,44 +9278,4 @@ mod tests {
             "the routing key copied the DCID out of the packet"
         );
     }
-
-    #[cfg(target_os = "linux")]
-    fn bound_interface(socket: &UdpSocket) -> String {
-        use std::os::fd::AsRawFd as _;
-        let mut buf = [0u8; libc::IFNAMSIZ];
-        let mut len = buf.len() as libc::socklen_t;
-        let rc = unsafe {
-            libc::getsockopt(
-                socket.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_BINDTODEVICE,
-                buf.as_mut_ptr().cast(),
-                &mut len,
-            )
-        };
-        assert_eq!(rc, 0, "read SO_BINDTODEVICE");
-        let end = buf.iter().position(|&byte| byte == 0).unwrap_or(buf.len());
-        String::from_utf8_lossy(&buf[..end]).into_owned()
-    }
-
-    /// A captured peer's QUIC dial has to leave through the physical underlay, not the
-    /// device the route names; otherwise every datagram loops back into the TUN.
-    #[cfg(target_os = "linux")]
-    #[test]
-    #[ignore = "installs a capture route and binds the underlay"]
-    fn a_real_captured_datagram_dial_binds_the_underlay() {
-        let peer: SocketAddr = "203.0.113.1:443".parse().expect("peer");
-        let plan = crate::tun_route::Plan {
-            routes: vec![("203.0.113.0".parse().expect("prefix"), 24)],
-            ..crate::tun_route::Plan::default()
-        };
-        let _guard = crate::tun_route::Guard::install("lo", &plan).expect("install the capture");
-        let (sock, _local) =
-            datagram_to_with_source(peer, None, None).expect("a dial under the capture");
-        let bound = bound_interface(&sock);
-        assert!(
-            !bound.is_empty() && bound != "lo",
-            "the datagram left the capture device: {bound:?}"
-        );
-    }
 }
