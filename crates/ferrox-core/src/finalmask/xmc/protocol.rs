@@ -97,32 +97,24 @@ pub fn read_varint_with_length<R: Read>(reader: &mut R) -> io::Result<(Varint, u
 }
 
 pub fn write_varint<W: Write>(writer: &mut W, value: Varint) -> io::Result<()> {
+    let size = varint_size(value);
+    let mut bytes = [0u8; 5];
     let mut remaining = value as u32;
-    loop {
+    for slot in &mut bytes[..size] {
         let mut current = (remaining & u32::from(SEGMENT_BITS)) as u8;
         remaining >>= 7;
         if remaining != 0 {
             current |= CONTINUE_BIT;
         }
-        writer.write_all(&[current])?;
-        if remaining == 0 {
-            return Ok(());
-        }
+        *slot = current;
     }
+    writer.write_all(&bytes[..size])
 }
 
 #[must_use]
-pub fn varint_size(value: Varint) -> usize {
-    let mut remaining = value as u32;
-    let mut size = 0;
-    for _ in 0..5 {
-        size += 1;
-        remaining >>= 7;
-        if remaining == 0 {
-            break;
-        }
-    }
-    size
+pub const fn varint_size(value: Varint) -> usize {
+    let size = (value as u32).bit_width().div_ceil(7) as usize;
+    if size == 0 { 1 } else { size }
 }
 
 pub fn read_string<R: Read>(reader: &mut R) -> io::Result<String> {
@@ -305,6 +297,34 @@ mod tests {
         let mut reader: &[u8] = &[0xff, 0xff, 0xff, 0xff, 0x1f];
         let error = read_varint(&mut reader).expect_err("too large");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    struct Writes {
+        bytes: Vec<u8>,
+        calls: usize,
+    }
+
+    impl Write for Writes {
+        fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+            self.calls += 1;
+            self.bytes.extend_from_slice(input);
+            Ok(input.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_varint_leaves_in_one_write() {
+        let mut writer = Writes {
+            bytes: Vec::new(),
+            calls: 0,
+        };
+        write_varint(&mut writer, 268_435_455).expect("writes");
+        assert_eq!(writer.calls, 1, "a multi-byte varint is one write");
+        assert_eq!(writer.bytes, [0xff, 0xff, 0xff, 0x7f]);
     }
 
     #[test]

@@ -2073,13 +2073,27 @@ impl<S: Stream> Session13<S> {
             if self.read_finished()? {
                 return Ok(());
             }
-            let mut buf = [0u8; 16_384];
-            match self.io.read(&mut buf) {
+            match self.read_more(16_384) {
                 Ok(0) => return Err(TlsError::Closed),
-                Ok(n) => self.inbuf.extend_from_slice(&buf[..n]),
+                Ok(_) => {}
                 Err(error) if TlsError::is_timeout(&error) => return Err(TlsError::Timeout),
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(error) => return Err(TlsError::from(error)),
+            }
+        }
+    }
+
+    fn read_more(&mut self, room: usize) -> std::io::Result<usize> {
+        let at = self.inbuf.len();
+        self.inbuf.resize(at + room, 0);
+        match self.io.read(&mut self.inbuf[at..]) {
+            Ok(read) => {
+                self.inbuf.truncate(at + read);
+                Ok(read)
+            }
+            Err(error) => {
+                self.inbuf.truncate(at);
+                Err(error)
             }
         }
     }
@@ -2092,42 +2106,60 @@ impl<S: Stream> Session13<S> {
             if self.inbuf.len() < 5 + len {
                 return Ok(false);
             }
-            let mut body = self.inbuf[5..5 + len].to_vec();
-            self.inbuf.drain(..5 + len);
             match header[0] {
-                0x14 => continue,
-                0x15 => return Err(TlsError::Closed),
+                0x14 => {
+                    self.inbuf.drain(..5 + len);
+                    continue;
+                }
+                0x15 => {
+                    self.inbuf.drain(..5 + len);
+                    return Err(TlsError::Closed);
+                }
                 0x17 => {}
                 _ => {
+                    self.inbuf.drain(..5 + len);
                     return Err(TlsError::Other(
                         "reality: unexpected record type".to_owned(),
                     ));
                 }
             }
-            let keys = self
-                .client_hs
-                .as_mut()
-                .ok_or_else(|| TlsError::Other("reality: no client handshake keys".to_owned()))?;
-            let (kind, plen) = crate::tls::shaped::record::open13(keys, header, &mut body)?;
+            let Some(keys) = self.client_hs.as_mut() else {
+                self.inbuf.drain(..5 + len);
+                return Err(TlsError::Other(
+                    "reality: no client handshake keys".to_owned(),
+                ));
+            };
+            let opened = {
+                let body = &mut self.inbuf[5..5 + len];
+                crate::tls::shaped::record::open13(keys, header, body)
+            };
+            let (kind, plen) = match opened {
+                Ok(opened) => opened,
+                Err(error) => {
+                    self.inbuf.drain(..5 + len);
+                    return Err(error);
+                }
+            };
             match kind {
                 22 => {
-                    self.hs.extend_from_slice(&body[..plen]);
+                    self.hs.extend_from_slice(&self.inbuf[5..5 + plen]);
+                    self.inbuf.drain(..5 + len);
                     if self.hs.len() >= 4 {
                         let len = u24(&self.hs[1..4]).unwrap_or(usize::MAX);
                         if self.hs.len() < 4 + len {
                             return Ok(false);
                         }
-                        let message: Vec<u8> = self.hs.drain(..4 + len).collect();
-                        if message[0] != 20 {
+                        if self.hs[0] != 20 {
                             return Err(TlsError::Other(
                                 "reality: expected the client Finished".to_owned(),
                             ));
                         }
-                        if message[4..] != self.expected_finished[..] {
+                        if self.hs[4..4 + len] != self.expected_finished[..] {
                             return Err(TlsError::Other(
                                 "reality: client Finished did not verify".to_owned(),
                             ));
                         }
+                        self.hs.drain(..4 + len);
                         self.phase = Phase::Done;
                         self.client_hs = None;
                         self.process_post_handshake()?;
@@ -2136,9 +2168,11 @@ impl<S: Stream> Session13<S> {
                 }
                 21 => {
                     self.eof = true;
+                    self.inbuf.drain(..5 + len);
                     return Err(TlsError::Closed);
                 }
                 _ => {
+                    self.inbuf.drain(..5 + len);
                     return Err(TlsError::Other(
                         "reality: application record before Finished".to_owned(),
                     ));
@@ -2166,34 +2200,46 @@ impl<S: Stream> Session13<S> {
         if self.inbuf.len() < 5 + len {
             return Ok(false);
         }
-        let mut body = self.inbuf[5..5 + len].to_vec();
-        self.inbuf.drain(..5 + len);
         if header[0] == 0x14 {
+            self.inbuf.drain(..5 + len);
             return Ok(true);
         }
         if header[0] != 0x17 {
+            self.inbuf.drain(..5 + len);
             return Err(TlsError::Other(
                 "reality: plaintext record after the handshake".to_owned(),
             ));
         }
-        let keys = self
-            .read_key
-            .as_mut()
-            .ok_or_else(|| TlsError::Other("reality: no read keys".to_owned()))?;
-        let (kind, plen) = crate::tls::shaped::record::open13(keys, header, &mut body)?;
+        let Some(keys) = self.read_key.as_mut() else {
+            self.inbuf.drain(..5 + len);
+            return Err(TlsError::Other("reality: no read keys".to_owned()));
+        };
+        let opened = {
+            let body = &mut self.inbuf[5..5 + len];
+            crate::tls::shaped::record::open13(keys, header, body)
+        };
+        let (kind, plen) = match opened {
+            Ok(opened) => opened,
+            Err(error) => {
+                self.inbuf.drain(..5 + len);
+                return Err(error);
+            }
+        };
+        let post_handshake = kind == 22;
         match kind {
             23 => {
                 self.plain.clear();
-                self.plain.extend_from_slice(&body[..plen]);
+                self.plain.extend_from_slice(&self.inbuf[5..5 + plen]);
                 self.plain_at = 0;
                 self.plain_end = plen;
             }
-            22 => {
-                self.hs.extend_from_slice(&body[..plen]);
-                self.process_post_handshake()?;
-            }
+            22 => self.hs.extend_from_slice(&self.inbuf[5..5 + plen]),
             21 => self.eof = true,
             _ => {}
+        }
+        self.inbuf.drain(..5 + len);
+        if post_handshake {
+            self.process_post_handshake()?;
         }
         Ok(true)
     }
@@ -2314,12 +2360,11 @@ impl<S: Stream> Read for Session13<S> {
             if self.eof {
                 return Ok(0);
             }
-            let mut chunk = [0u8; 16_384];
-            match self.io.read(&mut chunk) {
+            match self.read_more(16_384) {
                 Ok(0) => {
                     return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
                 }
-                Ok(n) => self.inbuf.extend_from_slice(&chunk[..n]),
+                Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(error) => return Err(error),
             }

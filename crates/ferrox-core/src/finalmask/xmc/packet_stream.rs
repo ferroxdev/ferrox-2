@@ -3,8 +3,8 @@ use super::protocol::Packet;
 #[cfg(test)]
 use super::protocol::write_long;
 use super::protocol::{
-    MAX_PACKET_BODY_LENGTH, MAX_PACKET_DATA_LENGTH, MAX_STRING_LENGTH, encode_packet, read_long,
-    read_varint, read_varint_with_length, varint_size, write_string, write_varint,
+    MAX_PACKET_BODY_LENGTH, MAX_PACKET_DATA_LENGTH, MAX_STRING_LENGTH, read_long, read_varint,
+    read_varint_with_length, varint_size, write_string, write_varint,
 };
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -30,8 +30,15 @@ fn retryable(kind: io::ErrorKind) -> bool {
 }
 
 fn queue_keepalive(frame: &mut WriteBuffer, id: i64) -> io::Result<()> {
-    frame.bytes = encode_packet(KEEPALIVE_PACKET, &id.to_be_bytes())?;
+    let data = id.to_be_bytes();
+    let body = varint_size(KEEPALIVE_PACKET) + data.len();
+    let body =
+        i32::try_from(body).map_err(|_| io::Error::other("packet length exceeds a varint"))?;
+    frame.bytes.clear();
     frame.pos = 0;
+    write_varint(&mut frame.bytes, body)?;
+    write_varint(&mut frame.bytes, KEEPALIVE_PACKET)?;
+    frame.bytes.extend_from_slice(&data);
     Ok(())
 }
 
@@ -63,10 +70,10 @@ struct ReadState<R> {
     reader: R,
     buffer: Vec<u8>,
     buffer_at: usize,
+    buffer_end: usize,
     pending_start: usize,
     pending_end: usize,
     pending_total: usize,
-    chunk: [u8; 8192],
 }
 
 enum Event {
@@ -82,7 +89,7 @@ enum NextError {
 impl<R: Read> ReadState<R> {
     fn next_event(&mut self, output: &mut [u8], remote_id: i32) -> Result<Event, NextError> {
         loop {
-            let available = &self.buffer[self.buffer_at..];
+            let available = &self.buffer[self.buffer_at..self.buffer_end];
             let mut body = available;
             let (length, prefix) = match read_varint_with_length(&mut body) {
                 Ok(field) => field,
@@ -151,19 +158,23 @@ impl<R: Read> ReadState<R> {
 
     fn advance(&mut self, length: usize) {
         self.buffer_at += length;
-        if self.buffer_at == self.buffer.len() {
-            self.buffer.clear();
+        if self.buffer_at == self.buffer_end {
             self.buffer_at = 0;
-        } else if self.buffer_at >= 4096 || self.buffer_at * 2 >= self.buffer.len() {
-            self.buffer.copy_within(self.buffer_at.., 0);
-            self.buffer.truncate(self.buffer.len() - self.buffer_at);
+            self.buffer_end = 0;
+        } else if self.buffer_at >= 4096 || self.buffer_at * 2 >= self.buffer_end {
+            self.buffer.copy_within(self.buffer_at..self.buffer_end, 0);
+            self.buffer_end -= self.buffer_at;
             self.buffer_at = 0;
         }
     }
 
     fn refill(&mut self) -> io::Result<()> {
         loop {
-            match self.reader.read(&mut self.chunk) {
+            if self.buffer_end == self.buffer.len() {
+                let at = self.buffer.len();
+                self.buffer.resize(at + 8192, 0);
+            }
+            match self.reader.read(&mut self.buffer[self.buffer_end..]) {
                 Ok(0) => {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -171,7 +182,7 @@ impl<R: Read> ReadState<R> {
                     ));
                 }
                 Ok(read) => {
-                    self.buffer.extend_from_slice(&self.chunk[..read]);
+                    self.buffer_end += read;
                     return Ok(());
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -201,12 +212,12 @@ where
         Self {
             reader: Mutex::new(ReadState {
                 reader,
-                buffer: Vec::new(),
+                buffer: vec![0; 8192],
                 buffer_at: 0,
+                buffer_end: 0,
                 pending_start: 0,
                 pending_end: 0,
                 pending_total: 0,
-                chunk: [0; 8192],
             }),
             writer,
             write_buffer,
@@ -491,13 +502,16 @@ fn parse_custom_payload_data<'a>(data: &mut &'a [u8]) -> io::Result<Option<&'a [
     let channel = read_channel(data).map_err(|error| {
         io::Error::other(format!("read minecraft custom payload channel: {error}"))
     })?;
-    if channel != CHANNEL {
+    if channel != CHANNEL.as_bytes() {
+        std::str::from_utf8(channel).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "read string: invalid utf-8")
+        })?;
         return Ok(None);
     }
     Ok(Some(*data))
 }
 
-fn read_channel<'a>(data: &mut &'a [u8]) -> io::Result<&'a str> {
+fn read_channel<'a>(data: &mut &'a [u8]) -> io::Result<&'a [u8]> {
     let (length, _) = read_varint_with_length(data)?;
     if !(0..=MAX_STRING_LENGTH).contains(&length) {
         return Err(io::Error::new(
@@ -514,8 +528,7 @@ fn read_channel<'a>(data: &mut &'a [u8]) -> io::Result<&'a str> {
     }
     let (channel, rest) = data.split_at(length);
     *data = rest;
-    std::str::from_utf8(channel)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "read string: invalid utf-8"))
+    Ok(channel)
 }
 
 fn flush_frame<W: Write>(writer: &mut W, frame: &mut WriteBuffer) -> io::Result<()> {
@@ -632,6 +645,50 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_keepalive_reuses_the_frame_buffer() {
+        let mut frame = WriteBuffer {
+            bytes: Vec::with_capacity(64),
+            pos: 0,
+        };
+        queue_keepalive(&mut frame, 7).expect("queues");
+        let ((), counts) = crate::alloc_count::measure(|| {
+            queue_keepalive(&mut frame, 8).expect("queues");
+        });
+        assert_eq!(
+            counts.allocs, 0,
+            "the frame is rewritten where it landed: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn a_refill_reads_into_the_buffer_it_owns() {
+        struct DirectRead {
+            expected: usize,
+        }
+
+        impl Read for DirectRead {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                assert_eq!(output.as_ptr() as usize, self.expected);
+                output[..3].copy_from_slice(b"abc");
+                Ok(3)
+            }
+        }
+
+        let mut state = ReadState {
+            reader: DirectRead { expected: 0 },
+            buffer: vec![0; 8192],
+            buffer_at: 0,
+            buffer_end: 0,
+            pending_start: 0,
+            pending_end: 0,
+            pending_total: 0,
+        };
+        state.reader.expected = state.buffer.as_ptr() as usize;
+        state.refill().expect("fills");
+        assert_eq!(&state.buffer[..state.buffer_end], b"abc");
     }
 
     fn frame(id: i32, data: &[u8]) -> Vec<u8> {
@@ -1020,12 +1077,14 @@ mod tests {
         let wire = frame(CLIENTBOUND_CUSTOM_PAYLOAD, &body);
 
         let mut client = PacketStream::new(Pipe::new(), out, true);
-        client
-            .reader
-            .lock()
-            .expect("reader")
-            .buffer
-            .extend_from_slice(&wire);
+        {
+            let mut state = client.reader.lock().expect("reader");
+            if wire.len() > state.buffer.len() {
+                state.buffer.resize(wire.len(), 0);
+            }
+            state.buffer[..wire.len()].copy_from_slice(&wire);
+            state.buffer_end = wire.len();
+        }
         let mut got = vec![0; payload.len()];
         let mut first = [0u8; 4096];
         let (read, counts) = crate::alloc_count::measure(|| client.read(&mut first));
