@@ -131,7 +131,7 @@ remove_routes() {
 # The app drops its guard on SIGINT; a killed run can leave the half-defaults behind and make the next engine fail.
 remove_auto_routes() {
     local upper
-    printf -v upper '%d.0.0.0/1' 128
+    upper=$(printf '%d.0.0.0/1' 128)
     ip route del 0.0.0.0/1 dev "$1" 2> /dev/null || true
     ip route del "$upper" dev "$1" 2> /dev/null || true
 }
