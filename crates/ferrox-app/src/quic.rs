@@ -223,6 +223,7 @@ impl PooledStream {
             activity: Arc::clone(&self.activity),
             stop: Arc::new(AtomicBool::new(false)),
             stalled: Arc::new(AtomicBool::new(false)),
+            read_since_flush: 0,
             owner: None,
         }
     }
@@ -2295,7 +2296,7 @@ fn clear_gro(sock: &UdpSocket) {
 /// loss the lane pays for in retransmit timers rather than in packets. The send side is the same number for the
 /// mirror reason: quiche hands the socket a burst of a window's worth of datagrams and a `send_to` the kernel
 /// cannot queue is a datagram quiche has already counted as sent.
-const DATAGRAM_BUFFER: i32 = 1 << 20;
+const DATAGRAM_BUFFER: i32 = 8 << 20;
 
 /// The least the ask has to land as for the lane to be worth reading back: a Linux default already clears it, a macOS and a Windows default do not, which is where the arm is observable.
 #[cfg(test)]
@@ -3515,15 +3516,6 @@ impl Datagram {
     #[cfg(target_os = "linux")]
     pub(crate) fn gso(&self) -> bool {
         self.gso
-    }
-
-    /// Keep the kernel from coalescing reads under a reader that takes one datagram per `recv_from`.
-    pub(crate) fn with_gro(mut self, gro: bool) -> Self {
-        if !gro {
-            clear_gro(&self.sock);
-        }
-        self.gro = gro;
-        self
     }
 
     /// Stop coalescing writes when the config names `disableGSO`; a lane that no longer takes the
@@ -5243,6 +5235,8 @@ pub(crate) struct QuicStream {
     stalled: Arc<AtomicBool>,
     /// The serving connection's identity, absent on a client-side handle whose sessions no listener owns.
     owner: Option<Arc<ConnectionToken>>,
+    /// Bytes this read handle has consumed since it last flushed a window update.
+    read_since_flush: usize,
 }
 
 /// How long one stream read polls quiche before idling: FIN and close land inside the next quantum.
@@ -5253,6 +5247,10 @@ const SEND_POLL: Duration = Duration::from_micros(250);
 
 /// Between polls of quiche state, so a waiting read never holds the connection lock.
 const STREAM_POLL: Duration = Duration::from_millis(5);
+
+/// A read reports its consumed window once it has taken half the advertised stream window: the driver's
+/// own flush carries the rest, so a window update does not pay a send syscall on every 64 KiB read.
+const READ_FLUSH: usize = 2 * 1024 * 1024;
 
 impl Read for QuicStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -5294,7 +5292,11 @@ impl Read for QuicStream {
                     if n > 0 {
                         self.peer_fin.store(fin, Ordering::Relaxed);
                         self.activity.touch();
-                        flush_egress(&mut conn, &self.sock);
+                        self.read_since_flush = self.read_since_flush.saturating_add(n);
+                        if self.read_since_flush >= READ_FLUSH {
+                            self.read_since_flush = 0;
+                            flush_egress(&mut conn, &self.sock);
+                        }
                         self.meter.read(n);
                         return Ok(n);
                     }
@@ -5413,6 +5415,7 @@ impl QuicStream {
             activity: Arc::new(Activity::new()),
             stop: Arc::new(AtomicBool::new(false)),
             stalled: Arc::new(AtomicBool::new(false)),
+            read_since_flush: 0,
             owner: None,
         }
     }
@@ -6115,6 +6118,7 @@ fn reap(
             activity: Arc::new(Activity::new()),
             stop,
             stalled: Arc::new(AtomicBool::new(false)),
+            read_since_flush: 0,
             owner: Some(owner),
         };
         let serve = Arc::clone(serve);
@@ -8587,6 +8591,7 @@ mod tests {
             activity: std::sync::Arc::new(Activity::new()),
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stalled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            read_since_flush: 0,
             owner: None,
         };
         let error = stream
@@ -8629,6 +8634,7 @@ mod tests {
             activity: std::sync::Arc::new(Activity::new()),
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stalled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            read_since_flush: 0,
             owner: None,
         };
         let started = Instant::now();
@@ -8679,6 +8685,7 @@ mod tests {
             activity: std::sync::Arc::new(Activity::new()),
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stalled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            read_since_flush: 0,
             owner: None,
         };
         let started = Instant::now();
@@ -8710,6 +8717,7 @@ mod tests {
             activity: std::sync::Arc::new(Activity::new()),
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stalled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            read_since_flush: 0,
             owner: None,
         };
         let moved = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));

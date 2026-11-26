@@ -41,6 +41,7 @@ const RETRY_TOKEN_TAG: usize = 32;
 const MAX_ASSOCIATIONS_PER_SESSION: usize = 256;
 const MAX_UDP_SOCKETS: usize = 2048;
 const MAX_TUIC_LANES: usize = 64;
+const LANES_PER_KEY: usize = 8;
 const MAX_RESOLVING_PER_SESSION: usize = 32;
 const MAX_RESOLVE_PAYLOADS: usize = 4;
 const RESOLVE_QUEUE: usize = 256;
@@ -88,7 +89,8 @@ pub(crate) struct TuicOut {
     cert_pins: Arc<[[u8; 32]]>,
     insecure: bool,
     heartbeat: Duration,
-    lanes: Mutex<HashMap<LaneKey, Arc<Lane>>>,
+    lanes: Mutex<HashMap<LaneKey, Vec<Arc<Lane>>>>,
+    pending: Mutex<HashMap<LaneKey, usize>>,
     session: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
@@ -118,6 +120,22 @@ impl std::ops::Deref for LaneLease {
 impl Drop for LaneLease {
     fn drop(&mut self) {
         self.0.leases.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct Expansion<'a> {
+    out: &'a TuicOut,
+    key: LaneKey,
+}
+
+impl Drop for Expansion<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.out.pending.lock() {
+            if let Some(n) = pending.get_mut(&self.key) {
+                *n -= 1;
+            }
+            pending.retain(|_, n| *n > 0);
+        }
     }
 }
 
@@ -344,6 +362,35 @@ impl Drop for Lane {
     }
 }
 
+#[allow(clippy::mutable_key_type)]
+fn prune_lanes(held: &mut HashMap<LaneKey, Vec<Arc<Lane>>>) {
+    for pool in held.values_mut() {
+        pool.retain(|lane| {
+            lane.leases.load(Ordering::Acquire) > 0
+                || !(lane.stop.load(Ordering::Relaxed)
+                    || lane.conn.lock().is_ok_and(|conn| conn.is_closed()))
+        });
+    }
+    held.retain(|_, pool| !pool.is_empty());
+}
+
+#[allow(clippy::mutable_key_type)]
+fn make_lane_room(held: &mut HashMap<LaneKey, Vec<Arc<Lane>>>) -> bool {
+    while held.values().map(Vec::len).sum::<usize>() >= MAX_TUIC_LANES {
+        let Some((key, at)) = held.iter().find_map(|(key, pool)| {
+            pool.iter()
+                .position(|lane| lane.leases.load(Ordering::Acquire) == 0)
+                .map(|at| (key.clone(), at))
+        }) else {
+            return false;
+        };
+        if let Some(pool) = held.get_mut(&key) {
+            pool.remove(at);
+        }
+    }
+    true
+}
+
 impl TuicOut {
     pub(crate) fn edge(&self) -> Option<SocketAddr> {
         proxy::resolve_outbound(&self.address, self.port)
@@ -353,36 +400,77 @@ impl TuicOut {
         let options = proxy::dial_options();
         let source = proxy::flow_source().ok()?;
         let key = (source, options.clone());
-        let mut held = self.lanes.lock().ok()?;
-        held.retain(|_, lane| {
-            lane.leases.load(Ordering::Acquire) > 0
-                || !(lane.stop.load(Ordering::Relaxed)
-                    || lane.conn.lock().is_ok_and(|conn| conn.is_closed()))
-        });
-        if let Some(lane) = held.get(&key) {
-            let live = !lane.stop.load(Ordering::Relaxed)
+        let live = |lane: &Arc<Lane>| {
+            !lane.stop.load(Ordering::Relaxed)
                 && lane
                     .conn
                     .lock()
-                    .is_ok_and(|conn| lane_established(&conn, lane));
-            if live {
+                    .is_ok_and(|conn| lane_established(&conn, lane))
+        };
+        let select = |held: &HashMap<LaneKey, Vec<Arc<Lane>>>, shared: bool| -> Option<LaneLease> {
+            if let Some(lane) = held.get(&key).and_then(|pool| {
+                pool.iter()
+                    .find(|lane| lane.leases.load(Ordering::Acquire) == 0 && live(lane))
+            }) {
                 lane.leases.fetch_add(1, Ordering::AcqRel);
                 return Some(LaneLease(Arc::clone(lane)));
             }
-        }
-        held.remove(&key);
-        if held.len() >= MAX_TUIC_LANES {
-            let idle = held
+            if !shared {
+                return None;
+            }
+            let lane = held
+                .get(&key)?
                 .iter()
-                .find(|(_, lane)| lane.leases.load(Ordering::Acquire) == 0)
-                .map(|(key, _)| key.clone());
-            let idle = idle?;
-            held.remove(&idle);
+                .filter(|lane| live(lane))
+                .min_by_key(|lane| lane.leases.load(Ordering::Acquire))?;
+            lane.leases.fetch_add(1, Ordering::AcqRel);
+            Some(LaneLease(Arc::clone(lane)))
+        };
+        let mut held = self.lanes.lock().ok()?;
+        prune_lanes(&mut held);
+        if let Some(lease) = select(&held, false) {
+            return Some(lease);
         }
-        let lane = self.connect_lane(source, options)?;
-        lane.leases.fetch_add(1, Ordering::AcqRel);
-        held.insert(key, Arc::clone(&lane));
-        Some(LaneLease(lane))
+        if !self.reserve_expansion(&key, &held) {
+            return select(&held, true);
+        }
+        drop(held);
+        let expansion = Expansion {
+            out: self,
+            key: key.clone(),
+        };
+        let Some(lane) = self.connect_lane(source, options) else {
+            drop(expansion);
+            let mut held = self.lanes.lock().ok()?;
+            prune_lanes(&mut held);
+            return select(&held, true);
+        };
+        let mut held = self.lanes.lock().ok()?;
+        prune_lanes(&mut held);
+        if held.get(&key).map_or(0, Vec::len) < LANES_PER_KEY && make_lane_room(&mut held) {
+            lane.leases.fetch_add(1, Ordering::AcqRel);
+            held.entry(key.clone()).or_default().push(Arc::clone(&lane));
+            drop(expansion);
+            return Some(LaneLease(lane));
+        }
+        drop(lane);
+        drop(expansion);
+        select(&held, true)
+    }
+
+    #[allow(clippy::mutable_key_type)]
+    fn reserve_expansion(&self, key: &LaneKey, held: &HashMap<LaneKey, Vec<Arc<Lane>>>) -> bool {
+        let Ok(mut pending) = self.pending.lock() else {
+            return false;
+        };
+        let queued: usize = pending.values().sum();
+        let total: usize = held.values().map(Vec::len).sum();
+        let mine = held.get(key).map_or(0, Vec::len) + pending.get(key).copied().unwrap_or(0);
+        if mine >= LANES_PER_KEY || total + queued >= MAX_TUIC_LANES {
+            return false;
+        }
+        *pending.entry(key.clone()).or_default() += 1;
+        true
     }
 
     fn connect_lane(
@@ -404,7 +492,7 @@ impl TuicOut {
                     options.as_deref(),
                     source,
                 )?;
-                (quic::Datagram::plain(sock).with_gro(false), peer, local)
+                (quic::Datagram::plain(sock), peer, local)
             };
         let socket = socket.with_options(options).with_source(source);
         let mut config = self.client_config()?;
@@ -540,7 +628,7 @@ impl TuicOut {
             stream.close();
             return;
         }
-        proxy::relay_quic_stream(client, stream, None);
+        proxy::relay_quic_stream(client, stream, Some(Box::new(move || drop(lane))));
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1481,6 +1569,7 @@ pub(crate) fn outbound(root: &Json) -> Result<Option<TuicOut>, String> {
         insecure: tls.insecure,
         heartbeat,
         lanes: Mutex::new(HashMap::new()),
+        pending: Mutex::new(HashMap::new()),
         session: Arc::new(Mutex::new(None)),
     }))
 }
@@ -1590,7 +1679,7 @@ pub(crate) fn serve_inbound(
         eprintln!("unreadable tuic identity in {path}: serves nothing");
         return false;
     };
-    let Ok(socket) = quic::bind_datagram_plain(address) else {
+    let Ok(socket) = quic::bind_datagram(address) else {
         eprintln!("tuic inbound in {path} cannot bind {address}: serves nothing");
         return false;
     };
@@ -1643,7 +1732,7 @@ pub(crate) fn serve_inbound(
     let meter = proxy::inbound_meter(inbound);
     thread::spawn(move || {
         run(
-            Arc::new(Datagram::plain(socket).with_gro(false)),
+            Arc::new(Datagram::plain(socket)),
             local,
             users,
             template,
@@ -2890,6 +2979,7 @@ mod tests {
             insecure: false,
             heartbeat: Duration::from_secs(30),
             lanes: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
             session: Arc::new(Mutex::new(None)),
         }
     }
@@ -2904,7 +2994,7 @@ mod tests {
         let server = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let address = server.local_addr().expect("address");
         let server_thread = thread::spawn(move || {
-            let sock = Datagram::plain(server).with_gro(false);
+            let sock = Datagram::plain(server);
             let _ = quic::server_accept(&sock, address, &mut config);
         });
         let mut out = test_out(address, roots);
@@ -2928,7 +3018,7 @@ mod tests {
         let address = server.local_addr().expect("address");
         let (early, observed) = std::sync::mpsc::channel();
         let server_thread = thread::spawn(move || {
-            let sock = Datagram::plain(server).with_gro(false);
+            let sock = Datagram::plain(server);
             let mut buf = vec![0u8; 65535];
             let mut out = vec![0u8; 65535];
             let mut first = quic::server_accept(&sock, address, &mut config);
