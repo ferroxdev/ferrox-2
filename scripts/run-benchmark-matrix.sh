@@ -15,6 +15,7 @@ probe_only=0
 build_only=0
 no_build=0
 selftest=0
+gool_shards=1
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --tier) tier="$2"; shift 2 ;;
@@ -24,6 +25,7 @@ while [[ $# -gt 0 ]]; do
     --bench-bin) bench_bin="$2"; shift 2 ;;
     --only) only+=("$2"); shift 2 ;;
     --exclude) exclude+=("$2"); shift 2 ;;
+    --shards) gool_shards="$2"; shift 2 ;;
     --gaps) gaps=1; shift ;;
     --probe-only) probe_only=1; shift ;;
     --build-only) build_only=1; shift ;;
@@ -32,6 +34,8 @@ while [[ $# -gt 0 ]]; do
     *) echo "::error::unknown argument $1" >&2; exit 2 ;;
   esac
 done
+[[ "$gool_shards" =~ ^[1-9][0-9]*$ ]] || { echo "::error::--shards needs a positive integer, got $gool_shards" >&2; exit 2; }
+export MATRIX_GOOL_SHARDS="$gool_shards"
 case "$tier" in
   smoke | standard | full) ;;
   *) echo "::error::--tier needs smoke, standard or full, got $tier" >&2; exit 2 ;;
@@ -591,7 +595,13 @@ while read -r id traffic connections iterations payload duration_ms; do
     skip_scenario_cells "$id" "no external WARP reference on this host"
     continue
   fi
-  if [[ "$id" == shadowsocks-* || "$id" == shadowsocks2022-* ]]; then
+  gool_sharded=0
+  if [[ "$id" == warp-gool-* && "$id" != warp-gool-classic-* ]] && (( gool_shards > 1 )); then
+    gool_sharded=1
+  fi
+  if (( gool_sharded )); then
+    srvport="$(matrix_udp_srvport_range "$gool_shards")"
+  elif [[ "$id" == shadowsocks-* || "$id" == shadowsocks2022-* ]]; then
     srvport="$(matrix_tcp_udp_srvport)"
   elif matrix_udp_carrier "$id"; then
     srvport="$(matrix_udp_srvport)"
@@ -620,7 +630,11 @@ while read -r id traffic connections iterations payload duration_ms; do
   fi
   innerport=""
   if matrix_nested_carrier "$id"; then
-    innerport="$(matrix_udp_srvport)" || {
+    if (( gool_sharded )); then
+      innerport="$(matrix_udp_srvport_range "$gool_shards")"
+    else
+      innerport="$(matrix_udp_srvport)"
+    fi || {
       cells_failed+=("$id (could not allocate an inner server port)")
       status=1
       continue
