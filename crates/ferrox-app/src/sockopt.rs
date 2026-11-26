@@ -885,6 +885,42 @@ pub(crate) fn apply_underlay(
     Ok(())
 }
 
+/// The wildcard probe a QUIC dial uses to learn the source the kernel picks, with the
+/// capture's underlay bound first so a captured peer answers from the physical address.
+pub(crate) fn probe_datagram(
+    options: Option<&SocketOptions>,
+    peer: SocketAddr,
+) -> io::Result<UdpSocket> {
+    let socket = Socket::new(domain_of(peer), Type::DGRAM, Some(Protocol::UDP))?;
+    if let Some(options) = options {
+        options.apply_to_datagram(&socket, peer)?;
+    }
+    apply_underlay(options, &socket, peer, false)?;
+    let bind = if peer.is_ipv6() {
+        SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))
+    } else {
+        SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0))
+    };
+    socket.bind(&SockAddr::from(bind))?;
+    Ok(UdpSocket::from(socket))
+}
+
+/// The same bind as `bind_datagram_at`, with the capture's underlay bound first, so the
+/// datagram leaves the physical interface while the route still names the device.
+pub(crate) fn bind_datagram_at_underlay(
+    options: Option<&SocketOptions>,
+    addr: SocketAddr,
+    peer: SocketAddr,
+) -> io::Result<UdpSocket> {
+    let socket = Socket::new(domain_of(addr), Type::DGRAM, Some(Protocol::UDP))?;
+    if let Some(options) = options {
+        options.apply_to_datagram(&socket, addr)?;
+    }
+    apply_underlay(options, &socket, peer, false)?;
+    socket.bind(&SockAddr::from(addr))?;
+    Ok(UdpSocket::from(socket))
+}
+
 fn domain_of(addr: SocketAddr) -> Domain {
     if addr.is_ipv4() {
         Domain::IPV4

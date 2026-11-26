@@ -233,7 +233,7 @@ jobs:
               elif message.get("reason") == "compiler-artifact" and message.get("target", {}).get("kind") == ["bin"] and message.get("executable"): print(message["executable"])')
           test -n "$bin"
           case "${{ runner.os }}" in
-            Linux) expected=(a_real_guard_installs_pins_and_retires_a_route a_real_tun_device_opens_and_names_itself) ;;
+            Linux) expected=(a_real_guard_installs_pins_and_retires_a_route a_real_tun_device_opens_and_names_itself a_real_captured_datagram_dial_binds_the_underlay) ;;
             macOS) expected=(a_real_feth_pair_carries_an_arp_request_to_the_bridge) ;;
             *) expected=() ;;
           esac

@@ -4172,11 +4172,14 @@ fn datagram_to_with_source(
     };
     let sock = if explicit {
         armed_lane(crate::sockopt::bind_datagram_at(options, at).ok()?, true)
+    } else if let Ok(sock) = crate::sockopt::bind_datagram_at_underlay(options, at, peer) {
+        armed_lane(sock, true)
     } else {
-        match crate::sockopt::bind_datagram_at(options, at) {
-            Ok(sock) => armed_lane(sock, true),
-            Err(_) => armed_lane(crate::sockopt::bind_datagram(options, bind).ok()?, true),
-        }
+        let wildcard: SocketAddr = bind.parse().ok()?;
+        armed_lane(
+            crate::sockopt::bind_datagram_at_underlay(options, wildcard, peer).ok()?,
+            true,
+        )
     };
     let local = sock.local_addr().ok()?;
     Some((sock, local))
@@ -4188,15 +4191,7 @@ fn probe_source(
     peer: SocketAddr,
     options: Option<&crate::sockopt::SocketOptions>,
 ) -> Option<SocketAddr> {
-    let bind = if peer.is_ipv6() {
-        "[::]:0"
-    } else {
-        "0.0.0.0:0"
-    };
-    let probe = UdpSocket::bind(bind).ok()?;
-    if let Some(options) = options {
-        options.apply_to_udp(&probe, peer).ok()?;
-    }
+    let probe = crate::sockopt::probe_datagram(options, peer).ok()?;
     probe.connect(peer).ok()?;
     probe.local_addr().ok()
 }
@@ -5164,16 +5159,8 @@ fn build_pooled_within(dial: &QuicDial, budget: Duration) -> Option<PooledConn> 
             (sock, local)
         } else if let Some(bound) = datagram_to_with_source(peer, flow.as_deref(), source) {
             bound
-        } else if source.is_some() {
-            continue;
         } else {
-            let Ok(sock) = bind_datagram(wildcard) else {
-                continue;
-            };
-            let Ok(local) = sock.local_addr() else {
-                continue;
-            };
-            (sock, local)
+            continue;
         };
         let sock = match relay.as_ref() {
             Some((control, via)) => Datagram::relayed(sock, *via, Arc::clone(control)),
@@ -9289,6 +9276,46 @@ mod tests {
         assert_eq!(
             routed.allocs, 0,
             "the routing key copied the DCID out of the packet"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn bound_interface(socket: &UdpSocket) -> String {
+        use std::os::fd::AsRawFd as _;
+        let mut buf = [0u8; libc::IFNAMSIZ];
+        let mut len = buf.len() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_BINDTODEVICE,
+                buf.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0, "read SO_BINDTODEVICE");
+        let end = buf.iter().position(|&byte| byte == 0).unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..end]).into_owned()
+    }
+
+    /// A captured peer's QUIC dial has to leave through the physical underlay, not the
+    /// device the route names; otherwise every datagram loops back into the TUN.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "installs a capture route and binds the underlay"]
+    fn a_real_captured_datagram_dial_binds_the_underlay() {
+        let peer: SocketAddr = "203.0.113.1:443".parse().expect("peer");
+        let plan = crate::tun_route::Plan {
+            routes: vec![("203.0.113.0".parse().expect("prefix"), 24)],
+            ..crate::tun_route::Plan::default()
+        };
+        let _guard = crate::tun_route::Guard::install("lo", &plan).expect("install the capture");
+        let (sock, _local) =
+            datagram_to_with_source(peer, None, None).expect("a dial under the capture");
+        let bound = bound_interface(&sock);
+        assert!(
+            !bound.is_empty() && bound != "lo",
+            "the datagram left the capture device: {bound:?}"
         );
     }
 }
