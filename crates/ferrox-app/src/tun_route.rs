@@ -1822,7 +1822,7 @@ mod tests {
                 libc::SOL_SOCKET,
                 libc::SO_BINDTODEVICE,
                 buf.as_mut_ptr().cast(),
-                &mut len,
+                &raw mut len,
             )
         };
         assert_eq!(rc, 0, "read SO_BINDTODEVICE");
