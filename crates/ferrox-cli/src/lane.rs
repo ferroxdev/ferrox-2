@@ -254,7 +254,7 @@ pub fn kill(paths: &Paths, pid: u32) -> Result<(), String> {
             }
             return Ok(());
         }
-        if wait_exit(pid, 10) {
+        if wait_exit(pid, 30) {
             return Ok(());
         }
         if unsafe { libc::kill(process, libc::SIGKILL) } != 0 {
@@ -608,6 +608,44 @@ fn can_signal(pid: u32) -> bool {
 }
 
 #[cfg(unix)]
+fn sudo_path(args: &[&str]) -> Option<PathBuf> {
+    let output = Command::new("sudo")
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+#[cfg(target_os = "linux")]
+fn privileged_exe(pid: u32) -> Option<PathBuf> {
+    let exe = format!("/proc/{pid}/exe");
+    sudo_path(&["-n", "readlink", "-f", &exe])
+}
+
+#[cfg(target_os = "macos")]
+fn privileged_exe(pid: u32) -> Option<PathBuf> {
+    let pid_arg = pid.to_string();
+    sudo_path(&["-n", "/bin/ps", "-p", &pid_arg, "-o", "comm="])
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn privileged_exe(_pid: u32) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(unix)]
+fn privileged_is_ferrox(paths: &Paths, pid: u32) -> Option<bool> {
+    privileged_exe(pid)
+        .map(|actual| recognises(&actual, &recorded_bin(paths), env_bin().as_deref()))
+}
+
+#[cfg(unix)]
 fn privileged_kill(pid: u32, signal: &str) -> bool {
     std::process::Command::new("sudo")
         .args(["-n", "kill", signal, &pid.to_string()])
@@ -636,11 +674,20 @@ pub fn stop(paths: &Paths) -> Result<(), String> {
             let _ = unsafe { libc::kill(process, libc::SIGTERM) };
         }
         #[cfg(any(unix, windows))]
-        if !wait_exit(pid, 10) {
+        if !wait_exit(pid, 50) {
             #[cfg(unix)]
             if executable.is_none() || !can_signal(pid) {
+                match privileged_is_ferrox(paths, pid) {
+                    Some(true) => {}
+                    Some(false) => return Err(not_ferrox(paths, pid)),
+                    None => {
+                        return Err(format!(
+                            "process {pid} cannot be confirmed as ferrox-app without sudo; it was not stopped. Run 'sudo kill {pid}' if it is the lane."
+                        ));
+                    }
+                }
                 let _ = privileged_kill(pid, "-TERM");
-                if !wait_exit(pid, 10) {
+                if !wait_exit(pid, 30) {
                     let _ = privileged_kill(pid, "-KILL");
                     if !wait_exit(pid, 10) {
                         return Err(format!(

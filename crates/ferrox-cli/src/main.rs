@@ -58,8 +58,12 @@ fn drop_sudo() {
         home.display()
     );
     let mut command = std::process::Command::new("sudo");
+    command.args(["-u", &user, "-H"]);
+    if std::env::var_os("FOXY_PASS").is_some_and(|value| !value.is_empty()) {
+        command.arg("--preserve-env=FOXY_PASS");
+    }
     command
-        .args(["-u", &user, "-H", "env", "FERROX_SUDO_DROPPED=1"])
+        .args(["env", "FERROX_SUDO_DROPPED=1"])
         .arg(format!("PATH={path}"));
     for (name, value) in std::env::vars_os() {
         let label = name.to_string_lossy();

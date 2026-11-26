@@ -200,6 +200,7 @@ jobs:
       - name: sudo keeps the lane in the invoking users files
         run: |
           set -euo pipefail
+          sudo env FOXY_PASS=probe "$PWD/dist/ferrox-cli.sh" --help >/dev/null
           root_state="$RUNNER_TEMP/cli-warp-root"
           rm -rf "$root_state"
           mkdir -p "$root_state/conf" "$root_state/state"
