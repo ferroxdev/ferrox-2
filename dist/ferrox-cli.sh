@@ -77,7 +77,7 @@ if [ "$(id -u 2>/dev/null)" = 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" !
     exit 1
   fi
   keep=()
-  for name in FERROX_CONF_DIR FERROX_STATE_DIR FERROX_BIN FERROX_PROFILE FERROX_RELEASE; do
+  for name in FERROX_CONF_DIR FERROX_STATE_DIR FERROX_BIN FERROX_PROFILE FERROX_RELEASE FOXY_CREDENTIALS FOXY_EMAIL XDG_CONFIG_HOME XDG_STATE_HOME; do
     [ -n "${!name:-}" ] && keep+=("$name=${!name}")
   done
   exec sudo -u "$SUDO_USER" -H env FERROX_SUDO_DROPPED=1 \
@@ -3049,20 +3049,28 @@ stop_lane() {
   if lane_running; then
     pid="$(lane_pid)"
     if lane_pid_runs "$pid" "$CFG" || lane_pid_is_ferrox "$pid"; then
-      # The app restores its routes and exits on the stop file; a process that
-      # predates it gets the signal after the grace period.
+      # The stop file carries the root lane; the signal makes a same-user lane
+      # leave at once instead of spending the grace period on it.
       : >"$STOP_FILE" 2>/dev/null || true
+      kill "$pid" 2>/dev/null || true
       while pid_alive "$pid" && [ "$waited" -lt 10 ]; do
         sleep 0.1
         waited=$((waited + 1))
       done
       waited=0
       if pid_alive "$pid"; then
-        kill "$pid" 2>/dev/null || sudo -n kill "$pid" 2>/dev/null || true
-        sleep 1
+        sudo -n kill "$pid" 2>/dev/null || true
+        while pid_alive "$pid" && [ "$waited" -lt 10 ]; do
+          sleep 0.1
+          waited=$((waited + 1))
+        done
+        waited=0
         if pid_alive "$pid"; then
           kill -9 "$pid" 2>/dev/null || sudo -n kill -9 "$pid" 2>/dev/null || true
-          sleep 1
+          while pid_alive "$pid" && [ "$waited" -lt 10 ]; do
+            sleep 0.1
+            waited=$((waited + 1))
+          done
         fi
         if pid_alive "$pid"; then
           say "lane pid $pid did not stop; run: sudo kill -9 $pid" >&2

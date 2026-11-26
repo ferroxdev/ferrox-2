@@ -169,6 +169,12 @@ fn state_root() -> PathBuf {
     home().join(".local").join("state").join("ferrox")
 }
 
+fn credential_path(conf_dir: &Path, named: Option<std::ffi::OsString>) -> PathBuf {
+    named
+        .filter(|path| !path.is_empty())
+        .map_or_else(|| conf_dir.join("credentials"), PathBuf::from)
+}
+
 impl Paths {
     pub fn new(instance: Option<&str>) -> Self {
         Self::with_dirs(conf_root(), state_root(), instance)
@@ -176,6 +182,7 @@ impl Paths {
 
     pub fn with_dirs(conf_dir: PathBuf, state_dir: PathBuf, instance: Option<&str>) -> Self {
         let suffix = instance.map_or_else(String::new, |name| format!("-{name}"));
+        let creds = credential_path(&conf_dir, std::env::var_os("FOXY_CREDENTIALS"));
         Self {
             cfg: conf_dir.join(format!("lane{suffix}.json")),
             pid_file: conf_dir.join(format!("lane{suffix}.pid")),
@@ -195,7 +202,7 @@ impl Paths {
             psiphon_dir: conf_dir.join(format!("psiphon{suffix}")),
             lanes_file: state_dir.join("lanes"),
             proxy_owner: state_dir.join("system-proxy.owner"),
-            creds: conf_dir.join("credentials"),
+            creds,
             token_file: conf_dir.join("foxy-token.json"),
             conf_dir,
             state_dir,
@@ -336,6 +343,20 @@ mod tests {
             assert_eq!(resolved, expected);
         }
         assert!(!resolved.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn a_named_credentials_file_leaves_the_default_beside_the_config() {
+        let conf = Path::new("/tmp/ferrox-conf");
+        assert_eq!(credential_path(conf, None), conf.join("credentials"));
+        assert_eq!(
+            credential_path(conf, Some(std::ffi::OsString::from(""))),
+            conf.join("credentials")
+        );
+        assert_eq!(
+            credential_path(conf, Some(std::ffi::OsString::from("/tmp/foxy-account"))),
+            PathBuf::from("/tmp/foxy-account")
+        );
     }
 
     #[test]

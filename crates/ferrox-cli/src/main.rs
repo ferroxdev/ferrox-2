@@ -62,7 +62,13 @@ fn drop_sudo() {
         .args(["-u", &user, "-H", "env", "FERROX_SUDO_DROPPED=1"])
         .arg(format!("PATH={path}"));
     for (name, value) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("FERROX_") && name != "FERROX_SUDO_DROPPED" {
+        let label = name.to_string_lossy();
+        let keep = label == "FOXY_CREDENTIALS"
+            || label == "FOXY_EMAIL"
+            || label == "XDG_CONFIG_HOME"
+            || label == "XDG_STATE_HOME"
+            || (label.starts_with("FERROX_") && label != "FERROX_SUDO_DROPPED");
+        if keep {
             let mut pair = name;
             pair.push("=");
             pair.push(value);
