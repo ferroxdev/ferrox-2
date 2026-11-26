@@ -796,7 +796,7 @@ while read -r id traffic connections iterations payload duration_ms; do
       sleep 1
     fi
     # `panic = "abort"` turns a panic into a bare `exit 134`; the backtrace names the frame the fault left behind.
-    if RUST_BACKTRACE=full "$bench_bin" "${engine_args[@]}" \
+    if FOXY_DEBUG=1 RUST_BACKTRACE=full "$bench_bin" "${engine_args[@]}" \
       --traffic "$traffic" --connections "$connections" \
       --iterations "$iterations" --payload-size "$payload" \
       --duration-ms "${duration_ms:-0}" \

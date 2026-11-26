@@ -2033,12 +2033,30 @@ fn attempt(
         &mut config,
     )
     .map_err(|error| format!("masque: cannot open a connection: {error}"))?;
+    let trace = crate::foxy::debug_on().then(Instant::now);
     quic::drive_handshake_by(&mut conn, sock, local, ESTABLISH_TIMEOUT)
         .ok_or("the QUIC handshake did not finish")?;
     verify_edge(spec, &conn)?;
     open_h3(&mut conn, spec)?;
     let mut stream = Stream::default();
-    let status = stream.wait_head(&mut conn, sock, local, HEAD_TIMEOUT)?;
+    let status = match stream.wait_head(&mut conn, sock, local, HEAD_TIMEOUT) {
+        Ok(status) => status,
+        Err(reason) => {
+            if let Some(started) = trace {
+                eprintln!(
+                    "foxy-debug: masque head failed {}ms: {reason}",
+                    started.elapsed().as_millis()
+                );
+            }
+            return Err(reason);
+        }
+    };
+    if let Some(started) = trace {
+        eprintln!(
+            "foxy-debug: masque head {status} {}ms",
+            started.elapsed().as_millis()
+        );
+    }
     if !(200..300).contains(&status) {
         return Err(format!("masque: the edge answered {status}"));
     }
