@@ -46,6 +46,11 @@ on:
         required: false
         default: false
         type: boolean
+      shards:
+        description: "WARP gool outer/inner sessions per engine (blank = 1)"
+        required: false
+        default: ""
+        type: string
 
 concurrency:
   group: matrix-${{ github.ref }}
@@ -84,6 +89,7 @@ jobs:
           WANT_REPEATS: ${{ inputs.repeats }}
           WANT_ENGINES: ${{ inputs.engines }}
           WANT_RUNNER: ${{ inputs.runner }}
+          WANT_SHARDS: ${{ inputs.shards }}
         run: |
           if [[ "$EVENT" == "schedule" ]]; then
             tier=standard
@@ -109,6 +115,10 @@ jobs:
           fi
           if [[ -n "$WANT_ENGINES" && ! "$WANT_ENGINES" =~ ^[A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*$ ]]; then
             echo "::error::engines must be a comma-separated list of engine names, got: $WANT_ENGINES" >&2
+            exit 2
+          fi
+          if [[ -n "$WANT_SHARDS" && ! "$WANT_SHARDS" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::shards must be a positive integer, got: $WANT_SHARDS" >&2
             exit 2
           fi
           source scripts/lib-matrix.sh
@@ -149,6 +159,7 @@ jobs:
           fi
           flags=""
           [[ -n "$WANT_REPEATS" ]] && flags="$flags --repeats $WANT_REPEATS"
+          [[ -n "$WANT_SHARDS" ]] && flags="$flags --shards $WANT_SHARDS"
           [[ "${WANT_GAPS:-false}" == "true" ]] && flags="$flags --gaps"
           trees="xray-core,xray-core-rust,sing-box,zeronet,leaf,xray-rust,aether"
           if [[ -n "$WANT_ENGINES" ]]; then
