@@ -2047,22 +2047,33 @@ fn handle_initiation(
     under_load: bool,
     sends: &mut Vec<Vec<u8>>,
 ) {
+    let tracing = crate::foxy::debug_on();
     let Some(peer) = peers.first() else {
         return;
     };
     if !check_mac1(packet, &peer.tunnel.public()) {
+        if tracing {
+            eprintln!("foxy-debug: wg srv init from {source} MAC1 FAIL");
+        }
         return;
     }
     if under_load {
         let (source_bytes, source_width) = endpoint_bytes(source);
         let source_bytes = &source_bytes[..source_width];
         if !cookies.check(now, packet, source_bytes) {
-            if let Some(reply) = cookies.reply(
+            let reply = cookies.reply(
                 now,
                 packet,
                 source_bytes,
                 &cookie_encryption_key(&peer.tunnel.public()),
-            ) {
+            );
+            if tracing {
+                eprintln!(
+                    "foxy-debug: wg srv init from {source} UNDER LOAD cookie reply={}",
+                    reply.is_some()
+                );
+            }
+            if let Some(reply) = reply {
                 let ipv6 = socket.local_addr().is_ok_and(|address| address.is_ipv6());
                 let _ = socket.send_to(&reply, send_endpoint(source, ipv6));
             }
@@ -2073,14 +2084,23 @@ fn handle_initiation(
         let message: &[u8; INITIATION_SIZE] = packet.try_into().ok()?;
         peer.tunnel.consume(message)
     }) else {
+        if tracing {
+            eprintln!("foxy-debug: wg srv init from {source} CONSUME FAIL");
+        }
         return;
     };
     let remote = state.remote_static();
     let Some(index) = peers.iter().position(|peer| peer.config.public == remote) else {
+        if tracing {
+            eprintln!("foxy-debug: wg srv init from {source} NO PEER for static");
+        }
         return;
     };
     let mut events = Vec::new();
-    peers[index].tunnel.answer(now, source, state, &mut events);
+    let sent = peers[index].tunnel.answer(now, source, state, &mut events);
+    if tracing {
+        eprintln!("foxy-debug: wg srv init from {source} answer sent={sent} events={}", events.len());
+    }
     let ipv6 = socket.local_addr().is_ok_and(|address| address.is_ipv6());
     flush(
         &mut events,

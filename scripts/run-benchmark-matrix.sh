@@ -521,7 +521,7 @@ matrix_start_server() {
     positional) args=(run "$config") ;;
     dash-c) args=(-c "$config") ;;
   esac
-  "$bin" "${args[@]}" >>"$logdir/server.log" 2>&1 &
+  FOXY_DEBUG=1 "$bin" "${args[@]}" >>"$logdir/server.log" 2>&1 &
   server_pid=$!
 }
 
