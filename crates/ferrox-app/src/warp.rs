@@ -2657,7 +2657,11 @@ fn connect_status(head: &[u8]) -> Option<u16> {
             return None;
         }
     }
-    std::str::from_utf8(status).ok()?.parse().ok()
+    Some(
+        u16::from(status[0] - b'0') * 100
+            + u16::from(status[1] - b'0') * 10
+            + u16::from(status[2] - b'0'),
+    )
 }
 
 fn connect_head_end(head: &[u8]) -> Option<usize> {

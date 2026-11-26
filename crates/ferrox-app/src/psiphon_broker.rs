@@ -1486,24 +1486,32 @@ fn decode_depth(bytes: &[u8], depth: usize) -> Option<(Value, usize)> {
 pub(crate) fn relay_request_packet(payload: &[u8]) -> Result<Vec<u8>, String> {
     let (value, _) =
         decode(payload).ok_or_else(|| "psiphon broker: relay request is not CBOR".to_owned())?;
-    match value.get(1) {
-        None => Ok(Vec::new()),
-        Some(value) => value
-            .bytes()
-            .map(<[u8]>::to_vec)
-            .ok_or_else(|| "psiphon broker: relay request field 1 is not bytes".to_owned()),
+    let Value::Map(entries) = value else {
+        return Ok(Vec::new());
+    };
+    for (key, value) in entries {
+        if key == Value::UInt(1) {
+            return match value {
+                Value::Bytes(bytes) => Ok(bytes),
+                _ => Err("psiphon broker: relay request field 1 is not bytes".to_owned()),
+            };
+        }
     }
+    Ok(Vec::new())
 }
 
 /// Encode the SSH success payload that carries the broker's next packet.
 pub(crate) fn relay_response(packet: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(packet.len() + 8);
     if packet.is_empty() {
-        return encode(&Value::Map(Vec::new()));
+        encode_head(5, 0, &mut out);
+        return out;
     }
-    encode(&Value::Map(vec![(
-        Value::UInt(1),
-        Value::Bytes(packet.to_vec()),
-    )]))
+    encode_head(5, 1, &mut out);
+    encode_head(0, 1, &mut out);
+    encode_head(2, packet.len() as u64, &mut out);
+    out.extend_from_slice(packet);
+    out
 }
 
 #[cfg(test)]
@@ -2149,5 +2157,41 @@ mod tests {
         assert_eq!(offer.answer_sdp, "answer");
         assert_eq!(offer.relay_packet_to_server, vec![8; 8]);
         assert_eq!(offer.protocol_version, 2);
+    }
+
+    #[test]
+    fn the_relay_response_is_the_canonical_single_field_map() {
+        for packet in [&[][..], &[1u8][..], &[7u8; 300][..]] {
+            let expected = if packet.is_empty() {
+                encode(&Value::Map(Vec::new()))
+            } else {
+                encode(&Value::Map(vec![(
+                    Value::UInt(1),
+                    Value::Bytes(packet.to_vec()),
+                )]))
+            };
+            assert_eq!(relay_response(packet), expected);
+        }
+    }
+
+    #[test]
+    fn the_relay_request_takes_the_first_bytes_field() {
+        let packet = vec![9u8; 40];
+        let payload = encode(&Value::Map(vec![
+            (Value::UInt(0), Value::Bytes(vec![1])),
+            (Value::UInt(1), Value::Bytes(packet.clone())),
+        ]));
+        assert_eq!(relay_request_packet(&payload).expect("request"), packet);
+        assert_eq!(
+            relay_request_packet(&encode(&Value::Map(Vec::new()))).expect("empty"),
+            Vec::<u8>::new()
+        );
+        assert!(
+            relay_request_packet(&encode(&Value::Map(vec![(
+                Value::UInt(1),
+                Value::Text("no".to_owned())
+            )])))
+            .is_err()
+        );
     }
 }

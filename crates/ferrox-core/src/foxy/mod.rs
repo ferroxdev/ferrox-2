@@ -317,7 +317,7 @@ pub fn head_field<'a>(head: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
     for line in lines {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         // A slice has no `split_once` on this toolchain, and the separator is one byte to find.
-        let Some(at) = line.iter().position(|byte| *byte == b':') else {
+        let Some(at) = octet_in(line, 0, b':') else {
             continue;
         };
         if line[..at].eq_ignore_ascii_case(name) {

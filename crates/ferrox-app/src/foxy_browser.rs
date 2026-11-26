@@ -27,10 +27,20 @@ fn verifier() -> Option<String> {
 
 fn challenge(verifier: &str) -> String {
     let digest = sha2::Sha256::digest(verifier.as_bytes());
-    ferrox_core::b64::encode(&digest)
-        .trim_end_matches('=')
-        .replace('+', "-")
-        .replace('/', "_")
+    let mut bytes = ferrox_core::b64::encode(&digest).into_bytes();
+    let len = bytes
+        .iter()
+        .rposition(|byte| *byte != b'=')
+        .map_or(0, |at| at + 1);
+    bytes.truncate(len);
+    for byte in &mut bytes {
+        match *byte {
+            b'+' => *byte = b'-',
+            b'/' => *byte = b'_',
+            _ => {}
+        }
+    }
+    String::from_utf8(bytes).expect("base64 is ASCII")
 }
 
 fn login_path(challenge: &str) -> String {

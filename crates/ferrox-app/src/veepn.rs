@@ -192,30 +192,39 @@ impl VeepnOut {
         let count = servers.dials.len();
         let now = foxy_account::epoch();
         let start = self.picked.fetch_add(1, Ordering::Relaxed);
-        let mut declined: Option<String> = None;
+        let base = start.checked_rem(count).unwrap_or(0);
+        let mut declined: Option<(usize, ferrox_core::foxy::Failure)> = None;
         let mut tried = 0usize;
         for sweep in 0..2 {
             if sweep == 1 {
                 let mut probe: Option<usize> = None;
                 let mut soonest = u64::MAX;
-                for step in 0..count {
-                    let at = (start + step) % count;
+                let mut at = base;
+                for _ in 0..count {
                     let until = servers.silence[at].load(Ordering::Relaxed);
                     if until < soonest {
                         soonest = until;
                         probe = Some(at);
+                    }
+                    at += 1;
+                    if at == count {
+                        at = 0;
                     }
                 }
                 if let Some(at) = probe {
                     servers.silence[at].store(0, Ordering::Relaxed);
                 }
             }
-            for step in 0..count {
-                let at = (start + step) % count;
+            let mut at = base;
+            for _ in 0..count {
                 if servers.silence[at].load(Ordering::Relaxed) > now {
+                    at += 1;
+                    if at == count {
+                        at = 0;
+                    }
                     continue;
                 }
-                let dial = picked(&servers.dials[..], at);
+                let dial = &servers.dials[at];
                 tried += 1;
                 match crate::foxy::open_h1(
                     dial,
@@ -242,18 +251,29 @@ impl VeepnOut {
                     Err(failure) => {
                         servers.silence[at]
                             .store(now.saturating_add(veepn::EDGE_SILENCE), Ordering::Relaxed);
-                        declined = Some(format!("{}:{}: {failure}", dial.host, dial.port));
+                        declined = Some((at, failure));
                     }
+                }
+                at += 1;
+                if at == count {
+                    at = 0;
                 }
             }
             if tried != 0 {
                 break;
             }
         }
-        Err(Refusal::from(declined.map_or_else(
-            || format!("region {region:?} lists no upstream this lane can dial"),
-            |last| format!("{region}: {tried} of {count} upstream(s) declined, last: {last}"),
-        )))
+        let why = match declined {
+            Some((at, failure)) => {
+                let dial = &servers.dials[at];
+                format!(
+                    "{region}: {tried} of {count} upstream(s) declined, last: {}:{}: {failure}",
+                    dial.host, dial.port
+                )
+            }
+            None => format!("region {region:?} lists no upstream this lane can dial"),
+        };
+        Err(Refusal::from(why))
     }
 
     /// The region the lane serves: the one configured, or the optimal one the plane names, kept for the same window as a list. Either way a flow takes a reference count, not a copy of the name, so an open builds no text of its own. A plane that cannot be reached is asked again after [`veepn::PLANE_RETRY`] seconds and the name it already gave is served meanwhile, because a seized API domain says nothing about which region carries this device.
@@ -477,36 +497,44 @@ impl VeepnOut {
         let (domains, start) = self.rotation();
         let count = domains.len();
         let attempts = count.min(veepn::MAX_ATTEMPTS);
-        let mut last = format!("{path} answered nothing");
+        let mut last: Option<String> = None;
         // The plane's asks are a body POSTed or a location GET: one of the two, decided by the body.
         let method = if body.is_empty() { "GET" } else { "POST" };
+        let mut slots: [(&str, &str); 4] = [("", ""); 4];
+        let mut fields = 0;
+        slots[fields] = ("User-Agent", veepn::USER_AGENT);
+        fields += 1;
+        slots[fields] = ("Accept", "application/json");
+        fields += 1;
+        if !body.is_empty() {
+            slots[fields] = ("Content-Type", "application/json");
+            fields += 1;
+        }
+        if let Some(value) = access {
+            slots[fields] = ("Authorization", value);
+            fields += 1;
+        }
+        let headers = &slots[..fields];
         for attempt in 0..attempts {
             if attempt != 0 && started.elapsed().as_secs() >= veepn::REQUEST_BUDGET {
+                let detail = last
+                    .as_deref()
+                    .map_or_else(|| format!("{path} answered nothing"), str::to_owned);
                 return Err(format!(
-                    "{path} ran out the {}s budget: {last}",
+                    "{path} ran out the {}s budget: {detail}",
                     veepn::REQUEST_BUDGET
                 ));
             }
             let endpoint = &domains[(start + attempt) % count];
-            let mut headers: Vec<(&str, &str)> = Vec::with_capacity(5);
-            headers.push(("User-Agent", veepn::USER_AGENT));
-            headers.push(("Accept", "application/json"));
-            if !body.is_empty() {
-                headers.push(("Content-Type", "application/json"));
-            }
-            headers.push(("Connection", "close"));
-            if let Some(value) = access {
-                headers.push(("Authorization", value));
-            }
             // An origin of this lane names a host and a port and no prefix, so the path is the whole request target.
             let mut patience = false;
-            match foxy_account::ask(endpoint, method, path, &headers, body) {
-                Err(why) => last = why,
+            match foxy_account::ask(endpoint, method, path, headers, body) {
+                Err(why) => last = Some(why),
                 Ok(reply) => match reply.status {
                     200..=299 => return Ok(Walked::Carried(reply)),
                     401 | 403 | 407 if access.is_some() => return Ok(Walked::Token),
                     429 | 500..=599 => {
-                        last = format!("{} answers {}", endpoint.host, reply.status);
+                        last = Some(format!("{} answers {}", endpoint.host, reply.status));
                         patience = true;
                     }
                     other => {
@@ -522,7 +550,7 @@ impl VeepnOut {
                 std::thread::sleep(Duration::from_secs(wait));
             }
         }
-        Err(last)
+        Err(last.unwrap_or_else(|| format!("{path} answered nothing")))
     }
 
     /// The rotation to walk and where this flow starts in it. The origins do not change after boot, so the walk reads the lane's own list and only the cursor moves.
@@ -549,6 +577,7 @@ fn servers_of(
     };
     let mut list = Vec::with_capacity(entries.len());
     let mut unusable = 0usize;
+    let mut window: Vec<u8> = Vec::new();
     for entry in entries {
         let username = entry.get("username").and_then(Json::as_str);
         let secret = entry.get("password").and_then(Json::as_str);
@@ -557,37 +586,37 @@ fn servers_of(
             .and_then(Json::as_port)
             .filter(|port| *port != 0);
         // Every address the entry lists becomes a dial of its own: the list is read once per region per 12 hours, so a walk of the region gets one edge per address rather than one per entry, and an edge that has gone quiet silences only itself.
-        let addresses = entry
-            .get("addresses")
-            .and_then(Json::as_arr)
-            .map(|addresses| {
-                addresses
-                    .iter()
-                    .filter_map(Json::as_str)
-                    .filter(|address| !address.is_empty())
-                    .collect::<Vec<_>>()
-            })
-            .filter(|addresses| !addresses.is_empty());
-        let (Some(username), Some(secret), Some(port), Some(addresses)) =
-            (username, secret, port, addresses)
-        else {
+        let Some(addresses) = entry.get("addresses").and_then(Json::as_arr) else {
+            unusable += 1;
+            continue;
+        };
+        let mut hosts = addresses
+            .iter()
+            .filter_map(Json::as_str)
+            .filter(|address| !address.is_empty());
+        let Some(first) = hosts.next() else {
+            unusable += 1;
+            continue;
+        };
+        let (Some(username), Some(secret), Some(port)) = (username, secret, port) else {
             unusable += 1;
             continue;
         };
         // The window is the length the pair codes to, so the whole of it is the credential and it becomes the dial's own text without a second copy.
-        let mut window = vec![0u8; veepn::credential_len(username, secret)];
+        window.clear();
+        window.resize(veepn::credential_len(username, secret), 0);
         if veepn::credential_into(username, secret, &mut window).is_err() {
             unusable += 1;
             continue;
         }
-        let Ok(token) = String::from_utf8(window) else {
+        let Ok(text) = std::str::from_utf8(&window) else {
             unusable += 1;
             continue;
         };
-        let token = std::sync::Arc::<str>::from(token);
-        for host in &addresses {
+        let token = std::sync::Arc::<str>::from(text);
+        for host in std::iter::once(first).chain(hosts) {
             list.push(FoxyDial {
-                host: std::sync::Arc::from(*host),
+                host: std::sync::Arc::from(host),
                 port,
                 // The plane lists an address, so the fetch reads it once and every flow after it dials that without parsing or asking the resolver; a listed name keeps `None` and is resolved when the flow opens.
                 address: edge_peer(host, port),
@@ -613,6 +642,7 @@ fn servers_of(
 }
 
 /// The upstream one flow dials: the `at`th of the region's list, wrapped, and borrowed from the list rather than rebuilt.
+#[cfg(test)]
 #[must_use]
 fn picked(dials: &[FoxyDial], at: usize) -> &FoxyDial {
     &dials[at % dials.len()]

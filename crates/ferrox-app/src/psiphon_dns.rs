@@ -531,12 +531,14 @@ fn run_transforms(transforms: &[Transform], mut value: Vec<u8>) -> io::Result<Ve
                 format!("psiphon transform: {why}"),
             )
         })?;
-        value = transform
+        if let std::borrow::Cow::Owned(replaced) = transform
             .find
             .replace_all(&value, |captures: &regex::bytes::Captures<'_>| {
                 expand(&replacement, captures)
             })
-            .into_owned();
+        {
+            value = replaced;
+        }
     }
     Ok(value)
 }
@@ -1824,6 +1826,21 @@ mod tests {
         let packet =
             super::apply_hex_transform(&[transform], &[0x12, 0x34, 0xab, 0xcd]).expect("transform");
         assert_eq!(packet, [0x34, 0x12, 0xab, 0xcd]);
+    }
+
+    #[test]
+    fn a_transform_that_does_not_match_keeps_the_buffer() {
+        let find = regex::bytes::Regex::new("zz").expect("regex");
+        let replacement = super::Node::parse(b"y").expect("pattern");
+        let transform = super::Transform { find, replacement };
+        let mut packet = Vec::with_capacity(64);
+        packet.extend_from_slice(&[1, 2, 3]);
+        let pointer = packet.as_ptr();
+        let capacity = packet.capacity();
+        let out = super::run_transforms(&[transform], packet).expect("transform");
+        assert_eq!(out, [1, 2, 3]);
+        assert_eq!(out.as_ptr(), pointer);
+        assert_eq!(out.capacity(), capacity);
     }
 
     #[test]

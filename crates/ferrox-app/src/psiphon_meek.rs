@@ -139,17 +139,17 @@ impl PaddingReceiver {
         })
     }
 
-    fn strip(&mut self, body: &[u8]) -> Result<Vec<u8>, String> {
+    fn strip<'a>(&mut self, body: &'a [u8]) -> Result<&'a [u8], String> {
         let mut at = 0;
         loop {
             if at >= body.len() {
-                return Ok(Vec::new());
+                return Ok(&[]);
             }
             let mut prefix = [body[at]];
             self.cipher.apply_keystream(&mut prefix);
             at += 1;
             match prefix[0] {
-                0 => return Ok(body[at..].to_vec()),
+                0 => return Ok(&body[at..]),
                 1 => {
                     let Some(size) = body.get(at..at + 2) else {
                         return Err("psiphon meek padding: truncated size".to_owned());
@@ -1508,11 +1508,12 @@ impl MeekHttp {
                 return Err(format!("psiphon meek status {}", reply.status));
             }
             self.absorb_cookie(&reply.headers);
-            let mut body = reply.body;
-            if let Some(receiver) = self.response_padding.as_mut() {
-                body = receiver.strip(&body)?;
-            }
-            sink.write_all(&body)
+            let body = reply.body;
+            let body = match self.response_padding.as_mut() {
+                Some(receiver) => receiver.strip(&body)?,
+                None => body.as_slice(),
+            };
+            sink.write_all(body)
                 .map_err(|error| format!("psiphon meek write: {error}"))?;
             return Ok(());
         }
@@ -1552,7 +1553,7 @@ impl MeekHttp {
                 )
                 .map_err(|_| "psiphon meek response".to_owned())?;
                 let body = receiver.strip(&body)?;
-                sink.write_all(&body)
+                sink.write_all(body)
                     .map_err(|error| format!("psiphon meek write: {error}"))?;
             } else {
                 crate::foxy_account::read_body_to(
@@ -1593,10 +1594,16 @@ impl MeekHttp {
 
 /// Whether a header is connection-specific and must not cross HTTP/3.
 fn is_hop_by_hop(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "connection" | "keep-alive" | "proxy-connection" | "transfer-encoding" | "upgrade" | "host"
-    )
+    [
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "transfer-encoding",
+        "upgrade",
+        "host",
+    ]
+    .into_iter()
+    .any(|hop| name.eq_ignore_ascii_case(hop))
 }
 
 /// The protocol name the meek cookie reports, with the CDN marker removed.
@@ -2110,6 +2117,15 @@ mod tests {
         frames.extend(sender.pad(&[]).expect("pads"));
         frames.extend(sender.pad(&[0x42, 0x43]).expect("pads"));
         assert_eq!(receiver.strip(&frames).expect("strips"), [0x42, 0x43]);
+    }
+
+    #[test]
+    fn the_stripped_payload_is_borrowed_from_the_received_body() {
+        let (mut sender, mut receiver) = padding_pair(0.0);
+        let frames = sender.pad(&[0x42, 0x43]).expect("pads");
+        let body = receiver.strip(&frames).expect("strips");
+        assert_eq!(body, [0x42, 0x43]);
+        assert_eq!(body.as_ptr(), frames[frames.len() - body.len()..].as_ptr());
     }
 
     /// The cookie signals payload padding only when the profile selected it.

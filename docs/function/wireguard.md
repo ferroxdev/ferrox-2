@@ -151,6 +151,8 @@ Zero extra copies on the stack send path. Every producer reserves the 16-byte tr
 
 - **The gVisor dependency.** The reference's netstack pulls gVisor's `tcpip`; this tree's `smoltcp` is one small crate, whose only new transitive licence is `0BSD` (`managed`), now in `deny.toml`. It is a dependency change, not a speed claim.
 
+- **The socket-family lookup on every initiation.** `handle_initiation` asked `local_addr` once for a cookie reply and again for the handshake flush; it now takes the `ipv6` the receive loop already holds, so an initiation pays no address lookup. The handshake tests hold the reply bytes; the removed `local_addr` calls are a syscall count no loopback test may claim, so the count stays `UNBLESSED` and no number is claimed here. What is **not** removed: the cookie reply still costs its `send_to`, and the flush still writes the same packets.
+
 Against sing-box, nothing is removed: its pinned WireGuard endpoint is a separate implementation, now the matrix's third server, and the translator maps this row's xray-shaped config onto it. ZeroNet's pin carries no WireGuard lane. The pinned AmneziaWG device is a third implementation of the same wire format, not the source of this row.
 
 ## What was not removed

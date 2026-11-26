@@ -1777,7 +1777,16 @@ fn receive_datagram(
         let under_load = cookies.observe(now);
         clear_reserved(packet);
         handle_initiation(
-            peers, now, source, &*packet, socket, to_stack, cookies, under_load, sends,
+            peers,
+            now,
+            source,
+            &*packet,
+            socket,
+            to_stack,
+            cookies,
+            under_load,
+            ipv6_socket,
+            sends,
         );
         return;
     }
@@ -1836,7 +1845,16 @@ fn receive_datagram_owned(
         let under_load = cookies.observe(now);
         clear_reserved(&mut packet);
         handle_initiation(
-            peers, now, source, &packet, socket, to_stack, cookies, under_load, sends,
+            peers,
+            now,
+            source,
+            &packet,
+            socket,
+            to_stack,
+            cookies,
+            under_load,
+            ipv6_socket,
+            sends,
         );
         return Some(packet);
     }
@@ -2045,6 +2063,7 @@ fn handle_initiation(
     to_stack: &Sender<Packet>,
     cookies: &mut CookieGuard,
     under_load: bool,
+    ipv6: bool,
     sends: &mut Vec<Vec<u8>>,
 ) {
     let Some(peer) = peers.first() else {
@@ -2063,7 +2082,6 @@ fn handle_initiation(
                 source_bytes,
                 &cookie_encryption_key(&peer.tunnel.public()),
             ) {
-                let ipv6 = socket.local_addr().is_ok_and(|address| address.is_ipv6());
                 let _ = socket.send_to(&reply, send_endpoint(source, ipv6));
             }
             return;
@@ -2081,7 +2099,6 @@ fn handle_initiation(
     };
     let mut events = Vec::new();
     peers[index].tunnel.answer(now, source, state, &mut events);
-    let ipv6 = socket.local_addr().is_ok_and(|address| address.is_ipv6());
     flush(
         &mut events,
         socket,
@@ -3296,6 +3313,7 @@ mod tests {
             &to_stack,
             &mut cookies,
             false,
+            false,
             &mut Vec::new(),
         );
         let mut response = [0u8; 128];
@@ -4253,6 +4271,7 @@ mod tests {
             &to_stack,
             &mut guard,
             true,
+            false,
             &mut Vec::new(),
         );
 
@@ -4280,6 +4299,7 @@ mod tests {
             &to_stack,
             &mut guard,
             true,
+            false,
             &mut Vec::new(),
         );
 

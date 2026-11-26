@@ -97,14 +97,30 @@ pub fn launch_into<'a>(
 ) -> std::io::Result<&'a [u8]> {
     escaped(udid)?;
     escaped(time_zone)?;
-    copy_parts(out, &launch_parts(udid, time_zone))
+    copy_parts(
+        out,
+        &launch_parts(udid, time_zone),
+        launch_len(udid, time_zone),
+    )
 }
 
 /// The bytes [`launch_into`] writes for these two names.
 #[must_use]
 pub fn launch_len(udid: &str, time_zone: &str) -> usize {
-    parts_len(&launch_parts(udid, time_zone))
+    LAUNCH_FIXED + udid.len() + time_zone.len()
 }
+
+const LAUNCH_FIXED: usize = b"{\"udid\": \"".len()
+    + b"\", \"appVersion\": \"".len()
+    + APP_VERSION.len()
+    + b"\", \"platform\": \"".len()
+    + PLATFORM.len()
+    + b"\", \"platformVersion\": \"".len()
+    + USER_AGENT.len()
+    + b"\", \"timeZone\": \"".len()
+    + b"\", \"deviceName\": \"".len()
+    + DEVICE_NAME.len()
+    + b"\"}".len();
 
 #[must_use]
 fn launch_parts<'a>(udid: &'a str, time_zone: &'a str) -> [&'a [u8]; 13] {
@@ -131,14 +147,17 @@ fn launch_parts<'a>(udid: &'a str, time_zone: &'a str) -> [&'a [u8]; 13] {
 /// [`std::io::ErrorKind::InvalidInput`] when `out` is shorter than [`server_list_len`] or the region holds a byte the string form would have to escape.
 pub fn server_list_into<'a>(region: &str, out: &'a mut [u8]) -> std::io::Result<&'a [u8]> {
     escaped(region)?;
-    copy_parts(out, &server_list_parts(region))
+    copy_parts(out, &server_list_parts(region), server_list_len(region))
 }
 
 /// The bytes [`server_list_into`] writes for this region.
 #[must_use]
 pub fn server_list_len(region: &str) -> usize {
-    parts_len(&server_list_parts(region))
+    SERVER_LIST_FIXED + region.len()
 }
+
+const SERVER_LIST_FIXED: usize =
+    b"{\"protocol\": \"https\", \"region\": \"".len() + b"\", \"type\": 0}".len();
 
 #[must_use]
 fn server_list_parts(region: &str) -> [&[u8]; 3] {
@@ -153,9 +172,9 @@ fn server_list_parts(region: &str) -> [&[u8]; 3] {
 ///
 /// # Errors
 /// [`std::io::ErrorKind::InvalidInput`] when `out` is shorter than the runs together.
-fn copy_parts<'a>(out: &'a mut [u8], parts: &[&[u8]]) -> std::io::Result<&'a [u8]> {
+fn copy_parts<'a>(out: &'a mut [u8], parts: &[&[u8]], total: usize) -> std::io::Result<&'a [u8]> {
     let mut text = out
-        .get_mut(..parts_len(parts))
+        .get_mut(..total)
         .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
     let written = text.len();
     for part in parts {
@@ -164,17 +183,6 @@ fn copy_parts<'a>(out: &'a mut [u8], parts: &[&[u8]]) -> std::io::Result<&'a [u8
         text = rest;
     }
     Ok(&out[..written])
-}
-
-#[must_use]
-const fn parts_len(parts: &[&[u8]]) -> usize {
-    let mut total = 0;
-    let mut at = 0;
-    while at < parts.len() {
-        total += parts[at].len();
-        at += 1;
-    }
-    total
 }
 
 /// A name the string form would have to escape is a refusal, not a surprise: the plane's own values never carry one, and a pasted region or zone might.
@@ -205,11 +213,14 @@ pub fn api_domain(url: &str) -> Option<(&str, u16)> {
 #[must_use]
 fn parse_port(digits: &str) -> Option<u16> {
     let digits = digits.as_bytes();
-    if digits.is_empty() || digits.len() > 5 || !digits.iter().all(u8::is_ascii_digit) {
+    if digits.is_empty() || digits.len() > 5 {
         return None;
     }
     let mut value = 0u32;
-    for digit in digits {
+    for &digit in digits {
+        if !digit.is_ascii_digit() {
+            return None;
+        }
         value = value * 10 + u32::from(digit - b'0');
     }
     (1..65_536).contains(&value).then_some(value as u16)

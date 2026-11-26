@@ -603,8 +603,9 @@ pub(crate) fn read_body<S: BufRead>(
             .any(|token| token.trim().eq_ignore_ascii_case("chunked"))
     }) {
         let mut body = Vec::new();
+        let mut line = String::new();
         loop {
-            let mut line = String::new();
+            line.clear();
             if (&mut *io)
                 .take(65)
                 .read_line(&mut line)
@@ -617,7 +618,7 @@ pub(crate) fn read_body<S: BufRead>(
             if size == 0 {
                 let mut trailer = 0usize;
                 loop {
-                    let mut line = String::new();
+                    line.clear();
                     let budget = MAX_HEAD.saturating_sub(trailer).saturating_add(1);
                     let read = (&mut *io)
                         .take(budget as u64)
@@ -686,8 +687,9 @@ pub(crate) fn read_body_to<S: BufRead, W: Write + ?Sized>(
             .any(|token| token.trim().eq_ignore_ascii_case("chunked"))
     }) {
         let mut total = 0usize;
+        let mut line = String::new();
         loop {
-            let mut line = String::new();
+            line.clear();
             if (&mut *io)
                 .take(65)
                 .read_line(&mut line)
@@ -700,7 +702,7 @@ pub(crate) fn read_body_to<S: BufRead, W: Write + ?Sized>(
             if size == 0 {
                 let mut trailer = 0usize;
                 loop {
-                    let mut line = String::new();
+                    line.clear();
                     let budget = MAX_HEAD.saturating_sub(trailer).saturating_add(1);
                     let read = (&mut *io)
                         .take(budget as u64)
