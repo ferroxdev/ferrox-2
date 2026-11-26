@@ -24,6 +24,8 @@ const API_HOSTS: [&str; 2] = ["api.devices.cloudflare.com", "api.cloudflareclien
 const API_VERSION: &str = "v0a4471";
 /// The HTTP authority WARP's CONNECT-IP endpoint answers on.
 const CONNECT_HOST: &str = "cloudflareaccess.com";
+/// The MASQUE edge that answers CONNECT-IP when the config names no address.
+const CONNECT_ADDRESS: &str = "162.159.198.2";
 /// The SNI the MASQUE edge presents.
 const CONNECT_SNI: &str = "consumer-masque.cloudflareclient.com";
 /// The resolver Aether's `--ech auto` queries for the ECH config.
@@ -783,7 +785,7 @@ impl WarpSpec {
                 .iter()
                 .filter_map(|text| text.parse().ok())
                 .collect(),
-            masque_address: CONNECT_HOST.to_owned(),
+            masque_address: CONNECT_ADDRESS.to_owned(),
             masque_port: QUIC_PORT,
             masque_server_name: CONNECT_SNI.to_owned(),
             masque_host: CONNECT_HOST.to_owned(),
@@ -954,7 +956,7 @@ fn split_host_port(text: &str, default_port: u16) -> Option<(String, u16)> {
     Some((text.to_owned(), default_port))
 }
 
-/// The `masque` block's five fields, each defaulting to the WARP edge the API names.
+/// The `masque` block's five fields; the address defaults to a WARP edge, not the authority.
 fn masque_settings(masque: Option<&crate::json::Json>) -> (String, u16, String, String, String) {
     let field = |key: &str, fallback: &str| {
         masque
@@ -969,7 +971,7 @@ fn masque_settings(masque: Option<&crate::json::Json>) -> (String, u16, String, 
         .and_then(crate::json::Json::as_port)
         .unwrap_or(QUIC_PORT);
     (
-        field("address", CONNECT_HOST),
+        field("address", CONNECT_ADDRESS),
         port,
         field("serverName", CONNECT_SNI),
         field("host", CONNECT_HOST),
@@ -3985,7 +3987,7 @@ pub(crate) fn one_tap(
             .iter()
             .filter_map(|text| text.parse().ok())
             .collect(),
-        masque_address: CONNECT_HOST.to_owned(),
+        masque_address: CONNECT_ADDRESS.to_owned(),
         masque_port: QUIC_PORT,
         masque_server_name: masque_sni.unwrap_or(CONNECT_SNI).to_owned(),
         masque_host: CONNECT_HOST.to_owned(),
@@ -4439,7 +4441,7 @@ mod tests {
             probe_host: PROBE_HOST.to_owned(),
             probe_port: PROBE_PORT,
             dns: Vec::new(),
-            masque_address: CONNECT_HOST.to_owned(),
+            masque_address: CONNECT_ADDRESS.to_owned(),
             masque_port: QUIC_PORT,
             masque_server_name: CONNECT_SNI.to_owned(),
             masque_host: CONNECT_HOST.to_owned(),
@@ -4574,7 +4576,7 @@ mod tests {
             probe_host: PROBE_HOST.to_owned(),
             probe_port: PROBE_PORT,
             dns: Vec::new(),
-            masque_address: CONNECT_HOST.to_owned(),
+            masque_address: CONNECT_ADDRESS.to_owned(),
             masque_port: QUIC_PORT,
             masque_server_name: CONNECT_SNI.to_owned(),
             masque_host: CONNECT_HOST.to_owned(),
@@ -5047,6 +5049,16 @@ mod tests {
             None
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_default_masque_address_is_an_edge_not_the_authority() {
+        let spec = WarpSpec::for_command(Mode::Masque, None, None);
+        assert_eq!(spec.masque_address, CONNECT_ADDRESS);
+        assert_eq!(spec.masque_host, CONNECT_HOST);
+        let (address, _, _, host, _) = masque_settings(None);
+        assert_eq!(address, CONNECT_ADDRESS);
+        assert_eq!(host, CONNECT_HOST);
     }
 
     #[test]
