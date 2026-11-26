@@ -614,6 +614,12 @@ impl Resolver {
         self.lookup_inner(name, false, false).records()
     }
 
+    /// Whether this resolver is the TUN's hijack address, which is reachable only while its
+    /// capture is live; a config's own resolver stays usable before the routes land.
+    pub(crate) fn is_tun_hijack(&self) -> bool {
+        self.servers.len() == 1 && self.servers[0].id == "tun-hijack"
+    }
+
     /// The relay's own outbound addresses resolve through the local dial: a routed DNS query
     /// for the proxy's own name would ask the proxy it is trying to open.
     pub(crate) fn lookup_local(self: &Arc<Self>, name: &str) -> Option<(Vec<IpAddr>, u32)> {

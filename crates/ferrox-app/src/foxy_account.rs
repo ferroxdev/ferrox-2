@@ -1062,6 +1062,16 @@ impl Endpoint {
         }
     }
 
+    /// Take the dialled peer before a TUN capture, so a renewal after it dials the same address
+    /// instead of asking a hijack resolver the physical route may not carry.
+    pub(crate) fn pin_before_capture(&mut self) {
+        if self.address.is_none() {
+            let (host, port) = self.dial_edge();
+            self.address = crate::proxy::resolve_edge_addrs(&host, port)
+                .and_then(|addrs| addrs.into_iter().next());
+        }
+    }
+
     fn connect_with(
         &self,
         cfg: &TlsConfig,
