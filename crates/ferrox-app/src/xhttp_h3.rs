@@ -459,50 +459,7 @@ impl H3Reader {
             let payload = &self.buf[at..end];
             at = end;
             match frame.kind {
-                frames::H3_HEADERS => {
-                    let status = hpack::qpack_status(payload);
-                    if status.is_some_and(|code| (100..200).contains(&code)) {
-                        continue;
-                    }
-                    self.head_seen = true;
-                    if self.head.is_none() && self.status.is_none() {
-                        let Some((head, status)) =
-                            decode_head(payload, self.expect_request, status)
-                        else {
-                            let missing = if self.expect_request {
-                                "h3 request head is missing"
-                            } else {
-                                "h3 response head is missing"
-                            };
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                missing,
-                            ));
-                        };
-                        if !self.expect_request {
-                            let connect_ok = self.connect
-                                && status.is_some_and(|code| (200..300).contains(&code));
-                            if !connect_ok {
-                                self.content_length = hpack::qpack_content_length(payload)
-                                    .map_err(|_| {
-                                        std::io::Error::new(
-                                            std::io::ErrorKind::InvalidData,
-                                            "h3 content-length is malformed",
-                                        )
-                                    })?;
-                            }
-                            if self.padding_head {
-                                self.padding = hpack::qpack_fields(payload).is_some_and(|fields| {
-                                    fields.iter().any(|(name, value)| {
-                                        name.eq_ignore_ascii_case(b"padding") && !value.is_empty()
-                                    })
-                                });
-                            }
-                        }
-                        self.head = head;
-                        self.status = status;
-                    }
-                }
+                frames::H3_HEADERS => self.headers(payload)?,
                 frames::H3_CANCEL_PUSH => {
                     // RFC 9114 §7.2.3: `CANCEL_PUSH` belongs to the control stream, so on a request stream it is `H3_FRAME_UNEXPECTED`, a connection error; a request reset is QUIC `RESET_STREAM`, not a frame.
                     self.wire.abort(frames::H3_FRAME_UNEXPECTED);
@@ -517,6 +474,49 @@ impl H3Reader {
             self.buf_at = at;
         }
         self.buf_at = at;
+        Ok(())
+    }
+
+    fn headers(&mut self, payload: &[u8]) -> std::io::Result<()> {
+        let status = hpack::qpack_status(payload);
+        if status.is_some_and(|code| (100..200).contains(&code)) {
+            return Ok(());
+        }
+        self.head_seen = true;
+        if self.head.is_some() || self.status.is_some() {
+            return Ok(());
+        }
+        let Some((head, status)) = decode_head(payload, self.expect_request, status) else {
+            let missing = if self.expect_request {
+                "h3 request head is missing"
+            } else {
+                "h3 response head is missing"
+            };
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                missing,
+            ));
+        };
+        if !self.expect_request {
+            let connect_ok = self.connect && status.is_some_and(|code| (200..300).contains(&code));
+            if !connect_ok {
+                self.content_length = hpack::qpack_content_length(payload).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "h3 content-length is malformed",
+                    )
+                })?;
+            }
+            if self.padding_head {
+                self.padding = hpack::qpack_fields(payload).is_some_and(|fields| {
+                    fields.iter().any(|(name, value)| {
+                        name.eq_ignore_ascii_case(b"padding") && !value.is_empty()
+                    })
+                });
+            }
+        }
+        self.head = head;
+        self.status = status;
         Ok(())
     }
 
