@@ -898,7 +898,13 @@ mod tests {
             .open(port_lock_path(&two))
             .unwrap();
         assert!(probe.try_lock().is_err());
+        drop(probe);
         drop(held);
+        let probe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(port_lock_path(&two))
+            .unwrap();
         assert!(probe.try_lock().is_ok());
         let _ = std::fs::remove_dir_all(root);
     }
@@ -915,7 +921,13 @@ mod tests {
             .open(port_lock_path(&two))
             .unwrap();
         assert!(probe.try_lock().is_err());
+        drop(probe);
         drop(held);
+        let probe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(port_lock_path(&two))
+            .unwrap();
         assert!(probe.try_lock().is_ok());
         let _ = std::fs::remove_dir_all(root);
     }
