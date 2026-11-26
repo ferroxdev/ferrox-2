@@ -1,7 +1,9 @@
 //! The catalogue is public, so the listing is the binary's `edges` call. The
 //! last answer is kept so the list still prints when the catalogue is down.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::Path;
 use std::process::Command;
 
@@ -11,6 +13,11 @@ use crate::args::{Options, Outbound, die};
 use crate::config::{build_outbound, remembered_city, remembered_country};
 use crate::lane::require_bin;
 use crate::paths::{Paths, read_trim, secure_dir, write_private};
+
+fn utf8(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes)
+        .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
+}
 
 fn rows(bin: &Path, ping: bool) -> String {
     let mut command = Command::new(bin);
@@ -22,17 +29,89 @@ fn rows(bin: &Path, ping: bool) -> String {
         .output()
         .ok()
         .filter(|output| output.status.success())
-        .map_or_default(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .map_or_default(|output| utf8(output.stdout))
 }
 
-fn plain(line: &str) -> String {
-    let Ok(mut value) = serde_json::from_str::<Value>(line) else {
-        return line.to_owned();
-    };
-    if let Some(object) = value.as_object_mut() {
-        object.remove("ms");
+fn upper(text: &str) -> Cow<'_, str> {
+    if text.chars().any(|character| character.is_lowercase()) {
+        Cow::Owned(text.to_uppercase())
+    } else {
+        Cow::Borrowed(text)
     }
-    value.to_string()
+}
+
+#[derive(Default)]
+struct Place {
+    edges: usize,
+    best: Option<u64>,
+}
+
+impl Place {
+    fn record(&mut self, reading: Option<u64>) {
+        self.edges += 1;
+        if let Some(ms) = reading {
+            self.best = Some(self.best.map_or(ms, |current| current.min(ms)));
+        }
+    }
+}
+
+struct Catalogue {
+    places: BTreeMap<String, BTreeMap<String, Place>>,
+    total: usize,
+    measured: bool,
+    saved: String,
+}
+
+fn catalogue(text: &str, wanted: &str) -> Catalogue {
+    let mut out = Catalogue {
+        places: BTreeMap::new(),
+        total: 0,
+        measured: false,
+        saved: String::with_capacity(text.len() + 1),
+    };
+    for line in text.lines() {
+        let Ok(mut edge) = serde_json::from_str::<Value>(line) else {
+            out.saved.push_str(line);
+            out.saved.push('\n');
+            continue;
+        };
+        let reading = ms_of(&edge);
+        if let Some(object) = edge.as_object_mut() {
+            object.remove("ms");
+        }
+        let _ = writeln!(out.saved, "{edge}");
+        let country = upper(
+            edge.get("country")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        );
+        if country.is_empty() || (!wanted.is_empty() && country.as_ref() != wanted.as_str()) {
+            continue;
+        }
+        let city = upper(edge.get("city").and_then(Value::as_str).unwrap_or_default());
+        out.total += 1;
+        out.measured |= reading.is_some();
+        if !out.places.contains_key(country.as_ref()) {
+            let mut place = Place::default();
+            place.record(reading.flatten());
+            let mut cities = BTreeMap::new();
+            cities.insert(city.into_owned(), place);
+            out.places.insert(country.into_owned(), cities);
+            continue;
+        }
+        let cities = out
+            .places
+            .get_mut(country.as_ref())
+            .expect("the country was checked above");
+        if let Some(place) = cities.get_mut(city.as_ref()) {
+            place.record(reading.flatten());
+        } else {
+            let mut place = Place::default();
+            place.record(reading.flatten());
+            cities.insert(city.into_owned(), place);
+        }
+    }
+    out
 }
 
 #[allow(clippy::option_option)]
@@ -42,6 +121,15 @@ fn ms_of(value: &Value) -> Option<Option<u64>> {
         return None;
     }
     Some(object.get("ms").and_then(Value::as_u64))
+}
+
+fn contains_ascii_ignore_case(haystack: &str, needle: &str) -> bool {
+    let needle = needle.as_bytes();
+    !needle.is_empty()
+        && haystack
+            .as_bytes()
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
 pub fn list(options: &Options, paths: &Paths, filter: &str, ping: bool) -> Result<(), String> {
@@ -56,7 +144,8 @@ pub fn list(options: &Options, paths: &Paths, filter: &str, ping: bool) -> Resul
         .map_err(|error| format!("cannot create the config dir: {error}"))?;
     let wanted = filter.to_uppercase();
     let mut text = rows(&bin, ping);
-    if text.trim().is_empty() {
+    let fresh = !text.trim().is_empty();
+    if !fresh {
         let Some(saved) = read_trim(&paths.locations_file) else {
             return Err(
                 "the catalogue did not answer and no list is saved yet: check the network, then run 'ferrox-cli locations' again."
@@ -68,54 +157,18 @@ pub fn list(options: &Options, paths: &Paths, filter: &str, ping: bool) -> Resul
             paths.locations_file.display()
         );
         text = saved;
-    } else {
-        let kept: Vec<String> = text.lines().map(plain).collect();
-        write_private(&paths.locations_file, &format!("{}\n", kept.join("\n")))
+    }
+    let parsed = catalogue(&text, &wanted);
+    if fresh {
+        write_private(&paths.locations_file, &parsed.saved)
             .map_err(|error| format!("cannot save the catalogue: {error}"))?;
     }
-
-    let mut places: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
-    let mut best: BTreeMap<(String, String), Option<u64>> = BTreeMap::new();
-    let mut total = 0;
-    let mut measured = false;
-    for line in text.lines() {
-        let Ok(edge) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let country = edge
-            .get("country")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_uppercase();
-        if country.is_empty() || (!wanted.is_empty() && country != wanted) {
-            continue;
-        }
-        let city = edge
-            .get("city")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_uppercase();
-        *places
-            .entry(country.clone())
-            .or_default()
-            .entry(city.clone())
-            .or_default() += 1;
-        total += 1;
-        if let Some(reading) = ms_of(&edge) {
-            measured = true;
-            let key = (country, city);
-            best.entry(key)
-                .and_modify(|entry| {
-                    *entry = match (*entry, reading) {
-                        (Some(current), Some(next)) => Some(current.min(next)),
-                        (None, Some(next)) => Some(next),
-                        (None, None) => None,
-                        (Some(current), None) => Some(current),
-                    };
-                })
-                .or_insert(reading);
-        }
-    }
+    let Catalogue {
+        places,
+        total,
+        measured,
+        ..
+    } = parsed;
 
     if places.is_empty() {
         if wanted.is_empty() {
@@ -149,32 +202,24 @@ pub fn list(options: &Options, paths: &Paths, filter: &str, ping: bool) -> Resul
         }
     }
 
-    let mut countries: Vec<String> = places.keys().cloned().collect();
-    countries.sort();
-    if let Some(index) = countries.iter().position(|country| country == "REC") {
-        let rec = countries.remove(index);
-        countries.insert(0, rec);
-    }
-    for country in &countries {
-        let cities = &places[country];
-        let mark = if country == &current_country {
+    let print_country = |country: &str, cities: &BTreeMap<String, Place>| {
+        let mark = if country == current_country.as_str() {
             "*"
         } else {
             " "
         };
         println!(
             " {mark} {country:<4} {:>3} edges{}",
-            cities.values().sum::<usize>(),
-            readable(country_reading(&best, country), ping, measured)
+            cities.values().map(|place| place.edges).sum::<usize>(),
+            readable(country_reading(cities), ping, measured)
         );
-        let mut city_names: Vec<&String> = cities.keys().collect();
-        city_names.sort();
-        for city in city_names {
-            let star = if country == &current_country && city == &current_city {
-                "*"
-            } else {
-                " "
-            };
+        for (city, place) in cities {
+            let star =
+                if country == current_country.as_str() && city.as_str() == current_city.as_str() {
+                    "*"
+                } else {
+                    " "
+                };
             let label = if city.is_empty() {
                 "any"
             } else {
@@ -182,15 +227,17 @@ pub fn list(options: &Options, paths: &Paths, filter: &str, ping: bool) -> Resul
             };
             println!(
                 "   {star}   {label:<6} {:>3}{}",
-                cities[city],
-                readable(
-                    best.get(&(country.clone(), city.clone()))
-                        .copied()
-                        .flatten(),
-                    ping,
-                    measured,
-                )
+                place.edges,
+                readable(place.best, ping, measured)
             );
+        }
+    };
+    if let Some(cities) = places.get("REC") {
+        print_country("REC", cities);
+    }
+    for (country, cities) in &places {
+        if country != "REC" {
+            print_country(country, cities);
         }
     }
     println!();
@@ -209,17 +256,8 @@ fn readable(reading: Option<u64>, ping: bool, measured: bool) -> String {
     )
 }
 
-fn country_reading(best: &BTreeMap<(String, String), Option<u64>>, country: &str) -> Option<u64> {
-    let mut found: Option<u64> = None;
-    for ((candidate, _city), reading) in best {
-        if candidate != country {
-            continue;
-        }
-        if let Some(ms) = reading {
-            found = Some(found.map_or(*ms, |current: u64| current.min(*ms)));
-        }
-    }
-    found
+fn country_reading(cities: &BTreeMap<String, Place>) -> Option<u64> {
+    cities.values().filter_map(|place| place.best).min()
 }
 
 fn veepn_regions(paths: &Paths, filter: &str) -> Result<(), String> {
@@ -238,7 +276,7 @@ fn veepn_regions(paths: &Paths, filter: &str) -> Result<(), String> {
     let mut text = output
         .ok()
         .filter(|output| output.status.success())
-        .map_or_default(|output| String::from_utf8_lossy(&output.stdout).into_owned());
+        .map_or_default(|output| utf8(output.stdout));
     if text.trim().is_empty() {
         let Some(saved) = read_trim(&paths.veepn_locations) else {
             return Err(
@@ -264,27 +302,38 @@ fn veepn_regions(paths: &Paths, filter: &str) -> Result<(), String> {
         .into_iter()
         .flatten()
     {
-        let code = location
-            .get("countryCode")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_uppercase();
+        let code = upper(
+            location
+                .get("countryCode")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        );
         let region = location
             .get("region")
             .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        let name = location
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
+            .unwrap_or_default();
         if code.is_empty()
-            || (!wanted.is_empty() && code != wanted && region.to_uppercase() != wanted)
+            || (!wanted.is_empty()
+                && code.as_ref() != wanted.as_str()
+                && upper(region).as_ref() != wanted.as_str())
         {
             continue;
         }
-        places.entry(code).or_default().push((region, name));
+        let name = location
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if places.contains_key(code.as_ref()) {
+            places
+                .get_mut(code.as_ref())
+                .expect("the country code was checked above")
+                .push((region.to_owned(), name.to_owned()));
+        } else {
+            places.insert(
+                code.into_owned(),
+                vec![(region.to_owned(), name.to_owned())],
+            );
+        }
     }
     if places.is_empty() {
         if wanted.is_empty() {
@@ -344,7 +393,7 @@ fn psiphon_regions(options: &Options, paths: &Paths, filter: &str) -> Result<(),
     let mut text = output
         .ok()
         .filter(|output| output.status.success())
-        .map_or_default(|output| String::from_utf8_lossy(&output.stdout).into_owned());
+        .map_or_default(|output| utf8(output.stdout));
     if text.trim().is_empty() {
         let Some(saved) = read_trim(&paths.psiphon_locations) else {
             return Err(
@@ -364,11 +413,11 @@ fn psiphon_regions(options: &Options, paths: &Paths, filter: &str) -> Result<(),
     let mut rows = Vec::new();
     for line in text.lines() {
         let (code, count) = line.split_once('\t').unwrap_or((line, "0"));
-        let code = code.trim().to_uppercase();
-        if code.is_empty() || (!wanted.is_empty() && code != wanted) {
+        let code = upper(code.trim());
+        if code.is_empty() || (!wanted.is_empty() && code.as_ref() != wanted.as_str()) {
             continue;
         }
-        rows.push((code, count.trim().parse::<u64>().unwrap_or(0)));
+        rows.push((code.into_owned(), count.trim().parse::<u64>().unwrap_or(0)));
     }
     if rows.is_empty() {
         if wanted.is_empty() {
@@ -408,7 +457,6 @@ pub fn remember(options: &Options, paths: &Paths, country: &str, city: &str) -> 
     }
     if options.outbound == Some(Outbound::Veepn) {
         if let Some(saved) = read_trim(&paths.veepn_locations) {
-            let wanted = country.to_uppercase();
             let found = serde_json::from_str::<Value>(&saved).is_ok_and(|document| {
                 document
                     .get("locations")
@@ -418,14 +466,13 @@ pub fn remember(options: &Options, paths: &Paths, country: &str, city: &str) -> 
                             let code = location
                                 .get("countryCode")
                                 .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_uppercase();
+                                .unwrap_or_default();
                             let region = location
                                 .get("region")
                                 .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_uppercase();
-                            code == wanted || region == wanted
+                                .unwrap_or_default();
+                            upper(code).as_ref() == country.as_str()
+                                || upper(region).as_ref() == country.as_str()
                         })
                     })
             });
@@ -466,7 +513,7 @@ pub fn remember(options: &Options, paths: &Paths, country: &str, city: &str) -> 
     }
     if let Some(saved) = read_trim(&paths.locations_file) {
         let needle = format!("\"country\":\"{country}\"");
-        if !saved.to_lowercase().contains(&needle.to_lowercase()) {
+        if !contains_ascii_ignore_case(&saved, &needle) {
             die(&format!(
                 "'{country}' is not in the saved catalogue list; run 'ferrox-cli locations' to refresh it, or pick a code it prints."
             ));
@@ -488,14 +535,62 @@ pub fn remember(options: &Options, paths: &Paths, country: &str, city: &str) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{country_reading, readable};
+    use std::collections::BTreeMap;
+
+    use super::{Place, catalogue, contains_ascii_ignore_case, country_reading, readable};
 
     #[test]
     fn a_silent_city_does_not_hide_a_measured_one() {
-        let mut best = std::collections::BTreeMap::new();
-        best.insert(("US".to_owned(), "SFO".to_owned()), None);
-        best.insert(("US".to_owned(), "IAD".to_owned()), Some(21));
-        assert_eq!(country_reading(&best, "US"), Some(21));
+        let mut cities = BTreeMap::new();
+        cities.insert(
+            "SFO".to_owned(),
+            Place {
+                edges: 1,
+                best: None,
+            },
+        );
+        cities.insert(
+            "IAD".to_owned(),
+            Place {
+                edges: 1,
+                best: Some(21),
+            },
+        );
+        assert_eq!(country_reading(&cities), Some(21));
+    }
+
+    #[test]
+    fn a_catalogue_is_parsed_and_saved_once() {
+        let text = concat!(
+            "{\"country\":\"us\",\"city\":\"sfo\",\"ms\":21}\n",
+            "{\"country\":\"US\",\"city\":\"IAD\",\"ms\":null}\n",
+            "{\"country\":\"US\",\"city\":\"IAD\",\"ms\":9}\n",
+            "not json\n",
+        );
+        let parsed = catalogue(text, "");
+        assert_eq!(parsed.total, 3);
+        assert!(parsed.measured);
+        let us = &parsed.places["US"];
+        assert_eq!(us["SFO"].edges, 1);
+        assert_eq!(us["SFO"].best, Some(21));
+        assert_eq!(us["IAD"].edges, 2);
+        assert_eq!(us["IAD"].best, Some(9));
+        assert_eq!(country_reading(us), Some(9));
+        assert_eq!(parsed.saved.lines().count(), 4);
+        assert!(!parsed.saved.contains("\"ms\""));
+        assert!(parsed.saved.ends_with("not json\n"));
+    }
+
+    #[test]
+    fn a_saved_catalogue_is_searched_without_lowercasing_it() {
+        assert!(contains_ascii_ignore_case(
+            "{\"country\":\"US\",\"city\":\"SFO\"}",
+            "\"country\":\"us\""
+        ));
+        assert!(!contains_ascii_ignore_case(
+            "{\"country\":\"GB\",\"city\":\"LHR\"}",
+            "\"country\":\"US\""
+        ));
     }
 
     #[test]
