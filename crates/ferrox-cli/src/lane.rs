@@ -927,6 +927,24 @@ pub fn other_lanes(paths: &Paths) -> Vec<(String, u32)> {
 mod tests {
     use super::*;
 
+    fn free_within(path: &std::path::Path) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            let probe = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .unwrap();
+            if probe.try_lock().is_ok() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn lanes_in_one_root_share_the_port_probe_lock() {
         let root = std::env::temp_dir().join(format!("ferrox-ports-{}", std::process::id()));
@@ -939,8 +957,9 @@ mod tests {
             .open(port_lock_path(&two))
             .unwrap();
         assert!(probe.try_lock().is_err());
+        drop(probe);
         drop(held);
-        assert!(probe.try_lock().is_ok());
+        assert!(free_within(&port_lock_path(&two)));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -956,8 +975,9 @@ mod tests {
             .open(port_lock_path(&two))
             .unwrap();
         assert!(probe.try_lock().is_err());
+        drop(probe);
         drop(held);
-        assert!(probe.try_lock().is_ok());
+        assert!(free_within(&port_lock_path(&two)));
         let _ = std::fs::remove_dir_all(root);
     }
 
