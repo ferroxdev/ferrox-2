@@ -1993,7 +1993,7 @@ fn resolve_edges(identity: &mut Identity, spec: &mut WarpSpec) -> Result<(), Str
     }
     if want_wireguard && wireguard.is_none() && spec.mode == Mode::WireGuard {
         let edge = identity.wireguard.endpoint;
-        if check_wireguard(identity, spec, edge) {
+        if check_wireguard(identity, spec, edge) && http_check_wireguard(identity, spec, edge) {
             wireguard = Some(edge);
             println!("[+] selected API WireGuard endpoint {edge}");
         } else {
