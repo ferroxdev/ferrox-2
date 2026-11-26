@@ -2405,16 +2405,16 @@ fn http_check(
         }
     }
     let line = response.split(|byte| *byte == b'\n').next().unwrap_or(&[]);
-    http_status_code(&String::from_utf8_lossy(line)) == Some(204)
+    http_status_code(line) == Some(204)
 }
 
-fn http_status_code(status_line: &str) -> Option<u16> {
-    let mut parts = status_line.split(' ');
+fn http_status_code(status_line: &[u8]) -> Option<u16> {
+    let mut parts = status_line.split(|byte| *byte == b' ');
     let version = parts.next()?;
-    if !version.starts_with("HTTP/") {
+    if !version.starts_with(b"HTTP/") {
         return None;
     }
-    parts.next()?.trim().parse().ok()
+    std::str::from_utf8(parts.next()?).ok()?.trim().parse().ok()
 }
 
 /// The `WireGuard` half as the existing `wireguard` outbound reads it.
@@ -2665,18 +2665,17 @@ fn connect_status(head: &[u8]) -> Option<u16> {
 }
 
 fn connect_head_end(head: &[u8]) -> Option<usize> {
-    let crlf = head
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|at| at + 4);
-    let lf = head
-        .windows(2)
-        .position(|window| window == b"\n\n")
-        .map(|at| at + 2);
-    match (crlf, lf) {
-        (Some(crlf), Some(lf)) => Some(crlf.min(lf)),
-        (crlf, lf) => crlf.or(lf),
+    let mut from = 0;
+    while let Some(at) = ferrox_core::foxy::octet_in(head, from, b'\n') {
+        if at >= 1 && head[at - 1] == b'\n' {
+            return Some(at + 1);
+        }
+        if at >= 3 && head[at - 1] == b'\r' && head[at - 2] == b'\n' && head[at - 3] == b'\r' {
+            return Some(at + 1);
+        }
+        from = at + 1;
     }
+    None
 }
 
 fn read_connect_head(
@@ -6745,10 +6744,41 @@ mod tests {
 
     #[test]
     fn an_http_status_line_is_read_not_guessed() {
-        assert_eq!(http_status_code("HTTP/1.1 204 No Content"), Some(204));
-        assert_eq!(http_status_code("HTTP/1.1 200 OK"), Some(200));
-        assert_eq!(http_status_code("204"), None);
-        assert_eq!(http_status_code("GET / HTTP/1.1"), None);
+        assert_eq!(http_status_code(b"HTTP/1.1 204 No Content"), Some(204));
+        assert_eq!(http_status_code(b"HTTP/1.1 200 OK"), Some(200));
+        assert_eq!(http_status_code(b"204"), None);
+        assert_eq!(http_status_code(b"GET / HTTP/1.1"), None);
+    }
+
+    #[test]
+    fn a_connect_head_end_matches_the_window_scan() {
+        fn reference(head: &[u8]) -> Option<usize> {
+            let crlf = head
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|at| at + 4);
+            let lf = head
+                .windows(2)
+                .position(|window| window == b"\n\n")
+                .map(|at| at + 2);
+            match (crlf, lf) {
+                (Some(crlf), Some(lf)) => Some(crlf.min(lf)),
+                (crlf, lf) => crlf.or(lf),
+            }
+        }
+        let mut seed = 0x9e37_79b9_u32;
+        for length in 0..96 {
+            let mut bytes = Vec::with_capacity(length);
+            for _ in 0..length {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                bytes.push(match seed % 7 {
+                    0 => b'\r',
+                    1 => b'\n',
+                    _ => b'x',
+                });
+            }
+            assert_eq!(connect_head_end(&bytes), reference(&bytes), "{bytes:?}");
+        }
     }
 
     #[test]

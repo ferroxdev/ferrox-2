@@ -170,6 +170,8 @@ No local duration is quoted: every contributor dials through a VPN, so a local r
 
 The gateway status code is assembled from its three checked digits instead of validating the slice as UTF-8 and parsing it again. `a_connect_status_line_is_read_not_guessed` holds the status bytes; the instruction count the rewrite should move stays `UNBLESSED`. What is **not** removed: the reason phrase and header walk that guard the same status line are unchanged.
 
+The CONNECT reply head is found by one octet scan for the blank line instead of two overlapping `windows` passes, and the HTTP status line is parsed as bytes rather than a lossy `String`; `a_connect_head_end_matches_the_window_scan` sweeps the scan against the old window search, and `an_http_status_line_is_read_not_guessed` holds the status bytes. The instruction count the rewrite should move stays `UNBLESSED`. What is **not** removed: the head is still copied into the read buffer, and the status parse still walks the line once.
+
 ## CI scope
 
 What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md). The dial-side of the row is this page's own unit races, and the throughput comparison is the matrix's WARP rows (`warp-masque-*`, `warp-gool-*`, `warp-gool-classic-*`, `warp-mim-*`): ferrox's warp outbound against Aether in the same cell, which runs only in CI because everything beyond loopback is.
