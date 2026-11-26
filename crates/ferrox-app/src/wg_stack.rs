@@ -3170,17 +3170,25 @@ pub(crate) fn client_udp_forward<T: Clone + Into<ToTunnel>>(
     let mut buf = crate::proxy::udp_buffer();
     let mut app: Option<SocketAddr> = None;
     let tracing = crate::foxy::debug_on();
-    let mut up_logged = 0u32;
-    let mut down_logged = 0u32;
+    let start = StdInstant::now();
+    let mut last_packet = start;
+    let mut seen = 0u32;
     while !stop.load(Ordering::Relaxed) {
         let mut idle = true;
         while let Ok(packet) = reply_rx.try_recv() {
-            if tracing && down_logged < 6 {
-                eprintln!(
-                    "foxy-debug: fwd down #{down_logged} len={} port={port} app={app:?}",
-                    packet.packet().len()
-                );
-                down_logged += 1;
+            if tracing {
+                let now = StdInstant::now();
+                let gap = now.duration_since(last_packet);
+                if seen < 10 || gap > Duration::from_millis(500) {
+                    eprintln!(
+                        "foxy-debug: fwd down t={}ms gap={}ms len={} port={port} app={app:?}",
+                        now.duration_since(start).as_millis(),
+                        gap.as_millis(),
+                        packet.packet().len()
+                    );
+                }
+                seen += 1;
+                last_packet = now;
             }
             idle &= !forward_downlink(&packet, port, app, relay);
             drop(packet);
@@ -3192,13 +3200,22 @@ pub(crate) fn client_udp_forward<T: Clone + Into<ToTunnel>>(
                     continue;
                 }
                 app = Some(sender);
-                if tracing && up_logged < 6 {
-                    eprintln!("foxy-debug: fwd up #{up_logged} {n}B {sender}->{target}");
-                    up_logged += 1;
+                if tracing {
+                    let now = StdInstant::now();
+                    let gap = now.duration_since(last_packet);
+                    if seen < 10 || gap > Duration::from_millis(500) {
+                        eprintln!(
+                            "foxy-debug: fwd up t={}ms gap={}ms {n}B {sender}->{target}",
+                            now.duration_since(start).as_millis(),
+                            gap.as_millis()
+                        );
+                    }
+                    seen += 1;
+                    last_packet = now;
                 }
                 if !lane_send(config, port, target, &buf[..n], &to_tunnel, headroom) {
                     if tracing {
-                        eprintln!("foxy-debug: fwd lane_send failed after {up_logged} up");
+                        eprintln!("foxy-debug: fwd lane_send failed");
                     }
                     break;
                 }
