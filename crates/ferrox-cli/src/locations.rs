@@ -33,7 +33,7 @@ fn rows(bin: &Path, ping: bool) -> String {
 }
 
 fn upper(text: &str) -> Cow<'_, str> {
-    if text.chars().any(|character| character.is_lowercase()) {
+    if text.chars().any(char::is_lowercase) {
         Cow::Owned(text.to_uppercase())
     } else {
         Cow::Borrowed(text)
