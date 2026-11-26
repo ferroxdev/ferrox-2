@@ -608,18 +608,48 @@ fn can_signal(pid: u32) -> bool {
 }
 
 #[cfg(unix)]
-fn sudo_path(args: &[&str]) -> Option<PathBuf> {
-    let output = Command::new("sudo")
-        .args(args)
+fn sudo_ready() -> bool {
+    Command::new("sudo")
+        .args(["-n", "true"])
         .stdin(Stdio::null())
+        .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(unix)]
+fn sudo_prompt() -> bool {
+    use std::io::IsTerminal;
+    (std::io::stdin().is_terminal() || std::io::stderr().is_terminal())
+        && Command::new("sudo")
+            .arg("-v")
+            .status()
+            .is_ok_and(|status| status.success())
+}
+
+#[cfg(unix)]
+fn sudo_path(args: &[&str]) -> Option<PathBuf> {
+    let read = || {
+        let output = Command::new("sudo")
+            .args(args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        (!path.is_empty()).then(|| PathBuf::from(path))
+    };
+    if let Some(path) = read() {
+        return Some(path);
+    }
+    if sudo_ready() || !sudo_prompt() {
         return None;
     }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    (!path.is_empty()).then(|| PathBuf::from(path))
+    read()
 }
 
 #[cfg(target_os = "linux")]
@@ -646,14 +676,25 @@ fn privileged_is_ferrox(paths: &Paths, pid: u32) -> Option<bool> {
 }
 
 #[cfg(unix)]
-fn privileged_kill(pid: u32, signal: &str) -> bool {
-    std::process::Command::new("sudo")
+fn sudo_signal(pid: u32, signal: &str) -> bool {
+    Command::new("sudo")
         .args(["-n", "kill", signal, &pid.to_string()])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+#[cfg(unix)]
+fn privileged_kill(pid: u32, signal: &str) -> bool {
+    if sudo_signal(pid, signal) {
+        return true;
+    }
+    if sudo_ready() || !sudo_prompt() {
+        return false;
+    }
+    sudo_signal(pid, signal)
 }
 
 pub fn stop(paths: &Paths) -> Result<(), String> {

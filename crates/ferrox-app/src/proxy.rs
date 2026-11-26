@@ -353,6 +353,10 @@ fn dokodemo_user_level(inbound: &Json) -> u32 {
 
 #[allow(clippy::too_many_lines)]
 fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, test: bool) -> ! {
+    // Armed before the outbound builds: a lane still signing in must honour a stop it cannot signal.
+    if !test {
+        crate::shutdown::watch();
+    }
     // Sized before the first lane, so every flow from here reads the ceiling its role named.
     if dials_a_proxy(root) {
         lane_pool::mark_proxy_peer();
@@ -484,7 +488,6 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, tes
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
     }
     if !test {
-        crate::shutdown::watch();
         if let Some(geodata) = geodata {
             crate::geodata::start(geodata, route.clone(), outbound.clone(), root.clone());
         }
