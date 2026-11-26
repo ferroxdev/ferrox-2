@@ -1121,16 +1121,16 @@ pub fn parse() -> Options {
     if options.warp
         && !matches!(
             options.outbound,
-            Some(Outbound::Foxy | Outbound::Psiphon | Outbound::Warp)
+            Some(Outbound::Foxy | Outbound::Psiphon | Outbound::Veepn | Outbound::Warp)
         )
     {
         die(
-            "--warp starts the WARP lane by itself, or chains foxy or psiphon through it (up --warp, up --foxy --warp, up --psiphon --warp); nothing was started.",
+            "--warp starts the WARP lane by itself, or chains foxy, psiphon or veepn through it (up --warp, up --foxy --warp, up --psiphon --warp, up --veepn --warp); nothing was started.",
         );
     }
     if options.outbound == Some(Outbound::Warp) && !options.upstream.is_empty() {
         die(
-            "the WARP lane dials Cloudflare directly; --upstream belongs to the foxy or psiphon lane; nothing was started.",
+            "the WARP lane dials Cloudflare directly; --upstream belongs to the foxy, psiphon or veepn lane; nothing was started.",
         );
     }
     if !options.udp_via.is_empty()
@@ -1209,8 +1209,8 @@ outbound (choose one)
   --veepn                VeePN lane; anonymous, no account and no server
   --psiphon              native OSSH/SSH lane; no account and no client binary
   --psiphon-cdn          the same lane with CDN fronting and beast mode
-  --warp                 the WARP (Aether) lane by itself; with --foxy or
-                         --psiphon it chains that carrier through WARP
+  --warp                 the WARP (Aether) lane by itself; with --foxy,
+                         --psiphon or --veepn it chains that carrier through WARP
   --vless LINK           a vless:// share link (tcp, ws, grpc, httpupgrade, xhttp)
   --vmess HOST:PORT --uuid ID
   --trojan HOST:PORT --password PW
@@ -1266,9 +1266,9 @@ psiphon options (nothing is required: the signed list names the servers)
   --psiphon-bin FILE     a psiphon-tunnel-core path, if one is used
   --psiphon-exchange-key KEY / --psiphon-conduit-timeout SECS
 
-warp options (the lane alone, or chained with foxy or psiphon)
-  --warp                 the WARP (Aether) lane by itself, or with --foxy or
-                         --psiphon chains that carrier through WARP first
+warp options (the lane alone, or chained with foxy, psiphon or veepn)
+  --warp                 the WARP (Aether) lane by itself, or with --foxy,
+                         --psiphon or --veepn chains that carrier through WARP
   --warp-mode MODE       auto (default), wireguard, masque, gool (wg-over-masque),
                          gool-classic (WARP in WARP) or mim (MASQUE in MASQUE)
   --warp-identity FILE   the WARP device identity to reuse (default beside the lane)

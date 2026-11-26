@@ -45,6 +45,9 @@ fn signalled() -> bool {
 pub(crate) fn watch() {
     install_signals();
     let stop_file = std::env::var_os("FERROX_STOP_FILE").map(std::path::PathBuf::from);
+    if let Some(path) = stop_file.as_deref() {
+        let _ = std::fs::remove_file(path);
+    }
     let spawned = std::thread::Builder::new()
         .name("ferrox-shutdown".to_owned())
         .spawn(move || {

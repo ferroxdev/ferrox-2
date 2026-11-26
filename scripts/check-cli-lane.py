@@ -963,6 +963,22 @@ def check_udp_split(state: pathlib.Path) -> int:
                 f"the UDP warp lane has no identity file: {lane_warp!r}"
             )
 
+        chained = lane("--warp", "--udp-via", "warp")
+        if len(chained.get("outbounds", [])) != 2:
+            raise AssertionError(
+                f"the chained UDP lane added a second WARP outbound: {chained!r}"
+            )
+        if not any(
+            outbound.get("tag") == "warp" and outbound.get("protocol") == "warp"
+            for outbound in chained["outbounds"]
+        ):
+            raise AssertionError(f"the chained UDP lane has no WARP outbound: {chained!r}")
+        if not any(
+            rule.get("network") == "udp" and rule.get("outboundTag") == "warp"
+            for rule in chained.get("routing", {}).get("rules", [])
+        ):
+            raise AssertionError(f"the chained UDP lane has no UDP rule: {chained!r}")
+
         psiphon = lane("--udp-via", "psiphon-cdn")
         lane_psiphon = split(psiphon, "udp-psiphon-cdn")
         settings = lane_psiphon.get("settings", {})
@@ -1026,6 +1042,62 @@ def check_udp_split(state: pathlib.Path) -> int:
             for rule in chained.get("routing", {}).get("rules", [])
         ):
             raise AssertionError(f"the chained lane has no WARP rule: {chained!r}")
+
+        snapshot.unlink(missing_ok=True)
+        subprocess.run(
+            [
+                str(CLI),
+                "up",
+                "--veepn",
+                "--warp",
+                "--warp-mode",
+                "mim",
+                "--fronts",
+                "socks",
+                "--socks",
+                str(free_port()),
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=WATCH,
+            env=env,
+        )
+        if not snapshot.exists():
+            raise AssertionError("no config was written for --veepn --warp")
+        chained = json.loads(snapshot.read_text(encoding="utf-8"))
+        carrier = chained["outbounds"][0]
+        if carrier.get("protocol") != "veepn":
+            raise AssertionError(f"the chained carrier is not veepn: {carrier!r}")
+        upstream = carrier.get("settings", {}).get("upstreamProxy", "")
+        if not upstream.startswith("socks5://127.0.0.1:"):
+            raise AssertionError(f"veepn did not dial the WARP front: {carrier!r}")
+        warp = next(
+            (
+                outbound
+                for outbound in chained["outbounds"]
+                if outbound.get("tag") == "warp"
+            ),
+            None,
+        )
+        if (
+            warp is None
+            or warp.get("protocol") != "warp"
+            or warp.get("settings", {}).get("mode") != "mim"
+            or not warp.get("settings", {}).get("register")
+        ):
+            raise AssertionError(f"the chained veepn lane has no mim WARP outbound: {chained!r}")
+        if not any(
+            inbound.get("tag") == "ferrox-warp-hop"
+            for inbound in chained["inbounds"]
+        ):
+            raise AssertionError(f"the chained veepn lane has no hidden front: {chained!r}")
+        if not any(
+            rule.get("inboundTag") == ["ferrox-warp-hop"]
+            and rule.get("outboundTag") == "warp"
+            for rule in chained.get("routing", {}).get("rules", [])
+        ):
+            raise AssertionError(f"the chained veepn lane has no WARP rule: {chained!r}")
 
         direct = lane("--udp-via", "direct")
         if split(direct, "udp-direct").get("protocol") != "freedom":

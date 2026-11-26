@@ -65,6 +65,25 @@ resolve_bin() {
   done
   BIN="$cargo_target/${profiles[0]}/ferrox-app"
 }
+# sudo raises this launcher for the TUN device, but the account, credentials and
+# session belong to the invoking user: drop back before touching any of them.
+if [ "$(id -u 2>/dev/null)" = 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ] && [ "${FERROX_SUDO_DROPPED:-0}" != 1 ]; then
+  SUDO_HOME="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)"
+  if [ -z "$SUDO_HOME" ]; then
+    SUDO_HOME="$(dscl . -read "/Users/$SUDO_USER" NFSHomeDirectory 2>/dev/null | awk 'NR == 1 {print $2}')"
+  fi
+  if [ -z "$SUDO_HOME" ]; then
+    echo "ferrox-cli.sh: cannot resolve the home of $SUDO_USER; nothing was started." >&2
+    exit 1
+  fi
+  keep=()
+  for name in FERROX_CONF_DIR FERROX_STATE_DIR FERROX_BIN FERROX_PROFILE FERROX_RELEASE; do
+    [ -n "${!name:-}" ] && keep+=("$name=${!name}")
+  done
+  exec sudo -u "$SUDO_USER" -H env FERROX_SUDO_DROPPED=1 \
+    PATH="$PATH:$SUDO_HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin" \
+    ${keep[@]+"${keep[@]}"} /bin/bash "$SELF" "$@"
+fi
 CONF_DIR="${FERROX_CONF_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/ferrox}"
 # The system proxy is machine-wide, so its marker and the lane registry live
 # outside the per-user config dir that FERROX_CONF_DIR can move.
@@ -322,8 +341,8 @@ outbound (choose one)
   --veepn                VeePN lane; anonymous, no account and no server
   --psiphon              Psiphon lane; native OSSH/SSH, no client binary
   --psiphon-cdn          the same lane with CDN fronting + beast mode requested
-  --warp                 the WARP (Aether) lane by itself; with --foxy or
-                         --psiphon it chains that carrier through WARP
+  --warp                 the WARP (Aether) lane by itself; with --foxy,
+                         --psiphon or --veepn it chains that carrier through WARP
   --vless LINK           any vless:// share link
   --vmess LINK|HOST:PORT any vmess:// share link, or HOST:PORT with --uuid ID
   --trojan HOST:PORT --password PW
@@ -403,9 +422,9 @@ psiphon options (native OSSH/SSH transport and the lane's local SOCKS)
   --psiphon-establish-timeout, --psiphon-emit-bytes) are still parsed for script
   compatibility; the native engine names each one as ignored in one line.
 
-warp options (the lane alone, or chained with foxy or psiphon)
-  --warp                 the WARP (Aether) lane by itself, or with --foxy or
-                         --psiphon chains that carrier through WARP first:
+warp options (the lane alone, or chained with foxy, psiphon or veepn)
+  --warp                 the WARP (Aether) lane by itself, or with --foxy,
+                         --psiphon or --veepn chains that carrier through WARP first:
                          register once, then egress the account plane, the signed
                          list and the carrier through it. One process, one config
   --warp-mode MODE       auto (default), wireguard, masque, gool (WG over
@@ -1271,10 +1290,10 @@ veepn_outbound() {
   local region udid
   region="$(effective_region)"
   udid="$(stable_udid)" || return 1
-  python3 - "$region" "$VEEPN_DOMAINS" "$udid" <<'PY'
+  python3 - "$region" "$VEEPN_DOMAINS" "$udid" "$UPSTREAM" <<'PY'
 import json, sys
 
-region, domains, udid = sys.argv[1:4]
+region, domains, udid, upstream = sys.argv[1:5]
 settings = {}
 if region:
     settings["region"] = region
@@ -1283,6 +1302,8 @@ if listed:
     settings["domains"] = listed
 if udid:
     settings["udid"] = udid
+if upstream:
+    settings["upstreamProxy"] = upstream
 print(json.dumps({"protocol": "veepn", "settings": settings}))
 PY
 }
@@ -1475,10 +1496,11 @@ if in_config == "1":
         settings["scan"] = "balanced"
     outbounds.append({"tag": "warp", "protocol": "warp", "settings": settings})
     rules.append({"type": "field", "inboundTag": ["ferrox-warp-hop"], "outboundTag": "warp"})
-if udp:
-    lane = json.loads(udp)
-    lane["tag"] = tag
-    outbounds.append(lane)
+if tag:
+    if udp:
+        lane = json.loads(udp)
+        lane["tag"] = tag
+        outbounds.append(lane)
     rules.insert(0, {"type": "field", "network": "udp", "outboundTag": tag})
 print(json.dumps({"hidden_port": int(hidden) if hidden else 0,
                   "outbounds": outbounds, "rules": rules}))
@@ -2525,12 +2547,33 @@ lane_pid_runs() {
   return 1
 }
 
-# `kill -0` answers EPERM for a root-owned lane; `ps` still sees the pid.
+lane_pid_is_ferrox() {
+  local command
+  [ -n "$BIN" ] || return 1
+  command="$(ps -p "$1" -ww -o command= 2>/dev/null)" || return 1
+  case "$command" in
+    *"${BIN##*/}"*) return 0 ;;
+  esac
+  return 1
+}
+
+# `kill -0` answers EPERM for a root-owned lane; `ps` still sees the pid. A
+# zombie has already exited even though its pid is still visible.
 pid_alive() {
-  local pid="$1"
+  local pid="$1" state
   [ -n "$pid" ] || return 1
-  kill -0 "$pid" 2>/dev/null && return 0
-  ps -p "$pid" -o pid= >/dev/null 2>&1
+  if kill -0 "$pid" 2>/dev/null; then
+    state="$(ps -p "$pid" -o stat= 2>/dev/null || true)"
+    case "$state" in
+      *Z*) return 1 ;;
+    esac
+    return 0
+  fi
+  state="$(ps -p "$pid" -o stat= 2>/dev/null)" || return 1
+  case "$state" in
+    *Z*) return 1 ;;
+  esac
+  return 0
 }
 
 lane_running_at() {
@@ -2750,12 +2793,25 @@ build_config() {
       ;;
     veepn)
       load_lane_location
+      WARP_IN_CONFIG=0
+      WARP_HIDDEN_PORT=""
+      BUILT_UDP_OUTBOUND=""
+      BUILT_UDP_TAG=""
+      if [ "$WANT_WARP" = 1 ] && [ -z "$UPSTREAM" ]; then
+        WARP_HIDDEN_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')" ||
+          die "cannot reserve a loopback port for the WARP hop; nothing was started."
+        UPSTREAM="socks5://127.0.0.1:$WARP_HIDDEN_PORT"
+        WARP_IN_CONFIG=1
+        say "warp: the Veepn plane and its edges ride a WARP exit through a hidden loopback front."
+      elif [ "$WANT_WARP" = 1 ]; then
+        say "--upstream names the hop, so --warp is not applied; WARP rides --udp-via warp only."
+      fi
       BUILT_OUTBOUND="$(build_outbound veepn)" || exit 1
       save_lane_location
       ;;
     warp)
       if [ -n "$UPSTREAM" ]; then
-        die "the WARP lane dials Cloudflare directly; --upstream belongs to the foxy or psiphon lane; nothing was started."
+        die "the WARP lane dials Cloudflare directly; --upstream belongs to the foxy, psiphon or veepn lane; nothing was started."
       fi
       BUILT_OUTBOUND="$(build_outbound warp)" || exit 1
       ;;
@@ -2906,7 +2962,12 @@ start_lane() {
   new_cfg="$CFG"; new_fronts="$FRONTS"
   if lane_running; then
     say "a lane${INSTANCE:+ '$INSTANCE'} is already running (pid $(lane_pid)); stopping it first."
-    stop_lane 0
+    if ! stop_lane 0; then
+      [ -n "$CFG_STAGE" ] && rm -f "$CFG_STAGE"
+      CFG="$new_cfg"; FRONTS="$new_fronts"
+      proxy_unlock
+      return 1
+    fi
   fi
   CFG="$new_cfg"; FRONTS="$new_fronts"
   if ! write_lane_meta; then
@@ -2983,15 +3044,15 @@ supervise_lane() {
 }
 
 stop_lane() {
-  local clear="${1:-1}" supervisor waited=0 pid
+  local clear="${1:-1}" supervisor waited=0 pid stopped=1 command
   load_lane_meta || true
   if lane_running; then
     pid="$(lane_pid)"
-    if lane_pid_runs "$pid" "$CFG"; then
+    if lane_pid_runs "$pid" "$CFG" || lane_pid_is_ferrox "$pid"; then
       # The app restores its routes and exits on the stop file; a process that
       # predates it gets the signal after the grace period.
       : >"$STOP_FILE" 2>/dev/null || true
-      while pid_alive "$pid" && [ "$waited" -lt 50 ]; do
+      while pid_alive "$pid" && [ "$waited" -lt 10 ]; do
         sleep 0.1
         waited=$((waited + 1))
       done
@@ -3005,9 +3066,19 @@ stop_lane() {
         fi
         if pid_alive "$pid"; then
           say "lane pid $pid did not stop; run: sudo kill -9 $pid" >&2
+          stopped=0
         fi
       fi
+    else
+      command="$(ps -p "$pid" -ww -o command= 2>/dev/null)" || command=""
+      if [ -z "$command" ] && pid_alive "$pid"; then
+        say "lane pid $pid cannot be inspected as this user; run: sudo kill $pid" >&2
+        stopped=0
+      fi
     fi
+  fi
+  if [ "$stopped" = 0 ]; then
+    return 1
   fi
   rm -f "$STOP_FILE"
   if [ "$clear" = 1 ]; then
@@ -3031,7 +3102,7 @@ stop_lane() {
 
 # The config is ours only when we generated it: a --config file belongs to its owner.
 stop_and_forget() {
-  stop_lane 1
+  stop_lane 1 || return 1
   [ "$OUTBOUND" = config ] || rm -f "$CFG"
 }
 
@@ -3368,7 +3439,7 @@ warp_ladder() {
   [ -z "$UPSTREAM" ] || return 1
   [ "$WANT_WARP" = 0 ] || return 1
   grep -q "the account plane answered 451" "$LOG" 2>/dev/null || return 1
-  stop_and_forget
+  stop_and_forget || return 1
   say "the account plane answered 451 from this region: the lane retries once through"
   say "WARP (register an identity, sign in through it). Pass '--warp' to make that"
   say "the first move next time."
@@ -3389,7 +3460,7 @@ action_up() {
       exit 1
     fi
     # An attempt cut short is not a lane: Ctrl-C before it proves a flow removes what it started.
-    trap 'stop_and_forget; say "interrupted: the lane was stopped and its config removed; the log stays at $LOG."; exit 130' INT TERM
+    trap 'if stop_and_forget; then say "interrupted: the lane was stopped and its config removed; the log stays at $LOG."; else say "interrupted: the lane did not stop; its config and pid were kept for ferrox-cli down."; fi; exit 130' INT TERM
     if [ -n "$FRONTS" ] && ! wait_fronts; then
       if warp_ladder; then continue; fi
       say "the lane did not open its fronts; last lines of $LOG:"
@@ -3448,7 +3519,7 @@ action_serve() {
       exit 1
     fi
     # A serve that never proved a flow is an attempt too: the same interruption cleanup applies.
-    trap 'stop_and_forget; say "interrupted: the lane was stopped and its config removed; the log stays at $LOG."; exit 130' INT TERM
+    trap 'if stop_and_forget; then say "interrupted: the lane was stopped and its config removed; the log stays at $LOG."; else say "interrupted: the lane did not stop; its config and pid were kept for ferrox-cli down."; fi; exit 130' INT TERM
     if [ -n "$FRONTS" ] && ! wait_fronts; then
       if warp_ladder; then continue; fi
       say "the lane did not open its fronts; last lines of $LOG:"
@@ -3490,7 +3561,7 @@ action_serve() {
   say "Ctrl-C stops it."
   trap 'stop_and_forget; exit 0' INT TERM
   local pid; pid="$(lane_pid)"
-  while [ -n "$pid" ] && pid_alive "$pid"; do sleep 2; done
+  while pid_alive "$pid"; do sleep 2; done
   say "the lane exited; last lines of $LOG:"
   tail -n 15 "$LOG" 2>/dev/null || true
   stop_and_forget
@@ -3849,8 +3920,8 @@ fi
 if [ -n "$FXA_USER_AGENT" ] && [ "$OUTBOUND" != foxy ]; then
   die "--fxa-user-agent belongs to the foxy lane; nothing was started."
 fi
-if [ "$WANT_WARP" = 1 ] && [ "$OUTBOUND" != foxy ] && [ "$OUTBOUND" != psiphon ] && [ "$OUTBOUND" != warp ]; then
-  die "--warp starts the WARP lane by itself, or chains foxy or psiphon through it (up --warp, up --foxy --warp, up --psiphon --warp); nothing was started."
+if [ "$WANT_WARP" = 1 ] && [ "$OUTBOUND" != foxy ] && [ "$OUTBOUND" != psiphon ] && [ "$OUTBOUND" != veepn ] && [ "$OUTBOUND" != warp ]; then
+  die "--warp starts the WARP lane by itself, or chains foxy, psiphon or veepn through it (up --warp, up --foxy --warp, up --psiphon --warp, up --veepn --warp); nothing was started."
 fi
 if [ "$WARP_MODE_SET" = 1 ] && [ "$WANT_WARP" != 1 ] && [ "$UDP_VIA" != warp ]; then
   die "--warp-mode belongs to --warp or --udp-via warp; nothing was started."
@@ -3978,11 +4049,14 @@ case "$ACTION" in
     if [ "$ALL" = 1 ]; then
       stop_all_lanes || down_rc=$?
     else
-      stop_lane 1 || down_rc=$?
-      forget_lane_config
+      if stop_lane 1; then
+        forget_lane_config
+      else
+        down_rc=$?
+      fi
     fi
     if [ "$down_rc" -ne 0 ]; then
-      say "lane${INSTANCE:+ '$INSTANCE'} stopped, but the system proxy was not cleared; run 'ferrox-cli down' again." >&2
+      say "lane${INSTANCE:+ '$INSTANCE'} could not be fully stopped or the system proxy was not cleared; run 'ferrox-cli down' again." >&2
       exit "$down_rc"
     fi
     if [ "$ALL" = 1 ]; then

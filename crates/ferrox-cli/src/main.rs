@@ -31,7 +31,58 @@ use args::{Action, Options, Outbound};
 use config::{FoxyAccount, Ports, fronts, port_of};
 use paths::{Paths, read_trim, read_trim_checked};
 
+#[cfg(unix)]
+fn drop_sudo() {
+    if unsafe { libc::geteuid() } != 0
+        || std::env::var("FERROX_SUDO_DROPPED").is_ok_and(|value| value == "1")
+    {
+        return;
+    }
+    let Some(user) = std::env::var("SUDO_USER")
+        .ok()
+        .filter(|user| user != "root")
+    else {
+        return;
+    };
+    let Some(home) = paths::sudo_home() else {
+        args::die(&format!(
+            "cannot resolve the home of {user}; nothing was started."
+        ));
+    };
+    let Ok(exe) = std::env::current_exe() else {
+        args::die("cannot find this executable to drop sudo; nothing was started.");
+    };
+    let path = format!(
+        "{}:{}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin",
+        std::env::var("PATH").unwrap_or_default(),
+        home.display()
+    );
+    let mut command = std::process::Command::new("sudo");
+    command
+        .args(["-u", &user, "-H", "env", "FERROX_SUDO_DROPPED=1"])
+        .arg(format!("PATH={path}"));
+    for (name, value) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("FERROX_") && name != "FERROX_SUDO_DROPPED" {
+            let mut pair = name;
+            pair.push("=");
+            pair.push(value);
+            command.arg(pair);
+        }
+    }
+    let status = command.arg(exe).args(std::env::args_os().skip(1)).status();
+    match status {
+        Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+        Err(error) => args::die(&format!(
+            "cannot drop sudo to {user}: {error}; nothing was started."
+        )),
+    }
+}
+
+#[cfg(not(unix))]
+fn drop_sudo() {}
+
 fn main() {
+    drop_sudo();
     let mut options = args::parse();
     if options.vpn && matches!(options.action, Action::Up | Action::Serve) {
         args::require_vpn_admin();
@@ -399,13 +450,6 @@ fn up_once(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
         );
     }
     let warp_used = warp_identity_needed(options);
-    let hidden_socks = match write_lane_config(options, paths, ports, account.as_ref()) {
-        Ok(port) => port,
-        Err(error) => {
-            eprintln!("ferrox-cli: {error}");
-            return 1;
-        }
-    };
     if let Err(error) = prepare_warp_identity(warp_used, options, paths, &bin) {
         eprintln!("ferrox-cli: {error}");
         return 1;
@@ -428,6 +472,13 @@ fn up_once(options: &mut Options, paths: &mut Paths, serve: bool) -> i32 {
             return 1;
         }
     }
+    let hidden_socks = match write_lane_config(options, paths, ports, account.as_ref()) {
+        Ok(port) => port,
+        Err(error) => {
+            eprintln!("ferrox-cli: {error}");
+            return 1;
+        }
+    };
     let pid = match lane::start(&bin, paths, options.debug, options.vpn) {
         Ok(pid) => pid,
         Err(error) => {

@@ -200,6 +200,7 @@ impl TokenFile {
         use crate::json::{self, Json};
         if let Some(dir) = self.path.parent() {
             let _ = std::fs::create_dir_all(dir);
+            crate::ownership::hand_back(dir);
         }
         let Some(_lock) = self.lock_file() else {
             eprintln!("foxy: cannot lock the session at {}", self.path.display());
@@ -291,6 +292,7 @@ impl TokenFile {
             let _ = std::fs::remove_file(&temp);
             return false;
         }
+        crate::ownership::hand_back(&self.path);
         true
     }
 
@@ -325,13 +327,15 @@ impl TokenFile {
     fn lock_file(&self) -> Option<std::fs::File> {
         let mut path = self.path.as_os_str().to_owned();
         path.push(".lock");
+        let path = std::path::PathBuf::from(path);
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .open(std::path::PathBuf::from(path))
+            .open(&path)
             .ok()?;
+        crate::ownership::hand_back(&path);
         for _ in 0..100 {
             match file.try_lock() {
                 Ok(()) => return Some(file),

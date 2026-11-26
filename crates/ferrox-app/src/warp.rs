@@ -1385,6 +1385,9 @@ fn quarantine(path: &Path) {
             "warp: the damaged identity at {} could not be moved aside: {error}",
             path.display()
         );
+    } else {
+        #[cfg(unix)]
+        crate::ownership::hand_back(&target);
     }
 }
 
@@ -1434,7 +1437,10 @@ fn backup_corrupt(path: &Path) -> Result<(), String> {
                 "warp: cannot sync the damaged identity `{}`: {error}",
                 target.display()
             )
-        })
+        })?;
+        #[cfg(unix)]
+        crate::ownership::hand_back(&target);
+        Ok(())
     })();
     if result.is_err() && created {
         let _ = std::fs::remove_file(&target);
@@ -1823,6 +1829,8 @@ impl Identity {
         {
             std::fs::create_dir_all(parent)
                 .map_err(|error| format!("warp: cannot create `{}`: {error}", parent.display()))?;
+            #[cfg(unix)]
+            crate::ownership::hand_back(parent);
         }
         let mut temp = path.to_path_buf();
         let name = temp.file_name().map_or_else(
@@ -1859,6 +1867,8 @@ impl Identity {
             drop(file);
             std::fs::rename(&temp, path)
                 .map_err(|error| format!("warp: cannot save `{}`: {error}", path.display()))?;
+            #[cfg(unix)]
+            crate::ownership::hand_back(path);
             #[cfg(unix)]
             if let Some(parent) = path
                 .parent()
