@@ -408,7 +408,7 @@ matrix_wireguard_dir() {
   dir="$root/$dir"
   mkdir -p "$dir"
   local pair
-  for pair in server client server-inner client-inner; do
+  for pair in server server-inner; do
     if [[ ! -s "$dir/$pair.txt" ]]; then
       "${ferrox_bin:?no ferrox binary to mint the WireGuard keypairs}" x25519 >"$dir/$pair.txt" || return 1
     fi
@@ -480,12 +480,34 @@ matrix_wireguard_engine_v6() {
   printf 'fd00::%d/128\n' "$((index + 2))"
 }
 
-matrix_wireguard_client_private() {
-  matrix_wireguard_key "$(matrix_wireguard_dir)/client.txt" PrivateKey
+matrix_wireguard_inner_engine_dir() {
+  local dir
+  dir="$(matrix_wireguard_dir)/$1"
+  mkdir -p "$dir" || return 1
+  if [[ ! -s "$dir/inner-client.txt" ]]; then
+    "${ferrox_bin:?no ferrox binary to mint the WireGuard keypairs}" x25519 >"$dir/inner-client.txt" || return 1
+  fi
+  echo "$dir"
 }
 
-matrix_wireguard_client_public() {
-  matrix_wireguard_key "$(matrix_wireguard_dir)/client.txt" 'Password (PublicKey)'
+matrix_wireguard_inner_engine_private() {
+  matrix_wireguard_key "$(matrix_wireguard_inner_engine_dir "$1")/inner-client.txt" PrivateKey
+}
+
+matrix_wireguard_inner_engine_public() {
+  matrix_wireguard_key "$(matrix_wireguard_inner_engine_dir "$1")/inner-client.txt" 'Password (PublicKey)'
+}
+
+matrix_wireguard_inner_engine_v4() {
+  local index
+  index="$(matrix_wireguard_index "$1")" || return 1
+  printf '10.1.0.%d/32\n' "$((index + 2))"
+}
+
+matrix_wireguard_inner_engine_v6() {
+  local index
+  index="$(matrix_wireguard_index "$1")" || return 1
+  printf 'fd01::%d/128\n' "$((index + 2))"
 }
 
 matrix_wireguard_inner_server_private() {
@@ -494,14 +516,6 @@ matrix_wireguard_inner_server_private() {
 
 matrix_wireguard_inner_server_public() {
   sed -n 's/^Password (PublicKey): //p' "$(matrix_wireguard_dir)/server-inner.txt"
-}
-
-matrix_wireguard_inner_client_private() {
-  sed -n 's/^PrivateKey: //p' "$(matrix_wireguard_dir)/client-inner.txt"
-}
-
-matrix_wireguard_inner_client_public() {
-  sed -n 's/^Password (PublicKey): //p' "$(matrix_wireguard_dir)/client-inner.txt"
 }
 
 # The server's TLS: the identity the client is asked to trust.
@@ -778,16 +792,33 @@ wireguard_kernel_client() {
   wireguard_client "$1" "${2:-ferrox}" false
 }
 
-# The outer hop of the WireGuard-in-WireGuard lane: one fixed client key, since
-# the scenario hands every engine the same identity it builds from this config.
+# The outer hop of the WireGuard-in-WireGuard lane: one identity per engine, since
+# the peer's replay timestamp belongs to a key and a shared one stalls the next engine.
 wireguard_classic_server() {
-  echo "\"protocol\": \"wireguard\", \"settings\": {\"secretKey\": \"$(matrix_wireguard_server_private)\", \"address\": [\"10.0.0.1/32\", \"fd00::1/128\"], \"mtu\": 1280, \"peers\": [{\"publicKey\": \"$(matrix_wireguard_client_public)\", \"allowedIPs\": [\"10.0.0.2/32\", \"fd00::2/128\"]}]}"
+  local peers="" engine public v4 v6 peer
+  for engine in $(matrix_wireguard_engines); do
+    public="$(matrix_wireguard_engine_public "$engine")" || return 1
+    v4="$(matrix_wireguard_engine_v4 "$engine")" || return 1
+    v6="$(matrix_wireguard_engine_v6 "$engine")" || return 1
+    peer="{\"publicKey\": \"$public\", \"allowedIPs\": [\"$v4\", \"$v6\"]}"
+    peers+="${peers:+,}$peer"
+  done
+  echo "\"protocol\": \"wireguard\", \"settings\": {\"secretKey\": \"$(matrix_wireguard_server_private)\", \"address\": [\"10.0.0.1/32\", \"fd00::1/128\"], \"mtu\": 1280, \"peers\": [$peers]}"
 }
 
 # The inner hop of a nested WARP tunnel: a second WireGuard device, reachable
-# only through the outer carrier, with its own addresses and keypair.
+# only through the outer carrier, with one identity per engine so a handshake
+# from one engine cannot advance the replay state the next engine reads.
 wireguard_inner_server() {
-  echo "\"protocol\": \"wireguard\", \"settings\": {\"secretKey\": \"$(matrix_wireguard_inner_server_private)\", \"address\": [\"10.1.0.1/32\", \"fd01::1/128\"], \"mtu\": 1280, \"peers\": [{\"publicKey\": \"$(matrix_wireguard_inner_client_public)\", \"allowedIPs\": [\"10.1.0.2/32\", \"fd01::2/128\"]}]}"
+  local peers="" engine public v4 v6 peer
+  for engine in $(matrix_wireguard_engines); do
+    public="$(matrix_wireguard_inner_engine_public "$engine")" || return 1
+    v4="$(matrix_wireguard_inner_engine_v4 "$engine")" || return 1
+    v6="$(matrix_wireguard_inner_engine_v6 "$engine")" || return 1
+    peer="{\"publicKey\": \"$public\", \"allowedIPs\": [\"$v4\", \"$v6\"]}"
+    peers+="${peers:+,}$peer"
+  done
+  echo "\"protocol\": \"wireguard\", \"settings\": {\"secretKey\": \"$(matrix_wireguard_inner_server_private)\", \"address\": [\"10.1.0.1/32\", \"fd01::1/128\"], \"mtu\": 1280, \"peers\": [$peers]}"
 }
 
 wireguard_identity() {
@@ -805,14 +836,24 @@ EOF
 }
 
 warp_classic_client_settings() {
-  local outer_port="$1" inner_port="$2"
-  echo "\"tag\": \"proxy\", \"protocol\": \"warp\", \"settings\": {\"mode\": \"gool-classic\", \"identity\": $(wireguard_identity "$(matrix_wireguard_client_private)" "$(matrix_wireguard_server_public)" "127.0.0.1:$outer_port" "10.0.0.2" "fd00::2"), \"goolIdentity\": $(wireguard_identity "$(matrix_wireguard_inner_client_private)" "$(matrix_wireguard_inner_server_public)" "127.0.0.1:$inner_port" "10.1.0.2" "fd01::2"), \"wiwOuter\": \"127.0.0.1:$outer_port\", \"wiwInner\": \"127.0.0.1:$inner_port\", \"mtu\": 1280}"
+  local outer_port="$1" inner_port="$2" engine="${3:-ferrox}"
+  local outer_private outer_v4 outer_v6 inner_private inner_v4 inner_v6
+  outer_private="$(matrix_wireguard_engine_private "$engine")" || return 1
+  outer_v4="$(matrix_wireguard_engine_v4 "$engine")" || return 1
+  outer_v6="$(matrix_wireguard_engine_v6 "$engine")" || return 1
+  inner_private="$(matrix_wireguard_inner_engine_private "$engine")" || return 1
+  inner_v4="$(matrix_wireguard_inner_engine_v4 "$engine")" || return 1
+  inner_v6="$(matrix_wireguard_inner_engine_v6 "$engine")" || return 1
+  echo "\"tag\": \"proxy\", \"protocol\": \"warp\", \"settings\": {\"mode\": \"gool-classic\", \"identity\": $(wireguard_identity "$outer_private" "$(matrix_wireguard_server_public)" "127.0.0.1:$outer_port" "${outer_v4%/32}" "${outer_v6%/128}"), \"goolIdentity\": $(wireguard_identity "$inner_private" "$(matrix_wireguard_inner_server_public)" "127.0.0.2:$inner_port" "${inner_v4%/32}" "${inner_v6%/128}"), \"wiwOuter\": \"127.0.0.1:$outer_port\", \"wiwInner\": \"127.0.0.2:$inner_port\", \"mtu\": 1280}"
 }
 
 warp_gool_client_settings() {
-  local outer_port="$1" inner_port="$2"
-  local extra
-  extra=", \"goolIdentity\": $(wireguard_identity "$(matrix_wireguard_inner_client_private)" "$(matrix_wireguard_inner_server_public)" "127.0.0.1:$inner_port" "10.1.0.2" "fd01::2"), \"goolPeer\": \"127.0.0.1:$inner_port\""
+  local outer_port="$1" inner_port="$2" engine="${3:-ferrox}"
+  local extra inner_private inner_v4 inner_v6
+  inner_private="$(matrix_wireguard_inner_engine_private "$engine")" || return 1
+  inner_v4="$(matrix_wireguard_inner_engine_v4 "$engine")" || return 1
+  inner_v6="$(matrix_wireguard_inner_engine_v6 "$engine")" || return 1
+  extra=", \"goolIdentity\": $(wireguard_identity "$inner_private" "$(matrix_wireguard_inner_server_public)" "127.0.0.1:$inner_port" "${inner_v4%/32}" "${inner_v6%/128}"), \"goolPeer\": \"127.0.0.1:$inner_port\""
   warp_client_settings "$outer_port" gool "$extra"
 }
 
@@ -1039,7 +1080,7 @@ scenario_config() {
     masque-h2-*) server_config "$(masque_server_settings h2)" "$(masque_client_settings "$port" h2)" "$port" ;;
     masque-*) server_config "$(masque_server_settings)" "$(masque_client_settings "$port")" "$port" ;;
     warp-masque-*) server_config "$(masque_server_settings)" "$(warp_client_settings "$port")" "$port" ;;
-    warp-gool-classic-*) nested_server_config "$port" "$inner" "$(wireguard_classic_server)" "$(wireguard_inner_server)" "$(warp_classic_client_settings "$port" "$inner")" ;;
+    warp-gool-classic-*) nested_server_config "$port" "$inner" "$(wireguard_classic_server)" "$(wireguard_inner_server)" "$(warp_classic_client_settings "$port" "$inner")" "127.0.0.2" ;;
     warp-gool-*) nested_server_config "$port" "$inner" "$(masque_server_settings)" "$(wireguard_inner_server)" "$(warp_gool_client_settings "$port" "$inner")" ;;
     warp-mim-*) nested_server_config "$port" "$inner" "$(masque_server_settings)" "$(masque_inner_server_settings)" "$(warp_mim_client_settings "$port" "$inner")" "127.0.0.2" ;;
     socks-raw-*) server_config "$(socks_server)" "$(socks_client "$port")" "$port" ;;
