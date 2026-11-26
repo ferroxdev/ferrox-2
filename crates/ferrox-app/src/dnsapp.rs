@@ -533,6 +533,83 @@ impl Resolver {
         }))
     }
 
+    /// The resolver a hijacking TUN inbound names, for a root config with no
+    /// `dns` block. Its queries ride the local dial: the app's own outbound
+    /// edges must resolve before the outbound that would carry a routed query
+    /// is open, or a captured stub resolver deadlocks against the proxy.
+    fn from_tun(root: &Json) -> Result<Option<Self>, String> {
+        let Some(inbounds) = root.get("inbounds").and_then(Json::as_arr) else {
+            return Ok(None);
+        };
+        for inbound in inbounds {
+            if inbound.get("protocol").and_then(Json::as_str) != Some("tun") {
+                continue;
+            }
+            let field = |key: &str| {
+                inbound
+                    .get("settings")
+                    .and_then(|settings| settings.get(key))
+                    .or_else(|| inbound.get(key))
+            };
+            if field("dns_mode").and_then(Json::as_str) != Some("hijack") {
+                continue;
+            }
+            let address = match field("dns_address") {
+                Some(Json::Str(address)) => Some(address.as_str()),
+                Some(Json::Arr(items)) => items.iter().find_map(Json::as_str),
+                _ => None,
+            };
+            let Some(address) = address else {
+                continue;
+            };
+            let (Some(ip), _) = crate::tun::parse_address(Some(address), None)? else {
+                continue;
+            };
+            return Ok(Some(Self {
+                servers: vec![Server {
+                    transport: Transport::Udp,
+                    endpoint: Some(Endpoint {
+                        host: ip.to_string(),
+                        port: 53,
+                    }),
+                    path: String::new(),
+                    matcher: None,
+                    implicit_local: false,
+                    local_dial: true,
+                    skip_fallback: true,
+                    final_query: false,
+                    policy_id: 0,
+                    tag: None,
+                    id: "tun-hijack".to_owned(),
+                    timeout: DEFAULT_TIMEOUT,
+                    cache: CachePolicy {
+                        disable: false,
+                        serve_stale: false,
+                        serve_expired: Duration::ZERO,
+                    },
+                    client_ip: None,
+                    expected: None,
+                    unexpected: None,
+                    act_prior: false,
+                    act_unprior: false,
+                    v4: true,
+                    v6: true,
+                    req_id: AtomicU16::new(0),
+                }],
+                hosts: Vec::new(),
+                needs_lower: false,
+                strategy: Strategy::Both,
+                disable_fallback: false,
+                disable_fallback_if_match: false,
+                parallel: false,
+                cache: vec![Mutex::new(HashMap::new())],
+                fake: None,
+                pool: OnceLock::new(),
+            }));
+        }
+        Ok(None)
+    }
+
     pub(crate) fn lookup(self: &Arc<Self>, name: &str) -> Option<(Vec<IpAddr>, u32)> {
         self.lookup_inner(name, false, false).records()
     }
@@ -2204,7 +2281,11 @@ static INSTALLED: Mutex<Option<Arc<Resolver>>> = Mutex::new(None);
 /// Build the resolver a root config names and make it the one the relay's own
 /// name lookups use. Called before the first inbound opens.
 pub(crate) fn install(root: &Json) -> Result<(), String> {
-    let resolver = Resolver::from_root(root)?.map(Arc::new);
+    let resolver = match Resolver::from_root(root)? {
+        Some(resolver) => Some(resolver),
+        None => Resolver::from_tun(root)?,
+    }
+    .map(Arc::new);
     *INSTALLED
         .lock()
         .map_err(|_| "dns: the resolver lock is poisoned".to_owned())? = resolver;
@@ -2223,6 +2304,103 @@ mod resolver_tests {
 
     fn root(text: &str) -> Json {
         crate::json::parse(text).expect("config")
+    }
+
+    fn tun_root(mode: &str, address: &str) -> Json {
+        root(&format!(
+            r#"{{"inbounds":[{{"protocol":"tun","settings":{{"dns_mode":"{mode}","dns_address":["{address}"]}}}}]}}"#
+        ))
+    }
+
+    #[test]
+    fn a_tun_hijack_names_the_resolver_its_address_uses() {
+        let resolver = Resolver::from_tun(&tun_root("hijack", "192.0.2.53"))
+            .expect("config")
+            .expect("resolver");
+        assert_eq!(resolver.servers.len(), 1);
+        let server = &resolver.servers[0];
+        assert!(server.local_dial);
+        assert!(server.skip_fallback);
+        assert_eq!(
+            server.endpoint.as_ref().expect("endpoint").host,
+            "192.0.2.53"
+        );
+        assert_eq!(server.endpoint.as_ref().expect("endpoint").port, 53);
+    }
+
+    #[test]
+    fn a_tun_without_hijack_names_no_resolver() {
+        assert!(
+            Resolver::from_tun(&tun_root("system", "192.0.2.53"))
+                .expect("config")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_root_dns_block_wins_over_a_tun_hijack() {
+        let config = root(
+            r#"{"dns":{"servers":["192.0.2.54"]},"inbounds":[{"protocol":"tun","settings":{"dns_mode":"hijack","dns_address":["192.0.2.53"]}}]}"#,
+        );
+        let resolver = Resolver::from_root(&config)
+            .expect("config")
+            .expect("resolver");
+        assert_eq!(resolver.servers.len(), 1);
+        assert_eq!(
+            resolver.servers[0]
+                .endpoint
+                .as_ref()
+                .expect("endpoint")
+                .host,
+            "192.0.2.54"
+        );
+    }
+
+    #[test]
+    fn install_takes_the_resolver_from_a_tun_hijack() {
+        if !crate::conn::in_a_quiet_process(
+            "dnsapp::resolver_tests::install_takes_the_resolver_from_a_tun_hijack",
+        ) {
+            return;
+        }
+        install(&tun_root("hijack", "192.0.2.53")).expect("installs");
+        let resolver = installed().expect("a resolver from the hijacking inbound");
+        assert!(resolver.servers[0].local_dial);
+    }
+
+    #[test]
+    fn a_domain_edge_resolves_through_the_installed_local_resolver() {
+        if !crate::conn::in_a_quiet_process(
+            "dnsapp::resolver_tests::a_domain_edge_resolves_through_the_installed_local_resolver",
+        ) {
+            return;
+        }
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let port = socket.local_addr().expect("addr").port();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            let (len, peer) = socket.recv_from(&mut buf).expect("query");
+            count.fetch_add(1, Ordering::SeqCst);
+            let question = parse_query(&buf[..len]).expect("question");
+            let answer = ip_answer(&question, 0, 120, &[vec![192, 0, 2, 7]]).expect("answer");
+            socket.send_to(&answer, peer).expect("reply");
+        });
+        let resolver = Arc::new(
+            Resolver::from_root(&root(&format!(
+                r#"{{"dns":{{"queryStrategy":"UseIPv4","servers":["udp+local://127.0.0.1:{port}"]}}}}"#
+            )))
+            .expect("resolver")
+            .expect("configured"),
+        );
+        *INSTALLED.lock().expect("lock") = Some(Arc::clone(&resolver));
+        let addrs = crate::proxy::resolve_edge_addrs("edge.test", 443).expect("resolves");
+        assert_eq!(addrs, vec![SocketAddr::from(([192, 0, 2, 7], 443))]);
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -3,13 +3,11 @@
 use crate::conn::Connection;
 use crate::quic::QuicheConnection;
 use ferrox_core::foxy::connectip;
-use ferrox_core::foxy::{
-    self, Failure, Pass, authority, edge_authority, edge_peer, frames, hpack, masque,
-};
+use ferrox_core::foxy::{self, Failure, Pass, edge_authority, edge_peer, frames, hpack, masque};
 use ferrox_core::tls::RecordAlignment;
 use ferrox_core::tls::TlsProvider;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, ToSocketAddrs as _};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -183,9 +181,9 @@ fn tls_to_edge(dial: &FoxyDial) -> Result<ferrox_core::tls::RustlsProvider<Conne
         Some(peer) => dial_peers(dial, std::iter::once(peer)),
         None => dial_peers(
             dial,
-            authority(&dial.host, dial.port)
-                .to_socket_addrs()
-                .map_err(|_| Failure::Io)?,
+            crate::proxy::resolve_edge_addrs(&dial.host, dial.port)
+                .ok_or(Failure::Io)?
+                .into_iter(),
         ),
     }
 }
@@ -449,7 +447,9 @@ pub(crate) fn associate_udp(proxy: &UpstreamProxy) -> Option<(Arc<Connection>, S
 fn tcp_to_proxy(proxy: &UpstreamProxy) -> Option<Connection> {
     match edge_peer(&proxy.host, proxy.port) {
         Some(peer) => tcp_to_peers(std::iter::once(peer)),
-        None => tcp_to_peers(authority(&proxy.host, proxy.port).to_socket_addrs().ok()?),
+        None => {
+            tcp_to_peers(crate::proxy::resolve_edge_addrs(&proxy.host, proxy.port)?.into_iter())
+        }
     }
 }
 

@@ -5,7 +5,9 @@ A terminal gets the four-way prompt and the answer is the carrier the lane is
 started with; a pipe is never prompted and takes auto. `status` reads the
 carrier, the allowance and the uptime back from the lane it was given: a fake
 pid and a synthetic log stand in for a live account, and the front refuses the
-trace immediately because nothing listens on its port. A missing allowance is
+trace immediately because nothing listens on its port. A lane owned by another
+user (pid 1 stands in) is still seen as running, because `kill -0` answers EPERM
+while the process exists. A missing allowance is
 reported rather than skipped, and which of the two reasons it is comes from what
 the log does hold. `locations --ping` is given a fake catalogue: the rows must
 order by latency, keep a silent edge as `no answer`, pin REC, and leave the
@@ -692,6 +694,34 @@ def check_status(state: pathlib.Path) -> int:
                     )
                     return 1
             print(f"check-cli-lane: {label}")
+        (state / "lane.pid").write_text("1\n", encoding="utf-8")
+        (state / "lane.log").write_text("", encoding="utf-8")
+        (state / "lane.json").write_text(
+            json.dumps({"outbounds": [vless]}), encoding="utf-8"
+        )
+        run = subprocess.run(
+            [
+                str(CLI),
+                "status",
+                "--fronts",
+                "socks",
+                "--socks",
+                str(free_port()),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=WATCH,
+            env=env_for(state),
+        )
+        output = run.stdout + run.stderr
+        if "lane pid 1, fronts:" not in output:
+            print(
+                "check-cli-lane: a lane owned by another user is reported as "
+                f"not running:\n{output}",
+                file=sys.stderr,
+            )
+            return 1
+        print("check-cli-lane: a root-owned lane is still seen as running")
     finally:
         lane.terminate()
         lane.wait(timeout=WATCH)

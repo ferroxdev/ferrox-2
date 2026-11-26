@@ -3,7 +3,7 @@ use bytes::BufMut as _;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
-use std::net::{IpAddr, Shutdown, SocketAddr, ToSocketAddrs as _, UdpSocket};
+use std::net::{IpAddr, Shutdown, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -4171,12 +4171,18 @@ fn datagram_to_with_source(
         },
     };
     let sock = if explicit {
-        armed_lane(crate::sockopt::bind_datagram_at(options, at).ok()?, true)
+        armed_lane(
+            crate::sockopt::bind_datagram_at_underlay(options, at, peer).ok()?,
+            true,
+        )
+    } else if let Ok(sock) = crate::sockopt::bind_datagram_at_underlay(options, at, peer) {
+        armed_lane(sock, true)
     } else {
-        match crate::sockopt::bind_datagram_at(options, at) {
-            Ok(sock) => armed_lane(sock, true),
-            Err(_) => armed_lane(crate::sockopt::bind_datagram(options, bind).ok()?, true),
-        }
+        let wildcard: SocketAddr = bind.parse().ok()?;
+        armed_lane(
+            crate::sockopt::bind_datagram_at_underlay(options, wildcard, peer).ok()?,
+            true,
+        )
     };
     let local = sock.local_addr().ok()?;
     Some((sock, local))
@@ -4188,15 +4194,7 @@ fn probe_source(
     peer: SocketAddr,
     options: Option<&crate::sockopt::SocketOptions>,
 ) -> Option<SocketAddr> {
-    let bind = if peer.is_ipv6() {
-        "[::]:0"
-    } else {
-        "0.0.0.0:0"
-    };
-    let probe = UdpSocket::bind(bind).ok()?;
-    if let Some(options) = options {
-        options.apply_to_udp(&probe, peer).ok()?;
-    }
+    let probe = crate::sockopt::probe_datagram(options, peer).ok()?;
     probe.connect(peer).ok()?;
     probe.local_addr().ok()
 }
@@ -5134,10 +5132,7 @@ fn build_pooled_within(dial: &QuicDial, budget: Duration) -> Option<PooledConn> 
     let roots = dial.roots.as_deref().unwrap_or(&[]);
     let built = crate::foxy::debug_on().then(Instant::now);
     // One attempt per resolved address: the first answer is not always the reachable one.
-    let peers: Vec<SocketAddr> = format!("{}:{}", dial.address, dial.port)
-        .to_socket_addrs()
-        .ok()?
-        .collect();
+    let peers = crate::proxy::resolve_edge_addrs(&dial.address, dial.port)?;
     let resolved = built.map(|_| Instant::now());
     // One hop per connection, not per address. An HTTP hop is TCP-only: refusing beats bypassing the proxy.
     let relay = match dial.upstream.as_ref() {
@@ -5154,8 +5149,13 @@ fn build_pooled_within(dial: &QuicDial, budget: Duration) -> Option<PooledConn> 
             "0.0.0.0:0"
         };
         // A plain lane binds the kernel-picked source so the route poll compares an address, not a wildcard.
-        let (sock, local) = if relay.is_some() {
-            let Ok(sock) = bind_datagram(wildcard) else {
+        let (sock, local) = if let Some((_, via)) = relay.as_ref() {
+            let Ok(wildcard) = wildcard.parse::<SocketAddr>() else {
+                continue;
+            };
+            let Ok(sock) =
+                crate::sockopt::bind_datagram_at_underlay(flow.as_deref(), wildcard, *via)
+            else {
                 continue;
             };
             let Ok(local) = sock.local_addr() else {
@@ -5164,16 +5164,8 @@ fn build_pooled_within(dial: &QuicDial, budget: Duration) -> Option<PooledConn> 
             (sock, local)
         } else if let Some(bound) = datagram_to_with_source(peer, flow.as_deref(), source) {
             bound
-        } else if source.is_some() {
-            continue;
         } else {
-            let Ok(sock) = bind_datagram(wildcard) else {
-                continue;
-            };
-            let Ok(local) = sock.local_addr() else {
-                continue;
-            };
-            (sock, local)
+            continue;
         };
         let sock = match relay.as_ref() {
             Some((control, via)) => Datagram::relayed(sock, *via, Arc::clone(control)),

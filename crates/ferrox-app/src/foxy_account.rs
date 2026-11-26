@@ -1087,10 +1087,8 @@ impl Endpoint {
         } else {
             let peer = match self.address {
                 Some(address) => address,
-                None => format!("{}:{}", edge.0, edge.1)
-                    .to_socket_addrs()
-                    .map_err(|why| format!("resolve {}: {why}", edge.0))?
-                    .next()
+                None => crate::proxy::resolve_edge_addrs(&edge.0, edge.1)
+                    .and_then(|addrs| addrs.into_iter().next())
                     .ok_or_else(|| format!("{} resolves to nothing", edge.0))?,
             };
             crate::conn::dial_tcp(&peer, IO_TIMEOUT)
@@ -1172,8 +1170,6 @@ impl ferrox_core::tls::RecordAlignment for DeadlineConnection {
         ferrox_core::tls::RecordAlignment::write_all_slices(&mut self.inner, parts)
     }
 }
-
-use std::net::ToSocketAddrs as _;
 
 /// The challenge host serves its script only over HTTP/2 and binds the page's state to the connection, so one connection carries every stream of a solve.
 struct H2Connection {
