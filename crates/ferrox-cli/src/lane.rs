@@ -608,18 +608,48 @@ fn can_signal(pid: u32) -> bool {
 }
 
 #[cfg(unix)]
-fn sudo_path(args: &[&str]) -> Option<PathBuf> {
-    let output = Command::new("sudo")
-        .args(args)
+fn sudo_ready() -> bool {
+    Command::new("sudo")
+        .args(["-n", "true"])
         .stdin(Stdio::null())
+        .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(unix)]
+fn sudo_prompt() -> bool {
+    use std::io::IsTerminal;
+    (std::io::stdin().is_terminal() || std::io::stderr().is_terminal())
+        && Command::new("sudo")
+            .arg("-v")
+            .status()
+            .is_ok_and(|status| status.success())
+}
+
+#[cfg(unix)]
+fn sudo_path(args: &[&str]) -> Option<PathBuf> {
+    let read = || {
+        let output = Command::new("sudo")
+            .args(args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        (!path.is_empty()).then(|| PathBuf::from(path))
+    };
+    if let Some(path) = read() {
+        return Some(path);
+    }
+    if sudo_ready() || !sudo_prompt() {
         return None;
     }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    (!path.is_empty()).then(|| PathBuf::from(path))
+    read()
 }
 
 #[cfg(target_os = "linux")]
@@ -646,14 +676,25 @@ fn privileged_is_ferrox(paths: &Paths, pid: u32) -> Option<bool> {
 }
 
 #[cfg(unix)]
-fn privileged_kill(pid: u32, signal: &str) -> bool {
-    std::process::Command::new("sudo")
+fn sudo_signal(pid: u32, signal: &str) -> bool {
+    Command::new("sudo")
         .args(["-n", "kill", signal, &pid.to_string()])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+#[cfg(unix)]
+fn privileged_kill(pid: u32, signal: &str) -> bool {
+    if sudo_signal(pid, signal) {
+        return true;
+    }
+    if sudo_ready() || !sudo_prompt() {
+        return false;
+    }
+    sudo_signal(pid, signal)
 }
 
 pub fn stop(paths: &Paths) -> Result<(), String> {
@@ -886,6 +927,24 @@ pub fn other_lanes(paths: &Paths) -> Vec<(String, u32)> {
 mod tests {
     use super::*;
 
+    fn free_within(path: &std::path::Path) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            let probe = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .unwrap();
+            if probe.try_lock().is_ok() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn lanes_in_one_root_share_the_port_probe_lock() {
         let root = std::env::temp_dir().join(format!("ferrox-ports-{}", std::process::id()));
@@ -900,12 +959,7 @@ mod tests {
         assert!(probe.try_lock().is_err());
         drop(probe);
         drop(held);
-        let probe = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(port_lock_path(&two))
-            .unwrap();
-        assert!(probe.try_lock().is_ok());
+        assert!(free_within(&port_lock_path(&two)));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -923,12 +977,7 @@ mod tests {
         assert!(probe.try_lock().is_err());
         drop(probe);
         drop(held);
-        let probe = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(port_lock_path(&two))
-            .unwrap();
-        assert!(probe.try_lock().is_ok());
+        assert!(free_within(&port_lock_path(&two)));
         let _ = std::fs::remove_dir_all(root);
     }
 

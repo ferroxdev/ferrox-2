@@ -212,9 +212,16 @@ jobs:
           trace="$(curl -fsS --noproxy '' --max-time 60 --retry 3 --socks5-hostname "127.0.0.1:$port" https://www.cloudflare.com/cdn-cgi/trace)"
           printf '%s\n' "$trace"
           printf '%s\n' "$trace" | grep -qx 'warp=on'
+          down_started="$(date +%s%N)"
           sudo env FERROX_CONF_DIR="$root_state/conf" FERROX_STATE_DIR="$root_state/state" \
             FERROX_BIN="$PWD/target/release/ferrox-app" \
             "$PWD/dist/ferrox-cli.sh" down
+          down_ms=$(( ($(date +%s%N) - down_started) / 1000000 ))
+          echo "sudo lane down: ${down_ms}ms"
+          if [ "$down_ms" -gt 15000 ]; then
+            echo "::error::the sudo lane took ${down_ms}ms to stop"
+            exit 1
+          fi
           if find "$root_state" -user root -print -quit | grep -q .; then
             echo "::error::a sudo lane left root-owned files under $root_state"
             find "$root_state" -user root -ls

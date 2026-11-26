@@ -2559,12 +2559,21 @@ lane_pid_is_ferrox() {
   return 1
 }
 
+# A root lane's signal needs sudo; an expired timestamp is not a refusal, so ask once on a terminal.
+sudo_retry() {
+  sudo -n "$@" && return 0
+  sudo -n true 2>/dev/null && return 1
+  { [ -t 0 ] || [ -t 2 ]; } || return 1
+  sudo -v || return 1
+  sudo -n "$@"
+}
+
 # A root lane is unreadable without sudo; confirm the command still names this
 # lane's binary and config before an elevated kill can reach it.
 privileged_lane_pid() {
   local command
   [ -n "$BIN" ] || return 1
-  command="$(sudo -n ps -p "$1" -ww -o command= 2>/dev/null)" || return 1
+  command="$(sudo_retry ps -p "$1" -ww -o command= 2>/dev/null)" || return 1
   case "$command" in
     *"${BIN##*/}"*"${CFG##*/}"*) return 0 ;;
   esac
@@ -3077,14 +3086,14 @@ stop_lane() {
           say "lane pid $pid is not ferrox-app or could not be confirmed with sudo; it was not stopped. Run: sudo kill $pid" >&2
           stopped=0
         else
-          sudo -n kill "$pid" 2>/dev/null || true
+          sudo_retry kill "$pid" 2>/dev/null || true
           while pid_alive "$pid" && [ "$waited" -lt 30 ]; do
             sleep 0.1
             waited=$((waited + 1))
           done
           waited=0
           if pid_alive "$pid"; then
-            sudo -n kill -9 "$pid" 2>/dev/null || true
+            sudo_retry kill -9 "$pid" 2>/dev/null || true
             while pid_alive "$pid" && [ "$waited" -lt 10 ]; do
               sleep 0.1
               waited=$((waited + 1))
