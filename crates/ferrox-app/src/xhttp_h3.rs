@@ -772,7 +772,7 @@ impl crate::proxy::LaneWrite for H3Writer {
             self.block.clear();
             hpack::qpack_literal_many(&fields, &mut self.block);
             let body = &head[at + 4..];
-            stage_head(&mut self.block, &mut self.pending, body);
+            stage_head(&self.block, &mut self.pending, body);
             self.input = data.len();
             self.at = 0;
             self.headed = true;
@@ -890,7 +890,7 @@ fn data_frame(frame: &mut Vec<u8>, payload: &[u8]) {
     frame.extend_from_slice(payload);
 }
 
-fn stage_head(block: &mut Vec<u8>, frame: &mut Vec<u8>, body: &[u8]) {
+fn stage_head(block: &[u8], frame: &mut Vec<u8>, body: &[u8]) {
     frame.clear();
     frame.reserve(block.len() + body.len() + 18);
     frames::quic_varint(frame, frames::H3_HEADERS);
@@ -2353,12 +2353,12 @@ fn h3_control_frames(
             return Err(H3_FRAME_UNEXPECTED);
         }
         if end > control.len() {
-            if kind != 0x7 {
+            if kind == 0x7 {
+                control_drain(control, at);
+            } else {
                 let held = control.len().saturating_sub(cursor);
                 control.clear();
                 *skip = (len - held) as u64;
-            } else {
-                control_drain(control, at);
             }
             at = 0;
             break;
@@ -2699,13 +2699,13 @@ mod tests {
         let mut block = Vec::new();
         let mut frame = Vec::new();
         hpack::qpack_literal_many(&[(":status", "200"), ("content-length", "3")], &mut block);
-        stage_head(&mut block, &mut frame, b"abc");
+        stage_head(&block, &mut frame, b"abc");
         let expected = frame.clone();
         block.clear();
         frame.clear();
         let ((), counts) = ferrox_core::alloc_count::measure(|| {
             hpack::qpack_literal_many(&[(":status", "200"), ("content-length", "3")], &mut block);
-            stage_head(&mut block, &mut frame, b"abc");
+            stage_head(&block, &mut frame, b"abc");
         });
         assert_eq!(
             counts.allocs, 0,
@@ -3784,7 +3784,7 @@ mod tests {
         CONTROL_DRAINS.with(|drains| {
             assert_eq!(drains.get(), 1, "the batch is drained once");
         });
-        assert!(control.is_empty());
+        assert_eq!(control, Vec::<u8>::new());
         assert_eq!(goaway.load(Ordering::SeqCst), 4);
     }
 
