@@ -78,6 +78,7 @@ if [[ $fast == 0 ]]; then
   python3 scripts/check-matrix-legs.py --selftest
   ./scripts/check-fixture-safety.sh --selftest
   ./scripts/run-benchmark-matrix.sh --selftest
+  ./scripts/release-plan.sh --selftest
   python3 scripts/workflow-result.py --selftest
   python3 scripts/rewrite-depinfo.py --selftest
   python3 scripts/psiphon-target.py --selftest
