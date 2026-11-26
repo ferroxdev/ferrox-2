@@ -1723,6 +1723,13 @@ impl ClientStack {
             return Some(packet);
         };
         let Some(lane) = table.get(&datagram.destination_port) else {
+            if crate::foxy::debug_on() {
+                eprintln!(
+                    "foxy-debug: deliver_udp port={} NO LANE (routes={})",
+                    datagram.destination_port,
+                    table.len()
+                );
+            }
             return Some(packet);
         };
         let handed = LanePacket {
@@ -3162,9 +3169,19 @@ pub(crate) fn client_udp_forward<T: Clone + Into<ToTunnel>>(
     }
     let mut buf = crate::proxy::udp_buffer();
     let mut app: Option<SocketAddr> = None;
+    let tracing = crate::foxy::debug_on();
+    let mut up_logged = 0u32;
+    let mut down_logged = 0u32;
     while !stop.load(Ordering::Relaxed) {
         let mut idle = true;
         while let Ok(packet) = reply_rx.try_recv() {
+            if tracing && down_logged < 6 {
+                eprintln!(
+                    "foxy-debug: fwd down #{down_logged} len={} port={port} app={app:?}",
+                    packet.packet().len()
+                );
+                down_logged += 1;
+            }
             idle &= !forward_downlink(&packet, port, app, relay);
             drop(packet);
         }
@@ -3175,7 +3192,14 @@ pub(crate) fn client_udp_forward<T: Clone + Into<ToTunnel>>(
                     continue;
                 }
                 app = Some(sender);
+                if tracing && up_logged < 6 {
+                    eprintln!("foxy-debug: fwd up #{up_logged} {n}B {sender}->{target}");
+                    up_logged += 1;
+                }
                 if !lane_send(config, port, target, &buf[..n], &to_tunnel, headroom) {
+                    if tracing {
+                        eprintln!("foxy-debug: fwd lane_send failed after {up_logged} up");
+                    }
                     break;
                 }
                 idle = false;
