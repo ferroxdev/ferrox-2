@@ -58,6 +58,8 @@ SOCKS_PORT=1080
 SERVER_PID=""
 BG_PIDS=""
 ENGINE_PIDS=""
+AUTO_ENGINE=0
+TUN_NAME=""
 
 note() { printf '%s\n' "$*" >&2; }
 die() { note "tun-bench: $*"; exit 2; }
@@ -126,6 +128,12 @@ remove_routes() {
     ip route flush table 2022 2> /dev/null || true
 }
 
+# The app drops its guard on SIGINT; a killed run can leave the half-defaults behind and make the next engine fail.
+remove_auto_routes() {
+    ip route del 0.0.0.0/1 dev "$1" 2> /dev/null || true
+    ip route del 128.0.0.0/1 dev "$1" 2> /dev/null || true
+}
+
 ns_setup() {
     unshare --net -- sleep 1000000 &
     SERVER_PID=$!
@@ -171,6 +179,25 @@ start_ferrox() {
     ip link set fx0 up
     wait_up fx0 || return 1
     install_routes fx0
+    TUN_NAME=fx0
+}
+
+start_ferrox_auto() {
+    mode=$1
+    [ -n "$FERROX" ] || return 1
+    AUTO_ENGINE=1
+    printf '%s\n' "{\"inbounds\":[{\"tag\":\"tun\",\"protocol\":\"tun\",\"settings\":{\"name\":\"fx0\",\"mtu\":$MTU,\"stack\":\"$mode\",\"address\":\"$TUN_ADDR\",\"prefix\":$TUN_PREFIX,\"queues\":$QUEUES,\"auto_route\":true}}],\"outbounds\":[{\"tag\":\"proxy\",\"protocol\":\"socks\",\"settings\":{\"servers\":[{\"address\":\"$VETH_SERVER\",\"port\":$SOCKS_PORT}]}}]}" \
+        > "$OUT_DIR/ferrox-auto-$mode.json"
+    "$FERROX" run -c "$OUT_DIR/ferrox-auto-$mode.json" > "$OUT_DIR/ferrox-auto-$mode.log" 2>&1 &
+    ENGINE_PIDS=$!
+    for _ in $(seq 1 600); do
+        grep -q "tun inbound: interface .* up (stack " "$OUT_DIR/ferrox-auto-$mode.log" 2> /dev/null && break
+        kill -0 "$ENGINE_PIDS" 2> /dev/null || break
+        sleep 0.1
+    done
+    if ! grep -q "tun inbound: interface .* up (stack " "$OUT_DIR/ferrox-auto-$mode.log" 2> /dev/null; then
+        note "ferrox-auto-$mode did not report its TUN up"; cat "$OUT_DIR/ferrox-auto-$mode.log" >&2; return 1
+    fi
     TUN_NAME=fx0
 }
 
@@ -235,6 +262,7 @@ start_xray() {
 start_engine() {
     engine=$1
     ENGINE_PIDS=""
+    AUTO_ENGINE=0
     remove_routes
     case "$engine" in
         ferrox) start_ferrox smoltcp ;;
@@ -242,6 +270,11 @@ start_engine() {
         ferrox-userspace) start_ferrox userspace ;;
         ferrox-system) start_ferrox system ;;
         ferrox-hybrid) start_ferrox hybrid ;;
+        ferrox-auto) start_ferrox_auto smoltcp ;;
+        ferrox-auto-native) start_ferrox_auto loopback ;;
+        ferrox-auto-userspace) start_ferrox_auto userspace ;;
+        ferrox-auto-system) start_ferrox_auto system ;;
+        ferrox-auto-hybrid) start_ferrox_auto hybrid ;;
         hev|hev-socks5-tunnel) start_hev ;;
         xray) start_xray ;;
         singbox-system|sing-tun-system) start_singbox system system "$SINGBOX" ;;
@@ -295,6 +328,8 @@ stop_engine() {
     done
     ENGINE_PIDS=""
     remove_routes
+    if [ "${AUTO_ENGINE:-0}" = 1 ]; then remove_auto_routes "${TUN_NAME:-fx0}"; fi
+    AUTO_ENGINE=0
     sleep 0.5
 }
 
