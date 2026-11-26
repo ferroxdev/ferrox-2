@@ -176,6 +176,10 @@ impl Mode {
             Self::Mim => "mim",
         }
     }
+
+    fn needs_masque(self) -> bool {
+        matches!(self, Self::Masque | Self::Gool | Self::Mim)
+    }
 }
 
 /// One parsed `warp` outbound setting list. Everything has a WARP default so a
@@ -695,6 +699,19 @@ impl WarpSpec {
                 saved.team.as_deref(),
                 path,
             )?;
+            if !inner && self.mode.needs_masque() && saved.masque.is_none() {
+                if test || !self.register {
+                    return Err(format!(
+                        "warp: `{}` has no MASQUE key for mode `{:?}`",
+                        path.display(),
+                        self.mode
+                    ));
+                }
+                let identity = register(self, enroll)?;
+                quarantine(path);
+                identity.save(path)?;
+                return Ok(identity);
+            }
             if test {
                 return Ok(saved);
             }
@@ -3933,6 +3950,7 @@ pub(crate) fn one_tap(
     let mode = Mode::parse(Some(mode))?;
     let path = PathBuf::from(path);
     let resumed = path.is_file();
+    let mut replace_masque = false;
     if resumed {
         // The outer device was already created; a failed inner enrollment must be able to finish on the next run instead of minting a second device.
         let saved = Identity::load(&path).map_err(LoadError::into_message)?;
@@ -3941,12 +3959,7 @@ pub(crate) fn one_tap(
             saved.team.as_deref(),
             &path,
         )?;
-        if matches!(mode, Mode::Masque | Mode::Gool | Mode::Mim) && saved.masque.is_none() {
-            return Err(format!(
-                "warp: `{}` has no MASQUE key for mode `{mode:?}`; remove it to register a new device",
-                path.display()
-            ));
-        }
+        replace_masque = mode.needs_masque() && saved.masque.is_none();
     }
     let ForcedEdges {
         wiw_outer,
@@ -4002,6 +4015,11 @@ pub(crate) fn one_tap(
         team: team.cloned(),
         gateway,
     };
+    if replace_masque {
+        let identity = register(&spec, true)?;
+        quarantine(&path);
+        identity.save(&path)?;
+    }
     if !resumed && matches!(mode, Mode::Gool | Mode::GoolClassic) {
         if let Some(identity) = &spec.gool.inline {
             ensure_saved_team(
