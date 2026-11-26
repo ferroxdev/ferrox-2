@@ -1437,6 +1437,7 @@ const SCAN_ENTRY_CAP: usize = 4096;
 pub(crate) struct ScanState {
     entries: HashMap<String, ScanEntry>,
     shuffle_seed: String,
+    key: String,
 }
 
 #[derive(Debug)]
@@ -1486,6 +1487,7 @@ impl ScanState {
         Self {
             entries: HashMap::new(),
             shuffle_seed,
+            key: String::new(),
         }
     }
 
@@ -1498,6 +1500,7 @@ impl ScanState {
     fn hints_at(&self, now: Instant) -> (Vec<ScanCandidate>, HashSet<String>, String) {
         let mut preferred = Vec::new();
         let mut skipped = HashSet::new();
+        let mut key = String::new();
         for entry in self.entries.values() {
             let Some((success, _)) = entry.last_outcome() else {
                 continue;
@@ -1508,15 +1511,22 @@ impl ScanState {
             if success {
                 preferred.push(entry);
             } else {
-                skipped.insert(entry.candidate.key());
+                entry.candidate.key_into(&mut key);
+                skipped.insert(key.clone());
             }
         }
+        let mut left_key = String::new();
+        let mut right_key = String::new();
         preferred.sort_by(|left, right| {
             right
                 .last_success
                 .cmp(&left.last_success)
                 .then(right.success_count.cmp(&left.success_count))
-                .then(left.candidate.key().cmp(&right.candidate.key()))
+                .then_with(|| {
+                    left.candidate.key_into(&mut left_key);
+                    right.candidate.key_into(&mut right_key);
+                    left_key.cmp(&right_key)
+                })
         });
         (
             preferred
@@ -1538,22 +1548,32 @@ impl ScanState {
     }
 
     fn record_at(&mut self, candidate: &ScanCandidate, success: bool, now: Instant) {
-        let key = candidate.key();
-        if self.entries.len() >= SCAN_ENTRY_CAP && !self.entries.contains_key(&key) {
-            self.entries.retain(|_, entry| entry.is_live(now));
-            while self.entries.len() >= SCAN_ENTRY_CAP {
-                let oldest = self
-                    .entries
+        let Self { entries, key, .. } = self;
+        candidate.key_into(key);
+        if entries.len() >= SCAN_ENTRY_CAP && !entries.contains_key(key.as_str()) {
+            entries.retain(|_, entry| entry.is_live(now));
+            while entries.len() >= SCAN_ENTRY_CAP {
+                let oldest = entries
                     .iter()
                     .min_by_key(|(_, entry)| entry.touched())
                     .map(|(key, _)| key.clone());
                 let Some(oldest) = oldest else {
                     break;
                 };
-                self.entries.remove(&oldest);
+                entries.remove(&oldest);
             }
         }
-        let entry = self.entries.entry(key).or_insert_with(|| ScanEntry {
+        if let Some(entry) = entries.get_mut(key.as_str()) {
+            if success {
+                entry.last_success = Some(now);
+                entry.success_count += 1;
+            } else {
+                entry.last_failure = Some(now);
+                entry.failure_count += 1;
+            }
+            return;
+        }
+        let entry = entries.entry(key.clone()).or_insert_with(|| ScanEntry {
             candidate: candidate.clone(),
             last_success: None,
             last_failure: None,
@@ -1573,6 +1593,23 @@ impl ScanState {
 #[cfg(test)]
 mod tests {
     use super::{CDN_SETS, CdnSet, select, snis};
+
+    #[test]
+    fn recording_the_same_candidate_reuses_its_key_buffer() {
+        let mut state = super::ScanState::new();
+        let candidate = super::ScanCandidate {
+            ip: "192.0.2.1".to_owned(),
+            sni: "A.Example".to_owned(),
+        };
+        state.record(&candidate, true);
+        let capacity = state.key.capacity();
+        assert!(capacity > 0);
+        for _ in 0..8 {
+            state.record(&candidate, true);
+        }
+        assert_eq!(state.key.capacity(), capacity);
+        assert_eq!(state.len(), 1);
+    }
 
     #[test]
     fn the_hint_cache_keeps_a_bounded_set_of_outcomes() {

@@ -58564,10 +58564,28 @@ mod tests {
         thread::sleep(Duration::from_millis(300));
         let _ = release.send(());
         let mut back = [0u8; 2];
-        let read = session.read(&mut back);
+        let mut filled = 0;
+        let reading = Instant::now();
+        while filled < back.len() && reading.elapsed() < Duration::from_secs(5) {
+            match session.read(&mut back[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => {
+                    panic!("the cleared probe clock must not expire the reused session: {error}")
+                }
+            }
+        }
         serving.join().expect("joins");
-        assert!(
-            read.is_ok(),
+        assert_eq!(
+            filled,
+            back.len(),
             "the cleared probe clock must not expire the reused session"
         );
         assert_eq!(&back, b"ok");
