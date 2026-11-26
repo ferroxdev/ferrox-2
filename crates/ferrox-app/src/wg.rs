@@ -13,7 +13,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, U
 #[cfg(target_os = "linux")]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1504,14 +1504,14 @@ enum Transport {
 /// `downlink` already unwrapped, tagged with the server it dialled.
 pub(crate) struct Lane {
     target: SocketAddr,
-    uplink: Sender<Vec<u8>>,
+    uplink: SyncSender<Vec<u8>>,
     downlink: Receiver<Vec<u8>>,
 }
 
 impl Lane {
     pub(crate) fn new(
         target: SocketAddr,
-        uplink: Sender<Vec<u8>>,
+        uplink: SyncSender<Vec<u8>>,
         downlink: Receiver<Vec<u8>>,
     ) -> Self {
         Self {
@@ -1524,6 +1524,16 @@ impl Lane {
     /// The next record from the outer, unwrapped by the bridge.
     fn recv(&self) -> Option<(SocketAddr, Vec<u8>)> {
         Some((self.target, self.downlink.try_recv().ok()?))
+    }
+
+    /// Wait up to `timeout` for the next record, so an idle reader sleeps
+    /// instead of spinning and a full downlink backpressures the bridge
+    /// rather than buffering the whole transfer.
+    fn recv_timeout(&self, timeout: Duration) -> Option<(SocketAddr, Vec<u8>)> {
+        match self.downlink.recv_timeout(timeout) {
+            Ok(payload) => Some((self.target, payload)),
+            Err(_) => None,
+        }
     }
 }
 
@@ -1554,7 +1564,7 @@ impl Transport {
                 let _ = socket.send_to(packet, send_endpoint(endpoint, self.ipv6()));
             }
             Self::Lane(lane) => {
-                let _ = lane.uplink.send(packet.to_vec());
+                let _ = lane.uplink.try_send(packet.to_vec());
             }
         }
     }
@@ -1565,7 +1575,7 @@ impl Transport {
             Self::Socket(socket) => send_batch(socket, self.ipv6(), endpoint, packets),
             Self::Lane(lane) => {
                 for packet in packets {
-                    let _ = lane.uplink.send(packet.clone());
+                    let _ = lane.uplink.try_send(packet.clone());
                 }
             }
         }
@@ -1877,7 +1887,17 @@ fn io(
             }
             Transport::Lane(lane) => {
                 let mut received = 0;
-                while let Some((source, payload)) = lane.recv() {
+                let mut first = true;
+                loop {
+                    let next = if first {
+                        lane.recv_timeout(IO_TICK)
+                    } else {
+                        lane.recv()
+                    };
+                    first = false;
+                    let Some((source, payload)) = next else {
+                        break;
+                    };
                     #[cfg(target_os = "linux")]
                     receive_datagram_owned(
                         &mut peers,

@@ -267,13 +267,15 @@ impl std::fmt::Debug for MasqueOut {
 /// The in-process counterpart of [`MasqueOut::udp_forwarder`]: it leases the
 /// outer tunnel, claims the inner port, and carries a nested tunnel's records
 /// over the outer's datagram path with no loopback socket in between.
+const UPLINK_DEPTH: usize = 64;
+const DOWNLINK_DEPTH: usize = 256;
 #[allow(clippy::needless_pass_by_value)]
 fn lane_bridge(
     tunnel: &MasqueOut,
     target: SocketAddr,
     port: u16,
     uplink: Receiver<Vec<u8>>,
-    downlink: Sender<Vec<u8>>,
+    downlink: SyncSender<Vec<u8>>,
     ready: Option<Sender<Result<(), String>>>,
 ) {
     let mut ready = ready;
@@ -848,8 +850,8 @@ impl MasqueOut {
             .map_err(|error| format!("masque lane: no local address: {error}"))?
             .port();
         drop(probe);
-        let (uplink, uplink_rx) = mpsc::channel();
-        let (downlink_tx, downlink) = mpsc::channel();
+        let (uplink, uplink_rx) = mpsc::sync_channel(UPLINK_DEPTH);
+        let (downlink_tx, downlink) = mpsc::sync_channel(DOWNLINK_DEPTH);
         let (ready_tx, ready_rx) = mpsc::channel();
         let tunnel = Arc::clone(self);
         std::thread::spawn(move || {
