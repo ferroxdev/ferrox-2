@@ -4171,7 +4171,10 @@ fn datagram_to_with_source(
         },
     };
     let sock = if explicit {
-        armed_lane(crate::sockopt::bind_datagram_at(options, at).ok()?, true)
+        armed_lane(
+            crate::sockopt::bind_datagram_at_underlay(options, at, peer).ok()?,
+            true,
+        )
     } else if let Ok(sock) = crate::sockopt::bind_datagram_at_underlay(options, at, peer) {
         armed_lane(sock, true)
     } else {
@@ -5146,8 +5149,13 @@ fn build_pooled_within(dial: &QuicDial, budget: Duration) -> Option<PooledConn> 
             "0.0.0.0:0"
         };
         // A plain lane binds the kernel-picked source so the route poll compares an address, not a wildcard.
-        let (sock, local) = if relay.is_some() {
-            let Ok(sock) = bind_datagram(wildcard) else {
+        let (sock, local) = if let Some((_, via)) = relay.as_ref() {
+            let Ok(wildcard) = wildcard.parse::<SocketAddr>() else {
+                continue;
+            };
+            let Ok(sock) =
+                crate::sockopt::bind_datagram_at_underlay(flow.as_deref(), wildcard, *via)
+            else {
                 continue;
             };
             let Ok(local) = sock.local_addr() else {
