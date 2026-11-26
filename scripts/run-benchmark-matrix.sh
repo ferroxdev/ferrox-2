@@ -697,7 +697,9 @@ while read -r id traffic connections iterations payload duration_ms; do
         [[ "$label" == sing-box ]] || \
           client_args+=(--outbound-config-for "$label=$wg_config")
       fi
-      if [[ "$id" == warp-gool-* ]]; then
+      # Only an engine with its own WireGuard identity takes a per-engine WARP config.
+      if [[ "$id" == warp-gool-* && "$label" != sing-box ]] \
+        && matrix_wireguard_index "$label" >/dev/null 2>&1; then
         if [[ "$id" == warp-gool-classic-* ]]; then
           gool_json="$(warp_classic_client_settings "$srvport" "$innerport" "$label")" || {
             cells_failed+=("$cell (could not mint the gool-classic client for $label)")
