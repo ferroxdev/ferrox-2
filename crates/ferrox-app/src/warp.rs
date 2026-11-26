@@ -3357,7 +3357,6 @@ fn validate_gool(identity: &Identity, spec: &WarpSpec) -> Result<(), String> {
 pub(crate) struct GoolOut {
     outer: Arc<crate::masque::MasqueOut>,
     inner: Arc<crate::wg::WireGuardOut>,
-    _forwarder: crate::wg_stack::UdpForwarder,
 }
 
 impl GoolOut {
@@ -3368,15 +3367,14 @@ impl GoolOut {
         remote: SocketAddr,
     ) -> Result<Self, String> {
         let outer = Arc::new(outer);
-        let forwarder = outer.udp_forwarder(remote)?;
+        let lane = outer.datagram_lane(remote)?;
         let mtu = spec.mtu.min(GOOL_INNER_MTU);
-        let settings = wireguard_settings_with_endpoint(inner_identity, spec, forwarder.local, mtu);
+        let settings = wireguard_settings_with_endpoint(inner_identity, spec, remote, mtu);
         let config = crate::wireguard::DeviceConfig::from_json(&settings)?;
-        let inner = crate::wg::WireGuardOut::with_noise(config, spec.noize.wireguard())?;
+        let inner = crate::wg::WireGuardOut::with_lane(config, lane, spec.noize.wireguard())?;
         Ok(Self {
             outer,
             inner: Arc::new(inner),
-            _forwarder: forwarder,
         })
     }
 

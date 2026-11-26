@@ -264,6 +264,97 @@ impl std::fmt::Debug for MasqueOut {
     }
 }
 
+/// The in-process counterpart of [`MasqueOut::udp_forwarder`]: it leases the
+/// outer tunnel, claims the inner port, and carries a nested tunnel's records
+/// over the outer's datagram path with no loopback socket in between.
+#[allow(clippy::needless_pass_by_value)]
+fn lane_bridge(
+    tunnel: &MasqueOut,
+    target: SocketAddr,
+    port: u16,
+    uplink: Receiver<Vec<u8>>,
+    downlink: Sender<Vec<u8>>,
+    ready: Option<Sender<Result<(), String>>>,
+) {
+    let mut ready = ready;
+    let mut reported = false;
+    loop {
+        let (inner, _lease) = match tunnel.ensure_leased() {
+            Ok(inner) => {
+                reported = false;
+                inner
+            }
+            Err(reason) => {
+                if !reported {
+                    if let Some(ready) = ready.take() {
+                        let _ = ready.send(Err(reason.clone()));
+                    }
+                    eprintln!("masque: {reason}");
+                    reported = true;
+                }
+                std::thread::sleep(TICK);
+                continue;
+            }
+        };
+        let Ok((_reply_tx, reply_rx)) = wg_stack::claim_udp_route(&inner.routes, port) else {
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(Err(
+                    "the datagram lane port is already registered".to_owned()
+                ));
+            }
+            return;
+        };
+        if let Some(ready) = ready.take() {
+            let _ = ready.send(Ok(()));
+        }
+        loop {
+            let mut idle = true;
+            while let Ok(packet) = reply_rx.try_recv() {
+                if let Some(datagram) = connectip::udp_from_packet(packet.packet())
+                    && datagram.destination_port == port
+                {
+                    if downlink.send(datagram.payload.to_vec()).is_err() {
+                        return;
+                    }
+                    idle = false;
+                }
+            }
+            match uplink.try_recv() {
+                Ok(packet) => {
+                    wg_stack::lane_send(
+                        inner.config.as_ref(),
+                        port,
+                        target,
+                        &packet,
+                        &inner.to_tunnel,
+                        0,
+                    );
+                    idle = false;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => return,
+            }
+            if !inner.alive.load(Ordering::Acquire) {
+                break;
+            }
+            if idle {
+                match reply_rx.recv_timeout(TICK) {
+                    Ok(packet) => {
+                        if let Some(datagram) = connectip::udp_from_packet(packet.packet())
+                            && datagram.destination_port == port
+                            && downlink.send(datagram.payload.to_vec()).is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        }
+    }
+}
+
 impl MasqueOut {
     pub(crate) fn new(outbound: &Json) -> Result<Self, String> {
         let spec = ClientSpec::from(outbound)?;
@@ -740,6 +831,45 @@ impl MasqueOut {
                 stop.store(true, Ordering::Relaxed);
                 Err("masque forwarder: the UDP relay did not start".to_owned())
             }
+        }
+    }
+
+    /// A fixed-target datagram lane carried in-process, so a nested tunnel's
+    /// reader skips the loopback socket a forwarder would need. The bridge owns
+    /// the lease and re-leases on reconnect, exactly as the socket forwarder does.
+    pub(crate) fn datagram_lane(
+        self: &Arc<Self>,
+        target: SocketAddr,
+    ) -> Result<crate::wg::Lane, String> {
+        let probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .map_err(|error| format!("masque lane: cannot bind: {error}"))?;
+        let port = probe
+            .local_addr()
+            .map_err(|error| format!("masque lane: no local address: {error}"))?
+            .port();
+        drop(probe);
+        let (uplink, uplink_rx) = mpsc::channel();
+        let (downlink_tx, downlink) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let tunnel = Arc::clone(self);
+        std::thread::spawn(move || {
+            lane_bridge(
+                &tunnel,
+                target,
+                port,
+                uplink_rx,
+                downlink_tx,
+                Some(ready_tx),
+            );
+        });
+        let setup = ESTABLISH_TIMEOUT
+            .saturating_add(HEAD_TIMEOUT)
+            .saturating_add(WARP_ASSIGN_WAIT)
+            .saturating_add(Duration::from_secs(1));
+        match ready_rx.recv_timeout(setup) {
+            Ok(Ok(())) => Ok(crate::wg::Lane::new(target, uplink, downlink)),
+            Ok(Err(reason)) => Err(format!("masque lane: {reason}")),
+            Err(_) => Err("masque lane: the datagram lane did not start".to_owned()),
         }
     }
 

@@ -2720,7 +2720,7 @@ fn lane_targets(
 const UNSPECIFIED: SocketAddr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
 
 /// Build and send one datagram to a target; false means the tunnel is gone.
-fn lane_send(
+pub(crate) fn lane_send(
     config: &DeviceConfig,
     source_port: u16,
     target: SocketAddr,
