@@ -154,7 +154,8 @@ jobs:
             local port trace
             port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
             echo "::group::$label"
-            if ! dist/ferrox-cli.sh up --fronts socks --socks "$port" "$@"; then
+            if ! dist/ferrox-cli.sh up --fronts socks --socks "$port" \
+              --warp-identity "$RUNNER_TEMP/warp-identity.json" "$@"; then
               echo "::error::$label did not start"
               failed=1
               dist/ferrox-cli.sh down || true
@@ -190,7 +191,8 @@ jobs:
           port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
           sudo env FERROX_CONF_DIR="$root_state/conf" FERROX_STATE_DIR="$root_state/state" \
             FERROX_BIN="$PWD/target/release/ferrox-app" \
-            "$PWD/dist/ferrox-cli.sh" up --vpn --fronts socks --socks "$port" --warp --warp-mode masque
+            "$PWD/dist/ferrox-cli.sh" up --vpn --fronts socks --socks "$port" \
+            --warp --warp-mode masque --warp-identity "$RUNNER_TEMP/warp-identity.json"
           trace="$(curl -fsS --noproxy '' --max-time 60 --retry 3 --socks5-hostname "127.0.0.1:$port" https://www.cloudflare.com/cdn-cgi/trace)"
           printf '%s\n' "$trace"
           printf '%s\n' "$trace" | grep -qx 'warp=on'
