@@ -466,7 +466,9 @@ impl H3Reader {
                     }
                     self.head_seen = true;
                     if self.head.is_none() && self.status.is_none() {
-                        let Some((head, status)) = decode_head(payload, self.expect_request) else {
+                        let Some((head, status)) =
+                            decode_head(payload, self.expect_request, status)
+                        else {
                             let missing = if self.expect_request {
                                 "h3 request head is missing"
                             } else {
@@ -986,46 +988,17 @@ fn response_fields(head: &mut [u8]) -> Vec<(&str, &str)> {
 }
 
 /// Decode what the receiving side reads: a request side keeps the synthesized head and the status its upload gates on, a response side keeps only the status and never builds a head it would drop.
-fn decode_head(payload: &[u8], expect_request: bool) -> Option<(Option<Vec<u8>>, Option<u16>)> {
+fn decode_head(
+    payload: &[u8],
+    expect_request: bool,
+    status: Option<u16>,
+) -> Option<(Option<Vec<u8>>, Option<u16>)> {
     if expect_request {
         let fields = hpack::qpack_fields(payload)?;
-        let head = synth_head(&fields)?;
-        Some((Some(head), status_from_fields(&fields)))
+        Some((Some(synth_head(&fields)?), status))
     } else {
-        Some((None, Some(qpack_status_walk(payload)?)))
+        Some((None, Some(status?)))
     }
-}
-
-fn status_from_fields(fields: &[(Vec<u8>, Vec<u8>)]) -> Option<u16> {
-    let mut status = None;
-    for (name, value) in fields {
-        if name == b":status" {
-            status = Some(status_value(value)?);
-        }
-    }
-    status
-}
-
-fn status_value(bytes: &[u8]) -> Option<u16> {
-    if bytes.len() != 3 || !bytes.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    Some(
-        u16::from(bytes[0] - b'0') * 100
-            + u16::from(bytes[1] - b'0') * 10
-            + u16::from(bytes[2] - b'0'),
-    )
-}
-
-fn qpack_status_walk(block: &[u8]) -> Option<u16> {
-    #[cfg(test)]
-    STATUS_WALKS.with(|walks| walks.set(walks.get() + 1));
-    hpack::qpack_status(block)
-}
-
-#[cfg(test)]
-thread_local! {
-    static STATUS_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether a field byte can ride an HTTP/1 line: a peer that smuggles `\r\n` through QPACK would write its own headers into the head `accept_core` parses.
@@ -3493,7 +3466,9 @@ mod tests {
             ],
             &mut block,
         );
-        let (decoded, counts) = ferrox_core::alloc_count::measure(|| decode_head(&block, false));
+        let status = hpack::qpack_status(&block);
+        let (decoded, counts) =
+            ferrox_core::alloc_count::measure(|| decode_head(&block, false, status));
         assert_eq!(decoded, Some((None, Some(200))));
         assert_eq!(
             counts.allocs, 0,
@@ -3505,7 +3480,7 @@ mod tests {
         hpack::qpack_literal_many(&[(":status", "200"), ("content-length", "10")], &mut sized);
         assert_eq!(hpack::qpack_content_length(&sized), Ok(Some(10)));
         assert_eq!(
-            decode_head(&block, true),
+            decode_head(&block, true, status),
             None,
             "a response block is not a request head"
         );
@@ -3519,7 +3494,9 @@ mod tests {
             ],
             &mut request,
         );
-        let (decoded, counts) = ferrox_core::alloc_count::measure(|| decode_head(&request, true));
+        let status = hpack::qpack_status(&request);
+        let (decoded, counts) =
+            ferrox_core::alloc_count::measure(|| decode_head(&request, true, status));
         assert!(matches!(
             decoded,
             Some((Some(head), None)) if head.starts_with(b"POST /x HTTP/3\r\n")
@@ -3529,17 +3506,17 @@ mod tests {
             "the request head is built from its fields: {counts:?}"
         );
         assert_eq!(
-            decode_head(&request, false),
+            decode_head(&request, false, status),
             None,
             "a response reader refuses a block that names no status"
         );
         assert_eq!(
-            decode_head(&[0x01, 0x00, 0xC0, 0x01], false),
+            decode_head(&[0x01, 0x00, 0xC0, 0x01], false, None),
             None,
             "a dynamic-table prefix leaves no status this lane can read"
         );
         assert_eq!(
-            decode_head(&[], false),
+            decode_head(&[], false, None),
             None,
             "an empty response head names no status"
         );
@@ -3549,16 +3526,16 @@ mod tests {
             &[(":method", "POST"), (":path", "/x"), (":status", "500")],
             &mut status,
         );
+        let code = hpack::qpack_status(&status);
         assert!(
-            matches!(decode_head(&status, true), Some((Some(_), Some(500)))),
+            matches!(decode_head(&status, true, code), Some((Some(_), Some(500)))),
             "a request head's status still reaches the upload gate"
         );
     }
 
-    /// A request already decoded its fields for the synthesized head, so its last `:status`
-    /// comes from that list; a response, which keeps no fields, still walks the block.
+    /// One QPACK status scan feeds both the uploaded request's gate and the response head.
     #[test]
-    fn a_request_status_does_not_walk_the_block_again() {
+    fn a_headers_scan_reaches_both_the_head_and_the_status() {
         let mut block = Vec::new();
         hpack::qpack_literal_many(
             &[
@@ -3569,25 +3546,15 @@ mod tests {
             ],
             &mut block,
         );
-        STATUS_WALKS.with(|walks| walks.set(0));
+        let status = hpack::qpack_status(&block);
         assert_eq!(
-            decode_head(&block, true),
+            decode_head(&block, true, status),
             Some((
                 Some(b"POST /x HTTP/3\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec()),
                 Some(503)
             ))
         );
-        STATUS_WALKS.with(|walks| {
-            assert_eq!(walks.get(), 0, "the request status reuses its fields");
-        });
-        assert_eq!(decode_head(&block, false), Some((None, Some(503))));
-        STATUS_WALKS.with(|walks| {
-            assert_eq!(
-                walks.get(),
-                1,
-                "a response still walks the block for its status"
-            );
-        });
+        assert_eq!(decode_head(&block, false, status), Some((None, Some(503))));
     }
 
     #[test]
