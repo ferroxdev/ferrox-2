@@ -725,6 +725,12 @@ pub fn qpack_field(out: &mut Vec<u8>, name: &str, value: &[u8]) {
 
 /// Any request as literal field lines: two zero prefix bytes name no dynamic state, and each field is a `001` name length, name, value length and value run with no Huffman to compute.
 pub fn qpack_literal_many(fields: &[(&str, &str)], out: &mut Vec<u8>) {
+    out.reserve(
+        2 + fields
+            .iter()
+            .map(|(name, value)| qpack_field_len(name.len(), value.len()))
+            .sum::<usize>(),
+    );
     qpack_open(out);
     for (name, value) in fields {
         qpack_field(out, name, value.as_bytes());
@@ -1453,6 +1459,37 @@ mod tests {
                 "index {index}"
             );
         }
+    }
+
+    /// A block's length is known from its fields, so the literal writer opens one buffer
+    /// instead of growing it a field at a time.
+    #[test]
+    fn qpack_literal_many_sizes_its_block_once() {
+        let ((), counts) = crate::alloc_count::measure(|| {
+            let mut block = Vec::new();
+            qpack_literal_many(
+                &[
+                    (":method", "POST"),
+                    (":path", "/x"),
+                    (":authority", "example.test"),
+                    ("x-test", "value"),
+                ],
+                &mut block,
+            );
+            assert_eq!(block[..2], [0, 0]);
+            assert_eq!(
+                block.len(),
+                2 + qpack_field_len(7, 4)
+                    + qpack_field_len(5, 2)
+                    + qpack_field_len(10, 12)
+                    + qpack_field_len(6, 5)
+            );
+            std::hint::black_box(block);
+        });
+        assert_eq!(
+            counts.allocs, 1,
+            "the block is the only allocation its fields need: {counts:?}"
+        );
     }
 
     #[test]
