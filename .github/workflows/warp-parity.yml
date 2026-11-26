@@ -151,6 +151,7 @@ jobs:
           failed=0
           run_lane() {
             local label="$1"; shift
+            local want="${LANE_WARP:-on}"
             local port trace
             port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
             echo "::group::$label"
@@ -167,8 +168,8 @@ jobs:
               failed=1
             else
               printf '%s\n' "$trace"
-              printf '%s\n' "$trace" | grep -qx 'warp=on' || {
-                echo "::error::$label did not egress through WARP"
+              printf '%s\n' "$trace" | grep -qx "warp=$want" || {
+                echo "::error::$label did not egress with warp=$want"
                 failed=1
               }
             fi
@@ -180,7 +181,7 @@ jobs:
           run_lane "nested WireGuard" --warp --warp-mode wiw
           run_lane "nested MASQUE" --warp --warp-mode mim
           run_lane "direct auto" --warp
-          run_lane "Veepn through nested MASQUE" --veepn --warp --warp-mode mim
+          LANE_WARP=off run_lane "Veepn through nested MASQUE" --veepn --warp --warp-mode mim
           test "$failed" = 0
       - name: sudo keeps the lane in the invoking users files
         run: |

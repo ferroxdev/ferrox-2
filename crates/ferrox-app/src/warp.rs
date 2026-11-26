@@ -1991,6 +1991,17 @@ fn resolve_edges(identity: &mut Identity, spec: &mut WarpSpec) -> Result<(), Str
             }
         }
     }
+    if want_wireguard && wireguard.is_none() && spec.mode == Mode::WireGuard {
+        let edge = identity.wireguard.endpoint;
+        if check_wireguard(identity, spec, edge) {
+            wireguard = Some(edge);
+            println!("[+] selected API WireGuard endpoint {edge}");
+        } else {
+            cooldowns.hold(edge, now);
+            scan.get_or_insert(ScanMode::Balanced);
+            eprintln!("[-] API WireGuard edge {edge} did not answer; scanning");
+        }
+    }
     cooldowns.purge(now);
     let excluded = cooldowns.excluded(now);
     if let Some(mode) = scan {
