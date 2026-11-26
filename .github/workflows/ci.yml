@@ -105,6 +105,7 @@ jobs:
           python3 scripts/check-matrix-legs.py --selftest
           python3 scripts/workflow-result.py --selftest
           python3 scripts/rewrite-depinfo.py --selftest
+          ./scripts/release-plan.sh --selftest
       - name: the live comparison helper
         run: python3 scripts/psiphon-target.py --selftest
       - name: the Psiphon config map
