@@ -13,7 +13,7 @@ use std::collections::HashSet;
 use std::io::{Read as _, Write as _};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -290,6 +290,7 @@ impl EdgeSpec {
 struct GoolSettings {
     identity_file: Option<PathBuf>,
     inline: Option<Identity>,
+    inline_many: Vec<Identity>,
     peer: Option<SocketAddr>,
     wiw_outer: Option<SocketAddr>,
     wiw_inner: Option<SocketAddr>,
@@ -305,6 +306,14 @@ fn gool_settings(settings: &crate::json::Json, env: &Env<'_>) -> Result<GoolSett
         .get("goolIdentity")
         .map(Identity::from_json)
         .transpose()?;
+    let inline_many = match settings.get("goolIdentities") {
+        None => Vec::new(),
+        Some(crate::json::Json::Arr(items)) => items
+            .iter()
+            .map(Identity::from_json)
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => return Err("warp gool: `goolIdentities` must be an array".to_owned()),
+    };
     let peer = match settings.get("goolPeer") {
         None => None,
         Some(crate::json::Json::Str(text)) => Some(
@@ -316,6 +325,7 @@ fn gool_settings(settings: &crate::json::Json, env: &Env<'_>) -> Result<GoolSett
     Ok(GoolSettings {
         identity_file,
         inline,
+        inline_many,
         peer,
         wiw_outer: nested_peer(settings, "wiwOuter", "AETHER_WIW_OUTER_PEER", env)?,
         wiw_inner: nested_peer(settings, "wiwInner", "AETHER_WIW_INNER_PEER", env)?,
@@ -636,6 +646,15 @@ impl WarpSpec {
                 .to_owned()
         })?;
         self.identity_at_in(&self.gool_path(&paths)?, true, test)
+    }
+
+    /// The inner identities the shards are built from: the `goolIdentities` list when present,
+    /// else the single `goolIdentity`/file as one shard.
+    fn gool_identities_in(&self, test: bool) -> Result<Vec<Identity>, String> {
+        if !self.gool.inline_many.is_empty() {
+            return Ok(self.gool.inline_many.clone());
+        }
+        Ok(vec![self.gool_identity_in(test)?])
     }
 
     /// The path the inner MASQUE identity is saved to, the sibling Aether uses.
@@ -2682,13 +2701,14 @@ pub(crate) struct WarpOut {
     mode: Mode,
     wireguard: Option<Arc<crate::wg::WireGuardOut>>,
     masque: Option<Arc<crate::masque::MasqueOut>>,
-    gool: Option<Arc<GoolOut>>,
-    gool_classic: Option<Arc<GoolClassicOut>>,
+    gool: Vec<Arc<GoolOut>>,
+    gool_classic: Vec<Arc<GoolClassicOut>>,
     mim: Option<Arc<MimOut>>,
     chosen: Mutex<Option<Lane>>,
     gateway: Option<Gateway>,
     probe_host: String,
     probe_port: u16,
+    shard: AtomicUsize,
 }
 
 fn configured_identity(spec: &WarpSpec, test: bool) -> Result<Option<Identity>, String> {
@@ -2704,6 +2724,7 @@ fn configured_identity(spec: &WarpSpec, test: bool) -> Result<Option<Identity>, 
     if test
         && matches!(spec.mode, Mode::Gool | Mode::GoolClassic)
         && spec.gool.inline.is_none()
+        && spec.gool.inline_many.is_empty()
         && !spec
             .gool
             .identity_file
@@ -2796,19 +2817,30 @@ fn select_gateway(spec: &WarpSpec, identity: &Identity, carrier: bool) -> Option
     }
 }
 
+/// The shard one flow takes: round-robin across the built shards, so the flows spread over the
+/// independent outer conversations instead of bursting one.
+fn pick_shard<'a, T>(shard: &AtomicUsize, shards: &'a [T]) -> Option<&'a T> {
+    if shards.is_empty() {
+        return None;
+    }
+    let at = shard.fetch_add(1, Ordering::Relaxed) % shards.len();
+    shards.get(at)
+}
+
 impl WarpOut {
     fn unbuilt(spec: &WarpSpec) -> Self {
         Self {
             mode: spec.mode,
             wireguard: None,
             masque: None,
-            gool: None,
-            gool_classic: None,
+            gool: Vec::new(),
+            gool_classic: Vec::new(),
             mim: None,
             chosen: Mutex::new(None),
             gateway: None,
             probe_host: spec.probe_host.clone(),
             probe_port: spec.probe_port,
+            shard: AtomicUsize::new(0),
         }
     }
 
@@ -2864,17 +2896,17 @@ impl WarpOut {
             }
         };
         let gool = if spec.mode == Mode::Gool {
-            Some(Arc::new(build_gool(&identity, &spec, test)?))
+            build_gool_shards(&identity, &spec, test)?
         } else {
-            None
+            Vec::new()
         };
         let gool_classic = if spec.mode == Mode::GoolClassic {
             let inner = inner_identity
                 .as_ref()
                 .ok_or("warp gool-classic: the inner identity was not built")?;
-            Some(Arc::new(build_gool_classic(&identity, inner, &spec)?))
+            vec![Arc::new(build_gool_classic(&identity, inner, &spec)?)]
         } else {
-            None
+            Vec::new()
         };
         let mim = if spec.mode == Mode::Mim {
             let inner = inner_identity
@@ -2887,12 +2919,12 @@ impl WarpOut {
         let gateway = select_gateway(
             &spec,
             &identity,
-            masque.is_some() || gool.is_some() || mim.is_some(),
+            masque.is_some() || !gool.is_empty() || mim.is_some(),
         );
         if wireguard.is_none()
             && masque.is_none()
-            && gool.is_none()
-            && gool_classic.is_none()
+            && gool.is_empty()
+            && gool_classic.is_empty()
             && mim.is_none()
         {
             return Err("warp: neither half could be built".to_owned());
@@ -2908,6 +2940,7 @@ impl WarpOut {
             gateway,
             probe_host: spec.probe_host,
             probe_port: spec.probe_port,
+            shard: AtomicUsize::new(0),
         })
     }
 
@@ -2953,7 +2986,13 @@ impl WarpOut {
     }
 
     fn has_masque_carrier(&self) -> bool {
-        self.masque.is_some() || self.gool.is_some() || self.mim.is_some()
+        self.masque.is_some() || !self.gool.is_empty() || self.mim.is_some()
+    }
+
+    /// The shard one flow takes: round-robin across the built shards, so the flows spread over the
+    /// independent outer conversations instead of bursting one.
+    fn next_shard<'a, T>(&self, shards: &'a [T]) -> Option<&'a T> {
+        pick_shard(&self.shard, shards)
     }
 
     fn serve_gateway(
@@ -2973,7 +3012,7 @@ impl WarpOut {
                 Some(ready),
                 Some(Arc::clone(&cancelled)),
             )
-        } else if let Some(gool) = &self.gool {
+        } else if let Some(gool) = self.next_shard(&self.gool) {
             gool.outer.serve_tcp_cancellable(
                 client,
                 asked,
@@ -3007,27 +3046,23 @@ impl WarpOut {
         match self.mode {
             Mode::WireGuard => self.wireguard.as_ref().and_then(|half| half.edge()),
             Mode::Masque => self.masque.as_ref().and_then(|half| half.edge()),
-            Mode::Gool => self.gool.as_ref().and_then(|gool| gool.edge()),
-            Mode::GoolClassic => self
-                .gool_classic
-                .as_ref()
-                .and_then(|classic| classic.edge()),
+            Mode::Gool => self.gool.first().and_then(|gool| gool.edge()),
+            Mode::GoolClassic => self.gool_classic.first().and_then(|classic| classic.edge()),
             Mode::Mim => self.mim.as_ref().and_then(|mim| mim.edge()),
             Mode::Auto => match self.chosen.lock().ok().and_then(|chosen| *chosen) {
                 Some(Lane::WireGuard) => self.wireguard.as_ref().and_then(|half| half.edge()),
                 Some(Lane::Masque) => self.masque.as_ref().and_then(|half| half.edge()),
-                Some(Lane::Gool) => self.gool.as_ref().and_then(|gool| gool.edge()),
-                Some(Lane::GoolClassic) => self
-                    .gool_classic
-                    .as_ref()
-                    .and_then(|classic| classic.edge()),
+                Some(Lane::Gool) => self.gool.first().and_then(|gool| gool.edge()),
+                Some(Lane::GoolClassic) => {
+                    self.gool_classic.first().and_then(|classic| classic.edge())
+                }
                 Some(Lane::Mim) => self.mim.as_ref().and_then(|mim| mim.edge()),
                 None => self
                     .wireguard
                     .as_ref()
                     .and_then(|half| half.edge())
                     .or_else(|| self.masque.as_ref().and_then(|half| half.edge()))
-                    .or_else(|| self.gool_classic.as_ref().and_then(|half| half.edge())),
+                    .or_else(|| self.gool_classic.first().and_then(|half| half.edge())),
             },
         }
     }
@@ -3159,12 +3194,12 @@ impl WarpOut {
                 }
             }
             Lane::Gool => {
-                if let Some(gool) = &self.gool {
+                if let Some(gool) = self.next_shard(&self.gool) {
                     gool.inner.serve_tcp(client, asked, prefix);
                 }
             }
             Lane::GoolClassic => {
-                if let Some(classic) = &self.gool_classic {
+                if let Some(classic) = self.next_shard(&self.gool_classic) {
                     classic.inner.serve_tcp(client, asked, prefix);
                 }
             }
@@ -3194,12 +3229,12 @@ impl WarpOut {
                 }
             }
             Lane::Gool => {
-                if let Some(gool) = &self.gool {
+                if let Some(gool) = self.next_shard(&self.gool) {
                     gool.inner.serve_udp(relay, associate, peer);
                 }
             }
             Lane::GoolClassic => {
-                if let Some(classic) = &self.gool_classic {
+                if let Some(classic) = self.next_shard(&self.gool_classic) {
                     classic.inner.serve_udp(relay, associate, peer);
                 }
             }
@@ -3263,7 +3298,11 @@ fn validate_gool(identity: &Identity, spec: &WarpSpec) -> Result<(), String> {
     if identity.masque.is_none() {
         return Err("warp gool: the identity has no MASQUE key".to_owned());
     }
-    let inner = spec.gool_identity_in(true)?;
+    let inner = spec
+        .gool_identities_in(true)?
+        .into_iter()
+        .next()
+        .ok_or("warp gool: no inner identity to validate")?;
     build_masque(identity, spec)?;
     let local = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
     let settings =
@@ -3306,16 +3345,44 @@ impl GoolOut {
     }
 }
 
-fn build_gool(identity: &Identity, spec: &WarpSpec, test: bool) -> Result<GoolOut, String> {
+fn build_gool(
+    identity: &Identity,
+    inner_identity: &Identity,
+    spec: &WarpSpec,
+    remote: SocketAddr,
+) -> Result<GoolOut, String> {
     if identity.masque.is_none() {
         return Err(
             "warp gool: the outer identity has no MASQUE key to carry WireGuard".to_owned(),
         );
     }
-    let inner_identity = spec.gool_identity_in(test)?;
-    let remote = spec.gool.peer.unwrap_or(inner_identity.wireguard.endpoint);
     let outer = build_masque(identity, spec)?;
-    GoolOut::new(outer, &inner_identity, spec, remote)
+    GoolOut::new(outer, inner_identity, spec, remote)
+}
+
+/// One `GoolOut` per inner identity, each on its own outer port (`base + i`) and inner peer.
+fn build_gool_shards(
+    identity: &Identity,
+    spec: &WarpSpec,
+    test: bool,
+) -> Result<Vec<Arc<GoolOut>>, String> {
+    let identities = spec.gool_identities_in(test)?;
+    let shards = identities.len();
+    let mut built = Vec::with_capacity(shards);
+    for (index, inner) in identities.iter().enumerate() {
+        let mut shard_spec = spec.clone();
+        if shards > 1 {
+            let offset = u16::try_from(index).unwrap_or(u16::MAX);
+            shard_spec.masque_port = spec.masque_port.saturating_add(offset);
+        }
+        let remote = if shards > 1 {
+            inner.wireguard.endpoint
+        } else {
+            spec.gool.peer.unwrap_or(inner.wireguard.endpoint)
+        };
+        built.push(Arc::new(build_gool(identity, inner, &shard_spec, remote)?));
+    }
+    Ok(built)
 }
 
 /// A MASQUE conversation carried inside another MASQUE conversation.
@@ -6693,8 +6760,8 @@ mod tests {
             mode: Mode::Masque,
             wireguard: None,
             masque: Some(Arc::new(masque)),
-            gool: None,
-            gool_classic: None,
+            gool: Vec::new(),
+            gool_classic: Vec::new(),
             mim: None,
             chosen: Mutex::new(None),
             gateway: Some(Gateway {
@@ -6703,6 +6770,7 @@ mod tests {
             }),
             probe_host: String::new(),
             probe_port: 0,
+            shard: AtomicUsize::new(0),
         };
         let listener = TcpListener::bind("127.0.0.1:0").expect("pair");
         let tun =
@@ -6932,5 +7000,16 @@ mod tests {
                 .iter()
                 .any(|(key, value)| key == "Authorization" && value == "Bearer a-device-token")
         );
+    }
+
+    #[test]
+    fn shard_dispatch_round_robins_over_every_shard() {
+        let shard = AtomicUsize::new(0);
+        let shards = [10u8, 20, 30];
+        let picked: Vec<u8> = (0..7)
+            .map(|_| *pick_shard(&shard, &shards).expect("a shard"))
+            .collect();
+        assert_eq!(picked, vec![10, 20, 30, 10, 20, 30, 10]);
+        assert!(pick_shard(&shard, &[] as &[u8]).is_none());
     }
 }

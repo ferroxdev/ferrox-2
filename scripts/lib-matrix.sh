@@ -27,6 +27,36 @@ print(s.getsockname()[1])
 s.close()'
 }
 
+# A base port whose `$1` successors are all free at once, for a lane that opens one
+# inbound per shard on consecutive ports. The plain allocator returns a single port and
+# its neighbours may be taken, so a sharded lane asks for the whole run in one bind.
+matrix_srvport_range() {
+  python3 -c 'import random, socket, sys
+n = int(sys.argv[1])
+kind = socket.SOCK_DGRAM if len(sys.argv) > 2 and sys.argv[2] == "udp" else socket.SOCK_STREAM
+for _ in range(200):
+    base = random.randint(20000, 60000 - n)
+    held = []
+    try:
+        for i in range(n):
+            held.append(socket.socket(socket.AF_INET, kind))
+            held[-1].bind(("127.0.0.1", base + i))
+    except OSError:
+        for sock in held:
+            sock.close()
+        continue
+    for sock in held:
+        sock.close()
+    print(base)
+    break
+else:
+    sys.exit(1)' "$1" "${2:-tcp}"
+}
+
+matrix_udp_srvport_range() {
+  matrix_srvport_range "$1" udp
+}
+
 # Shadowsocks listens on TCP and UDP under one port; a port free for only one
 # protocol fails the cell at bind time.
 matrix_tcp_udp_srvport() {
@@ -510,6 +540,43 @@ matrix_wireguard_inner_engine_v6() {
   printf 'fd01::%d/128\n' "$((index + 2))"
 }
 
+# A sharded WARP lane opens one inner WireGuard session per shard, and each session
+# needs its own key because the peer's replay timestamp belongs to the key. Shard 0
+# reuses the engine's single inner identity so a single-shard reference (aether, which
+# reads only the singular `goolIdentity`) still lands on the same peer. The addresses
+# live in a separate block from the `2..5` the unsharded lanes use, so a sharded cell
+# and an unsharded one never disagree about which address a key owns.
+matrix_wireguard_inner_engine_dir_at() {
+  local engine="$1" shard="${2:-0}" dir file="inner-client.txt"
+  dir="$(matrix_wireguard_dir)/$engine"
+  mkdir -p "$dir" || return 1
+  [[ "$shard" != 0 ]] && file="inner-client-$shard.txt"
+  if [[ ! -s "$dir/$file" ]]; then
+    "${ferrox_bin:?no ferrox binary to mint the WireGuard keypairs}" x25519 >"$dir/$file" || return 1
+  fi
+  echo "$dir/$file"
+}
+
+matrix_wireguard_inner_engine_private_at() {
+  matrix_wireguard_key "$(matrix_wireguard_inner_engine_dir_at "$1" "$2")" PrivateKey
+}
+
+matrix_wireguard_inner_engine_public_at() {
+  matrix_wireguard_key "$(matrix_wireguard_inner_engine_dir_at "$1" "$2")" 'Password (PublicKey)'
+}
+
+matrix_wireguard_inner_engine_v4_at() {
+  local index
+  index="$(matrix_wireguard_index "$1")" || return 1
+  printf '10.1.0.%d/32\n' "$((20 + index * ${MATRIX_GOOL_SHARDS:-1} + ${2:-0}))"
+}
+
+matrix_wireguard_inner_engine_v6_at() {
+  local index
+  index="$(matrix_wireguard_index "$1")" || return 1
+  printf 'fd01::%d/128\n' "$((20 + index * ${MATRIX_GOOL_SHARDS:-1} + ${2:-0}))"
+}
+
 matrix_wireguard_inner_server_private() {
   sed -n 's/^PrivateKey: //p' "$(matrix_wireguard_dir)/server-inner.txt"
 }
@@ -821,6 +888,21 @@ wireguard_inner_server() {
   echo "\"protocol\": \"wireguard\", \"settings\": {\"secretKey\": \"$(matrix_wireguard_inner_server_private)\", \"address\": [\"10.1.0.1/32\", \"fd01::1/128\"], \"mtu\": 1280, \"peers\": [$peers]}"
 }
 
+# One inner inbound per shard. Every engine lands on shard 0, matching the unsharded
+# peer set; higher shards carry ferrox alone, the only engine that opens more than one.
+wireguard_inner_server_shard() {
+  local shard="$1" peers="" engines="ferrox" engine public v4 v6 peer
+  [[ "$shard" == 0 ]] && engines="$(matrix_wireguard_engines)"
+  for engine in $engines; do
+    public="$(matrix_wireguard_inner_engine_public_at "$engine" "$shard")" || return 1
+    v4="$(matrix_wireguard_inner_engine_v4_at "$engine" "$shard")" || return 1
+    v6="$(matrix_wireguard_inner_engine_v6_at "$engine" "$shard")" || return 1
+    peer="{\"publicKey\": \"$public\", \"allowedIPs\": [\"$v4\", \"$v6\"]}"
+    peers+="${peers:+,}$peer"
+  done
+  echo "\"protocol\": \"wireguard\", \"settings\": {\"secretKey\": \"$(matrix_wireguard_inner_server_private)\", \"address\": [\"10.1.0.1/32\", \"fd01::1/128\"], \"mtu\": 1280, \"peers\": [$peers]}"
+}
+
 wireguard_identity() {
   local private="$1" public="$2" endpoint="$3" v4="$4" v6="$5"
   echo "{\"deviceId\": \"matrix\", \"token\": \"matrix\", \"wireguard\": {\"privateKey\": \"$private\", \"publicKey\": \"$public\", \"endpoint\": \"$endpoint\", \"address\": [\"$v4/32\", \"$v6/128\"], \"reserved\": [0, 0, 0]}}"
@@ -832,6 +914,26 @@ nested_server_config() {
 {"inbounds": [{"tag": "matrix-server", "listen": "127.0.0.1", "port": $port, $outer}, {"tag": "matrix-inner", "listen": "$inner_listen", "port": $inner_port, $inner}],
  "outbounds": [{$client}, {"tag": "inner", "protocol": "freedom", "settings": {"redirect": "$inner_listen:$inner_port"}}, {"tag": "direct", "protocol": "freedom", "settings": {"finalRules": [{"action": "allow"}]}}],
  "routing": {"rules": [{"type": "field", "inboundTag": ["harness-socks"], "outboundTag": "proxy"}, {"type": "field", "inboundTag": ["matrix-server"], "outboundTag": "inner"}, {"type": "field", "inboundTag": ["matrix-inner"], "outboundTag": "direct"}]}}
+EOF
+}
+
+# N independent (outer, inner) inbound pairs on consecutive ports. Each pair is its own
+# relay and its own stack, so a shard's loss and its one thread are isolated from the
+# others; the outer of shard i forwards to the inner of shard i and nowhere else.
+nested_server_config_sharded() {
+  local shards="$1" port="$2" inner_port="$3" client="$4"
+  local i outer inbounds="" outbounds="" rules="" inner
+  outer="$(masque_server_settings)"
+  for ((i = 0; i < shards; i++)); do
+    inner="$(wireguard_inner_server_shard "$i")" || return 1
+    inbounds+="${inbounds:+,}{\"tag\": \"matrix-server-$i\", \"listen\": \"127.0.0.1\", \"port\": $((port + i)), $outer}, {\"tag\": \"matrix-inner-$i\", \"listen\": \"127.0.0.1\", \"port\": $((inner_port + i)), $inner}"
+    outbounds+="${outbounds:+,}{\"tag\": \"inner-$i\", \"protocol\": \"freedom\", \"settings\": {\"redirect\": \"127.0.0.1:$((inner_port + i))\"}}"
+    rules+="${rules:+,}{\"type\": \"field\", \"inboundTag\": [\"matrix-server-$i\"], \"outboundTag\": \"inner-$i\"}, {\"type\": \"field\", \"inboundTag\": [\"matrix-inner-$i\"], \"outboundTag\": \"direct\"}"
+  done
+  cat <<EOF
+{"inbounds": [$inbounds],
+ "outbounds": [{$client}, $outbounds, {"tag": "direct", "protocol": "freedom", "settings": {"finalRules": [{"action": "allow"}]}}],
+ "routing": {"rules": [{"type": "field", "inboundTag": ["harness-socks"], "outboundTag": "proxy"}, $rules]}}
 EOF
 }
 
@@ -849,11 +951,17 @@ warp_classic_client_settings() {
 
 warp_gool_client_settings() {
   local outer_port="$1" inner_port="$2" engine="${3:-ferrox}"
-  local extra inner_private inner_v4 inner_v6
-  inner_private="$(matrix_wireguard_inner_engine_private "$engine")" || return 1
-  inner_v4="$(matrix_wireguard_inner_engine_v4 "$engine")" || return 1
-  inner_v6="$(matrix_wireguard_inner_engine_v6 "$engine")" || return 1
-  extra=", \"goolIdentity\": $(wireguard_identity "$inner_private" "$(matrix_wireguard_inner_server_public)" "127.0.0.1:$inner_port" "${inner_v4%/32}" "${inner_v6%/128}"), \"goolPeer\": \"127.0.0.1:$inner_port\""
+  local shards="${MATRIX_GOOL_SHARDS:-1}" i ids="" first="" extra
+  local inner_private inner_v4 inner_v6 id
+  for ((i = 0; i < shards; i++)); do
+    inner_private="$(matrix_wireguard_inner_engine_private_at "$engine" "$i")" || return 1
+    inner_v4="$(matrix_wireguard_inner_engine_v4_at "$engine" "$i")" || return 1
+    inner_v6="$(matrix_wireguard_inner_engine_v6_at "$engine" "$i")" || return 1
+    id="$(wireguard_identity "$inner_private" "$(matrix_wireguard_inner_server_public)" "127.0.0.1:$((inner_port + i))" "${inner_v4%/32}" "${inner_v6%/128}")"
+    ids+="${ids:+,}$id"
+    [[ "$i" == 0 ]] && first="$id"
+  done
+  extra=", \"goolIdentity\": $first, \"goolIdentities\": [$ids], \"goolPeer\": \"127.0.0.1:$inner_port\""
   warp_client_settings "$outer_port" gool "$extra"
 }
 
@@ -1081,7 +1189,7 @@ scenario_config() {
     masque-*) server_config "$(masque_server_settings)" "$(masque_client_settings "$port")" "$port" ;;
     warp-masque-*) server_config "$(masque_server_settings)" "$(warp_client_settings "$port")" "$port" ;;
     warp-gool-classic-*) nested_server_config "$port" "$inner" "$(wireguard_classic_server)" "$(wireguard_inner_server)" "$(warp_classic_client_settings "$port" "$inner")" "127.0.0.2" ;;
-    warp-gool-*) nested_server_config "$port" "$inner" "$(masque_server_settings)" "$(wireguard_inner_server)" "$(warp_gool_client_settings "$port" "$inner")" ;;
+    warp-gool-*) nested_server_config_sharded "${MATRIX_GOOL_SHARDS:-1}" "$port" "$inner" "$(warp_gool_client_settings "$port" "$inner")" ;;
     warp-mim-*) nested_server_config "$port" "$inner" "$(masque_server_settings)" "$(masque_inner_server_settings)" "$(warp_mim_client_settings "$port" "$inner")" "127.0.0.2" ;;
     socks-raw-*) server_config "$(socks_server)" "$(socks_client "$port")" "$port" ;;
     http-raw-*) server_config "$(http_server)" "$(http_client "$port")" "$port" ;;
