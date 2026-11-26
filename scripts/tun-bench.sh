@@ -130,8 +130,10 @@ remove_routes() {
 
 # The app drops its guard on SIGINT; a killed run can leave the half-defaults behind and make the next engine fail.
 remove_auto_routes() {
+    local upper
+    printf -v upper '%d.0.0.0/1' 128
     ip route del 0.0.0.0/1 dev "$1" 2> /dev/null || true
-    ip route del 128.0.0.0/1 dev "$1" 2> /dev/null || true
+    ip route del "$upper" dev "$1" 2> /dev/null || true
 }
 
 ns_setup() {
@@ -194,7 +196,7 @@ start_ferrox_auto() {
     else
         name_json=""
     fi
-    printf '%s\n' "{\"inbounds\":[{\"tag\":\"tun\",\"protocol\":\"tun\",\"settings\":{$name_json\"mtu\":$MTU,\"stack\":\"$mode\",\"address\":\"$TUN_ADDR\",\"prefix\":$TUN_PREFIX,\"queues\":$QUEUES,\"auto_route\":true,\"dns_mode\":\"hijack\",\"dns_address\":[\"1.1.1.1\"]}}],\"outbounds\":[{\"tag\":\"proxy\",\"protocol\":\"socks\",\"settings\":{\"servers\":[{\"address\":\"$VETH_SERVER\",\"port\":$SOCKS_PORT}]}}]}" \
+    printf '%s\n' "{\"inbounds\":[{\"tag\":\"tun\",\"protocol\":\"tun\",\"settings\":{$name_json\"mtu\":$MTU,\"stack\":\"$mode\",\"address\":\"$TUN_ADDR\",\"prefix\":$TUN_PREFIX,\"queues\":$QUEUES,\"auto_route\":true,\"dns_mode\":\"hijack\",\"dns_address\":[\"192.0.2.53\"]}}],\"outbounds\":[{\"tag\":\"proxy\",\"protocol\":\"socks\",\"settings\":{\"servers\":[{\"address\":\"$VETH_SERVER\",\"port\":$SOCKS_PORT}]}}]}" \
         > "$OUT_DIR/ferrox-auto-$tag.json"
     "$FERROX" run -c "$OUT_DIR/ferrox-auto-$tag.json" > "$OUT_DIR/ferrox-auto-$tag.log" 2>&1 &
     ENGINE_PIDS=$!
