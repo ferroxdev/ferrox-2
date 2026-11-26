@@ -80916,10 +80916,17 @@ mod tests {
         thread::spawn(move || {
             let mut buf = [0u8; 2048];
             loop {
-                let Ok((n, from)) = echo.recv_from(&mut buf) else {
-                    return;
-                };
-                let _ = echo.send_to(&buf[..n], from);
+                match echo.recv_from(&mut buf) {
+                    Ok((n, from)) => {
+                        let _ = echo.send_to(&buf[..n], from);
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                        ) => {}
+                    Err(_) => return,
+                }
             }
         });
         port
