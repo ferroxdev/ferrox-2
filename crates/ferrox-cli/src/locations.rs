@@ -85,7 +85,7 @@ fn catalogue(text: &str, wanted: &str) -> Catalogue {
                 .and_then(Value::as_str)
                 .unwrap_or_default(),
         );
-        if country.is_empty() || (!wanted.is_empty() && country.as_ref() != wanted.as_str()) {
+        if country.is_empty() || (!wanted.is_empty() && country.as_ref() != wanted) {
             continue;
         }
         let city = upper(edge.get("city").and_then(Value::as_str).unwrap_or_default());
