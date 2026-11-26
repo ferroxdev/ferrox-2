@@ -28,6 +28,12 @@ const WG_SEEDS_V4: [&str; 5] = [
     "162.159.193.1",
 ];
 
+const WG_KNOWN_V4: [&str; 3] = [
+    "162.159.192.2:2408",
+    "162.159.192.1:2408",
+    "162.159.195.1:2408",
+];
+
 const WG_PORTS: [u16; 54] = [
     2408, 500, 1701, 4500, 854, 859, 864, 878, 880, 890, 891, 894, 903, 908, 928, 934, 939, 942,
     943, 945, 946, 955, 968, 987, 988, 1002, 1010, 1014, 1018, 1070, 1074, 1180, 1387, 1843, 2371,
@@ -175,13 +181,27 @@ pub(crate) fn wg_candidates(mode: ScanMode) -> Vec<SocketAddr> {
         .iter()
         .filter_map(|text| text.parse().ok())
         .collect();
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for text in WG_KNOWN_V4 {
+        if let Ok(edge) = text.parse()
+            && seen.insert(edge)
+        {
+            out.push(edge);
+        }
+    }
     let mut ips: Vec<Ipv4Addr> = seeds;
     for ip in sample_prefixes(&WG_PREFIXES_V4, strategy.full_subnet, strategy.sample) {
         if !ips.contains(&ip) {
             ips.push(ip);
         }
     }
-    spread(&ips, &WG_PORTS, strategy.port_waves)
+    for edge in spread(&ips, &WG_PORTS, strategy.port_waves) {
+        if seen.insert(edge) {
+            out.push(edge);
+        }
+    }
+    out
 }
 
 pub(crate) fn masque_candidates(mode: ScanMode) -> Vec<SocketAddr> {
@@ -626,7 +646,9 @@ impl LastEdge {
         std::fs::rename(&temp, path).map_err(|error| {
             let _ = std::fs::remove_file(&temp);
             format!("warp: cannot save `{}`: {error}", path.display())
-        })
+        })?;
+        crate::ownership::hand_back(path);
+        Ok(())
     }
 
     pub(crate) fn get(&self, carrier: &str) -> Option<(SocketAddr, Option<&str>)> {
@@ -678,6 +700,7 @@ mod tests {
     fn the_reference_sweep_counts_are_the_documented_ones() {
         assert_eq!(WG_PREFIXES_V4.len(), 7);
         assert_eq!(WG_SEEDS_V4.len(), 5);
+        assert_eq!(WG_KNOWN_V4.len(), 3);
         assert_eq!(WG_PORTS.len(), 54);
         assert_eq!(MASQUE_PREFIXES_V4.len(), 14);
         assert_eq!(MASQUE_SEEDS.len(), 10);
@@ -686,14 +709,14 @@ mod tests {
     }
 
     #[test]
-    fn the_wireguard_sweep_starts_with_the_seeds_on_separate_ports() {
+    fn the_wireguard_sweep_starts_with_the_known_edges_then_the_seeds() {
         let candidates = wg_candidates(ScanMode::Turbo);
+        for (index, edge) in WG_KNOWN_V4.iter().enumerate() {
+            assert_eq!(candidates[index], edge.parse().expect("a known edge"));
+        }
         for (index, seed) in WG_SEEDS_V4.iter().enumerate() {
             let ip: Ipv4Addr = seed.parse().expect("a seed");
-            assert_eq!(
-                candidates[index],
-                SocketAddr::from((ip, WG_PORTS[index % WG_PORTS.len()]))
-            );
+            assert!(candidates.contains(&SocketAddr::from((ip, WG_PORTS[index % WG_PORTS.len()]))));
         }
         assert!(candidates.contains(&"162.159.192.1:2408".parse().expect("the default port")));
     }

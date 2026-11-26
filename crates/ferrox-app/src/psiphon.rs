@@ -6748,6 +6748,9 @@ fn default_state() -> PathBuf {
         return PathBuf::from(dir).join("ferrox/psiphon");
     }
     if let Some(home) = std::env::var_os("HOME") {
+        if cfg!(target_os = "macos") {
+            return PathBuf::from(home).join("Library/Application Support/ferrox/psiphon");
+        }
         return PathBuf::from(home).join(".local/state/ferrox/psiphon");
     }
     #[cfg(unix)]
@@ -9567,7 +9570,10 @@ fn cache_path(settings: &Settings) -> PathBuf {
 fn state_is_ours(path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata(path).is_ok_and(|meta| {
-        meta.is_dir() && meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o022 == 0
+        let owner = meta.uid();
+        meta.is_dir()
+            && (owner == unsafe { libc::geteuid() } || crate::ownership::is_invoking(owner))
+            && meta.mode() & 0o022 == 0
     })
 }
 
@@ -9580,9 +9586,11 @@ fn save_cache(settings: &Settings, text: &str) {
     let path = cache_path(settings);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
+        crate::ownership::hand_back(parent);
     }
     if state_is_ours(&settings.state) {
-        let _ = std::fs::write(path, text);
+        let _ = std::fs::write(&path, text);
+        crate::ownership::hand_back(&path);
     }
 }
 
@@ -10348,10 +10356,15 @@ impl CacheSlot<'_> {
         if std::fs::create_dir_all(self.dir).is_err() {
             return;
         }
-        let _ = std::fs::write(self.path("body"), body);
+        crate::ownership::hand_back(self.dir);
+        let body_path = self.path("body");
+        let _ = std::fs::write(&body_path, body);
+        crate::ownership::hand_back(&body_path);
         match etag.filter(|etag| !etag.is_empty()) {
             Some(etag) => {
-                let _ = std::fs::write(self.path("etag"), etag);
+                let etag_path = self.path("etag");
+                let _ = std::fs::write(&etag_path, etag);
+                crate::ownership::hand_back(&etag_path);
             }
             None => {
                 let _ = std::fs::remove_file(self.path("etag"));
@@ -10468,6 +10481,7 @@ fn fetch_osl_resumable(
     if let Some(parent) = part.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("psiphon: OSL cache directory: {error}"))?;
+        crate::ownership::hand_back(parent);
     }
     let offset = std::fs::metadata(&part).map_or(0, |metadata| metadata.len());
     let range = (offset > 0).then(|| format!("bytes={offset}-"));
@@ -10495,6 +10509,7 @@ fn fetch_osl_resumable(
         offset > 0,
         MAX_OSL_BYTES,
     )?;
+    crate::ownership::hand_back(&part);
     match reply.status {
         200 | 206 => {}
         416 if offset > 0 => {}
@@ -10641,11 +10656,15 @@ fn fetch_upgrade(
     }
     std::fs::create_dir_all(&job.state)
         .map_err(|error| format!("psiphon: upgrade state directory: {error}"))?;
+    crate::ownership::hand_back(&job.state);
     let part = job.state.join(format!("{UPGRADE_FILENAME}.{version}.part"));
     std::fs::write(&part, &reply.body)
         .map_err(|error| format!("psiphon: upgrade download {}: {error}", part.display()))?;
+    crate::ownership::hand_back(&part);
     std::fs::rename(&part, destination)
-        .map_err(|error| format!("psiphon: upgrade rename {}: {error}", part.display()))
+        .map_err(|error| format!("psiphon: upgrade rename {}: {error}", part.display()))?;
+    crate::ownership::hand_back(destination);
+    Ok(())
 }
 
 const FEEDBACK_MAX_BODY: usize = 1024 * 1024;
@@ -11081,7 +11100,10 @@ fn save_dial_parameters(settings: &Settings, host: &str, protocol: &str) {
     let mut text = String::new();
     json::write(&Json::Obj(entries), &mut text);
     let _ = std::fs::create_dir_all(&settings.state);
-    let _ = std::fs::write(dial_parameters_path(settings), text);
+    crate::ownership::hand_back(&settings.state);
+    let path = dial_parameters_path(settings);
+    let _ = std::fs::write(&path, text);
+    crate::ownership::hand_back(&path);
 }
 
 /// Apply an imported tunnel protocol to the entry's matching dial variant.
@@ -11102,6 +11124,7 @@ fn apply_dial_parameters(settings: &Settings, servers: &mut [Server]) {
 
 fn save_exchanged(settings: &Settings, entry: &Json) -> Result<(), String> {
     let _ = std::fs::create_dir_all(&settings.state);
+    crate::ownership::hand_back(&settings.state);
     let path = exchanged_path(settings);
     let host = entry.get("ipAddress").and_then(Json::as_str).unwrap_or("");
     let mut entries = Vec::new();
@@ -11126,7 +11149,9 @@ fn save_exchanged(settings: &Settings, entry: &Json) -> Result<(), String> {
                 std::fs::remove_file(&path).and_then(|()| std::fs::rename(&part, &path))
             })
         })
-        .map_err(|error| format!("psiphon: exchanged entry store: {error}"))
+        .map_err(|error| format!("psiphon: exchanged entry store: {error}"))?;
+    crate::ownership::hand_back(&path);
+    Ok(())
 }
 
 fn affinity_host(settings: &Settings) -> Option<String> {
@@ -11141,7 +11166,10 @@ fn affinity_host(settings: &Settings) -> Option<String> {
 
 fn save_affinity(settings: &Settings, host: &str) {
     let _ = std::fs::create_dir_all(&settings.state);
-    let _ = std::fs::write(settings.state.join("affinity.txt"), host);
+    crate::ownership::hand_back(&settings.state);
+    let path = settings.state.join("affinity.txt");
+    let _ = std::fs::write(&path, host);
+    crate::ownership::hand_back(&path);
 }
 
 fn absorb_exchanged(

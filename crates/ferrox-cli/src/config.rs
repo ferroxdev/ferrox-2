@@ -356,11 +356,14 @@ pub fn build_outbound(
 }
 
 /// The extra outbounds and routing `--warp` and `--udp-via` add to a generated
-/// foxy or psiphon config. The carrier outbound itself is built after this runs,
-/// so `options.upstream` already names the hidden front it must dial.
+/// foxy, psiphon or veepn config. The carrier outbound itself is built after
+/// this runs, so `options.upstream` already names the hidden front it must dial.
 pub fn lane_plan(options: &mut Options, paths: &Paths) -> Result<Generated, String> {
     let mut generated = Generated::default();
-    if !matches!(options.outbound, Some(Outbound::Foxy | Outbound::Psiphon)) {
+    if !matches!(
+        options.outbound,
+        Some(Outbound::Foxy | Outbound::Psiphon | Outbound::Veepn)
+    ) {
         return Ok(generated);
     }
     let warp_chain = options.warp && options.upstream.is_empty();
@@ -527,6 +530,9 @@ fn veepn_outbound(options: &Options, paths: &Paths) -> Result<Value, String> {
     let udid = stable_udid(options, paths)?;
     if !udid.is_empty() {
         settings.insert("udid".to_owned(), json!(udid));
+    }
+    if !options.upstream.is_empty() {
+        settings.insert("upstreamProxy".to_owned(), json!(options.upstream));
     }
     Ok(json!({"protocol": "veepn", "settings": settings}))
 }
@@ -1645,6 +1651,28 @@ mod tests {
             document["routing"]["rules"][0]["inboundTag"][0],
             WARP_HOP_TAG
         );
+    }
+
+    #[test]
+    fn write_config_chains_a_veepn_lane_through_warp() {
+        let dir = scratch("veepn-warp");
+        let paths = Paths::with_dirs(dir.clone(), dir.join("state"), None);
+        let mut options = options();
+        options.outbound = Some(Outbound::Veepn);
+        options.warp = true;
+        options.warp_mode = "mim".to_owned();
+        let generated = lane_plan(&mut options, &paths).unwrap();
+        let hidden = generated.hidden_socks.expect("warp needs a hidden front");
+        let outbound = build_outbound(&options, &paths, None).unwrap();
+        assert_eq!(outbound["protocol"], "veepn");
+        assert_eq!(
+            outbound["settings"]["upstreamProxy"],
+            format!("socks5://127.0.0.1:{hidden}")
+        );
+        assert_eq!(generated.extra[0].0, "warp");
+        assert_eq!(generated.extra[0].1["settings"]["mode"], "mim");
+        assert_eq!(generated.rules[0]["outboundTag"], "warp");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

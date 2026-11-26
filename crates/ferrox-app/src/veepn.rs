@@ -100,6 +100,8 @@ pub(crate) struct VeepnOut {
     udid: String,
     zone: String,
     roots: ferrox_core::tls::Anchors,
+    /// The hop both the plane's asks and every listed upstream chain through.
+    upstream: Option<crate::foxy::UpstreamProxy>,
     /// A region lists a dozen upstreams; every flow does not go to the first of them.
     picked: Arc<AtomicUsize>,
     /// One refresh at a time, so a cold cache is fetched once rather than once per waiting flow.
@@ -161,8 +163,26 @@ impl VeepnOut {
             udid,
             zone: zone_name(),
             roots,
+            upstream: None,
             picked: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    /// The same lane with its plane asks and listed upstreams chained through one hop, so a network that blocks `VeePN` can still carry it over WARP.
+    pub(crate) fn with_upstream(
+        region: String,
+        domains: &[String],
+        udid: String,
+        roots: ferrox_core::tls::Anchors,
+        upstream: crate::foxy::UpstreamProxy,
+    ) -> Result<Self, String> {
+        let mut lane = Self::new(region, domains, udid, roots)?;
+        let origins = Arc::get_mut(&mut lane.domains).expect("the fresh lane owns its origins");
+        for origin in origins.iter_mut() {
+            origin.upstream = Some(upstream.clone());
+        }
+        lane.upstream = Some(upstream);
+        Ok(lane)
     }
 
     /// One flow's tunnel: a listed upstream of the region and the `Foxy` lane's HTTP/1.1 record dialed at the target. The upstream, its pair and the region name are read where the cache holds them, so a flow builds no dial of its own. An upstream that declined a flow keeps the edge's silence for [`veepn::EDGE_SILENCE`] seconds, so one flow pays for a gone edge instead of every one after it. When a whole region has gone quiet the walk lifts the silence of the entry whose window ends first — a tie split by the flow's own rotation, so equal windows are probed in turn — and dials that one: a gone region costs a flow one handshake rather than its list, a recovered edge rejoins as soon as it answers, and an edge probed and declined again goes behind the others. One that refuses the pair takes the region's cache with it, so the next flow fetches fresh credentials. One that refuses the *target* takes nothing with it and stops the walk there: the answer is a fact about the host, every edge holds it, and the client is told so rather than about a general failure.
@@ -350,7 +370,7 @@ impl VeepnOut {
                 return Err(miss.why);
             }
         };
-        let list = servers_of(&found, &self.roots)?;
+        let list = servers_of(&found, &self.roots, self.upstream.as_ref())?;
         if list.is_empty() {
             return Err(format!("region {region:?} answers no usable upstream"));
         }
@@ -522,6 +542,7 @@ fn json(reply: &foxy_account::Reply) -> Result<Json, String> {
 fn servers_of(
     reply: &foxy_account::Reply,
     roots: &ferrox_core::tls::Anchors,
+    upstream: Option<&crate::foxy::UpstreamProxy>,
 ) -> Result<Vec<FoxyDial>, String> {
     let Json::Arr(entries) = json(reply)? else {
         return Err("the server list is not an array".to_owned());
@@ -571,7 +592,7 @@ fn servers_of(
                 // The plane lists an address, so the fetch reads it once and every flow after it dials that without parsing or asking the resolver; a listed name keeps `None` and is resolved when the flow opens.
                 address: edge_peer(host, port),
                 carrier: Carrier::H1,
-                upstream: None,
+                upstream: upstream.cloned(),
                 roots: Arc::clone(roots),
                 pins: ferrox_core::foxy::pin::Pins::default(),
                 pass: Pass {
@@ -686,6 +707,23 @@ mod tests {
             "00000000-0000-4000-8000-000000000000".to_owned(),
             ferrox_core::tls::Anchors::from(Vec::new()),
         )
+    }
+
+    /// The plane asks and every listed edge share the one hop, so a `VeePN` lane behind WARP does not leak a direct dial.
+    #[test]
+    fn a_chained_veepn_lane_puts_the_hop_on_its_plane_and_edges() {
+        let hop = crate::foxy::upstream_proxy("socks5://127.0.0.1:1080").expect("hop");
+        let named = ["https://antpeak.com".to_owned()];
+        let out = VeepnOut::with_upstream(
+            "DE".to_owned(),
+            &named,
+            "00000000-0000-4000-8000-000000000000".to_owned(),
+            ferrox_core::tls::Anchors::from(Vec::new()),
+            hop.clone(),
+        )
+        .expect("lane");
+        assert_eq!(out.upstream.as_ref(), Some(&hop));
+        assert_eq!(out.domains[0].upstream.as_ref(), Some(&hop));
     }
 
     /// A domain that does not parse refuses the lane at boot rather than leaving a rotation that dials nothing.
@@ -855,7 +893,7 @@ mod tests {
             body: body.as_bytes().to_vec(),
         };
         let roots = ferrox_core::tls::Anchors::from(Vec::new());
-        let list = servers_of(&reply, &roots).expect("a list");
+        let list = servers_of(&reply, &roots, None).expect("a list");
         assert_eq!(
             list.iter()
                 .map(|dial| (dial.host.as_ref(), dial.port))
@@ -875,6 +913,14 @@ mod tests {
         assert!(
             std::sync::Arc::ptr_eq(&list[0].pass.token, &list[1].pass.token),
             "both addresses share the one coded pair, not a copy each"
+        );
+        let hop = crate::foxy::upstream_proxy("socks5://127.0.0.1:1080").expect("hop");
+        let chained = servers_of(&reply, &roots, Some(&hop)).expect("a chained list");
+        assert!(
+            chained
+                .iter()
+                .all(|dial| dial.upstream.as_ref() == Some(&hop)),
+            "every listed edge dials through the configured hop"
         );
         assert_eq!(
             list[0].address,
@@ -912,6 +958,7 @@ mod tests {
                     body: b"{\"detail\": \"no json array here\"}".to_vec(),
                 },
                 &roots,
+                None,
             )
             .is_err(),
             "an answer that is not a list is named, not served as an empty region"

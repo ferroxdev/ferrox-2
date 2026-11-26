@@ -119,9 +119,103 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
+  cli-warp:
+    name: CLI direct and chained WARP
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: warp-parity
+      - name: build the engine
+        run: cargo build --locked --release -p ferrox-app
+      - name: WARP registration edge
+        run: |
+          set -euo pipefail
+          target/release/ferrox-app warp-register --mode wireguard -o "$RUNNER_TEMP/warp-wireguard-identity.json"
+          target/release/ferrox-app warp-register --mode auto -o "$RUNNER_TEMP/warp-identity.json"
+          for identity in "$RUNNER_TEMP/warp-wireguard-identity.json" "$RUNNER_TEMP/warp-identity.json"; do
+            python3 -c 'import json,sys; i=json.load(open(sys.argv[1])); print(sys.argv[1], "wireguard edge:", i.get("wireguard",{}).get("endpoint")); print(sys.argv[1], "masque key:", bool(i.get("masque",{}).get("privateKey")))' "$identity"
+          done
+      - name: direct and nested WARP through the CLI
+        env:
+          FERROX_BIN: ${{ github.workspace }}/target/release/ferrox-app
+          FERROX_PROFILE: release
+          FERROX_CONF_DIR: ${{ runner.temp }}/cli-warp/conf
+          FERROX_STATE_DIR: ${{ runner.temp }}/cli-warp/state
+        run: |
+          set -euo pipefail
+          mkdir -p "$FERROX_CONF_DIR" "$FERROX_STATE_DIR"
+          trap 'dist/ferrox-cli.sh down --all >/dev/null 2>&1 || true' EXIT
+          failed=0
+          run_lane() {
+            local label="$1"; shift
+            local want="${LANE_WARP:-on}"
+            local identity="$RUNNER_TEMP/warp-identity.json"
+            if [ "${1:-}" = "--identity" ]; then
+              identity="$2"; shift 2
+            fi
+            local port trace
+            port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+            echo "::group::$label"
+            if ! dist/ferrox-cli.sh up --fronts socks --socks "$port" \
+              --warp-identity "$identity" "$@"; then
+              echo "::error::$label did not start"
+              failed=1
+              dist/ferrox-cli.sh down || true
+              echo "::endgroup::"
+              return 0
+            fi
+            if ! trace="$(curl -fsS --noproxy '' --max-time 60 --retry 3 --socks5-hostname "127.0.0.1:$port" https://www.cloudflare.com/cdn-cgi/trace)"; then
+              echo "::error::$label did not carry the trace through WARP"
+              failed=1
+            else
+              printf '%s\n' "$trace"
+              printf '%s\n' "$trace" | grep -qx "warp=$want" || {
+                echo "::error::$label did not egress with warp=$want"
+                failed=1
+              }
+            fi
+            dist/ferrox-cli.sh down || true
+            echo "::endgroup::"
+          }
+          run_lane "direct WireGuard" --identity "$RUNNER_TEMP/warp-wireguard-identity.json" --warp --warp-mode wireguard
+          run_lane "direct MASQUE" --warp --warp-mode masque
+          run_lane "nested WireGuard" --identity "$RUNNER_TEMP/warp-wireguard-identity.json" --warp --warp-mode wiw
+          run_lane "nested MASQUE" --warp --warp-mode mim
+          run_lane "direct auto" --warp
+          LANE_WARP=off run_lane "Veepn through nested MASQUE" --veepn --warp --warp-mode mim
+          test "$failed" = 0
+      - name: sudo keeps the lane in the invoking users files
+        run: |
+          set -euo pipefail
+          root_state="$RUNNER_TEMP/cli-warp-root"
+          rm -rf "$root_state"
+          mkdir -p "$root_state/conf" "$root_state/state"
+          port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+          sudo env FERROX_CONF_DIR="$root_state/conf" FERROX_STATE_DIR="$root_state/state" \
+            FERROX_BIN="$PWD/target/release/ferrox-app" \
+            "$PWD/dist/ferrox-cli.sh" up --vpn --fronts socks --socks "$port" \
+            --warp --warp-mode masque --warp-identity "$RUNNER_TEMP/warp-identity.json"
+          trace="$(curl -fsS --noproxy '' --max-time 60 --retry 3 --socks5-hostname "127.0.0.1:$port" https://www.cloudflare.com/cdn-cgi/trace)"
+          printf '%s\n' "$trace"
+          printf '%s\n' "$trace" | grep -qx 'warp=on'
+          sudo env FERROX_CONF_DIR="$root_state/conf" FERROX_STATE_DIR="$root_state/state" \
+            FERROX_BIN="$PWD/target/release/ferrox-app" \
+            "$PWD/dist/ferrox-cli.sh" down
+          if find "$root_state" -user root -print -quit | grep -q .; then
+            echo "::error::a sudo lane left root-owned files under $root_state"
+            find "$root_state" -user root -ls
+            exit 1
+          fi
+
   result:
     name: result
-    needs: [warp-parity]
+    needs: [warp-parity, cli-warp]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5

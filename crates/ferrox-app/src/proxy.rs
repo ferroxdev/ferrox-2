@@ -484,6 +484,7 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, tes
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
     }
     if !test {
+        crate::shutdown::watch();
         if let Some(geodata) = geodata {
             crate::geodata::start(geodata, route.clone(), outbound.clone(), root.clone());
         }
@@ -519,9 +520,6 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, tes
     {
         // The startup record both pinned interop harnesses scan the server log for; not this binary's name.
         println!("ferrox-app serving; harness readiness token: core: Xray 26.11.9 started");
-    }
-    if !test {
-        crate::shutdown::watch();
     }
     loop {
         thread::park();
@@ -47083,7 +47081,29 @@ fn find_veepn_outbound(root: &Json) -> Option<crate::veepn::VeepnOut> {
         }
         let udid = crate::veepn::udid(&foxy_text(settings, "udid"));
         let region = foxy_text(settings, "region");
-        match crate::veepn::VeepnOut::new(region, &domains, udid, ca_roots(settings)) {
+        let named = foxy_text(settings, "upstreamProxy");
+        let upstream = if named.is_empty() {
+            None
+        } else {
+            let Some(hop) = crate::foxy::upstream_proxy(&named) else {
+                eprintln!(
+                    "veepn: upstreamProxy {named:?} is not an HTTP or SOCKS5 hop: serves nothing"
+                );
+                continue;
+            };
+            Some(hop)
+        };
+        let built = match upstream {
+            Some(hop) => crate::veepn::VeepnOut::with_upstream(
+                region,
+                &domains,
+                udid,
+                ca_roots(settings),
+                hop,
+            ),
+            None => crate::veepn::VeepnOut::new(region, &domains, udid, ca_roots(settings)),
+        };
+        match built {
             Ok(lane) => return Some(lane),
             Err(why) => eprintln!("{why}: serves nothing"),
         }

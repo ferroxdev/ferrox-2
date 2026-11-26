@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::args::die;
 use crate::config::{Ports, front_listeners, fronts, port_of};
-use crate::paths::{Paths, read_trim, read_trim_checked, secure_dir, write_private};
+use crate::paths::{Paths, hand_back, read_trim, read_trim_checked, secure_dir, write_private};
 
 fn bin_name() -> &'static str {
     if cfg!(windows) {
@@ -232,12 +232,16 @@ fn wait_exit(pid: u32, attempts: u32) -> bool {
     !alive(pid)
 }
 
+fn not_ferrox(paths: &Paths, pid: u32) -> String {
+    format!(
+        "process {pid} is not ferrox-app; it was not stopped. If the binary was renamed, set FERROX_BIN. Otherwise remove the stale pid file {}.",
+        paths.pid_file.display()
+    )
+}
+
 pub fn kill(paths: &Paths, pid: u32) -> Result<(), String> {
     if !is_ferrox(paths, pid) {
-        return Err(format!(
-            "process {pid} is not ferrox-app; it was not stopped. If the binary was renamed, set FERROX_BIN. Otherwise remove the stale pid file {}.",
-            paths.pid_file.display()
-        ));
+        return Err(not_ferrox(paths, pid));
     }
     #[cfg(unix)]
     {
@@ -454,6 +458,7 @@ pub fn start(bin: &Path, paths: &Paths, debug: bool, vpn: bool) -> Result<u32, S
         .truncate(true)
         .open(&paths.log)
         .map_err(|error| format!("cannot open {}: {error}", paths.log.display()))?;
+    hand_back(&paths.log);
     let err = out
         .try_clone()
         .map_err(|error| format!("cannot open {}: {error}", paths.log.display()))?;
@@ -597,14 +602,56 @@ fn wait_pid_file(_paths: &Paths, _child: &mut std::process::Child) -> Result<u32
     Err("privileged start is Unix-only".to_owned())
 }
 
+#[cfg(unix)]
+fn can_signal(pid: u32) -> bool {
+    i32::try_from(pid).is_ok_and(|pid| unsafe { libc::kill(pid, 0) } == 0)
+}
+
+#[cfg(unix)]
+fn privileged_kill(pid: u32, signal: &str) -> bool {
+    std::process::Command::new("sudo")
+        .args(["-n", "kill", signal, &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 pub fn stop(paths: &Paths) -> Result<(), String> {
     if let Some(pid) = pid(paths)
         && alive(pid)
     {
-        // The app restores the routes and exits on its own; an older process is killed after the grace period.
+        let executable = process_exe(pid);
+        // A readable executable that is not ours is a stale pid: say so at once instead of spending the grace period on it. An unreadable one may be the root lane, which an unprivileged `down` still stops through the file.
+        if executable.is_some() && !is_ferrox(paths, pid) {
+            return Err(not_ferrox(paths, pid));
+        }
+        // The app restores the routes and exits on its own; the signal makes a same-user lane leave at once, while the stop file carries the root lane whose signal this account cannot send.
         let _ = write_private(&paths.stop_file, "stop\n");
+        #[cfg(unix)]
+        if is_ferrox(paths, pid)
+            && let Ok(process) = i32::try_from(pid)
+        {
+            let _ = unsafe { libc::kill(process, libc::SIGTERM) };
+        }
         #[cfg(any(unix, windows))]
-        if !wait_exit(pid, 300) {
+        if !wait_exit(pid, 10) {
+            #[cfg(unix)]
+            if executable.is_none() || !can_signal(pid) {
+                let _ = privileged_kill(pid, "-TERM");
+                if !wait_exit(pid, 10) {
+                    let _ = privileged_kill(pid, "-KILL");
+                    if !wait_exit(pid, 10) {
+                        return Err(format!(
+                            "process {pid} did not stop; run 'sudo kill -9 {pid}' and then 'ferrox-cli down'."
+                        ));
+                    }
+                }
+            } else {
+                kill(paths, pid)?;
+            }
+            #[cfg(windows)]
             kill(paths, pid)?;
         }
     }
@@ -853,12 +900,42 @@ mod tests {
         );
         write_private(&paths.pid_file, &format!("{current}\n")).unwrap();
         assert!(!running(&paths));
+        let started = std::time::Instant::now();
         let error = stop(&paths).expect_err("a foreign pid is not stopped");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a foreign pid is refused without the stop grace period"
+        );
         assert!(
             error.contains(&paths.pid_file.display().to_string()),
             "the refusal names the pid file: {error}"
         );
         assert_eq!(pid(&paths), Some(current));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_live_lane_is_signalled_instead_of_waiting_for_the_stop_file() {
+        let root = std::env::temp_dir().join(format!("ferrox-signal-{}", std::process::id()));
+        let paths = Paths::with_dirs(root.join("conf"), root.join("state"), None);
+        let mut child = Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let executable = process_exe(pid).expect("the child executable");
+        write_private(&paths.pid_file, &format!("{pid}\n")).unwrap();
+        write_private(&bin_marker(&paths), &format!("{}\n", executable.display())).unwrap();
+        let reaper = std::thread::spawn(move || child.wait());
+        let started = std::time::Instant::now();
+        stop(&paths).expect("the lane stops");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a same-user lane leaves on SIGTERM, not after the stop-file grace"
+        );
+        assert!(!alive(pid), "the lane process exited");
+        let _ = reaper.join().expect("reaper");
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -24,6 +24,8 @@ const API_HOSTS: [&str; 2] = ["api.devices.cloudflare.com", "api.cloudflareclien
 const API_VERSION: &str = "v0a4471";
 /// The HTTP authority WARP's CONNECT-IP endpoint answers on.
 const CONNECT_HOST: &str = "cloudflareaccess.com";
+/// The MASQUE edge that answers CONNECT-IP when the config names no address.
+const CONNECT_ADDRESS: &str = "162.159.198.2";
 /// The SNI the MASQUE edge presents.
 const CONNECT_SNI: &str = "consumer-masque.cloudflareclient.com";
 /// The resolver Aether's `--ech auto` queries for the ECH config.
@@ -175,6 +177,10 @@ impl Mode {
             Self::GoolClassic => "gool-classic",
             Self::Mim => "mim",
         }
+    }
+
+    fn needs_masque(self) -> bool {
+        matches!(self, Self::Masque | Self::Gool | Self::Mim)
     }
 }
 
@@ -695,6 +701,19 @@ impl WarpSpec {
                 saved.team.as_deref(),
                 path,
             )?;
+            if !inner && self.mode.needs_masque() && saved.masque.is_none() {
+                if test || !self.register {
+                    return Err(format!(
+                        "warp: `{}` has no MASQUE key for mode `{:?}`",
+                        path.display(),
+                        self.mode
+                    ));
+                }
+                let identity = register(self, enroll)?;
+                quarantine(path);
+                identity.save(path)?;
+                return Ok(identity);
+            }
             if test {
                 return Ok(saved);
             }
@@ -766,7 +785,7 @@ impl WarpSpec {
                 .iter()
                 .filter_map(|text| text.parse().ok())
                 .collect(),
-            masque_address: CONNECT_HOST.to_owned(),
+            masque_address: CONNECT_ADDRESS.to_owned(),
             masque_port: QUIC_PORT,
             masque_server_name: CONNECT_SNI.to_owned(),
             masque_host: CONNECT_HOST.to_owned(),
@@ -937,7 +956,7 @@ fn split_host_port(text: &str, default_port: u16) -> Option<(String, u16)> {
     Some((text.to_owned(), default_port))
 }
 
-/// The `masque` block's five fields, each defaulting to the WARP edge the API names.
+/// The `masque` block's five fields; the address defaults to a WARP edge, not the authority.
 fn masque_settings(masque: Option<&crate::json::Json>) -> (String, u16, String, String, String) {
     let field = |key: &str, fallback: &str| {
         masque
@@ -952,7 +971,7 @@ fn masque_settings(masque: Option<&crate::json::Json>) -> (String, u16, String, 
         .and_then(crate::json::Json::as_port)
         .unwrap_or(QUIC_PORT);
     (
-        field("address", CONNECT_HOST),
+        field("address", CONNECT_ADDRESS),
         port,
         field("serverName", CONNECT_SNI),
         field("host", CONNECT_HOST),
@@ -1385,6 +1404,9 @@ fn quarantine(path: &Path) {
             "warp: the damaged identity at {} could not be moved aside: {error}",
             path.display()
         );
+    } else {
+        #[cfg(unix)]
+        crate::ownership::hand_back(&target);
     }
 }
 
@@ -1434,7 +1456,10 @@ fn backup_corrupt(path: &Path) -> Result<(), String> {
                 "warp: cannot sync the damaged identity `{}`: {error}",
                 target.display()
             )
-        })
+        })?;
+        #[cfg(unix)]
+        crate::ownership::hand_back(&target);
+        Ok(())
     })();
     if result.is_err() && created {
         let _ = std::fs::remove_file(&target);
@@ -1823,6 +1848,8 @@ impl Identity {
         {
             std::fs::create_dir_all(parent)
                 .map_err(|error| format!("warp: cannot create `{}`: {error}", parent.display()))?;
+            #[cfg(unix)]
+            crate::ownership::hand_back(parent);
         }
         let mut temp = path.to_path_buf();
         let name = temp.file_name().map_or_else(
@@ -1859,6 +1886,8 @@ impl Identity {
             drop(file);
             std::fs::rename(&temp, path)
                 .map_err(|error| format!("warp: cannot save `{}`: {error}", path.display()))?;
+            #[cfg(unix)]
+            crate::ownership::hand_back(path);
             #[cfg(unix)]
             if let Some(parent) = path
                 .parent()
@@ -1960,6 +1989,17 @@ fn resolve_edges(identity: &mut Identity, spec: &mut WarpSpec) -> Result<(), Str
                 scan.get_or_insert(ScanMode::Balanced);
                 eprintln!("[-] last MASQUE edge {edge} did not answer; scanning");
             }
+        }
+    }
+    if want_wireguard && wireguard.is_none() && spec.mode == Mode::WireGuard {
+        let edge = identity.wireguard.endpoint;
+        if check_wireguard(identity, spec, edge) && http_check_wireguard(identity, spec, edge) {
+            wireguard = Some(edge);
+            println!("[+] selected API WireGuard endpoint {edge}");
+        } else {
+            cooldowns.hold(edge, now);
+            scan.get_or_insert(ScanMode::Balanced);
+            eprintln!("[-] API WireGuard edge {edge} did not answer; scanning");
         }
     }
     cooldowns.purge(now);
@@ -3351,17 +3391,29 @@ impl MimOut {
     }
 }
 
-fn mim_remote(outer_edge: Option<SocketAddr>, spec: &WarpSpec) -> Result<SocketAddr, String> {
-    spec.mim
-        .inner
-        .or_else(|| {
-            let outer_ip = outer_edge.map(|edge| edge.ip());
-            let mode = spec.scan.unwrap_or(ScanMode::Balanced);
-            warp_scan::masque_candidates(mode)
-                .into_iter()
-                .find(|edge| Some(edge.ip()) != outer_ip)
-        })
-        .ok_or("warp mim: no second MASQUE edge is known for the inner hop".to_owned())
+fn mim_remote(
+    identity: &Identity,
+    outer_edge: Option<SocketAddr>,
+    spec: &WarpSpec,
+) -> Result<SocketAddr, String> {
+    if let Some(edge) = spec.mim.inner {
+        return Ok(edge);
+    }
+    let outer_ip = outer_edge.map(|edge| edge.ip());
+    let assigned = SocketAddr::new(identity.wireguard.endpoint.ip(), QUIC_PORT);
+    if Some(assigned.ip()) != outer_ip && check_masque(identity, spec, assigned) {
+        return Ok(assigned);
+    }
+    let mode = spec.scan.unwrap_or(ScanMode::Balanced);
+    for edge in warp_scan::masque_candidates(mode) {
+        if Some(edge.ip()) == outer_ip {
+            continue;
+        }
+        if check_masque(identity, spec, edge) {
+            return Ok(edge);
+        }
+    }
+    Err("warp mim: no second MASQUE edge answers for the inner hop".to_owned())
 }
 
 fn build_mim(
@@ -3373,7 +3425,7 @@ fn build_mim(
         return Err("warp mim: the outer identity has no MASQUE key".to_owned());
     }
     let outer = build_masque(identity, spec)?;
-    let remote = mim_remote(outer.edge(), spec)?;
+    let remote = mim_remote(identity, outer.edge(), spec)?;
     MimOut::new(outer, inner_identity, spec, remote)
 }
 
@@ -3387,7 +3439,7 @@ fn validate_mim(
         return Err("warp mim: the outer identity has no MASQUE key".to_owned());
     }
     let outer = build_masque(identity, spec)?;
-    let remote = mim_remote(outer.edge(), spec)?;
+    let remote = mim_remote(identity, outer.edge(), spec)?;
     let datagram = mim_inner_datagram(spec.mtu, remote)?;
     let mtu = mim_inner_mtu(datagram);
     let local = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
@@ -3923,6 +3975,7 @@ pub(crate) fn one_tap(
     let mode = Mode::parse(Some(mode))?;
     let path = PathBuf::from(path);
     let resumed = path.is_file();
+    let mut replace_masque = false;
     if resumed {
         // The outer device was already created; a failed inner enrollment must be able to finish on the next run instead of minting a second device.
         let saved = Identity::load(&path).map_err(LoadError::into_message)?;
@@ -3931,12 +3984,7 @@ pub(crate) fn one_tap(
             saved.team.as_deref(),
             &path,
         )?;
-        if matches!(mode, Mode::Masque | Mode::Gool | Mode::Mim) && saved.masque.is_none() {
-            return Err(format!(
-                "warp: `{}` has no MASQUE key for mode `{mode:?}`; remove it to register a new device",
-                path.display()
-            ));
-        }
+        replace_masque = mode.needs_masque() && saved.masque.is_none();
     }
     let ForcedEdges {
         wiw_outer,
@@ -3962,7 +4010,7 @@ pub(crate) fn one_tap(
             .iter()
             .filter_map(|text| text.parse().ok())
             .collect(),
-        masque_address: CONNECT_HOST.to_owned(),
+        masque_address: CONNECT_ADDRESS.to_owned(),
         masque_port: QUIC_PORT,
         masque_server_name: masque_sni.unwrap_or(CONNECT_SNI).to_owned(),
         masque_host: CONNECT_HOST.to_owned(),
@@ -3992,6 +4040,11 @@ pub(crate) fn one_tap(
         team: team.cloned(),
         gateway,
     };
+    if replace_masque {
+        let identity = register(&spec, true)?;
+        quarantine(&path);
+        identity.save(&path)?;
+    }
     if !resumed && matches!(mode, Mode::Gool | Mode::GoolClassic) {
         if let Some(identity) = &spec.gool.inline {
             ensure_saved_team(
@@ -4411,7 +4464,7 @@ mod tests {
             probe_host: PROBE_HOST.to_owned(),
             probe_port: PROBE_PORT,
             dns: Vec::new(),
-            masque_address: CONNECT_HOST.to_owned(),
+            masque_address: CONNECT_ADDRESS.to_owned(),
             masque_port: QUIC_PORT,
             masque_server_name: CONNECT_SNI.to_owned(),
             masque_host: CONNECT_HOST.to_owned(),
@@ -4546,7 +4599,7 @@ mod tests {
             probe_host: PROBE_HOST.to_owned(),
             probe_port: PROBE_PORT,
             dns: Vec::new(),
-            masque_address: CONNECT_HOST.to_owned(),
+            masque_address: CONNECT_ADDRESS.to_owned(),
             masque_port: QUIC_PORT,
             masque_server_name: CONNECT_SNI.to_owned(),
             masque_host: CONNECT_HOST.to_owned(),
@@ -5019,6 +5072,16 @@ mod tests {
             None
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_default_masque_address_is_an_edge_not_the_authority() {
+        let spec = WarpSpec::for_command(Mode::Masque, None, None);
+        assert_eq!(spec.masque_address, CONNECT_ADDRESS);
+        assert_eq!(spec.masque_host, CONNECT_HOST);
+        let (address, _, _, host, _) = masque_settings(None);
+        assert_eq!(address, CONNECT_ADDRESS);
+        assert_eq!(host, CONNECT_HOST);
     }
 
     #[test]
