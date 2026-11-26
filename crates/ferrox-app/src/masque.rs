@@ -269,6 +269,16 @@ impl std::fmt::Debug for MasqueOut {
 /// over the outer's datagram path with no loopback socket in between.
 const UPLINK_DEPTH: usize = 64;
 const DOWNLINK_DEPTH: usize = 256;
+
+/// Hand a reply to the reader, dropping it when the reader is behind exactly as
+/// a bounded loopback socket would; false means the reader is gone.
+fn lane_deliver(downlink: &SyncSender<Vec<u8>>, payload: &[u8]) -> bool {
+    match downlink.try_send(payload.to_vec()) {
+        Ok(()) | Err(mpsc::TrySendError::Full(_)) => true,
+        Err(mpsc::TrySendError::Disconnected(_)) => false,
+    }
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn lane_bridge(
     tunnel: &MasqueOut,
@@ -315,7 +325,7 @@ fn lane_bridge(
                 if let Some(datagram) = connectip::udp_from_packet(packet.packet())
                     && datagram.destination_port == port
                 {
-                    if downlink.send(datagram.payload.to_vec()).is_err() {
+                    if !lane_deliver(&downlink, datagram.payload) {
                         return;
                     }
                     idle = false;
@@ -344,7 +354,7 @@ fn lane_bridge(
                     Ok(packet) => {
                         if let Some(datagram) = connectip::udp_from_packet(packet.packet())
                             && datagram.destination_port == port
-                            && downlink.send(datagram.payload.to_vec()).is_err()
+                            && !lane_deliver(&downlink, datagram.payload)
                         {
                             return;
                         }
