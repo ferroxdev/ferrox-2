@@ -9586,6 +9586,7 @@ fn save_cache(settings: &Settings, text: &str) {
     let path = cache_path(settings);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
+        crate::ownership::hand_back(parent);
     }
     if state_is_ours(&settings.state) {
         let _ = std::fs::write(&path, text);
@@ -10655,6 +10656,7 @@ fn fetch_upgrade(
     }
     std::fs::create_dir_all(&job.state)
         .map_err(|error| format!("psiphon: upgrade state directory: {error}"))?;
+    crate::ownership::hand_back(&job.state);
     let part = job.state.join(format!("{UPGRADE_FILENAME}.{version}.part"));
     std::fs::write(&part, &reply.body)
         .map_err(|error| format!("psiphon: upgrade download {}: {error}", part.display()))?;
@@ -11098,6 +11100,7 @@ fn save_dial_parameters(settings: &Settings, host: &str, protocol: &str) {
     let mut text = String::new();
     json::write(&Json::Obj(entries), &mut text);
     let _ = std::fs::create_dir_all(&settings.state);
+    crate::ownership::hand_back(&settings.state);
     let path = dial_parameters_path(settings);
     let _ = std::fs::write(&path, text);
     crate::ownership::hand_back(&path);
@@ -11121,6 +11124,7 @@ fn apply_dial_parameters(settings: &Settings, servers: &mut [Server]) {
 
 fn save_exchanged(settings: &Settings, entry: &Json) -> Result<(), String> {
     let _ = std::fs::create_dir_all(&settings.state);
+    crate::ownership::hand_back(&settings.state);
     let path = exchanged_path(settings);
     let host = entry.get("ipAddress").and_then(Json::as_str).unwrap_or("");
     let mut entries = Vec::new();
@@ -11162,6 +11166,7 @@ fn affinity_host(settings: &Settings) -> Option<String> {
 
 fn save_affinity(settings: &Settings, host: &str) {
     let _ = std::fs::create_dir_all(&settings.state);
+    crate::ownership::hand_back(&settings.state);
     let path = settings.state.join("affinity.txt");
     let _ = std::fs::write(&path, host);
     crate::ownership::hand_back(&path);

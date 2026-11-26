@@ -626,7 +626,9 @@ impl LastEdge {
         std::fs::rename(&temp, path).map_err(|error| {
             let _ = std::fs::remove_file(&temp);
             format!("warp: cannot save `{}`: {error}", path.display())
-        })
+        })?;
+        crate::ownership::hand_back(path);
+        Ok(())
     }
 
     pub(crate) fn get(&self, carrier: &str) -> Option<(SocketAddr, Option<&str>)> {

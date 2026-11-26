@@ -40,14 +40,11 @@ fn signalled() -> bool {
     false
 }
 
-/// Start the watcher that restores the table and exits. The stop file is
-/// removed first so a restarted lane never sees the old request.
+/// Start the watcher that restores the table and exits. The launcher removes
+/// the stop file before spawn, so a restarted lane never sees the old request.
 pub(crate) fn watch() {
     install_signals();
     let stop_file = std::env::var_os("FERROX_STOP_FILE").map(std::path::PathBuf::from);
-    if let Some(path) = stop_file.as_deref() {
-        let _ = std::fs::remove_file(path);
-    }
     let spawned = std::thread::Builder::new()
         .name("ferrox-shutdown".to_owned())
         .spawn(move || {

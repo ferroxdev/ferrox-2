@@ -82,6 +82,7 @@ impl SlokStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|error| format!("create state directory: {error}"))?;
+            crate::ownership::hand_back(parent);
         }
         let mut temporary = path.as_os_str().to_owned();
         temporary.push(format!(".{}.tmp", std::process::id()));
@@ -114,6 +115,7 @@ impl SlokStore {
             let _ = std::fs::remove_file(&temporary);
             return Err(format!("replace state file: {error}"));
         }
+        crate::ownership::hand_back(path);
         #[cfg(unix)]
         if let Some(parent) = path
             .parent()
