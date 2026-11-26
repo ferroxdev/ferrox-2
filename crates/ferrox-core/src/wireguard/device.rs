@@ -245,6 +245,9 @@ impl Tunnel {
             return false;
         };
         let timestamp = self.timestamp_at(now);
+        if std::env::var_os("FOXY_DEBUG").is_some() {
+            eprintln!("foxy-debug: initiate now={now} ts={timestamp:?}");
+        }
         let mut message = state.create_initiation(&self.public, ephemeral, index, &timestamp);
         handshake::set_mac1(&mut message, &self.peer);
         if let Some((cookie, at)) = self.cookie {
@@ -575,12 +578,22 @@ impl Tunnel {
         out: &mut Vec<Event>,
     ) -> bool {
         if state.remote_static() != self.peer {
+            if std::env::var_os("FOXY_DEBUG").is_some() {
+                eprintln!("foxy-debug: answer REJECT static mismatch");
+            }
             return false;
         }
         if self
             .last_timestamp
             .is_some_and(|previous| previous >= state.timestamp())
         {
+            if std::env::var_os("FOXY_DEBUG").is_some() {
+                eprintln!(
+                    "foxy-debug: answer REJECT replay prev={:?} cur={:?}",
+                    self.last_timestamp,
+                    state.timestamp()
+                );
+            }
             return false;
         }
         let Ok((index, ephemeral)) = random_index() else {
