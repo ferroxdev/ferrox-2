@@ -3380,17 +3380,29 @@ impl MimOut {
     }
 }
 
-fn mim_remote(outer_edge: Option<SocketAddr>, spec: &WarpSpec) -> Result<SocketAddr, String> {
-    spec.mim
-        .inner
-        .or_else(|| {
-            let outer_ip = outer_edge.map(|edge| edge.ip());
-            let mode = spec.scan.unwrap_or(ScanMode::Balanced);
-            warp_scan::masque_candidates(mode)
-                .into_iter()
-                .find(|edge| Some(edge.ip()) != outer_ip)
-        })
-        .ok_or("warp mim: no second MASQUE edge is known for the inner hop".to_owned())
+fn mim_remote(
+    identity: &Identity,
+    outer_edge: Option<SocketAddr>,
+    spec: &WarpSpec,
+) -> Result<SocketAddr, String> {
+    if let Some(edge) = spec.mim.inner {
+        return Ok(edge);
+    }
+    let outer_ip = outer_edge.map(|edge| edge.ip());
+    let assigned = SocketAddr::new(identity.wireguard.endpoint.ip(), QUIC_PORT);
+    if Some(assigned.ip()) != outer_ip && check_masque(identity, spec, assigned) {
+        return Ok(assigned);
+    }
+    let mode = spec.scan.unwrap_or(ScanMode::Balanced);
+    for edge in warp_scan::masque_candidates(mode) {
+        if Some(edge.ip()) == outer_ip {
+            continue;
+        }
+        if check_masque(identity, spec, edge) {
+            return Ok(edge);
+        }
+    }
+    Err("warp mim: no second MASQUE edge answers for the inner hop".to_owned())
 }
 
 fn build_mim(
@@ -3402,7 +3414,7 @@ fn build_mim(
         return Err("warp mim: the outer identity has no MASQUE key".to_owned());
     }
     let outer = build_masque(identity, spec)?;
-    let remote = mim_remote(outer.edge(), spec)?;
+    let remote = mim_remote(identity, outer.edge(), spec)?;
     MimOut::new(outer, inner_identity, spec, remote)
 }
 
@@ -3416,7 +3428,7 @@ fn validate_mim(
         return Err("warp mim: the outer identity has no MASQUE key".to_owned());
     }
     let outer = build_masque(identity, spec)?;
-    let remote = mim_remote(outer.edge(), spec)?;
+    let remote = mim_remote(identity, outer.edge(), spec)?;
     let datagram = mim_inner_datagram(spec.mtu, remote)?;
     let mtu = mim_inner_mtu(datagram);
     let local = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
