@@ -133,6 +133,11 @@ jobs:
           shared-key: warp-parity
       - name: build the engine
         run: cargo build --locked --release -p ferrox-app
+      - name: WARP registration edge
+        run: |
+          set -euo pipefail
+          target/release/ferrox-app warp-register --mode auto -o "$RUNNER_TEMP/warp-identity.json"
+          python3 -c 'import json,sys; i=json.load(open(sys.argv[1])); print("wireguard edge:", i.get("wireguard",{}).get("endpoint")); print("masque edge:", i.get("masque",{}).get("address"), i.get("masque",{}).get("port"))' "$RUNNER_TEMP/warp-identity.json"
       - name: direct and nested WARP through the CLI
         env:
           FERROX_BIN: ${{ github.workspace }}/target/release/ferrox-app
@@ -159,11 +164,11 @@ jobs:
             dist/ferrox-cli.sh down
             echo "::endgroup::"
           }
-          run_lane "direct auto" --warp
-          run_lane "direct WireGuard" --warp --warp-mode wireguard
           run_lane "direct MASQUE" --warp --warp-mode masque
+          run_lane "direct WireGuard" --warp --warp-mode wireguard
           run_lane "nested WireGuard" --warp --warp-mode wiw
           run_lane "nested MASQUE" --warp --warp-mode mim
+          run_lane "direct auto" --warp
           run_lane "Veepn through nested MASQUE" --veepn --warp --warp-mode mim
       - name: sudo keeps the lane in the invoking users files
         run: |
