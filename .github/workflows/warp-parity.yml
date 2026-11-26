@@ -137,7 +137,7 @@ jobs:
         run: |
           set -euo pipefail
           target/release/ferrox-app warp-register --mode auto -o "$RUNNER_TEMP/warp-identity.json"
-          python3 -c 'import json,sys; i=json.load(open(sys.argv[1])); print("wireguard edge:", i.get("wireguard",{}).get("endpoint")); print("masque edge:", i.get("masque",{}).get("address"), i.get("masque",{}).get("port"))' "$RUNNER_TEMP/warp-identity.json"
+          python3 -c 'import json,sys; i=json.load(open(sys.argv[1])); print("wireguard edge:", i.get("wireguard",{}).get("endpoint")); print("masque key:", bool(i.get("masque",{}).get("privateKey")))' "$RUNNER_TEMP/warp-identity.json"
       - name: direct and nested WARP through the CLI
         env:
           FERROX_BIN: ${{ github.workspace }}/target/release/ferrox-app
@@ -148,28 +148,39 @@ jobs:
           set -euo pipefail
           mkdir -p "$FERROX_CONF_DIR" "$FERROX_STATE_DIR"
           trap 'dist/ferrox-cli.sh down --all >/dev/null 2>&1 || true' EXIT
+          failed=0
           run_lane() {
             local label="$1"; shift
             local port trace
             port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
             echo "::group::$label"
-            dist/ferrox-cli.sh up --fronts socks --socks "$port" "$@"
-            trace="$(curl -fsS --noproxy '' --max-time 60 --retry 3 --socks5-hostname "127.0.0.1:$port" https://www.cloudflare.com/cdn-cgi/trace)"
-            printf '%s\n' "$trace"
-            printf '%s\n' "$trace" | grep -qx 'warp=on' || {
-              echo "::error::$label did not egress through WARP"
-              dist/ferrox-cli.sh down
-              return 1
-            }
-            dist/ferrox-cli.sh down
+            if ! dist/ferrox-cli.sh up --fronts socks --socks "$port" "$@"; then
+              echo "::error::$label did not start"
+              failed=1
+              dist/ferrox-cli.sh down || true
+              echo "::endgroup::"
+              return 0
+            fi
+            if ! trace="$(curl -fsS --noproxy '' --max-time 60 --retry 3 --socks5-hostname "127.0.0.1:$port" https://www.cloudflare.com/cdn-cgi/trace)"; then
+              echo "::error::$label did not carry the trace through WARP"
+              failed=1
+            else
+              printf '%s\n' "$trace"
+              printf '%s\n' "$trace" | grep -qx 'warp=on' || {
+                echo "::error::$label did not egress through WARP"
+                failed=1
+              }
+            fi
+            dist/ferrox-cli.sh down || true
             echo "::endgroup::"
           }
-          run_lane "direct MASQUE" --warp --warp-mode masque
           run_lane "direct WireGuard" --warp --warp-mode wireguard
+          run_lane "direct MASQUE" --warp --warp-mode masque
           run_lane "nested WireGuard" --warp --warp-mode wiw
           run_lane "nested MASQUE" --warp --warp-mode mim
           run_lane "direct auto" --warp
           run_lane "Veepn through nested MASQUE" --veepn --warp --warp-mode mim
+          test "$failed" = 0
       - name: sudo keeps the lane in the invoking users files
         run: |
           set -euo pipefail
