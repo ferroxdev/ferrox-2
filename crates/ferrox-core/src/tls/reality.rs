@@ -2123,10 +2123,12 @@ impl<S: Stream> Session13<S> {
                     ));
                 }
             }
-            let keys = self
-                .client_hs
-                .as_mut()
-                .ok_or_else(|| TlsError::Other("reality: no client handshake keys".to_owned()))?;
+            let Some(keys) = self.client_hs.as_mut() else {
+                self.inbuf.drain(..5 + len);
+                return Err(TlsError::Other(
+                    "reality: no client handshake keys".to_owned(),
+                ));
+            };
             let opened = {
                 let body = &mut self.inbuf[5..5 + len];
                 crate::tls::shaped::record::open13(keys, header, body)
@@ -2208,10 +2210,10 @@ impl<S: Stream> Session13<S> {
                 "reality: plaintext record after the handshake".to_owned(),
             ));
         }
-        let keys = self
-            .read_key
-            .as_mut()
-            .ok_or_else(|| TlsError::Other("reality: no read keys".to_owned()))?;
+        let Some(keys) = self.read_key.as_mut() else {
+            self.inbuf.drain(..5 + len);
+            return Err(TlsError::Other("reality: no read keys".to_owned()));
+        };
         let opened = {
             let body = &mut self.inbuf[5..5 + len];
             crate::tls::shaped::record::open13(keys, header, body)
