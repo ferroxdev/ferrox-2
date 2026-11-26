@@ -113,8 +113,7 @@ pub fn write_varint<W: Write>(writer: &mut W, value: Varint) -> io::Result<()> {
 
 #[must_use]
 pub const fn varint_size(value: Varint) -> usize {
-    let bits = u32::BITS - (value as u32).leading_zeros();
-    let size = ((bits + 6) / 7) as usize;
+    let size = (value as u32).bit_width().div_ceil(7) as usize;
     if size == 0 { 1 } else { size }
 }
 
