@@ -136,8 +136,11 @@ jobs:
       - name: WARP registration edge
         run: |
           set -euo pipefail
+          target/release/ferrox-app warp-register --mode wireguard -o "$RUNNER_TEMP/warp-wireguard-identity.json"
           target/release/ferrox-app warp-register --mode auto -o "$RUNNER_TEMP/warp-identity.json"
-          python3 -c 'import json,sys; i=json.load(open(sys.argv[1])); print("wireguard edge:", i.get("wireguard",{}).get("endpoint")); print("masque key:", bool(i.get("masque",{}).get("privateKey")))' "$RUNNER_TEMP/warp-identity.json"
+          for identity in "$RUNNER_TEMP/warp-wireguard-identity.json" "$RUNNER_TEMP/warp-identity.json"; do
+            python3 -c 'import json,sys; i=json.load(open(sys.argv[1])); print(sys.argv[1], "wireguard edge:", i.get("wireguard",{}).get("endpoint")); print(sys.argv[1], "masque key:", bool(i.get("masque",{}).get("privateKey")))' "$identity"
+          done
       - name: direct and nested WARP through the CLI
         env:
           FERROX_BIN: ${{ github.workspace }}/target/release/ferrox-app
@@ -152,11 +155,15 @@ jobs:
           run_lane() {
             local label="$1"; shift
             local want="${LANE_WARP:-on}"
+            local identity="$RUNNER_TEMP/warp-identity.json"
+            if [ "${1:-}" = "--identity" ]; then
+              identity="$2"; shift 2
+            fi
             local port trace
             port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
             echo "::group::$label"
             if ! dist/ferrox-cli.sh up --fronts socks --socks "$port" \
-              --warp-identity "$RUNNER_TEMP/warp-identity.json" "$@"; then
+              --warp-identity "$identity" "$@"; then
               echo "::error::$label did not start"
               failed=1
               dist/ferrox-cli.sh down || true
@@ -176,9 +183,9 @@ jobs:
             dist/ferrox-cli.sh down || true
             echo "::endgroup::"
           }
-          run_lane "direct WireGuard" --warp --warp-mode wireguard
+          run_lane "direct WireGuard" --identity "$RUNNER_TEMP/warp-wireguard-identity.json" --warp --warp-mode wireguard
           run_lane "direct MASQUE" --warp --warp-mode masque
-          run_lane "nested WireGuard" --warp --warp-mode wiw
+          run_lane "nested WireGuard" --identity "$RUNNER_TEMP/warp-wireguard-identity.json" --warp --warp-mode wiw
           run_lane "nested MASQUE" --warp --warp-mode mim
           run_lane "direct auto" --warp
           LANE_WARP=off run_lane "Veepn through nested MASQUE" --veepn --warp --warp-mode mim
