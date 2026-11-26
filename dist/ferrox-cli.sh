@@ -2525,11 +2525,19 @@ lane_pid_runs() {
   return 1
 }
 
+# `kill -0` answers EPERM for a root-owned lane; `ps` still sees the pid.
+pid_alive() {
+  local pid="$1"
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null && return 0
+  ps -p "$pid" -o pid= >/dev/null 2>&1
+}
+
 lane_running_at() {
   local pidfile="$1" pid
   [ -f "$pidfile" ] || return 1
   pid="$(cat "$pidfile" 2>/dev/null || true)"
-  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+  pid_alive "$pid"
 }
 
 proxy_owner_pidfile() {
@@ -2582,7 +2590,7 @@ apply_instance() {
 lane_running() {
   [ -f "$PID_FILE" ] || return 1
   local pid; pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+  pid_alive "$pid"
 }
 
 lane_pid() { cat "$PID_FILE" 2>/dev/null || true; }
@@ -2616,7 +2624,7 @@ action_supervise() {
   [ -n "$watched" ] || exit 0
   trap 'supervise_terminate "$watched"; exit 0' HUP INT TERM
   printf '%s\n' "$$" > "$SUPERVISOR_FILE" 2>/dev/null || true
-  while kill -0 "$watched" 2>/dev/null; do sleep 1; done
+  while pid_alive "$watched"; do sleep 1; done
   supervise_clear "$watched"
   exit 0
 }
@@ -2936,7 +2944,7 @@ start_lane() {
     for _ in $(seq 1 1200); do
       lane_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
       [ -n "$lane_pid" ] && break
-      kill -0 "$sudo_pid" 2>/dev/null || break
+      pid_alive "$sudo_pid" || break
       sleep 0.1
     done
     if [ -z "$lane_pid" ]; then
@@ -2983,19 +2991,19 @@ stop_lane() {
       # The app restores its routes and exits on the stop file; a process that
       # predates it gets the signal after the grace period.
       : >"$STOP_FILE" 2>/dev/null || true
-      while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 50 ]; do
+      while pid_alive "$pid" && [ "$waited" -lt 50 ]; do
         sleep 0.1
         waited=$((waited + 1))
       done
       waited=0
-      if kill -0 "$pid" 2>/dev/null; then
+      if pid_alive "$pid"; then
         kill "$pid" 2>/dev/null || sudo -n kill "$pid" 2>/dev/null || true
         sleep 1
-        if kill -0 "$pid" 2>/dev/null; then
+        if pid_alive "$pid"; then
           kill -9 "$pid" 2>/dev/null || sudo -n kill -9 "$pid" 2>/dev/null || true
           sleep 1
         fi
-        if kill -0 "$pid" 2>/dev/null; then
+        if pid_alive "$pid"; then
           say "lane pid $pid did not stop; run: sudo kill -9 $pid" >&2
         fi
       fi
@@ -3006,7 +3014,7 @@ stop_lane() {
     supervisor="$(cat "$SUPERVISOR_PID_FILE" 2>/dev/null || true)"
     [ -n "$supervisor" ] || supervisor="$(cat "$SUPERVISOR_FILE" 2>/dev/null || true)"
     if [ -n "$supervisor" ]; then
-      while kill -0 "$supervisor" 2>/dev/null && [ "$waited" -lt 100 ]; do
+      while pid_alive "$supervisor" && [ "$waited" -lt 100 ]; do
         sleep 0.05
         waited=$((waited + 1))
       done
@@ -3167,7 +3175,7 @@ other_lanes() {
   for pidfile in "$CONF_DIR"/lane-*.pid; do
     [ -f "$pidfile" ] || continue
     pid="$(cat "$pidfile" 2>/dev/null || true)"
-    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || continue
+    pid_alive "$pid" || continue
     base="${pidfile##*/}"; base="${base#lane-}"; base="${base%.pid}"
     printf '  %s (pid %s)\n' "$base" "$pid"
   done
@@ -3482,7 +3490,7 @@ action_serve() {
   say "Ctrl-C stops it."
   trap 'stop_and_forget; exit 0' INT TERM
   local pid; pid="$(lane_pid)"
-  while [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; do sleep 2; done
+  while [ -n "$pid" ] && pid_alive "$pid"; do sleep 2; done
   say "the lane exited; last lines of $LOG:"
   tail -n 15 "$LOG" 2>/dev/null || true
   stop_and_forget
