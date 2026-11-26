@@ -1888,6 +1888,8 @@ fn io(
             Transport::Lane(lane) => {
                 let mut received = 0;
                 let mut first = true;
+                #[cfg(target_os = "linux")]
+                receive_batch.drain_recycled();
                 loop {
                     let next = if first {
                         lane.recv_timeout(IO_TICK)
