@@ -913,6 +913,7 @@ pub(crate) struct MeekHttp {
     path: &'static str,
     stream: Option<MeekStream>,
     cookie: Option<(String, String)>,
+    cookie_header: Option<String>,
     profile: Profile,
     request_padding: Option<PaddingSender>,
     response_padding: Option<PaddingReceiver>,
@@ -962,6 +963,9 @@ impl MeekHttp {
             _ => (None, None),
         };
         let dns = crate::psiphon_dns::Config::from_servers(&meek.dns);
+        let cookie_header = cookie
+            .as_ref()
+            .map(|(name, value)| format!("{name}={value}"));
         Ok(Self {
             meek,
             proxy,
@@ -970,6 +974,7 @@ impl MeekHttp {
             path,
             stream: None,
             cookie,
+            cookie_header,
             profile: chosen,
             request_padding,
             response_padding,
@@ -1031,6 +1036,7 @@ impl MeekHttp {
             path,
             stream: None,
             cookie: None,
+            cookie_header: None,
             profile: chosen,
             request_padding: None,
             response_padding: None,
@@ -1077,6 +1083,9 @@ impl MeekHttp {
             _ => (None, None),
         };
         let dns = crate::psiphon_dns::Config::from_servers(&meek.dns);
+        let cookie_header = cookie
+            .as_ref()
+            .map(|(name, value)| format!("{name}={value}"));
         Ok(Self {
             meek,
             proxy: None,
@@ -1085,6 +1094,7 @@ impl MeekHttp {
             path,
             stream: Some(stream),
             cookie,
+            cookie_header,
             profile: chosen,
             request_padding,
             response_padding,
@@ -1443,26 +1453,19 @@ impl MeekHttp {
             self.stream = None;
             self.open()?;
         }
-        let cookie = self
-            .cookie
-            .as_ref()
-            .map(|(name, value)| format!("{name}={value}"));
+        let cookie = self.cookie_header.as_deref();
         let mut host = self.meek.host.as_str();
-        let mut headers: Vec<(&str, &str)> = self
-            .meek
-            .headers
-            .iter()
-            .filter_map(|(name, value)| {
-                if name.eq_ignore_ascii_case("host") {
-                    host = value;
-                    None
-                } else if name.eq_ignore_ascii_case("user-agent") && value.is_empty() {
-                    None
-                } else {
-                    Some((name.as_str(), value.as_str()))
-                }
-            })
-            .collect();
+        let mut headers = Vec::with_capacity(self.meek.headers.len() + 5);
+        headers.extend(self.meek.headers.iter().filter_map(|(name, value)| {
+            if name.eq_ignore_ascii_case("host") {
+                host = value;
+                None
+            } else if name.eq_ignore_ascii_case("user-agent") && value.is_empty() {
+                None
+            } else {
+                Some((name.as_str(), value.as_str()))
+            }
+        }));
         for (name, value) in [
             ("Content-Type", self.profile.content_type),
             ("User-Agent", self.profile.user_agent.as_str()),
@@ -1478,7 +1481,7 @@ impl MeekHttp {
             }
         }
         let combined_cookie;
-        if let Some(cookie) = cookie.as_deref() {
+        if let Some(cookie) = cookie {
             if let Some(index) = headers
                 .iter()
                 .position(|(name, _)| name.eq_ignore_ascii_case("cookie"))
@@ -1491,11 +1494,7 @@ impl MeekHttp {
         }
         let timeout = self.budget()?;
         if let Some(MeekStream::H3(h3)) = self.stream.as_mut() {
-            let headers: Vec<(&str, &str)> = headers
-                .iter()
-                .copied()
-                .filter(|(name, _)| !is_hop_by_hop(name))
-                .collect();
+            headers.retain(|(name, _)| !is_hop_by_hop(name));
             let reply = h3.round_trip(
                 host,
                 self.path,
@@ -1588,6 +1587,12 @@ impl MeekHttp {
             {
                 value.trim().clone_into(cookie_value);
             }
+        }
+        if let Some(header) = self.cookie_header.as_mut() {
+            header.clear();
+            header.push_str(cookie_name);
+            header.push('=');
+            header.push_str(cookie_value);
         }
     }
 }
@@ -1856,6 +1861,17 @@ mod tests {
             assert_eq!(http.response_chunk(), http1);
             assert_eq!(http.h3_response_chunk(), h3);
         }
+    }
+
+    #[test]
+    fn the_cookie_header_is_cached_and_renewed() {
+        let mut http =
+            MeekHttp::new(entry(), None, Duration::from_secs(8), "/", None).expect("meek http");
+        let (name, value) = http.cookie.clone().expect("cookie");
+        let expected = format!("{name}={value}");
+        assert_eq!(http.cookie_header.as_deref(), Some(expected.as_str()));
+        http.absorb_cookie(&[("Set-Cookie".to_owned(), format!("{name}=renewed; Path=/"))]);
+        assert_eq!(http.cookie_header, Some(format!("{name}=renewed")));
     }
 
     /// A cookie carries the seed and the encrypted endpoint payload.

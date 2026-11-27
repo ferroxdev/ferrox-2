@@ -1252,9 +1252,12 @@ impl ScanSpec {
     /// The reference's affine permutation: a cache-key/seed-derived offset and
     /// a step coprime with the candidate count.
     fn permutation(&self, shuffle_key: &str) -> (u64, u64) {
-        let seed = Sha256::digest(
-            format!("fronted-meek-cdn-scan|{}|{shuffle_key}", self.cache_key).as_bytes(),
-        );
+        let mut hash = Sha256::new();
+        hash.update(b"fronted-meek-cdn-scan|");
+        hash.update(self.cache_key.as_bytes());
+        hash.update(b"|");
+        hash.update(shuffle_key.as_bytes());
+        let seed = hash.finalize();
         let offset = u64::from_be_bytes(seed[0..8].try_into().expect("sha256 half"));
         let mut step =
             u64::from_be_bytes(seed[8..16].try_into().expect("sha256 half")) % self.count;
@@ -1310,13 +1313,12 @@ impl ScanSpec {
         for probe in 0..probe_limit {
             let number = candidate_number.saturating_add(probe);
             let candidate = self.candidate_at(self.permuted_index_with(offset, step, number))?;
-            if fallback.is_none() {
-                fallback = Some(candidate.clone());
-            }
             candidate.key_into(&mut key);
-            if !skipped.contains(key.as_str()) {
-                return Some((candidate, number.saturating_add(1)));
+            if skipped.contains(key.as_str()) {
+                fallback.get_or_insert(candidate);
+                continue;
             }
+            return Some((candidate, number.saturating_add(1)));
         }
         fallback.map(|candidate| {
             (
@@ -1958,6 +1960,24 @@ mod tests {
                 reference
             );
         }
+    }
+
+    #[test]
+    fn selecting_an_unskipped_candidate_does_not_clone_it() {
+        let spec = super::ScanSpec::from_config(&["192.0.2.1".to_owned()], &[]).expect("spec");
+        let skipped = std::collections::HashSet::new();
+        let (candidate, built) =
+            ferrox_core::alloc_count::measure(|| spec.candidate_at(0).expect("candidate"));
+        let ((), keyed) = ferrox_core::alloc_count::measure(|| {
+            let mut key = String::new();
+            candidate.key_into(&mut key);
+        });
+        let ((selected, next), counts) = ferrox_core::alloc_count::measure(|| {
+            spec.select_probe(0, &skipped, "seed").expect("candidate")
+        });
+        assert_eq!(selected, candidate);
+        assert_eq!(next, 1);
+        assert_eq!(counts.allocs, built.allocs + keyed.allocs);
     }
 
     #[test]
