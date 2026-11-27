@@ -36968,7 +36968,8 @@ fn write_full(
             if peer_ended.load(std::sync::atomic::Ordering::Acquire) {
                 break;
             }
-            std::thread::sleep(RELAY_IDLE);
+            // The writer waits on the edge's next WINDOW_UPDATE, which the other leg reads: poll at the session grain, not the idle tick.
+            std::thread::sleep(crate::budgets::SESSION_POLL);
         }
     }
     total - buf.len()
