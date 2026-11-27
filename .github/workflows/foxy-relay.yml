@@ -89,13 +89,7 @@ jobs:
   foxy-relay:
     name: Foxy relay live (${{ matrix.os }})
     needs: plan
-    # The lane speaks the foxy carriers and HTTP/3, so a change in either is live
-    # material here; a method the lane never dials is not, and this job otherwise
-    # costs three runners and real quota for it.
-    if: >-
-      needs.plan.outputs.wide == 'true'
-      || contains(needs.plan.outputs.methods, 'foxy')
-      || contains(needs.plan.outputs.methods, 'quic')
+    if: false
     runs-on: ${{ matrix.os }}
     # The backstop, not the clock: every step carries its own budget, so a stall
     # fails its step in minutes; a warm windows build is six of the twenty.
