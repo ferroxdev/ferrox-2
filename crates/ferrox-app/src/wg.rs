@@ -3884,10 +3884,10 @@ mod tests {
         ));
     }
 
-    /// A routed destination is one list filtered where it sits, and a cached name is read without a
-    /// lowercase key: the only allocation either path still owes is the list or the answer it returns.
+    /// A routed destination is one list filtered where it sits, and a cached name is shared without a
+    /// copy: a routed literal costs one list, while an unrouted one and a cache hit cost none.
     #[test]
-    fn a_routed_destination_costs_one_list_and_a_cached_name_one_answer() {
+    fn a_routed_destination_costs_one_list_and_a_cached_name_no_copy() {
         let config = DeviceConfig {
             secret: [0x33; 32],
             addresses: vec!["10.0.0.2".parse().unwrap()],

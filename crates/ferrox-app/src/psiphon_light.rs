@@ -1147,6 +1147,72 @@ mod tests {
         );
     }
 
+    /// A second fill after the wire is cleared reuses the same allocation and the initialized tail.
+    #[test]
+    fn repeated_fills_reuse_the_wire_tail_after_compaction() {
+        struct Twice {
+            chunks: std::collections::VecDeque<Vec<u8>>,
+        }
+        impl Read for Twice {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let Some(mut chunk) = self.chunks.pop_front() else {
+                    return Ok(0);
+                };
+                let take = chunk.len().min(buf.len());
+                buf[..take].copy_from_slice(&chunk[..take]);
+                if take < chunk.len() {
+                    chunk.drain(..take);
+                    self.chunks.push_front(chunk);
+                }
+                Ok(take)
+            }
+        }
+        let mut stream = LightStream::new(
+            Twice {
+                chunks: vec![b"abcd".to_vec(), b"efgh".to_vec()].into(),
+            },
+            Vec::new(),
+        );
+        assert!(stream.fill().expect("first fill"));
+        assert_eq!(stream.wire.as_slice(), &b"abcd"[..]);
+        let capacity = stream.wire.capacity();
+        stream.wire_at = stream.wire.len();
+        stream.compact();
+        assert!(stream.wire.is_empty());
+        assert!(stream.fill().expect("second fill"));
+        assert_eq!(stream.wire.as_slice(), &b"efgh"[..]);
+        assert_eq!(stream.wire.capacity(), capacity, "the wire is reused");
+        assert!(stream.wire_init >= stream.wire.len());
+    }
+
+    /// A partial plain write stages only the remainder and retries it, with no byte lost or repeated.
+    #[test]
+    fn a_partial_plain_write_is_staged_and_retried() {
+        struct Partial {
+            out: Vec<u8>,
+        }
+        impl Write for Partial {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                let take = if self.out.is_empty() {
+                    2.min(buf.len())
+                } else {
+                    buf.len()
+                };
+                self.out.extend_from_slice(&buf[..take]);
+                Ok(take)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut stream = LightStream::new(Partial { out: Vec::new() }, Vec::new());
+        stream.write_padding_done = true;
+        let data = b"payload";
+        assert_eq!(stream.write(data).expect("writes"), data.len());
+        assert_eq!(stream.inner.out.as_slice(), &data[..]);
+        assert!(stream.pending.is_empty(), "the remainder was retried");
+    }
+
     /// A destination is normalized into one allocation, with the lowercasing done in place.
     #[test]
     fn normalize_destination_allocates_once() {

@@ -300,13 +300,28 @@ fn address_requests_len(entries: &[(u64, u8, &[u8])]) -> Option<usize> {
 
 /// One `ADDRESS_REQUEST` capsule naming every address a client wants, which is how the reference asks for both families at once: a proxy replaces the peer's allowed sources with each answer, so a second request would leave the first family unroutable. An empty batch, a zero request id or an address whose width disagrees with its version is refused before any bytes are written.
 pub fn address_requests(entries: &[(u64, u8, &[u8])], out: &mut Vec<u8>) {
-    let Some(need) = address_requests_len(entries) else {
+    let valid = !entries.is_empty()
+        && entries
+            .iter()
+            .all(|(id, version, address)| match (version, address.len()) {
+                (4, 4) | (6, 16) => *id != 0,
+                _ => false,
+            });
+    if !valid {
         return;
-    };
-    let start = out.len();
-    out.resize(start + need, 0);
-    let wrote = address_requests_into(entries, &mut out[start..]).expect("sized for the batch");
-    debug_assert_eq!(wrote, need);
+    }
+    let length: usize = entries
+        .iter()
+        .map(|(id, _, address)| quic_varint_len(*id) + 1 + address.len() + 1)
+        .sum();
+    quic_varint(out, ADDRESS_REQUEST);
+    quic_varint(out, length as u64);
+    for (id, version, address) in entries {
+        quic_varint(out, *id);
+        out.push(*version);
+        out.extend_from_slice(address);
+        out.push((address.len() as u8) * 8);
+    }
 }
 
 /// The same capsule written into the caller's fixed buffer, so a request that fits does not allocate: returns the bytes written, or `None` when the batch is malformed or the buffer is too short, leaving the buffer untouched in both cases.
@@ -1318,13 +1333,22 @@ mod tests {
         let entries = [(1, 4, &V4[..]), (2, 6, &V6[..])];
         let mut wanted = Vec::new();
         address_requests(&entries, &mut wanted);
-        let mut fixed = [0u8; 64];
+        let mut fixed = [0xA5u8; 64];
         let wrote = address_requests_into(&entries, &mut fixed).expect("fits");
         assert_eq!(&fixed[..wrote], wanted.as_slice());
+        let mut short = [0xA5u8; 64];
         assert!(
-            address_requests_into(&entries, &mut fixed[..wrote - 1]).is_none(),
+            address_requests_into(&entries, &mut short[..wrote - 1]).is_none(),
             "a short buffer refuses"
         );
+        assert_eq!(short, [0xA5u8; 64], "a short buffer is untouched");
+        let invalid = [(0, 4, &V4[..])];
+        let mut kept = [0xA5u8; 64];
+        assert!(
+            address_requests_into(&invalid, &mut kept).is_none(),
+            "an invalid batch refuses"
+        );
+        assert_eq!(kept, [0xA5u8; 64], "an invalid batch is untouched");
     }
 
     #[test]

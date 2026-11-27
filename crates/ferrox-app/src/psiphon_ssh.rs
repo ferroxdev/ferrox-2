@@ -2285,7 +2285,7 @@ impl Session {
         channel_type: &[u8],
         deadline: Option<Instant>,
     ) -> Result<Option<Channel>, String> {
-        let mut extra = Vec::with_capacity(host.len() + 16);
+        let mut extra = Vec::with_capacity(host.len() + 25);
         put_str(&mut extra, host.as_bytes());
         put_u32(&mut extra, u32::from(port));
         put_str(&mut extra, b"127.0.0.1");

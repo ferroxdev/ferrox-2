@@ -29,9 +29,9 @@ const SEND_WAIT: Duration = Duration::from_secs(10);
 const PUMP_WAIT: Duration = Duration::from_millis(5);
 /// The client's first unidirectional stream, carrying the SETTINGS that make the connection HTTP/3.
 const CONTROL_STREAM: u64 = 2;
-const H3_CONTROL_OPENING: [u8; 9] = [0x00, 0x04, 0x06, 0x01, 0x00, 0x07, 0x00, 0x08, 0x00];
-const H3_ENCODER_OPENING: [u8; 1] = [0x02];
-const H3_DECODER_OPENING: [u8; 1] = [0x03];
+static H3_CONTROL_OPENING: [u8; 9] = [0x00, 0x04, 0x06, 0x01, 0x00, 0x07, 0x00, 0x08, 0x00];
+static H3_ENCODER_OPENING: [u8; 1] = [0x02];
+static H3_DECODER_OPENING: [u8; 1] = [0x03];
 /// The ceiling of a QUIC frame header: two varints of at most eight bytes each. The request stream's window is this size and nothing larger, because a payload never passes through it — it lands in the buffer its reader uses.
 const H3_PEEK: usize = 16;
 /// The largest frame block the lane will consume without keeping it: a HEADERS answer's block and any frame the tunnel has no use for are bounded by one head, so a peer cannot make the lane wait on a block bigger than a header.
