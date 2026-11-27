@@ -269,6 +269,8 @@ impl std::fmt::Debug for MasqueOut {
 /// over the outer's datagram path with no loopback socket in between.
 const UPLINK_DEPTH: usize = 64;
 const DOWNLINK_DEPTH: usize = 256;
+/// The bridge blocks on the downlink, so its idle wait also bounds how long a pending uplink packet (an ACK at a cwnd boundary) waits; keep it short.
+const LANE_WAKE: Duration = Duration::from_millis(1);
 
 /// Hand a reply to the reader, dropping it when the reader is behind exactly as
 /// a bounded loopback socket would; false means the reader is gone.
@@ -335,26 +337,28 @@ fn lane_bridge(
                     idle = false;
                 }
             }
-            match uplink.try_recv() {
-                Ok((_endpoint, packet)) => {
-                    wg_stack::lane_send(
-                        inner.config.as_ref(),
-                        port,
-                        target,
-                        &packet,
-                        &inner.to_tunnel,
-                        0,
-                    );
-                    idle = false;
+            loop {
+                match uplink.try_recv() {
+                    Ok((_endpoint, packet)) => {
+                        wg_stack::lane_send(
+                            inner.config.as_ref(),
+                            port,
+                            target,
+                            &packet,
+                            &inner.to_tunnel,
+                            0,
+                        );
+                        idle = false;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => return,
                 }
-                Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => return,
             }
             if !inner.alive.load(Ordering::Acquire) {
                 break;
             }
             if idle {
-                match reply_rx.recv_timeout(TICK) {
+                match reply_rx.recv_timeout(LANE_WAKE) {
                     Ok(packet) => {
                         if let Some(datagram) = connectip::udp_from_packet(packet.packet())
                             && datagram.destination_port == port
