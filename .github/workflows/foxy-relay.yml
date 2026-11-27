@@ -1013,6 +1013,7 @@ jobs:
           FOXY_CODE: ${{ secrets.FOXY_CODE }}
           FOXY_COUNTRY: ${{ inputs.country || vars.FOXY_COUNTRY || 'US' }}
           FOXY_AB_TIMEOUT: '30'
+          EDGE_TTFB_MAX: '0.150'
           MAX_EDGES: '3'
           SESSIONS: '5'
           ROUNDS: '3'
