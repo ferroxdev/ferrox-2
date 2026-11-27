@@ -1972,8 +1972,9 @@ mod tests {
             let mut key = String::new();
             candidate.key_into(&mut key);
         });
-        let ((selected, next), counts) =
-            ferrox_core::alloc_count::measure(|| spec.select_probe(0, &skipped, "seed"));
+        let ((selected, next), counts) = ferrox_core::alloc_count::measure(|| {
+            spec.select_probe(0, &skipped, "seed").expect("candidate")
+        });
         assert_eq!(selected, candidate);
         assert_eq!(next, 1);
         assert_eq!(counts.allocs, built.allocs + keyed.allocs);
