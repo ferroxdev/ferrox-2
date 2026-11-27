@@ -1966,12 +1966,17 @@ mod tests {
     fn selecting_an_unskipped_candidate_does_not_clone_it() {
         let spec = super::ScanSpec::from_config(&["192.0.2.1".to_owned()], &[]).expect("spec");
         let skipped = std::collections::HashSet::new();
-        let ((candidate, next), counts) =
+        let (candidate, built) =
+            ferrox_core::alloc_count::measure(|| spec.candidate_at(0).expect("candidate"));
+        let ((), keyed) = ferrox_core::alloc_count::measure(|| {
+            let mut key = String::new();
+            candidate.key_into(&mut key);
+        });
+        let ((selected, next), counts) =
             ferrox_core::alloc_count::measure(|| spec.select_probe(0, &skipped, "seed"));
-        assert_eq!(candidate.ip, "192.0.2.1");
-        assert!(candidate.sni.is_empty());
+        assert_eq!(selected, candidate);
         assert_eq!(next, 1);
-        assert_eq!(counts.allocs, 2);
+        assert_eq!(counts.allocs, built.allocs + keyed.allocs);
     }
 
     #[test]
