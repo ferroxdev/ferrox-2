@@ -6,7 +6,8 @@
 # server per dial and would compare two tunnels, not two engines. The exit IP is
 # recorded per engine: the provider allocates egress per session, so the server
 # is the same even when the two exits differ. After the rounds, small probes
-# record TTFB, jitter and probe loss per engine. Linux only: CPU and peak RSS
+# record TTFB, jitter and probe loss per engine; a quick probe rejects an egress
+# whose TTFB would make the round a measurement of the tunnel, not the engine. Linux only: CPU and peak RSS
 # come from /proc. Durations are measured, never gated.
 set -euo pipefail
 
@@ -26,6 +27,7 @@ ROUNDS="${ROUNDS:-3}"
 DOWN_BYTES="${DOWN_BYTES:-10485760}"
 UP_BYTES="${UP_BYTES:-4194304}"
 MAX_EDGES="${MAX_EDGES:-8}"
+EDGE_TTFB_MAX="${EDGE_TTFB_MAX:-0.150}"
 LATENCY_PROBES="${LATENCY_PROBES:-15}"
 PROBE_TIMEOUT="${PROBE_TIMEOUT:-10}"
 TRACE_URL="${TRACE_URL:-https://www.cloudflare.com/cdn-cgi/trace}"
@@ -303,6 +305,14 @@ while IFS= read -r candidate; do
   fi
   if [ -z "$ip_a" ] || [ "$loc_a" != "$COUNTRY" ]; then
     echo "foxy-ab($CARRIER): arman exits $loc_a at $ip_a through $candidate" >&2
+    stop_arman
+    stop_ferrox
+    continue
+  fi
+  ttfb_f=$(probe "$FERROX_PORT" | awk '{print $3}')
+  ttfb_a=$(probe "$ARMAN_PORT" | awk '{print $3}')
+  if awk -v f="$ttfb_f" -v a="$ttfb_a" -v m="$EDGE_TTFB_MAX" 'BEGIN{exit !(f==0 || a==0 || f>m || a>m)}'; then
+    echo "::warning::foxy-ab($CARRIER): $candidate exits $COUNTRY but a probe is lost or above ${EDGE_TTFB_MAX}s (ferrox ${ttfb_f}s, arman ${ttfb_a}s); trying the next edge" >&2
     stop_arman
     stop_ferrox
     continue
