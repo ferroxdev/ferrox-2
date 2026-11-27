@@ -269,7 +269,7 @@ impl std::fmt::Debug for MasqueOut {
 /// over the outer's datagram path with no loopback socket in between.
 const UPLINK_DEPTH: usize = 64;
 const DOWNLINK_DEPTH: usize = 256;
-/// The bridge blocks on the downlink, so its idle wait also bounds how long a pending uplink packet (an ACK at a cwnd boundary) waits; keep it short.
+/// A datagram lane blocks on one direction, so its idle wait also bounds how long a packet in the other waits; keep it short (an ACK at a cwnd boundary otherwise idles a round trip).
 const LANE_WAKE: Duration = Duration::from_millis(1);
 
 /// Hand a reply to the reader, dropping it when the reader is behind exactly as
@@ -2794,7 +2794,7 @@ fn io(
             }
         }
         quic::flush_egress(&mut conn, sock);
-        if !quic::pump_once(&mut conn, sock, local, TICK) || conn.is_closed() {
+        if !quic::pump_once(&mut conn, sock, local, LANE_WAKE) || conn.is_closed() {
             break;
         }
         if moved && quic::path_failed(&mut conn, local) {
