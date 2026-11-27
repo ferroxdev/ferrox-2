@@ -93,6 +93,8 @@ const TUN_TICK: Duration = Duration::from_millis(1);
 /// Datagram lanes are idle most of their life; a ten millisecond wake is a
 /// poll of their own, not a bound on a request.
 const LANE_TICK: Duration = Duration::from_millis(10);
+/// Coalesce an ACK onto every second full segment, as RFC 9293 asks, so a bulk download pays half the ACKs; a lone segment waits no longer than this bound.
+const ACK_DELAY: Duration = Duration::from_millis(1);
 /// The most inner packets the tunnel reader may queue before the stack drains
 /// them; past it the oldest is dropped, as a full device would drop.
 const RX_PACKETS: usize = 4096;
@@ -1821,7 +1823,7 @@ impl ClientStack {
                 SocketBuffer::new(vec![0u8; TCP_SEND_BUFFER]),
             );
             socket.set_nagle_enabled(false);
-            socket.set_ack_delay(None);
+            socket.set_ack_delay(Some(ACK_DELAY.into()));
             socket.set_congestion_control(CongestionControl::Cubic);
             if probe {
                 socket.set_timeout(Some(crate::budgets::dial().into()));
@@ -2287,7 +2289,7 @@ impl ServerStack {
             SocketBuffer::new(vec![0u8; TCP_SEND_BUFFER]),
         );
         socket.set_nagle_enabled(false);
-        socket.set_ack_delay(None);
+        socket.set_ack_delay(Some(ACK_DELAY.into()));
         socket.set_congestion_control(CongestionControl::Cubic);
         if socket.listen(IpListenEndpoint { addr: None, port }).is_ok() {
             let handle = self.sockets.add(socket);
