@@ -187,8 +187,14 @@ impl VeepnOut {
 
     /// One flow's tunnel: a listed upstream of the region and the `Foxy` lane's HTTP/1.1 record dialed at the target. The upstream, its pair and the region name are read where the cache holds them, so a flow builds no dial of its own. An upstream that declined a flow keeps the edge's silence for [`veepn::EDGE_SILENCE`] seconds, so one flow pays for a gone edge instead of every one after it. When a whole region has gone quiet the walk lifts the silence of the entry whose window ends first — a tie split by the flow's own rotation, so equal windows are probed in turn — and dials that one: a gone region costs a flow one handshake rather than its list, a recovered edge rejoins as soon as it answers, and an edge probed and declined again goes behind the others. One that refuses the pair takes the region's cache with it, so the next flow fetches fresh credentials. One that refuses the *target* takes nothing with it and stops the walk there: the answer is a fact about the host, every edge holds it, and the client is told so rather than about a general failure.
     pub(crate) fn open(&self, target: &str) -> Result<Tunnel, Refusal> {
-        let region = self.region()?;
-        let servers = self.servers(&region)?;
+        let (region, servers) = match self.cached() {
+            Some(pair) => pair,
+            None => {
+                let region = self.region()?;
+                let servers = self.servers(&region)?;
+                (region, servers)
+            }
+        };
         let count = servers.dials.len();
         let now = foxy_account::epoch();
         let start = self.picked.fetch_add(1, Ordering::Relaxed);
@@ -274,6 +280,26 @@ impl VeepnOut {
             None => format!("region {region:?} lists no upstream this lane can dial"),
         };
         Err(Refusal::from(why))
+    }
+
+    /// The region and its list under one lock: a flow that finds both fresh takes one reference count each and no second lock.
+    fn cached(&self) -> Option<(Arc<str>, Arc<Servers>)> {
+        let now = foxy_account::epoch();
+        let plane = self.plane.lock().ok()?;
+        let region = if self.region.is_empty() {
+            let (named, until) = plane.region.as_ref()?;
+            if *until <= now {
+                return None;
+            }
+            Arc::clone(named)
+        } else {
+            Arc::clone(&self.region)
+        };
+        let (list, until) = plane.lists.get(region.as_ref())?;
+        if *until <= now {
+            return None;
+        }
+        Some((region, Arc::clone(list)))
     }
 
     /// The region the lane serves: the one configured, or the optimal one the plane names, kept for the same window as a list. Either way a flow takes a reference count, not a copy of the name, so an open builds no text of its own. A plane that cannot be reached is asked again after [`veepn::PLANE_RETRY`] seconds and the name it already gave is served meanwhile, because a seized API domain says nothing about which region carries this device.
@@ -884,6 +910,29 @@ mod tests {
             Arc::ptr_eq(&first, &cached),
             "and the name is the one the plane holds, not a copy of it"
         );
+    }
+
+    /// A fresh region and list come back together, so an open reads both under one lock.
+    #[test]
+    fn a_fresh_region_and_list_come_back_together() {
+        let mut out = lane(&["https://antpeak.com"]).expect("lane");
+        out.region = Arc::from("");
+        let named: Arc<str> = Arc::from("IR");
+        let silence = (0..1).map(|_| AtomicU64::new(0)).collect();
+        let seeded = Arc::new(Servers {
+            dials: vec![listed("192.0.2.12", 443, "MTAwMC1hYmM6czNjcjN0")],
+            silence,
+        });
+        {
+            let mut plane = out.plane.lock().expect("locks");
+            plane.region = Some((Arc::clone(&named), 4_000_000_000));
+            plane
+                .lists
+                .insert("IR".to_owned(), (Arc::clone(&seeded), 4_000_000_000));
+        }
+        let (region, servers) = out.cached().expect("both fresh");
+        assert!(Arc::ptr_eq(&region, &named));
+        assert!(Arc::ptr_eq(&servers, &seeded));
     }
 
     /// The cached region is shared, not copied: two flows read the *same* list allocation, so a dozen entries cost a refcount bump per flow instead of the whole region cloned out of the cache.
