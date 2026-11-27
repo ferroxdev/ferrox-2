@@ -416,10 +416,14 @@ pub(crate) fn tcp_via(proxy: &UpstreamProxy, host: &str, port: u16) -> Result<Co
     } else {
         socks_greeting(&mut stream)?;
         let host_len = u8::try_from(host.len()).map_err(|_| Failure::Io)?;
-        let mut request = vec![5, 1, 0, 3, host_len];
-        request.extend_from_slice(host.as_bytes());
-        request.extend_from_slice(&port.to_be_bytes());
-        stream.write_all(&request).map_err(|_| Failure::Io)?;
+        let mut request = [0u8; 5 + usize::from(u8::MAX) + 2];
+        request[..5].copy_from_slice(&[5, 1, 0, 3, host_len]);
+        let host_end = 5 + host.len();
+        request[5..host_end].copy_from_slice(host.as_bytes());
+        request[host_end..host_end + 2].copy_from_slice(&port.to_be_bytes());
+        stream
+            .write_all(&request[..host_end + 2])
+            .map_err(|_| Failure::Io)?;
         // The hop's bound address is not the edge's: read past it and drop it, the connection itself is the answer.
         if socks_reply(&mut stream)?.is_none() {
             return Err(Failure::Io);
