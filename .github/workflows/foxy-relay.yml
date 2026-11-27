@@ -1020,6 +1020,8 @@ jobs:
           FOXY_COUNTRY: ${{ inputs.country || vars.FOXY_COUNTRY || 'US' }}
           FOXY_AB_TIMEOUT: '30'
           MAX_EDGES: '3'
+          SESSIONS: '3'
+          ROUNDS: '2'
         run: |
           BIN="$PWD/target/release/ferrox-app"
           : > target/foxy-ab/legs.tsv
@@ -1031,15 +1033,21 @@ jobs:
             "$BIN" mint-foxy-pass -c foxy-mint.json -o target/foxy-ab/foxy-pass.json
             chmod 600 target/foxy-ab/foxy-pass.json
             rm -f foxy-mint.json
-            FERROX_BIN="$BIN" \
-            ARMAN_TEST="$PWD/target/foxy-ab/arman.test" \
-            PASS_FILE="$PWD/target/foxy-ab/foxy-pass.json" \
-            CARRIER="$carrier" COUNTRY="$FOXY_COUNTRY" \
-            OUT="$PWD/target/foxy-ab/legs.tsv" \
-            RES_OUT="$PWD/target/foxy-ab/resources.tsv" \
-            PROBES_OUT="$PWD/target/foxy-ab/probes.tsv" \
-            LATENCY_PROBES=15 \
-            scripts/foxy-ab/run.sh || echo "::warning::the $carrier leg did not finish"
+            EDGE_USED=""
+            for session in $(seq 1 "$SESSIONS"); do
+              FERROX_BIN="$BIN" \
+              ARMAN_TEST="$PWD/target/foxy-ab/arman.test" \
+              PASS_FILE="$PWD/target/foxy-ab/foxy-pass.json" \
+              CARRIER="$carrier" COUNTRY="$FOXY_COUNTRY" EDGE="$EDGE_USED" \
+              OUT="$PWD/target/foxy-ab/legs.tsv" \
+              RES_OUT="$PWD/target/foxy-ab/resources.tsv" \
+              PROBES_OUT="$PWD/target/foxy-ab/probes.tsv" \
+              ROUNDS="$ROUNDS" LATENCY_PROBES=10 \
+              scripts/foxy-ab/run.sh || echo "::warning::the $carrier session $session did not finish"
+              if [ -z "$EDGE_USED" ]; then
+                EDGE_USED=$(awk -F'\t' -v c="$carrier" '$1==c && $2=="ferrox"{print $5; exit}' target/foxy-ab/resources.tsv)
+              fi
+            done
           done
           python3 scripts/foxy-ab/summarize.py \
             --legs target/foxy-ab/legs.tsv \

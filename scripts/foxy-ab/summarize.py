@@ -53,13 +53,25 @@ def read_resources(path):
                 rss_kib = int(raw_rss)
             except ValueError as exc:
                 raise SystemExit(f"{path}:{number}: {line!r}: {exc}") from exc
-            rows[(carrier, engine)] = {
-                "cpu_ms": cpu_ms,
-                "peak_rss_kib": rss_kib,
-                "edge": edge,
-                "same_ip": same_ip,
-                "exit_ip": exit_ip,
-            }
+            key = (carrier, engine)
+            previous = rows.get(key)
+            if previous is None:
+                rows[key] = {
+                    "cpu_ms": cpu_ms,
+                    "peak_rss_kib": rss_kib,
+                    "edge": edge,
+                    "same_ip": same_ip,
+                    "exit_ip": exit_ip,
+                }
+                continue
+            previous["cpu_ms"] += cpu_ms
+            previous["peak_rss_kib"] = max(previous["peak_rss_kib"], rss_kib)
+            if same_ip != "yes":
+                previous["same_ip"] = "no"
+            for field, value in (("edge", edge), ("exit_ip", exit_ip)):
+                seen = previous[field].split(",") if previous[field] else []
+                if value and value not in seen:
+                    previous[field] = ",".join(seen + [value])
     return rows
 
 
