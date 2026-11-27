@@ -3310,13 +3310,6 @@ impl H3 {
         }
     }
 
-    fn fin(&mut self, stream: u64) -> Result<(), Failure> {
-        let sent = self
-            .with_conn(|conn| conn.stream_send(stream, &[], true))
-            .ok_or(Failure::Io)?;
-        sent.map(|_| ()).map_err(|_| Failure::Io)
-    }
-
     /// How long one empty turn waits for a datagram: the read's own grain where a relay armed one, because the lane's lock is what the other direction of the flow is standing behind, and the idle tick everywhere else.
     fn pump_wait(&self) -> Duration {
         self.quantum

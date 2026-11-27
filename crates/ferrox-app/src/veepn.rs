@@ -187,13 +187,12 @@ impl VeepnOut {
 
     /// One flow's tunnel: a listed upstream of the region and the `Foxy` lane's HTTP/1.1 record dialed at the target. The upstream, its pair and the region name are read where the cache holds them, so a flow builds no dial of its own. An upstream that declined a flow keeps the edge's silence for [`veepn::EDGE_SILENCE`] seconds, so one flow pays for a gone edge instead of every one after it. When a whole region has gone quiet the walk lifts the silence of the entry whose window ends first — a tie split by the flow's own rotation, so equal windows are probed in turn — and dials that one: a gone region costs a flow one handshake rather than its list, a recovered edge rejoins as soon as it answers, and an edge probed and declined again goes behind the others. One that refuses the pair takes the region's cache with it, so the next flow fetches fresh credentials. One that refuses the *target* takes nothing with it and stops the walk there: the answer is a fact about the host, every edge holds it, and the client is told so rather than about a general failure.
     pub(crate) fn open(&self, target: &str) -> Result<Tunnel, Refusal> {
-        let (region, servers) = match self.cached() {
-            Some(pair) => pair,
-            None => {
-                let region = self.region()?;
-                let servers = self.servers(&region)?;
-                (region, servers)
-            }
+        let (region, servers) = if let Some(pair) = self.cached() {
+            pair
+        } else {
+            let region = self.region()?;
+            let servers = self.servers(&region)?;
+            (region, servers)
         };
         let count = servers.dials.len();
         let now = foxy_account::epoch();
