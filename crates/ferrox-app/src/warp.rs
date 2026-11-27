@@ -7011,9 +7011,10 @@ mod tests {
     #[test]
     fn a_canonical_connect_authority_is_not_rebuilt() {
         let asked = crate::proxy::Destination::Name("example.com".to_owned(), 443);
-        let (authority, counts) = ferrox_core::alloc_count::measure(|| connect_authority(&asked));
-        assert_eq!(authority.as_deref(), Some("example.com:443"));
-        assert_eq!(counts.allocs, 1);
+        let (authority, spelled) = ferrox_core::alloc_count::measure(|| asked.authority());
+        let (canonical, counts) = ferrox_core::alloc_count::measure(|| connect_authority(&asked));
+        assert_eq!(canonical.as_deref(), Some(authority.as_str()));
+        assert_eq!(counts.allocs, spelled.allocs);
         assert_eq!(
             connect_authority(&crate::proxy::Destination::Name(
                 "example.com.".to_owned(),
