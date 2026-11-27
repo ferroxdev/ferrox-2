@@ -15,7 +15,7 @@ use crate::xhttp::{XhttpMode, XhttpSettings};
 const TICK: Duration = Duration::from_millis(20);
 const POLL: Duration = Duration::from_millis(5);
 const READ_ROOM: usize = 16 * 1024;
-const H3_WRITE_CHUNK: usize = 16 * 1024;
+const H3_WRITE_CHUNK: usize = 32 * 1024;
 const H3_STREAM_CREATION_ERROR: u64 = 0x0103;
 const H3_CLOSED_CRITICAL_STREAM: u64 = 0x0104;
 const H3_FRAME_UNEXPECTED: u64 = 0x0105;
