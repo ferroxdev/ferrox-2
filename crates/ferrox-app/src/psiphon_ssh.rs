@@ -2293,7 +2293,7 @@ impl Session {
         self.open_payload_with_window(
             channel_type,
             &extra,
-            &format!("{host}:{port}"),
+            format_args!("{host}:{port}"),
             self.inner.channel_window,
             deadline,
         )
@@ -2422,7 +2422,7 @@ impl Session {
         &self,
         channel_type: &[u8],
         extra: &[u8],
-        target: &str,
+        target: impl std::fmt::Display,
         channel_window: u32,
         deadline: Option<Instant>,
     ) -> Result<Option<Channel>, String> {
@@ -2454,7 +2454,8 @@ impl Session {
         *lock(&state.open) = Some(tx);
         lock(&self.inner.channels).insert(local, Arc::clone(&state));
 
-        let mut payload = vec![MSG_CHANNEL_OPEN];
+        let mut payload = Vec::with_capacity(1 + 4 + channel_type.len() + 4 + 4 + 4 + extra.len());
+        payload.push(MSG_CHANNEL_OPEN);
         put_str(&mut payload, channel_type);
         put_u32(&mut payload, local);
         put_u32(&mut payload, channel_window);

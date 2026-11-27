@@ -177,7 +177,7 @@ fn endpoint_bytes(source: SocketAddr) -> ([u8; 18], usize) {
 /// A cached remote-DNS answer and the instant it stops being usable.
 #[derive(Debug)]
 struct Resolved {
-    addrs: Vec<IpAddr>,
+    addrs: Arc<[IpAddr]>,
     until: Instant,
 }
 
@@ -725,7 +725,17 @@ impl WireGuardOut {
     /// a peer routes. The stack caps how many it dials at once.
     fn destinations(&self, asked: &Destination) -> Vec<SocketAddr> {
         let mut addresses = match asked {
-            Destination::Address(address) => vec![*address],
+            Destination::Address(address) => {
+                if self
+                    .config
+                    .peers
+                    .iter()
+                    .any(|peer| peer.routes(address.ip()))
+                {
+                    return vec![*address];
+                }
+                return Vec::new();
+            }
             Destination::Name(host, port) => self.resolve(host, *port),
         };
         addresses.retain(|address| {
@@ -742,13 +752,13 @@ impl WireGuardOut {
             return vec![SocketAddr::new(address, port)];
         }
         self.lookup(host)
-            .into_iter()
-            .map(|address| SocketAddr::new(address, port))
+            .iter()
+            .map(|address| SocketAddr::new(*address, port))
             .collect()
     }
 
     /// Answers a name through the kernel when Linux exposes one, and through the tunnel's DNS exchange otherwise.
-    fn lookup(&self, host: &str) -> Vec<IpAddr> {
+    fn lookup(&self, host: &str) -> Arc<[IpAddr]> {
         let trimmed = host.strip_suffix('.').unwrap_or(host);
         let key = if trimmed.bytes().any(|byte| byte.is_ascii_uppercase()) {
             std::borrow::Cow::Owned(trimmed.to_ascii_lowercase())
@@ -759,7 +769,7 @@ impl WireGuardOut {
             && let Some(entry) = cache.get(key.as_ref())
             && entry.until > Instant::now()
         {
-            return entry.addrs.clone();
+            return Arc::clone(&entry.addrs);
         }
         #[cfg(target_os = "linux")]
         let answer = if self.kernel.is_some() {
@@ -770,6 +780,7 @@ impl WireGuardOut {
         #[cfg(not(target_os = "linux"))]
         let answer = self.query(host);
         let (addrs, ttl) = answer.unwrap_or_else(|| (Vec::new(), DNS_NEGATIVE_TTL));
+        let addrs: Arc<[IpAddr]> = addrs.into();
         if let Ok(mut cache) = self.resolved.lock() {
             if cache.len() >= DNS_CACHE {
                 cache.clear();
@@ -777,7 +788,7 @@ impl WireGuardOut {
             cache.insert(
                 key.into_owned(),
                 Resolved {
-                    addrs: addrs.clone(),
+                    addrs: Arc::clone(&addrs),
                     until: Instant::now() + Duration::from_secs(u64::from(ttl)),
                 },
             );
@@ -3910,24 +3921,21 @@ mod tests {
             targets.is_empty(),
             "a peer that routes nothing dials nothing"
         );
-        assert_eq!(
-            counts.allocs, 1,
-            "a literal's list is built before retain empties it"
-        );
+        assert_eq!(counts.allocs, 0, "an unrouted literal allocates no list");
         let addrs: Vec<IpAddr> = vec!["192.0.2.7".parse().unwrap()];
         wireguard.resolved.lock().unwrap().insert(
             "example.test".to_owned(),
             Resolved {
-                addrs: addrs.clone(),
+                addrs: addrs.clone().into(),
                 until: Instant::now() + Duration::from_secs(60),
             },
         );
         let (got, counts) = ferrox_core::alloc_count::measure(|| wireguard.lookup("example.test."));
-        assert_eq!(got, addrs);
-        assert_eq!(counts.allocs, 1, "only the answer clone, no lowercase key");
+        assert_eq!(got.as_ref(), addrs.as_slice());
+        assert_eq!(counts.allocs, 0, "a cache hit shares the answer");
         let (_, counts) = ferrox_core::alloc_count::measure(|| wireguard.lookup("Example.Test."));
         assert_eq!(
-            counts.allocs, 2,
+            counts.allocs, 1,
             "an uppercase name pays the lowercase copy"
         );
     }
@@ -3953,10 +3961,10 @@ mod tests {
             dns: vec!["127.0.0.1".parse().unwrap()],
         };
         let wireguard = WireGuardOut::new(config).expect("outbound");
-        assert_eq!(wireguard.lookup("missing.example"), Vec::<IpAddr>::new());
+        assert!(wireguard.lookup("missing.example").is_empty());
         let cache = wireguard.resolved.lock().expect("cache");
         let entry = cache.get("missing.example").expect("negative entry");
-        assert_eq!(entry.addrs, Vec::<IpAddr>::new());
+        assert!(entry.addrs.is_empty());
         assert!(entry.until > Instant::now());
     }
 

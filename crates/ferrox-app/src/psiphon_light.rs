@@ -2,6 +2,7 @@
 //! destination without an SSH tunnel, framed by a CBOR header and initial
 //! padding so the first records look like ordinary browser traffic.
 
+use std::fmt::Write as _;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -574,11 +575,16 @@ fn normalize_destination(host: &str, port: u16) -> Result<String, String> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(SocketAddr::new(ip, port).to_string());
     }
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let host = host.trim_end_matches('.');
     if host.is_empty() {
         return Err("psiphon light: destination host is empty".to_owned());
     }
-    Ok(format!("{host}:{port}"))
+    let mut target = String::with_capacity(host.len() + 6);
+    target.push_str(host);
+    target.make_ascii_lowercase();
+    target.push(':');
+    write!(target, "{port}").expect("a String write cannot fail");
+    Ok(target)
 }
 
 /// Map the reference platform name to its header code.
@@ -853,6 +859,7 @@ pub(crate) struct LightStream<T> {
     write_padding_done: bool,
     wire: Vec<u8>,
     wire_at: usize,
+    wire_init: usize,
     payload: std::ops::Range<usize>,
     pending: Vec<u8>,
     pending_at: usize,
@@ -868,6 +875,7 @@ impl<T> LightStream<T> {
             write_padding_done: false,
             wire: Vec::with_capacity(BUFFER),
             wire_at: 0,
+            wire_init: 0,
             payload: 0..0,
             pending: header,
             pending_at: 0,
@@ -906,7 +914,7 @@ impl<T: Read> Read for LightStream<T> {
             }
             let at = self.wire_at;
             if self.wire.len() - at < 2 {
-                if !fill(&mut self.inner, &mut self.wire)? {
+                if !self.fill()? {
                     return if at == self.wire.len() {
                         Ok(0)
                     } else {
@@ -922,7 +930,7 @@ impl<T: Read> Read for LightStream<T> {
                 continue;
             }
             if self.wire.len() - at < 4 {
-                if !fill(&mut self.inner, &mut self.wire)? {
+                if !self.fill()? {
                     return Err(truncated_frame());
                 }
                 continue;
@@ -936,7 +944,7 @@ impl<T: Read> Read for LightStream<T> {
             }
             let frame = 4 + usize::from(padding) + usize::from(payload);
             if self.wire.len() - at < frame {
-                if !fill(&mut self.inner, &mut self.wire)? {
+                if !self.fill()? {
                     return Err(truncated_frame());
                 }
                 continue;
@@ -978,16 +986,16 @@ fn truncated_frame() -> io::Error {
     )
 }
 
-/// Read one frame into `wire`, returning whether more frames remain.
-fn fill<T: Read>(inner: &mut T, wire: &mut Vec<u8>) -> io::Result<bool> {
-    let mut temp = [0u8; BUFFER];
-    match inner.read(&mut temp) {
-        Ok(0) => Ok(false),
-        Ok(count) => {
-            wire.extend_from_slice(&temp[..count]);
-            Ok(true)
-        }
-        Err(error) => Err(error),
+impl<T: Read> LightStream<T> {
+    /// Read one frame straight into the wire buffer, returning whether more frames remain.
+    fn fill(&mut self) -> io::Result<bool> {
+        let mut init = self.wire_init;
+        // SAFETY: every byte below `init` is initialised, and `init_room` zeroes the spare tail before the read writes it.
+        let read = unsafe {
+            crate::proxy::read_into_tail_room(&mut self.inner, &mut self.wire, &mut init, BUFFER)
+        };
+        self.wire_init = init;
+        read.map(|count| count != 0)
     }
 }
 
@@ -998,6 +1006,9 @@ impl<T: Write> Write for LightStream<T> {
             return Ok(0);
         }
         if self.write_padding_done {
+            if self.pending_len() == 0 && self.header_left == 0 && buf.len() <= MAX_RECORD {
+                return self.write_direct(buf);
+            }
             self.pending.extend_from_slice(buf);
             self.drain()?;
             return Ok(buf.len());
@@ -1043,6 +1054,29 @@ impl<T: Write> Write for LightStream<T> {
 }
 
 impl<T: Write> LightStream<T> {
+    /// Hand a record straight to the writer, staging only what it does not take, so an accepted write copies nothing.
+    fn write_direct(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self.inner.write(buf) {
+            Ok(0) => Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "psiphon light: TLS writer accepted no bytes",
+            )),
+            Ok(written) => {
+                if written < buf.len() {
+                    self.pending.extend_from_slice(&buf[written..]);
+                    self.drain()?;
+                }
+                Ok(buf.len())
+            }
+            Err(error) if idle(&error) => {
+                self.pending.extend_from_slice(buf);
+                self.drain()?;
+                Ok(buf.len())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Hand queued bytes to the TLS writer in 8-16 KiB records; false means a timeout.
     fn drain(&mut self) -> io::Result<bool> {
         while self.pending_at < self.pending.len() {
@@ -1078,6 +1112,82 @@ impl<T: Write> LightStream<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A read whose buffer is the wire buffer itself: the pointer it sees is where the bytes land, with no staging array in between.
+    #[test]
+    fn fill_reads_into_the_wire_buffer() {
+        struct Once {
+            seen: *const u8,
+            read: bool,
+        }
+        impl Read for Once {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.seen = buf.as_ptr();
+                if self.read {
+                    return Ok(0);
+                }
+                self.read = true;
+                buf[..4].copy_from_slice(b"data");
+                Ok(4)
+            }
+        }
+        let mut stream = LightStream::new(
+            Once {
+                seen: std::ptr::null(),
+                read: false,
+            },
+            Vec::new(),
+        );
+        assert!(stream.fill().expect("fills"), "the read returned bytes");
+        assert_eq!(stream.wire.as_slice(), &b"data"[..]);
+        assert_eq!(
+            stream.inner.seen,
+            stream.wire.as_ptr(),
+            "the read wrote at the wire buffer's base"
+        );
+    }
+
+    /// A destination is normalized into one allocation, with the lowercasing done in place.
+    #[test]
+    fn normalize_destination_allocates_once() {
+        let (target, counts) = ferrox_core::alloc_count::measure(|| {
+            normalize_destination("Example.COM.", 443).expect("destination")
+        });
+        assert_eq!(target, "example.com:443");
+        assert_eq!(counts.allocs, 1, "the target string is the only allocation");
+    }
+
+    /// A write after the opening goes straight to the writer, so the writer sees the caller's bytes rather than a staged copy.
+    #[test]
+    fn a_plain_write_goes_straight_to_the_writer() {
+        struct Once {
+            seen: *const u8,
+        }
+        impl Write for Once {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.seen = buf.as_ptr();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut stream = LightStream::new(
+            Once {
+                seen: std::ptr::null(),
+            },
+            Vec::new(),
+        );
+        stream.write_padding_done = true;
+        let data = b"payload";
+        assert_eq!(stream.write(data).expect("writes"), data.len());
+        assert_eq!(
+            stream.inner.seen,
+            data.as_ptr(),
+            "the writer saw the caller's buffer"
+        );
+        assert!(stream.pending.is_empty(), "nothing was staged");
+    }
 
     /// Encode a test proxy entry with the given fields.
     fn entry_bytes(fields: Vec<(Value, Value)>) -> Vec<u8> {

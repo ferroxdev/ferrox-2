@@ -8,6 +8,7 @@
 //! the stack when no tunnel does.
 
 use bytes::BufMut as _;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -1007,8 +1008,8 @@ fn uses_h1(tls: &TlsConfig) -> bool {
 fn open_h2(spec: &ClientSpec) -> Result<Inner, String> {
     let edge = resolve_edge(spec)?;
     let mut authority = authority(spec);
-    if spec.warp.is_some() && split_host_port(&authority).is_none() {
-        authority = format!("{authority}:443");
+    if spec.warp.is_some() && split_host_port(authority.as_ref()).is_none() {
+        authority = Cow::Owned(format!("{authority}:443"));
     }
     let tls = spec
         .tls
@@ -1020,7 +1021,7 @@ fn open_h2(spec: &ClientSpec) -> Result<Inner, String> {
         tls.insecure,
         spec.warp.as_ref(),
         edge,
-        &authority,
+        authority.as_ref(),
         &spec.path,
         &spec.headers,
         spec.tcp_mask.as_ref(),
@@ -1053,7 +1054,7 @@ fn open_h1(spec: &ClientSpec) -> Result<Inner, String> {
     let mut client = crate::masque_h1::Client::dial(
         tls,
         edge,
-        &authority,
+        authority.as_ref(),
         &spec.path,
         &spec.headers,
         spec.tcp_mask.as_ref(),
@@ -1082,7 +1083,7 @@ fn open_h2c(spec: &ClientSpec) -> Result<Inner, String> {
     let keepalive = spec.keepalive(H2_KEEPALIVE);
     let mut client = crate::masque_h2::Client::dial_cleartext(
         edge,
-        &authority,
+        authority.as_ref(),
         &spec.path,
         &spec.headers,
         spec.tcp_mask.as_ref(),
@@ -2334,7 +2335,7 @@ fn open_h3(conn: &mut QuicheConnection, spec: &ClientSpec) -> Result<(), String>
         b"connect-ip"
     };
     connectip::connect_ip_qpack_named_protocol(
-        &authority,
+        authority.as_ref(),
         &spec.path,
         protocol,
         &spec.headers,
@@ -2442,9 +2443,9 @@ fn send_data(conn: &mut QuicheConnection, stream: u64, bytes: &[u8]) -> Result<(
 }
 
 /// The request authority: configured host, else SNI, with a non-default port.
-fn authority(spec: &ClientSpec) -> String {
+fn authority(spec: &ClientSpec) -> Cow<'_, str> {
     if let Some(host) = &spec.host {
-        return host.clone();
+        return Cow::Borrowed(host.as_str());
     }
     let host = spec
         .tls
@@ -2452,12 +2453,12 @@ fn authority(spec: &ClientSpec) -> String {
         .map_or(spec.address.as_str(), |tls| tls.server_name.as_str());
     let default = if spec.tls.is_some() { 443 } else { 80 };
     if spec.port == default {
-        return host.to_owned();
+        return Cow::Borrowed(host);
     }
     if host.parse::<Ipv6Addr>().is_ok() {
-        return format!("[{host}]:{}", spec.port);
+        return Cow::Owned(format!("[{host}]:{}", spec.port));
     }
-    format!("{host}:{}", spec.port)
+    Cow::Owned(format!("{host}:{}", spec.port))
 }
 
 /// xray takes a subnet grant's first usable address rather than the raw bytes, so a proxy that assigns a range still names one host.
@@ -6812,7 +6813,11 @@ mod tests {
         )
         .expect("an outbound");
         let spec = ClientSpec::from(&outbound).expect("spec");
-        assert_eq!(authority(&spec), "edge.example:443");
+        assert_eq!(authority(&spec).as_ref(), "edge.example:443");
+        assert!(
+            matches!(authority(&spec), Cow::Borrowed(_)),
+            "a configured host is borrowed, not copied"
+        );
     }
 
     #[test]
