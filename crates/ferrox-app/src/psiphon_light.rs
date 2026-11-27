@@ -1002,10 +1002,9 @@ impl<T: Write> Write for LightStream<T> {
             self.drain()?;
             return Ok(buf.len());
         }
-        let mut frame = Vec::with_capacity(buf.len() + 2 + 17);
         let mut size = self.header_left + buf.len() + 2 + 17;
         if size > PADDING_MAX {
-            frame.extend_from_slice(&STOP_PADDING.to_be_bytes());
+            self.pending.extend_from_slice(&STOP_PADDING.to_be_bytes());
             self.write_padding_done = true;
         } else {
             size += 2;
@@ -1019,12 +1018,14 @@ impl<T: Write> Write for LightStream<T> {
                     "psiphon light: oversized frame",
                 ));
             }
-            frame.extend_from_slice(&(padding as u16).to_be_bytes());
-            frame.extend_from_slice(&(buf.len() as u16).to_be_bytes());
-            frame.resize(frame.len() + padding, 0);
+            self.pending
+                .extend_from_slice(&(padding as u16).to_be_bytes());
+            self.pending
+                .extend_from_slice(&(buf.len() as u16).to_be_bytes());
+            let end = self.pending.len() + padding;
+            self.pending.resize(end, 0);
         }
-        frame.extend_from_slice(buf);
-        self.pending.extend_from_slice(&frame);
+        self.pending.extend_from_slice(buf);
         self.drain()?;
         Ok(buf.len())
     }

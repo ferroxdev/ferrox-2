@@ -1516,10 +1516,11 @@ impl MeekHttp {
                 .map_err(|error| format!("psiphon meek write: {error}"))?;
             return Ok(());
         }
-        let mut head =
-            crate::foxy_account::request_head("POST", host, self.path, &headers, body.len());
+        let mut head: std::borrow::Cow<'_, [u8]> = std::borrow::Cow::Owned(
+            crate::foxy_account::request_head("POST", host, self.path, &headers, body.len()),
+        );
         if let Some(transform) = self.http_transform.as_deref().map(Vec::as_slice) {
-            head = crate::psiphon_dns::apply_bytes_transform(transform, &head)
+            head = crate::psiphon_dns::apply_bytes_transform(transform, head)
                 .map_err(|error| format!("psiphon meek transform: {error}"))?;
         }
         let deadline = request_deadline(timeout);
@@ -1533,7 +1534,7 @@ impl MeekHttp {
                 .ok_or_else(|| "psiphon meek has no connection".to_owned())?;
             let mut stream = DeadlineStream { stream, deadline };
             stream
-                .write_parts(&[&head, body])
+                .write_parts(&[head.as_ref(), body])
                 .and_then(|()| stream.flush())
                 .map_err(|error| format!("psiphon meek request: {error}"))?;
             let mut reader = BufReader::with_capacity(1024, &mut stream);
