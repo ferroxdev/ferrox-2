@@ -26,7 +26,7 @@ const HOP_HEAD: usize = 4_096;
 const DATAGRAM_BUF_MAX: usize = 256 * 1024;
 const SEND_WAIT: Duration = Duration::from_secs(10);
 /// What an empty turn on the lane's socket waits for a datagram, when nothing narrower is armed.
-const PUMP_WAIT: Duration = Duration::from_millis(1);
+const PUMP_WAIT: Duration = Duration::from_millis(5);
 /// The client's first unidirectional stream, carrying the SETTINGS that make the connection HTTP/3.
 const CONTROL_STREAM: u64 = 2;
 /// The ceiling of a QUIC frame header: two varints of at most eight bytes each. The request stream's window is this size and nothing larger, because a payload never passes through it — it lands in the buffer its reader uses.
