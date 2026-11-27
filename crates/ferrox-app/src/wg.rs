@@ -1267,13 +1267,25 @@ pub(crate) fn serve_inbound(
             "wireguard: the reference's server always serves a userspace stack; `noKernelTun` is not read here"
         );
     }
-    let socket = UdpSocket::bind(address)
-        .map_err(|error| format!("cannot bind wireguard `{address}`: {error}"))?;
-    let port = socket
-        .local_addr()
-        .map_err(|error| format!("wireguard `{address}` has no local address: {error}"))?
-        .port();
-    let _ = socket.set_read_timeout(Some(IO_TICK));
+    // A fixed loopback address is served in-process when an outer redirect dials it; any other bind keeps the socket.
+    let (transport, port) = if let Some(addr) = loopback_lane(address) {
+        let (to_inner, to_inner_rx) = mpsc::sync_channel(LANE_DEPTH);
+        let (from_inner, from_inner_rx) = mpsc::sync_channel(LANE_DEPTH);
+        register_inbound_lane(addr, to_inner, from_inner_rx);
+        (
+            Transport::Lane(Lane::new(from_inner, to_inner_rx)),
+            addr.port(),
+        )
+    } else {
+        let socket = UdpSocket::bind(address)
+            .map_err(|error| format!("cannot bind wireguard `{address}`: {error}"))?;
+        let port = socket
+            .local_addr()
+            .map_err(|error| format!("wireguard `{address}` has no local address: {error}"))?
+            .port();
+        let _ = socket.set_read_timeout(Some(IO_TICK));
+        (Transport::Socket(socket), port)
+    };
     let (packets_tx, packets_rx) = mpsc::channel();
     let (to_tunnel, from_tunnel) = mpsc::channel();
     let (recycle, recycled) = mpsc::channel();
@@ -1300,7 +1312,7 @@ pub(crate) fn serve_inbound(
     std::thread::spawn(move || {
         io(
             io_config,
-            Transport::Socket(socket),
+            transport,
             from_tunnel,
             io_packets,
             None,
@@ -1501,40 +1513,79 @@ enum Transport {
 /// A masque lane: an in-process pair to the outer tunnel's bridge, which owns
 /// the lease and re-leases on reconnect. The reader sends a transport record to
 /// `uplink`; the bridge wraps it for the outer and returns a reply on
-/// `downlink` already unwrapped, tagged with the server it dialled.
+/// `downlink` already unwrapped. Each record carries its own endpoint, so one
+/// inbound lane serves many peers without a loopback socket between them.
 pub(crate) struct Lane {
-    target: SocketAddr,
-    uplink: SyncSender<Vec<u8>>,
-    downlink: Receiver<Vec<u8>>,
+    uplink: SyncSender<(SocketAddr, Vec<u8>)>,
+    downlink: Receiver<(SocketAddr, Vec<u8>)>,
 }
 
 impl Lane {
     pub(crate) fn new(
-        target: SocketAddr,
-        uplink: SyncSender<Vec<u8>>,
-        downlink: Receiver<Vec<u8>>,
+        uplink: SyncSender<(SocketAddr, Vec<u8>)>,
+        downlink: Receiver<(SocketAddr, Vec<u8>)>,
     ) -> Self {
-        Self {
-            target,
-            uplink,
-            downlink,
-        }
+        Self { uplink, downlink }
     }
 
-    /// The next record from the outer, unwrapped by the bridge.
+    /// The next record from the outer, unwrapped by the bridge, with its endpoint.
     fn recv(&self) -> Option<(SocketAddr, Vec<u8>)> {
-        Some((self.target, self.downlink.try_recv().ok()?))
+        self.downlink.try_recv().ok()
     }
 
     /// Wait up to `timeout` for the next record, so an idle reader sleeps
     /// instead of spinning and a full downlink backpressures the bridge
     /// rather than buffering the whole transfer.
     fn recv_timeout(&self, timeout: Duration) -> Option<(SocketAddr, Vec<u8>)> {
-        match self.downlink.recv_timeout(timeout) {
-            Ok(payload) => Some((self.target, payload)),
-            Err(_) => None,
-        }
+        self.downlink.recv_timeout(timeout).ok()
     }
+}
+
+const LANE_DEPTH: usize = 256;
+
+/// Loopback `WireGuard` inbounds register an in-process lane so an outer stack's bare
+/// redirect reaches them without a loopback socket.
+static INBOUND_LANES: Mutex<Option<HashMap<SocketAddr, InboundLane>>> = Mutex::new(None);
+
+type LaneReader = Option<Receiver<(SocketAddr, Vec<u8>)>>;
+type LaneEnds = (SyncSender<(SocketAddr, Vec<u8>)>, LaneReader);
+
+struct InboundLane {
+    to_inner: SyncSender<(SocketAddr, Vec<u8>)>,
+    from_inner: Mutex<LaneReader>,
+}
+
+pub(crate) fn register_inbound_lane(
+    addr: SocketAddr,
+    to_inner: SyncSender<(SocketAddr, Vec<u8>)>,
+    from_inner: Receiver<(SocketAddr, Vec<u8>)>,
+) {
+    let mut guard = INBOUND_LANES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.get_or_insert_with(HashMap::new).insert(
+        addr,
+        InboundLane {
+            to_inner,
+            from_inner: Mutex::new(Some(from_inner)),
+        },
+    );
+}
+
+/// The shared sender and, on the first call only, the reply reader; the lane stays registered so
+/// every later peer re-clones the sender and one reader serves them all by endpoint.
+pub(crate) fn take_inbound_lane(addr: SocketAddr) -> Option<LaneEnds> {
+    let guard = INBOUND_LANES.lock().ok()?;
+    let lane = guard.as_ref()?.get(&addr)?;
+    let from_inner = lane.from_inner.lock().ok()?.take();
+    Some((lane.to_inner.clone(), from_inner))
+}
+
+fn loopback_lane(address: &str) -> Option<SocketAddr> {
+    address
+        .parse::<SocketAddr>()
+        .ok()
+        .filter(|addr| addr.ip().is_loopback() && addr.port() != 0)
 }
 
 impl Transport {
@@ -1564,7 +1615,7 @@ impl Transport {
                 let _ = socket.send_to(packet, send_endpoint(endpoint, self.ipv6()));
             }
             Self::Lane(lane) => {
-                let _ = lane.uplink.try_send(packet.to_vec());
+                let _ = lane.uplink.try_send((endpoint, packet.to_vec()));
             }
         }
     }
@@ -1575,7 +1626,7 @@ impl Transport {
             Self::Socket(socket) => send_batch(socket, self.ipv6(), endpoint, packets),
             Self::Lane(lane) => {
                 for packet in packets {
-                    let _ = lane.uplink.try_send(packet.clone());
+                    let _ = lane.uplink.try_send((endpoint, packet.clone()));
                 }
             }
         }

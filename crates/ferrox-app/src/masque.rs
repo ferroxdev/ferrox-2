@@ -272,8 +272,12 @@ const DOWNLINK_DEPTH: usize = 256;
 
 /// Hand a reply to the reader, dropping it when the reader is behind exactly as
 /// a bounded loopback socket would; false means the reader is gone.
-fn lane_deliver(downlink: &SyncSender<Vec<u8>>, payload: &[u8]) -> bool {
-    match downlink.try_send(payload.to_vec()) {
+fn lane_deliver(
+    downlink: &SyncSender<(SocketAddr, Vec<u8>)>,
+    target: SocketAddr,
+    payload: &[u8],
+) -> bool {
+    match downlink.try_send((target, payload.to_vec())) {
         Ok(()) | Err(mpsc::TrySendError::Full(_)) => true,
         Err(mpsc::TrySendError::Disconnected(_)) => false,
     }
@@ -284,8 +288,8 @@ fn lane_bridge(
     tunnel: &MasqueOut,
     target: SocketAddr,
     port: u16,
-    uplink: Receiver<Vec<u8>>,
-    downlink: SyncSender<Vec<u8>>,
+    uplink: Receiver<(SocketAddr, Vec<u8>)>,
+    downlink: SyncSender<(SocketAddr, Vec<u8>)>,
     ready: Option<Sender<Result<(), String>>>,
 ) {
     let mut ready = ready;
@@ -325,14 +329,14 @@ fn lane_bridge(
                 if let Some(datagram) = connectip::udp_from_packet(packet.packet())
                     && datagram.destination_port == port
                 {
-                    if !lane_deliver(&downlink, datagram.payload) {
+                    if !lane_deliver(&downlink, target, datagram.payload) {
                         return;
                     }
                     idle = false;
                 }
             }
             match uplink.try_recv() {
-                Ok(packet) => {
+                Ok((_endpoint, packet)) => {
                     wg_stack::lane_send(
                         inner.config.as_ref(),
                         port,
@@ -354,7 +358,7 @@ fn lane_bridge(
                     Ok(packet) => {
                         if let Some(datagram) = connectip::udp_from_packet(packet.packet())
                             && datagram.destination_port == port
-                            && !lane_deliver(&downlink, datagram.payload)
+                            && !lane_deliver(&downlink, target, datagram.payload)
                         {
                             return;
                         }
@@ -879,7 +883,7 @@ impl MasqueOut {
             .saturating_add(WARP_ASSIGN_WAIT)
             .saturating_add(Duration::from_secs(1));
         match ready_rx.recv_timeout(setup) {
-            Ok(Ok(())) => Ok(crate::wg::Lane::new(target, uplink, downlink)),
+            Ok(Ok(())) => Ok(crate::wg::Lane::new(uplink, downlink)),
             Ok(Err(reason)) => Err(format!("masque lane: {reason}")),
             Err(_) => Err("masque lane: the datagram lane did not start".to_owned()),
         }

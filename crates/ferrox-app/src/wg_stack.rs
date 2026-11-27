@@ -1942,8 +1942,23 @@ struct Listener {
     since: StdInstant,
 }
 
+pub(crate) enum UdpUplink {
+    Socket(UdpSocket),
+    Lane(SyncSender<(SocketAddr, Vec<u8>)>),
+}
+
+impl UdpUplink {
+    #[cfg(test)]
+    pub(crate) fn send(&self, payload: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Socket(socket) => socket.send(payload),
+            Self::Lane(_) => unreachable!("a lane record carries its own endpoint"),
+        }
+    }
+}
+
 struct UdpLane {
-    uplink: UdpSocket,
+    uplink: UdpUplink,
     head: Vec<u8>,
     stop: Arc<AtomicBool>,
     last_used: Arc<AtomicU64>,
@@ -2161,11 +2176,18 @@ impl ServerStack {
             lane
         };
         lane.last_used.store(now, Ordering::Relaxed);
-        let (head, payload) =
-            crate::proxy::socks_udp_parts(&mut lane.head, &dial, datagram.payload);
-        #[cfg(test)]
-        remember_server_datagram(head, payload);
-        let _ = crate::proxy::send_two(&lane.uplink, head, payload);
+        match &lane.uplink {
+            UdpUplink::Socket(socket) => {
+                let (head, payload) =
+                    crate::proxy::socks_udp_parts(&mut lane.head, &dial, datagram.payload);
+                #[cfg(test)]
+                remember_server_datagram(head, payload);
+                let _ = crate::proxy::send_two(socket, head, payload);
+            }
+            UdpUplink::Lane(to_inner) => {
+                let _ = to_inner.try_send((source, datagram.payload.to_vec()));
+            }
+        }
     }
 
     /// Drive the server interface and hand off every completed flow.
@@ -3238,12 +3260,7 @@ pub(crate) fn server_udp<T: Clone + Into<ToTunnel>>(
     out: &Outbound,
     to_tunnel: &T,
     headroom: usize,
-) -> Option<(UdpSocket, Arc<AtomicBool>)> {
-    let relay = UdpSocket::bind("127.0.0.1:0").ok()?;
-    let relay_address = relay.local_addr().ok()?;
-    let uplink = UdpSocket::bind("127.0.0.1:0").ok()?;
-    uplink.connect(relay_address).ok()?;
-    let reader = uplink.try_clone().ok()?;
+) -> Option<(UdpUplink, Arc<AtomicBool>)> {
     let (_, source, target) = flow;
     let outbound = match out {
         Outbound::Route(plan) => plan
@@ -3256,6 +3273,22 @@ pub(crate) fn server_udp<T: Clone + Into<ToTunnel>>(
             .into_owned(),
         other => other.clone(),
     };
+    // A bare redirect to a registered loopback lane carries the datagram in-process, skipping the relay.
+    if let Outbound::Freedom(freedom) = &outbound
+        && let Some((to_inner, reader)) = freedom
+            .plain_redirect()
+            .and_then(crate::wg::take_inbound_lane)
+    {
+        if let Some(from_inner) = reader {
+            spawn_lane_reader(target, from_inner, to_tunnel.clone().into(), headroom);
+        }
+        return Some((UdpUplink::Lane(to_inner), Arc::new(AtomicBool::new(false))));
+    }
+    let relay = UdpSocket::bind("127.0.0.1:0").ok()?;
+    let relay_address = relay.local_addr().ok()?;
+    let uplink = UdpSocket::bind("127.0.0.1:0").ok()?;
+    uplink.connect(relay_address).ok()?;
+    let reader = uplink.try_clone().ok()?;
     let _ = relay.set_read_timeout(Some(crate::budgets::udp_idle()));
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -3313,7 +3346,52 @@ pub(crate) fn server_udp<T: Clone + Into<ToTunnel>>(
             }
         }
     });
-    Some((uplink, stop))
+    Some((UdpUplink::Socket(uplink), stop))
+}
+
+/// Serve a registered inbound lane: raw replies from the inner arrive tagged with the peer they
+/// answer, so one reader routes every client without a loopback socket.
+fn spawn_lane_reader(
+    target: SocketAddr,
+    from_inner: Receiver<(SocketAddr, Vec<u8>)>,
+    tunnel: ToTunnel,
+    headroom: usize,
+) {
+    let stop = Arc::new(AtomicBool::new(false));
+    std::thread::spawn(move || {
+        loop {
+            let (source, payload) = match from_inner.recv_timeout(LANE_TICK) {
+                Ok(record) => record,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+            let mut source_bytes = [0u8; 16];
+            let mut destination_bytes = [0u8; 16];
+            let source_bytes = ip_bytes_into(target.ip(), &mut source_bytes);
+            let destination_bytes = ip_bytes_into(source.ip(), &mut destination_bytes);
+            let header = if source_bytes.len() == 4 {
+                IPV4_HEADER
+            } else {
+                IPV6_HEADER
+            };
+            let mut packet =
+                Vec::with_capacity(headroom + header + 8 + payload.len() + WG_TAG_SIZE);
+            packet.resize(headroom, 0);
+            let datagram = UdpDatagram {
+                source: source_bytes,
+                destination: destination_bytes,
+                source_port: target.port(),
+                destination_port: source.port(),
+                payload: &payload,
+            };
+            if !udp_datagram(&datagram, &mut packet) {
+                continue;
+            }
+            if tunnel.send_or_stop(packet, &stop).is_err() {
+                break;
+            }
+        }
+    });
 }
 
 fn socket_addr(bytes: &[u8], port: u16) -> Option<SocketAddr> {
@@ -4652,6 +4730,147 @@ mod tests {
             "not this device's address"
         );
         assert!(replies.try_recv().is_err(), "and no reply was sent");
+    }
+
+    /// A bare redirect to a registered loopback lane carries bytes in-process, with no socket.
+    #[test]
+    fn a_plain_redirect_reaches_a_registered_lane_without_a_socket() {
+        let (to_tunnel, replies) = std::sync::mpsc::channel();
+        let lane: SocketAddr = "127.0.0.2:40001".parse().unwrap();
+        let (to_inner, to_inner_rx) = std::sync::mpsc::sync_channel(8);
+        let (from_inner, from_inner_rx) = std::sync::mpsc::sync_channel(8);
+        crate::wg::register_inbound_lane(lane, to_inner, from_inner_rx);
+
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds":[{{"protocol":"freedom","settings":{{"redirect":"{lane}"}}}}]}}"#
+        ))
+        .expect("a freedom outbound");
+        let freedom = crate::proxy::find_freedom_outbound(&root)
+            .expect("the outbound reads")
+            .expect("a freedom outbound");
+        let out = Outbound::Freedom(Arc::new(freedom));
+
+        let source: SocketAddr = "10.0.0.2:1234".parse().unwrap();
+        let started = StdInstant::now();
+        let last_used = Arc::new(AtomicU64::new(0));
+        let (uplink, stop) = server_udp(
+            ([0x11; 32], source, lane),
+            lane,
+            started,
+            &last_used,
+            &out,
+            &to_tunnel,
+            0,
+        )
+        .expect("lane");
+        let UdpUplink::Lane(to_inner) = &uplink else {
+            panic!("the redirect resolved to a socket, not an in-process lane");
+        };
+
+        to_inner.try_send((source, b"ping".to_vec())).expect("send");
+        assert_eq!(
+            to_inner_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the inner stack sees the raw payload, with its endpoint"),
+            (source, b"ping".to_vec())
+        );
+
+        from_inner.send((source, b"pong".to_vec())).expect("reply");
+        let packet = replies.recv_timeout(Duration::from_secs(5)).expect("reply");
+        let datagram = udp_from_packet(&packet).expect("inner datagram");
+        assert_eq!(datagram.payload, b"pong");
+        assert_eq!(datagram.source, ip_bytes(lane.ip()));
+        assert_eq!(datagram.source_port, lane.port());
+        assert_eq!(datagram.destination, ip_bytes(source.ip()));
+        assert_eq!(datagram.destination_port, source.port());
+        stop.store(true, Ordering::Relaxed);
+    }
+
+    /// One registered lane serves every peer: the first takes the reader, later ones re-clone the
+    /// sender, and a reply is routed by the peer it names rather than the peer that opened it.
+    #[test]
+    fn a_shared_lane_routes_each_peers_reply() {
+        let (to_tunnel, replies) = std::sync::mpsc::channel();
+        let lane: SocketAddr = "127.0.0.2:40002".parse().unwrap();
+        let (to_inner, to_inner_rx) = std::sync::mpsc::sync_channel(8);
+        let (from_inner, from_inner_rx) = std::sync::mpsc::sync_channel(8);
+        crate::wg::register_inbound_lane(lane, to_inner, from_inner_rx);
+
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds":[{{"protocol":"freedom","settings":{{"redirect":"{lane}"}}}}]}}"#
+        ))
+        .expect("a freedom outbound");
+        let freedom = crate::proxy::find_freedom_outbound(&root)
+            .expect("the outbound reads")
+            .expect("a freedom outbound");
+        let out = Outbound::Freedom(Arc::new(freedom));
+
+        let a: SocketAddr = "10.0.0.2:1000".parse().unwrap();
+        let b: SocketAddr = "10.0.0.3:2000".parse().unwrap();
+        let started = StdInstant::now();
+        let used_a = Arc::new(AtomicU64::new(0));
+        let used_b = Arc::new(AtomicU64::new(0));
+        let (up_a, _) = server_udp(
+            ([0x11; 32], a, lane),
+            lane,
+            started,
+            &used_a,
+            &out,
+            &to_tunnel,
+            0,
+        )
+        .expect("lane a");
+        let (up_b, _) = server_udp(
+            ([0x22; 32], b, lane),
+            lane,
+            started,
+            &used_b,
+            &out,
+            &to_tunnel,
+            0,
+        )
+        .expect("lane b");
+        let UdpUplink::Lane(tx_a) = &up_a else {
+            panic!("peer a is not on a lane");
+        };
+        let UdpUplink::Lane(tx_b) = &up_b else {
+            panic!("peer b is not on a lane");
+        };
+
+        tx_a.try_send((a, b"A".to_vec())).expect("a sends");
+        tx_b.try_send((b, b"B".to_vec())).expect("b sends");
+        let mut seen = vec![
+            to_inner_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("a reaches the inner"),
+            to_inner_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("b reaches the inner"),
+        ];
+        seen.sort();
+        assert_eq!(seen, vec![(a, b"A".to_vec()), (b, b"B".to_vec())]);
+
+        from_inner.send((b, b"rb".to_vec())).expect("reply b");
+        from_inner.send((a, b"ra".to_vec())).expect("reply a");
+        for _ in 0..2 {
+            let packet = replies
+                .recv_timeout(Duration::from_secs(5))
+                .expect("a reply");
+            let datagram = udp_from_packet(&packet).expect("datagram");
+            match datagram.destination_port {
+                2000 => {
+                    assert_eq!(datagram.destination, ip_bytes(b.ip()));
+                    assert_eq!(datagram.payload, b"rb");
+                }
+                1000 => {
+                    assert_eq!(datagram.destination, ip_bytes(a.ip()));
+                    assert_eq!(datagram.payload, b"ra");
+                }
+                other => panic!("unexpected reply to port {other}"),
+            }
+            assert_eq!(datagram.source, ip_bytes(lane.ip()));
+            assert_eq!(datagram.source_port, lane.port());
+        }
     }
 
     /// An echo to the server's own tunnel address is answered locally.

@@ -6629,6 +6629,25 @@ impl FreedomOut {
             && self.final_rules.is_empty()
     }
 
+    /// The literal address a bare redirect names, when nothing else would rewrite the
+    /// datagram. A registered loopback lane can then be reached without a socket.
+    pub(crate) fn plain_redirect(&self) -> Option<SocketAddr> {
+        if self.domain != FreedomDomain::AsIs
+            || self.proxy_protocol != 0
+            || self.fragment.is_some()
+            || !self.noises.is_empty()
+            || !self.final_rules.is_empty()
+        {
+            return None;
+        }
+        match &self.redirect {
+            Some(FreedomRedirect::Address(host, port)) if *port != 0 => {
+                Some(SocketAddr::new(host.parse().ok()?, *port))
+            }
+            _ => None,
+        }
+    }
+
     /// Whether this lane carries block or allow rules a direct handler that reads only the default
     /// lane would silently skip.
     fn has_final_rules(&self) -> bool {
