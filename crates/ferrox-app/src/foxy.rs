@@ -33,7 +33,7 @@ const CONTROL_STREAM: u64 = 2;
 const H3_PEEK: usize = 16;
 /// The largest frame block the lane will consume without keeping it: a HEADERS answer's block and any frame the tunnel has no use for are bounded by one head, so a peer cannot make the lane wait on a block bigger than a header.
 const H3_SKIP: usize = MAX_HEAD;
-const H3_FRAME: usize = 32 * 1024;
+const H3_FRAME: usize = 16 * 1024;
 
 /// The carriers the lane can carry, in `auto`'s preference order: HTTP/2 (the edge speaks it and a resumed TCP session carries the bytes), HTTP/1.1 (every edge does), QUIC (one handshake carries every flow, and it is the only carrier that carries a datagram).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
