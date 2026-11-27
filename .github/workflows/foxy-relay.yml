@@ -1022,6 +1022,8 @@ jobs:
           MAX_EDGES: '3'
           SESSIONS: '3'
           ROUNDS: '2'
+          DOWN_BYTES: '20971520'
+          UP_BYTES: '16777216'
         run: |
           BIN="$PWD/target/release/ferrox-app"
           : > target/foxy-ab/legs.tsv
@@ -1042,7 +1044,7 @@ jobs:
               OUT="$PWD/target/foxy-ab/legs.tsv" \
               RES_OUT="$PWD/target/foxy-ab/resources.tsv" \
               PROBES_OUT="$PWD/target/foxy-ab/probes.tsv" \
-              ROUNDS="$ROUNDS" LATENCY_PROBES=10 \
+              ROUNDS="$ROUNDS" LATENCY_PROBES=20 \
               scripts/foxy-ab/run.sh || echo "::warning::the $carrier session $session did not finish"
               if [ -z "$EDGE_USED" ]; then
                 EDGE_USED=$(awk -F'\t' -v c="$carrier" '$1==c && $2=="ferrox"{print $5; exit}' target/foxy-ab/resources.tsv)

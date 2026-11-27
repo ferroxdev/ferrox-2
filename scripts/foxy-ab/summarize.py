@@ -291,7 +291,7 @@ def main():
             f_per_mib = ferrox.get("cpu_ms_per_mib")
             a_per_mib = arman.get("cpu_ms_per_mib")
             if f_per_mib and a_per_mib:
-                cell["ferrox_cpu_per_mib_over_arman"] = ratio(a_per_mib, f_per_mib)
+                cell["arman_cpu_per_mib_over_ferrox"] = ratio(a_per_mib, f_per_mib)
             cell["ferrox_rss_over_arman"] = ratio(
                 ferrox["peak_rss_kib"], arman["peak_rss_kib"]
             )
