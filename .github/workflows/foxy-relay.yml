@@ -1020,8 +1020,8 @@ jobs:
           FOXY_COUNTRY: ${{ inputs.country || vars.FOXY_COUNTRY || 'US' }}
           FOXY_AB_TIMEOUT: '30'
           MAX_EDGES: '3'
-          SESSIONS: '3'
-          ROUNDS: '2'
+          SESSIONS: '5'
+          ROUNDS: '3'
           DOWN_BYTES: '20971520'
           UP_BYTES: '16777216'
         run: |

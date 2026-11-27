@@ -13,7 +13,7 @@ use crate::quic::{self, Activity, Datagram, QuicheConnection};
 use crate::xhttp::{XhttpMode, XhttpSettings};
 
 const TICK: Duration = Duration::from_millis(20);
-const POLL: Duration = Duration::from_millis(5);
+const POLL: Duration = Duration::from_millis(1);
 const READ_ROOM: usize = 16 * 1024;
 const H3_WRITE_CHUNK: usize = 32 * 1024;
 const H3_STREAM_CREATION_ERROR: u64 = 0x0103;
