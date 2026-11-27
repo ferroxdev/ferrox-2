@@ -50,6 +50,10 @@ on:
         description: commit or branch to test (empty means the dispatched ref)
         required: false
         default: ""
+      ab:
+        description: also run the ferrox-vs-arman A/B on ubuntu (same pass, same edge and edge IP)
+        type: boolean
+        default: false
 
 # One account, so every relay and the allowance probe take turns: a second
 # client downloading while a transfer is bracketed is charged to the bracket.
@@ -957,6 +961,104 @@ jobs:
             echo "### Lane CPU and peak RSS, live (${{ matrix.os }})"
             echo "$resources"
           fi
+
+  foxy-ab:
+    name: Foxy A/B, ferrox vs arman (ubuntu)
+    needs: [plan, foxy-relay]
+    # Manual only, and only when the dispatch asks: this spends the account's
+    # quota on both engines and its numbers are read, never gated. It waits for
+    # the relay matrix because one account means one client at a time: a second
+    # client downloading would be charged to the relay's bracketed transfer.
+    if: always() && inputs.ab == true && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check secrets present
+        id: secrets
+        env:
+          FOXY_EMAIL: ${{ secrets.FOXY_EMAIL || secrets.USERNAME }}
+          FOXY_PASS: ${{ secrets.FOXY_PASS || secrets.PASSWORD }}
+        run: |
+          if [ -z "$FOXY_EMAIL" ] || [ -z "$FOXY_PASS" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::the account secrets are missing; skipping the A/B."
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: foxy-ab
+      - name: Build ferrox-app (release)
+        if: steps.secrets.outputs.present == 'true'
+        run: cargo build --locked --release -p ferrox-app
+      - name: Fetch the arman pin
+        if: steps.secrets.outputs.present == 'true'
+        run: ./scripts/fetch-upstream.sh --only arman-vpn-client
+      - uses: actions/setup-go@v5
+        if: steps.secrets.outputs.present == 'true'
+        with:
+          go-version-file: upstream/arman-vpn-client/core/go.mod
+          cache-dependency-path: upstream/arman-vpn-client/core/go.sum
+      - name: Build the arman A/B driver
+        if: steps.secrets.outputs.present == 'true'
+        run: |
+          mkdir -p target/foxy-ab
+          cp scripts/foxy-ab/arman_foxy_ab_test.go \
+            upstream/arman-vpn-client/core/internal/proxy/
+          cd upstream/arman-vpn-client/core
+          GOTOOLCHAIN=auto go test -c -o "$GITHUB_WORKSPACE/target/foxy-ab/arman.test" ./internal/proxy
+      - name: A/B h2 and h3 on the same edge
+        if: steps.secrets.outputs.present == 'true'
+        env:
+          FOXY_EMAIL: ${{ secrets.FOXY_EMAIL || secrets.USERNAME }}
+          FOXY_PASS: ${{ secrets.FOXY_PASS || secrets.PASSWORD }}
+          FOXY_CODE: ${{ secrets.FOXY_CODE }}
+          FOXY_COUNTRY: ${{ inputs.country || vars.FOXY_COUNTRY || 'US' }}
+          FOXY_AB_TIMEOUT: '30'
+          MAX_EDGES: '3'
+        run: |
+          BIN="$PWD/target/release/ferrox-app"
+          : > target/foxy-ab/legs.tsv
+          : > target/foxy-ab/resources.tsv
+          : > target/foxy-ab/probes.tsv
+          for carrier in h2 h3; do
+            CARRIER="$carrier" python3 -c 'import json,os; doc={"inbounds":[],"outbounds":[{"protocol":"foxy","settings":{"email":os.environ["FOXY_EMAIL"],"password":os.environ["FOXY_PASS"],"code":os.environ.get("FOXY_CODE",""),"country":os.environ["FOXY_COUNTRY"],"carrier":os.environ["CARRIER"]}}]}; json.dump(doc, open("foxy-mint.json","w"))'
+            chmod 600 foxy-mint.json
+            "$BIN" mint-foxy-pass -c foxy-mint.json -o target/foxy-ab/foxy-pass.json
+            chmod 600 target/foxy-ab/foxy-pass.json
+            rm -f foxy-mint.json
+            FERROX_BIN="$BIN" \
+            ARMAN_TEST="$PWD/target/foxy-ab/arman.test" \
+            PASS_FILE="$PWD/target/foxy-ab/foxy-pass.json" \
+            CARRIER="$carrier" COUNTRY="$FOXY_COUNTRY" \
+            OUT="$PWD/target/foxy-ab/legs.tsv" \
+            RES_OUT="$PWD/target/foxy-ab/resources.tsv" \
+            PROBES_OUT="$PWD/target/foxy-ab/probes.tsv" \
+            LATENCY_PROBES=15 \
+            scripts/foxy-ab/run.sh || echo "::warning::the $carrier leg did not finish"
+          done
+          python3 scripts/foxy-ab/summarize.py \
+            --legs target/foxy-ab/legs.tsv \
+            --resources target/foxy-ab/resources.tsv \
+            --probes target/foxy-ab/probes.tsv \
+            --json target/foxy-ab/summary.json | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Upload the A/B evidence
+        if: always() && steps.secrets.outputs.present == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: foxy-ab
+          path: |
+            target/foxy-ab/legs.tsv
+            target/foxy-ab/resources.tsv
+            target/foxy-ab/probes.tsv
+            target/foxy-ab/summary.json
+            target/foxy-ab/work-*/ferrox.log
+            target/foxy-ab/work-*/arman.log
+          if-no-files-found: ignore
 
   result:
     name: result

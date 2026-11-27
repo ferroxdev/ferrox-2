@@ -178,3 +178,13 @@ path          = "app"
 test_enabled  = false
 ferrox_binary = ""
 note          = "Android VPN client for VLESS, REALITY, XHTTP, Cloudflare WARP, Tailscale and AmneziaWG, powered by a sing-box fork; the client-side superset and config shapes to read against"
+
+[sources.arman-vpn-client]
+repo          = "https://github.com/armanlife/arman-vpn-client"
+rev           = "48228f9277d10067fcc231de68938d838c485694"
+topics        = "foxy, masque, h1, h2, h3, socks, go"
+default_branch = "main"
+path          = "core"
+test_enabled  = false
+ferrox_binary = ""
+note          = "the Go core of a second Firefox-VPN client: its own h1/h2/h3 MASQUE sessions, utls and a 64 KiB relay buffer. Read as the A/B comparator in foxy-relay.yml's foxy-ab job, which drives its h2/h3 session directly behind its own SOCKS server with the pass ferrox minted, so both engines dial the same edge and credential. No suite seam injects ferrox-app."
