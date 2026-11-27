@@ -31,11 +31,10 @@ except ImportError:
 PALETTE = {
     "ferrox": "#F58518",
     "xray-core": "#4C78A8",
-    "zeronet": "#54A24B",
     "sing-box": "#E45756",
     "xray-rust": "#B279A2",
 }
-CORE_ORDER = ["ferrox", "xray-core", "zeronet", "sing-box", "xray-rust"]
+CORE_ORDER = ["ferrox", "xray-core", "sing-box", "xray-rust"]
 
 
 def load_records(path):

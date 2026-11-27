@@ -60,7 +60,7 @@ LIST_KEYS = ("methods", "scenarios", "go_packages", "suites_skipped", "engines")
 # leaves out are engines it has recorded as unable to serve the method, so a cell
 # need not build, fetch or probe them. `xray-core` is not optional: the harness
 # refuses a comparison without it.
-ENGINES = ("xray-core", "sing-box", "zeronet", "xray-core-rust", "xray-rust", "leaf", "aether")
+ENGINES = ("xray-core", "sing-box", "xray-core-rust", "xray-rust", "leaf", "aether")
 REFERENCE = "xray-core"
 
 # The data files whose every row names its own page in the first column: a hunk
@@ -1007,9 +1007,9 @@ def cmd_selftest(args: argparse.Namespace) -> int:
              "vmess_over_raw_tcp trojan_over_raw_tcp")
     for label, got, want in [
         ("a suite narrows to the names in scope",
-         filter_suite("zeronet", suite, ["vmess"]),
+         filter_suite("xray-rust", suite, ["vmess"]),
          "cargo test -p p --test t -- --ignored --test-threads=1 vmess_over_raw_tcp"),
-        ("a pin with no name in scope is skipped", filter_suite("zeronet", suite, ["kcp"]), ""),
+        ("a pin with no name in scope is skipped", filter_suite("xray-rust", suite, ["kcp"]), ""),
         ("a pin-qualified pattern stays with its pin",
          "yes" if matches("xray-rust", "rust_socks_vless_reality",
                           ["xray-rust-hysteria=auth"]) else "no", "no"),
@@ -1031,7 +1031,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         "vmess-raw-tcp-latency-1",
     ]
     ok = plan["scenarios"] == vmess_cells and len(plan["rows"]) == 7 \
-        and "vmess_over_raw_tcp_matches_the_oracle" in plan["suites"].get("zeronet", "") \
+        and "TestVMessGCM" in plan["suites"].get("xray-core", "") \
         and "vmess" not in plan["suites"].get("xray-rust", "") \
         and "rust_" not in plan["suites"].get("xray-rust", "") \
         and plan["suites_skipped"] == ["xray-rust", "xray-rust-hysteria"]
@@ -1041,7 +1041,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
           f"suites {sorted(plan['suites'])})")
     shared = build_plan(root, ["crates/ferrox-core/src/record.rs"])
     ok = len(shared["rows"]) == 4 and len(shared["scenarios"]) == 53 \
-        and "trojan_over_raw_tcp_matches_the_oracle" in shared["suites"]["zeronet"] \
+        and "TestSimpleTLSConnectionPinned" in shared["suites"]["xray-core"] \
         and shared["go_packages"] == ["./common/crypto/..."]
     failed += 0 if ok else 1
     print(f"selftest: {'ok  ' if ok else 'FAIL'} the record layer owes every method "
@@ -1104,7 +1104,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
     # probes; a page that says nothing keeps the tier's whole set.
     for label, changed, want in [
         ("a page's own plan carries only its proven comparators",
-         ["crates/ferrox-app/src/vmess.rs"], ["xray-core", "zeronet"]),
+         ["crates/ferrox-app/src/vmess.rs"], ["xray-core"]),
         ("a page that declares nothing keeps every comparator",
          ["crates/ferrox-app/src/ws.rs"], []),
         ("a plan of both keeps every comparator",

@@ -4,8 +4,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 filter="${1:-${BASELINE_SUITES:-all}}"
-if [[ "$filter" != "all" && "$filter" != "zeronet" && "$filter" != "xray-rust" ]]; then
-  echo "::error::unknown suite '$filter'; want all|zeronet|xray-rust"
+if [[ "$filter" != "all" && "$filter" != "xray-rust" ]]; then
+  echo "::error::unknown suite '$filter'; want all|xray-rust"
   exit 1
 fi
 pins_file="upstream/pins.toml"
@@ -51,7 +51,7 @@ if ! cargo build --locked -q -p ferrox-app 2>/dev/null; then
 fi
 
 workspace="$PWD"
-for name in zeronet xray-rust; do
+for name in xray-rust; do
   if [[ "$filter" != "all" && "$filter" != "$name" ]]; then
     continue
   fi

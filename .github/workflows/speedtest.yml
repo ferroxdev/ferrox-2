@@ -31,7 +31,7 @@ on:
       cores:
         description: "Comma-separated subset to drive"
         required: false
-        default: "ferrox,xray-core,zeronet,sing-box,xray-rust"
+        default: "ferrox,xray-core,sing-box,xray-rust"
         type: string
       curl_max_time:
         description: "Seconds before one download is declared stalled"
@@ -76,7 +76,7 @@ jobs:
       - name: check the upstream pins resolve
         run: ./scripts/check-upstream-pins.sh
       - name: fetch the pinned comparator trees
-        run: ./scripts/fetch-upstream.sh --only xray-core,sing-box,zeronet,xray-rust
+        run: ./scripts/fetch-upstream.sh --only xray-core,sing-box,xray-rust
       - name: install the chart dependency
         run: pip install -r scripts/requirements-benchmark.txt
       - name: hand the run its configs (masked before anything runs)

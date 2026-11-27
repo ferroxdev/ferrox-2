@@ -207,6 +207,6 @@ What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`]
 <!-- scope:begin -->
 - paths: crates/ferrox-core/src/record.rs, crates/ferrox-core/src/aead.rs, crates/ferrox-core/src/poly1305.rs, crates/ferrox-core/src/chacha/*, crates/ferrox-core/src/aesgcm/*
 - scenarios: vless-raw, vmess-raw, trojan-raw, shadowsocks-raw
-- oracle: over_raw_tcp
+- oracle: tls
 - go: ./common/crypto/...
 <!-- scope:end -->

@@ -175,6 +175,6 @@ What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`]
 - paths: crates/ferrox-app/src/httpupgrade.rs, scripts/httpupgrade-oracle/*
 - symbols: httpupgrade
 - scenarios: vless-httpupgrade
-- oracle: http_upgrade, httpupgrade
+- oracle: httpupgrade
 - go: ./transport/internet/httpupgrade/...
 <!-- scope:end -->
