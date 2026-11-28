@@ -3933,10 +3933,60 @@ mod tests {
         let (got, counts) = ferrox_core::alloc_count::measure(|| wireguard.lookup("example.test."));
         assert_eq!(got.as_ref(), addrs.as_slice());
         assert_eq!(counts.allocs, 0, "a cache hit shares the answer");
+        let again = wireguard.lookup("example.test.");
+        assert!(Arc::ptr_eq(&got, &again), "the cache hands out one Arc");
         let (_, counts) = ferrox_core::alloc_count::measure(|| wireguard.lookup("Example.Test."));
         assert_eq!(
             counts.allocs, 1,
             "an uppercase name pays the lowercase copy"
+        );
+    }
+
+    fn lookup_shared_probe(wireguard: &WireGuardOut) -> usize {
+        let mut sum = 0;
+        for _ in 0..4096 {
+            let addrs = wireguard.lookup("example.test.");
+            sum += std::hint::black_box(&addrs).len();
+        }
+        sum
+    }
+
+    #[inline(never)]
+    fn lookup_clone_probe(wireguard: &WireGuardOut) -> usize {
+        let mut sum = 0;
+        for _ in 0..4096 {
+            let addrs = wireguard.lookup("example.test.").to_vec();
+            sum += std::hint::black_box(&addrs).len();
+        }
+        sum
+    }
+
+    /// A cache hit shares the Arc, where the Vec cache it replaces copied every answer.
+    #[test]
+    fn the_shared_lookup_costs_no_clone_where_a_vec_does() {
+        let config = DeviceConfig {
+            secret: [0x55; 32],
+            addresses: vec!["10.0.0.2".parse().unwrap()],
+            peers: Vec::new(),
+            mtu: 1420,
+            reserved: [0; 3],
+            is_client: Some(true),
+            no_kernel_tun: true,
+            large_segments: false,
+            dns: Vec::new(),
+        };
+        let wireguard = WireGuardOut::with_dns_port(config, 0).expect("outbound");
+        let addrs: Arc<[IpAddr]> = vec!["192.0.2.7".parse().unwrap()].into();
+        wireguard.resolved.lock().unwrap().insert(
+            "example.test".to_owned(),
+            Resolved {
+                addrs,
+                until: Instant::now() + Duration::from_secs(60),
+            },
+        );
+        assert_eq!(
+            lookup_shared_probe(&wireguard),
+            lookup_clone_probe(&wireguard)
         );
     }
 

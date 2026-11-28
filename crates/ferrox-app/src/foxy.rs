@@ -4567,7 +4567,8 @@ mod tests {
     /// The H3 opening is one static byte sequence, so two connections share its addresses instead of each copying the same bytes.
     #[test]
     fn the_h3_opening_is_shared_static_bytes() {
-        let first = H3::h3_opening();
+        let (first, counts) = ferrox_core::alloc_count::measure(H3::h3_opening);
+        assert_eq!(counts.allocs, 0, "the opening is static, not built");
         let second = H3::h3_opening();
         for (one, two) in first.iter().zip(second.iter()) {
             assert_eq!(one.0, two.0);
@@ -4579,6 +4580,38 @@ mod tests {
         );
         assert_eq!(first[1].1, &[0x02][..]);
         assert_eq!(first[2].1, &[0x03][..]);
+    }
+
+    fn h3_static_probe() -> usize {
+        let mut sum = 0;
+        for _ in 0..4096 {
+            for (_, bytes) in H3::h3_opening() {
+                sum += std::hint::black_box(bytes).len();
+            }
+        }
+        sum
+    }
+
+    #[inline(never)]
+    fn h3_built_probe() -> usize {
+        let mut sum = 0;
+        for _ in 0..4096 {
+            let opening = [
+                std::hint::black_box(H3_CONTROL_OPENING.to_vec()),
+                std::hint::black_box(H3_ENCODER_OPENING.to_vec()),
+                std::hint::black_box(H3_DECODER_OPENING.to_vec()),
+            ];
+            for bytes in &opening {
+                sum += bytes.len();
+            }
+        }
+        sum
+    }
+
+    /// The static opening is the same bytes as three built buffers, without the builds.
+    #[test]
+    fn the_static_opening_costs_no_build_where_three_vectors_do() {
+        assert_eq!(h3_static_probe(), h3_built_probe());
     }
 
     /// A `Read` source that answers a whole buffer in one call and counts the calls it got: the read count is exact here, which is what a loopback socket cannot promise.

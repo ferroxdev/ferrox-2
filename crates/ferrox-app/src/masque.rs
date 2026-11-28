@@ -6821,6 +6821,65 @@ mod tests {
     }
 
     #[test]
+    fn the_authority_borrows_the_default_port_and_copies_only_a_non_default_one() {
+        let default = crate::json::parse(
+            r#"{"settings":{"address":"127.0.0.1","port":443},"streamSettings":{"security":"tls","tlsSettings":{"serverName":"localhost","allowInsecure":true}}}"#,
+        )
+        .expect("the default-port outbound");
+        let spec = ClientSpec::from(&default).expect("the default-port spec");
+        let (value, counts) = ferrox_core::alloc_count::measure(|| authority(&spec));
+        assert_eq!(value.as_ref(), "localhost");
+        assert!(matches!(value, Cow::Borrowed(_)));
+        assert_eq!(counts.allocs, 0, "the default port is borrowed");
+        let custom = crate::json::parse(
+            r#"{"settings":{"address":"127.0.0.1","port":8443},"streamSettings":{"security":"tls","tlsSettings":{"serverName":"localhost","allowInsecure":true}}}"#,
+        )
+        .expect("the custom-port outbound");
+        let spec = ClientSpec::from(&custom).expect("the custom-port spec");
+        let (value, counts) = ferrox_core::alloc_count::measure(|| authority(&spec));
+        assert_eq!(value.as_ref(), "localhost:8443");
+        assert!(matches!(value, Cow::Owned(_)));
+        assert_eq!(counts.allocs, 1, "only the non-default port is built");
+    }
+
+    fn authority_borrow_probe(spec: &ClientSpec) -> usize {
+        let mut sum = 0;
+        for _ in 0..4096 {
+            let value = authority(std::hint::black_box(spec));
+            sum += std::hint::black_box(value.as_ref()).len();
+        }
+        sum
+    }
+
+    #[inline(never)]
+    fn authority_built_probe(host: &str, port: u16, default: bool) -> usize {
+        let mut sum = 0;
+        for _ in 0..4096 {
+            let value = if default {
+                std::hint::black_box(host).to_owned()
+            } else {
+                format!("{}:{port}", std::hint::black_box(host))
+            };
+            sum += std::hint::black_box(value.as_str()).len();
+        }
+        sum
+    }
+
+    /// The default-port authority is the configured host itself, not a copy of it.
+    #[test]
+    fn the_borrowed_authority_costs_no_copy_where_the_built_one_does() {
+        let outbound = crate::json::parse(
+            r#"{"settings":{"address":"127.0.0.1","port":443},"streamSettings":{"security":"tls","tlsSettings":{"serverName":"localhost","allowInsecure":true}}}"#,
+        )
+        .expect("the default-port outbound");
+        let spec = ClientSpec::from(&outbound).expect("the default-port spec");
+        assert_eq!(
+            authority_borrow_probe(&spec),
+            authority_built_probe("localhost", 443, true)
+        );
+    }
+
+    #[test]
     fn the_reference_user_and_pass_write_the_basic_header() {
         let outbound = crate::json::parse(
             r#"{"settings":{"address":"127.0.0.1","port":8443},"streamSettings":{"security":"tls","tlsSettings":{"serverName":"localhost","allowInsecure":true},"masqueSettings":{"user":"u","pass":"p:q","headers":{"X-Token":"a"}}}}"#,

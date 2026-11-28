@@ -2285,11 +2285,7 @@ impl Session {
         channel_type: &[u8],
         deadline: Option<Instant>,
     ) -> Result<Option<Channel>, String> {
-        let mut extra = Vec::with_capacity(host.len() + 25);
-        put_str(&mut extra, host.as_bytes());
-        put_u32(&mut extra, u32::from(port));
-        put_str(&mut extra, b"127.0.0.1");
-        put_u32(&mut extra, 0);
+        let extra = direct_tcpip_extra(host, port);
         self.open_payload_with_window(
             channel_type,
             &extra,
@@ -2454,13 +2450,7 @@ impl Session {
         *lock(&state.open) = Some(tx);
         lock(&self.inner.channels).insert(local, Arc::clone(&state));
 
-        let mut payload = Vec::with_capacity(1 + 4 + channel_type.len() + 4 + 4 + 4 + extra.len());
-        payload.push(MSG_CHANNEL_OPEN);
-        put_str(&mut payload, channel_type);
-        put_u32(&mut payload, local);
-        put_u32(&mut payload, channel_window);
-        put_u32(&mut payload, CHANNEL_PACKET);
-        payload.extend_from_slice(extra);
+        let payload = channel_open_payload(channel_type, local, channel_window, extra);
         if let Err(why) = self.inner.send_until(&payload, deadline) {
             lock(&self.inner.channels).remove(&local);
             self.inner.close();
@@ -5986,6 +5976,28 @@ fn put_str(out: &mut Vec<u8>, value: &[u8]) {
     out.extend_from_slice(value);
 }
 
+/// The `direct-tcpip` fields, with exactly the capacity their encoding needs.
+fn direct_tcpip_extra(host: &str, port: u16) -> Vec<u8> {
+    let mut extra = Vec::with_capacity(host.len() + 25);
+    put_str(&mut extra, host.as_bytes());
+    put_u32(&mut extra, u32::from(port));
+    put_str(&mut extra, b"127.0.0.1");
+    put_u32(&mut extra, 0);
+    extra
+}
+
+/// One channel-open message, with exactly the capacity its fields need.
+fn channel_open_payload(channel_type: &[u8], local: u32, window: u32, extra: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(1 + 4 + channel_type.len() + 4 + 4 + 4 + extra.len());
+    payload.push(MSG_CHANNEL_OPEN);
+    put_str(&mut payload, channel_type);
+    put_u32(&mut payload, local);
+    put_u32(&mut payload, window);
+    put_u32(&mut payload, CHANNEL_PACKET);
+    payload.extend_from_slice(extra);
+    payload
+}
+
 fn put_name_list(out: &mut Vec<u8>, value: &[u8]) {
     put_str(out, value);
 }
@@ -6117,7 +6129,134 @@ fn test_channel_with_window(payloads: &[&[u8]], window: u32) -> Channel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
     use std::net::TcpListener;
+
+    /// The `direct-tcpip` fields fit their buffer exactly, so no field pushes it into a second allocation.
+    #[test]
+    fn a_direct_tcpip_extra_is_one_allocation_with_no_spare_room() {
+        let host = "example.test";
+        let (extra, counts) = ferrox_core::alloc_count::measure(|| direct_tcpip_extra(host, 443));
+        assert_eq!(extra.len(), host.len() + 25);
+        assert_eq!(counts.allocs, 1, "the fields fill the one allocation");
+        assert_eq!(counts.bytes, extra.len(), "no spare room is requested");
+    }
+
+    /// The channel-open message fits its buffer exactly, so the payload is sent without a regrow.
+    #[test]
+    fn a_channel_open_payload_is_one_allocation_with_no_spare_room() {
+        let extra = direct_tcpip_extra("example.test", 443);
+        let channel_type = b"direct-tcpip";
+        let (payload, counts) = ferrox_core::alloc_count::measure(|| {
+            channel_open_payload(channel_type, 7, 1024, &extra)
+        });
+        assert_eq!(
+            payload.len(),
+            1 + 4 + channel_type.len() + 4 + 4 + 4 + extra.len()
+        );
+        assert_eq!(counts.allocs, 1, "the payload fills the one allocation");
+        assert_eq!(counts.bytes, payload.len(), "no spare room is requested");
+    }
+
+    fn extra_fits_probe() -> usize {
+        let mut sum = 0;
+        for _ in 0..4096 {
+            let extra = std::hint::black_box(direct_tcpip_extra("example.test", 443));
+            sum += extra.len();
+        }
+        sum
+    }
+
+    #[inline(never)]
+    fn extra_short_probe() -> usize {
+        let mut sum = 0;
+        for _ in 0..4096 {
+            let mut extra = Vec::with_capacity("example.test".len() + 16);
+            put_str(&mut extra, b"example.test");
+            put_u32(&mut extra, 443);
+            put_str(&mut extra, b"127.0.0.1");
+            put_u32(&mut extra, 0);
+            sum += std::hint::black_box(&extra).len();
+        }
+        sum
+    }
+
+    /// The exact-capacity fields fit without the regrow the short buffer pays.
+    #[test]
+    fn the_exact_extra_costs_no_regrow_where_the_short_one_does() {
+        assert_eq!(extra_fits_probe(), extra_short_probe());
+    }
+
+    fn payload_fits_probe() -> usize {
+        let extra = direct_tcpip_extra("example.test", 443);
+        let mut sum = 0;
+        for _ in 0..4096 {
+            let payload =
+                std::hint::black_box(channel_open_payload(b"direct-tcpip", 7, 1024, &extra));
+            sum += payload.len();
+        }
+        sum
+    }
+
+    #[inline(never)]
+    fn payload_grown_probe() -> usize {
+        let extra = direct_tcpip_extra("example.test", 443);
+        let mut sum = 0;
+        for _ in 0..4096 {
+            let mut payload = Vec::new();
+            payload.push(MSG_CHANNEL_OPEN);
+            put_str(&mut payload, b"direct-tcpip");
+            put_u32(&mut payload, 7);
+            put_u32(&mut payload, 1024);
+            put_u32(&mut payload, CHANNEL_PACKET);
+            payload.extend_from_slice(&extra);
+            sum += std::hint::black_box(&payload).len();
+        }
+        sum
+    }
+
+    /// The exact-capacity message is the same bytes without the growth the empty Vec pays.
+    #[test]
+    fn the_exact_payload_costs_no_growth_where_the_empty_one_does() {
+        assert_eq!(payload_fits_probe(), payload_grown_probe());
+    }
+
+    struct Sink(usize);
+
+    impl std::fmt::Write for Sink {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            self.0 += text.len();
+            Ok(())
+        }
+    }
+
+    fn target_args_probe(host: &str, port: u16) -> usize {
+        let mut sink = Sink(0);
+        for _ in 0..4096 {
+            let target = format_args!("{}:{}", std::hint::black_box(host), port);
+            write!(&mut sink, "{target}").expect("writes");
+        }
+        sink.0
+    }
+
+    #[inline(never)]
+    fn target_string_probe(host: &str, port: u16) -> usize {
+        let mut sum = 0;
+        for _ in 0..4096 {
+            let target = format!("{}:{}", std::hint::black_box(host), port);
+            sum += std::hint::black_box(&target).len();
+        }
+        sum
+    }
+
+    /// A channel target is formatted into the caller's sink, not built as a String first.
+    #[test]
+    fn the_channel_target_costs_no_string_where_the_old_one_does() {
+        assert_eq!(
+            target_args_probe("example.test", 443),
+            target_string_probe("example.test", 443)
+        );
+    }
 
     fn test_channel(inner: Arc<Inner>, state: Arc<ChannelState>) -> Channel {
         Channel {

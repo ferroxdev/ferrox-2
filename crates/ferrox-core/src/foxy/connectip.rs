@@ -1334,7 +1334,10 @@ mod tests {
         let mut wanted = Vec::new();
         address_requests(&entries, &mut wanted);
         let mut fixed = [0xA5u8; 64];
-        let wrote = address_requests_into(&entries, &mut fixed).expect("fits");
+        let (wrote, counts) =
+            ferrox_core::alloc_count::measure(|| address_requests_into(&entries, &mut fixed));
+        let wrote = wrote.expect("fits");
+        assert_eq!(counts.allocs, 0, "the fixed buffer is the caller's");
         assert_eq!(&fixed[..wrote], wanted.as_slice());
         let mut short = [0xA5u8; 64];
         assert!(
@@ -1349,6 +1352,35 @@ mod tests {
             "an invalid batch refuses"
         );
         assert_eq!(kept, [0xA5u8; 64], "an invalid batch is untouched");
+    }
+
+    fn fixed_request_probe(entries: &[(u64, u8, &[u8])]) -> usize {
+        let mut out = [0u8; 32];
+        let mut sum = 0;
+        for _ in 0..4096 {
+            sum += address_requests_into(std::hint::black_box(entries), &mut out).unwrap_or(0);
+            std::hint::black_box(&out);
+        }
+        sum
+    }
+
+    #[inline(never)]
+    fn vec_request_probe(entries: &[(u64, u8, &[u8])]) -> usize {
+        let mut sum = 0;
+        for _ in 0..4096 {
+            let mut out = Vec::new();
+            address_requests(std::hint::black_box(entries), &mut out);
+            sum += out.len();
+            std::hint::black_box(&out);
+        }
+        sum
+    }
+
+    /// The caller's buffer writes the same request as the Vec path without paying for the Vec.
+    #[test]
+    fn the_fixed_request_costs_no_allocation_where_the_vec_one_does() {
+        let entries = [(1, 4, &V4[..]), (2, 6, &V6[..])];
+        assert_eq!(fixed_request_probe(&entries), vec_request_probe(&entries));
     }
 
     #[test]

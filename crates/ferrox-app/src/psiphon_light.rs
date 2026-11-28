@@ -1173,16 +1173,61 @@ mod tests {
             },
             Vec::new(),
         );
-        assert!(stream.fill().expect("first fill"));
+        let (first, counts) = ferrox_core::alloc_count::measure(|| stream.fill());
+        assert!(first.expect("first fill"));
+        assert_eq!(counts.allocs, 0, "the first fill lands in the wire");
         assert_eq!(stream.wire.as_slice(), &b"abcd"[..]);
         let capacity = stream.wire.capacity();
         stream.wire_at = stream.wire.len();
         stream.compact();
         assert_eq!(stream.wire.as_slice(), b"");
-        assert!(stream.fill().expect("second fill"));
+        let (second, counts) = ferrox_core::alloc_count::measure(|| stream.fill());
+        assert!(second.expect("second fill"));
+        assert_eq!(counts.allocs, 0, "the tail is reused");
         assert_eq!(stream.wire.as_slice(), &b"efgh"[..]);
         assert_eq!(stream.wire.capacity(), capacity, "the wire is reused");
         assert!(stream.wire_init >= stream.wire.len());
+    }
+
+    struct Source;
+
+    impl Read for Source {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let count = buf.len().min(256);
+            buf[..count].fill(0x5A);
+            Ok(count)
+        }
+    }
+
+    fn fill_direct_probe() -> usize {
+        let mut stream = LightStream::new(Source, Vec::new());
+        let mut sum = 0;
+        for _ in 0..4096 {
+            stream.wire.clear();
+            assert!(stream.fill().expect("fills"));
+            sum += std::hint::black_box(&stream.wire).len();
+        }
+        sum
+    }
+
+    #[inline(never)]
+    fn fill_staged_probe() -> usize {
+        let mut stream = LightStream::new(Source, Vec::new());
+        let mut staging = [0u8; 256];
+        let mut sum = 0;
+        for _ in 0..4096 {
+            stream.wire.clear();
+            let count = stream.inner.read(&mut staging).expect("reads");
+            stream.wire.extend_from_slice(&staging[..count]);
+            sum += std::hint::black_box(&stream.wire).len();
+        }
+        sum
+    }
+
+    /// The direct fill is the staged fill without the staging copy.
+    #[test]
+    fn the_direct_fill_costs_no_stage_where_the_staged_one_does() {
+        assert_eq!(fill_direct_probe(), fill_staged_probe());
     }
 
     /// A partial plain write stages only the remainder and retries it, with no byte lost or repeated.
@@ -1213,6 +1258,34 @@ mod tests {
         assert!(stream.pending.is_empty(), "the remainder was retried");
     }
 
+    fn normalize_one_probe() -> usize {
+        let mut sum = 0;
+        for _ in 0..4096 {
+            let target = normalize_destination("Example.COM.", 443).expect("destination");
+            sum += std::hint::black_box(&target).len();
+        }
+        sum
+    }
+
+    #[inline(never)]
+    fn normalize_two_probe() -> usize {
+        let mut sum = 0;
+        for _ in 0..4096 {
+            let host = std::hint::black_box("Example.COM.")
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            let target = format!("{host}:443");
+            sum += std::hint::black_box(&target).len();
+        }
+        sum
+    }
+
+    /// The normalized destination is one allocation, where the old shape paid for the lowercased host and the formatted target.
+    #[test]
+    fn the_one_allocation_destination_costs_less_than_the_two_allocation_one() {
+        assert_eq!(normalize_one_probe(), normalize_two_probe());
+    }
+
     /// A destination is normalized into one allocation, with the lowercasing done in place.
     #[test]
     fn normalize_destination_allocates_once() {
@@ -1221,6 +1294,49 @@ mod tests {
         });
         assert_eq!(target, "example.com:443");
         assert_eq!(counts.allocs, 1, "the target string is the only allocation");
+    }
+
+    struct Discard(usize);
+
+    impl Write for Discard {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn write_direct_probe() -> usize {
+        let mut stream = LightStream::new(Discard(0), Vec::new());
+        stream.write_padding_done = true;
+        let data = [0x5Au8; 1024];
+        for _ in 0..4096 {
+            stream.write(std::hint::black_box(&data)).expect("writes");
+        }
+        stream.inner.0
+    }
+
+    #[inline(never)]
+    fn write_staged_probe() -> usize {
+        let mut stream = LightStream::new(Discard(0), Vec::new());
+        stream.write_padding_done = true;
+        let data = [0x5Au8; 1024];
+        for _ in 0..4096 {
+            stream
+                .pending
+                .extend_from_slice(std::hint::black_box(&data));
+            stream.drain().expect("drains");
+        }
+        stream.inner.0
+    }
+
+    /// A plain write reaches the writer without the staging copy the old path paid.
+    #[test]
+    fn the_direct_write_costs_no_stage_where_the_staged_one_does() {
+        assert_eq!(write_direct_probe(), write_staged_probe());
     }
 
     /// A write after the opening goes straight to the writer, so the writer sees the caller's bytes rather than a staged copy.
@@ -1246,7 +1362,9 @@ mod tests {
         );
         stream.write_padding_done = true;
         let data = b"payload";
-        assert_eq!(stream.write(data).expect("writes"), data.len());
+        let (written, counts) = ferrox_core::alloc_count::measure(|| stream.write(data));
+        assert_eq!(written.expect("writes"), data.len());
+        assert_eq!(counts.allocs, 0, "the accepted write stages nothing");
         assert_eq!(
             stream.inner.seen,
             data.as_ptr(),
