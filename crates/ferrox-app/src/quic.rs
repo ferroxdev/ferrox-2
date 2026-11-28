@@ -5499,10 +5499,6 @@ impl QuicStream {
         if n > 0 {
             self.meter.write(n);
             self.activity.touch();
-        } else {
-            // No window or no lock: the datagram that grants or releases it is what wakes this lane.
-            self.note_datagram_wait();
-            crate::proxy::note_wait_idle(STREAM_QUANTUM);
         }
         Ok(n)
     }
