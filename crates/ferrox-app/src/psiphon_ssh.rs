@@ -6157,6 +6157,7 @@ mod tests {
         assert_eq!(counts.bytes, payload.len(), "no spare room is requested");
     }
 
+    #[inline(never)]
     fn extra_fits_probe() -> usize {
         let mut sum = 0;
         for _ in 0..4096 {
@@ -6186,6 +6187,7 @@ mod tests {
         assert_eq!(extra_fits_probe(), extra_short_probe());
     }
 
+    #[inline(never)]
     fn payload_fits_probe() -> usize {
         let extra = direct_tcpip_extra("example.test", 443);
         let mut sum = 0;
@@ -6229,6 +6231,7 @@ mod tests {
         }
     }
 
+    #[inline(never)]
     fn target_args_probe(host: &str, port: u16) -> usize {
         let mut sink = Sink(0);
         for _ in 0..4096 {

@@ -3942,6 +3942,7 @@ mod tests {
         );
     }
 
+    #[inline(never)]
     fn lookup_shared_probe(wireguard: &WireGuardOut) -> usize {
         let mut sum = 0;
         for _ in 0..4096 {

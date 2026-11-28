@@ -6842,6 +6842,7 @@ mod tests {
         assert!(counts.allocs > 0, "only the non-default port is built");
     }
 
+    #[inline(never)]
     fn authority_borrow_probe(spec: &ClientSpec) -> usize {
         let mut sum = 0;
         for _ in 0..4096 {

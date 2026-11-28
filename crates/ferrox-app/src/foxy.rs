@@ -4582,6 +4582,7 @@ mod tests {
         assert_eq!(first[2].1, &[0x03][..]);
     }
 
+    #[inline(never)]
     fn h3_static_probe() -> usize {
         let mut sum = 0;
         for _ in 0..4096 {

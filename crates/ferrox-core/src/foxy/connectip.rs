@@ -1354,6 +1354,7 @@ mod tests {
         assert_eq!(kept, [0xA5u8; 64], "an invalid batch is untouched");
     }
 
+    #[inline(never)]
     fn fixed_request_probe(entries: &[(u64, u8, &[u8])]) -> usize {
         let mut out = [0u8; 32];
         let mut sum = 0;

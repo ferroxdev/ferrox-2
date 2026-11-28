@@ -1199,6 +1199,7 @@ mod tests {
         }
     }
 
+    #[inline(never)]
     fn fill_direct_probe() -> usize {
         let mut stream = LightStream::new(Source, Vec::new());
         let mut sum = 0;
@@ -1258,6 +1259,7 @@ mod tests {
         assert!(stream.pending.is_empty(), "the remainder was retried");
     }
 
+    #[inline(never)]
     fn normalize_one_probe() -> usize {
         let mut sum = 0;
         for _ in 0..4096 {
@@ -1309,6 +1311,7 @@ mod tests {
         }
     }
 
+    #[inline(never)]
     fn write_direct_probe() -> usize {
         let mut stream = LightStream::new(Discard(0), Vec::new());
         stream.write_padding_done = true;
