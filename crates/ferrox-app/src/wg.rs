@@ -3967,7 +3967,14 @@ mod tests {
         let config = DeviceConfig {
             secret: [0x55; 32],
             addresses: vec!["10.0.0.2".parse().unwrap()],
-            peers: Vec::new(),
+            peers: vec![PeerConfig {
+                public: [0x66; 32],
+                preshared: [0; 32],
+                endpoint: Some("127.0.0.1:9".parse().unwrap()),
+                endpoints: Vec::new(),
+                keepalive: 0,
+                allowed: vec![("192.0.2.0".parse().unwrap(), 24)],
+            }],
             mtu: 1420,
             reserved: [0; 3],
             is_client: Some(true),

@@ -1335,7 +1335,7 @@ mod tests {
         address_requests(&entries, &mut wanted);
         let mut fixed = [0xA5u8; 64];
         let (wrote, counts) =
-            ferrox_core::alloc_count::measure(|| address_requests_into(&entries, &mut fixed));
+            crate::alloc_count::measure(|| address_requests_into(&entries, &mut fixed));
         let wrote = wrote.expect("fits");
         assert_eq!(counts.allocs, 0, "the fixed buffer is the caller's");
         assert_eq!(&fixed[..wrote], wanted.as_slice());

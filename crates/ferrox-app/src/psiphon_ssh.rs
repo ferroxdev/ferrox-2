@@ -6129,7 +6129,6 @@ fn test_channel_with_window(payloads: &[&[u8]], window: u32) -> Channel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fmt::Write as _;
     use std::net::TcpListener;
 
     /// The `direct-tcpip` fields fit their buffer exactly, so no field pushes it into a second allocation.
