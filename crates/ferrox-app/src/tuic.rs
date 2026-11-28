@@ -351,6 +351,16 @@ impl TuicOut {
     }
 
     fn lane(&self) -> Option<LaneLease> {
+        self.lease(false)
+    }
+
+    /// A UDP association shares the key's first live lane: datagrams from several associations do
+    /// not block one another, so one connection carries them where a flow would take a lane of its own.
+    fn lane_shared(&self) -> Option<LaneLease> {
+        self.lease(true)
+    }
+
+    fn lease(&self, shared: bool) -> Option<LaneLease> {
         let options = proxy::dial_options();
         let source = proxy::flow_source().ok()?;
         let key = (source, options.clone());
@@ -383,7 +393,7 @@ impl TuicOut {
         let pool = held.entry(key).or_default();
         if let Some(lane) = pool
             .iter()
-            .find(|lane| lane.leases.load(Ordering::Acquire) == 0 && live(lane))
+            .find(|lane| (shared || lane.leases.load(Ordering::Acquire) == 0) && live(lane))
         {
             lane.leases.fetch_add(1, Ordering::AcqRel);
             return Some(LaneLease(Arc::clone(lane)));
@@ -568,7 +578,7 @@ impl TuicOut {
         associate: Option<&Connection>,
         peer: Option<IpAddr>,
     ) {
-        let Some(lane) = self.lane() else {
+        let Some(lane) = self.lane_shared() else {
             return;
         };
         if let Some(associate) = associate {
