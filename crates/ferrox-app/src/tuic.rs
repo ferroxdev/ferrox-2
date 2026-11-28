@@ -41,6 +41,7 @@ const RETRY_TOKEN_TAG: usize = 32;
 const MAX_ASSOCIATIONS_PER_SESSION: usize = 256;
 const MAX_UDP_SOCKETS: usize = 2048;
 const MAX_TUIC_LANES: usize = 64;
+const LANES_PER_KEY: usize = 8;
 const MAX_RESOLVING_PER_SESSION: usize = 32;
 const MAX_RESOLVE_PAYLOADS: usize = 4;
 const RESOLVE_QUEUE: usize = 256;
@@ -88,7 +89,7 @@ pub(crate) struct TuicOut {
     cert_pins: Arc<[[u8; 32]]>,
     insecure: bool,
     heartbeat: Duration,
-    lanes: Mutex<HashMap<LaneKey, Arc<Lane>>>,
+    lanes: Mutex<HashMap<LaneKey, Vec<Arc<Lane>>>>,
     session: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
@@ -354,35 +355,51 @@ impl TuicOut {
         let source = proxy::flow_source().ok()?;
         let key = (source, options.clone());
         let mut held = self.lanes.lock().ok()?;
-        held.retain(|_, lane| {
-            lane.leases.load(Ordering::Acquire) > 0
-                || !(lane.stop.load(Ordering::Relaxed)
-                    || lane.conn.lock().is_ok_and(|conn| conn.is_closed()))
-        });
-        if let Some(lane) = held.get(&key) {
-            let live = !lane.stop.load(Ordering::Relaxed)
+        for pool in held.values_mut() {
+            pool.retain(|lane| {
+                lane.leases.load(Ordering::Acquire) > 0
+                    || !(lane.stop.load(Ordering::Relaxed)
+                        || lane.conn.lock().is_ok_and(|conn| conn.is_closed()))
+            });
+        }
+        held.retain(|_, pool| !pool.is_empty());
+        let live = |lane: &Arc<Lane>| {
+            !lane.stop.load(Ordering::Relaxed)
                 && lane
                     .conn
                     .lock()
-                    .is_ok_and(|conn| lane_established(&conn, lane));
-            if live {
-                lane.leases.fetch_add(1, Ordering::AcqRel);
-                return Some(LaneLease(Arc::clone(lane)));
+                    .is_ok_and(|conn| lane_established(&conn, lane))
+        };
+        while held.values().map(Vec::len).sum::<usize>() >= MAX_TUIC_LANES {
+            let (key, at) = held.iter().find_map(|(key, pool)| {
+                pool.iter()
+                    .position(|lane| lane.leases.load(Ordering::Acquire) == 0)
+                    .map(|at| (key.clone(), at))
+            })?;
+            if let Some(pool) = held.get_mut(&key) {
+                pool.remove(at);
             }
         }
-        held.remove(&key);
-        if held.len() >= MAX_TUIC_LANES {
-            let idle = held
-                .iter()
-                .find(|(_, lane)| lane.leases.load(Ordering::Acquire) == 0)
-                .map(|(key, _)| key.clone());
-            let idle = idle?;
-            held.remove(&idle);
+        let pool = held.entry(key).or_default();
+        if let Some(lane) = pool
+            .iter()
+            .find(|lane| lane.leases.load(Ordering::Acquire) == 0 && live(lane))
+        {
+            lane.leases.fetch_add(1, Ordering::AcqRel);
+            return Some(LaneLease(Arc::clone(lane)));
         }
-        let lane = self.connect_lane(source, options)?;
+        if pool.len() < LANES_PER_KEY {
+            let lane = self.connect_lane(source, options)?;
+            lane.leases.fetch_add(1, Ordering::AcqRel);
+            pool.push(Arc::clone(&lane));
+            return Some(LaneLease(lane));
+        }
+        let lane = pool
+            .iter()
+            .filter(|lane| live(lane))
+            .min_by_key(|lane| lane.leases.load(Ordering::Acquire))?;
         lane.leases.fetch_add(1, Ordering::AcqRel);
-        held.insert(key, Arc::clone(&lane));
-        Some(LaneLease(lane))
+        Some(LaneLease(Arc::clone(lane)))
     }
 
     fn connect_lane(
@@ -404,7 +421,7 @@ impl TuicOut {
                     options.as_deref(),
                     source,
                 )?;
-                (quic::Datagram::plain(sock).with_gro(false), peer, local)
+                (quic::Datagram::plain(sock), peer, local)
             };
         let socket = socket.with_options(options).with_source(source);
         let mut config = self.client_config()?;
@@ -1050,6 +1067,7 @@ fn drive_client(weak: &std::sync::Weak<Lane>) {
                         );
                     }
                 }
+                quic::drained_lanes(&lane.sock);
                 lane.finish_handshake() && {
                     let turned = match lane.conn.lock() {
                         Ok(mut conn) => {
@@ -1082,6 +1100,7 @@ fn drive_client(weak: &std::sync::Weak<Lane>) {
                         },
                     );
                     drop(conn);
+                    quic::drained_lanes(&lane.sock);
                     lane.finish_handshake() && {
                         let turned = match lane.conn.lock() {
                             Ok(mut conn) => client_turn(
@@ -1590,7 +1609,7 @@ pub(crate) fn serve_inbound(
         eprintln!("unreadable tuic identity in {path}: serves nothing");
         return false;
     };
-    let Ok(socket) = quic::bind_datagram_plain(address) else {
+    let Ok(socket) = quic::bind_datagram(address) else {
         eprintln!("tuic inbound in {path} cannot bind {address}: serves nothing");
         return false;
     };
@@ -1643,7 +1662,7 @@ pub(crate) fn serve_inbound(
     let meter = proxy::inbound_meter(inbound);
     thread::spawn(move || {
         run(
-            Arc::new(Datagram::plain(socket).with_gro(false)),
+            Arc::new(Datagram::plain(socket)),
             local,
             users,
             template,
@@ -2904,7 +2923,7 @@ mod tests {
         let server = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let address = server.local_addr().expect("address");
         let server_thread = thread::spawn(move || {
-            let sock = Datagram::plain(server).with_gro(false);
+            let sock = Datagram::plain(server);
             let _ = quic::server_accept(&sock, address, &mut config);
         });
         let mut out = test_out(address, roots);
@@ -2928,7 +2947,7 @@ mod tests {
         let address = server.local_addr().expect("address");
         let (early, observed) = std::sync::mpsc::channel();
         let server_thread = thread::spawn(move || {
-            let sock = Datagram::plain(server).with_gro(false);
+            let sock = Datagram::plain(server);
             let mut buf = vec![0u8; 65535];
             let mut out = vec![0u8; 65535];
             let mut first = quic::server_accept(&sock, address, &mut config);
