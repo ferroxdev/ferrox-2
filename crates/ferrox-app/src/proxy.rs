@@ -37016,6 +37016,8 @@ fn write_full(
             Err(_) => break,
         };
         if stalled {
+            // A write that found no credit can leave the record it just sealed in the TLS queue; flush it before the writer parks, or the edge never sees the frame that would reopen the window.
+            let _ = lane.flush();
             let wait = lane.write_wait();
             drop(lane);
             // A closed window answers before the socket is touched, so the lane cannot report its own death here: the leg that carried the other way has to say so.
