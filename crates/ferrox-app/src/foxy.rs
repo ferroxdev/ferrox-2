@@ -4462,6 +4462,14 @@ impl Tunnel {
             Self::H3(lane) => lane.read_wait(),
         }
     }
+
+    /// The edge socket a stalled uplink waits on: only an `h2` send window closes on a writer, and it reopens on a frame the other leg reads, so the writer parks on that socket instead of sleeping a fixed tick.
+    pub(crate) fn write_wait(&self) -> Option<(EdgeWait, Duration)> {
+        match self {
+            Self::H2(lane) => lane.read_wait(),
+            Self::H1(_) | Self::H3(_) => None,
+        }
+    }
 }
 
 /// Ends an h2 lane that no `settle` handed back: a reusable stream is returned to the session, and one that did not end cleanly is reset and removed.

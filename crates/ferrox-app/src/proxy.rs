@@ -37016,12 +37016,18 @@ fn write_full(
             Err(_) => break,
         };
         if stalled {
+            let wait = lane.write_wait();
             drop(lane);
             // A closed window answers before the socket is touched, so the lane cannot report its own death here: the leg that carried the other way has to say so.
             if peer_ended.load(std::sync::atomic::Ordering::Acquire) {
                 break;
             }
-            std::thread::sleep(RELAY_IDLE);
+            // The grant that reopens an h2 window arrives on the edge socket, so the writer parks there rather than sleeping a fixed tick; the yield lets the leg that reads it take the lane first.
+            if let Some((edge, park)) = wait {
+                census!("uplink-park", crate::census::handle(&edge), Some(park));
+                let _ = edge.wait_readable(park);
+            }
+            std::thread::yield_now();
         }
     }
     total - buf.len()
