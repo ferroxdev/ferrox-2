@@ -552,7 +552,8 @@ impl TuicOut {
             id,
             proxy::flow_outbound_meter().unwrap_or_default(),
         )
-        .with_stop(Arc::clone(&lane.stop));
+        .with_stop(Arc::clone(&lane.stop))
+        .with_blocking_send();
         if stream.write_all(&header).is_err() {
             stream.close();
             return;

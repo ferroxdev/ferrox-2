@@ -223,6 +223,7 @@ impl PooledStream {
             activity: Arc::clone(&self.activity),
             stop: Arc::new(AtomicBool::new(false)),
             stalled: Arc::new(AtomicBool::new(false)),
+            blocking_send: false,
             owner: None,
         }
     }
@@ -5248,6 +5249,8 @@ pub(crate) struct QuicStream {
     stop: Arc<AtomicBool>,
     /// A partial frame spent its send deadline: the next `write_all` retry fails instead of starting a second wait.
     stalled: Arc<AtomicBool>,
+    /// A client-side relay lane takes the connection lock instead of spinning off it: the driver's hold is one batch, and a lock answer is not a window.
+    blocking_send: bool,
     /// The serving connection's identity, absent on a client-side handle whose sessions no listener owns.
     owner: Option<Arc<ConnectionToken>>,
 }
@@ -5439,6 +5442,7 @@ impl QuicStream {
             activity: Arc::new(Activity::new()),
             stop: Arc::new(AtomicBool::new(false)),
             stalled: Arc::new(AtomicBool::new(false)),
+            blocking_send: false,
             owner: None,
         }
     }
@@ -5447,6 +5451,13 @@ impl QuicStream {
     /// that owns the connection instead of holding the socket past it.
     pub(crate) fn with_stop(mut self, stop: Arc<AtomicBool>) -> Self {
         self.stop = stop;
+        self
+    }
+
+    /// A client lane waits for the connection lock its driver holds for one batch instead of
+    /// treating the contention as a full window and sleeping a relay poll.
+    pub(crate) fn with_blocking_send(mut self) -> Self {
+        self.blocking_send = true;
         self
     }
 
@@ -5495,7 +5506,7 @@ impl QuicStream {
             return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
         }
         let mut rest = bytes::Bytes::copy_from_slice(buf);
-        let n = self.send_once(&mut rest, false)?;
+        let n = self.send_once(&mut rest, self.blocking_send)?;
         if n > 0 {
             self.meter.write(n);
             self.activity.touch();
@@ -6039,6 +6050,7 @@ fn route_batch(
 }
 
 /// New peer streams to sessions, finished ones out of the table, dead connections dropped. One lock per connection covers the closed, timer, source-id and readable questions, and the tables live across calls so a busy connection does not pay for them again on every visit.
+#[allow(clippy::too_many_lines)]
 fn reap(
     serve: &Serve,
     sock: &Arc<Datagram>,
@@ -6141,6 +6153,7 @@ fn reap(
             activity: Arc::new(Activity::new()),
             stop,
             stalled: Arc::new(AtomicBool::new(false)),
+            blocking_send: false,
             owner: Some(owner),
         };
         let serve = Arc::clone(serve);
@@ -8613,6 +8626,7 @@ mod tests {
             activity: std::sync::Arc::new(Activity::new()),
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stalled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            blocking_send: false,
             owner: None,
         };
         let error = stream
@@ -8642,6 +8656,7 @@ mod tests {
             activity: std::sync::Arc::new(Activity::new()),
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stalled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            blocking_send: false,
             owner: None,
         };
         let _step = crate::proxy::RelayStep::enter();
@@ -8688,6 +8703,7 @@ mod tests {
             activity: std::sync::Arc::new(Activity::new()),
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stalled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            blocking_send: false,
             owner: None,
         };
         let started = Instant::now();
@@ -8738,6 +8754,7 @@ mod tests {
             activity: std::sync::Arc::new(Activity::new()),
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stalled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            blocking_send: false,
             owner: None,
         };
         let started = Instant::now();
@@ -8769,6 +8786,7 @@ mod tests {
             activity: std::sync::Arc::new(Activity::new()),
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stalled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            blocking_send: false,
             owner: None,
         };
         let moved = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));
