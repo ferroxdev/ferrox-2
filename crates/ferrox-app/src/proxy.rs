@@ -588,6 +588,36 @@ fn routed_out(
     }
 }
 
+/// The loopback addresses a plain `freedom` redirect names, so a `wireguard` inbound served there
+/// can be reached in-process and a relay a client dials directly keeps its socket.
+fn collect_redirect_targets(
+    route: Option<&Arc<RouteShared>>,
+    outbound: Option<&Outbound>,
+) -> HashSet<std::net::SocketAddr> {
+    let mut targets = HashSet::new();
+    let mut add = |candidate: &Outbound| {
+        if let Outbound::Freedom(freedom) = candidate
+            && let Some(address) = freedom.plain_redirect()
+        {
+            targets.insert(address);
+        }
+    };
+    match route {
+        Some(shared) => {
+            for candidate in shared.tagged.values() {
+                add(candidate);
+            }
+            add(&shared.default);
+        }
+        None => {
+            if let Some(candidate) = outbound {
+                add(candidate);
+            }
+        }
+    }
+    targets
+}
+
 /// Opens every inbound the config names, proving each server inbound's rules at startup, and reports
 /// how many opened and whether a hysteria inbound wants the readiness token.
 fn inbound_sniffing(inbound: &Json, label: &str) -> Option<Arc<crate::sniff::Sniffing>> {
@@ -723,24 +753,7 @@ fn serve_inbounds_counted(
     }
     let routed =
         |inbound: &Json, source_known: bool| routed_out(outbound, route, inbound, source_known);
-    let redirect_targets: HashSet<std::net::SocketAddr> = match route {
-        Some(shared) => shared
-            .tagged
-            .values()
-            .chain(std::iter::once(&shared.default))
-            .filter_map(|outbound| match outbound {
-                Outbound::Freedom(freedom) => freedom.plain_redirect(),
-                _ => None,
-            })
-            .collect(),
-        None => outbound
-            .and_then(|outbound| match outbound {
-                Outbound::Freedom(freedom) => freedom.plain_redirect(),
-                _ => None,
-            })
-            .into_iter()
-            .collect(),
-    };
+    let redirect_targets = collect_redirect_targets(route, outbound);
     let mut inbounds = 0;
     let configured = configured_emails(root);
     if let Some(list) = root.get("inbounds").and_then(Json::as_arr) {
@@ -85294,6 +85307,28 @@ mod tests {
         let mut back = [0u8; 4];
         client.read_exact(&mut back).expect("echoes");
         assert_eq!(&back, b"ping");
+    }
+
+    #[test]
+    fn a_classic_relay_is_not_a_redirect_target_but_its_inner_is() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"inner","protocol":"freedom","settings":{"redirect":"127.0.0.2:41001"}},{"tag":"direct","protocol":"freedom","settings":{"finalRules":[{"action":"allow"}]}}],"routing":{"rules":[{"type":"field","inboundTag":["matrix-server"],"outboundTag":"inner"},{"type":"field","inboundTag":["matrix-inner"],"outboundTag":"direct"}]}}"#,
+        )
+        .expect("parses");
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("a table");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("builds");
+        let targets = collect_redirect_targets(Some(&shared), None);
+        assert!(
+            targets.contains(&"127.0.0.2:41001".parse::<std::net::SocketAddr>().unwrap()),
+            "the inner is the redirect target and lanes"
+        );
+        assert!(
+            !targets.contains(&"127.0.0.1:41000".parse::<std::net::SocketAddr>().unwrap()),
+            "the relay a client dials directly must keep its socket"
+        );
     }
 
     /// A route plan built the way `serve_root` builds it, so the tests exercise the registry and the
