@@ -720,6 +720,24 @@ fn serve_inbounds_counted(
     }
     let routed =
         |inbound: &Json, source_known: bool| routed_out(outbound, route, inbound, source_known);
+    let redirect_targets: HashSet<std::net::SocketAddr> = match route {
+        Some(shared) => shared
+            .tagged
+            .values()
+            .chain(std::iter::once(&shared.default))
+            .filter_map(|outbound| match outbound {
+                Outbound::Freedom(freedom) => freedom.plain_redirect(),
+                _ => None,
+            })
+            .collect(),
+        None => outbound
+            .and_then(|outbound| match outbound {
+                Outbound::Freedom(freedom) => freedom.plain_redirect(),
+                _ => None,
+            })
+            .into_iter()
+            .collect(),
+    };
     let mut inbounds = 0;
     let configured = configured_emails(root);
     if let Some(list) = root.get("inbounds").and_then(Json::as_arr) {
@@ -1092,6 +1110,9 @@ fn serve_inbounds_counted(
                             &out,
                             address,
                             handler_stop.as_ref(),
+                            address
+                                .parse::<std::net::SocketAddr>()
+                                .is_ok_and(|addr| redirect_targets.contains(&addr)),
                         ) {
                             Ok(_) => {
                                 inbounds += 1;

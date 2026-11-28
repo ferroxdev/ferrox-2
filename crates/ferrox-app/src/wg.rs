@@ -1254,6 +1254,7 @@ pub(crate) fn serve_inbound(
     out: &Outbound,
     address: &str,
     stop: Option<&Arc<crate::proxy::Stop>>,
+    lane: bool,
 ) -> Result<u16, String> {
     let settings = inbound
         .get("settings")
@@ -1268,7 +1269,7 @@ pub(crate) fn serve_inbound(
         );
     }
     // A fixed loopback address is served in-process when an outer redirect dials it; any other bind keeps the socket.
-    let (transport, port) = if let Some(addr) = loopback_lane(address) {
+    let (transport, port) = if lane && let Some(addr) = loopback_lane(address) {
         let (to_inner, to_inner_rx) = mpsc::sync_channel(LANE_DEPTH);
         let (from_inner, from_inner_rx) = mpsc::sync_channel(LANE_DEPTH);
         register_inbound_lane(addr, to_inner, from_inner_rx);
@@ -3652,7 +3653,7 @@ mod tests {
         let inbound =
             crate::json::parse(&format!(r#"{{"settings":{server_settings}}}"#)).expect("inbound");
         let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
-        let port = serve_inbound(&inbound, &out, "127.0.0.1:0", None).expect("serve");
+        let port = serve_inbound(&inbound, &out, "127.0.0.1:0", None, false).expect("serve");
         assert_ne!(port, 0);
 
         let client = DeviceConfig::from_json(
@@ -3682,6 +3683,32 @@ mod tests {
         assert_eq!(&answer, b"headhello");
         let mut eof = [0u8; 1];
         assert_eq!(app.read(&mut eof).expect("eof"), 0);
+    }
+
+    #[test]
+    fn a_loopback_listener_that_is_not_a_redirect_target_binds_its_socket() {
+        let reserved = UdpSocket::bind("127.0.0.1:0").expect("reserve");
+        let port = reserved.local_addr().expect("reserved address").port();
+        drop(reserved);
+        let client_private = [0x11; 32];
+        let server_private = [0x22; 32];
+        let client_public = ferrox_core::wireguard::device::public_key(&client_private);
+        let hex = ferrox_core::foxy::account::hex_encode;
+        let server_settings = format!(
+            r#"{{"secretKey":"{}","endpoint":["10.0.0.1"],"users":[{{"account":{{"publicKey":"{}","allowedIPs":["10.0.0.2/32"]}}}}]}}"#,
+            hex(&server_private),
+            hex(&client_public)
+        );
+        let inbound =
+            crate::json::parse(&format!(r#"{{"settings":{server_settings}}}"#)).expect("inbound");
+        let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
+        let address = format!("127.0.0.1:{port}");
+        let served = serve_inbound(&inbound, &out, &address, None, false).expect("serve");
+        assert_eq!(served, port);
+        assert!(
+            UdpSocket::bind(&address).is_err(),
+            "an inbound no redirect targets must own its UDP socket"
+        );
     }
 
     #[test]
@@ -3765,7 +3792,7 @@ mod tests {
         let inbound =
             crate::json::parse(&format!(r#"{{"settings":{server_settings}}}"#)).expect("inbound");
         let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
-        let port = serve_inbound(&inbound, &out, "127.0.0.1:0", None).expect("serve");
+        let port = serve_inbound(&inbound, &out, "127.0.0.1:0", None, false).expect("serve");
 
         let dead = UdpSocket::bind("127.0.0.1:0").expect("dead endpoint");
         let client = DeviceConfig {
@@ -4189,7 +4216,7 @@ mod tests {
         let inbound =
             crate::json::parse(&format!(r#"{{"settings":{server_settings}}}"#)).expect("inbound");
         let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
-        let port = serve_inbound(&inbound, &out, "127.0.0.1:0", None).expect("serve");
+        let port = serve_inbound(&inbound, &out, "127.0.0.1:0", None, false).expect("serve");
 
         let client = DeviceConfig::from_json(
             &crate::json::parse(&format!(
