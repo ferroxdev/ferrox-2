@@ -984,16 +984,23 @@ fn truncated_frame() -> io::Error {
     )
 }
 
-/// Read one frame into `wire`, returning whether more frames remain.
+/// Read one frame into `wire`'s own tail, returning whether more frames remain.
 fn fill<T: Read>(inner: &mut T, wire: &mut Vec<u8>) -> io::Result<bool> {
-    let mut temp = [0u8; BUFFER];
-    match inner.read(&mut temp) {
-        Ok(0) => Ok(false),
+    let base = wire.len();
+    wire.resize(base + BUFFER, 0);
+    match inner.read(&mut wire[base..]) {
+        Ok(0) => {
+            wire.truncate(base);
+            Ok(false)
+        }
         Ok(count) => {
-            wire.extend_from_slice(&temp[..count]);
+            wire.truncate(base + count);
             Ok(true)
         }
-        Err(error) => Err(error),
+        Err(error) => {
+            wire.truncate(base);
+            Err(error)
+        }
     }
 }
 
@@ -1256,6 +1263,33 @@ mod tests {
             "the writer saw the caller's buffer"
         );
         assert!(stream.pending.is_empty(), "nothing was staged");
+    }
+
+    /// A frame lands in the wire buffer's own tail, not in a temporary the wire copies from.
+    #[test]
+    fn a_frame_is_read_into_the_wires_own_tail() {
+        struct Probe {
+            seen: *const u8,
+            payload: &'static [u8],
+        }
+        impl Read for Probe {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.seen = buf.as_ptr();
+                let count = self.payload.len().min(buf.len());
+                buf[..count].copy_from_slice(&self.payload[..count]);
+                Ok(count)
+            }
+        }
+        let mut wire = Vec::with_capacity(BUFFER);
+        let base = wire.as_ptr();
+        let mut probe = Probe {
+            seen: std::ptr::null(),
+            payload: b"frame",
+        };
+        assert!(fill(&mut probe, &mut wire).expect("fills"));
+        assert_eq!(probe.seen, base, "the reader wrote the wire's own room");
+        assert_eq!(wire, b"frame");
+        assert_eq!(wire.capacity(), BUFFER, "the wire keeps its allocation");
     }
 
     /// Encode a test proxy entry with the given fields.

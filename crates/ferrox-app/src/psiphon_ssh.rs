@@ -1487,11 +1487,26 @@ impl Proxy {
         write_all_parts_until::<17>(stream, deadline, &parts[..count])
             .map_err(|error| format!("psiphon: upstream proxy write: {error}"))?;
         let mut head = Vec::with_capacity(128);
+        let mut window = [0u8; 512];
         loop {
-            let mut byte = [0u8; 1];
-            read_exact_until(stream, deadline, &mut byte)
+            arm_tcp_io(stream, deadline)
                 .map_err(|error| format!("psiphon: upstream proxy read: {error}"))?;
-            head.push(byte[0]);
+            let peeked = match stream.peek(&mut window) {
+                Ok(0) => {
+                    return Err("psiphon: upstream proxy closed before its answer".to_owned());
+                }
+                Ok(count) => count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    return Err(format!("psiphon: upstream proxy read: {error}"));
+                }
+            };
+            let take = crate::proxy::find_across(&head, &window[..peeked], b"\r\n\r\n")
+                .map_or(peeked, |at| at + 4 - head.len());
+            let start = head.len();
+            head.resize(start + take, 0);
+            read_exact_until(stream, deadline, &mut head[start..])
+                .map_err(|error| format!("psiphon: upstream proxy read: {error}"))?;
             if head.ends_with(b"\r\n\r\n") {
                 break;
             }
@@ -2590,17 +2605,17 @@ impl Session {
                 .then_some(server.web_server_secret.as_str());
             web_handshake_query(relay_protocol, identity, relay.as_ref(), secret)
         };
+        let address = server.address.to_string();
+        let request = format!(
+            "GET /handshake?{query} HTTP/1.1\r\nHost: {}\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+            authority_host(&address, port)
+        );
         let mut channel = self
-            .open_named_with_deadline(
-                &server.address.to_string(),
-                port,
-                b"direct-tcpip",
-                Some(deadline),
-            )?
+            .open_named_with_deadline(&address, port, b"direct-tcpip", Some(deadline))?
             .ok_or_else(|| format!("psiphon web api split-tunnels {}:{port}", server.address))?;
         channel.set_deadline(Some(deadline));
         let config = TlsConfig {
-            server_name: server.address.to_string(),
+            server_name: address,
             insecure: true,
             ..TlsConfig::default()
         };
@@ -2611,10 +2626,6 @@ impl Session {
         if tls.peer_leaf() != Some(certificate.as_slice()) {
             return Err("psiphon web api: the server's certificate is not the entry's".to_owned());
         }
-        let request = format!(
-            "GET /handshake?{query} HTTP/1.1\r\nHost: {}\r\nAccept: */*\r\nConnection: close\r\n\r\n",
-            authority_host(&server.address.to_string(), port)
-        );
         tls.write_all(request.as_bytes())
             .map_err(|error| format!("psiphon web api request: {error}"))?;
         let mut response = Vec::new();
@@ -7499,6 +7510,48 @@ mod tests {
             server.join().expect("server").as_slice(),
             &b"CONNECT [2001:db8::1]:443 HTTP/1.1\r\nHost: [2001:db8::1]:443\r\nProxy-Authorization: Basic dXNlcjpwQHNz\r\n\r\n"[..]
         );
+    }
+
+    #[test]
+    fn an_http_connect_answer_keeps_the_bytes_after_its_head() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 128];
+            while !request.ends_with(b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).expect("read");
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let mut reply = Vec::new();
+            reply.extend_from_slice(b"HTTP/1.1 200 OK\r\nX-Pad: ");
+            reply.extend(std::iter::repeat_n(b'p', 600));
+            reply.extend_from_slice(b"\r\n\r\nfirst tunnel bytes");
+            stream.write_all(&reply).expect("reply");
+        });
+        let proxy = Proxy::parse(
+            "http://example.com:1",
+            &crate::psiphon_dns::Config::from_servers(&[]),
+        )
+        .expect("proxy");
+        let mut stream = TcpStream::connect(address).expect("connect");
+        proxy
+            .connect_http(
+                &mut stream,
+                "example.com",
+                443,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .expect("connect");
+        let mut tail = [0u8; 18];
+        stream.read_exact(&mut tail).expect("the tunnel tail");
+        assert_eq!(&tail, b"first tunnel bytes");
+        server.join().expect("server");
     }
 
     #[test]
