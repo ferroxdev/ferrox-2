@@ -297,6 +297,7 @@ struct GoolSettings {
     identity_file: Option<PathBuf>,
     inline: Option<Identity>,
     inline_many: Vec<Identity>,
+    wiw_inline_many: Vec<Identity>,
     peer: Option<SocketAddr>,
     wiw_outer: Option<SocketAddr>,
     wiw_inner: Option<SocketAddr>,
@@ -320,6 +321,14 @@ fn gool_settings(settings: &crate::json::Json, env: &Env<'_>) -> Result<GoolSett
             .collect::<Result<Vec<_>, _>>()?,
         Some(_) => return Err("warp gool: `goolIdentities` must be an array".to_owned()),
     };
+    let wiw_inline_many = match settings.get("wiwIdentities") {
+        None => Vec::new(),
+        Some(crate::json::Json::Arr(items)) => items
+            .iter()
+            .map(Identity::from_json)
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => return Err("warp gool-classic: `wiwIdentities` must be an array".to_owned()),
+    };
     let peer = match settings.get("goolPeer") {
         None => None,
         Some(crate::json::Json::Str(text)) => Some(
@@ -332,6 +341,7 @@ fn gool_settings(settings: &crate::json::Json, env: &Env<'_>) -> Result<GoolSett
         identity_file,
         inline,
         inline_many,
+        wiw_inline_many,
         peer,
         wiw_outer: nested_peer(settings, "wiwOuter", "AETHER_WIW_OUTER_PEER", env)?,
         wiw_inner: nested_peer(settings, "wiwInner", "AETHER_WIW_INNER_PEER", env)?,
@@ -661,6 +671,15 @@ impl WarpSpec {
             return Ok(self.gool.inline_many.clone());
         }
         Ok(vec![self.gool_identity_in(test)?])
+    }
+
+    /// The outer identities a classic shard dials with: the `wiwIdentities` list when present,
+    /// else the resolved outer identity as one shard.
+    fn wiw_identities_in(&self, outer: &Identity) -> Vec<Identity> {
+        if !self.gool.wiw_inline_many.is_empty() {
+            return self.gool.wiw_inline_many.clone();
+        }
+        vec![outer.clone()]
     }
 
     /// The path the inner MASQUE identity is saved to, the sibling Aether uses.
@@ -2967,7 +2986,7 @@ impl WarpOut {
             let inner = inner_identity
                 .as_ref()
                 .ok_or("warp gool-classic: the inner identity was not built")?;
-            vec![Arc::new(build_gool_classic(&identity, inner, &spec)?)]
+            build_gool_classic_shards(&identity, inner, &spec)?
         } else {
             Vec::new()
         };
@@ -3675,8 +3694,53 @@ fn build_gool_classic(
         .wiw_inner
         .or(spec.gool.peer)
         .unwrap_or(inner_identity.wireguard.endpoint);
+    build_gool_classic_at(outer_identity, inner_identity, spec, remote)
+}
+
+fn build_gool_classic_at(
+    outer_identity: &Identity,
+    inner_identity: &Identity,
+    spec: &WarpSpec,
+    remote: SocketAddr,
+) -> Result<GoolClassicOut, String> {
     let outer = build_wireguard(outer_identity, spec)?;
     GoolClassicOut::new(outer, inner_identity, spec, remote)
+}
+
+/// One pair per `wiwIdentities` entry, each outer on its own port and each inner on its own
+/// peer. A single outer keeps the singular path, so the edge scan and the one-shard config
+/// behave exactly as before.
+fn build_gool_classic_shards(
+    outer_identity: &Identity,
+    inner_identity: &Identity,
+    spec: &WarpSpec,
+) -> Result<Vec<Arc<GoolClassicOut>>, String> {
+    let outers = spec.wiw_identities_in(outer_identity);
+    if outers.len() <= 1 {
+        return Ok(vec![Arc::new(build_gool_classic(
+            &outers[0],
+            inner_identity,
+            spec,
+        )?)]);
+    }
+    let inners = spec.gool_identities_in(false)?;
+    if inners.len() != outers.len() {
+        return Err(format!(
+            "warp gool-classic: {} `wiwIdentities` but {} `goolIdentities`",
+            outers.len(),
+            inners.len()
+        ));
+    }
+    let mut built = Vec::with_capacity(outers.len());
+    for (outer, inner) in outers.iter().zip(&inners) {
+        built.push(Arc::new(build_gool_classic_at(
+            outer,
+            inner,
+            spec,
+            inner.wireguard.endpoint,
+        )?));
+    }
+    Ok(built)
 }
 
 /// The `--register` kinds: one protocol, both hops of a two-hop one, or all five.
@@ -5827,6 +5891,37 @@ mod tests {
             Mode::parse(Some("wiw")).expect("the alias"),
             Mode::GoolClassic
         );
+    }
+
+    #[test]
+    fn the_classic_shards_take_their_outer_ports_and_inner_peers() {
+        let key_a = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let key_b = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+        let identity = |endpoint: &str, key: &str| {
+            format!(
+                r#"{{"deviceId":"m","token":"t","wireguard":{{"privateKey":"{key}","publicKey":"{key}","endpoint":"{endpoint}","address":["10.0.0.2/32","fd00::2/128"],"reserved":[0,0,0]}}}}"#
+            )
+        };
+        let outer0 = identity("127.0.0.1:4100", key_a);
+        let outer1 = identity("127.0.0.1:4101", key_b);
+        let inner0 = identity("127.0.0.2:5100", key_a);
+        let inner1 = identity("127.0.0.2:5101", key_b);
+        let settings = crate::json::parse(&format!(
+            r#"{{"mode":"gool-classic","identity":{outer0},"wiwIdentities":[{outer0},{outer1}],"goolIdentity":{inner0},"goolIdentities":[{inner0},{inner1}],"wiwOuter":"127.0.0.1:4100","wiwInner":"127.0.0.2:5100"}}"#
+        ))
+        .expect("settings");
+        let spec = WarpSpec::from(&settings).expect("a sharded classic spec");
+        let outer =
+            Identity::from_json(settings.get("identity").expect("the outer")).expect("identity");
+        let outer_shards = spec.wiw_identities_in(&outer);
+        assert_eq!(outer_shards.len(), 2);
+        assert_eq!(outer_shards[1].wireguard.endpoint.port(), 4101);
+        let inner_shards = spec.gool_identities_in(false).expect("the inners");
+        assert_eq!(inner_shards.len(), 2);
+        assert_eq!(inner_shards[1].wireguard.endpoint.port(), 5101);
+        let built =
+            build_gool_classic_shards(&outer, &inner_shards[0], &spec).expect("both shards build");
+        assert_eq!(built.len(), 2);
     }
 
     #[test]
