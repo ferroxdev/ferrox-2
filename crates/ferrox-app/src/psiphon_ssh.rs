@@ -87,6 +87,7 @@ pub(crate) trait ServerRequests: Send + Sync {
 }
 /// One channel packet plus its header, padding and tag; a larger peer packet
 /// grows the one buffer it needs instead of every pooled buffer.
+#[cfg(test)]
 const PACKET_CHUNK: usize = CHANNEL_PACKET as usize + 1024;
 /// The pool holds a whole channel window plus the packets a flow is writing,
 /// so a saturated download recycles buffers instead of allocating one per packet.
@@ -1436,16 +1437,13 @@ impl Proxy {
         }
         let port = &digits[at..];
         let auth = !self.user.is_empty() || !self.pass.is_empty();
-        let mut encoded = Vec::new();
-        if auth {
-            let len = ferrox_core::b64::encoded_len(self.user.len() + self.pass.len() + 1);
-            encoded.resize(len, 0);
-            ferrox_core::b64::encode_parts_into(
-                &[self.user.as_bytes(), &b":"[..], self.pass.as_bytes()],
-                &mut encoded[..],
-            )
-            .map_err(|error| format!("psiphon: upstream proxy credentials: {error}"))?;
-        }
+        let mut auth_stack = [0u8; 256];
+        let mut auth_heap = Vec::new();
+        let encoded: &[u8] = if auth {
+            http_basic_auth(&self.user, &self.pass, &mut auth_stack, &mut auth_heap)?
+        } else {
+            &[]
+        };
         let mut parts: [&[u8]; 17] = [&b""[..]; 17];
         let mut count = 0;
         parts[count] = b"CONNECT ";
@@ -1477,7 +1475,7 @@ impl Proxy {
         if auth {
             parts[count] = b"Proxy-Authorization: Basic ";
             count += 1;
-            parts[count] = encoded.as_slice();
+            parts[count] = encoded;
             count += 1;
             parts[count] = b"\r\n";
             count += 1;
@@ -1486,19 +1484,7 @@ impl Proxy {
         count += 1;
         write_all_parts_until::<17>(stream, deadline, &parts[..count])
             .map_err(|error| format!("psiphon: upstream proxy write: {error}"))?;
-        let mut head = Vec::with_capacity(128);
-        loop {
-            let mut byte = [0u8; 1];
-            read_exact_until(stream, deadline, &mut byte)
-                .map_err(|error| format!("psiphon: upstream proxy read: {error}"))?;
-            head.push(byte[0]);
-            if head.ends_with(b"\r\n\r\n") {
-                break;
-            }
-            if head.len() > 4096 {
-                return Err("psiphon: upstream proxy answer is too long".to_owned());
-            }
-        }
+        let head = read_http_head(stream, deadline)?;
         let text = String::from_utf8_lossy(&head);
         let status = text
             .split_whitespace()
@@ -1650,6 +1636,37 @@ fn read_exact_until(
     Ok(())
 }
 
+fn read_http_head(stream: &mut TcpStream, deadline: Instant) -> Result<Vec<u8>, String> {
+    let mut head = Vec::with_capacity(128);
+    let mut window = [0u8; 512];
+    loop {
+        arm_tcp_io(stream, deadline)
+            .map_err(|error| format!("psiphon: upstream proxy read: {error}"))?;
+        let peeked = match stream.peek(&mut window) {
+            Ok(0) => {
+                return Err("psiphon: upstream proxy closed before its answer".to_owned());
+            }
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(format!("psiphon: upstream proxy read: {error}"));
+            }
+        };
+        let take = crate::proxy::find_across(&head, &window[..peeked], b"\r\n\r\n")
+            .map_or(peeked, |at| at + 4 - head.len());
+        let start = head.len();
+        head.resize(start + take, 0);
+        read_exact_until(stream, deadline, &mut head[start..])
+            .map_err(|error| format!("psiphon: upstream proxy read: {error}"))?;
+        if head.ends_with(b"\r\n\r\n") {
+            return Ok(head);
+        }
+        if head.len() > 4096 {
+            return Err("psiphon: upstream proxy answer is too long".to_owned());
+        }
+    }
+}
+
 fn write_all_until(stream: &mut TcpStream, deadline: Instant, mut bytes: &[u8]) -> io::Result<()> {
     while !bytes.is_empty() {
         arm_tcp_io(stream, deadline)?;
@@ -1702,6 +1719,25 @@ fn write_all_parts_until<const N: usize>(
         parts = rest;
     }
     Ok(())
+}
+
+/// The upstream `Basic` credential, encoded into the caller's stack room and only falling back to the heap for a pair too long for it.
+fn http_basic_auth<'a>(
+    user: &str,
+    pass: &str,
+    stack: &'a mut [u8; 256],
+    heap: &'a mut Vec<u8>,
+) -> Result<&'a [u8], String> {
+    let len = ferrox_core::b64::encoded_len(user.len() + pass.len() + 1);
+    let out = if len <= stack.len() {
+        &mut stack[..len]
+    } else {
+        heap.resize(len, 0);
+        &mut heap[..]
+    };
+    ferrox_core::b64::encode_parts_into(&[user.as_bytes(), &b":"[..], pass.as_bytes()], out)
+        .map_err(|error| format!("psiphon: upstream proxy credentials: {error}"))?;
+    Ok(out)
 }
 
 fn authority_host(host: &str, port: u16) -> String {
@@ -2111,8 +2147,7 @@ impl Session {
         // An OSSH server reads the seed before it writes anything, so the client line goes first.
         let our_version = b"SSH-2.0-OpenSSH_9.6";
         write_all(&mut output, b"SSH-2.0-OpenSSH_9.6\r\n")?;
-        let mut banner = Vec::with_capacity(256);
-        let version = read_identification(&mut input, &mut banner)?;
+        let version = read_identification(&mut input)?;
 
         let kex = kex(
             &mut output,
@@ -2590,17 +2625,17 @@ impl Session {
                 .then_some(server.web_server_secret.as_str());
             web_handshake_query(relay_protocol, identity, relay.as_ref(), secret)
         };
+        let address = server.address.to_string();
+        let request = format!(
+            "GET /handshake?{query} HTTP/1.1\r\nHost: {}\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+            authority_host(&address, port)
+        );
         let mut channel = self
-            .open_named_with_deadline(
-                &server.address.to_string(),
-                port,
-                b"direct-tcpip",
-                Some(deadline),
-            )?
+            .open_named_with_deadline(&address, port, b"direct-tcpip", Some(deadline))?
             .ok_or_else(|| format!("psiphon web api split-tunnels {}:{port}", server.address))?;
         channel.set_deadline(Some(deadline));
         let config = TlsConfig {
-            server_name: server.address.to_string(),
+            server_name: address,
             insecure: true,
             ..TlsConfig::default()
         };
@@ -2611,10 +2646,6 @@ impl Session {
         if tls.peer_leaf() != Some(certificate.as_slice()) {
             return Err("psiphon web api: the server's certificate is not the entry's".to_owned());
         }
-        let request = format!(
-            "GET /handshake?{query} HTTP/1.1\r\nHost: {}\r\nAccept: */*\r\nConnection: close\r\n\r\n",
-            authority_host(&server.address.to_string(), port)
-        );
         tls.write_all(request.as_bytes())
             .map_err(|error| format!("psiphon web api request: {error}"))?;
         let mut response = Vec::new();
@@ -4460,8 +4491,8 @@ impl PacketReader {
             .take()
             .or_else(|| lock(&self.pool).pop())
             .unwrap_or_default();
-        if buffer.len() < PACKET_CHUNK {
-            buffer.resize(PACKET_CHUNK, 0);
+        if buffer.len() < self.block {
+            buffer.resize(self.block, 0);
         }
         let taken = self.take_pending(&mut buffer[..self.block]);
         if taken < self.block {
@@ -4663,10 +4694,10 @@ fn write_all_deadline(
 }
 
 /// Read the server banner, retaining bytes read past its newline.
-fn read_identification(reader: &mut PacketReader, banner: &mut Vec<u8>) -> Result<Vec<u8>, String> {
+fn read_identification(reader: &mut PacketReader) -> Result<Vec<u8>, String> {
     let mut chunk = [0u8; 512];
     let mut raw = [0u8; 512];
-    banner.clear();
+    let mut banner = Vec::with_capacity(256);
     loop {
         arm_deadline(&reader.io, reader.deadline)
             .map_err(|error| format!("psiphon ssh banner: {error}"))?;
@@ -4709,7 +4740,7 @@ fn read_identification(reader: &mut PacketReader, banner: &mut Vec<u8>) -> Resul
                     reader.obfuscation = Some(saved);
                 }
                 reader.pending.extend_from_slice(&raw[end + 1..read]);
-                return Ok(banner.clone());
+                return Ok(banner);
             }
             banner.clear();
             start = end + 1;
@@ -4724,25 +4755,22 @@ struct Keys {
     server_mac: [u8; 32],
 }
 
-#[allow(clippy::too_many_lines)]
-fn kex(
-    writer: &mut PacketWriter,
-    reader: &mut PacketReader,
-    client_version: &[u8],
-    server_version: &[u8],
-    expected_host_key: &[u8],
-    algorithms: Option<&[String; 4]>,
-) -> Result<Keys, String> {
-    let [kex_name, cipher, mac, host_key] = match algorithms {
-        Some(names) => (*names).clone(),
-        None => [
-            "curve25519-sha256,curve25519-sha256@libssh.org".to_owned(),
-            "aes128-ctr".to_owned(),
-            "hmac-sha2-256".to_owned(),
-            "rsa-sha2-256,rsa-sha2-512,ssh-rsa,ssh-ed25519".to_owned(),
-        ],
-    };
-    let mut kexinit = vec![MSG_KEXINIT];
+/// The KEXINIT payload, sized once for every name list it carries, so the handshake's first packet is not regrown.
+fn build_kexinit(kex_name: &str, cipher: &str, mac: &str, host_key: &str) -> Vec<u8> {
+    let len = 1
+        + 16
+        + 4
+        + kex_name.len()
+        + 4
+        + host_key.len()
+        + 2 * (4 + cipher.len())
+        + 2 * (4 + mac.len())
+        + 2 * (4 + 4)
+        + 2 * 4
+        + 1
+        + 4;
+    let mut kexinit = Vec::with_capacity(len);
+    kexinit.push(MSG_KEXINIT);
     kexinit.extend_from_slice(&random::<16>());
     put_name_list(&mut kexinit, kex_name.as_bytes());
     put_name_list(&mut kexinit, host_key.as_bytes());
@@ -4756,6 +4784,38 @@ fn kex(
     put_name_list(&mut kexinit, b"");
     kexinit.push(0);
     put_u32(&mut kexinit, 0);
+    kexinit
+}
+
+/// The four algorithm names the client offers, borrowed from the configured list or the defaults, so a handshake copies none of them.
+fn kex_names(algorithms: Option<&[String; 4]>) -> [&str; 4] {
+    match algorithms {
+        Some(names) => [
+            names[0].as_str(),
+            names[1].as_str(),
+            names[2].as_str(),
+            names[3].as_str(),
+        ],
+        None => [
+            "curve25519-sha256,curve25519-sha256@libssh.org",
+            "aes128-ctr",
+            "hmac-sha2-256",
+            "rsa-sha2-256,rsa-sha2-512,ssh-rsa,ssh-ed25519",
+        ],
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn kex(
+    writer: &mut PacketWriter,
+    reader: &mut PacketReader,
+    client_version: &[u8],
+    server_version: &[u8],
+    expected_host_key: &[u8],
+    algorithms: Option<&[String; 4]>,
+) -> Result<Keys, String> {
+    let [kex_name, cipher, mac, host_key] = kex_names(algorithms);
+    let kexinit = build_kexinit(kex_name, cipher, mac, host_key);
     writer
         .send(&kexinit)
         .map_err(|error| format!("psiphon ssh kexinit: {error}"))?;
@@ -6131,6 +6191,70 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
 
+    /// The KEXINIT payload fills one allocation exactly instead of growing through every name list.
+    #[test]
+    fn a_kexinit_is_one_allocation_with_no_spare_room() {
+        let (payload, counts) = ferrox_core::alloc_count::measure(|| {
+            build_kexinit(
+                "curve25519-sha256",
+                "aes128-ctr",
+                "hmac-sha2-256",
+                "ssh-ed25519",
+            )
+        });
+        assert_eq!(counts.allocs, 1, "the name lists fill the one allocation");
+        assert_eq!(counts.bytes, payload.len(), "no spare room is requested");
+        assert_eq!(payload.len(), payload.capacity());
+    }
+
+    /// The handshake names are borrowed, whether configured or defaulted, so no handshake clones four strings.
+    #[test]
+    fn kex_names_cost_no_allocation() {
+        let (defaults, counts) = ferrox_core::alloc_count::measure(|| kex_names(None));
+        assert_eq!(counts.allocs, 0);
+        assert_eq!(
+            defaults,
+            [
+                "curve25519-sha256,curve25519-sha256@libssh.org",
+                "aes128-ctr",
+                "hmac-sha2-256",
+                "rsa-sha2-256,rsa-sha2-512,ssh-rsa,ssh-ed25519"
+            ]
+        );
+        let configured = [
+            "curve25519-sha256".to_owned(),
+            "aes256-ctr".to_owned(),
+            "hmac-sha2-512".to_owned(),
+            "ssh-ed25519".to_owned(),
+        ];
+        let (borrowed, counts) = ferrox_core::alloc_count::measure(|| kex_names(Some(&configured)));
+        assert_eq!(counts.allocs, 0);
+        assert_eq!(
+            borrowed,
+            [
+                "curve25519-sha256",
+                "aes256-ctr",
+                "hmac-sha2-512",
+                "ssh-ed25519"
+            ]
+        );
+    }
+
+    /// A short upstream credential is encoded into the caller's stack room, not a heap vector.
+    #[test]
+    fn short_proxy_credentials_cost_no_allocation() {
+        let (len, counts) = ferrox_core::alloc_count::measure(|| {
+            let mut stack = [0u8; 256];
+            let mut heap = Vec::new();
+            let encoded = http_basic_auth("user", "pass", &mut stack, &mut heap)
+                .expect("the credential encodes");
+            assert_eq!(encoded, b"dXNlcjpwYXNz");
+            encoded.len()
+        });
+        assert_eq!(len, 12);
+        assert_eq!(counts.allocs, 0, "the stack room held the credential");
+    }
+
     /// The `direct-tcpip` fields fit their buffer exactly, so no field pushes it into a second allocation.
     #[test]
     fn a_direct_tcpip_extra_is_one_allocation_with_no_spare_room() {
@@ -6417,6 +6541,30 @@ mod tests {
     }
 
     #[test]
+    fn a_small_packet_does_not_zero_the_whole_chunk() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let mut peer = TcpStream::connect(listener.local_addr().expect("address")).expect("peer");
+        let (socket, _) = listener.accept().expect("accept");
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&7u32.to_be_bytes());
+        wire.push(4);
+        wire.extend_from_slice(&[MSG_IGNORE, MSG_IGNORE]);
+        wire.extend_from_slice(&[0u8; 4]);
+        peer.write_all(&wire).expect("write");
+        let mut spare = Vec::with_capacity(PACKET_CHUNK);
+        spare.resize(wire.len(), 0);
+        let pool = Arc::new(Mutex::new(vec![spare]));
+        let mut reader = PacketReader::new(socket, None, None, None, pool);
+        let packet = reader.recv().expect("packet");
+        assert_eq!(packet.kind(), Some(MSG_IGNORE));
+        assert_eq!(
+            packet.buffer.len(),
+            wire.len(),
+            "the reader kept the buffer at the packet it read"
+        );
+    }
+
+    #[test]
     fn a_kex_packet_need_not_be_a_block_multiple() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let mut peer = TcpStream::connect(listener.local_addr().expect("address")).expect("peer");
@@ -6449,9 +6597,8 @@ mod tests {
         peer.write_all(&wire).expect("write");
         let pool = Arc::new(Mutex::new(Vec::new()));
         let mut reader = PacketReader::new(socket, None, None, None, pool);
-        let mut banner = Vec::new();
         assert_eq!(
-            read_identification(&mut reader, &mut banner).expect("banner"),
+            read_identification(&mut reader).expect("banner"),
             b"SSH-2.0-test"
         );
         let packet = reader.recv().expect("packet");
@@ -6474,9 +6621,8 @@ mod tests {
         peer.write_all(&wire).expect("write");
         let pool = Arc::new(Mutex::new(Vec::new()));
         let mut reader = PacketReader::new(socket, Some(Rc4::new(key)), None, None, pool);
-        let mut banner = Vec::new();
         assert_eq!(
-            read_identification(&mut reader, &mut banner).expect("banner"),
+            read_identification(&mut reader).expect("banner"),
             b"SSH-2.0-test"
         );
         let packet = reader.recv().expect("packet");
@@ -7499,6 +7645,48 @@ mod tests {
             server.join().expect("server").as_slice(),
             &b"CONNECT [2001:db8::1]:443 HTTP/1.1\r\nHost: [2001:db8::1]:443\r\nProxy-Authorization: Basic dXNlcjpwQHNz\r\n\r\n"[..]
         );
+    }
+
+    #[test]
+    fn an_http_connect_answer_keeps_the_bytes_after_its_head() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 128];
+            while !request.ends_with(b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).expect("read");
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let mut reply = Vec::new();
+            reply.extend_from_slice(b"HTTP/1.1 200 OK\r\nX-Pad: ");
+            reply.extend(std::iter::repeat_n(b'p', 600));
+            reply.extend_from_slice(b"\r\n\r\nfirst tunnel bytes");
+            stream.write_all(&reply).expect("reply");
+        });
+        let proxy = Proxy::parse(
+            "http://example.com:1",
+            &crate::psiphon_dns::Config::from_servers(&[]),
+        )
+        .expect("proxy");
+        let mut stream = TcpStream::connect(address).expect("connect");
+        proxy
+            .connect_http(
+                &mut stream,
+                "example.com",
+                443,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .expect("connect");
+        let mut tail = [0u8; 18];
+        stream.read_exact(&mut tail).expect("the tunnel tail");
+        assert_eq!(&tail, b"first tunnel bytes");
+        server.join().expect("server");
     }
 
     #[test]
