@@ -716,7 +716,7 @@ masque_inner_server_settings() {
 
 # `MATRIX_XMUX=N` lets concurrent flows spread over N carrier lanes; unset keeps one.
 matrix_xmux() {
-  local lanes="${MATRIX_XMUX:-}"
+  local lanes="${MATRIX_XMUX:-4}"
   if [[ "$lanes" =~ ^[1-9][0-9]*$ ]]; then
     printf ', "xmux": {"maxConnections": %s}' "$lanes"
   fi
