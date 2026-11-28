@@ -47,7 +47,7 @@ on:
         default: false
         type: boolean
       shards:
-        description: "WARP gool outer/inner sessions per engine (blank = 1)"
+        description: "WARP gool / gool-classic outer/inner sessions per engine (blank = 1)"
         required: false
         default: ""
         type: string
