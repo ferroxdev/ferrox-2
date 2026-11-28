@@ -1314,7 +1314,9 @@ mod tests {
         stream.write_padding_done = true;
         let data = [0x5Au8; 1024];
         for _ in 0..4096 {
-            stream.write(std::hint::black_box(&data)).expect("writes");
+            stream
+                .write_all(std::hint::black_box(&data))
+                .expect("writes");
         }
         stream.inner.0
     }
