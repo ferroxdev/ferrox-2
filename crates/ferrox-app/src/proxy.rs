@@ -15898,6 +15898,12 @@ pub(crate) fn write_wait_pending() -> bool {
     WAIT_WRITE.with(std::cell::Cell::get)
 }
 
+/// Whether the step's last wait is for readability, so a QUIC write blocked on its connection's
+/// window or lock parks on the datagram that carries the grant instead of sleeping a poll.
+pub(crate) fn read_wait_pending() -> bool {
+    WAIT_FD.with(std::cell::Cell::get).is_some() && !WAIT_WRITE.with(std::cell::Cell::get)
+}
+
 pub(crate) fn forget_wait_fd() {
     WAIT_FD.with(|slot| slot.set(None));
     WAIT_WRITE.with(|slot| slot.set(false));
@@ -38628,6 +38634,8 @@ pub(crate) mod lane_pool {
         waiting: Mutex<Vec<std::sync::Arc<ReadySlot>>>,
         wake: Option<WakePipe>,
         reaper: Mutex<Option<std::thread::JoinHandle<()>>>,
+        /// Set once a reaper owns `drained`: a pool whose lanes never park on a socket must not grow that vector.
+        reaping: std::sync::atomic::AtomicBool,
         /// Slots whose sibling ended, named so the reaper drops them without scanning the parked set.
         retired: Mutex<Vec<u64>>,
         /// Descriptors a pump drained: a datagram read by the connection's own thread never reaches the
@@ -38891,7 +38899,7 @@ pub(crate) mod lane_pool {
     /// on that socket are handed back here, since their descriptor will never report the read.
     pub(crate) fn note_drained(key: WaitFd) {
         for pool in [POOL.get(), DEMUX_POOL.get()].into_iter().flatten() {
-            if pool.wake.is_none() {
+            if pool.wake.is_none() || !pool.reaping.load(std::sync::atomic::Ordering::Relaxed) {
                 continue;
             }
             pool.drained
@@ -38945,6 +38953,7 @@ pub(crate) mod lane_pool {
             waiting: Mutex::new(Vec::new()),
             wake: WakePipe::new(),
             reaper: Mutex::new(None),
+            reaping: std::sync::atomic::AtomicBool::new(false),
             retired: Mutex::new(Vec::new()),
             drained: Mutex::new(Vec::new()),
             next_slot: std::sync::atomic::AtomicU64::new(0),
@@ -39252,10 +39261,14 @@ pub(crate) mod lane_pool {
             return false;
         };
         let weak = std::sync::Arc::downgrade(pool);
+        pool.reaping
+            .store(true, std::sync::atomic::Ordering::Release);
         let Ok(handle) = thread::Builder::new()
             .name("ferrox-relay-ready".into())
             .spawn(move || reaper_loop(&weak, reactor))
         else {
+            pool.reaping
+                .store(false, std::sync::atomic::Ordering::Release);
             return false;
         };
         *slot = Some(handle);
@@ -42462,8 +42475,10 @@ fn forward_flush(buffer: &RelayBuf, uplink: &impl CarrierSink, at: &mut Forward)
                 at.lost = true;
                 return Some(Next::Done);
             }
-            // A full socket hands the lane to the reactor, while a full window rejoins the queue at once.
-            Push::Took(_) | Push::Parked if crate::proxy::write_wait_pending() => {
+            // A full socket or a QUIC window hands the lane to the reactor, while a full TCP window rejoins the queue at once.
+            Push::Took(_) | Push::Parked
+                if crate::proxy::write_wait_pending() || crate::proxy::read_wait_pending() =>
+            {
                 return Some(Next::Idle);
             }
             Push::Took(_) | Push::Parked => {
@@ -54125,6 +54140,40 @@ mod tests {
             let _ = client.read(&mut sink);
         });
         let _ = drain.join();
+    }
+
+    /// A QUIC write blocked on its connection's window names the lane's datagram socket, so the
+    /// grant wakes it instead of a poll.
+    #[test]
+    fn a_window_blocked_write_parks_on_the_lane_socket() {
+        #[derive(Clone)]
+        struct Windowed;
+        impl CarrierSink for Windowed {
+            fn send(&self, _: &[u8]) -> bool {
+                false
+            }
+            fn push_ready(&self, _: &[u8]) -> Push {
+                Push::Parked
+            }
+            fn close(&self) {}
+        }
+
+        let mut buffer = RelayBuf::with_len(64 * 1024);
+        buffer.as_mut()[..64].fill(1);
+        let mut at = Forward::new();
+        at.pending = 64;
+        let step = crate::proxy::RelayStep::enter();
+        crate::proxy::note_wait_fd(1);
+        assert_eq!(
+            forward_flush(&buffer, &Windowed, &mut at),
+            Some(Next::Idle),
+            "a full window held the lane on the clock"
+        );
+        assert!(
+            crate::proxy::read_wait_pending(),
+            "the lane parked without naming the socket its grant arrives on"
+        );
+        drop(step);
     }
 
     /// A carrier that takes nothing for the stall budget ends the leg where it stands: the parked
