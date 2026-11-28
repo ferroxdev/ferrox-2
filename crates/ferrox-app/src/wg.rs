@@ -1269,13 +1269,14 @@ pub(crate) fn serve_inbound(
         );
     }
     // A fixed loopback address is served in-process when an outer redirect dials it; any other bind keeps the socket.
-    let (transport, port) = if lane && let Some(addr) = loopback_lane(address) {
+    let (transport, port, lane_addr) = if lane && let Some(addr) = loopback_lane(address) {
         let (to_inner, to_inner_rx) = mpsc::sync_channel(LANE_DEPTH);
         let (from_inner, from_inner_rx) = mpsc::sync_channel(LANE_DEPTH);
         register_inbound_lane(addr, to_inner, from_inner_rx);
         (
             Transport::Lane(Lane::new(from_inner, to_inner_rx)),
             addr.port(),
+            Some(addr),
         )
     } else {
         let socket = UdpSocket::bind(address)
@@ -1285,7 +1286,7 @@ pub(crate) fn serve_inbound(
             .map_err(|error| format!("wireguard `{address}` has no local address: {error}"))?
             .port();
         let _ = socket.set_read_timeout(Some(IO_TICK));
-        (Transport::Socket(socket), port)
+        (Transport::Socket(socket), port, None)
     };
     let (packets_tx, packets_rx) = mpsc::channel();
     let (to_tunnel, from_tunnel) = mpsc::channel();
@@ -1326,6 +1327,9 @@ pub(crate) fn serve_inbound(
         let _ = stack.join();
         if let Some(stop) = io_closed {
             stop.mark_closed();
+        }
+        if let Some(addr) = lane_addr {
+            deregister_inbound_lane(addr);
         }
     });
     Ok(port)
@@ -1580,6 +1584,15 @@ pub(crate) fn take_inbound_lane(addr: SocketAddr) -> Option<LaneEnds> {
     let lane = guard.as_ref()?.get(&addr)?;
     let from_inner = lane.from_inner.lock().ok()?.take();
     Some((lane.to_inner.clone(), from_inner))
+}
+
+/// Drop a stopped inbound's lane so a reload at the same address starts clean.
+pub(crate) fn deregister_inbound_lane(addr: SocketAddr) {
+    if let Ok(mut guard) = INBOUND_LANES.lock()
+        && let Some(map) = guard.as_mut()
+    {
+        map.remove(&addr);
+    }
 }
 
 fn loopback_lane(address: &str) -> Option<SocketAddr> {
