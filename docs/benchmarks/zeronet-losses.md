@@ -45,9 +45,11 @@ Run
 (`tuic-duplex-win` @ `6377051d`) re-ran the worst TUIC cell at the full tier.
 `tuic-raw-duplex-8--srv-sing-box` read ferrox **632.2 MiB/s** (three repeats
 705.9 / 632.2 / 632.2), **3.28×** the #46 leg and **2.14×** zeronet's 295.1;
-sing-box read 420.9 in the same cell. The change is the client lane's blocking
-connection lock, described in `docs/function/tuic.md`. The cell's own gate is
-still red against `xray-core-rust` (981.7), a comparator absent from #46.
+sing-box read 420.9 in the same cell against 219.3 in #46, so that runner's own
+speed is part of the absolute ratio. The same-cell ratio moved **0.878 → 1.50**.
+The change is the client lane's blocking connection lock, described in
+`docs/function/tuic.md`. The cell's own gate is still red against
+`xray-core-rust` (981.7), a comparator absent from #46.
 `tuic-raw-up-1--srv-sing-box` read ferrox 430.6 against sing-box's 508.6
 (0.847×), up from 0.593× on the prior branch run but still under the comparator.
 
