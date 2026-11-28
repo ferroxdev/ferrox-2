@@ -714,9 +714,9 @@ masque_inner_server_settings() {
   echo "\"protocol\": \"masque\", \"settings\": {\"warp\": true, \"users\": [{\"email\": \"matrix@carrier.test\", \"pass\": \"$PASSWORD\"}], \"address\": [\"10.15.0.1/24\", \"fd15::1/64\"]}, \"streamSettings\": {\"network\": \"masque\", \"security\": \"tls\", \"tlsSettings\": {\"alpn\": [\"h3\"], \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"keyFile\": \"$dir/key.pem\"}]}}"
 }
 
-# `xmux.maxConnections` lets concurrent flows spread over that many carrier lanes; unset keeps one.
+# `MATRIX_XMUX=N` lets concurrent flows spread over N carrier lanes; unset keeps one.
 matrix_xmux() {
-  local lanes="${MATRIX_XMUX:-4}"
+  local lanes="${MATRIX_XMUX:-}"
   if [[ "$lanes" =~ ^[1-9][0-9]*$ ]]; then
     printf ', "xmux": {"maxConnections": %s}' "$lanes"
   fi
