@@ -1614,7 +1614,7 @@ pub(crate) fn recv_batch(_sock: &Datagram, _batch: &mut Batch) -> Drain {
 /// The HTTP/3 opening, carried exactly once per connection: a second control stream is a connection error.
 pub(crate) fn send_h3_opening(conn: &mut QuicheConnection, sock: &Datagram) -> bool {
     for (stream, payload) in crate::foxy::H3::h3_opening() {
-        let mut rest = payload;
+        let mut rest = &payload[..];
         while !rest.is_empty() {
             match conn.stream_send(stream, rest, false) {
                 Ok(0) | Err(_) => return false,
@@ -1631,7 +1631,7 @@ pub(crate) fn send_h3_opening(conn: &mut QuicheConnection, sock: &Datagram) -> b
 pub(crate) fn send_h3_server_opening(conn: &mut QuicheConnection, sock: &Datagram) -> bool {
     for (index, (_, payload)) in crate::foxy::H3::h3_opening().into_iter().enumerate() {
         let stream = [3u64, 7, 11][index];
-        let mut rest = payload;
+        let mut rest = &payload[..];
         while !rest.is_empty() {
             match conn.stream_send(stream, rest, false) {
                 Ok(0) | Err(_) => return false,
@@ -9027,12 +9027,8 @@ mod tests {
         let (first, second) = server.join().expect("joins");
         assert!(!first.0, "the first peer did not resume");
         assert!(second.0, "the server saw the resumption");
-        let want = crate::foxy::H3::h3_opening()[0].1;
-        assert_eq!(
-            second.1.as_slice(),
-            want,
-            "the early bytes are the opening itself"
-        );
+        let want = crate::foxy::H3::h3_opening()[0].1.clone();
+        assert_eq!(second.1, want, "the early bytes are the opening itself");
     }
 
     /// The production dial hands the offer to the connection before its first packet, not only the
