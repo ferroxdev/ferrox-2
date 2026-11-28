@@ -1436,16 +1436,13 @@ impl Proxy {
         }
         let port = &digits[at..];
         let auth = !self.user.is_empty() || !self.pass.is_empty();
-        let mut encoded = Vec::new();
-        if auth {
-            let len = ferrox_core::b64::encoded_len(self.user.len() + self.pass.len() + 1);
-            encoded.resize(len, 0);
-            ferrox_core::b64::encode_parts_into(
-                &[self.user.as_bytes(), &b":"[..], self.pass.as_bytes()],
-                &mut encoded[..],
-            )
-            .map_err(|error| format!("psiphon: upstream proxy credentials: {error}"))?;
-        }
+        let mut auth_stack = [0u8; 256];
+        let mut auth_heap = Vec::new();
+        let encoded: &[u8] = if auth {
+            http_basic_auth(&self.user, &self.pass, &mut auth_stack, &mut auth_heap)?
+        } else {
+            &[]
+        };
         let mut parts: [&[u8]; 17] = [&b""[..]; 17];
         let mut count = 0;
         parts[count] = b"CONNECT ";
@@ -1477,7 +1474,7 @@ impl Proxy {
         if auth {
             parts[count] = b"Proxy-Authorization: Basic ";
             count += 1;
-            parts[count] = encoded.as_slice();
+            parts[count] = encoded;
             count += 1;
             parts[count] = b"\r\n";
             count += 1;
@@ -1717,6 +1714,25 @@ fn write_all_parts_until<const N: usize>(
         parts = rest;
     }
     Ok(())
+}
+
+/// The upstream `Basic` credential, encoded into the caller's stack room and only falling back to the heap for a pair too long for it.
+fn http_basic_auth<'a>(
+    user: &str,
+    pass: &str,
+    stack: &'a mut [u8; 256],
+    heap: &'a mut Vec<u8>,
+) -> Result<&'a [u8], String> {
+    let len = ferrox_core::b64::encoded_len(user.len() + pass.len() + 1);
+    let out = if len <= stack.len() {
+        &mut stack[..len]
+    } else {
+        heap.resize(len, 0);
+        &mut heap[..]
+    };
+    ferrox_core::b64::encode_parts_into(&[user.as_bytes(), &b":"[..], pass.as_bytes()], out)
+        .map_err(|error| format!("psiphon: upstream proxy credentials: {error}"))?;
+    Ok(out)
 }
 
 fn authority_host(host: &str, port: u16) -> String {
@@ -2126,8 +2142,7 @@ impl Session {
         // An OSSH server reads the seed before it writes anything, so the client line goes first.
         let our_version = b"SSH-2.0-OpenSSH_9.6";
         write_all(&mut output, b"SSH-2.0-OpenSSH_9.6\r\n")?;
-        let mut banner = Vec::with_capacity(256);
-        let version = read_identification(&mut input, &mut banner)?;
+        let version = read_identification(&mut input)?;
 
         let kex = kex(
             &mut output,
@@ -4471,8 +4486,8 @@ impl PacketReader {
             .take()
             .or_else(|| lock(&self.pool).pop())
             .unwrap_or_default();
-        if buffer.len() < PACKET_CHUNK {
-            buffer.resize(PACKET_CHUNK, 0);
+        if buffer.len() < self.block {
+            buffer.resize(self.block, 0);
         }
         let taken = self.take_pending(&mut buffer[..self.block]);
         if taken < self.block {
@@ -4674,10 +4689,10 @@ fn write_all_deadline(
 }
 
 /// Read the server banner, retaining bytes read past its newline.
-fn read_identification(reader: &mut PacketReader, banner: &mut Vec<u8>) -> Result<Vec<u8>, String> {
+fn read_identification(reader: &mut PacketReader) -> Result<Vec<u8>, String> {
     let mut chunk = [0u8; 512];
     let mut raw = [0u8; 512];
-    banner.clear();
+    let mut banner = Vec::with_capacity(256);
     loop {
         arm_deadline(&reader.io, reader.deadline)
             .map_err(|error| format!("psiphon ssh banner: {error}"))?;
@@ -4720,7 +4735,7 @@ fn read_identification(reader: &mut PacketReader, banner: &mut Vec<u8>) -> Resul
                     reader.obfuscation = Some(saved);
                 }
                 reader.pending.extend_from_slice(&raw[end + 1..read]);
-                return Ok(banner.clone());
+                return Ok(banner);
             }
             banner.clear();
             start = end + 1;
@@ -4735,25 +4750,22 @@ struct Keys {
     server_mac: [u8; 32],
 }
 
-#[allow(clippy::too_many_lines)]
-fn kex(
-    writer: &mut PacketWriter,
-    reader: &mut PacketReader,
-    client_version: &[u8],
-    server_version: &[u8],
-    expected_host_key: &[u8],
-    algorithms: Option<&[String; 4]>,
-) -> Result<Keys, String> {
-    let [kex_name, cipher, mac, host_key] = match algorithms {
-        Some(names) => (*names).clone(),
-        None => [
-            "curve25519-sha256,curve25519-sha256@libssh.org".to_owned(),
-            "aes128-ctr".to_owned(),
-            "hmac-sha2-256".to_owned(),
-            "rsa-sha2-256,rsa-sha2-512,ssh-rsa,ssh-ed25519".to_owned(),
-        ],
-    };
-    let mut kexinit = vec![MSG_KEXINIT];
+/// The KEXINIT payload, sized once for every name list it carries, so the handshake's first packet is not regrown.
+fn build_kexinit(kex_name: &str, cipher: &str, mac: &str, host_key: &str) -> Vec<u8> {
+    let len = 1
+        + 16
+        + 4
+        + kex_name.len()
+        + 4
+        + host_key.len()
+        + 2 * (4 + cipher.len())
+        + 2 * (4 + mac.len())
+        + 2 * (4 + 4)
+        + 2 * 4
+        + 1
+        + 4;
+    let mut kexinit = Vec::with_capacity(len);
+    kexinit.push(MSG_KEXINIT);
     kexinit.extend_from_slice(&random::<16>());
     put_name_list(&mut kexinit, kex_name.as_bytes());
     put_name_list(&mut kexinit, host_key.as_bytes());
@@ -4767,6 +4779,38 @@ fn kex(
     put_name_list(&mut kexinit, b"");
     kexinit.push(0);
     put_u32(&mut kexinit, 0);
+    kexinit
+}
+
+/// The four algorithm names the client offers, borrowed from the configured list or the defaults, so a handshake copies none of them.
+fn kex_names(algorithms: Option<&[String; 4]>) -> [&str; 4] {
+    match algorithms {
+        Some(names) => [
+            names[0].as_str(),
+            names[1].as_str(),
+            names[2].as_str(),
+            names[3].as_str(),
+        ],
+        None => [
+            "curve25519-sha256,curve25519-sha256@libssh.org",
+            "aes128-ctr",
+            "hmac-sha2-256",
+            "rsa-sha2-256,rsa-sha2-512,ssh-rsa,ssh-ed25519",
+        ],
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn kex(
+    writer: &mut PacketWriter,
+    reader: &mut PacketReader,
+    client_version: &[u8],
+    server_version: &[u8],
+    expected_host_key: &[u8],
+    algorithms: Option<&[String; 4]>,
+) -> Result<Keys, String> {
+    let [kex_name, cipher, mac, host_key] = kex_names(algorithms);
+    let kexinit = build_kexinit(kex_name, cipher, mac, host_key);
     writer
         .send(&kexinit)
         .map_err(|error| format!("psiphon ssh kexinit: {error}"))?;
@@ -6142,6 +6186,70 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
 
+    /// The KEXINIT payload fills one allocation exactly instead of growing through every name list.
+    #[test]
+    fn a_kexinit_is_one_allocation_with_no_spare_room() {
+        let (payload, counts) = ferrox_core::alloc_count::measure(|| {
+            build_kexinit(
+                "curve25519-sha256",
+                "aes128-ctr",
+                "hmac-sha2-256",
+                "ssh-ed25519",
+            )
+        });
+        assert_eq!(counts.allocs, 1, "the name lists fill the one allocation");
+        assert_eq!(counts.bytes, payload.len(), "no spare room is requested");
+        assert_eq!(payload.len(), payload.capacity());
+    }
+
+    /// The handshake names are borrowed, whether configured or defaulted, so no handshake clones four strings.
+    #[test]
+    fn kex_names_cost_no_allocation() {
+        let (defaults, counts) = ferrox_core::alloc_count::measure(|| kex_names(None));
+        assert_eq!(counts.allocs, 0);
+        assert_eq!(
+            defaults,
+            [
+                "curve25519-sha256,curve25519-sha256@libssh.org",
+                "aes128-ctr",
+                "hmac-sha2-256",
+                "rsa-sha2-256,rsa-sha2-512,ssh-rsa,ssh-ed25519"
+            ]
+        );
+        let configured = [
+            "curve25519-sha256".to_owned(),
+            "aes256-ctr".to_owned(),
+            "hmac-sha2-512".to_owned(),
+            "ssh-ed25519".to_owned(),
+        ];
+        let (borrowed, counts) = ferrox_core::alloc_count::measure(|| kex_names(Some(&configured)));
+        assert_eq!(counts.allocs, 0);
+        assert_eq!(
+            borrowed,
+            [
+                "curve25519-sha256",
+                "aes256-ctr",
+                "hmac-sha2-512",
+                "ssh-ed25519"
+            ]
+        );
+    }
+
+    /// A short upstream credential is encoded into the caller's stack room, not a heap vector.
+    #[test]
+    fn short_proxy_credentials_cost_no_allocation() {
+        let (len, counts) = ferrox_core::alloc_count::measure(|| {
+            let mut stack = [0u8; 256];
+            let mut heap = Vec::new();
+            let encoded = http_basic_auth("user", "pass", &mut stack, &mut heap)
+                .expect("the credential encodes");
+            assert_eq!(encoded, b"dXNlcjpwYXNz");
+            encoded.len()
+        });
+        assert_eq!(len, 12);
+        assert_eq!(counts.allocs, 0, "the stack room held the credential");
+    }
+
     /// The `direct-tcpip` fields fit their buffer exactly, so no field pushes it into a second allocation.
     #[test]
     fn a_direct_tcpip_extra_is_one_allocation_with_no_spare_room() {
@@ -6428,6 +6536,30 @@ mod tests {
     }
 
     #[test]
+    fn a_small_packet_does_not_zero_the_whole_chunk() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let mut peer = TcpStream::connect(listener.local_addr().expect("address")).expect("peer");
+        let (socket, _) = listener.accept().expect("accept");
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&7u32.to_be_bytes());
+        wire.push(4);
+        wire.extend_from_slice(&[MSG_IGNORE, MSG_IGNORE]);
+        wire.extend_from_slice(&[0u8; 4]);
+        peer.write_all(&wire).expect("write");
+        let mut spare = Vec::with_capacity(PACKET_CHUNK);
+        spare.resize(wire.len(), 0);
+        let pool = Arc::new(Mutex::new(vec![spare]));
+        let mut reader = PacketReader::new(socket, None, None, None, pool);
+        let packet = reader.recv().expect("packet");
+        assert_eq!(packet.kind(), Some(MSG_IGNORE));
+        assert_eq!(
+            packet.buffer.len(),
+            wire.len(),
+            "the reader kept the buffer at the packet it read"
+        );
+    }
+
+    #[test]
     fn a_kex_packet_need_not_be_a_block_multiple() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let mut peer = TcpStream::connect(listener.local_addr().expect("address")).expect("peer");
@@ -6460,9 +6592,8 @@ mod tests {
         peer.write_all(&wire).expect("write");
         let pool = Arc::new(Mutex::new(Vec::new()));
         let mut reader = PacketReader::new(socket, None, None, None, pool);
-        let mut banner = Vec::new();
         assert_eq!(
-            read_identification(&mut reader, &mut banner).expect("banner"),
+            read_identification(&mut reader).expect("banner"),
             b"SSH-2.0-test"
         );
         let packet = reader.recv().expect("packet");
@@ -6485,9 +6616,8 @@ mod tests {
         peer.write_all(&wire).expect("write");
         let pool = Arc::new(Mutex::new(Vec::new()));
         let mut reader = PacketReader::new(socket, Some(Rc4::new(key)), None, None, pool);
-        let mut banner = Vec::new();
         assert_eq!(
-            read_identification(&mut reader, &mut banner).expect("banner"),
+            read_identification(&mut reader).expect("banner"),
             b"SSH-2.0-test"
         );
         let packet = reader.recv().expect("packet");

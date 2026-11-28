@@ -327,16 +327,40 @@ fn carrier_alpn(carrier: Carrier) -> std::sync::Arc<[Vec<u8>]> {
     std::sync::Arc::clone(&lists[carrier.key() as usize])
 }
 
+/// The empty lists a config that names none share, so a dial does not allocate four empty arcs.
+fn no_lists() -> &'static (
+    std::sync::Arc<[[u8; 32]]>,
+    std::sync::Arc<[String]>,
+    std::sync::Arc<[u16]>,
+    std::sync::Arc<[u16]>,
+) {
+    static EMPTY: std::sync::OnceLock<(
+        std::sync::Arc<[[u8; 32]]>,
+        std::sync::Arc<[String]>,
+        std::sync::Arc<[u16]>,
+        std::sync::Arc<[u16]>,
+    )> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(|| {
+        (
+            std::sync::Arc::from(Vec::new()),
+            std::sync::Arc::from(Vec::new()),
+            std::sync::Arc::from(Vec::new()),
+            std::sync::Arc::from(Vec::new()),
+        )
+    })
+}
+
 fn tls_config(dial: &FoxyDial) -> ferrox_core::tls::TlsConfig {
+    let empty = no_lists();
     ferrox_core::tls::TlsConfig {
         server_name: dial.host.to_string(),
         alpn: carrier_alpn(dial.carrier),
         roots: Arc::clone(&dial.roots),
         pins: dial.pins.clone(),
-        cert_pins: std::sync::Arc::from(Vec::new()),
-        verify_names: std::sync::Arc::default(),
-        cipher_suites: std::sync::Arc::default(),
-        curves: std::sync::Arc::default(),
+        cert_pins: Arc::clone(&empty.0),
+        verify_names: Arc::clone(&empty.1),
+        cipher_suites: Arc::clone(&empty.2),
+        curves: Arc::clone(&empty.3),
         insecure: false,
         resumption: true,
         fingerprint: None,
@@ -5175,6 +5199,18 @@ pub(crate) mod loopback {
             Arc::ptr_eq(&tls_config(&first).roots, &tls_config(&second).roots),
             "the platform store is read once for the process, not once per dial"
         );
+    }
+
+    /// A dial that names no certificate pins, verification names, suites or curves shares the empty lists instead of allocating four of them.
+    #[test]
+    fn a_dial_without_lists_shares_the_empty_ones() {
+        let dial = dial_for(Vec::new(), 443, Carrier::H2, foxy::pin::Pins::default());
+        let first = tls_config(&dial);
+        let second = tls_config(&dial);
+        assert!(Arc::ptr_eq(&first.cert_pins, &second.cert_pins));
+        assert!(Arc::ptr_eq(&first.verify_names, &second.verify_names));
+        assert!(Arc::ptr_eq(&first.cipher_suites, &second.cipher_suites));
+        assert!(Arc::ptr_eq(&first.curves, &second.curves));
     }
 
     /// An address that accepts TCP is not an address that carries the lane: `localhost` answers v6 first on both runners that matter, so a silent v6 listener must not cost the lane the v4 edge behind it.

@@ -724,6 +724,7 @@ fn relay<T: Read + Write + Queued + HalfClose>(mut stream: T, mut peer: TcpStrea
     let _ = peer.set_nodelay(true);
     let _ = peer.set_read_timeout(Some(POLL));
     let _ = peer.set_write_timeout(Some(POLL));
+    let _ = peer.set_nonblocking(true);
     let mut up = vec![0u8; BUFFER];
     let mut down = vec![0u8; BUFFER];
     let mut down_at = 0usize;
@@ -826,15 +827,12 @@ fn relay<T: Read + Write + Queued + HalfClose>(mut stream: T, mut peer: TcpStrea
 /// Whether the loopback peer has bytes ready (`Some(true)`), reached EOF
 /// (`Some(false)`), or has nothing to report yet (`None`), without consuming.
 fn ready(peer: &TcpStream) -> io::Result<Option<bool>> {
-    let _ = peer.set_nonblocking(true);
-    let state = match peer.peek(&mut [0u8; 1]) {
+    match peer.peek(&mut [0u8; 1]) {
         Ok(0) => Ok(Some(false)),
         Ok(_) => Ok(Some(true)),
         Err(error) if idle(&error) => Ok(None),
         Err(error) => Err(error),
-    };
-    let _ = peer.set_nonblocking(false);
-    state
+    }
 }
 
 /// Whether the loopback peer has bytes ready, reached EOF, or is unchanged.
@@ -987,7 +985,14 @@ fn truncated_frame() -> io::Error {
 /// Read one frame into `wire`'s own tail, returning whether more frames remain.
 fn fill<T: Read>(inner: &mut T, wire: &mut Vec<u8>) -> io::Result<bool> {
     let base = wire.len();
-    wire.resize(base + BUFFER, 0);
+    let spare = wire.capacity().saturating_sub(base);
+    let room = if spare == 0 {
+        wire.reserve(BUFFER);
+        BUFFER
+    } else {
+        spare.min(BUFFER)
+    };
+    wire.resize(base + room, 0);
     match inner.read(&mut wire[base..]) {
         Ok(0) => {
             wire.truncate(base);
@@ -1263,6 +1268,54 @@ mod tests {
             "the writer saw the caller's buffer"
         );
         assert!(stream.pending.is_empty(), "nothing was staged");
+    }
+
+    /// A frame already in the wire reads into the spare room it has instead of growing the buffer.
+    #[test]
+    fn a_frame_with_a_prefix_does_not_grow_the_wire() {
+        struct Once<'a> {
+            payload: &'a [u8],
+            sent: bool,
+        }
+        impl Read for Once<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.sent {
+                    return Ok(0);
+                }
+                self.sent = true;
+                let count = self.payload.len().min(buf.len());
+                buf[..count].copy_from_slice(&self.payload[..count]);
+                Ok(count)
+            }
+        }
+        let mut wire = Vec::with_capacity(BUFFER);
+        wire.extend_from_slice(b"head");
+        let capacity = wire.capacity();
+        let mut probe = Once {
+            payload: b"frame",
+            sent: false,
+        };
+        assert!(fill(&mut probe, &mut wire).expect("fills"));
+        assert_eq!(&wire[..9], b"headframe");
+        assert_eq!(
+            wire.capacity(),
+            capacity,
+            "the spare room was already there"
+        );
+    }
+
+    /// Readiness peeks without toggling the peer's blocking mode on every turn.
+    #[test]
+    fn readiness_leaves_the_peer_nonblocking() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let peer = TcpStream::connect(listener.local_addr().expect("address")).expect("peer");
+        let (_socket, _) = listener.accept().expect("accept");
+        peer.set_read_timeout(Some(Duration::from_millis(10)))
+            .expect("timeout");
+        peer.set_nonblocking(true).expect("nonblocking");
+        assert_eq!(ready(&peer).expect("ready"), None);
+        let error = peer.read(&mut [0u8; 1]).expect_err("nothing is waiting");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
     }
 
     /// A frame lands in the wire buffer's own tail, not in a temporary the wire copies from.
