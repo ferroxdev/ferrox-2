@@ -664,9 +664,16 @@ impl MasqueOut {
                 }
                 continue;
             }
-            if let Some(at) = slot.lanes.iter().position(|lane| {
-                lane.active.load(Ordering::Acquire) < concurrency && lane.requests < lane.cap
-            }) {
+            if let Some(at) = slot
+                .lanes
+                .iter()
+                .enumerate()
+                .filter(|(_, lane)| {
+                    lane.active.load(Ordering::Acquire) < concurrency && lane.requests < lane.cap
+                })
+                .min_by_key(|(_, lane)| lane.active.load(Ordering::Acquire))
+                .map(|(at, _)| at)
+            {
                 return Ok(Self::take(&mut slot, at));
             }
             if slot.lanes.len() < slot.target && slot.reconnect.due(now) {
@@ -5431,6 +5438,32 @@ mod tests {
             })
             .expect("an expired healthy lane does not hold the backoff");
         assert_eq!(dials, 1);
+    }
+
+    /// Every flow after the pool fills must go to the least-loaded lane, not back to the first.
+    #[test]
+    fn a_full_pool_spreads_each_new_flow_over_the_least_loaded_lane() {
+        let outbound = crate::json::parse(
+            r#"{"settings":{"address":"127.0.0.1","port":8443},"streamSettings":{"security":"tls","tlsSettings":{"serverName":"localhost","allowInsecure":true},"masqueSettings":{"xmux":{"maxConnections":4,"hKeepAlivePeriod":-1}}}}"#,
+        )
+        .expect("the xmux outbound");
+        let masque = MasqueOut::new(&outbound).expect("the pool");
+        let now = Instant::now();
+        let mut leases = Vec::new();
+        for _ in 0..8 {
+            let (_, lease) = masque
+                .ensure_flow_at(now, || {
+                    let mut lane = dead_lane(true);
+                    lane.alive = Arc::new(AtomicBool::new(true));
+                    Ok(lane)
+                })
+                .expect("a lane for the flow");
+            leases.push(lease);
+        }
+        let slot = masque.inner.lock().expect("the pool");
+        assert_eq!(slot.lanes.len(), 4, "the pool dialled its target");
+        let loads: Vec<u64> = slot.lanes.iter().map(|lane| lane.requests).collect();
+        assert_eq!(loads, vec![2, 2, 2, 2], "flows landed unevenly: {loads:?}");
     }
 
     #[test]
