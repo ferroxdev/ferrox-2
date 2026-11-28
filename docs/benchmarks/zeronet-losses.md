@@ -38,6 +38,19 @@ xray-core-server WebSocket, raw-up and gRPC-bulk cells. In every row zeronet is
 also well under the pinned xray-core client where both run, so the cells are not
 xray-core's to win either.
 
+## Targeted after #46
+
+Run
+[46141630494](https://github.com/ferroxdev/ferrox-2/actions/runs/46141630494)
+(`tuic-duplex-win` @ `6377051d`) re-ran the worst TUIC cell at the full tier.
+`tuic-raw-duplex-8--srv-sing-box` read ferrox **632.2 MiB/s** (three repeats
+705.9 / 632.2 / 632.2), **3.28×** the #46 leg and **2.14×** zeronet's 295.1;
+sing-box read 420.9 in the same cell. The change is the client lane's blocking
+connection lock, described in `docs/function/tuic.md`. The cell's own gate is
+still red against `xray-core-rust` (981.7), a comparator absent from #46.
+`tuic-raw-up-1--srv-sing-box` read ferrox 430.6 against sing-box's 508.6
+(0.847×), up from 0.593× on the prior branch run but still under the comparator.
+
 ## CPU per GiB: 10 cells where zeronet used less
 
 Lower is better. zeronet's CPU/GiB is below ferrox's in ten cells (values are
