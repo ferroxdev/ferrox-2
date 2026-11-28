@@ -269,8 +269,6 @@ carrier-psiphon  psiphon_quic::tests::the_byte_varint_walk_costs_the_same_answer
 # writer; it is not a measurement of the previous writer.
 carrier-psiphon  psiphon_shadowsocks::tests::the_direct_write_costs_the_seal_and_nothing_else  ferrox_app::psiphon_shadowsocks::tests::direct_write_probe
 carrier-psiphon  psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy  ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe
-carrier-psiphon  psiphon_light::tests::the_direct_fill_costs_no_stage_where_the_staged_one_does  ferrox_app::psiphon_light::tests::fill_direct_probe
-carrier-psiphon  psiphon_light::tests::the_direct_fill_costs_no_stage_where_the_staged_one_does  ferrox_app::psiphon_light::tests::fill_staged_probe
 carrier-psiphon  psiphon_light::tests::the_direct_write_costs_no_stage_where_the_staged_one_does  ferrox_app::psiphon_light::tests::write_direct_probe
 carrier-psiphon  psiphon_light::tests::the_direct_write_costs_no_stage_where_the_staged_one_does  ferrox_app::psiphon_light::tests::write_staged_probe
 carrier-psiphon  psiphon_light::tests::the_one_allocation_destination_costs_less_than_the_two_allocation_one  ferrox_app::psiphon_light::tests::normalize_one_probe

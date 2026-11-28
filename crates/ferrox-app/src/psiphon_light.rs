@@ -859,7 +859,6 @@ pub(crate) struct LightStream<T> {
     write_padding_done: bool,
     wire: Vec<u8>,
     wire_at: usize,
-    wire_init: usize,
     payload: std::ops::Range<usize>,
     pending: Vec<u8>,
     pending_at: usize,
@@ -875,7 +874,6 @@ impl<T> LightStream<T> {
             write_padding_done: false,
             wire: Vec::with_capacity(BUFFER),
             wire_at: 0,
-            wire_init: 0,
             payload: 0..0,
             pending: header,
             pending_at: 0,
@@ -914,7 +912,7 @@ impl<T: Read> Read for LightStream<T> {
             }
             let at = self.wire_at;
             if self.wire.len() - at < 2 {
-                if !self.fill()? {
+                if !fill(&mut self.inner, &mut self.wire)? {
                     return if at == self.wire.len() {
                         Ok(0)
                     } else {
@@ -930,7 +928,7 @@ impl<T: Read> Read for LightStream<T> {
                 continue;
             }
             if self.wire.len() - at < 4 {
-                if !self.fill()? {
+                if !fill(&mut self.inner, &mut self.wire)? {
                     return Err(truncated_frame());
                 }
                 continue;
@@ -944,7 +942,7 @@ impl<T: Read> Read for LightStream<T> {
             }
             let frame = 4 + usize::from(padding) + usize::from(payload);
             if self.wire.len() - at < frame {
-                if !self.fill()? {
+                if !fill(&mut self.inner, &mut self.wire)? {
                     return Err(truncated_frame());
                 }
                 continue;
@@ -986,16 +984,16 @@ fn truncated_frame() -> io::Error {
     )
 }
 
-impl<T: Read> LightStream<T> {
-    /// Read one frame straight into the wire buffer, returning whether more frames remain.
-    fn fill(&mut self) -> io::Result<bool> {
-        let mut init = self.wire_init;
-        // SAFETY: every byte below `init` is initialised, and `init_room` zeroes the spare tail before the read writes it.
-        let read = unsafe {
-            crate::proxy::read_into_tail_room(&mut self.inner, &mut self.wire, &mut init, BUFFER)
-        };
-        self.wire_init = init;
-        read.map(|count| count != 0)
+/// Read one frame into `wire`, returning whether more frames remain.
+fn fill<T: Read>(inner: &mut T, wire: &mut Vec<u8>) -> io::Result<bool> {
+    let mut temp = [0u8; BUFFER];
+    match inner.read(&mut temp) {
+        Ok(0) => Ok(false),
+        Ok(count) => {
+            wire.extend_from_slice(&temp[..count]);
+            Ok(true)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -1112,124 +1110,6 @@ impl<T: Write> LightStream<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A read whose buffer is the wire buffer itself: the pointer it sees is where the bytes land, with no staging array in between.
-    #[test]
-    fn fill_reads_into_the_wire_buffer() {
-        struct Once {
-            seen: *const u8,
-            read: bool,
-        }
-        impl Read for Once {
-            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-                self.seen = buf.as_ptr();
-                if self.read {
-                    return Ok(0);
-                }
-                self.read = true;
-                buf[..4].copy_from_slice(b"data");
-                Ok(4)
-            }
-        }
-        let mut stream = LightStream::new(
-            Once {
-                seen: std::ptr::null(),
-                read: false,
-            },
-            Vec::new(),
-        );
-        assert!(stream.fill().expect("fills"), "the read returned bytes");
-        assert_eq!(stream.wire.as_slice(), &b"data"[..]);
-        assert_eq!(
-            stream.inner.seen,
-            stream.wire.as_ptr(),
-            "the read wrote at the wire buffer's base"
-        );
-    }
-
-    /// A second fill after the wire is cleared reuses the same allocation and the initialized tail.
-    #[test]
-    fn repeated_fills_reuse_the_wire_tail_after_compaction() {
-        struct Twice {
-            chunks: std::collections::VecDeque<Vec<u8>>,
-        }
-        impl Read for Twice {
-            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-                let Some(mut chunk) = self.chunks.pop_front() else {
-                    return Ok(0);
-                };
-                let take = chunk.len().min(buf.len());
-                buf[..take].copy_from_slice(&chunk[..take]);
-                if take < chunk.len() {
-                    chunk.drain(..take);
-                    self.chunks.push_front(chunk);
-                }
-                Ok(take)
-            }
-        }
-        let mut stream = LightStream::new(
-            Twice {
-                chunks: vec![b"abcd".to_vec(), b"efgh".to_vec()].into(),
-            },
-            Vec::new(),
-        );
-        let (first, counts) = ferrox_core::alloc_count::measure(|| stream.fill());
-        assert!(first.expect("first fill"));
-        assert_eq!(counts.allocs, 0, "the first fill lands in the wire");
-        assert_eq!(stream.wire.as_slice(), &b"abcd"[..]);
-        let capacity = stream.wire.capacity();
-        stream.wire_at = stream.wire.len();
-        stream.compact();
-        assert_eq!(stream.wire.as_slice(), b"");
-        let (second, counts) = ferrox_core::alloc_count::measure(|| stream.fill());
-        assert!(second.expect("second fill"));
-        assert_eq!(counts.allocs, 0, "the tail is reused");
-        assert_eq!(stream.wire.as_slice(), &b"efgh"[..]);
-        assert_eq!(stream.wire.capacity(), capacity, "the wire is reused");
-        assert!(stream.wire_init >= stream.wire.len());
-    }
-
-    struct Source;
-
-    impl Read for Source {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            let count = buf.len().min(256);
-            buf[..count].fill(0x5A);
-            Ok(count)
-        }
-    }
-
-    #[inline(never)]
-    fn fill_direct_probe() -> usize {
-        let mut stream = LightStream::new(Source, Vec::new());
-        let mut sum = 0;
-        for _ in 0..4096 {
-            stream.wire.clear();
-            assert!(stream.fill().expect("fills"));
-            sum += std::hint::black_box(&stream.wire).len();
-        }
-        sum
-    }
-
-    #[inline(never)]
-    fn fill_staged_probe() -> usize {
-        let mut stream = LightStream::new(Source, Vec::new());
-        let mut staging = [0u8; 256];
-        let mut sum = 0;
-        for _ in 0..4096 {
-            stream.wire.clear();
-            let count = stream.inner.read(&mut staging).expect("reads");
-            stream.wire.extend_from_slice(&staging[..count]);
-            sum += std::hint::black_box(&stream.wire).len();
-        }
-        sum
-    }
-
-    /// The direct fill is the staged fill without the staging copy.
-    #[test]
-    fn the_direct_fill_costs_no_stage_where_the_staged_one_does() {
-        assert_eq!(fill_direct_probe(), fill_staged_probe());
-    }
 
     /// A partial plain write stages only the remainder and retries it, with no byte lost or repeated.
     #[test]
