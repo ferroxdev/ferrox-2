@@ -219,6 +219,7 @@ struct WarpSpec {
     cooldown: Duration,
     noize: crate::noize::NoizeSettings,
     quic_v2: bool,
+    xmux: Option<crate::json::Json>,
     gool: GoolSettings,
     mim: MimSettings,
     team: Option<crate::zerotrust::TeamSettings>,
@@ -534,6 +535,10 @@ impl WarpSpec {
         let noize =
             crate::noize::NoizeSettings::from_settings_with(settings, env.var, env.present)?;
         let quic_v2 = quic_v2_enabled(settings, (env.var)("AETHER_QUIC_V2").as_deref());
+        let xmux = settings
+            .get("masque")
+            .and_then(|masque| masque.get("xmux"))
+            .cloned();
         let gool = gool_settings(settings, env)?;
         let mim = if mode == Mode::Mim {
             mim_settings(settings, env)?
@@ -577,6 +582,7 @@ impl WarpSpec {
             cooldown: edge.cooldown,
             noize,
             quic_v2,
+            xmux,
             gool,
             mim,
             team,
@@ -839,6 +845,7 @@ impl WarpSpec {
             cooldown: Duration::from_secs(COOLDOWN_SECS),
             noize: crate::noize::NoizeSettings::default(),
             quic_v2: true,
+            xmux: None,
             gool: GoolSettings::default(),
             mim: MimSettings::default(),
             team: None,
@@ -2542,6 +2549,9 @@ fn masque_outbound(identity: &Identity, spec: &WarpSpec) -> Result<crate::json::
     if let Some(warp_tls) = spec.tls.json() {
         masque_settings.push(("warpTls", warp_tls));
     }
+    if let Some(xmux) = &spec.xmux {
+        masque_settings.push(("xmux", xmux.clone()));
+    }
     let masque_settings = obj_pairs(masque_settings);
     let tls = obj_pairs(vec![
         ("serverName", string(&spec.masque_server_name)),
@@ -3620,6 +3630,9 @@ fn mim_outbound(
     if let Some(warp_tls) = spec.tls.json() {
         masque_settings.push(("warpTls", warp_tls));
     }
+    if let Some(xmux) = &spec.xmux {
+        masque_settings.push(("xmux", xmux.clone()));
+    }
     let masque_settings = obj_pairs(masque_settings);
     let tls = obj_pairs(vec![
         ("serverName", string(&spec.masque_server_name)),
@@ -4179,6 +4192,7 @@ pub(crate) fn one_tap(
         cooldown: Duration::from_secs(COOLDOWN_SECS),
         noize: crate::noize::NoizeSettings::from_cli(peers.noize, peers.no_profile_retry),
         quic_v2: !peers.no_quic_v2,
+        xmux: None,
         gool: GoolSettings {
             wiw_outer,
             wiw_inner,
@@ -4632,6 +4646,7 @@ mod tests {
             cooldown: Duration::from_secs(COOLDOWN_SECS),
             noize: crate::noize::NoizeSettings::default(),
             quic_v2: true,
+            xmux: None,
             gool: GoolSettings::default(),
             mim: MimSettings::default(),
             team: None,
@@ -4767,6 +4782,7 @@ mod tests {
             cooldown: Duration::from_secs(COOLDOWN_SECS),
             noize: crate::noize::NoizeSettings::default(),
             quic_v2: true,
+            xmux: None,
             gool: GoolSettings::default(),
             mim: MimSettings::default(),
             team: None,
@@ -4864,6 +4880,7 @@ mod tests {
             cooldown: Duration::from_secs(COOLDOWN_SECS),
             noize: crate::noize::NoizeSettings::default(),
             quic_v2: true,
+            xmux: None,
             gool: GoolSettings::default(),
             mim: MimSettings::default(),
             team: None,
@@ -4892,6 +4909,39 @@ mod tests {
                 .and_then(crate::json::Json::as_u32),
             Some(u32::from(DEFAULT_MTU))
         );
+    }
+
+    #[test]
+    fn the_warps_masque_half_carries_the_xmux_lane_pool() {
+        let settings = crate::json::parse(
+            r#"{"mode":"masque","register":true,"masque":{"xmux":{"maxConnections":4}}}"#,
+        )
+        .expect("settings");
+        let parsed = WarpSpec::from(&settings).expect("a warp spec");
+        assert!(parsed.xmux.is_some(), "the warp spec keeps the lane pool");
+        let key = rcgen::KeyPair::generate().expect("a MASQUE key");
+        let identity = Identity {
+            masque: Some(MasqueIdentity {
+                private: key.serialize_der(),
+                server: decode_pem(&key.public_key_pem()).expect("the server key"),
+                addresses: vec!["172.16.0.2".parse().expect("a v4 address")],
+            }),
+            ..sample_identity()
+        };
+        let mut spec = sample_spec();
+        spec.xmux = Some(crate::json::parse(r#"{"maxConnections":4}"#).expect("xmux"));
+        let outbound = masque_outbound(&identity, &spec).expect("the MASQUE half");
+        assert_eq!(
+            outbound
+                .get("streamSettings")
+                .and_then(|settings| settings.get("masqueSettings"))
+                .and_then(|settings| settings.get("xmux"))
+                .and_then(|xmux| xmux.get("maxConnections"))
+                .and_then(crate::json::Json::as_u32),
+            Some(4),
+            "the WARP MASQUE half carries the lane pool"
+        );
+        crate::masque::MasqueOut::new(&outbound).expect("the carrier reads the pool");
     }
 
     #[test]

@@ -714,16 +714,25 @@ masque_inner_server_settings() {
   echo "\"protocol\": \"masque\", \"settings\": {\"warp\": true, \"users\": [{\"email\": \"matrix@carrier.test\", \"pass\": \"$PASSWORD\"}], \"address\": [\"10.15.0.1/24\", \"fd15::1/64\"]}, \"streamSettings\": {\"network\": \"masque\", \"security\": \"tls\", \"tlsSettings\": {\"alpn\": [\"h3\"], \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"keyFile\": \"$dir/key.pem\"}]}}"
 }
 
+# `xmux.maxConnections` lets concurrent flows spread over that many carrier lanes; unset keeps one.
+matrix_xmux() {
+  local lanes="${MATRIX_XMUX:-4}"
+  if [[ "$lanes" =~ ^[1-9][0-9]*$ ]]; then
+    printf ', "xmux": {"maxConnections": %s}' "$lanes"
+  fi
+}
+
 masque_client_settings() {
-  local port="$1" mode="${2:-h3}" dir pin auth stream
+  local port="$1" mode="${2:-h3}" dir pin auth stream xmux
+  xmux="$(matrix_xmux)"
   dir="$(matrix_tls_dir)"
   pin="$(matrix_tls_pin "$dir/cert.pem")"
   auth="$(printf '%s' "matrix@carrier.test:$PASSWORD" | base64)"
   case "$mode" in
-    h1) stream="\"network\": \"masque\", \"security\": \"tls\", \"masqueSettings\": {\"headers\": {\"Authorization\": \"Basic $auth\"}}, \"tlsSettings\": {\"serverName\": \"carrier.test\", \"alpn\": [\"http/1.1\"], \"caCertFile\": \"$dir/cert.pem\", \"pinnedPeerCertSha256\": \"$pin\", \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"usage\": \"verify\"}]}" ;;
-    h2) stream="\"network\": \"masque\", \"security\": \"tls\", \"masqueSettings\": {\"headers\": {\"Authorization\": \"Basic $auth\"}}, \"tlsSettings\": {\"serverName\": \"carrier.test\", \"alpn\": [\"h2\"], \"caCertFile\": \"$dir/cert.pem\", \"pinnedPeerCertSha256\": \"$pin\", \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"usage\": \"verify\"}]}" ;;
-    h2c) stream="\"network\": \"masque\", \"security\": \"none\", \"masqueSettings\": {\"headers\": {\"Authorization\": \"Basic $auth\"}}" ;;
-    *) stream="\"network\": \"masque\", \"security\": \"tls\", \"masqueSettings\": {\"headers\": {\"Authorization\": \"Basic $auth\"}}, \"tlsSettings\": {\"serverName\": \"carrier.test\", \"alpn\": [\"h3\"], \"caCertFile\": \"$dir/cert.pem\", \"pinnedPeerCertSha256\": \"$pin\", \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"usage\": \"verify\"}]}" ;;
+    h1) stream="\"network\": \"masque\", \"security\": \"tls\", \"masqueSettings\": {\"headers\": {\"Authorization\": \"Basic $auth\"}$xmux}, \"tlsSettings\": {\"serverName\": \"carrier.test\", \"alpn\": [\"http/1.1\"], \"caCertFile\": \"$dir/cert.pem\", \"pinnedPeerCertSha256\": \"$pin\", \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"usage\": \"verify\"}]}" ;;
+    h2) stream="\"network\": \"masque\", \"security\": \"tls\", \"masqueSettings\": {\"headers\": {\"Authorization\": \"Basic $auth\"}$xmux}, \"tlsSettings\": {\"serverName\": \"carrier.test\", \"alpn\": [\"h2\"], \"caCertFile\": \"$dir/cert.pem\", \"pinnedPeerCertSha256\": \"$pin\", \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"usage\": \"verify\"}]}" ;;
+    h2c) stream="\"network\": \"masque\", \"security\": \"none\", \"masqueSettings\": {\"headers\": {\"Authorization\": \"Basic $auth\"}$xmux}" ;;
+    *) stream="\"network\": \"masque\", \"security\": \"tls\", \"masqueSettings\": {\"headers\": {\"Authorization\": \"Basic $auth\"}$xmux}, \"tlsSettings\": {\"serverName\": \"carrier.test\", \"alpn\": [\"h3\"], \"caCertFile\": \"$dir/cert.pem\", \"pinnedPeerCertSha256\": \"$pin\", \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"usage\": \"verify\"}]}" ;;
   esac
   echo "\"tag\": \"proxy\", \"protocol\": \"masque\", \"settings\": {\"address\": \"127.0.0.1\", \"port\": $port, \"largeSegments\": true}, \"streamSettings\": {$stream}"
 }
@@ -732,10 +741,11 @@ masque_client_settings() {
 # dialect with a pinned mode, a WireGuard half the pinned mode never dials, and
 # a stream TLS fixture the Aether adapter alone reads for its client identity.
 warp_client_settings() {
-  local port="$1" mode="${2:-masque}" extra="${3:-}" key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" pem="MEECAQEwEwYHKoZIzj0CAQYIKoZIzj0DAQcEJzAlAgEBBCBCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQg==" dir pin
+  local port="$1" mode="${2:-masque}" extra="${3:-}" key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" pem="MEECAQEwEwYHKoZIzj0CAQYIKoZIzj0DAQcEJzAlAgEBBCBCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQg==" dir pin xmux
   dir="$(matrix_tls_dir)" || return 1
   pin="$(matrix_tls_spki "$dir/cert.pem")" || return 1
-  echo "\"tag\": \"proxy\", \"protocol\": \"warp\", \"settings\": {\"mode\": \"$mode\"$extra, \"identity\": {\"deviceId\": \"matrix\", \"token\": \"matrix\", \"wireguard\": {\"privateKey\": \"$key\", \"publicKey\": \"$key\", \"endpoint\": \"192.0.2.1:2408\", \"address\": [\"10.13.0.2/32\", \"fd13::2/128\"], \"reserved\": [0, 0, 0]}, \"masque\": {\"privateKey\": \"$pem\", \"publicKey\": \"$pin\", \"address\": [\"10.13.0.2/32\", \"fd13::2/128\"]}}, \"masque\": {\"address\": \"127.0.0.1\", \"port\": $port, \"serverName\": \"carrier.test\", \"host\": \"carrier.test\", \"path\": \"/\"}}, \"streamSettings\": {\"network\": \"masque\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"carrier.test\", \"alpn\": [\"h3\"], \"caCertFile\": \"$dir/cert.pem\", \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"keyFile\": \"$dir/key.pem\", \"usage\": \"verify\"}]}}"
+  xmux="$(matrix_xmux)"
+  echo "\"tag\": \"proxy\", \"protocol\": \"warp\", \"settings\": {\"mode\": \"$mode\"$extra, \"identity\": {\"deviceId\": \"matrix\", \"token\": \"matrix\", \"wireguard\": {\"privateKey\": \"$key\", \"publicKey\": \"$key\", \"endpoint\": \"192.0.2.1:2408\", \"address\": [\"10.13.0.2/32\", \"fd13::2/128\"], \"reserved\": [0, 0, 0]}, \"masque\": {\"privateKey\": \"$pem\", \"publicKey\": \"$pin\", \"address\": [\"10.13.0.2/32\", \"fd13::2/128\"]}}, \"masque\": {\"address\": \"127.0.0.1\", \"port\": $port, \"serverName\": \"carrier.test\", \"host\": \"carrier.test\", \"path\": \"/\"$xmux}}, \"streamSettings\": {\"network\": \"masque\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"carrier.test\", \"alpn\": [\"h3\"], \"caCertFile\": \"$dir/cert.pem\", \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"keyFile\": \"$dir/key.pem\", \"usage\": \"verify\"}]}}"
 }
 
 httpupgrade_settings() {
