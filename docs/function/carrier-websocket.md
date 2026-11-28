@@ -186,6 +186,6 @@ What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`]
 - paths: crates/ferrox-app/src/ws.rs
 - symbols: ws, websocket
 - scenarios: vless-ws, vless-tls-ws, vmess-tls-ws, trojan-tls-ws
-- oracle: websocket, ws
+- oracle: ws
 - go: ./transport/internet/websocket/...
 <!-- scope:end -->

@@ -161,12 +161,12 @@ jobs:
           [[ -n "$WANT_REPEATS" ]] && flags="$flags --repeats $WANT_REPEATS"
           [[ -n "$WANT_SHARDS" ]] && flags="$flags --shards $WANT_SHARDS"
           [[ "${WANT_GAPS:-false}" == "true" ]] && flags="$flags --gaps"
-          trees="xray-core,xray-core-rust,sing-box,zeronet,leaf,xray-rust,aether"
+          trees="xray-core,xray-core-rust,sing-box,leaf,xray-rust,aether"
           if [[ -n "$WANT_ENGINES" ]]; then
             # A typed list is the caller's own, ferrox included or not.
             flags="$flags --engines $WANT_ENGINES"
           elif [[ "$tier" == "smoke" ]]; then
-            trees="xray-core,xray-core-rust,sing-box,zeronet"
+            trees="xray-core,xray-core-rust,sing-box"
           fi
           {
             echo "tier=$tier"

@@ -228,9 +228,9 @@ fi
 
 if [[ -z "$engines_list" ]]; then
   if [[ "$tier" == "smoke" ]]; then
-    engines_list="ferrox,xray-core,xray-core-rust,zeronet,sing-box"
+    engines_list="ferrox,xray-core,xray-core-rust,sing-box"
   else
-    engines_list="ferrox,xray-core,aether,xray-core-rust,zeronet,sing-box,xray-rust,leaf"
+    engines_list="ferrox,xray-core,aether,xray-core-rust,sing-box,xray-rust,leaf"
   fi
 fi
 if [[ -z "$repeats" ]]; then
@@ -290,7 +290,7 @@ done
   echo "engines skipped: ${skipped[*]:-<none>}" >&2
 } || true
 ordered=()
-for want in xray-core ferrox aether xray-core-rust zeronet sing-box xray-rust leaf; do
+for want in xray-core ferrox aether xray-core-rust sing-box xray-rust leaf; do
   for have in ${built[@]+"${built[@]}"}; do
     [[ "${have%%=*}" == "$want" ]] && ordered+=("$have")
   done
@@ -348,7 +348,7 @@ manifest() {
       label="${have%%=*}"
       echo "engine $label: ${have#*=} sha256=$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "${have#*=}") mib=$(python3 -c 'import os,sys;print(f"{os.path.getsize(sys.argv[1]) / 1048576:.1f}")' "${have#*=}")"
     done
-    for pin in xray-core xray-core-rust sing-box zeronet xray-rust leaf aether; do
+    for pin in xray-core xray-core-rust sing-box xray-rust leaf aether; do
       echo "pin $pin: $(pin_of "$pin")"
     done
   } >"$out/manifest.txt"
@@ -826,29 +826,51 @@ while read -r id traffic connections iterations payload duration_ms; do
       echo "::warning::$cell: $server has not bound udp/$srvport yet; the harness will say if it cannot carry" >&2
     fi
     perf_pid=""
+    client_perf_pid=""
+    profiling=""
     if [[ -n "${PROFILE_DIR:-}" && "$server" == "${PROFILE_SERVER:-ferrox}" ]]; then
+      profiling=1
       mkdir -p "$PROFILE_DIR"
-      perf record -F 997 -g --call-graph dwarf -p "$server_pid" \
+      perf record -F 997 -g --call-graph fp -p "$server_pid" \
         -o "$PROFILE_DIR/$cell.perf.data" -- sleep 600 &
       perf_pid=$!
       sleep 1
     fi
+    bench_cmd=(env RUST_BACKTRACE=full "$bench_bin" "${engine_args[@]}"
+      --traffic "$traffic" --connections "$connections"
+      --iterations "$iterations" --payload-size "$payload"
+      --duration-ms "${duration_ms:-0}"
+      --tcp-latency-iterations "$iterations"
+      --repeats "$repeats"
+      --server-pid "$(matrix_native_pid "$server_pid")"
+      --keep-going
+      "${client_args[@]}"
+      --output-dir "$celldir/runs"
+      --scenario "$cell"
+      --json-report "$celldir/cell.json")
     # `panic = "abort"` turns a panic into a bare `exit 134`; the backtrace names the frame the fault left behind.
-    if RUST_BACKTRACE=full "$bench_bin" "${engine_args[@]}" \
-      --traffic "$traffic" --connections "$connections" \
-      --iterations "$iterations" --payload-size "$payload" \
-      --duration-ms "${duration_ms:-0}" \
-      --tcp-latency-iterations "$iterations" \
-      --repeats "$repeats" \
-      --server-pid "$(matrix_native_pid "$server_pid")" \
-      --keep-going \
-      "${client_args[@]}" \
-      --output-dir "$celldir/runs" \
-      --scenario "$cell" \
-      --json-report "$celldir/cell.json" >>"$celldir/stdout.log" 2>&1; then
+    if [[ -n "$profiling" ]]; then
+      # The client engine is the child the bench spawns; sample it too, so the receive path is profiled beside the server.
+      "${bench_cmd[@]}" >>"$celldir/stdout.log" 2>&1 &
+      bench_pid=$!
+      client_pid=""
+      for _ in $(seq 1 400); do
+        client_pid="$(pgrep -P "$bench_pid" -x ferrox-app 2>/dev/null | head -1 || true)"
+        [[ -n "$client_pid" ]] && break
+        sleep 0.05
+      done
+      if [[ -n "$client_pid" ]]; then
+        perf record -F 997 -g --call-graph fp -p "$client_pid" \
+          -o "$PROFILE_DIR/$cell.cli.perf.data" -- sleep 600 &
+        client_perf_pid=$!
+      fi
+      if wait "$bench_pid"; then code=0; else code=$?; fi
+    else
+      if "${bench_cmd[@]}" >>"$celldir/stdout.log" 2>&1; then code=0; else code=$?; fi
+    fi
+    if ((code == 0)); then
       cells_run=$((cells_run + 1))
     else
-      code=$?
       cells_failed+=("$cell (exit $code)")
       status=1
       # A failed cell's bench output and engine stderr are files the job never reads; echo the panic back into the log.
@@ -863,6 +885,10 @@ while read -r id traffic connections iterations payload duration_ms; do
     if [[ -n "$perf_pid" ]]; then
       kill -INT "$perf_pid" 2>/dev/null || true
       wait "$perf_pid" 2>/dev/null || true
+    fi
+    if [[ -n "$client_perf_pid" ]]; then
+      kill -INT "$client_perf_pid" 2>/dev/null || true
+      wait "$client_perf_pid" 2>/dev/null || true
     fi
     matrix_stop_server
     {

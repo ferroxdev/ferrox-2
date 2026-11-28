@@ -46,7 +46,6 @@ THROUGHPUT_ENGINES = [
     "ferrox",
     "aether",
     "xray-core-rust",
-    "zeronet",
     "sing-box",
     "xray-rust",
     "leaf",

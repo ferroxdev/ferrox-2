@@ -3380,7 +3380,6 @@ fn validate_gool(identity: &Identity, spec: &WarpSpec) -> Result<(), String> {
 pub(crate) struct GoolOut {
     outer: Arc<crate::masque::MasqueOut>,
     inner: Arc<crate::wg::WireGuardOut>,
-    _forwarder: crate::wg_stack::UdpForwarder,
 }
 
 impl GoolOut {
@@ -3391,15 +3390,14 @@ impl GoolOut {
         remote: SocketAddr,
     ) -> Result<Self, String> {
         let outer = Arc::new(outer);
-        let forwarder = outer.udp_forwarder(remote)?;
+        let lane = outer.datagram_lane(remote)?;
         let mtu = spec.mtu.min(GOOL_INNER_MTU);
-        let settings = wireguard_settings_with_endpoint(inner_identity, spec, forwarder.local, mtu);
+        let settings = wireguard_settings_with_endpoint(inner_identity, spec, remote, mtu);
         let config = crate::wireguard::DeviceConfig::from_json(&settings)?;
-        let inner = crate::wg::WireGuardOut::with_noise(config, spec.noize.wireguard())?;
+        let inner = crate::wg::WireGuardOut::with_lane(config, lane, spec.noize.wireguard())?;
         Ok(Self {
             outer,
             inner: Arc::new(inner),
-            _forwarder: forwarder,
         })
     }
 
@@ -6218,6 +6216,7 @@ mod tests {
             &freedom_outbound(None),
             "127.0.0.1:0",
             None,
+            false,
         )
         .expect("the wireguard server serves");
 
@@ -6535,9 +6534,14 @@ mod tests {
         );
         let inner_inbound = crate::json::parse(&format!(r#"{{"settings":{inner_settings}}}"#))
             .expect("an inner wireguard inbound");
-        let inner_port =
-            crate::wg::serve_inbound(&inner_inbound, &freedom_outbound(None), "127.0.0.1:0", None)
-                .expect("the inner wireguard server serves");
+        let inner_port = crate::wg::serve_inbound(
+            &inner_inbound,
+            &freedom_outbound(None),
+            "127.0.0.1:0",
+            None,
+            false,
+        )
+        .expect("the inner wireguard server serves");
         crate::proxy::echo_trace("wiw: inner inbound");
 
         let outer_settings = format!(
@@ -6553,6 +6557,7 @@ mod tests {
             &freedom_outbound(Some(&redirect)),
             "127.0.0.1:0",
             None,
+            false,
         )
         .expect("the outer wireguard server serves");
         crate::proxy::echo_trace("wiw: outer inbound");

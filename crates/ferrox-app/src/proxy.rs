@@ -723,6 +723,24 @@ fn serve_inbounds_counted(
     }
     let routed =
         |inbound: &Json, source_known: bool| routed_out(outbound, route, inbound, source_known);
+    let redirect_targets: HashSet<std::net::SocketAddr> = match route {
+        Some(shared) => shared
+            .tagged
+            .values()
+            .chain(std::iter::once(&shared.default))
+            .filter_map(|outbound| match outbound {
+                Outbound::Freedom(freedom) => freedom.plain_redirect(),
+                _ => None,
+            })
+            .collect(),
+        None => outbound
+            .and_then(|outbound| match outbound {
+                Outbound::Freedom(freedom) => freedom.plain_redirect(),
+                _ => None,
+            })
+            .into_iter()
+            .collect(),
+    };
     let mut inbounds = 0;
     let configured = configured_emails(root);
     if let Some(list) = root.get("inbounds").and_then(Json::as_arr) {
@@ -1095,6 +1113,9 @@ fn serve_inbounds_counted(
                             &out,
                             address,
                             handler_stop.as_ref(),
+                            address
+                                .parse::<std::net::SocketAddr>()
+                                .is_ok_and(|addr| redirect_targets.contains(&addr)),
                         ) {
                             Ok(_) => {
                                 inbounds += 1;
@@ -6667,6 +6688,25 @@ impl FreedomOut {
             && self.fragment.is_none()
             && self.noises.is_empty()
             && self.final_rules.is_empty()
+    }
+
+    /// The literal address a bare redirect names, when nothing else would rewrite the
+    /// datagram. A registered loopback lane can then be reached without a socket.
+    pub(crate) fn plain_redirect(&self) -> Option<SocketAddr> {
+        if self.domain != FreedomDomain::AsIs
+            || self.proxy_protocol != 0
+            || self.fragment.is_some()
+            || !self.noises.is_empty()
+            || !self.final_rules.is_empty()
+        {
+            return None;
+        }
+        match &self.redirect {
+            Some(FreedomRedirect::Address(host, port)) if *port != 0 => {
+                Some(SocketAddr::new(host.parse().ok()?, *port))
+            }
+            _ => None,
+        }
     }
 
     /// Whether this lane carries block or allow rules a direct handler that reads only the default

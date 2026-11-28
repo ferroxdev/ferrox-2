@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       suite:
-        description: "suite to run (all|zeronet|xray-rust)"
+        description: "suite to run (all|xray-rust)"
         required: false
         default: "all"
 

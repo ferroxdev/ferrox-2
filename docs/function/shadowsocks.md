@@ -188,6 +188,5 @@ What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`]
 - paths: crates/ferrox-core/src/shadowsocks.rs, crates/ferrox-app/src/shadowsocks.rs
 - symbols: shadowsocks, ss
 - scenarios: shadowsocks-raw
-- oracle: shadowsocks
 - go: ./proxy/shadowsocks/...
 <!-- scope:end -->

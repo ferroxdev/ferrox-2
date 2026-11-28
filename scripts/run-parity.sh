@@ -85,13 +85,6 @@ build() {
       (cd "upstream/$name" && GOENV=off GOWORK=off CGO_ENABLED=0 \
         go build -tags "with_utls,with_quic,with_wireguard" -o "$OLDPWD/$binary" ./cmd/sing-box) || return 1
       ;;
-    zeronet)
-      note "building the pinned ZeroNet (zray) at $rev"
-      (cd "upstream/$name" && cargo build --release -p zray-cli --bin zray) || return 1
-      local zray
-      zray="$(built "upstream/$name/target/release/zray")" || return 1
-      cp "$zray" "$binary" || return 1
-      ;;
     xray-rust)
       note "building the pinned xray-rust at $rev (long: aws-lc-rs, quinn, prost)"
       (cd "upstream/$name" && CARGO_TARGET_DIR="$OLDPWD/$engine_dir/xray-rust-target" \
@@ -120,7 +113,6 @@ build() {
 config_arg_for() {
   case "$1" in
     sing-box) echo short ;;
-    zeronet) echo positional ;;
     leaf) echo dash-c ;;
     *) echo long ;;
   esac
@@ -139,7 +131,7 @@ engine_args=()
 config_shapes=()
 skipped=()
 
-engine_list="${ENGINES:-xray-core,zeronet,sing-box,leaf}"
+engine_list="${ENGINES:-xray-core,sing-box,leaf}"
 engine_list="${engine_list//,/ }"
 
 for entry in $engine_list; do

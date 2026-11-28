@@ -7,13 +7,14 @@
 #   2. every method this tree already carries has a row — every
 #      `Support::Implemented` method string in `vless.rs` above `#[cfg(test)]`
 #      and every page under `docs/function/`;
-#   3. every method any of the four pinned trees carries has a row — every
+#   3. every method any of the three pinned trees carries has a row — every
 #      directory in their method catalogues is cited by at least one row.
 #
 # Rule 3 needs the pinned checkouts. A source that `upstream/pins.toml` names
 # and that is not on disk fails rather than skipping: a gate that cannot run
 # says so, and `CHECK_SUPERSET_UPSTREAM=0` is the one way to say so without a
-# red.
+# red. A citation under a source that `pins.toml` no longer names is provenance
+# from a retired comparator and is not existence-checked.
 set -euo pipefail
 
 root="${FERROX_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
@@ -41,12 +42,9 @@ CATALOGUES = [
     "upstream/sing-box/protocol",
     "upstream/sing-box/transport",
     "upstream/xray-rust/crates",
-    "upstream/zeronet/crates",
 ]
 EXTRAS = [
-    "upstream/zeronet/bench/hotpath",
     "upstream/xray-rust/fuzz",
-    "upstream/zeronet/fuzz",
 ]
 
 fails = []
@@ -93,7 +91,7 @@ def load_rows():
         fails.append("docs/method-superset.md: the matrix has no rows")
 
 
-def check_rows():
+def check_rows(sources):
     for name, row in sorted(rows.items()):
         if row["state"] not in STATES:
             fails.append(f"{name}: state {row['state']!r} is not one of "
@@ -113,6 +111,8 @@ def check_rows():
                 continue
             valid += 1
             if os.environ.get("CHECK_SUPERSET_UPSTREAM") == "0" and path.startswith("upstream/"):
+                continue
+            if path.startswith("upstream/") and path.split("/", 2)[1] not in sources:
                 continue
             if not os.path.exists(os.path.join(root, path)):
                 fails.append(f"{name}: reference `{path}` does not exist")
@@ -186,8 +186,8 @@ def check_upstream(sources):
         elif not covered(extra):
             fails.append(f"`{extra}` is a method directory in a pinned tree "
                          "and no matrix row cites it")
-    missing = [name for name in ("xray-core", "sing-box", "xray-rust",
-                                "zeronet") if name not in sources]
+    missing = [name for name in ("xray-core", "sing-box", "xray-rust")
+               if name not in sources]
     if missing:
         fails.append(f"pins.toml does not name {', '.join(missing)}, so the "
                      "matrix is only checked against what is pinned")
@@ -195,9 +195,9 @@ def check_upstream(sources):
 
 
 load_rows()
-check_rows()
-check_in_flight()
 sources = pinned_sources()
+check_rows(sources)
+check_in_flight()
 catalogues = check_upstream(sources)
 
 checked = 0
@@ -216,7 +216,7 @@ if fails:
 
 sources_label = ("0 pinned source(s) (not checked)"
                  if os.environ.get("CHECK_SUPERSET_UPSTREAM") == "0"
-                 else "4 pinned source(s)")
+                 else "3 pinned source(s)")
 print(f"check-method-superset: {len(rows)} row(s) over {catalogues} catalogue(s) "
       f"and {sources_label}, {checked} reference path(s) agreed")
 EOF
@@ -232,20 +232,18 @@ for catalogue in upstream/xray-core/proxy \
     upstream/xray-core/transport/internet \
     upstream/sing-box/protocol \
     upstream/sing-box/transport \
-    upstream/xray-rust/crates \
-    upstream/zeronet/crates; do
+    upstream/xray-rust/crates; do
   mkdir -p "$selftest/$catalogue/probe"
 done
-for extra in upstream/zeronet/bench/hotpath upstream/xray-rust/fuzz \
-    upstream/zeronet/fuzz; do
+for extra in upstream/xray-rust/fuzz; do
   mkdir -p "$selftest/$extra"
 done
-printf '[sources.xray-core]\n[sources.sing-box]\n[sources.xray-rust]\n[sources.zeronet]\n' \
+printf '[sources.xray-core]\n[sources.sing-box]\n[sources.xray-rust]\n' \
     > "$selftest/upstream/pins.toml"
 printf 'let support = Support::Implemented { method: "vless-probe" };\n#[cfg(test)]\n' \
     > "$selftest/crates/ferrox-core/src/vless.rs"
 printf '# page\n' > "$selftest/docs/function/probe-page.md"
-refs="upstream/xray-core/proxy/probe, upstream/xray-core/transport/internet/probe, upstream/sing-box/protocol/probe, upstream/sing-box/transport/probe, upstream/xray-rust/crates/probe, upstream/zeronet/crates/probe, upstream/zeronet/bench/hotpath, upstream/xray-rust/fuzz, upstream/zeronet/fuzz, crates/ferrox-core/src/vless.rs"
+refs="upstream/xray-core/proxy/probe, upstream/xray-core/transport/internet/probe, upstream/sing-box/protocol/probe, upstream/sing-box/transport/probe, upstream/xray-rust/crates/probe, upstream/xray-rust/fuzz, crates/ferrox-core/src/vless.rs"
 matrix="$selftest/docs/method-superset.md"
 printf '<!-- matrix:begin -->\n| row | layer | state | references | note |\n| --- | --- | --- | --- | --- |\n| probe-page | surface | implemented | %s | carries `vless-probe` |\n<!-- matrix:end -->\n' \
     "$refs" > "$matrix"
@@ -262,8 +260,8 @@ expect() {
   fi
 }
 
-sed -i.bak 's#upstream/zeronet/fuzz##' "$matrix"
-expect 'upstream/zeronet/fuzz` is a method directory' "uncited catalogue"
+sed -i.bak 's#upstream/xray-rust/fuzz##' "$matrix"
+expect 'upstream/xray-rust/fuzz` is a method directory' "uncited catalogue"
 sed -i.bak 's#crates/ferrox-core/src/vless.rs#crates/ferrox-core/src/missing.rs#' "$matrix"
 out="$(FERROX_ROOT="$selftest" CHECK_SUPERSET_UPSTREAM=0 "$0" 2>&1)" && {
   echo "::error::self-test: a missing local reference still passes with upstream checks off"

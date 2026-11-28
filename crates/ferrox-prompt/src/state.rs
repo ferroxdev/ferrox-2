@@ -657,16 +657,13 @@ mod tests {
         let pins = pins_from_text(include_str!("../../../upstream/pins.toml"));
         assert!(pins.len() >= 13, "expected at least the thirteen pins");
         assert!(pins.iter().any(|pin| pin.name == "xray-core-rust"));
-        // The always set is the four same-format cores, and nothing else claims it.
+        // The always set is the three same-format cores, and nothing else claims it.
         let always: Vec<&str> = pins
             .iter()
             .filter(|pin| pin.always)
             .map(|pin| pin.name.as_str())
             .collect();
-        assert_eq!(
-            always,
-            ["xray-core", "sing-box", "xray-core-rust", "zeronet"]
-        );
+        assert_eq!(always, ["xray-core", "sing-box", "xray-core-rust"]);
     }
 
     #[test]

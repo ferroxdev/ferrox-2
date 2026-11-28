@@ -26,7 +26,6 @@ trojan-raw-down-8--srv-xray-core|sing-box|0.91|359
 trojan-tls-xhttp-h2-down-8--srv-xray-core|xray-core-rust|0.74|359
 vless-grpc-bulk-down-1--srv-ferrox|sing-box|0.80|359
 vless-grpc-bulk-down-1--srv-xray-core|xray-core-rust|0.90|359
-vless-grpc-bulk-down-1--srv-xray-core|zeronet|0.92|359
 vless-httpupgrade-down-8--srv-ferrox|sing-box|0.81|359
 vless-httpupgrade-down-8--srv-xray-core|sing-box|0.86|359
 vless-raw-down-1--srv-ferrox|sing-box|0.57|359
@@ -51,8 +50,6 @@ wireguard-raw-up-1--srv-sing-box|sing-box|0.71|1214
 wireguard-raw-up-1--srv-xray-core|sing-box|0.94|1214
 vless-reality-xhttp-down-8--srv-ferrox|xray-core-rust|0.47|359
 vless-reality-xhttp-down-8--srv-xray-core|xray-core-rust|0.68|359
-vless-tls-httpupgrade-down-8--srv-ferrox|zeronet|0.88|359
-vless-tls-httpupgrade-ed-down-8--srv-ferrox|zeronet|0.87|359
 vless-tls-raw-up-1--srv-xray-core|sing-box|0.92|359
 vless-tls-raw-up-1--srv-xray-core|xray-core-rust|0.92|359
 vless-tls-raw-up-1--srv-xray-core|xray-rust|0.93|359

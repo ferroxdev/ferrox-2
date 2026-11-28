@@ -121,6 +121,5 @@ What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`]
 - paths: -
 - symbols: trojan
 - scenarios: trojan-raw, trojan-tls, trojan-quic
-- oracle: trojan
 - go: ./proxy/trojan/...
 <!-- scope:end -->

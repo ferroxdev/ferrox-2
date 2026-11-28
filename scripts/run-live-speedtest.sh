@@ -60,7 +60,7 @@ pins_file="upstream/pins.toml"
 engine_dir="target/live-engines"
 source "$(dirname "$0")/lib-engines.sh"
 
-ALL_CORES="ferrox xray-core zeronet sing-box xray-rust"
+ALL_CORES="ferrox xray-core sing-box xray-rust"
 
 main() {
   mkdir -p "$out" "$engine_dir" "$out/configs" "$out/dl" "$out/attempts"
@@ -111,7 +111,7 @@ main() {
         echo "engine $core: SKIPPED (${skip_reason[$core]:-unknown})"
       fi
     done
-    for pin in xray-core sing-box zeronet xray-rust; do
+    for pin in xray-core sing-box xray-rust; do
       echo "pin $pin: $(pin_of "$pin")"
     done
   } >"$out/manifest.txt"

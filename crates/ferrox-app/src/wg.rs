@@ -13,7 +13,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, U
 #[cfg(target_os = "linux")]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -271,6 +271,46 @@ impl WireGuardOut {
             );
         }
         let socket = bind_socket(&config)?;
+        Ok(Self::serve(
+            config,
+            Transport::Socket(socket),
+            dns_port,
+            dns_servers,
+            noise,
+        ))
+    }
+
+    /// Build a client outbound whose transport is an in-process masque lane.
+    pub(crate) fn with_lane(
+        config: DeviceConfig,
+        lane: Lane,
+        noise: crate::noize::WireGuardNoize,
+    ) -> Result<Self, String> {
+        if config.is_client == Some(false) {
+            return Err("a wireguard outbound must set `isClient: true`".to_owned());
+        }
+        let dns_servers = if config.dns.is_empty() {
+            DEFAULT_DNS.to_vec()
+        } else {
+            config.dns.clone()
+        };
+        Ok(Self::serve(
+            config,
+            Transport::Lane(lane),
+            DNS_PORT,
+            dns_servers,
+            noise,
+        ))
+    }
+
+    /// Spawn the userspace reader and stack over `transport`.
+    fn serve(
+        config: DeviceConfig,
+        transport: Transport,
+        dns_port: u16,
+        dns_servers: Vec<IpAddr>,
+        noise: crate::noize::WireGuardNoize,
+    ) -> Self {
         let (packets_tx, packets_rx) = mpsc::channel();
         let (to_tunnel, from_tunnel) = mpsc::channel();
         let (recycle, recycled) = mpsc::channel();
@@ -285,7 +325,7 @@ impl WireGuardOut {
         std::thread::spawn(move || {
             io(
                 io_config,
-                socket,
+                transport,
                 from_tunnel,
                 io_packets,
                 Some(io_routes),
@@ -309,7 +349,7 @@ impl WireGuardOut {
                 Some(recycle),
             );
         });
-        Ok(Self {
+        Self {
             config: Arc::new(config),
             flows,
             to_tunnel,
@@ -322,7 +362,7 @@ impl WireGuardOut {
             resolved: Mutex::new(HashMap::new()),
             #[cfg(target_os = "linux")]
             kernel: None,
-        })
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1214,6 +1254,7 @@ pub(crate) fn serve_inbound(
     out: &Outbound,
     address: &str,
     stop: Option<&Arc<crate::proxy::Stop>>,
+    lane: bool,
 ) -> Result<u16, String> {
     let settings = inbound
         .get("settings")
@@ -1227,13 +1268,25 @@ pub(crate) fn serve_inbound(
             "wireguard: the reference's server always serves a userspace stack; `noKernelTun` is not read here"
         );
     }
-    let socket = UdpSocket::bind(address)
-        .map_err(|error| format!("cannot bind wireguard `{address}`: {error}"))?;
-    let port = socket
-        .local_addr()
-        .map_err(|error| format!("wireguard `{address}` has no local address: {error}"))?
-        .port();
-    let _ = socket.set_read_timeout(Some(IO_TICK));
+    // A fixed loopback address is served in-process when an outer redirect dials it; any other bind keeps the socket.
+    let (transport, port) = if lane && let Some(addr) = loopback_lane(address) {
+        let (to_inner, to_inner_rx) = mpsc::sync_channel(LANE_DEPTH);
+        let (from_inner, from_inner_rx) = mpsc::sync_channel(LANE_DEPTH);
+        register_inbound_lane(addr, to_inner, from_inner_rx);
+        (
+            Transport::Lane(Lane::new(from_inner, to_inner_rx)),
+            addr.port(),
+        )
+    } else {
+        let socket = UdpSocket::bind(address)
+            .map_err(|error| format!("cannot bind wireguard `{address}`: {error}"))?;
+        let port = socket
+            .local_addr()
+            .map_err(|error| format!("wireguard `{address}` has no local address: {error}"))?
+            .port();
+        let _ = socket.set_read_timeout(Some(IO_TICK));
+        (Transport::Socket(socket), port)
+    };
     let (packets_tx, packets_rx) = mpsc::channel();
     let (to_tunnel, from_tunnel) = mpsc::channel();
     let (recycle, recycled) = mpsc::channel();
@@ -1260,7 +1313,7 @@ pub(crate) fn serve_inbound(
     std::thread::spawn(move || {
         io(
             io_config,
-            socket,
+            transport,
             from_tunnel,
             io_packets,
             None,
@@ -1451,6 +1504,136 @@ impl Peers {
     }
 }
 
+/// The `WireGuard` reader's wire: a real UDP socket, or an in-process masque
+/// lane that wraps each transport record for the outer tunnel.
+enum Transport {
+    Socket(UdpSocket),
+    Lane(Lane),
+}
+
+/// A masque lane: an in-process pair to the outer tunnel's bridge, which owns
+/// the lease and re-leases on reconnect. The reader sends a transport record to
+/// `uplink`; the bridge wraps it for the outer and returns a reply on
+/// `downlink` already unwrapped. Each record carries its own endpoint, so one
+/// inbound lane serves many peers without a loopback socket between them.
+pub(crate) struct Lane {
+    uplink: SyncSender<(SocketAddr, Vec<u8>)>,
+    downlink: Receiver<(SocketAddr, Vec<u8>)>,
+}
+
+impl Lane {
+    pub(crate) fn new(
+        uplink: SyncSender<(SocketAddr, Vec<u8>)>,
+        downlink: Receiver<(SocketAddr, Vec<u8>)>,
+    ) -> Self {
+        Self { uplink, downlink }
+    }
+
+    /// The next record from the outer, unwrapped by the bridge, with its endpoint.
+    fn recv(&self) -> Option<(SocketAddr, Vec<u8>)> {
+        self.downlink.try_recv().ok()
+    }
+
+    /// Wait up to `timeout` for the next record, so an idle reader sleeps
+    /// instead of spinning and a full downlink backpressures the bridge
+    /// rather than buffering the whole transfer.
+    fn recv_timeout(&self, timeout: Duration) -> Option<(SocketAddr, Vec<u8>)> {
+        self.downlink.recv_timeout(timeout).ok()
+    }
+}
+
+const LANE_DEPTH: usize = 256;
+
+/// Loopback `WireGuard` inbounds register an in-process lane so an outer stack's bare
+/// redirect reaches them without a loopback socket.
+static INBOUND_LANES: Mutex<Option<HashMap<SocketAddr, InboundLane>>> = Mutex::new(None);
+
+type LaneReader = Option<Receiver<(SocketAddr, Vec<u8>)>>;
+type LaneEnds = (SyncSender<(SocketAddr, Vec<u8>)>, LaneReader);
+
+struct InboundLane {
+    to_inner: SyncSender<(SocketAddr, Vec<u8>)>,
+    from_inner: Mutex<LaneReader>,
+}
+
+pub(crate) fn register_inbound_lane(
+    addr: SocketAddr,
+    to_inner: SyncSender<(SocketAddr, Vec<u8>)>,
+    from_inner: Receiver<(SocketAddr, Vec<u8>)>,
+) {
+    let mut guard = INBOUND_LANES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.get_or_insert_with(HashMap::new).insert(
+        addr,
+        InboundLane {
+            to_inner,
+            from_inner: Mutex::new(Some(from_inner)),
+        },
+    );
+}
+
+/// The shared sender and, on the first call only, the reply reader; the lane stays registered so
+/// every later peer re-clones the sender and one reader serves them all by endpoint.
+pub(crate) fn take_inbound_lane(addr: SocketAddr) -> Option<LaneEnds> {
+    let guard = INBOUND_LANES.lock().ok()?;
+    let lane = guard.as_ref()?.get(&addr)?;
+    let from_inner = lane.from_inner.lock().ok()?.take();
+    Some((lane.to_inner.clone(), from_inner))
+}
+
+fn loopback_lane(address: &str) -> Option<SocketAddr> {
+    address
+        .parse::<SocketAddr>()
+        .ok()
+        .filter(|addr| addr.ip().is_loopback() && addr.port() != 0)
+}
+
+impl Transport {
+    fn ipv6(&self) -> bool {
+        match self {
+            Self::Socket(socket) => socket.local_addr().is_ok_and(|address| address.is_ipv6()),
+            Self::Lane(_) => false,
+        }
+    }
+
+    fn widen(&self) {
+        if let Self::Socket(socket) = self {
+            widen(socket);
+        }
+    }
+
+    fn set_read_timeout(&self, timeout: Duration) {
+        if let Self::Socket(socket) = self {
+            let _ = socket.set_read_timeout(Some(timeout));
+        }
+    }
+
+    /// Send one record to `endpoint`; a lane ignores it and dials its own server.
+    fn send_to(&self, packet: &[u8], endpoint: SocketAddr) {
+        match self {
+            Self::Socket(socket) => {
+                let _ = socket.send_to(packet, send_endpoint(endpoint, self.ipv6()));
+            }
+            Self::Lane(lane) => {
+                let _ = lane.uplink.try_send((endpoint, packet.to_vec()));
+            }
+        }
+    }
+
+    /// Send one endpoint's records, batching on a socket and looping a lane.
+    fn send_batch(&self, endpoint: SocketAddr, packets: &[Vec<u8>]) {
+        match self {
+            Self::Socket(socket) => send_batch(socket, self.ipv6(), endpoint, packets),
+            Self::Lane(lane) => {
+                for packet in packets {
+                    let _ = lane.uplink.try_send((endpoint, packet.clone()));
+                }
+            }
+        }
+    }
+}
+
 /// The tunnel reader and writer: inner packets leave, datagrams arrive, and the
 /// timers run on the same clock.
 #[allow(clippy::needless_pass_by_value)]
@@ -1458,7 +1641,7 @@ impl Peers {
 #[allow(clippy::too_many_lines)]
 fn io(
     config: DeviceConfig,
-    socket: UdpSocket,
+    transport: Transport,
     from_tunnel: Receiver<Vec<u8>>,
     to_stack: Sender<Packet>,
     routes: Option<UdpRoutes>,
@@ -1467,9 +1650,9 @@ fn io(
     recycled: Receiver<Vec<u8>>,
     noise: crate::noize::WireGuardNoize,
 ) {
-    let _ = socket.set_read_timeout(Some(IO_TICK));
-    widen(&socket);
-    let ipv6_socket = socket.local_addr().is_ok_and(|address| address.is_ipv6());
+    transport.set_read_timeout(IO_TICK);
+    transport.widen();
+    let ipv6_socket = transport.ipv6();
     let epoch = tai64n_now();
     let mut peers = peers(&config, epoch, noise);
     let mut cookies = CookieGuard::default();
@@ -1500,7 +1683,7 @@ fn io(
                     if let Some(index) = pending {
                         flush(
                             &mut events,
-                            &socket,
+                            &transport,
                             &to_stack,
                             routes.as_ref(),
                             &peers,
@@ -1527,7 +1710,7 @@ fn io(
                 if let Some(previous) = pending {
                     flush(
                         &mut events,
-                        &socket,
+                        &transport,
                         &to_stack,
                         routes.as_ref(),
                         &peers,
@@ -1546,7 +1729,7 @@ fn io(
         if let Some(index) = pending {
             flush(
                 &mut events,
-                &socket,
+                &transport,
                 &to_stack,
                 routes.as_ref(),
                 &peers,
@@ -1560,7 +1743,7 @@ fn io(
             peers[index].tunnel.poll(now, &mut events);
             flush(
                 &mut events,
-                &socket,
+                &transport,
                 &to_stack,
                 routes.as_ref(),
                 &peers,
@@ -1571,31 +1754,96 @@ fn io(
             );
         }
 
-        #[cfg(target_os = "linux")]
-        {
-            let mut first = true;
-            let mut received = 0;
-            loop {
-                match receive_batch.recv(&socket, first) {
-                    Ok(0) => break,
-                    Ok(got) => {
-                        first = false;
-                        for at in 0..got {
-                            if receive_batch.truncated(at) {
-                                continue;
-                            }
-                            if let Some(source) = receive_batch.source(at) {
-                                let source = recv_endpoint(source, ipv6_socket);
-                                let Some(packet) = receive_batch.take(at) else {
-                                    let packet = receive_batch.packet(at);
-                                    if packet.len() >= 4 {
-                                        receive_datagram(
+        match &transport {
+            Transport::Socket(socket) => {
+                #[cfg(target_os = "linux")]
+                {
+                    let mut first = true;
+                    let mut received = 0;
+                    loop {
+                        match receive_batch.recv(socket, first) {
+                            Ok(0) => break,
+                            Ok(got) => {
+                                first = false;
+                                for at in 0..got {
+                                    if receive_batch.truncated(at) {
+                                        continue;
+                                    }
+                                    if let Some(source) = receive_batch.source(at) {
+                                        let source = recv_endpoint(source, ipv6_socket);
+                                        let Some(packet) = receive_batch.take(at) else {
+                                            let packet = receive_batch.packet(at);
+                                            if packet.len() >= 4 {
+                                                receive_datagram(
+                                                    &mut peers,
+                                                    &mut cookies,
+                                                    now,
+                                                    source,
+                                                    packet,
+                                                    &transport,
+                                                    &to_stack,
+                                                    &mut incoming,
+                                                    routes.as_ref(),
+                                                    ipv6_socket,
+                                                    &mut sends,
+                                                );
+                                            }
+                                            continue;
+                                        };
+                                        if let Some(back) = receive_datagram_owned(
                                             &mut peers,
                                             &mut cookies,
                                             now,
                                             source,
                                             packet,
-                                            &socket,
+                                            &transport,
+                                            &to_stack,
+                                            &mut incoming,
+                                            routes.as_ref(),
+                                            ipv6_socket,
+                                            &mut sends,
+                                            Some(&recycle),
+                                        ) {
+                                            receive_batch.put_back(back);
+                                        }
+                                    }
+                                }
+                                received += got;
+                                if got < RX_BATCH || received >= RX_BURST {
+                                    break;
+                                }
+                            }
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::WouldBlock
+                                        | std::io::ErrorKind::TimedOut
+                                        | std::io::ErrorKind::Interrupted
+                                ) || crate::proxy::is_udp_gone(&error) =>
+                            {
+                                break;
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                }
+                #[cfg(windows)]
+                {
+                    let mut received = 0;
+                    match wait_readable(socket, IO_TICK) {
+                        Ok(true) => loop {
+                            match socket.recv_from(&mut buf) {
+                                Ok((n, source)) => {
+                                    received += 1;
+                                    if n >= 4 {
+                                        let source = recv_endpoint(source, ipv6_socket);
+                                        receive_datagram(
+                                            &mut peers,
+                                            &mut cookies,
+                                            now,
+                                            source,
+                                            &mut buf[..n],
+                                            &transport,
                                             &to_stack,
                                             &mut incoming,
                                             routes.as_ref(),
@@ -1603,54 +1851,41 @@ fn io(
                                             &mut sends,
                                         );
                                     }
-                                    continue;
-                                };
-                                if let Some(back) = receive_datagram_owned(
-                                    &mut peers,
-                                    &mut cookies,
-                                    now,
-                                    source,
-                                    packet,
-                                    &socket,
-                                    &to_stack,
-                                    &mut incoming,
-                                    routes.as_ref(),
-                                    ipv6_socket,
-                                    &mut sends,
-                                    Some(&recycle),
-                                ) {
-                                    receive_batch.put_back(back);
+                                    let more = match wait_readable(socket, Duration::ZERO) {
+                                        Ok(more) => more,
+                                        Err(_) => return,
+                                    };
+                                    if received >= RX_BURST || !more {
+                                        break;
+                                    }
                                 }
+                                Err(error)
+                                    if matches!(
+                                        error.kind(),
+                                        std::io::ErrorKind::WouldBlock
+                                            | std::io::ErrorKind::TimedOut
+                                    ) =>
+                                {
+                                    break;
+                                }
+                                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                                    continue;
+                                }
+                                Err(error) if crate::proxy::is_udp_gone(&error) => break,
+                                Err(_) => return,
                             }
-                        }
-                        received += got;
-                        if got < RX_BATCH || received >= RX_BURST {
-                            break;
-                        }
+                        },
+                        Ok(false) => {}
+                        Err(_) => return,
                     }
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::WouldBlock
-                                | std::io::ErrorKind::TimedOut
-                                | std::io::ErrorKind::Interrupted
-                        ) || crate::proxy::is_udp_gone(&error) =>
-                    {
-                        break;
-                    }
-                    Err(_) => return,
                 }
-            }
-        }
-        #[cfg(windows)]
-        {
-            let mut received = 0;
-            match wait_readable(&socket, IO_TICK) {
-                Ok(true) => loop {
-                    match socket.recv_from(&mut buf) {
-                        Ok((n, source)) => {
-                            received += 1;
-                            if n >= 4 {
+                #[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
+                {
+                    let mut received = 0;
+                    let mut nonblocking = false;
+                    loop {
+                        match socket.recv_from(&mut buf) {
+                            Ok((n, source)) if n >= 4 => {
                                 let source = recv_endpoint(source, ipv6_socket);
                                 receive_datagram(
                                     &mut peers,
@@ -1658,94 +1893,102 @@ fn io(
                                     now,
                                     source,
                                     &mut buf[..n],
-                                    &socket,
+                                    &transport,
                                     &to_stack,
                                     &mut incoming,
                                     routes.as_ref(),
                                     ipv6_socket,
                                     &mut sends,
                                 );
+                                received += 1;
+                                if received >= RX_BURST {
+                                    break;
+                                }
+                                if !nonblocking {
+                                    if socket.set_nonblocking(true).is_err() {
+                                        break;
+                                    }
+                                    nonblocking = true;
+                                }
                             }
-                            let more = match wait_readable(&socket, Duration::ZERO) {
-                                Ok(more) => more,
-                                Err(_) => return,
-                            };
-                            if received >= RX_BURST || !more {
+                            Ok(_) => break,
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::WouldBlock
+                                        | std::io::ErrorKind::TimedOut
+                                        | std::io::ErrorKind::Interrupted
+                                ) || crate::proxy::is_udp_gone(&error) =>
+                            {
                                 break;
                             }
+                            Err(_) => {
+                                if nonblocking {
+                                    let _ = socket.set_nonblocking(false);
+                                }
+                                return;
+                            }
                         }
-                        Err(error)
-                            if matches!(
-                                error.kind(),
-                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                            ) =>
-                        {
-                            break;
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(error) if crate::proxy::is_udp_gone(&error) => break,
-                        Err(_) => return,
                     }
-                },
-                Ok(false) => {}
-                Err(_) => return,
+                    if nonblocking {
+                        let _ = socket.set_nonblocking(false);
+                        // A mode switch does not promise the read timeout survived it, and this loop waits on that bound.
+                        let _ = socket.set_read_timeout(Some(IO_TICK));
+                    }
+                }
             }
-        }
-        #[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
-        {
-            let mut received = 0;
-            let mut nonblocking = false;
-            loop {
-                match socket.recv_from(&mut buf) {
-                    Ok((n, source)) if n >= 4 => {
-                        let source = recv_endpoint(source, ipv6_socket);
+            Transport::Lane(lane) => {
+                let mut received = 0;
+                let mut first = true;
+                #[cfg(target_os = "linux")]
+                receive_batch.drain_recycled();
+                loop {
+                    let next = if first {
+                        lane.recv_timeout(IO_TICK)
+                    } else {
+                        lane.recv()
+                    };
+                    first = false;
+                    let Some((source, payload)) = next else {
+                        break;
+                    };
+                    #[cfg(target_os = "linux")]
+                    receive_datagram_owned(
+                        &mut peers,
+                        &mut cookies,
+                        now,
+                        source,
+                        payload,
+                        &transport,
+                        &to_stack,
+                        &mut incoming,
+                        routes.as_ref(),
+                        ipv6_socket,
+                        &mut sends,
+                        Some(&recycle),
+                    );
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        let mut payload = payload;
                         receive_datagram(
                             &mut peers,
                             &mut cookies,
                             now,
                             source,
-                            &mut buf[..n],
-                            &socket,
+                            &mut payload[..],
+                            &transport,
                             &to_stack,
                             &mut incoming,
                             routes.as_ref(),
                             ipv6_socket,
                             &mut sends,
                         );
-                        received += 1;
-                        if received >= RX_BURST {
-                            break;
-                        }
-                        if !nonblocking {
-                            if socket.set_nonblocking(true).is_err() {
-                                break;
-                            }
-                            nonblocking = true;
-                        }
                     }
-                    Ok(_) => break,
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::WouldBlock
-                                | std::io::ErrorKind::TimedOut
-                                | std::io::ErrorKind::Interrupted
-                        ) || crate::proxy::is_udp_gone(&error) =>
-                    {
+                    received += 1;
+                    if received >= RX_BURST {
                         break;
                     }
-                    Err(_) => {
-                        if nonblocking {
-                            let _ = socket.set_nonblocking(false);
-                        }
-                        return;
-                    }
                 }
-            }
-            if nonblocking {
-                let _ = socket.set_nonblocking(false);
-                // A mode switch does not promise the read timeout survived it, and this loop waits on that bound.
-                let _ = socket.set_read_timeout(Some(IO_TICK));
             }
         }
     }
@@ -1759,7 +2002,7 @@ fn receive_datagram(
     now: u64,
     source: SocketAddr,
     packet: &mut [u8],
-    socket: &UdpSocket,
+    transport: &Transport,
     to_stack: &Sender<Packet>,
     incoming: &mut Vec<Event>,
     routes: Option<&UdpRoutes>,
@@ -1781,7 +2024,7 @@ fn receive_datagram(
             now,
             source,
             &*packet,
-            socket,
+            transport,
             to_stack,
             cookies,
             under_load,
@@ -1804,7 +2047,7 @@ fn receive_datagram(
     peers[index].tunnel.receive(now, source, packet, incoming);
     flush(
         incoming,
-        socket,
+        transport,
         to_stack,
         routes,
         peers,
@@ -1826,7 +2069,7 @@ fn receive_datagram_owned(
     now: u64,
     source: SocketAddr,
     mut packet: Vec<u8>,
-    socket: &UdpSocket,
+    transport: &Transport,
     to_stack: &Sender<Packet>,
     incoming: &mut Vec<Event>,
     routes: Option<&UdpRoutes>,
@@ -1849,7 +2092,7 @@ fn receive_datagram_owned(
             now,
             source,
             &packet,
-            socket,
+            transport,
             to_stack,
             cookies,
             under_load,
@@ -1874,7 +2117,7 @@ fn receive_datagram_owned(
         .receive_owned(now, source, packet, incoming);
     flush(
         incoming,
-        socket,
+        transport,
         to_stack,
         routes,
         peers,
@@ -2059,7 +2302,7 @@ fn handle_initiation(
     now: u64,
     source: SocketAddr,
     packet: &[u8],
-    socket: &UdpSocket,
+    transport: &Transport,
     to_stack: &Sender<Packet>,
     cookies: &mut CookieGuard,
     under_load: bool,
@@ -2082,7 +2325,7 @@ fn handle_initiation(
                 source_bytes,
                 &cookie_encryption_key(&peer.tunnel.public()),
             ) {
-                let _ = socket.send_to(&reply, send_endpoint(source, ipv6));
+                transport.send_to(&reply, source);
             }
             return;
         }
@@ -2101,7 +2344,7 @@ fn handle_initiation(
     peers[index].tunnel.answer(now, source, state, &mut events);
     flush(
         &mut events,
-        socket,
+        transport,
         to_stack,
         None,
         peers,
@@ -2223,7 +2466,7 @@ fn retire_learned(peers: &[Peer], index: usize, current: IpAddr, owner: usize) {
 #[allow(clippy::too_many_arguments)]
 fn flush(
     events: &mut Vec<Event>,
-    socket: &UdpSocket,
+    transport: &Transport,
     to_stack: &Sender<Packet>,
     routes: Option<&UdpRoutes>,
     peers: &Peers,
@@ -2249,45 +2492,53 @@ fn flush(
                     continue;
                 }
                 if is_initiation(&packet) {
-                    flush_sends(socket, ipv6_socket, endpoint, sends);
+                    flush_sends(transport, ipv6_socket, endpoint, sends);
                     endpoint = None;
                     if primary && let Some(index) = peer {
                         peers[index].noise.before_handshake(|noise| {
-                            send_noise(socket, ipv6_socket, to, noise);
+                            send_noise(transport, ipv6_socket, to, noise);
                         });
                     }
-                    send_packet(socket, ipv6_socket, to, primary, &packet, candidates, owner);
+                    send_packet(
+                        transport,
+                        ipv6_socket,
+                        to,
+                        primary,
+                        &packet,
+                        candidates,
+                        owner,
+                    );
                     if primary && let Some(index) = peer {
                         peers[index].noise.after_handshake(|noise| {
-                            send_noise(socket, ipv6_socket, to, noise);
+                            send_noise(transport, ipv6_socket, to, noise);
                         });
                     }
                 } else if ipv6_socket || to.is_ipv4() {
                     if endpoint != Some(to) {
-                        flush_sends(socket, ipv6_socket, endpoint, sends);
+                        flush_sends(transport, ipv6_socket, endpoint, sends);
                         endpoint = Some(to);
                     }
                     if is_keepalive(&packet) {
-                        flush_sends(socket, ipv6_socket, endpoint, sends);
+                        flush_sends(transport, ipv6_socket, endpoint, sends);
                         if let Some(index) = peer {
                             peers[index].noise.keepalive(|noise| {
-                                send_noise(socket, ipv6_socket, to, noise);
+                                send_noise(transport, ipv6_socket, to, noise);
                             });
                         }
                     }
                     sends.push(packet);
                     if sends.len() == SEND_BATCH {
-                        flush_sends(socket, ipv6_socket, endpoint, sends);
+                        flush_sends(transport, ipv6_socket, endpoint, sends);
                     }
                 }
             }
             Event::Data(inner) => {
-                flush_sends(socket, ipv6_socket, endpoint, sends);
+                flush_sends(transport, ipv6_socket, endpoint, sends);
                 endpoint = None;
                 deliver_data(inner, 0, peers, peer, routes, to_stack, recycle);
             }
             Event::DataPrefixed(inner) => {
-                flush_sends(socket, ipv6_socket, endpoint, sends);
+                flush_sends(transport, ipv6_socket, endpoint, sends);
                 endpoint = None;
                 deliver_data(
                     inner,
@@ -2301,7 +2552,7 @@ fn flush(
             }
         }
     }
-    flush_sends(socket, ipv6_socket, endpoint, sends);
+    flush_sends(transport, ipv6_socket, endpoint, sends);
 }
 
 /// Hand one decrypted packet to its UDP lane or the stack, with `at` naming the
@@ -2366,7 +2617,7 @@ fn recycle_slot(inner: Vec<u8>, at: usize, recycle: Option<&Sender<Vec<u8>>>) {
 const SEND_BATCH: usize = 64;
 
 fn flush_sends(
-    socket: &UdpSocket,
+    transport: &Transport,
     ipv6: bool,
     endpoint: Option<SocketAddr>,
     sends: &mut Vec<Vec<u8>>,
@@ -2379,7 +2630,7 @@ fn flush_sends(
         return;
     };
     if ipv6 || endpoint.is_ipv4() {
-        send_batch(socket, ipv6, endpoint, sends);
+        transport.send_batch(endpoint, sends);
     }
     sends.clear();
 }
@@ -2857,9 +3108,9 @@ fn is_keepalive(packet: &[u8]) -> bool {
             .is_some_and(|first| u32::from(*first) == TYPE_TRANSPORT)
 }
 
-fn send_noise(socket: &UdpSocket, ipv6: bool, endpoint: SocketAddr, packet: &[u8]) {
+fn send_noise(transport: &Transport, ipv6: bool, endpoint: SocketAddr, packet: &[u8]) {
     if ipv6 || endpoint.is_ipv4() {
-        let _ = socket.send_to(packet, send_endpoint(endpoint, ipv6));
+        transport.send_to(packet, endpoint);
     }
 }
 
@@ -2867,7 +3118,7 @@ fn send_noise(socket: &UdpSocket, ipv6: bool, endpoint: SocketAddr, packet: &[u8
 /// resolves to two families or two hosts is raced; data follows the endpoint
 /// the responder pinned.
 fn send_packet(
-    socket: &UdpSocket,
+    transport: &Transport,
     ipv6: bool,
     endpoint: SocketAddr,
     primary: bool,
@@ -2877,7 +3128,7 @@ fn send_packet(
 ) {
     if is_initiation(packet) {
         if primary && (ipv6 || endpoint.is_ipv4()) {
-            let _ = socket.send_to(packet, send_endpoint(endpoint, ipv6));
+            transport.send_to(packet, endpoint);
         }
         for target in candidates.unwrap_or_default() {
             let target = canonical_endpoint(*target);
@@ -2887,12 +3138,12 @@ fn send_packet(
             if !pin_learned(target, owner) {
                 continue;
             }
-            let _ = socket.send_to(packet, send_endpoint(target, ipv6));
+            transport.send_to(packet, target);
         }
         return;
     }
     if ipv6 || endpoint.is_ipv4() {
-        let _ = socket.send_to(packet, send_endpoint(endpoint, ipv6));
+        transport.send_to(packet, endpoint);
     }
 }
 
@@ -2920,6 +3171,10 @@ fn recv_endpoint(socket: SocketAddr, ipv6: bool) -> SocketAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wire(socket: &UdpSocket) -> Transport {
+        Transport::Socket(socket.try_clone().expect("socket clone"))
+    }
     use std::net::TcpListener;
     use std::thread;
 
@@ -3066,7 +3321,7 @@ mod tests {
         let mut events = vec![Event::Data(packet)];
         flush(
             &mut events,
-            &socket,
+            &wire(&socket),
             &to_stack,
             None,
             &peers,
@@ -3082,7 +3337,7 @@ mod tests {
         let mut events = vec![Event::Data(packet)];
         flush(
             &mut events,
-            &socket,
+            &wire(&socket),
             &to_stack,
             None,
             &peers,
@@ -3309,7 +3564,7 @@ mod tests {
             0,
             source,
             &sent(&events),
-            &socket,
+            &wire(&socket),
             &to_stack,
             &mut cookies,
             false,
@@ -3370,7 +3625,7 @@ mod tests {
                 0,
                 source,
                 &mut packet,
-                &socket,
+                &wire(&socket),
                 &to_stack,
                 &mut incoming,
                 None,
@@ -3417,7 +3672,7 @@ mod tests {
         let inbound =
             crate::json::parse(&format!(r#"{{"settings":{server_settings}}}"#)).expect("inbound");
         let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
-        let port = serve_inbound(&inbound, &out, "127.0.0.1:0", None).expect("serve");
+        let port = serve_inbound(&inbound, &out, "127.0.0.1:0", None, false).expect("serve");
         assert_ne!(port, 0);
 
         let client = DeviceConfig::from_json(
@@ -3447,6 +3702,32 @@ mod tests {
         assert_eq!(&answer, b"headhello");
         let mut eof = [0u8; 1];
         assert_eq!(app.read(&mut eof).expect("eof"), 0);
+    }
+
+    #[test]
+    fn a_loopback_listener_that_is_not_a_redirect_target_binds_its_socket() {
+        let reserved = UdpSocket::bind("127.0.0.1:0").expect("reserve");
+        let port = reserved.local_addr().expect("reserved address").port();
+        drop(reserved);
+        let client_private = [0x11; 32];
+        let server_private = [0x22; 32];
+        let client_public = ferrox_core::wireguard::device::public_key(&client_private);
+        let hex = ferrox_core::foxy::account::hex_encode;
+        let server_settings = format!(
+            r#"{{"secretKey":"{}","endpoint":["10.0.0.1"],"users":[{{"account":{{"publicKey":"{}","allowedIPs":["10.0.0.2/32"]}}}}]}}"#,
+            hex(&server_private),
+            hex(&client_public)
+        );
+        let inbound =
+            crate::json::parse(&format!(r#"{{"settings":{server_settings}}}"#)).expect("inbound");
+        let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
+        let address = format!("127.0.0.1:{port}");
+        let served = serve_inbound(&inbound, &out, &address, None, false).expect("serve");
+        assert_eq!(served, port);
+        assert!(
+            UdpSocket::bind(&address).is_err(),
+            "an inbound no redirect targets must own its UDP socket"
+        );
     }
 
     #[test]
@@ -3530,7 +3811,7 @@ mod tests {
         let inbound =
             crate::json::parse(&format!(r#"{{"settings":{server_settings}}}"#)).expect("inbound");
         let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
-        let port = serve_inbound(&inbound, &out, "127.0.0.1:0", None).expect("serve");
+        let port = serve_inbound(&inbound, &out, "127.0.0.1:0", None, false).expect("serve");
 
         let dead = UdpSocket::bind("127.0.0.1:0").expect("dead endpoint");
         let client = DeviceConfig {
@@ -3896,7 +4177,7 @@ mod tests {
                 .collect();
             flush(
                 &mut events,
-                &socket,
+                &wire(&socket),
                 &to_stack,
                 None,
                 &peers,
@@ -3954,7 +4235,7 @@ mod tests {
         let inbound =
             crate::json::parse(&format!(r#"{{"settings":{server_settings}}}"#)).expect("inbound");
         let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
-        let port = serve_inbound(&inbound, &out, "127.0.0.1:0", None).expect("serve");
+        let port = serve_inbound(&inbound, &out, "127.0.0.1:0", None, false).expect("serve");
 
         let client = DeviceConfig::from_json(
             &crate::json::parse(&format!(
@@ -4058,7 +4339,7 @@ mod tests {
         let mut initiation = vec![0u8; INITIATION_SIZE];
         initiation[..4].copy_from_slice(&TYPE_INITIATION.to_le_bytes());
         send_packet(
-            &sender,
+            &wire(&sender),
             true,
             candidates[0],
             true,
@@ -4081,7 +4362,7 @@ mod tests {
         transport[..4]
             .copy_from_slice(&ferrox_core::wireguard::transport::TYPE_TRANSPORT.to_le_bytes());
         send_packet(
-            &sender,
+            &wire(&sender),
             true,
             candidates[0],
             true,
@@ -4105,7 +4386,7 @@ mod tests {
         };
         let fallback_port = v4_only.local_addr().expect("fallback address").port();
         send_packet(
-            &v4_only,
+            &wire(&v4_only),
             false,
             candidates[0],
             true,
@@ -4151,7 +4432,7 @@ mod tests {
         let mut initiation = vec![0u8; INITIATION_SIZE];
         initiation[..4].copy_from_slice(&TYPE_INITIATION.to_le_bytes());
         send_packet(
-            &sender,
+            &wire(&sender),
             true,
             roamed_address,
             true,
@@ -4176,7 +4457,7 @@ mod tests {
         transport[..4]
             .copy_from_slice(&ferrox_core::wireguard::transport::TYPE_TRANSPORT.to_le_bytes());
         send_packet(
-            &sender,
+            &wire(&sender),
             true,
             roamed_address,
             true,
@@ -4267,7 +4548,7 @@ mod tests {
             0,
             client_address,
             &first,
-            &server,
+            &wire(&server),
             &to_stack,
             &mut guard,
             true,
@@ -4295,7 +4576,7 @@ mod tests {
             1,
             client_address,
             &retry,
-            &server,
+            &wire(&server),
             &to_stack,
             &mut guard,
             true,

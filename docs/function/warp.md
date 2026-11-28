@@ -180,5 +180,5 @@ What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`]
 - paths: crates/ferrox-app/src/warp.rs, crates/ferrox-app/src/zerotrust.rs, crates/ferrox-app/src/warp_scan.rs, crates/ferrox-app/src/noize.rs
 - symbols: find_warp_outbound
 - scenarios: warp-masque, warp-gool, warp-gool-classic, warp-mim
-- engines: xray-core, aether, zeronet
+- engines: xray-core, aether
 <!-- scope:end -->

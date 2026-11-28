@@ -87,19 +87,6 @@ test_enabled  = false
 ferrox_binary = ""
 note          = "v2rayNG fork for Iranians: cipherSuites + unsafe fingerprints, aether core, plaintext VLESS/TROJAN to public (the superset rows)"
 
-[sources.zeronet]
-repo          = "https://github.com/zeghostwriter/ZeroNet"
-rev           = "29e7a95eaaf7e0158b96cba83d7118f5f3d87bfd"
-always        = true
-default_branch = "main"
-path          = "crates"
-test_enabled  = true
-suite         = "cargo test -p zero-runtime --test xray_oracle -- --ignored --test-threads=1 vless_over_raw_tcp_matches_the_oracle trojan_over_raw_tcp_matches_the_oracle shadowsocks_over_raw_tcp_matches_the_oracle vless_over_websocket_matches_the_oracle vless_over_http_upgrade_matches_the_oracle vless_over_grpc_matches_the_oracle vmess_over_raw_tcp_matches_the_oracle trojan_over_websocket_matches_the_oracle vmess_over_websocket_matches_the_oracle"
-ferrox_binary = "ferrox-app"
-seam           = "ZRAY_XRAY_BINARY"
-baseline_env  = "ZRAY_ORACLE_LOG=1 ZRAY_TEST_LOG=debug"
-note          = "MIT Zray core; 9 oracle tests run against ferrox-app via ZRAY_XRAY_BINARY, checked by conformance.yml"
-
 [sources.mqvpn]
 repo          = "https://github.com/mp0rta/mqvpn"
 rev           = "13de90fc2f91cead636a018ceda06caf85ecd5bb"
