@@ -87,6 +87,7 @@ pub(crate) trait ServerRequests: Send + Sync {
 }
 /// One channel packet plus its header, padding and tag; a larger peer packet
 /// grows the one buffer it needs instead of every pooled buffer.
+#[cfg(test)]
 const PACKET_CHUNK: usize = CHANNEL_PACKET as usize + 1024;
 /// The pool holds a whole channel window plus the packets a flow is writing,
 /// so a saturated download recycles buffers instead of allocating one per packet.

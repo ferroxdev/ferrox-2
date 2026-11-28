@@ -1308,7 +1308,7 @@ mod tests {
     #[test]
     fn readiness_leaves_the_peer_nonblocking() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
-        let peer = TcpStream::connect(listener.local_addr().expect("address")).expect("peer");
+        let mut peer = TcpStream::connect(listener.local_addr().expect("address")).expect("peer");
         let (_socket, _) = listener.accept().expect("accept");
         peer.set_read_timeout(Some(Duration::from_millis(10)))
             .expect("timeout");
