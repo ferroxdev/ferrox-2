@@ -596,7 +596,7 @@ while read -r id traffic connections iterations payload duration_ms; do
     continue
   fi
   gool_sharded=0
-  if [[ "$id" == warp-gool-* && "$id" != warp-gool-classic-* ]] && (( gool_shards > 1 )); then
+  if [[ "$id" == warp-gool-* ]] && (( gool_shards > 1 )); then
     gool_sharded=1
   fi
   if (( gool_sharded )); then
