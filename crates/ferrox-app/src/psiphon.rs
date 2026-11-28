@@ -17409,7 +17409,7 @@ mod tests {
             .http_transform(false, None)
             .expect("transform");
         let head = b"POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
-        let transformed = crate::psiphon_dns::apply_bytes_transform(selected.as_slice(), head)
+        let transformed = crate::psiphon_dns::apply_bytes_transform(selected.as_slice(), &head[..])
             .expect("transform");
         assert!(transformed.starts_with(b"GET / HTTP/1.1"));
     }

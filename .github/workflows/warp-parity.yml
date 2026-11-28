@@ -122,7 +122,7 @@ jobs:
   cli-warp:
     name: CLI direct and chained WARP
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
         with:
@@ -138,7 +138,8 @@ jobs:
           set -euo pipefail
           target/release/ferrox-app warp-register --mode wireguard -o "$RUNNER_TEMP/warp-wireguard-identity.json"
           target/release/ferrox-app warp-register --mode auto -o "$RUNNER_TEMP/warp-identity.json"
-          for identity in "$RUNNER_TEMP/warp-wireguard-identity.json" "$RUNNER_TEMP/warp-identity.json"; do
+          target/release/ferrox-app warp-register --mode gool -o "$RUNNER_TEMP/warp-gool-identity.json"
+          for identity in "$RUNNER_TEMP"/warp*-identity*.json; do
             python3 -c 'import json,sys; i=json.load(open(sys.argv[1])); print(sys.argv[1], "wireguard edge:", i.get("wireguard",{}).get("endpoint")); print(sys.argv[1], "masque key:", bool(i.get("masque",{}).get("privateKey")))' "$identity"
           done
       - name: direct and nested WARP through the CLI
@@ -185,14 +186,21 @@ jobs:
           }
           run_lane "direct WireGuard" --identity "$RUNNER_TEMP/warp-wireguard-identity.json" --warp --warp-mode wireguard
           run_lane "direct MASQUE" --warp --warp-mode masque
-          run_lane "nested WireGuard" --identity "$RUNNER_TEMP/warp-wireguard-identity.json" --warp --warp-mode wiw
-          run_lane "nested MASQUE" --warp --warp-mode mim
           run_lane "direct auto" --warp
+          run_lane "direct WireGuard over MASQUE" --identity "$RUNNER_TEMP/warp-gool-identity.json" --warp --warp-mode gool
+          run_lane "nested WireGuard" --identity "$RUNNER_TEMP/warp-wireguard-identity.json" --warp --warp-mode gool-classic
+          run_lane "nested MASQUE" --warp --warp-mode mim
+          LANE_WARP=off run_lane "Veepn through WireGuard" --identity "$RUNNER_TEMP/warp-wireguard-identity.json" --veepn --warp --warp-mode wireguard
+          LANE_WARP=off run_lane "Veepn through MASQUE" --veepn --warp --warp-mode masque
+          LANE_WARP=off run_lane "Veepn through auto" --veepn --warp
+          LANE_WARP=off run_lane "Veepn through WireGuard over MASQUE" --identity "$RUNNER_TEMP/warp-gool-identity.json" --veepn --warp --warp-mode gool
+          LANE_WARP=off run_lane "Veepn through nested WireGuard" --identity "$RUNNER_TEMP/warp-wireguard-identity.json" --veepn --warp --warp-mode gool-classic
           LANE_WARP=off run_lane "Veepn through nested MASQUE" --veepn --warp --warp-mode mim
           test "$failed" = 0
       - name: sudo keeps the lane in the invoking users files
         run: |
           set -euo pipefail
+          sudo env FOXY_PASS=probe "$PWD/dist/ferrox-cli.sh" --help >/dev/null
           root_state="$RUNNER_TEMP/cli-warp-root"
           rm -rf "$root_state"
           mkdir -p "$root_state/conf" "$root_state/state"
@@ -204,9 +212,16 @@ jobs:
           trace="$(curl -fsS --noproxy '' --max-time 60 --retry 3 --socks5-hostname "127.0.0.1:$port" https://www.cloudflare.com/cdn-cgi/trace)"
           printf '%s\n' "$trace"
           printf '%s\n' "$trace" | grep -qx 'warp=on'
+          down_started="$(date +%s%N)"
           sudo env FERROX_CONF_DIR="$root_state/conf" FERROX_STATE_DIR="$root_state/state" \
             FERROX_BIN="$PWD/target/release/ferrox-app" \
             "$PWD/dist/ferrox-cli.sh" down
+          down_ms=$(( ($(date +%s%N) - down_started) / 1000000 ))
+          echo "sudo lane down: ${down_ms}ms"
+          if [ "$down_ms" -gt 15000 ]; then
+            echo "::error::the sudo lane took ${down_ms}ms to stop"
+            exit 1
+          fi
           if find "$root_state" -user root -print -quit | grep -q .; then
             echo "::error::a sudo lane left root-owned files under $root_state"
             find "$root_state" -user root -ls

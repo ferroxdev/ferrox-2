@@ -139,17 +139,17 @@ impl PaddingReceiver {
         })
     }
 
-    fn strip(&mut self, body: &[u8]) -> Result<Vec<u8>, String> {
+    fn strip<'a>(&mut self, body: &'a [u8]) -> Result<&'a [u8], String> {
         let mut at = 0;
         loop {
             if at >= body.len() {
-                return Ok(Vec::new());
+                return Ok(&[]);
             }
             let mut prefix = [body[at]];
             self.cipher.apply_keystream(&mut prefix);
             at += 1;
             match prefix[0] {
-                0 => return Ok(body[at..].to_vec()),
+                0 => return Ok(&body[at..]),
                 1 => {
                     let Some(size) = body.get(at..at + 2) else {
                         return Err("psiphon meek padding: truncated size".to_owned());
@@ -913,6 +913,7 @@ pub(crate) struct MeekHttp {
     path: &'static str,
     stream: Option<MeekStream>,
     cookie: Option<(String, String)>,
+    cookie_header: Option<String>,
     profile: Profile,
     request_padding: Option<PaddingSender>,
     response_padding: Option<PaddingReceiver>,
@@ -962,6 +963,9 @@ impl MeekHttp {
             _ => (None, None),
         };
         let dns = crate::psiphon_dns::Config::from_servers(&meek.dns);
+        let cookie_header = cookie
+            .as_ref()
+            .map(|(name, value)| format!("{name}={value}"));
         Ok(Self {
             meek,
             proxy,
@@ -970,6 +974,7 @@ impl MeekHttp {
             path,
             stream: None,
             cookie,
+            cookie_header,
             profile: chosen,
             request_padding,
             response_padding,
@@ -1031,6 +1036,7 @@ impl MeekHttp {
             path,
             stream: None,
             cookie: None,
+            cookie_header: None,
             profile: chosen,
             request_padding: None,
             response_padding: None,
@@ -1077,6 +1083,9 @@ impl MeekHttp {
             _ => (None, None),
         };
         let dns = crate::psiphon_dns::Config::from_servers(&meek.dns);
+        let cookie_header = cookie
+            .as_ref()
+            .map(|(name, value)| format!("{name}={value}"));
         Ok(Self {
             meek,
             proxy: None,
@@ -1085,6 +1094,7 @@ impl MeekHttp {
             path,
             stream: Some(stream),
             cookie,
+            cookie_header,
             profile: chosen,
             request_padding,
             response_padding,
@@ -1443,26 +1453,19 @@ impl MeekHttp {
             self.stream = None;
             self.open()?;
         }
-        let cookie = self
-            .cookie
-            .as_ref()
-            .map(|(name, value)| format!("{name}={value}"));
+        let cookie = self.cookie_header.as_deref();
         let mut host = self.meek.host.as_str();
-        let mut headers: Vec<(&str, &str)> = self
-            .meek
-            .headers
-            .iter()
-            .filter_map(|(name, value)| {
-                if name.eq_ignore_ascii_case("host") {
-                    host = value;
-                    None
-                } else if name.eq_ignore_ascii_case("user-agent") && value.is_empty() {
-                    None
-                } else {
-                    Some((name.as_str(), value.as_str()))
-                }
-            })
-            .collect();
+        let mut headers = Vec::with_capacity(self.meek.headers.len() + 5);
+        headers.extend(self.meek.headers.iter().filter_map(|(name, value)| {
+            if name.eq_ignore_ascii_case("host") {
+                host = value;
+                None
+            } else if name.eq_ignore_ascii_case("user-agent") && value.is_empty() {
+                None
+            } else {
+                Some((name.as_str(), value.as_str()))
+            }
+        }));
         for (name, value) in [
             ("Content-Type", self.profile.content_type),
             ("User-Agent", self.profile.user_agent.as_str()),
@@ -1478,7 +1481,7 @@ impl MeekHttp {
             }
         }
         let combined_cookie;
-        if let Some(cookie) = cookie.as_deref() {
+        if let Some(cookie) = cookie {
             if let Some(index) = headers
                 .iter()
                 .position(|(name, _)| name.eq_ignore_ascii_case("cookie"))
@@ -1491,11 +1494,7 @@ impl MeekHttp {
         }
         let timeout = self.budget()?;
         if let Some(MeekStream::H3(h3)) = self.stream.as_mut() {
-            let headers: Vec<(&str, &str)> = headers
-                .iter()
-                .copied()
-                .filter(|(name, _)| !is_hop_by_hop(name))
-                .collect();
+            headers.retain(|(name, _)| !is_hop_by_hop(name));
             let reply = h3.round_trip(
                 host,
                 self.path,
@@ -1508,18 +1507,20 @@ impl MeekHttp {
                 return Err(format!("psiphon meek status {}", reply.status));
             }
             self.absorb_cookie(&reply.headers);
-            let mut body = reply.body;
-            if let Some(receiver) = self.response_padding.as_mut() {
-                body = receiver.strip(&body)?;
-            }
-            sink.write_all(&body)
+            let body = reply.body;
+            let body = match self.response_padding.as_mut() {
+                Some(receiver) => receiver.strip(&body)?,
+                None => body.as_slice(),
+            };
+            sink.write_all(body)
                 .map_err(|error| format!("psiphon meek write: {error}"))?;
             return Ok(());
         }
-        let mut head =
-            crate::foxy_account::request_head("POST", host, self.path, &headers, body.len());
+        let mut head: std::borrow::Cow<'_, [u8]> = std::borrow::Cow::Owned(
+            crate::foxy_account::request_head("POST", host, self.path, &headers, body.len()),
+        );
         if let Some(transform) = self.http_transform.as_deref().map(Vec::as_slice) {
-            head = crate::psiphon_dns::apply_bytes_transform(transform, &head)
+            head = crate::psiphon_dns::apply_bytes_transform(transform, head)
                 .map_err(|error| format!("psiphon meek transform: {error}"))?;
         }
         let deadline = request_deadline(timeout);
@@ -1533,7 +1534,7 @@ impl MeekHttp {
                 .ok_or_else(|| "psiphon meek has no connection".to_owned())?;
             let mut stream = DeadlineStream { stream, deadline };
             stream
-                .write_parts(&[&head, body])
+                .write_parts(&[head.as_ref(), body])
                 .and_then(|()| stream.flush())
                 .map_err(|error| format!("psiphon meek request: {error}"))?;
             let mut reader = BufReader::with_capacity(1024, &mut stream);
@@ -1552,7 +1553,7 @@ impl MeekHttp {
                 )
                 .map_err(|_| "psiphon meek response".to_owned())?;
                 let body = receiver.strip(&body)?;
-                sink.write_all(&body)
+                sink.write_all(body)
                     .map_err(|error| format!("psiphon meek write: {error}"))?;
             } else {
                 crate::foxy_account::read_body_to(
@@ -1588,15 +1589,27 @@ impl MeekHttp {
                 value.trim().clone_into(cookie_value);
             }
         }
+        if let Some(header) = self.cookie_header.as_mut() {
+            header.clear();
+            header.push_str(cookie_name);
+            header.push('=');
+            header.push_str(cookie_value);
+        }
     }
 }
 
 /// Whether a header is connection-specific and must not cross HTTP/3.
 fn is_hop_by_hop(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "connection" | "keep-alive" | "proxy-connection" | "transfer-encoding" | "upgrade" | "host"
-    )
+    [
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "transfer-encoding",
+        "upgrade",
+        "host",
+    ]
+    .into_iter()
+    .any(|hop| name.eq_ignore_ascii_case(hop))
 }
 
 /// The protocol name the meek cookie reports, with the CDN marker removed.
@@ -1849,6 +1862,17 @@ mod tests {
             assert_eq!(http.response_chunk(), http1);
             assert_eq!(http.h3_response_chunk(), h3);
         }
+    }
+
+    #[test]
+    fn the_cookie_header_is_cached_and_renewed() {
+        let mut http =
+            MeekHttp::new(entry(), None, Duration::from_secs(8), "/", None).expect("meek http");
+        let (name, value) = http.cookie.clone().expect("cookie");
+        let expected = format!("{name}={value}");
+        assert_eq!(http.cookie_header.as_deref(), Some(expected.as_str()));
+        http.absorb_cookie(&[("Set-Cookie".to_owned(), format!("{name}=renewed; Path=/"))]);
+        assert_eq!(http.cookie_header, Some(format!("{name}=renewed")));
     }
 
     /// A cookie carries the seed and the encrypted endpoint payload.
@@ -2110,6 +2134,15 @@ mod tests {
         frames.extend(sender.pad(&[]).expect("pads"));
         frames.extend(sender.pad(&[0x42, 0x43]).expect("pads"));
         assert_eq!(receiver.strip(&frames).expect("strips"), [0x42, 0x43]);
+    }
+
+    #[test]
+    fn the_stripped_payload_is_borrowed_from_the_received_body() {
+        let (mut sender, mut receiver) = padding_pair(0.0);
+        let frames = sender.pad(&[0x42, 0x43]).expect("pads");
+        let body = receiver.strip(&frames).expect("strips");
+        assert_eq!(body, [0x42, 0x43]);
+        assert_eq!(body.as_ptr(), frames[frames.len() - body.len()..].as_ptr());
     }
 
     /// The cookie signals payload padding only when the profile selected it.

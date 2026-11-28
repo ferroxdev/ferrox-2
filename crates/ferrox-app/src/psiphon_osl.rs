@@ -432,22 +432,21 @@ fn combine(shares: &[Option<Vec<u8>>]) -> Vec<u8> {
         .unwrap_or(0);
     let mut secret = vec![0u8; length];
     for (at, byte) in secret.iter_mut().enumerate() {
-        let points: Vec<(u8, u8)> = present.iter().map(|(x, share)| (*x, share[at])).collect();
-        *byte = interpolate(&points);
+        *byte = interpolate_shares(&present, at);
     }
     secret
 }
 
-fn interpolate(points: &[(u8, u8)]) -> u8 {
+fn interpolate_shares(points: &[(u8, &[u8])], at: usize) -> u8 {
     let mut value = 0u8;
-    for (index, (ax, ay)) in points.iter().enumerate() {
+    for (index, (ax, share)) in points.iter().enumerate() {
         let mut weight = 1u8;
         for (other, (bx, _)) in points.iter().enumerate() {
             if index != other {
                 weight = mul(weight, divide(*bx, *ax ^ *bx));
             }
         }
-        value ^= mul(weight, *ay);
+        value ^= mul(weight, share[at]);
     }
     value
 }

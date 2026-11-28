@@ -1419,17 +1419,72 @@ impl Proxy {
         port: u16,
         deadline: Instant,
     ) -> Result<(), String> {
-        let authority = authority_host(host, port);
-        let mut request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
-        if !self.user.is_empty() || !self.pass.is_empty() {
-            let encoded =
-                ferrox_core::b64::encode(format!("{}:{}", self.user, self.pass).as_bytes());
-            request.push_str("Proxy-Authorization: Basic ");
-            request.push_str(&encoded);
-            request.push_str("\r\n");
+        let bracketed = host.contains(':') && !host.starts_with('[');
+        let open: &[u8] = if bracketed { b"[" } else { b"" };
+        let close: &[u8] = if bracketed { b"]" } else { b"" };
+        let port_number = port;
+        let mut digits = [0u8; 5];
+        let mut at = digits.len();
+        let mut rest = port;
+        loop {
+            at -= 1;
+            digits[at] = b'0' + (rest % 10) as u8;
+            rest /= 10;
+            if rest == 0 {
+                break;
+            }
         }
-        request.push_str("\r\n");
-        write_all_until(stream, deadline, request.as_bytes())
+        let port = &digits[at..];
+        let auth = !self.user.is_empty() || !self.pass.is_empty();
+        let mut encoded = Vec::new();
+        if auth {
+            let len = ferrox_core::b64::encoded_len(self.user.len() + self.pass.len() + 1);
+            encoded.resize(len, 0);
+            ferrox_core::b64::encode_parts_into(
+                &[self.user.as_bytes(), &b":"[..], self.pass.as_bytes()],
+                &mut encoded[..],
+            )
+            .map_err(|error| format!("psiphon: upstream proxy credentials: {error}"))?;
+        }
+        let mut parts: [&[u8]; 17] = [&b""[..]; 17];
+        let mut count = 0;
+        parts[count] = b"CONNECT ";
+        count += 1;
+        parts[count] = open;
+        count += 1;
+        parts[count] = host.as_bytes();
+        count += 1;
+        parts[count] = close;
+        count += 1;
+        parts[count] = b":";
+        count += 1;
+        parts[count] = port;
+        count += 1;
+        parts[count] = b" HTTP/1.1\r\nHost: ";
+        count += 1;
+        parts[count] = open;
+        count += 1;
+        parts[count] = host.as_bytes();
+        count += 1;
+        parts[count] = close;
+        count += 1;
+        parts[count] = b":";
+        count += 1;
+        parts[count] = port;
+        count += 1;
+        parts[count] = b"\r\n";
+        count += 1;
+        if auth {
+            parts[count] = b"Proxy-Authorization: Basic ";
+            count += 1;
+            parts[count] = encoded.as_slice();
+            count += 1;
+            parts[count] = b"\r\n";
+            count += 1;
+        }
+        parts[count] = b"\r\n";
+        count += 1;
+        write_all_parts_until::<17>(stream, deadline, &parts[..count])
             .map_err(|error| format!("psiphon: upstream proxy write: {error}"))?;
         let mut head = Vec::with_capacity(128);
         loop {
@@ -1451,7 +1506,8 @@ impl Proxy {
             .and_then(|code| code.parse::<u16>().ok());
         if !matches!(status, Some(200..=299)) {
             return Err(format!(
-                "psiphon: upstream proxy refused {authority}: {}",
+                "psiphon: upstream proxy refused {}: {}",
+                authority_host(host, port_number),
                 text.lines().next().unwrap_or("no status")
             ));
         }
@@ -1480,13 +1536,11 @@ impl Proxy {
             2 if auth => {
                 let user = self.user.as_bytes();
                 let pass = self.pass.as_bytes();
-                let mut request = Vec::with_capacity(3 + user.len() + pass.len());
-                request.push(1);
-                request.push(u8::try_from(user.len()).unwrap_or(u8::MAX));
-                request.extend_from_slice(user);
-                request.push(u8::try_from(pass.len()).unwrap_or(u8::MAX));
-                request.extend_from_slice(pass);
-                write_all_until(stream, deadline, &request)
+                let version = [1u8];
+                let user_len = [u8::try_from(user.len()).unwrap_or(u8::MAX)];
+                let pass_len = [u8::try_from(pass.len()).unwrap_or(u8::MAX)];
+                let parts: [&[u8]; 5] = [&version, &user_len, user, &pass_len, pass];
+                write_all_parts_until::<5>(stream, deadline, &parts)
                     .map_err(|error| format!("psiphon: upstream proxy auth: {error}"))?;
                 let mut reply = [0u8; 2];
                 read_exact_until(stream, deadline, &mut reply)
@@ -1497,27 +1551,36 @@ impl Proxy {
             }
             _ => return Err("psiphon: upstream proxy offers no usable method".to_owned()),
         }
-        let mut request = Vec::with_capacity(22 + host.len());
-        request.extend_from_slice(&[5, 1, 0]);
+        let mut request = [0u8; 22 + 255];
+        request[..3].copy_from_slice(&[5u8, 1, 0]);
+        let mut at = 3;
         match host.parse::<IpAddr>() {
             Ok(IpAddr::V4(address)) => {
-                request.push(1);
-                request.extend_from_slice(&address.octets());
+                request[at] = 1;
+                at += 1;
+                request[at..at + 4].copy_from_slice(&address.octets());
+                at += 4;
             }
             Ok(IpAddr::V6(address)) => {
-                request.push(4);
-                request.extend_from_slice(&address.octets());
+                request[at] = 4;
+                at += 1;
+                request[at..at + 16].copy_from_slice(&address.octets());
+                at += 16;
             }
             Err(_) => {
                 let length = u8::try_from(host.len())
                     .map_err(|_| "psiphon: upstream proxy host name is too long".to_owned())?;
-                request.push(3);
-                request.push(length);
-                request.extend_from_slice(host.as_bytes());
+                request[at] = 3;
+                at += 1;
+                request[at] = length;
+                at += 1;
+                request[at..at + host.len()].copy_from_slice(host.as_bytes());
+                at += host.len();
             }
         }
-        request.extend_from_slice(&port.to_be_bytes());
-        write_all_until(stream, deadline, &request)
+        request[at..at + 2].copy_from_slice(&port.to_be_bytes());
+        at += 2;
+        write_all_until(stream, deadline, &request[..at])
             .map_err(|error| format!("psiphon: upstream proxy request: {error}"))?;
         let mut head = [0u8; 4];
         read_exact_until(stream, deadline, &mut head)
@@ -1601,6 +1664,42 @@ fn write_all_until(stream: &mut TcpStream, deadline: Instant, mut bytes: &[u8]) 
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error),
         }
+    }
+    Ok(())
+}
+
+const NO_PARTS: &[u8] = &[];
+
+fn write_all_parts_until<const N: usize>(
+    stream: &mut TcpStream,
+    deadline: Instant,
+    mut parts: &[&[u8]],
+) -> io::Result<()> {
+    while !parts.is_empty() {
+        let (chunk, rest) = parts.split_at(parts.len().min(N));
+        let mut made: [IoSlice; N] = std::array::from_fn(|_| IoSlice::new(NO_PARTS));
+        let mut pieces = 0usize;
+        for part in chunk.iter().copied().filter(|part| !part.is_empty()) {
+            made[pieces] = IoSlice::new(part);
+            pieces += 1;
+        }
+        let mut slices = &mut made[..pieces];
+        while !slices.is_empty() {
+            arm_tcp_io(stream, deadline)?;
+            let wrote = match stream.write_vectored(slices) {
+                Ok(wrote) => wrote,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
+            if wrote == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                ));
+            }
+            IoSlice::advance_slices(&mut slices, wrote);
+        }
+        parts = rest;
     }
     Ok(())
 }
@@ -7219,6 +7318,92 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn an_http_connect_request_is_the_bytes_the_reference_sends() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 128];
+            while !request.ends_with(b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).expect("read");
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+            }
+            stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").expect("reply");
+            request
+        });
+        let proxy = Proxy::parse(
+            "http://user:p%40ss@example.com:1",
+            &crate::psiphon_dns::Config::from_servers(&[]),
+        )
+        .expect("proxy");
+        let mut stream = TcpStream::connect(address).expect("connect");
+        proxy
+            .connect_http(
+                &mut stream,
+                "2001:db8::1",
+                443,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .expect("connect");
+        assert_eq!(
+            server.join().expect("server").as_slice(),
+            &b"CONNECT [2001:db8::1]:443 HTTP/1.1\r\nHost: [2001:db8::1]:443\r\nProxy-Authorization: Basic dXNlcjpwQHNz\r\n\r\n"[..]
+        );
+    }
+
+    #[test]
+    fn a_socks5_request_is_the_bytes_the_reference_sends() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            let mut greeting = [0u8; 4];
+            stream.read_exact(&mut greeting).expect("greeting");
+            assert_eq!(greeting, [5, 2, 0, 2]);
+            stream.write_all(&[5, 2]).expect("method");
+            let mut auth = [0u8; 11];
+            stream.read_exact(&mut auth).expect("auth");
+            assert_eq!(auth, *b"\x01\x04user\x04p@ss");
+            stream.write_all(&[1, 0]).expect("auth reply");
+            let mut head = [0u8; 5];
+            stream.read_exact(&mut head).expect("request head");
+            assert_eq!(&head[..4], &[5, 1, 0, 3]);
+            let mut name = [0u8; 11];
+            stream.read_exact(&mut name).expect("request name");
+            assert_eq!(&name, b"example.com");
+            let mut port = [0u8; 2];
+            stream.read_exact(&mut port).expect("request port");
+            assert_eq!(port, 443u16.to_be_bytes());
+            stream
+                .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .expect("reply");
+        });
+        let proxy = Proxy::parse(
+            "socks5://user:p%40ss@example.com:1",
+            &crate::psiphon_dns::Config::from_servers(&[]),
+        )
+        .expect("proxy");
+        let mut stream = TcpStream::connect(address).expect("connect");
+        proxy
+            .connect_socks(
+                &mut stream,
+                "example.com",
+                443,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .expect("connect");
+        server.join().expect("server");
     }
 
     #[test]

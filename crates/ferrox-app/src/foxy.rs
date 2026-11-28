@@ -416,10 +416,14 @@ pub(crate) fn tcp_via(proxy: &UpstreamProxy, host: &str, port: u16) -> Result<Co
     } else {
         socks_greeting(&mut stream)?;
         let host_len = u8::try_from(host.len()).map_err(|_| Failure::Io)?;
-        let mut request = vec![5, 1, 0, 3, host_len];
-        request.extend_from_slice(host.as_bytes());
-        request.extend_from_slice(&port.to_be_bytes());
-        stream.write_all(&request).map_err(|_| Failure::Io)?;
+        let mut request = [0u8; 262];
+        request[..5].copy_from_slice(&[5, 1, 0, 3, host_len]);
+        let host_end = 5 + host.len();
+        request[5..host_end].copy_from_slice(host.as_bytes());
+        request[host_end..host_end + 2].copy_from_slice(&port.to_be_bytes());
+        stream
+            .write_all(&request[..host_end + 2])
+            .map_err(|_| Failure::Io)?;
         // The hop's bound address is not the edge's: read past it and drop it, the connection itself is the answer.
         if socks_reply(&mut stream)?.is_none() {
             return Err(Failure::Io);
@@ -2770,11 +2774,7 @@ impl H3 {
             &dial.pass.token,
             &mut block,
         );
-        let mut frame = Vec::with_capacity(16 + block.len());
-        frames::quic_varint(&mut frame, frames::H3_HEADERS);
-        frames::quic_varint(&mut frame, block.len() as u64);
-        frame.extend_from_slice(&block);
-        lane.send(lane.quic.id, &frame, false)?;
+        lane.send_headers(&block)?;
         let status = lane.read_head()?;
         opened(status)?;
         let mut request = Vec::new();
@@ -2805,11 +2805,7 @@ impl H3 {
             &dial.pass.token,
             &mut block,
         );
-        let mut frame = Vec::with_capacity(16 + block.len());
-        frames::quic_varint(&mut frame, frames::H3_HEADERS);
-        frames::quic_varint(&mut frame, block.len() as u64);
-        frame.extend_from_slice(&block);
-        self.send(self.quic.id, &frame, false)?;
+        self.send_headers(&block)?;
         self.read_head()
     }
 
@@ -3265,34 +3261,15 @@ impl H3 {
     fn request(&mut self, target: &str, bearer: &str) -> Result<u16, Failure> {
         let mut block = Vec::with_capacity(96 + bearer.len());
         hpack::qpack_connect(target, bearer, &mut block);
-        let mut frame = Vec::with_capacity(16 + block.len());
-        frames::quic_varint(&mut frame, frames::H3_HEADERS);
-        frames::quic_varint(&mut frame, block.len() as u64);
-        frame.extend_from_slice(&block);
-        self.send(self.quic.id, &frame, false)?;
+        self.send_headers(&block)?;
         self.read_head()
     }
 
-    fn send(&mut self, stream: u64, buf: &[u8], fin: bool) -> Result<(), Failure> {
-        let deadline = Instant::now() + SEND_WAIT;
-        let mut rest = bytes::Bytes::copy_from_slice(buf);
-        while !rest.is_empty() {
-            let (written, remainder) = self
-                .with_conn(|conn| conn.stream_send_zc(stream, rest.clone(), false))
-                .ok_or(Failure::Io)?
-                .map_err(|_| Failure::Io)?;
-            rest = remainder.unwrap_or_default();
-            if written == 0 {
-                if Instant::now() >= deadline {
-                    return Err(Failure::Io);
-                }
-                self.pump(self.pump_wait());
-            }
-        }
-        if fin {
-            self.fin(stream)?;
-        }
-        Ok(())
+    fn send_headers(&mut self, block: &[u8]) -> Result<(), Failure> {
+        let mut head = [0u8; 16];
+        let mut at = frames::quic_varint_into(&mut head, frames::H3_HEADERS);
+        at += frames::quic_varint_into(&mut head[at..], block.len() as u64);
+        self.send_pair(self.quic.id, &head[..at], block)
     }
 
     /// The frame's header and its payload accepted under one lock and flushed once: two `send` calls pay the connection mutex twice, and the egress sweep after the header alone puts those nine bytes in a datagram of their own.
@@ -3331,13 +3308,6 @@ impl H3 {
                 self.pump(self.pump_wait());
             }
         }
-    }
-
-    fn fin(&mut self, stream: u64) -> Result<(), Failure> {
-        let sent = self
-            .with_conn(|conn| conn.stream_send(stream, &[], true))
-            .ok_or(Failure::Io)?;
-        sent.map(|_| ()).map_err(|_| Failure::Io)
     }
 
     /// How long one empty turn waits for a datagram: the read's own grain where a relay armed one, because the lane's lock is what the other direction of the flow is standing behind, and the idle tick everywhere else.

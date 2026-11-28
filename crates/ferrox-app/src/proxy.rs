@@ -353,6 +353,10 @@ fn dokodemo_user_level(inbound: &Json) -> u32 {
 
 #[allow(clippy::too_many_lines)]
 fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, test: bool) -> ! {
+    // Armed before the outbound builds: a lane still signing in must honour a stop it cannot signal.
+    if !test {
+        crate::shutdown::watch();
+    }
     // Sized before the first lane, so every flow from here reads the ceiling its role named.
     if dials_a_proxy(root) {
         lane_pool::mark_proxy_peer();
@@ -484,7 +488,6 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, tes
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
     }
     if !test {
-        crate::shutdown::watch();
         if let Some(geodata) = geodata {
             crate::geodata::start(geodata, route.clone(), outbound.clone(), root.clone());
         }
@@ -3619,6 +3622,17 @@ impl Outbound {
                     }
                 }
             }
+            Self::Foxy(foxy) => {
+                for address in foxy
+                    .account_edges
+                    .iter()
+                    .chain(foxy.resolved.iter().map(|(_, address)| address))
+                {
+                    if !edges.contains(address) {
+                        edges.push(*address);
+                    }
+                }
+            }
             other => {
                 if let Some(edge) = other.edge() {
                     edges.push(edge);
@@ -4750,6 +4764,17 @@ impl RoutePlan {
                 for edge in wireguard.edges() {
                     if !edges.contains(&edge) {
                         edges.push(edge);
+                    }
+                }
+            }
+            Outbound::Foxy(foxy) => {
+                for address in foxy
+                    .account_edges
+                    .iter()
+                    .chain(foxy.resolved.iter().map(|(_, address)| address))
+                {
+                    if !edges.contains(address) {
+                        edges.push(*address);
                     }
                 }
             }
@@ -6438,6 +6463,11 @@ pub(crate) struct FoxyOut {
     pins: ferrox_core::foxy::pin::Pins,
     pass: ferrox_core::foxy::Pass,
     edge_address: Option<SocketAddr>,
+    /// Each ladder edge's first address, taken before the capture: after it, a hijack resolver
+    /// the underlay cannot reach would otherwise strand every dial of a name already known.
+    resolved: Vec<(std::sync::Arc<str>, SocketAddr)>,
+    /// The account plane's addresses, pinned before the capture so a renewal after it dials the same peers.
+    account_edges: Vec<SocketAddr>,
     direct_ports: Vec<u16>,
     direct_suffixes: Vec<String>,
     exit_probe: Option<String>,
@@ -6459,6 +6489,16 @@ fn carrier_slots() -> std::sync::Arc<std::sync::Mutex<[u8; 3]>> {
 }
 
 impl FoxyOut {
+    /// The address this edge is dialled at: the configured pin, else the one taken before the capture.
+    fn dial_address(&self, edge: &ferrox_core::foxy::Candidate) -> Option<SocketAddr> {
+        self.edge_address.or_else(|| {
+            self.resolved
+                .iter()
+                .find(|(host, _)| host.as_ref() == edge.host.as_ref())
+                .map(|(_, address)| *address)
+        })
+    }
+
     /// Whether this edge is already known not to answer this carrier, inside the window.
     fn carrier_unanswered(
         &self,
@@ -11194,7 +11234,11 @@ fn resolve_name_watching(
     if stopped(stop) {
         return None;
     }
-    if let Some(resolver) = crate::dnsapp::installed() {
+    // A TUN's hijack address is the local resolver only while its capture is live; before the routes land the physical resolver is the system's. A config's own resolver stays usable throughout.
+    let physical = local
+        && crate::dnsapp::installed().is_some_and(|resolver| resolver.is_tun_hijack())
+        && !crate::tun_route::live_capture();
+    if !physical && let Some(resolver) = crate::dnsapp::installed() {
         if stop.is_some() {
             let addrs = resolve_on(
                 &DNS_APP_POOL,
@@ -16079,12 +16123,17 @@ pub(crate) fn resolve_outbound(address: &str, port: u16) -> Option<SocketAddr> {
 
 /// Every address an outbound edge names, resolved through the relay's own resolver on
 /// the local dial. A domain edge must resolve before the outbound that would carry a
-/// routed query is open, or a captured stub resolver deadlocks against the proxy.
+/// routed query is open, or a captured stub resolver deadlocks against the proxy. A TUN's
+/// hijack address is only the local resolver once its capture is live, so before the
+/// routes land the system resolver answers; asking the hijack address first would fail
+/// on a network that does not carry it and strand the lane it was resolving.
 pub(crate) fn resolve_edge_addrs(host: &str, port: u16) -> Option<Vec<SocketAddr>> {
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return Some(vec![SocketAddr::new(ip, port)]);
     }
-    let addrs: Vec<SocketAddr> = if let Some(resolver) = crate::dnsapp::installed() {
+    let addrs: Vec<SocketAddr> = if let Some(resolver) = crate::dnsapp::installed()
+        .filter(|resolver| !resolver.is_tun_hijack() || crate::tun_route::live_capture())
+    {
         let (ips, _) = resolver.lookup_local(host)?;
         ips.into_iter()
             .map(|ip| SocketAddr::new(ip, port))
@@ -32321,7 +32370,7 @@ fn probe_edge_exit(
         let dial = crate::foxy::FoxyDial {
             host: edge.host.clone(),
             port: edge.port,
-            address: foxy.edge_address,
+            address: foxy.dial_address(edge),
             carrier: crate::foxy::Carrier::H1,
             upstream: foxy.upstream.clone(),
             roots: foxy.roots.clone(),
@@ -32338,7 +32387,7 @@ fn probe_edge_exit(
     let dial = crate::foxy::FoxyDial {
         host: edge.host.clone(),
         port: edge.port,
-        address: foxy.edge_address,
+        address: foxy.dial_address(edge),
         carrier: crate::foxy::Carrier::H3,
         upstream: foxy.upstream.clone(),
         roots: foxy.roots.clone(),
@@ -32488,7 +32537,7 @@ fn foxy_open(foxy: &FoxyOut, asked: &Destination) -> FoxyOpen {
             let dial = crate::foxy::FoxyDial {
                 host: edge.host.clone(),
                 port: edge.port,
-                address: foxy.edge_address,
+                address: foxy.dial_address(edge),
                 carrier,
                 upstream: foxy.upstream.clone(),
                 roots: foxy.roots.clone(),
@@ -35634,7 +35683,7 @@ fn open_foxy_ip_tunnel(foxy: &FoxyOut, tunnel: &mut Option<crate::foxy::Ip>) -> 
             let dial = crate::foxy::FoxyDial {
                 host: edge.host.clone(),
                 port: edge.port,
-                address: foxy.edge_address,
+                address: foxy.dial_address(edge),
                 carrier,
                 upstream: foxy.upstream.clone(),
                 roots: foxy.roots.clone(),
@@ -35723,7 +35772,7 @@ fn foxy_udp_dial(foxy: &FoxyOut, dest: &SocketAddr) -> Option<crate::foxy::Datag
             let dial = crate::foxy::FoxyDial {
                 host: edge.host.clone(),
                 port: edge.port,
-                address: foxy.edge_address,
+                address: foxy.dial_address(edge),
                 carrier,
                 upstream: foxy.upstream.clone(),
                 roots: foxy.roots.clone(),
@@ -36750,13 +36799,21 @@ fn serve_socks_udp_trojan(relay: &UdpSocket, trojan: &TrojanOut, peer: Option<Ip
     }
 }
 
-/// The pooled dial uses the edge's name, not its resolved address, so a country's flows share one connection.
+/// The pooled dial keeps the edge's name as its TLS name and dials the address taken before
+/// the capture, so a country's flows share one connection without asking a resolver after it.
 fn foxy_quic_dial(foxy: &FoxyOut, edge: &ferrox_core::foxy::Candidate) -> crate::quic::QuicDial {
+    let (address, port) = match foxy.dial_address(edge) {
+        Some(address) => (
+            std::sync::Arc::from(address.ip().to_string()),
+            address.port(),
+        ),
+        None => (std::sync::Arc::clone(&edge.host), edge.port),
+    };
     crate::quic::QuicDial {
         id: [0; 16],
         host: std::sync::Arc::clone(&edge.host),
-        address: std::sync::Arc::clone(&edge.host),
-        port: edge.port,
+        address,
+        port,
         upstream: foxy.upstream.clone(),
         roots: Some(foxy.roots.clone()),
         ech_config_list: None,
@@ -46914,6 +46971,9 @@ fn foxy_account(
     )?;
     let mut guardian =
         crate::foxy_account::Endpoint::parse(guardian, std::sync::Arc::clone(roots))?;
+    // Take the account plane's peers before the capture, so a renewal after it dials the same addresses.
+    fxa.pin_before_capture();
+    guardian.pin_before_capture();
     fxa.upstream = upstream.cloned();
     guardian.upstream = upstream.cloned();
     let account = std::sync::Arc::new(crate::foxy_account::Account {
@@ -47244,6 +47304,21 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
         // The ladder is tiered once: the country's edges in tier order never change, and a flow that rebuilt them copied four strings per edge to walk a list it had already.
         let ladder =
             ferrox_core::foxy::catalog::tier(&candidates, &country, &city, MAX_FOXY_ALTERNATES);
+        // Take each edge's address before the TUN capture, so a dial after it needs no resolver.
+        let resolved: Vec<(std::sync::Arc<str>, SocketAddr)> = ladder
+            .iter()
+            .filter_map(|edge| {
+                resolve_edge_addrs(&edge.host, edge.port)
+                    .and_then(|addrs| addrs.into_iter().next())
+                    .map(|address| (std::sync::Arc::clone(&edge.host), address))
+            })
+            .collect();
+        let account_edges: Vec<SocketAddr> = account.as_ref().map_or_else(Vec::new, |account| {
+            [account.fxa.address, account.guardian.address]
+                .into_iter()
+                .flatten()
+                .collect()
+        });
         return Some(FoxyOut {
             account,
             ladder,
@@ -47264,6 +47339,8 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
             pins,
             pass,
             edge_address,
+            resolved,
+            account_edges,
             direct_ports: foxy_ports(settings.and_then(|s| s.get("directPorts"))),
             direct_suffixes: foxy_list_or(&link, settings, "directDomains"),
             exit_probe: foxy_exit_probe(&link, settings),
@@ -58527,10 +58604,28 @@ mod tests {
         thread::sleep(Duration::from_millis(300));
         let _ = release.send(());
         let mut back = [0u8; 2];
-        let read = session.read(&mut back);
+        let mut filled = 0;
+        let reading = Instant::now();
+        while filled < back.len() && reading.elapsed() < Duration::from_secs(5) {
+            match session.read(&mut back[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => {
+                    panic!("the cleared probe clock must not expire the reused session: {error}")
+                }
+            }
+        }
         serving.join().expect("joins");
-        assert!(
-            read.is_ok(),
+        assert_eq!(
+            filled,
+            back.len(),
             "the cleared probe clock must not expire the reused session"
         );
         assert_eq!(&back, b"ok");
@@ -68543,6 +68638,8 @@ mod tests {
                 quota_limit: None,
             },
             edge_address: None,
+            resolved: Vec::new(),
+            account_edges: Vec::new(),
             direct_ports: Vec::new(),
             direct_suffixes: Vec::new(),
             exit_probe: None,
@@ -68748,6 +68845,32 @@ mod tests {
         assert!(foxy_quic_dial(&foxy, &foxy.ladder[0]).quic_v2);
     }
 
+    /// A TUN capture must pin the Foxy lane's account plane and every edge the ladder can dial,
+    /// not only a direct outbound's single server; each address was taken before the routes landed.
+    #[test]
+    fn a_foxy_lane_names_the_edges_taken_before_the_capture() {
+        let mut foxy = foxy_with_one_edge();
+        let edge: SocketAddr = "192.0.2.7:443".parse().expect("address");
+        let account: SocketAddr = "192.0.2.9:443".parse().expect("address");
+        foxy.resolved = vec![(std::sync::Arc::from("edge.example"), edge)];
+        foxy.account_edges = vec![account];
+        let mut edges = Outbound::Foxy(Box::new(foxy)).edges();
+        edges.sort_unstable();
+        assert_eq!(edges, vec![edge, account]);
+    }
+
+    /// The QUIC dial carries the edge's name as its TLS name and the address taken before the
+    /// capture as the peer, so a pooled connection needs no resolver after the routes land.
+    #[test]
+    fn the_foxy_quic_dial_keeps_the_name_and_dials_the_taken_address() {
+        let mut foxy = foxy_with_one_edge();
+        let edge: SocketAddr = "192.0.2.7:443".parse().expect("address");
+        foxy.resolved = vec![(std::sync::Arc::from("edge.example"), edge)];
+        let dial = foxy_quic_dial(&foxy, &foxy.ladder[0]);
+        assert_eq!(dial.host.as_ref(), "edge.example");
+        assert_eq!(dial.address.as_ref(), "192.0.2.7");
+    }
+
     /// `auto` chooses per flow kind, so the lane keeps the last rung each kind opened for `status` to print.
     #[test]
     fn the_lane_remembers_the_carrier_each_flow_kind_opened() {
@@ -68783,7 +68906,7 @@ mod tests {
                     let dial = crate::foxy::FoxyDial {
                         host: std::sync::Arc::clone(&edge.host),
                         port: edge.port,
-                        address: foxy.edge_address,
+                        address: foxy.dial_address(edge),
                         carrier: crate::foxy::Carrier::H2,
                         upstream: foxy.upstream.clone(),
                         roots: foxy.roots.clone(),
@@ -80956,10 +81079,17 @@ mod tests {
         thread::spawn(move || {
             let mut buf = [0u8; 2048];
             loop {
-                let Ok((n, from)) = echo.recv_from(&mut buf) else {
-                    return;
-                };
-                let _ = echo.send_to(&buf[..n], from);
+                match echo.recv_from(&mut buf) {
+                    Ok((n, from)) => {
+                        let _ = echo.send_to(&buf[..n], from);
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                        ) => {}
+                    Err(_) => return,
+                }
             }
         });
         port
@@ -84837,6 +84967,8 @@ mod tests {
                 quota_limit: None,
             },
             edge_address: Some(edge),
+            resolved: Vec::new(),
+            account_edges: Vec::new(),
             direct_ports: Vec::new(),
             direct_suffixes: Vec::new(),
             exit_probe: None,
@@ -84937,6 +85069,8 @@ mod tests {
                 quota_limit: None,
             },
             edge_address: Some(edge),
+            resolved: Vec::new(),
+            account_edges: Vec::new(),
             direct_ports: Vec::new(),
             direct_suffixes: Vec::new(),
             exit_probe: None,

@@ -65,25 +65,34 @@ pub fn hawk_credentials(session_token: &str) -> Option<(String, [u8; HAWK_KEY_LE
 
 #[must_use]
 pub fn hex_to_bytes(hex: &str) -> Vec<u8> {
-    hex.as_bytes()
-        .chunks(2)
-        .filter(|pair| pair.len() == 2)
-        .filter_map(|pair| {
-            let hi = (pair[0] as char).to_digit(16)?;
-            let lo = (pair[1] as char).to_digit(16)?;
-            Some(((hi << 4) | lo) as u8)
-        })
-        .collect()
+    let bytes = hex.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.as_chunks::<2>().0 {
+        if let (Some(hi), Some(lo)) = (nibble(pair[0]), nibble(pair[1])) {
+            out.push((hi << 4) | lo);
+        }
+    }
+    out
+}
+
+fn nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[must_use]
 pub fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
-        out.push(char::from_digit(u32::from(byte & 0x0f), 16).unwrap_or('0'));
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = Vec::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[usize::from(byte >> 4)]);
+        out.push(HEX[usize::from(byte & 0x0f)]);
     }
-    out
+    String::from_utf8(out).expect("hex digits are ASCII")
 }
 
 /// HKDF-SHA256 expand: one HMAC per output block, chained.

@@ -22,7 +22,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: an existing tag (vX.Y.Z) to rebuild onto; leave empty to ship the version Cargo.toml declares
+        description: an existing tag (vX.Y.Z) to rebuild onto; leave empty to ship the version Cargo.toml declares from this commit, moving that tag here if it already exists
         required: false
         default: ""
 
@@ -60,32 +60,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
           WANT: ${{ github.event.inputs.tag }}
-        run: |
-          valid_version() {
-            printf '%s' "$1" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'
-          }
-          tag_commit() {
-            git rev-parse --verify "refs/tags/$1^{commit}" 2>/dev/null
-          }
-          if [ "$EVENT" = push ]; then
-            valid_version "$REF_NAME" || { echo "::error::the pushed tag must be vX.Y.Z, got: $REF_NAME"; exit 1; }
-            version="$REF_NAME"
-            commit="$(git rev-parse HEAD)"
-          elif [ -n "$WANT" ]; then
-            valid_version "$WANT" || { echo "::error::the tag input must name an existing vX.Y.Z tag, got: $WANT"; exit 1; }
-            commit="$(tag_commit "$WANT")" || { echo "::error::the tag input names no tag: $WANT"; exit 1; }
-            version="$WANT"
-          else
-            # Nothing typed: the version this workspace declares is the version
-            # to ship, so pressing the button once is the whole interaction.
-            DECLARED="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -1)"
-            [ -n "$DECLARED" ] || { echo "::error::cannot read the workspace version from Cargo.toml"; exit 1; }
-            valid_version "v$DECLARED" || { echo "::error::Cargo.toml declares a non-vX.Y.Z version: $DECLARED"; exit 1; }
-            version="v$DECLARED"
-            commit="$(tag_commit "$version")" || commit="$(git rev-parse HEAD)"
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+        run: scripts/release-plan.sh "$EVENT" "$REF_NAME" "$WANT" >> "$GITHUB_OUTPUT"
 
   build:
     name: ${{ matrix.target }}
@@ -402,6 +377,7 @@ jobs:
           VERSION: ${{ needs.plan.outputs.version }}
           COMMIT: ${{ needs.plan.outputs.commit }}
           EVENT: ${{ github.event_name }}
+          WANT: ${{ github.event.inputs.tag }}
         run: |
           tag_path="repos/$GH_REPO/git/ref/tags/$VERSION"
           tag_err="$RUNNER_TEMP/tag.err"
@@ -424,8 +400,17 @@ jobs:
             exit 1
           fi
           if [ -n "$tag_commit" ] && [ "$tag_commit" != "$COMMIT" ]; then
-            echo "::error::$VERSION already points at $tag_commit, not $COMMIT"
-            exit 1
+            if [ "$EVENT" = workflow_dispatch ] && [ -z "$WANT" ]; then
+              # An empty dispatch names the version Cargo.toml declares, which is
+              # a rerelease: move that version's tag to the commit this run builds.
+              gh api -X PATCH "repos/$GH_REPO/git/refs/tags/$VERSION" \
+                -f sha="$COMMIT" -F force=true >/dev/null
+              echo "moved $VERSION from $tag_commit to $COMMIT"
+              tag_commit="$COMMIT"
+            else
+              echo "::error::$VERSION already points at $tag_commit, not $COMMIT"
+              exit 1
+            fi
           fi
           if gh release view "$VERSION" >/dev/null 2>&1; then
             gh release edit "$VERSION" --notes-file RELEASE-BODY.md

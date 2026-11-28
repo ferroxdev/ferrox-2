@@ -254,7 +254,7 @@ pub fn kill(paths: &Paths, pid: u32) -> Result<(), String> {
             }
             return Ok(());
         }
-        if wait_exit(pid, 10) {
+        if wait_exit(pid, 30) {
             return Ok(());
         }
         if unsafe { libc::kill(process, libc::SIGKILL) } != 0 {
@@ -608,14 +608,93 @@ fn can_signal(pid: u32) -> bool {
 }
 
 #[cfg(unix)]
-fn privileged_kill(pid: u32, signal: &str) -> bool {
-    std::process::Command::new("sudo")
+fn sudo_ready() -> bool {
+    Command::new("sudo")
+        .args(["-n", "true"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(unix)]
+fn sudo_prompt() -> bool {
+    use std::io::IsTerminal;
+    (std::io::stdin().is_terminal() || std::io::stderr().is_terminal())
+        && Command::new("sudo")
+            .arg("-v")
+            .status()
+            .is_ok_and(|status| status.success())
+}
+
+#[cfg(unix)]
+fn sudo_path(args: &[&str]) -> Option<PathBuf> {
+    let read = || {
+        let output = Command::new("sudo")
+            .args(args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        (!path.is_empty()).then(|| PathBuf::from(path))
+    };
+    if let Some(path) = read() {
+        return Some(path);
+    }
+    if sudo_ready() || !sudo_prompt() {
+        return None;
+    }
+    read()
+}
+
+#[cfg(target_os = "linux")]
+fn privileged_exe(pid: u32) -> Option<PathBuf> {
+    let exe = format!("/proc/{pid}/exe");
+    sudo_path(&["-n", "readlink", "-f", &exe])
+}
+
+#[cfg(target_os = "macos")]
+fn privileged_exe(pid: u32) -> Option<PathBuf> {
+    let pid_arg = pid.to_string();
+    sudo_path(&["-n", "/bin/ps", "-p", &pid_arg, "-o", "comm="])
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn privileged_exe(_pid: u32) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(unix)]
+fn privileged_is_ferrox(paths: &Paths, pid: u32) -> Option<bool> {
+    privileged_exe(pid)
+        .map(|actual| recognises(&actual, &recorded_bin(paths), env_bin().as_deref()))
+}
+
+#[cfg(unix)]
+fn sudo_signal(pid: u32, signal: &str) -> bool {
+    Command::new("sudo")
         .args(["-n", "kill", signal, &pid.to_string()])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+#[cfg(unix)]
+fn privileged_kill(pid: u32, signal: &str) -> bool {
+    if sudo_signal(pid, signal) {
+        return true;
+    }
+    if sudo_ready() || !sudo_prompt() {
+        return false;
+    }
+    sudo_signal(pid, signal)
 }
 
 pub fn stop(paths: &Paths) -> Result<(), String> {
@@ -636,11 +715,20 @@ pub fn stop(paths: &Paths) -> Result<(), String> {
             let _ = unsafe { libc::kill(process, libc::SIGTERM) };
         }
         #[cfg(any(unix, windows))]
-        if !wait_exit(pid, 10) {
+        if !wait_exit(pid, 50) {
             #[cfg(unix)]
             if executable.is_none() || !can_signal(pid) {
+                match privileged_is_ferrox(paths, pid) {
+                    Some(true) => {}
+                    Some(false) => return Err(not_ferrox(paths, pid)),
+                    None => {
+                        return Err(format!(
+                            "process {pid} cannot be confirmed as ferrox-app without sudo; it was not stopped. Run 'sudo kill {pid}' if it is the lane."
+                        ));
+                    }
+                }
                 let _ = privileged_kill(pid, "-TERM");
-                if !wait_exit(pid, 10) {
+                if !wait_exit(pid, 30) {
                     let _ = privileged_kill(pid, "-KILL");
                     if !wait_exit(pid, 10) {
                         return Err(format!(
@@ -839,6 +927,24 @@ pub fn other_lanes(paths: &Paths) -> Vec<(String, u32)> {
 mod tests {
     use super::*;
 
+    fn free_within(path: &std::path::Path) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            let probe = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .unwrap();
+            if probe.try_lock().is_ok() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn lanes_in_one_root_share_the_port_probe_lock() {
         let root = std::env::temp_dir().join(format!("ferrox-ports-{}", std::process::id()));
@@ -851,8 +957,9 @@ mod tests {
             .open(port_lock_path(&two))
             .unwrap();
         assert!(probe.try_lock().is_err());
+        drop(probe);
         drop(held);
-        assert!(probe.try_lock().is_ok());
+        assert!(free_within(&port_lock_path(&two)));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -868,8 +975,9 @@ mod tests {
             .open(port_lock_path(&two))
             .unwrap();
         assert!(probe.try_lock().is_err());
+        drop(probe);
         drop(held);
-        assert!(probe.try_lock().is_ok());
+        assert!(free_within(&port_lock_path(&two)));
         let _ = std::fs::remove_dir_all(root);
     }
 

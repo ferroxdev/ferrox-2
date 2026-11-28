@@ -503,8 +503,11 @@ fn expand(replacement: &[u8], captures: &regex::bytes::Captures<'_>) -> Vec<u8> 
 
 /// Apply the configured transforms to a packet through its hex form.
 pub(crate) fn apply_hex_transform(transforms: &[Transform], packet: &[u8]) -> io::Result<Vec<u8>> {
-    let value = run_transforms(transforms, hex_encode(packet).into_bytes())?;
-    hex_decode(&value).ok_or_else(|| {
+    let value = run_transforms(
+        transforms,
+        std::borrow::Cow::Owned(hex_encode(packet).into_bytes()),
+    )?;
+    hex_decode(value.as_ref()).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "psiphon transform produced invalid hex",
@@ -513,15 +516,18 @@ pub(crate) fn apply_hex_transform(transforms: &[Transform], packet: &[u8]) -> io
 }
 
 /// Apply the configured transforms directly to bytes, as the HTTP transformer does.
-pub(crate) fn apply_bytes_transform(
+pub(crate) fn apply_bytes_transform<'a>(
     transforms: &[Transform],
-    packet: &[u8],
-) -> io::Result<Vec<u8>> {
-    run_transforms(transforms, packet.to_vec())
+    packet: impl Into<std::borrow::Cow<'a, [u8]>>,
+) -> io::Result<std::borrow::Cow<'a, [u8]>> {
+    run_transforms(transforms, packet.into())
 }
 
-/// Run each transform in order over one value.
-fn run_transforms(transforms: &[Transform], mut value: Vec<u8>) -> io::Result<Vec<u8>> {
+/// Run each transform in order over one value, keeping the caller's bytes when nothing matches.
+fn run_transforms<'a>(
+    transforms: &[Transform],
+    mut value: std::borrow::Cow<'a, [u8]>,
+) -> io::Result<std::borrow::Cow<'a, [u8]>> {
     for transform in transforms {
         let mut replacement = Vec::new();
         let mut work = 0;
@@ -531,12 +537,14 @@ fn run_transforms(transforms: &[Transform], mut value: Vec<u8>) -> io::Result<Ve
                 format!("psiphon transform: {why}"),
             )
         })?;
-        value = transform
+        let replaced = transform
             .find
-            .replace_all(&value, |captures: &regex::bytes::Captures<'_>| {
+            .replace_all(value.as_ref(), |captures: &regex::bytes::Captures<'_>| {
                 expand(&replacement, captures)
-            })
-            .into_owned();
+            });
+        if let std::borrow::Cow::Owned(replaced) = replaced {
+            value = std::borrow::Cow::Owned(replaced);
+        }
     }
     Ok(value)
 }
@@ -1156,21 +1164,23 @@ fn query_one(
     let id = crate::psiphon_ssh::random::<2>();
     let edns0 = coin(config.edns0_probability);
     let casing = coin(config.qname_casing_probability);
-    let (mut request, mut sent_name) = query_packet(id, host, record, edns0, casing)?;
-    if let Some(transforms) = transform {
+    let (mut request, sent_range) = query_packet(id, host, record, edns0, casing)?;
+    let mut sent_name = None;
+    let sent_range = if let Some(transforms) = transform {
+        let original = sent_range.map(|range| request[range].to_vec());
         request = apply_hex_transform(transforms, &request)?;
-        sent_name = question_name(&request).map(<[u8]>::to_vec).or(sent_name);
-    }
+        sent_name = question_name(&request).map(<[u8]>::to_vec).or(original);
+        None
+    } else {
+        sent_range
+    };
     socket.send(&request)?;
     let mut reply = [0u8; MAX_REPLY];
     let count = socket.recv(&mut reply)?;
-    parse_reply(
-        id,
-        &reply[..count],
-        record,
-        sent_name.as_deref(),
-        question_match,
-    )
+    let sent = sent_name
+        .as_deref()
+        .or_else(|| sent_range.map(|range| &request[range]));
+    parse_reply(id, &reply[..count], record, sent, question_match)
 }
 
 /// Build the query, optionally with EDNS0 and randomized QNAME casing.
@@ -1180,7 +1190,7 @@ fn query_packet(
     record: u16,
     edns0: bool,
     casing: bool,
-) -> io::Result<(Vec<u8>, Option<Vec<u8>>)> {
+) -> io::Result<(Vec<u8>, Option<std::ops::Range<usize>>)> {
     let name = host.trim_end_matches('.');
     if name.is_empty() || name.len() > 253 {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "bad DNS name"));
@@ -1209,13 +1219,13 @@ fn query_packet(
         }
     }
     packet.push(0);
-    let name_bytes = packet[12..packet.len()].to_vec();
+    let name_end = packet.len();
     packet.extend_from_slice(&record.to_be_bytes());
     packet.extend_from_slice(&1u16.to_be_bytes());
     if edns0 {
         packet.extend_from_slice(&[0, 0, 41, 0x10, 0x00, 0, 0, 0, 0, 0, 0]);
     }
-    Ok((packet, Some(name_bytes)))
+    Ok((packet, Some(12..name_end)))
 }
 
 /// The first question name in a DNS packet, if the packet is well formed.
@@ -1824,6 +1834,44 @@ mod tests {
         let packet =
             super::apply_hex_transform(&[transform], &[0x12, 0x34, 0xab, 0xcd]).expect("transform");
         assert_eq!(packet, [0x34, 0x12, 0xab, 0xcd]);
+    }
+
+    #[test]
+    fn a_transform_that_does_not_match_keeps_the_buffer() {
+        let find = regex::bytes::Regex::new("zz").expect("regex");
+        let replacement = super::Node::parse(b"y").expect("pattern");
+        let transform = super::Transform { find, replacement };
+        let mut packet = Vec::with_capacity(64);
+        packet.extend_from_slice(&[1, 2, 3]);
+        let pointer = packet.as_ptr();
+        let capacity = packet.capacity();
+        let out = super::run_transforms(&[transform], std::borrow::Cow::Owned(packet))
+            .expect("transform");
+        let std::borrow::Cow::Owned(out) = out else {
+            panic!("a held buffer stays owned");
+        };
+        assert_eq!(out, [1, 2, 3]);
+        assert_eq!(out.as_ptr(), pointer);
+        assert_eq!(out.capacity(), capacity);
+    }
+
+    #[test]
+    fn a_borrowed_transform_that_does_not_match_stays_borrowed() {
+        let find = regex::bytes::Regex::new("zz").expect("regex");
+        let replacement = super::Node::parse(b"y").expect("pattern");
+        let transform = super::Transform { find, replacement };
+        let packet = [1u8, 2, 3];
+        let out = super::apply_bytes_transform(&[transform], &packet[..]).expect("transform");
+        assert!(matches!(&out, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(out.as_ptr(), packet.as_ptr());
+    }
+
+    #[test]
+    fn a_question_range_is_the_name_the_packet_carries() {
+        let (packet, range) =
+            super::query_packet([0x12, 0x34], "example.com", 1, false, false).expect("query");
+        let range = range.expect("name");
+        assert_eq!(&packet[range], b"\x07example\x03com\x00");
     }
 
     #[test]

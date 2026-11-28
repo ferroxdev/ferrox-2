@@ -44,8 +44,8 @@ const PROBE_HOST: &str = "one.one.one.one";
 const PROBE_PORT: u16 = 53;
 /// The name an ironclad edge must carry a real HTTP response for.
 const HTTP_PROBE_HOST: &str = "www.gstatic.com";
-/// The path whose `204` the reference's ironclad check reads.
-const HTTP_PROBE_PATH: &str = "/generate_204";
+/// The reference's ironclad probe: `GET /generate_204`, closed after one response.
+const HTTP_PROBE_REQUEST: &[u8] = b"GET /generate_204 HTTP/1.1\r\nHost: www.gstatic.com\r\nConnection: close\r\nUser-Agent: ferrox-ironclad\r\n\r\n";
 /// How long an ironclad edge waits for that response.
 const HTTP_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
 /// The port an ironclad scan asks, unless `ironcladPort` or the environment moves it.
@@ -2334,7 +2334,8 @@ fn check_masque(identity: &Identity, spec: &WarpSpec, edge: SocketAddr) -> bool 
     set_masque_edge(&mut edge_spec, edge);
     let answered =
         build_masque(identity, &edge_spec).is_ok_and(|out| out.probe(PROBE_HOST, PROBE_PORT));
-    answered && (spec.scan != Some(ScanMode::Ironclad) || http_check_masque(identity, spec, edge))
+    answered
+        && (spec.scan != Some(ScanMode::Ironclad) || http_check_masque_at(identity, &edge_spec))
 }
 
 fn http_check_wireguard(identity: &Identity, spec: &WarpSpec, edge: SocketAddr) -> bool {
@@ -2352,7 +2353,11 @@ fn http_check_wireguard(identity: &Identity, spec: &WarpSpec, edge: SocketAddr) 
 fn http_check_masque(identity: &Identity, spec: &WarpSpec, edge: SocketAddr) -> bool {
     let mut edge_spec = spec.clone();
     set_masque_edge(&mut edge_spec, edge);
-    let Ok(out) = build_masque(identity, &edge_spec) else {
+    http_check_masque_at(identity, &edge_spec)
+}
+
+fn http_check_masque_at(identity: &Identity, edge_spec: &WarpSpec) -> bool {
+    let Ok(out) = build_masque(identity, edge_spec) else {
         return false;
     };
     http_check(
@@ -2385,36 +2390,42 @@ fn http_check(
         crate::conn::Connection::from(tunnel),
         &crate::proxy::Destination::Name(HTTP_PROBE_HOST.to_owned(), port),
     );
-    let request = format!(
-        "GET {HTTP_PROBE_PATH} HTTP/1.1\r\nHost: {HTTP_PROBE_HOST}\r\nConnection: close\r\nUser-Agent: ferrox-ironclad\r\n\r\n"
-    );
-    if client.write_all(request.as_bytes()).is_err() {
+    if client.write_all(HTTP_PROBE_REQUEST).is_err() {
         return false;
     }
-    let mut response = Vec::new();
+    let mut response = [0u8; 256];
     let mut buffer = [0u8; 128];
+    let mut filled = 0;
     loop {
         match client.read(&mut buffer) {
             Ok(0) | Err(_) => break,
             Ok(read) => {
-                response.extend_from_slice(&buffer[..read]);
-                if response.windows(2).any(|window| window == b"\r\n") || response.len() >= 128 {
+                response[filled..filled + read].copy_from_slice(&buffer[..read]);
+                filled += read;
+                if response[..filled]
+                    .windows(2)
+                    .any(|window| window == b"\r\n")
+                    || filled >= 128
+                {
                     break;
                 }
             }
         }
     }
-    let line = response.split(|byte| *byte == b'\n').next().unwrap_or(&[]);
-    http_status_code(&String::from_utf8_lossy(line)) == Some(204)
+    let line = response[..filled]
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or(&[]);
+    http_status_code(line) == Some(204)
 }
 
-fn http_status_code(status_line: &str) -> Option<u16> {
-    let mut parts = status_line.split(' ');
+fn http_status_code(status_line: &[u8]) -> Option<u16> {
+    let mut parts = status_line.split(|byte| *byte == b' ');
     let version = parts.next()?;
-    if !version.starts_with("HTTP/") {
+    if !version.starts_with(b"HTTP/") {
         return None;
     }
-    parts.next()?.trim().parse().ok()
+    std::str::from_utf8(parts.next()?).ok()?.trim().parse().ok()
 }
 
 /// The `WireGuard` half as the existing `wireguard` outbound reads it.
@@ -2586,12 +2597,12 @@ fn connect_authority(asked: &crate::proxy::Destination) -> Option<String> {
     if authority.parse::<SocketAddr>().is_ok() {
         return Some(authority);
     }
-    let (host, port) = authority.rsplit_once(':')?;
-    let port = port.parse::<u16>().ok().filter(|port| *port != 0)?;
-    let host = host.trim_end_matches('.');
-    let valid = !host.is_empty()
-        && host.len() <= 253
-        && host.split('.').all(|label| {
+    let (host, port_text) = authority.rsplit_once(':')?;
+    let port = port_text.parse::<u16>().ok().filter(|port| *port != 0)?;
+    let trimmed = host.trim_end_matches('.');
+    let valid = !trimmed.is_empty()
+        && trimmed.len() <= 253
+        && trimmed.split('.').all(|label| {
             !label.is_empty()
                 && label.len() <= 63
                 && !label.starts_with('-')
@@ -2600,17 +2611,26 @@ fn connect_authority(asked: &crate::proxy::Destination) -> Option<String> {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
         });
-    valid.then(|| format!("{host}:{port}"))
+    if !valid {
+        return None;
+    }
+    if trimmed.len() == host.len() && port_text.as_bytes().first() != Some(&b'0') {
+        return Some(authority);
+    }
+    Some(format!("{trimmed}:{port}"))
 }
 
 fn connect_request(asked: &crate::proxy::Destination) -> Option<Vec<u8>> {
     let authority = connect_authority(asked)?;
-    Some(
-        format!(
-            "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: {REGISTER_AGENT}\r\n\r\n"
-        )
-        .into_bytes(),
-    )
+    let mut request = Vec::with_capacity(64 + authority.len() * 2 + REGISTER_AGENT.len());
+    request.extend_from_slice(b"CONNECT ");
+    request.extend_from_slice(authority.as_bytes());
+    request.extend_from_slice(b" HTTP/1.1\r\nHost: ");
+    request.extend_from_slice(authority.as_bytes());
+    request.extend_from_slice(b"\r\nUser-Agent: ");
+    request.extend_from_slice(REGISTER_AGENT.as_bytes());
+    request.extend_from_slice(b"\r\n\r\n");
+    Some(request)
 }
 
 fn connect_status(head: &[u8]) -> Option<u16> {
@@ -2657,22 +2677,25 @@ fn connect_status(head: &[u8]) -> Option<u16> {
             return None;
         }
     }
-    std::str::from_utf8(status).ok()?.parse().ok()
+    Some(
+        u16::from(status[0] - b'0') * 100
+            + u16::from(status[1] - b'0') * 10
+            + u16::from(status[2] - b'0'),
+    )
 }
 
 fn connect_head_end(head: &[u8]) -> Option<usize> {
-    let crlf = head
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|at| at + 4);
-    let lf = head
-        .windows(2)
-        .position(|window| window == b"\n\n")
-        .map(|at| at + 2);
-    match (crlf, lf) {
-        (Some(crlf), Some(lf)) => Some(crlf.min(lf)),
-        (crlf, lf) => crlf.or(lf),
+    let mut from = 0;
+    while let Some(at) = ferrox_core::foxy::octet_in(head, from, b'\n') {
+        if at >= 1 && head[at - 1] == b'\n' {
+            return Some(at + 1);
+        }
+        if at >= 3 && head[at - 1] == b'\r' && head[at - 2] == b'\n' && head[at - 3] == b'\r' {
+            return Some(at + 1);
+        }
+        from = at + 1;
     }
+    None
 }
 
 fn read_connect_head(
@@ -6746,10 +6769,41 @@ mod tests {
 
     #[test]
     fn an_http_status_line_is_read_not_guessed() {
-        assert_eq!(http_status_code("HTTP/1.1 204 No Content"), Some(204));
-        assert_eq!(http_status_code("HTTP/1.1 200 OK"), Some(200));
-        assert_eq!(http_status_code("204"), None);
-        assert_eq!(http_status_code("GET / HTTP/1.1"), None);
+        assert_eq!(http_status_code(b"HTTP/1.1 204 No Content"), Some(204));
+        assert_eq!(http_status_code(b"HTTP/1.1 200 OK"), Some(200));
+        assert_eq!(http_status_code(b"204"), None);
+        assert_eq!(http_status_code(b"GET / HTTP/1.1"), None);
+    }
+
+    #[test]
+    fn a_connect_head_end_matches_the_window_scan() {
+        fn reference(head: &[u8]) -> Option<usize> {
+            let crlf = head
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|at| at + 4);
+            let lf = head
+                .windows(2)
+                .position(|window| window == b"\n\n")
+                .map(|at| at + 2);
+            match (crlf, lf) {
+                (Some(crlf), Some(lf)) => Some(crlf.min(lf)),
+                (crlf, lf) => crlf.or(lf),
+            }
+        }
+        let mut seed = 0x9e37_79b9_u32;
+        for length in 0..96 {
+            let mut bytes = Vec::with_capacity(length);
+            for _ in 0..length {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                bytes.push(match seed % 7 {
+                    0 => b'\r',
+                    1 => b'\n',
+                    _ => b'x',
+                });
+            }
+            assert_eq!(connect_head_end(&bytes), reference(&bytes), "{bytes:?}");
+        }
     }
 
     #[test]
@@ -6949,6 +7003,31 @@ mod tests {
         )
         .expect_err("a string gateway");
         assert!(reason.contains("gateway"), "{reason}");
+    }
+
+    #[test]
+    fn the_ironclad_probe_request_is_the_reference_bytes() {
+        let expected = format!(
+            "GET /generate_204 HTTP/1.1\r\nHost: {HTTP_PROBE_HOST}\r\nConnection: close\r\nUser-Agent: ferrox-ironclad\r\n\r\n"
+        );
+        assert_eq!(HTTP_PROBE_REQUEST, expected.as_bytes());
+    }
+
+    #[test]
+    fn a_canonical_connect_authority_is_not_rebuilt() {
+        let asked = crate::proxy::Destination::Name("example.com".to_owned(), 443);
+        let (authority, spelled) = ferrox_core::alloc_count::measure(|| asked.authority());
+        let (canonical, counts) = ferrox_core::alloc_count::measure(|| connect_authority(&asked));
+        assert_eq!(canonical.as_deref(), Some(authority.as_str()));
+        assert_eq!(counts.allocs, spelled.allocs);
+        assert_eq!(
+            connect_authority(&crate::proxy::Destination::Name(
+                "example.com.".to_owned(),
+                443
+            ))
+            .as_deref(),
+            Some("example.com:443")
+        );
     }
 
     #[test]

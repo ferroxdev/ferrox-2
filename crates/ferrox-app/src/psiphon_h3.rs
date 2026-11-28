@@ -268,6 +268,8 @@ pub(crate) struct H3 {
     response: Response,
     finished: bool,
     read_chunk: usize,
+    read_buf: Vec<u8>,
+    chunk_buf: Vec<u8>,
 }
 
 impl H3 {
@@ -432,6 +434,8 @@ impl H3 {
             },
             finished: false,
             read_chunk: 16 * 1024,
+            read_buf: Vec::new(),
+            chunk_buf: Vec::new(),
         })
     }
 
@@ -452,64 +456,68 @@ impl H3 {
         read_chunk: usize,
     ) -> Result<Response, String> {
         self.read_chunk = read_chunk.max(1);
-        let mut list = vec![
-            quiche::h3::Header::new(b":method", b"POST"),
-            quiche::h3::Header::new(b":scheme", b"https"),
-            quiche::h3::Header::new(b":authority", host.as_bytes()),
-            quiche::h3::Header::new(b":path", path.as_bytes()),
-        ];
+        let mut list = Vec::with_capacity(4 + headers.len());
+        list.push(quiche::h3::Header::new(b":method", b"POST"));
+        list.push(quiche::h3::Header::new(b":scheme", b"https"));
+        list.push(quiche::h3::Header::new(b":authority", host.as_bytes()));
+        list.push(quiche::h3::Header::new(b":path", path.as_bytes()));
         for (name, value) in headers {
             list.push(quiche::h3::Header::new(name.as_bytes(), value.as_bytes()));
         }
-        self.response = Response {
-            status: 0,
-            headers: Vec::new(),
-            body: Vec::new(),
-        };
-        self.finished = false;
-        self.stream = None;
-        let stream = self
-            .http3
-            .send_request(&mut self.conn, &list, body.is_empty())
-            .map_err(|error| format!("psiphon h3 request: {error}"))?;
-        self.stream = Some(stream);
-        let deadline = Instant::now() + timeout;
-        let mut buffer = vec![0u8; 65535];
-        let mut out = [0u8; MAX_DATAGRAM];
-        let mut dead = DeadFront::default();
-        if !body.is_empty() {
-            let mut sent = 0;
-            while sent < body.len() {
-                match self
-                    .http3
-                    .send_body(&mut self.conn, stream, &body[sent..], true)
-                {
-                    Ok(0) => return Err("psiphon h3 body was not sent".to_owned()),
-                    Ok(wrote) => sent += wrote,
-                    Err(quiche::h3::Error::Done) => {
-                        self.flush(&mut out, &mut dead)?;
-                        self.receive(&mut buffer, deadline, &mut dead)?;
-                    }
-                    Err(error) => return Err(format!("psiphon h3 body: {error}")),
-                }
-            }
-        }
-        self.flush(&mut out, &mut dead)?;
-        while !self.finished {
-            self.receive(&mut buffer, deadline, &mut dead)?;
-            self.flush(&mut out, &mut dead)?;
-        }
-        if self.response.status == 0 {
-            return Err("psiphon h3 response had no status".to_owned());
-        }
-        Ok(std::mem::replace(
-            &mut self.response,
-            Response {
+        let mut buffer = std::mem::take(&mut self.read_buf);
+        buffer.resize(65_535, 0);
+        let result = (|| {
+            self.response = Response {
                 status: 0,
                 headers: Vec::new(),
                 body: Vec::new(),
-            },
-        ))
+            };
+            self.finished = false;
+            self.stream = None;
+            let stream = self
+                .http3
+                .send_request(&mut self.conn, &list, body.is_empty())
+                .map_err(|error| format!("psiphon h3 request: {error}"))?;
+            self.stream = Some(stream);
+            let deadline = Instant::now() + timeout;
+            let mut out = [0u8; MAX_DATAGRAM];
+            let mut dead = DeadFront::default();
+            if !body.is_empty() {
+                let mut sent = 0;
+                while sent < body.len() {
+                    match self
+                        .http3
+                        .send_body(&mut self.conn, stream, &body[sent..], true)
+                    {
+                        Ok(0) => return Err("psiphon h3 body was not sent".to_owned()),
+                        Ok(wrote) => sent += wrote,
+                        Err(quiche::h3::Error::Done) => {
+                            self.flush(&mut out, &mut dead)?;
+                            self.receive(&mut buffer, deadline, &mut dead)?;
+                        }
+                        Err(error) => return Err(format!("psiphon h3 body: {error}")),
+                    }
+                }
+            }
+            self.flush(&mut out, &mut dead)?;
+            while !self.finished {
+                self.receive(&mut buffer, deadline, &mut dead)?;
+                self.flush(&mut out, &mut dead)?;
+            }
+            if self.response.status == 0 {
+                return Err("psiphon h3 response had no status".to_owned());
+            }
+            Ok(std::mem::replace(
+                &mut self.response,
+                Response {
+                    status: 0,
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                },
+            ))
+        })();
+        self.read_buf = buffer;
+        result
     }
 
     fn receive(
@@ -576,33 +584,40 @@ impl H3 {
             match self.http3.poll(&mut self.conn) {
                 Ok((id, quiche::h3::Event::Headers { list, .. })) if id == stream => {
                     for header in list {
-                        let name = String::from_utf8_lossy(header.name()).to_string();
-                        let value = String::from_utf8_lossy(header.value()).to_string();
-                        if name == ":status" {
-                            self.response.status = value.parse().unwrap_or(0);
-                        } else if !name.starts_with(':') {
-                            self.response.headers.push((name, value));
+                        let name = header.name();
+                        if name == b":status" {
+                            self.response.status = std::str::from_utf8(header.value())
+                                .ok()
+                                .and_then(|value| value.parse().ok())
+                                .unwrap_or(0);
+                        } else if !name.starts_with(b":") {
+                            self.response.headers.push((
+                                String::from_utf8_lossy(name).to_string(),
+                                String::from_utf8_lossy(header.value()).to_string(),
+                            ));
                         }
                     }
                 }
                 Ok((id, quiche::h3::Event::Data)) if id == stream => {
-                    let mut chunk = [0u8; 16 * 1024];
+                    let mut chunk = std::mem::take(&mut self.chunk_buf);
+                    chunk.resize(16 * 1024, 0);
                     let limit = self.read_chunk.min(chunk.len()).max(1);
-                    let chunk = &mut chunk[..limit];
+                    let slice = &mut chunk[..limit];
                     loop {
-                        match self.http3.recv_body(&mut self.conn, stream, chunk) {
+                        match self.http3.recv_body(&mut self.conn, stream, slice) {
                             Ok(0) | Err(quiche::h3::Error::Done) => break,
                             Ok(read) => {
                                 if self.response.body.len() + read > MAX_RESPONSE {
                                     return Err("psiphon h3 response is too large".to_owned());
                                 }
-                                self.response.body.extend_from_slice(&chunk[..read]);
+                                self.response.body.extend_from_slice(&slice[..read]);
                             }
                             Err(error) => {
                                 return Err(format!("psiphon h3 response body: {error}"));
                             }
                         }
                     }
+                    self.chunk_buf = chunk;
                 }
                 Ok((id, quiche::h3::Event::Finished)) if id == stream => {
                     self.finished = true;

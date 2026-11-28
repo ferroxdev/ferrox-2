@@ -516,16 +516,20 @@ fn element(der: &[u8], at: usize) -> Option<(u8, usize, usize)> {
 
 /// Match a certificate name, including a one-label wildcard.
 fn matches_name(pattern: &str, name: &str) -> bool {
-    let pattern = pattern.trim_end_matches('.').to_ascii_lowercase();
-    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    let pattern = pattern.trim_end_matches('.');
+    let name = name.trim_end_matches('.');
     if let Some(suffix) = pattern.strip_prefix("*.") {
-        return name.strip_suffix(suffix).is_some_and(|prefix| {
-            prefix
-                .strip_suffix('.')
-                .is_some_and(|label| !label.is_empty() && !label.contains('.'))
-        });
+        let Some(at) = name.len().checked_sub(suffix.len()) else {
+            return false;
+        };
+        if !name.is_char_boundary(at) || !name[at..].eq_ignore_ascii_case(suffix) {
+            return false;
+        }
+        return name[..at]
+            .strip_suffix('.')
+            .is_some_and(|label| !label.is_empty() && !label.contains('.'));
     }
-    pattern == name
+    pattern.eq_ignore_ascii_case(name)
 }
 
 /// Parse a configured proxy address and check its IP family.
@@ -998,10 +1002,9 @@ impl<T: Write> Write for LightStream<T> {
             self.drain()?;
             return Ok(buf.len());
         }
-        let mut frame = Vec::with_capacity(buf.len() + 2 + 17);
         let mut size = self.header_left + buf.len() + 2 + 17;
         if size > PADDING_MAX {
-            frame.extend_from_slice(&STOP_PADDING.to_be_bytes());
+            self.pending.extend_from_slice(&STOP_PADDING.to_be_bytes());
             self.write_padding_done = true;
         } else {
             size += 2;
@@ -1015,12 +1018,14 @@ impl<T: Write> Write for LightStream<T> {
                     "psiphon light: oversized frame",
                 ));
             }
-            frame.extend_from_slice(&(padding as u16).to_be_bytes());
-            frame.extend_from_slice(&(buf.len() as u16).to_be_bytes());
-            frame.resize(frame.len() + padding, 0);
+            self.pending
+                .extend_from_slice(&(padding as u16).to_be_bytes());
+            self.pending
+                .extend_from_slice(&(buf.len() as u16).to_be_bytes());
+            let end = self.pending.len() + padding;
+            self.pending.resize(end, 0);
         }
-        frame.extend_from_slice(buf);
-        self.pending.extend_from_slice(&frame);
+        self.pending.extend_from_slice(buf);
         self.drain()?;
         Ok(buf.len())
     }
@@ -1601,5 +1606,50 @@ mod tests {
         assert!(wire.len() + 17 >= PADDING_MIN);
         assert!(wire.len() + 17 <= PADDING_MAX);
         assert!(wire.windows(5).any(|window| window == b"hello"));
+    }
+
+    fn reference_matches(pattern: &str, name: &str) -> bool {
+        let pattern = pattern.trim_end_matches('.').to_ascii_lowercase();
+        let name = name.trim_end_matches('.').to_ascii_lowercase();
+        if let Some(suffix) = pattern.strip_prefix("*.") {
+            return name.strip_suffix(suffix).is_some_and(|prefix| {
+                prefix
+                    .strip_suffix('.')
+                    .is_some_and(|label| !label.is_empty() && !label.contains('.'))
+            });
+        }
+        pattern == name
+    }
+
+    #[test]
+    fn certificate_name_matching_is_unchanged() {
+        let patterns = [
+            "*.example.com",
+            "*.example.com.",
+            "edge.example",
+            "EDGE.Example.",
+            "*.*.example.com",
+            "ü.example",
+        ];
+        let names = [
+            "a.example.com",
+            "A.Example.COM.",
+            "a.b.example.com",
+            "example.com",
+            ".example.com",
+            "edge.example",
+            "other.example",
+            "ü.example",
+            "Ü.example",
+        ];
+        for pattern in patterns {
+            for name in names {
+                assert_eq!(
+                    matches_name(pattern, name),
+                    reference_matches(pattern, name),
+                    "{pattern} vs {name}"
+                );
+            }
+        }
     }
 }

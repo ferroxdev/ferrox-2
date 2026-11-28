@@ -1251,12 +1251,12 @@ fn send_packet(to_tunnel: &ToTunnel, packet: Vec<u8>, headroom: usize, limit: us
     if packet.len().saturating_sub(headroom) <= limit {
         return to_tunnel.send(packet).is_ok();
     }
-    let Some(fragments) = fragment_packet(&packet, headroom, limit) else {
-        return to_tunnel.send(packet).is_ok();
-    };
-    fragments
-        .into_iter()
-        .all(|fragment| to_tunnel.send(fragment).is_ok())
+    match fragment_packet_owned(packet, headroom, limit) {
+        Ok(fragments) => fragments
+            .into_iter()
+            .all(|fragment| to_tunnel.send(fragment).is_ok()),
+        Err(packet) => to_tunnel.send(packet).is_ok(),
+    }
 }
 
 /// The outcome of offering one server packet to the tunnel writer.
@@ -1275,85 +1275,149 @@ fn try_send_packet(to_tunnel: &ToTunnel, packet: Vec<u8>, headroom: usize, limit
         };
     }
     // A fragmented inner packet keeps the blocking send so a run is never torn in half.
-    if send_packet(to_tunnel, packet, headroom, limit) {
-        Flush::Sent
-    } else {
-        Flush::Closed
+    match fragment_packet_owned(packet, headroom, limit) {
+        Ok(fragments) => {
+            if fragments
+                .into_iter()
+                .all(|fragment| to_tunnel.send(fragment).is_ok())
+            {
+                Flush::Sent
+            } else {
+                Flush::Closed
+            }
+        }
+        Err(packet) => {
+            if to_tunnel.send(packet).is_ok() {
+                Flush::Sent
+            } else {
+                Flush::Closed
+            }
+        }
     }
 }
 
+#[cfg(test)]
 fn fragment_packet(packet: &[u8], headroom: usize, limit: usize) -> Option<Vec<Vec<u8>>> {
-    let ip = packet.get(headroom..)?;
-    match ip.first()? >> 4 {
-        4 => {
-            let header = usize::from(ip[0] & 0x0f) * 4;
-            let total = usize::from(u16::from_be_bytes([*ip.get(2)?, *ip.get(3)?]));
-            if header < IPV4_HEADER || total < header || headroom + total > packet.len() {
-                return None;
-            }
-            let payload = &ip[header..total];
-            if payload.is_empty() {
-                return None;
-            }
-            let piece = (limit.saturating_sub(header) & !7).max(8);
-            let id = NEXT_FRAGMENT_ID.fetch_add(1, Ordering::Relaxed) as u16;
-            let mut fragments = Vec::with_capacity(payload.len().div_ceil(piece));
-            let mut at = 0;
-            while at < payload.len() {
-                let length = piece.min(payload.len() - at);
-                let more = at + length < payload.len();
-                let mut fragment = Vec::with_capacity(headroom + header + length + WG_TAG_SIZE);
-                fragment.resize(headroom, 0);
-                fragment.extend_from_slice(&ip[..header]);
-                let total = (header + length) as u16;
-                fragment[headroom + 2..headroom + 4].copy_from_slice(&total.to_be_bytes());
-                fragment[headroom + 4..headroom + 6].copy_from_slice(&id.to_be_bytes());
-                let offset = (at / 8) as u16;
-                let flags = (if more { 0x2000 } else { 0 }) | offset;
-                fragment[headroom + 6..headroom + 8].copy_from_slice(&flags.to_be_bytes());
-                fragment[headroom + 10..headroom + 12].copy_from_slice(&0u16.to_be_bytes());
-                fragment.extend_from_slice(&payload[at..at + length]);
-                let checksum = ipv4_checksum(&fragment[headroom..headroom + header]);
-                fragment[headroom + 10..headroom + 12].copy_from_slice(&checksum.to_be_bytes());
-                fragments.push(fragment);
-                at += length;
-            }
-            Some(fragments)
-        }
-        6 => {
-            let total = IPV6_HEADER + usize::from(u16::from_be_bytes([*ip.get(4)?, *ip.get(5)?]));
-            if total < IPV6_HEADER || total > ip.len() {
-                return None;
-            }
-            let payload = &ip[IPV6_HEADER..total];
-            if payload.is_empty() {
-                return None;
-            }
-            let piece = (limit.saturating_sub(IPV6_HEADER + 8) & !7).max(8);
-            let id = NEXT_FRAGMENT_ID.fetch_add(1, Ordering::Relaxed);
-            let mut fragments = Vec::with_capacity(payload.len().div_ceil(piece));
-            let mut at = 0;
-            while at < payload.len() {
-                let body = piece.min(payload.len() - at);
-                let more = at + body < payload.len();
-                let mut fragment =
-                    Vec::with_capacity(headroom + IPV6_HEADER + 8 + body + WG_TAG_SIZE);
-                fragment.resize(headroom, 0);
-                fragment.extend_from_slice(&ip[..IPV6_HEADER]);
-                let length = (8 + body) as u16;
-                fragment[headroom + 4..headroom + 6].copy_from_slice(&length.to_be_bytes());
-                fragment[headroom + 6] = 44;
-                let fields = ((at / 8) as u16) << 3 | u16::from(more);
-                fragment.extend_from_slice(&[ip[6], 0, (fields >> 8) as u8, fields as u8]);
-                fragment.extend_from_slice(&id.to_be_bytes());
-                fragment.extend_from_slice(&payload[at..at + body]);
-                fragments.push(fragment);
-                at += body;
-            }
-            Some(fragments)
-        }
-        _ => None,
+    fragment_packet_owned(packet.to_vec(), headroom, limit).ok()
+}
+
+/// Split an owned inner packet, keeping its first fragment in the caller's allocation.
+fn fragment_packet_owned(
+    packet: Vec<u8>,
+    headroom: usize,
+    limit: usize,
+) -> Result<Vec<Vec<u8>>, Vec<u8>> {
+    let Some(first) = packet.get(headroom).copied() else {
+        return Err(packet);
+    };
+    match first >> 4 {
+        4 => fragment_ipv4(packet, headroom, limit, first),
+        6 => fragment_ipv6(packet, headroom, limit),
+        _ => Err(packet),
     }
+}
+
+fn fragment_ipv4(
+    mut packet: Vec<u8>,
+    headroom: usize,
+    limit: usize,
+    first: u8,
+) -> Result<Vec<Vec<u8>>, Vec<u8>> {
+    let header = usize::from(first & 0x0f) * 4;
+    let Some(total) = packet
+        .get(headroom + 2..headroom + 4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u16::from_be_bytes)
+    else {
+        return Err(packet);
+    };
+    let total = usize::from(total);
+    if header < IPV4_HEADER || total < header || headroom + total > packet.len() {
+        return Err(packet);
+    }
+    let payload_len = total - header;
+    if payload_len == 0 {
+        return Err(packet);
+    }
+    let piece = (limit.saturating_sub(header) & !7).max(8);
+    let id = NEXT_FRAGMENT_ID.fetch_add(1, Ordering::Relaxed) as u16;
+    let count = payload_len.div_ceil(piece);
+    let mut fragments = Vec::with_capacity(count);
+    for index in 1..count {
+        let at = index * piece;
+        let length = piece.min(payload_len - at);
+        let more = at + length < payload_len;
+        let mut fragment = Vec::with_capacity(headroom + header + length + WG_TAG_SIZE);
+        fragment.resize(headroom, 0);
+        fragment.extend_from_slice(&packet[headroom..headroom + header]);
+        fragment
+            .extend_from_slice(&packet[headroom + header + at..headroom + header + at + length]);
+        let total = (header + length) as u16;
+        fragment[headroom + 2..headroom + 4].copy_from_slice(&total.to_be_bytes());
+        fragment[headroom + 4..headroom + 6].copy_from_slice(&id.to_be_bytes());
+        let offset = (at / 8) as u16;
+        let flags = (if more { 0x2000 } else { 0 }) | offset;
+        fragment[headroom + 6..headroom + 8].copy_from_slice(&flags.to_be_bytes());
+        fragment[headroom + 10..headroom + 12].copy_from_slice(&0u16.to_be_bytes());
+        let checksum = ipv4_checksum(&fragment[headroom..headroom + header]);
+        fragment[headroom + 10..headroom + 12].copy_from_slice(&checksum.to_be_bytes());
+        fragments.push(fragment);
+    }
+    let length = piece.min(payload_len);
+    let more = length < payload_len;
+    packet[..headroom].fill(0);
+    packet.truncate(headroom + header + length);
+    let total = (header + length) as u16;
+    packet[headroom + 2..headroom + 4].copy_from_slice(&total.to_be_bytes());
+    packet[headroom + 4..headroom + 6].copy_from_slice(&id.to_be_bytes());
+    let flags: u16 = if more { 0x2000 } else { 0 };
+    packet[headroom + 6..headroom + 8].copy_from_slice(&flags.to_be_bytes());
+    packet[headroom + 10..headroom + 12].copy_from_slice(&0u16.to_be_bytes());
+    let checksum = ipv4_checksum(&packet[headroom..headroom + header]);
+    packet[headroom + 10..headroom + 12].copy_from_slice(&checksum.to_be_bytes());
+    fragments.insert(0, packet);
+    Ok(fragments)
+}
+
+fn fragment_ipv6(packet: Vec<u8>, headroom: usize, limit: usize) -> Result<Vec<Vec<u8>>, Vec<u8>> {
+    let Some(length) = packet
+        .get(headroom + 4..headroom + 6)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u16::from_be_bytes)
+    else {
+        return Err(packet);
+    };
+    let total = IPV6_HEADER + usize::from(length);
+    if total < IPV6_HEADER || total > packet.len() - headroom {
+        return Err(packet);
+    }
+    let payload_len = total - IPV6_HEADER;
+    if payload_len == 0 {
+        return Err(packet);
+    }
+    let piece = (limit.saturating_sub(IPV6_HEADER + 8) & !7).max(8);
+    let id = NEXT_FRAGMENT_ID.fetch_add(1, Ordering::Relaxed);
+    let mut fragments = Vec::with_capacity(payload_len.div_ceil(piece));
+    let mut at = 0;
+    while at < payload_len {
+        let body = piece.min(payload_len - at);
+        let more = at + body < payload_len;
+        let mut fragment = Vec::with_capacity(headroom + IPV6_HEADER + 8 + body + WG_TAG_SIZE);
+        fragment.resize(headroom, 0);
+        fragment.extend_from_slice(&packet[headroom..headroom + IPV6_HEADER]);
+        let length = (8 + body) as u16;
+        fragment[headroom + 4..headroom + 6].copy_from_slice(&length.to_be_bytes());
+        fragment[headroom + 6] = 44;
+        let fields = ((at / 8) as u16) << 3 | u16::from(more);
+        fragment.extend_from_slice(&[packet[headroom + 6], 0, (fields >> 8) as u8, fields as u8]);
+        fragment.extend_from_slice(&id.to_be_bytes());
+        fragment.extend_from_slice(
+            &packet[headroom + IPV6_HEADER + at..headroom + IPV6_HEADER + at + body],
+        );
+        fragments.push(fragment);
+        at += body;
+    }
+    Ok(fragments)
 }
 
 /// What the tunnel reader sends the stack.
@@ -5186,6 +5250,17 @@ mod tests {
             _ => return false,
         };
         tcp_checksum(&source, &destination, &segment) == expected
+    }
+
+    #[test]
+    fn a_fragmented_packet_keeps_its_first_buffer() {
+        let original = tcp_data([10, 0, 0, 2], [192, 0, 2, 1], &[0x5a; 5000]);
+        let pointer = original.as_ptr();
+        let capacity = original.capacity();
+        let fragments = fragment_packet_owned(original, 0, TUNNEL_FRAGMENT).expect("fragments");
+        assert!(fragments.len() > 1);
+        assert_eq!(fragments[0].as_ptr(), pointer);
+        assert_eq!(fragments[0].capacity(), capacity);
     }
 
     #[test]

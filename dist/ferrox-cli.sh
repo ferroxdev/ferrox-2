@@ -80,7 +80,9 @@ if [ "$(id -u 2>/dev/null)" = 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" !
   for name in FERROX_CONF_DIR FERROX_STATE_DIR FERROX_BIN FERROX_PROFILE FERROX_RELEASE FOXY_CREDENTIALS FOXY_EMAIL XDG_CONFIG_HOME XDG_STATE_HOME; do
     [ -n "${!name:-}" ] && keep+=("$name=${!name}")
   done
-  exec sudo -u "$SUDO_USER" -H env FERROX_SUDO_DROPPED=1 \
+  preserve=()
+  [ -n "${FOXY_PASS:-}" ] && preserve+=(--preserve-env=FOXY_PASS)
+  exec sudo -u "$SUDO_USER" -H ${preserve[@]+"${preserve[@]}"} env FERROX_SUDO_DROPPED=1 \
     PATH="$PATH:$SUDO_HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin" \
     ${keep[@]+"${keep[@]}"} /bin/bash "$SELF" "$@"
 fi
@@ -2557,6 +2559,27 @@ lane_pid_is_ferrox() {
   return 1
 }
 
+# A root lane's signal needs sudo; an expired timestamp is not a refusal, so ask once on a terminal.
+sudo_retry() {
+  sudo -n "$@" && return 0
+  sudo -n true 2>/dev/null && return 1
+  { [ -t 0 ] || [ -t 2 ]; } || return 1
+  sudo -v || return 1
+  sudo -n "$@"
+}
+
+# A root lane is unreadable without sudo; confirm the command still names this
+# lane's binary and config before an elevated kill can reach it.
+privileged_lane_pid() {
+  local command
+  [ -n "$BIN" ] || return 1
+  command="$(sudo_retry ps -p "$1" -ww -o command= 2>/dev/null)" || return 1
+  case "$command" in
+    *"${BIN##*/}"*"${CFG##*/}"*) return 0 ;;
+  esac
+  return 1
+}
+
 # `kill -0` answers EPERM for a root-owned lane; `ps` still sees the pid. A
 # zombie has already exited even though its pid is still visible.
 pid_alive() {
@@ -3053,28 +3076,33 @@ stop_lane() {
       # leave at once instead of spending the grace period on it.
       : >"$STOP_FILE" 2>/dev/null || true
       kill "$pid" 2>/dev/null || true
-      while pid_alive "$pid" && [ "$waited" -lt 10 ]; do
+      while pid_alive "$pid" && [ "$waited" -lt 50 ]; do
         sleep 0.1
         waited=$((waited + 1))
       done
       waited=0
       if pid_alive "$pid"; then
-        sudo -n kill "$pid" 2>/dev/null || true
-        while pid_alive "$pid" && [ "$waited" -lt 10 ]; do
-          sleep 0.1
-          waited=$((waited + 1))
-        done
-        waited=0
-        if pid_alive "$pid"; then
-          kill -9 "$pid" 2>/dev/null || sudo -n kill -9 "$pid" 2>/dev/null || true
-          while pid_alive "$pid" && [ "$waited" -lt 10 ]; do
+        if ! privileged_lane_pid "$pid"; then
+          say "lane pid $pid is not ferrox-app or could not be confirmed with sudo; it was not stopped. Run: sudo kill $pid" >&2
+          stopped=0
+        else
+          sudo_retry kill "$pid" 2>/dev/null || true
+          while pid_alive "$pid" && [ "$waited" -lt 30 ]; do
             sleep 0.1
             waited=$((waited + 1))
           done
-        fi
-        if pid_alive "$pid"; then
-          say "lane pid $pid did not stop; run: sudo kill -9 $pid" >&2
-          stopped=0
+          waited=0
+          if pid_alive "$pid"; then
+            sudo_retry kill -9 "$pid" 2>/dev/null || true
+            while pid_alive "$pid" && [ "$waited" -lt 10 ]; do
+              sleep 0.1
+              waited=$((waited + 1))
+            done
+          fi
+          if pid_alive "$pid"; then
+            say "lane pid $pid did not stop; run: sudo kill -9 $pid" >&2
+            stopped=0
+          fi
         fi
       fi
     else

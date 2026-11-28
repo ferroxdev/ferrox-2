@@ -514,10 +514,13 @@ pub(crate) fn read_reply_limited<S: Read>(
 
 /// Read the status line and headers and leave the body unread, for a HEAD or a streamed GET.
 pub(crate) fn read_head<S: BufRead>(io: &mut S) -> Result<Reply, Failure> {
-    let mut lines: Vec<String> = Vec::with_capacity(12);
+    let mut line = String::new();
     let mut total = 0usize;
+    let mut status = None;
+    let mut first = true;
+    let mut headers = Vec::with_capacity(12);
     loop {
-        let mut line = String::new();
+        line.clear();
         let budget = MAX_HEAD.saturating_sub(total).saturating_add(1);
         let read = (&mut *io)
             .take(budget as u64)
@@ -530,38 +533,36 @@ pub(crate) fn read_head<S: BufRead>(io: &mut S) -> Result<Reply, Failure> {
         if total > MAX_HEAD {
             return Err(Failure::Frame);
         }
-        let blank = line == "\r\n" || line == "\n";
-        if blank {
+        if line == "\r\n" || line == "\n" {
             break;
         }
-        lines.push(line);
-    }
-    let status = lines
-        .first()
-        .and_then(|line| {
-            let mut parts = line.split(' ');
-            let version = parts.next()?;
-            let code = parts.next()?;
-            (version.starts_with("HTTP/1.") && code.len() == 3)
-                .then(|| code.parse::<u16>().ok())
-                .flatten()
-        })
-        .ok_or(Failure::Frame)?;
-    let mut headers = Vec::with_capacity(lines.len());
-    for line in &lines[1..] {
-        let Some(colon) = line.find(':') else {
+        if first {
+            first = false;
+            status = status_code(&line);
             continue;
-        };
-        headers.push((
-            line[..colon].trim().to_owned(),
-            line[colon + 1..].trim().to_owned(),
-        ));
+        }
+        if let Some(colon) = line.find(':') {
+            headers.push((
+                line[..colon].trim().to_owned(),
+                line[colon + 1..].trim().to_owned(),
+            ));
+        }
     }
     Ok(Reply {
-        status,
+        status: status.ok_or(Failure::Frame)?,
         headers,
         body: Vec::new(),
     })
+}
+
+/// The status line's code, as the reply head spells it.
+fn status_code(line: &str) -> Option<u16> {
+    let mut parts = line.split(' ');
+    let version = parts.next()?;
+    let code = parts.next()?;
+    (version.starts_with("HTTP/1.") && code.len() == 3)
+        .then(|| code.parse::<u16>().ok())
+        .flatten()
 }
 
 /// The size from a chunk line, ignoring any extension the sender appended.
@@ -603,8 +604,9 @@ pub(crate) fn read_body<S: BufRead>(
             .any(|token| token.trim().eq_ignore_ascii_case("chunked"))
     }) {
         let mut body = Vec::new();
+        let mut line = String::new();
         loop {
-            let mut line = String::new();
+            line.clear();
             if (&mut *io)
                 .take(65)
                 .read_line(&mut line)
@@ -617,7 +619,7 @@ pub(crate) fn read_body<S: BufRead>(
             if size == 0 {
                 let mut trailer = 0usize;
                 loop {
-                    let mut line = String::new();
+                    line.clear();
                     let budget = MAX_HEAD.saturating_sub(trailer).saturating_add(1);
                     let read = (&mut *io)
                         .take(budget as u64)
@@ -686,8 +688,9 @@ pub(crate) fn read_body_to<S: BufRead, W: Write + ?Sized>(
             .any(|token| token.trim().eq_ignore_ascii_case("chunked"))
     }) {
         let mut total = 0usize;
+        let mut line = String::new();
         loop {
-            let mut line = String::new();
+            line.clear();
             if (&mut *io)
                 .take(65)
                 .read_line(&mut line)
@@ -700,7 +703,7 @@ pub(crate) fn read_body_to<S: BufRead, W: Write + ?Sized>(
             if size == 0 {
                 let mut trailer = 0usize;
                 loop {
-                    let mut line = String::new();
+                    line.clear();
                     let budget = MAX_HEAD.saturating_sub(trailer).saturating_add(1);
                     let read = (&mut *io)
                         .take(budget as u64)
@@ -1060,6 +1063,16 @@ impl Endpoint {
         }
     }
 
+    /// Take the dialled peer before a TUN capture, so a renewal after it dials the same address
+    /// instead of asking a hijack resolver the physical route may not carry.
+    pub(crate) fn pin_before_capture(&mut self) {
+        if self.address.is_none() {
+            let (host, port) = self.dial_edge();
+            self.address = crate::proxy::resolve_edge_addrs(&host, port)
+                .and_then(|addrs| addrs.into_iter().next());
+        }
+    }
+
     fn connect_with(
         &self,
         cfg: &TlsConfig,
@@ -1222,24 +1235,32 @@ impl H2Connection {
             F_ACK, F_END, F_END_HEADERS, F_PADDED, F_PRIORITY, T_CONT, T_DATA, T_GOAWAY, T_HEADERS,
             T_PING, T_RST, T_SETTINGS, T_WINDOW, block_encode, frame_head, read_head_bounded,
         };
-        let mut fields: Vec<(String, String)> = Vec::with_capacity(headers.len() + 4);
-        fields.push((":method".to_owned(), method.to_owned()));
-        fields.push((":scheme".to_owned(), "https".to_owned()));
-        fields.push((":authority".to_owned(), endpoint.host_header().into_owned()));
-        fields.push((":path".to_owned(), path.to_owned()));
+        let authority = endpoint.host_header();
+        let mut fields: Vec<(Cow<'_, str>, Cow<'_, str>)> = Vec::with_capacity(headers.len() + 5);
+        fields.push((Cow::Borrowed(":method"), Cow::Borrowed(method)));
+        fields.push((Cow::Borrowed(":scheme"), Cow::Borrowed("https")));
+        fields.push((Cow::Borrowed(":authority"), authority));
+        fields.push((Cow::Borrowed(":path"), Cow::Borrowed(path)));
         for (name, value) in headers {
-            let lower = name.to_ascii_lowercase();
-            if matches!(lower.as_str(), "connection" | "host") {
+            if name.eq_ignore_ascii_case("connection") || name.eq_ignore_ascii_case("host") {
                 continue;
             }
-            fields.push((lower, (*value).to_owned()));
+            let name = if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+                Cow::Owned(name.to_ascii_lowercase())
+            } else {
+                Cow::Borrowed(*name)
+            };
+            fields.push((name, Cow::Borrowed(*value)));
         }
         if !body.is_empty() {
-            fields.push(("content-length".to_owned(), body.len().to_string()));
+            fields.push((
+                Cow::Borrowed("content-length"),
+                Cow::Owned(body.len().to_string()),
+            ));
         }
         let borrowed: Vec<(&str, &str)> = fields
             .iter()
-            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .map(|(name, value)| (name.as_ref(), value.as_ref()))
             .collect();
         let block = block_encode(&borrowed);
         let stream = self.next;

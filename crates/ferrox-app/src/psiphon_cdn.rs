@@ -1136,6 +1136,17 @@ impl ScanCandidate {
     pub(crate) fn key(&self) -> String {
         format!("{}|{}", self.ip, self.sni.to_ascii_lowercase())
     }
+
+    pub(crate) fn key_into(&self, out: &mut String) {
+        out.clear();
+        out.push_str(&self.ip);
+        out.push('|');
+        if self.sni.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            out.push_str(&self.sni.to_ascii_lowercase());
+        } else {
+            out.push_str(&self.sni);
+        }
+    }
 }
 
 impl ScanSpec {
@@ -1240,10 +1251,13 @@ impl ScanSpec {
 
     /// The reference's affine permutation: a cache-key/seed-derived offset and
     /// a step coprime with the candidate count.
-    fn permuted_index(&self, candidate_number: u64, shuffle_key: &str) -> u64 {
-        let seed = Sha256::digest(
-            format!("fronted-meek-cdn-scan|{}|{shuffle_key}", self.cache_key).as_bytes(),
-        );
+    fn permutation(&self, shuffle_key: &str) -> (u64, u64) {
+        let mut hash = Sha256::new();
+        hash.update(b"fronted-meek-cdn-scan|");
+        hash.update(self.cache_key.as_bytes());
+        hash.update(b"|");
+        hash.update(shuffle_key.as_bytes());
+        let seed = hash.finalize();
         let offset = u64::from_be_bytes(seed[0..8].try_into().expect("sha256 half"));
         let mut step =
             u64::from_be_bytes(seed[8..16].try_into().expect("sha256 half")) % self.count;
@@ -1256,6 +1270,10 @@ impl ScanSpec {
                 step = 1;
             }
         }
+        (offset, step)
+    }
+
+    fn permuted_index_with(&self, offset: u64, step: u64, candidate_number: u64) -> u64 {
         (offset % self.count + (candidate_number % self.count) * step) % self.count
     }
 
@@ -1289,16 +1307,18 @@ impl ScanSpec {
             .saturating_add(1)
             .min(self.count)
             .max(1);
+        let (offset, step) = self.permutation(shuffle_key);
+        let mut key = String::new();
         let mut fallback = None;
         for probe in 0..probe_limit {
             let number = candidate_number.saturating_add(probe);
-            let candidate = self.candidate_at(self.permuted_index(number, shuffle_key))?;
-            if fallback.is_none() {
-                fallback = Some(candidate.clone());
+            let candidate = self.candidate_at(self.permuted_index_with(offset, step, number))?;
+            candidate.key_into(&mut key);
+            if skipped.contains(key.as_str()) {
+                fallback.get_or_insert(candidate);
+                continue;
             }
-            if !skipped.contains(&candidate.key()) {
-                return Some((candidate, number.saturating_add(1)));
-            }
+            return Some((candidate, number.saturating_add(1)));
         }
         fallback.map(|candidate| {
             (
@@ -1419,6 +1439,7 @@ const SCAN_ENTRY_CAP: usize = 4096;
 pub(crate) struct ScanState {
     entries: HashMap<String, ScanEntry>,
     shuffle_seed: String,
+    key: String,
 }
 
 #[derive(Debug)]
@@ -1468,6 +1489,7 @@ impl ScanState {
         Self {
             entries: HashMap::new(),
             shuffle_seed,
+            key: String::new(),
         }
     }
 
@@ -1480,6 +1502,7 @@ impl ScanState {
     fn hints_at(&self, now: Instant) -> (Vec<ScanCandidate>, HashSet<String>, String) {
         let mut preferred = Vec::new();
         let mut skipped = HashSet::new();
+        let mut key = String::new();
         for entry in self.entries.values() {
             let Some((success, _)) = entry.last_outcome() else {
                 continue;
@@ -1490,15 +1513,22 @@ impl ScanState {
             if success {
                 preferred.push(entry);
             } else {
-                skipped.insert(entry.candidate.key());
+                entry.candidate.key_into(&mut key);
+                skipped.insert(key.clone());
             }
         }
+        let mut left_key = String::new();
+        let mut right_key = String::new();
         preferred.sort_by(|left, right| {
             right
                 .last_success
                 .cmp(&left.last_success)
                 .then(right.success_count.cmp(&left.success_count))
-                .then(left.candidate.key().cmp(&right.candidate.key()))
+                .then_with(|| {
+                    left.candidate.key_into(&mut left_key);
+                    right.candidate.key_into(&mut right_key);
+                    left_key.cmp(&right_key)
+                })
         });
         (
             preferred
@@ -1520,22 +1550,32 @@ impl ScanState {
     }
 
     fn record_at(&mut self, candidate: &ScanCandidate, success: bool, now: Instant) {
-        let key = candidate.key();
-        if self.entries.len() >= SCAN_ENTRY_CAP && !self.entries.contains_key(&key) {
-            self.entries.retain(|_, entry| entry.is_live(now));
-            while self.entries.len() >= SCAN_ENTRY_CAP {
-                let oldest = self
-                    .entries
+        let Self { entries, key, .. } = self;
+        candidate.key_into(key);
+        if entries.len() >= SCAN_ENTRY_CAP && !entries.contains_key(key.as_str()) {
+            entries.retain(|_, entry| entry.is_live(now));
+            while entries.len() >= SCAN_ENTRY_CAP {
+                let oldest = entries
                     .iter()
                     .min_by_key(|(_, entry)| entry.touched())
                     .map(|(key, _)| key.clone());
                 let Some(oldest) = oldest else {
                     break;
                 };
-                self.entries.remove(&oldest);
+                entries.remove(&oldest);
             }
         }
-        let entry = self.entries.entry(key).or_insert_with(|| ScanEntry {
+        if let Some(entry) = entries.get_mut(key.as_str()) {
+            if success {
+                entry.last_success = Some(now);
+                entry.success_count += 1;
+            } else {
+                entry.last_failure = Some(now);
+                entry.failure_count += 1;
+            }
+            return;
+        }
+        let entry = entries.entry(key.clone()).or_insert_with(|| ScanEntry {
             candidate: candidate.clone(),
             last_success: None,
             last_failure: None,
@@ -1555,6 +1595,23 @@ impl ScanState {
 #[cfg(test)]
 mod tests {
     use super::{CDN_SETS, CdnSet, select, snis};
+
+    #[test]
+    fn recording_the_same_candidate_reuses_its_key_buffer() {
+        let mut state = super::ScanState::new();
+        let candidate = super::ScanCandidate {
+            ip: "192.0.2.1".to_owned(),
+            sni: "A.Example".to_owned(),
+        };
+        state.record(&candidate, true);
+        let capacity = state.key.capacity();
+        assert!(capacity > 0);
+        for _ in 0..8 {
+            state.record(&candidate, true);
+        }
+        assert_eq!(state.key.capacity(), capacity);
+        assert_eq!(state.len(), 1);
+    }
 
     #[test]
     fn the_hint_cache_keeps_a_bounded_set_of_outcomes() {
@@ -1869,5 +1926,84 @@ mod tests {
         let (preferred, skipped, _) = state.hints_at(start + Duration::from_hours(192));
         assert_eq!(preferred, Vec::new());
         assert_eq!(skipped, std::collections::HashSet::new());
+    }
+
+    #[test]
+    fn the_hoisted_permutation_matches_the_reference_sequence() {
+        use sha2::Digest as _;
+
+        let spec =
+            super::ScanSpec::from_config(&["192.0.2.0/30".to_owned()], &["a.example".to_owned()])
+                .expect("spec");
+        let shuffle_key = "shuffle";
+        let seed = super::Sha256::digest(
+            format!("fronted-meek-cdn-scan|{}|{shuffle_key}", spec.cache_key()).as_bytes(),
+        );
+        let offset = u64::from_be_bytes(seed[0..8].try_into().expect("sha256 half"));
+        let mut step =
+            u64::from_be_bytes(seed[8..16].try_into().expect("sha256 half")) % spec.count;
+        if step == 0 {
+            step = 1;
+        }
+        while super::gcd(step, spec.count) != 1 {
+            step += 1;
+            if step >= spec.count {
+                step = 1;
+            }
+        }
+        let (hoisted_offset, hoisted_step) = spec.permutation(shuffle_key);
+        assert_eq!((hoisted_offset, hoisted_step), (offset, step));
+        for number in 0..spec.count * 2 {
+            let reference = (offset % spec.count + (number % spec.count) * step) % spec.count;
+            assert_eq!(
+                spec.permuted_index_with(hoisted_offset, hoisted_step, number),
+                reference
+            );
+        }
+    }
+
+    #[test]
+    fn selecting_an_unskipped_candidate_does_not_clone_it() {
+        let spec = super::ScanSpec::from_config(&["192.0.2.1".to_owned()], &[]).expect("spec");
+        let skipped = std::collections::HashSet::new();
+        let (candidate, built) =
+            ferrox_core::alloc_count::measure(|| spec.candidate_at(0).expect("candidate"));
+        let ((), keyed) = ferrox_core::alloc_count::measure(|| {
+            let mut key = String::new();
+            candidate.key_into(&mut key);
+        });
+        let ((selected, next), counts) = ferrox_core::alloc_count::measure(|| {
+            spec.select_probe(0, &skipped, "seed").expect("candidate")
+        });
+        assert_eq!(selected, candidate);
+        assert_eq!(next, 1);
+        assert_eq!(counts.allocs, built.allocs + keyed.allocs);
+    }
+
+    #[test]
+    fn the_reused_cache_key_matches_the_owned_key() {
+        let candidates = [
+            ("192.0.2.1", "Edge.Example"),
+            ("198.51.100.7", "edge.example"),
+            ("203.0.113.9", "ü.example"),
+        ];
+        let mut out = String::new();
+        super::ScanCandidate {
+            ip: "198.51.100.7".to_owned(),
+            sni: "edge.example".to_owned(),
+        }
+        .key_into(&mut out);
+        let capacity = out.capacity();
+        let pointer = out.as_ptr();
+        for (ip, sni) in candidates {
+            let candidate = super::ScanCandidate {
+                ip: ip.to_owned(),
+                sni: sni.to_owned(),
+            };
+            candidate.key_into(&mut out);
+            assert_eq!(out, candidate.key());
+            assert_eq!(out.capacity(), capacity);
+            assert_eq!(out.as_ptr(), pointer);
+        }
     }
 }

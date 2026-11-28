@@ -318,6 +318,20 @@ pub(crate) fn unpin_dialled(_address: IpAddr) -> bool {
     false
 }
 
+/// Whether a TUN capture is live, so a resolver's hijack address is reachable through it rather
+/// than through the physical route the app's own edges still use before the routes land.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+pub(crate) fn live_capture() -> bool {
+    capture()
+        .lock()
+        .is_ok_and(|slot| slot.iter().any(|guard| guard.strong_count() > 0))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub(crate) fn live_capture() -> bool {
+    false
+}
+
 /// Whether a live capture already sends this address into a TUN device.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub(crate) fn captured(address: IpAddr) -> io::Result<bool> {
