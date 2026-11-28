@@ -327,19 +327,16 @@ fn carrier_alpn(carrier: Carrier) -> std::sync::Arc<[Vec<u8>]> {
     std::sync::Arc::clone(&lists[carrier.key() as usize])
 }
 
-/// The empty lists a config that names none share, so a dial does not allocate four empty arcs.
-fn no_lists() -> &'static (
+type EmptyLists = (
     std::sync::Arc<[[u8; 32]]>,
     std::sync::Arc<[String]>,
     std::sync::Arc<[u16]>,
     std::sync::Arc<[u16]>,
-) {
-    static EMPTY: std::sync::OnceLock<(
-        std::sync::Arc<[[u8; 32]]>,
-        std::sync::Arc<[String]>,
-        std::sync::Arc<[u16]>,
-        std::sync::Arc<[u16]>,
-    )> = std::sync::OnceLock::new();
+);
+
+/// The empty lists a config that names none share, so a dial does not allocate four empty arcs.
+fn no_lists() -> &'static EmptyLists {
+    static EMPTY: std::sync::OnceLock<EmptyLists> = std::sync::OnceLock::new();
     EMPTY.get_or_init(|| {
         (
             std::sync::Arc::from(Vec::new()),

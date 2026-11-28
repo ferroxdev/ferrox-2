@@ -727,8 +727,7 @@ fn relay<T: Read + Write + Queued + HalfClose>(mut stream: T, mut peer: TcpStrea
     let _ = peer.set_nonblocking(true);
     let mut up = vec![0u8; BUFFER];
     let mut down = vec![0u8; BUFFER];
-    let mut down_at = 0usize;
-    let mut down_len = 0usize;
+    let (mut down_at, mut down_len) = (0usize, 0usize);
     let mut peer_eof = false;
     let mut stream_eof = false;
     let mut last_down = Instant::now();
