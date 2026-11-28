@@ -114,6 +114,12 @@ carrier-foxy  foxy::tests::a_growing_head_rewalked_costs_the_old_pass  ferrox_co
 carrier-foxy  foxy::connectip::tests::the_word_sum_costs_the_words_it_reads  ferrox_core::foxy::connectip::word_sum
 carrier-foxy  foxy::connectip::tests::the_word_sum_costs_the_words_it_reads  ferrox_core::foxy::connectip::tests::the_word_sum_costs_the_words_it_reads
 carrier-foxy  foxy::connectip::tests::the_serial_word_sum_costs_the_same_answer  ferrox_core::foxy::connectip::tests::the_serial_word_sum_costs_the_same_answer
+carrier-foxy  foxy::tests::the_static_opening_costs_no_build_where_three_vectors_do  foxy::tests::h3_static_probe
+carrier-foxy  foxy::tests::the_static_opening_costs_no_build_where_three_vectors_do  foxy::tests::h3_built_probe
+carrier-foxy  foxy::connectip::tests::the_fixed_request_costs_no_allocation_where_the_vec_one_does  ferrox_core::foxy::connectip::tests::fixed_request_probe
+carrier-foxy  foxy::connectip::tests::the_fixed_request_costs_no_allocation_where_the_vec_one_does  ferrox_core::foxy::connectip::tests::vec_request_probe
+carrier-foxy  masque::tests::the_borrowed_authority_costs_no_copy_where_the_built_one_does  masque::tests::authority_borrow_probe
+carrier-foxy  masque::tests::the_borrowed_authority_costs_no_copy_where_the_built_one_does  masque::tests::authority_built_probe
 carrier-grpc  grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else  grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else
 carrier-grpc  grpc::tests::the_varint_length_over_every_boundary  grpc::tests::the_varint_length_over_every_boundary
 carrier-grpc  grpc::tests::the_varint_shift_loop_over_every_boundary  grpc::tests::the_varint_shift_loop_over_every_boundary
@@ -263,6 +269,16 @@ carrier-psiphon  psiphon_quic::tests::the_byte_varint_walk_costs_the_same_answer
 # writer; it is not a measurement of the previous writer.
 carrier-psiphon  psiphon_shadowsocks::tests::the_direct_write_costs_the_seal_and_nothing_else  ferrox_app::psiphon_shadowsocks::tests::direct_write_probe
 carrier-psiphon  psiphon_shadowsocks::tests::the_flattened_write_costs_the_copy  ferrox_app::psiphon_shadowsocks::tests::flattened_write_probe
+carrier-psiphon  psiphon_light::tests::the_direct_write_costs_no_stage_where_the_staged_one_does  ferrox_app::psiphon_light::tests::write_direct_probe
+carrier-psiphon  psiphon_light::tests::the_direct_write_costs_no_stage_where_the_staged_one_does  ferrox_app::psiphon_light::tests::write_staged_probe
+carrier-psiphon  psiphon_light::tests::the_one_allocation_destination_costs_less_than_the_two_allocation_one  ferrox_app::psiphon_light::tests::normalize_one_probe
+carrier-psiphon  psiphon_light::tests::the_one_allocation_destination_costs_less_than_the_two_allocation_one  ferrox_app::psiphon_light::tests::normalize_two_probe
+carrier-psiphon  psiphon_ssh::tests::the_exact_extra_costs_no_regrow_where_the_short_one_does  ferrox_app::psiphon_ssh::tests::extra_fits_probe
+carrier-psiphon  psiphon_ssh::tests::the_exact_extra_costs_no_regrow_where_the_short_one_does  ferrox_app::psiphon_ssh::tests::extra_short_probe
+carrier-psiphon  psiphon_ssh::tests::the_exact_payload_costs_no_growth_where_the_empty_one_does  ferrox_app::psiphon_ssh::tests::payload_fits_probe
+carrier-psiphon  psiphon_ssh::tests::the_exact_payload_costs_no_growth_where_the_empty_one_does  ferrox_app::psiphon_ssh::tests::payload_grown_probe
+carrier-psiphon  psiphon_ssh::tests::the_channel_target_costs_no_string_where_the_old_one_does  ferrox_app::psiphon_ssh::tests::target_args_probe
+carrier-psiphon  psiphon_ssh::tests::the_channel_target_costs_no_string_where_the_old_one_does  ferrox_app::psiphon_ssh::tests::target_string_probe
 # The sniff probe's frame is not an exact gate: on the same source it has read
 # 1228 and 1231, so it is reported here and not in expected-ops.
 engine-sniffing-http-tls-quic-fakedns  sniff::tests::a_warm_probe_costs_the_documented_instructions  ferrox_app::sniff::Sniffing::inspect
@@ -270,6 +286,8 @@ carrier-quic  proxy::tests::quic_serves_vless_echo_over_loopback  quic::serve_lo
 wireguard  wireguard::device::tests::a_replayed_transport_counter_is_refused  wireguard::device::Tunnel::send
 wireguard  wg::tests::a_prefix_table_picks_the_peer_the_scan_picks  ferrox_app::wg::tests::route_scan_once
 wireguard  wg::tests::a_prefix_table_picks_the_peer_the_scan_picks  ferrox_app::wg::tests::route_table_once
+wireguard  wg::tests::the_shared_lookup_costs_no_clone_where_a_vec_does  ferrox_app::wg::tests::lookup_shared_probe
+wireguard  wg::tests::the_shared_lookup_costs_no_clone_where_a_vec_does  ferrox_app::wg::tests::lookup_clone_probe
 carrier-quic  quic::tests::a_two_entry_identity_builds_every_context  quic::tls_config
 
 # The TUIC parser's own frame: one full PACKET header and payload over a fixed

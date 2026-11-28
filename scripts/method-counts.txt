@@ -1167,8 +1167,8 @@ wireguard prefixed-record-zeroed-bytes 0 ferrox-core-wireguard::tests::a_prefixe
 wireguard received-record-copies 0 ferrox-core-wireguard::tests::an_owned_transport_record_keeps_the_received_allocation
 wireguard kernel-rule-priority 32765 ferrox-app-wg-kernel::tests::the_rule_marks_the_table
 wireguard kernel-iif-priority 32764 ferrox-app-wg-kernel::tests::the_iif_rule_keeps_the_reverse_path_inside_the_tunnel
-wireguard routed-destination-list-allocations 1 ferrox-app-wg::tests::a_routed_destination_costs_one_list_and_a_cached_name_one_answer
-wireguard cached-name-lookup-allocations 1 ferrox-app-wg::tests::a_routed_destination_costs_one_list_and_a_cached_name_one_answer
+wireguard routed-destination-list-allocations 1 ferrox-app-wg::tests::a_routed_destination_costs_one_list_and_a_cached_name_no_copy
+wireguard cached-name-lookup-allocations 0 ferrox-app-wg::tests::a_routed_destination_costs_one_list_and_a_cached_name_no_copy
 wireguard routed-lane-target-allocations 0 ferrox-app-wg-stack::tests::a_datagrams_targets_never_reach_the_allocator
 wireguard routed-lane-targets-kept-in-answer-order 2 ferrox-app-wg-stack::tests::a_datagrams_targets_never_reach_the_allocator
 carrier-masque ops-retired-instructions UNBLESSED scripts/count-ops.sh

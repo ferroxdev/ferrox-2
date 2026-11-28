@@ -1,6 +1,6 @@
 //! MASQUE CONNECT-IP (RFC 9484) over CONNECT-UDP's two carriers: one `connect-ip` request with `capsule-protocol: ?1`, then `ADDRESS_ASSIGN` 1, `ADDRESS_REQUEST` 2 and `ROUTE_ADVERTISEMENT` 3 capsules decide what the stream carries, IP packets for every destination riding the type-0 DATAGRAM capsule with a zero context byte — arithmetic only, no socket, clock or heap.
 
-use super::frames::{quic_read, quic_varint, quic_varint_len};
+use super::frames::{quic_read, quic_varint, quic_varint_into, quic_varint_len};
 use super::hpack::{integer, integer_into};
 use std::net::IpAddr;
 
@@ -279,6 +279,25 @@ pub fn address_request(id: u64, version: u8, address: &[u8], out: &mut Vec<u8>) 
     address_requests(&[(id, version, address)], out);
 }
 
+/// The bytes one valid request batch takes, or `None` when a batch is malformed.
+fn address_requests_len(entries: &[(u64, u8, &[u8])]) -> Option<usize> {
+    let valid = !entries.is_empty()
+        && entries
+            .iter()
+            .all(|(id, version, address)| match (version, address.len()) {
+                (4, 4) | (6, 16) => *id != 0,
+                _ => false,
+            });
+    if !valid {
+        return None;
+    }
+    let body: usize = entries
+        .iter()
+        .map(|(id, _, address)| quic_varint_len(*id) + 1 + address.len() + 1)
+        .sum();
+    Some(quic_varint_len(ADDRESS_REQUEST) + quic_varint_len(body as u64) + body)
+}
+
 /// One `ADDRESS_REQUEST` capsule naming every address a client wants, which is how the reference asks for both families at once: a proxy replaces the peer's allowed sources with each answer, so a second request would leave the first family unroutable. An empty batch, a zero request id or an address whose width disagrees with its version is refused before any bytes are written.
 pub fn address_requests(entries: &[(u64, u8, &[u8])], out: &mut Vec<u8>) {
     let valid = !entries.is_empty()
@@ -303,6 +322,31 @@ pub fn address_requests(entries: &[(u64, u8, &[u8])], out: &mut Vec<u8>) {
         out.extend_from_slice(address);
         out.push((address.len() as u8) * 8);
     }
+}
+
+/// The same capsule written into the caller's fixed buffer, so a request that fits does not allocate: returns the bytes written, or `None` when the batch is malformed or the buffer is too short, leaving the buffer untouched in both cases.
+pub fn address_requests_into(entries: &[(u64, u8, &[u8])], out: &mut [u8]) -> Option<usize> {
+    let need = address_requests_len(entries)?;
+    if out.len() < need {
+        return None;
+    }
+    let body: usize = entries
+        .iter()
+        .map(|(id, _, address)| quic_varint_len(*id) + 1 + address.len() + 1)
+        .sum();
+    let mut at = 0;
+    at += quic_varint_into(&mut out[at..], ADDRESS_REQUEST);
+    at += quic_varint_into(&mut out[at..], body as u64);
+    for (id, version, address) in entries {
+        at += quic_varint_into(&mut out[at..], *id);
+        out[at] = *version;
+        at += 1;
+        out[at..at + address.len()].copy_from_slice(address);
+        at += address.len();
+        out[at] = (address.len() as u8) * 8;
+        at += 1;
+    }
+    Some(at)
 }
 
 /// Bytes one DATAGRAM capsule takes for an IP packet of this length, so a caller frames it before building it: HTTP/3 writes its frame length ahead, and the capsule's own varint sits inside it.
@@ -1281,6 +1325,63 @@ mod tests {
         };
         assert_eq!(body.len(), 7 + 19);
         assert_eq!(request(1, 4, &V4).len(), 9, "one family keeps its bytes");
+    }
+
+    /// The fixed-buffer request writes the Vec request's bytes at the caller's address, and a buffer one byte short refuses before writing.
+    #[test]
+    fn the_fixed_buffer_request_is_the_vec_one() {
+        let entries = [(1, 4, &V4[..]), (2, 6, &V6[..])];
+        let mut wanted = Vec::new();
+        address_requests(&entries, &mut wanted);
+        let mut fixed = [0xA5u8; 64];
+        let (wrote, counts) =
+            crate::alloc_count::measure(|| address_requests_into(&entries, &mut fixed));
+        let wrote = wrote.expect("fits");
+        assert_eq!(counts.allocs, 0, "the fixed buffer is the caller's");
+        assert_eq!(&fixed[..wrote], wanted.as_slice());
+        let mut short = [0xA5u8; 64];
+        assert!(
+            address_requests_into(&entries, &mut short[..wrote - 1]).is_none(),
+            "a short buffer refuses"
+        );
+        assert_eq!(short, [0xA5u8; 64], "a short buffer is untouched");
+        let invalid = [(0, 4, &V4[..])];
+        let mut kept = [0xA5u8; 64];
+        assert!(
+            address_requests_into(&invalid, &mut kept).is_none(),
+            "an invalid batch refuses"
+        );
+        assert_eq!(kept, [0xA5u8; 64], "an invalid batch is untouched");
+    }
+
+    #[inline(never)]
+    fn fixed_request_probe(entries: &[(u64, u8, &[u8])]) -> usize {
+        let mut out = [0u8; 32];
+        let mut sum = 0;
+        for _ in 0..4096 {
+            sum += address_requests_into(std::hint::black_box(entries), &mut out).unwrap_or(0);
+            std::hint::black_box(&out);
+        }
+        sum
+    }
+
+    #[inline(never)]
+    fn vec_request_probe(entries: &[(u64, u8, &[u8])]) -> usize {
+        let mut sum = 0;
+        for _ in 0..4096 {
+            let mut out = Vec::new();
+            address_requests(std::hint::black_box(entries), &mut out);
+            sum += out.len();
+            std::hint::black_box(&out);
+        }
+        sum
+    }
+
+    /// The caller's buffer writes the same request as the Vec path without paying for the Vec.
+    #[test]
+    fn the_fixed_request_costs_no_allocation_where_the_vec_one_does() {
+        let entries = [(1, 4, &V4[..]), (2, 6, &V6[..])];
+        assert_eq!(fixed_request_probe(&entries), vec_request_probe(&entries));
     }
 
     #[test]

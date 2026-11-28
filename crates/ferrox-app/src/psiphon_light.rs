@@ -2,6 +2,7 @@
 //! destination without an SSH tunnel, framed by a CBOR header and initial
 //! padding so the first records look like ordinary browser traffic.
 
+use std::fmt::Write as _;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -574,11 +575,16 @@ fn normalize_destination(host: &str, port: u16) -> Result<String, String> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(SocketAddr::new(ip, port).to_string());
     }
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let host = host.trim_end_matches('.');
     if host.is_empty() {
         return Err("psiphon light: destination host is empty".to_owned());
     }
-    Ok(format!("{host}:{port}"))
+    let mut target = String::with_capacity(host.len() + 6);
+    target.push_str(host);
+    target.make_ascii_lowercase();
+    target.push(':');
+    write!(target, "{port}").expect("a String write cannot fail");
+    Ok(target)
 }
 
 /// Map the reference platform name to its header code.
@@ -998,6 +1004,9 @@ impl<T: Write> Write for LightStream<T> {
             return Ok(0);
         }
         if self.write_padding_done {
+            if self.pending_len() == 0 && self.header_left == 0 && buf.len() <= MAX_RECORD {
+                return self.write_direct(buf);
+            }
             self.pending.extend_from_slice(buf);
             self.drain()?;
             return Ok(buf.len());
@@ -1043,6 +1052,29 @@ impl<T: Write> Write for LightStream<T> {
 }
 
 impl<T: Write> LightStream<T> {
+    /// Hand a record straight to the writer, staging only what it does not take, so an accepted write copies nothing.
+    fn write_direct(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self.inner.write(buf) {
+            Ok(0) => Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "psiphon light: TLS writer accepted no bytes",
+            )),
+            Ok(written) => {
+                if written < buf.len() {
+                    self.pending.extend_from_slice(&buf[written..]);
+                    self.drain()?;
+                }
+                Ok(buf.len())
+            }
+            Err(error) if idle(&error) => {
+                self.pending.extend_from_slice(buf);
+                self.drain()?;
+                Ok(buf.len())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Hand queued bytes to the TLS writer in 8-16 KiB records; false means a timeout.
     fn drain(&mut self) -> io::Result<bool> {
         while self.pending_at < self.pending.len() {
@@ -1078,6 +1110,153 @@ impl<T: Write> LightStream<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A partial plain write stages only the remainder and retries it, with no byte lost or repeated.
+    #[test]
+    fn a_partial_plain_write_is_staged_and_retried() {
+        struct Partial {
+            out: Vec<u8>,
+        }
+        impl Write for Partial {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                let take = if self.out.is_empty() {
+                    2.min(buf.len())
+                } else {
+                    buf.len()
+                };
+                self.out.extend_from_slice(&buf[..take]);
+                Ok(take)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut stream = LightStream::new(Partial { out: Vec::new() }, Vec::new());
+        stream.write_padding_done = true;
+        let data = b"payload";
+        assert_eq!(stream.write(data).expect("writes"), data.len());
+        assert_eq!(stream.inner.out.as_slice(), &data[..]);
+        assert!(stream.pending.is_empty(), "the remainder was retried");
+    }
+
+    #[inline(never)]
+    fn normalize_one_probe() -> usize {
+        let mut sum = 0;
+        for _ in 0..4096 {
+            let target = normalize_destination("Example.COM.", 443).expect("destination");
+            sum += std::hint::black_box(&target).len();
+        }
+        sum
+    }
+
+    #[inline(never)]
+    fn normalize_two_probe() -> usize {
+        let mut sum = 0;
+        for _ in 0..4096 {
+            let host = std::hint::black_box("Example.COM.")
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            let target = format!("{host}:443");
+            sum += std::hint::black_box(&target).len();
+        }
+        sum
+    }
+
+    /// The normalized destination is one allocation, where the old shape paid for the lowercased host and the formatted target.
+    #[test]
+    fn the_one_allocation_destination_costs_less_than_the_two_allocation_one() {
+        assert_eq!(normalize_one_probe(), normalize_two_probe());
+    }
+
+    /// A destination is normalized into one allocation, with the lowercasing done in place.
+    #[test]
+    fn normalize_destination_allocates_once() {
+        let (target, counts) = ferrox_core::alloc_count::measure(|| {
+            normalize_destination("Example.COM.", 443).expect("destination")
+        });
+        assert_eq!(target, "example.com:443");
+        assert_eq!(counts.allocs, 1, "the target string is the only allocation");
+    }
+
+    struct Discard(usize);
+
+    impl Write for Discard {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[inline(never)]
+    fn write_direct_probe() -> usize {
+        let mut stream = LightStream::new(Discard(0), Vec::new());
+        stream.write_padding_done = true;
+        let data = [0x5Au8; 1024];
+        for _ in 0..4096 {
+            stream
+                .write_all(std::hint::black_box(&data))
+                .expect("writes");
+        }
+        stream.inner.0
+    }
+
+    #[inline(never)]
+    fn write_staged_probe() -> usize {
+        let mut stream = LightStream::new(Discard(0), Vec::new());
+        stream.write_padding_done = true;
+        let data = [0x5Au8; 1024];
+        for _ in 0..4096 {
+            stream
+                .pending
+                .extend_from_slice(std::hint::black_box(&data));
+            stream.drain().expect("drains");
+        }
+        stream.inner.0
+    }
+
+    /// A plain write reaches the writer without the staging copy the old path paid.
+    #[test]
+    fn the_direct_write_costs_no_stage_where_the_staged_one_does() {
+        assert_eq!(write_direct_probe(), write_staged_probe());
+    }
+
+    /// A write after the opening goes straight to the writer, so the writer sees the caller's bytes rather than a staged copy.
+    #[test]
+    fn a_plain_write_goes_straight_to_the_writer() {
+        struct Once {
+            seen: *const u8,
+        }
+        impl Write for Once {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.seen = buf.as_ptr();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut stream = LightStream::new(
+            Once {
+                seen: std::ptr::null(),
+            },
+            Vec::new(),
+        );
+        stream.write_padding_done = true;
+        let data = b"payload";
+        let (written, counts) = ferrox_core::alloc_count::measure(|| stream.write(data));
+        assert_eq!(written.expect("writes"), data.len());
+        assert_eq!(counts.allocs, 0, "the accepted write stages nothing");
+        assert_eq!(
+            stream.inner.seen,
+            data.as_ptr(),
+            "the writer saw the caller's buffer"
+        );
+        assert!(stream.pending.is_empty(), "nothing was staged");
+    }
 
     /// Encode a test proxy entry with the given fields.
     fn entry_bytes(fields: Vec<(Value, Value)>) -> Vec<u8> {

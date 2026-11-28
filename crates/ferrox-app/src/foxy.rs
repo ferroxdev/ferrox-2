@@ -29,6 +29,9 @@ const SEND_WAIT: Duration = Duration::from_secs(10);
 const PUMP_WAIT: Duration = Duration::from_millis(5);
 /// The client's first unidirectional stream, carrying the SETTINGS that make the connection HTTP/3.
 const CONTROL_STREAM: u64 = 2;
+static H3_CONTROL_OPENING: [u8; 9] = [0x00, 0x04, 0x06, 0x01, 0x00, 0x07, 0x00, 0x08, 0x00];
+static H3_ENCODER_OPENING: [u8; 1] = [0x02];
+static H3_DECODER_OPENING: [u8; 1] = [0x03];
 /// The ceiling of a QUIC frame header: two varints of at most eight bytes each. The request stream's window is this size and nothing larger, because a payload never passes through it — it lands in the buffer its reader uses.
 const H3_PEEK: usize = 16;
 /// The largest frame block the lane will consume without keeping it: a HEADERS answer's block and any frame the tunnel has no use for are bounded by one head, so a peer cannot make the lane wait on a block bigger than a header.
@@ -2691,18 +2694,12 @@ impl H3 {
     }
 
     /// The HTTP/3 opening a fresh connection carries exactly once: a complete SETTINGS plus QPACK encoder/decoder hellos, literal-only with no dynamic table; a truncated SETTINGS waits forever and a second control stream is a connection error, and nothing is ever finished.
-    pub(crate) fn h3_opening() -> [(u64, Vec<u8>); 3] {
-        let mut control = Vec::with_capacity(16);
-        frames::quic_varint(&mut control, 0x00);
-        let settings = [0x01u8, 0x00, 0x07, 0x00, 0x08, 0x00];
-        frames::quic_varint(&mut control, 0x04);
-        frames::quic_varint(&mut control, settings.len() as u64);
-        control.extend_from_slice(&settings);
-        let mut encoder = Vec::with_capacity(2);
-        frames::quic_varint(&mut encoder, 0x02);
-        let mut decoder = Vec::with_capacity(2);
-        frames::quic_varint(&mut decoder, 0x03);
-        [(CONTROL_STREAM, control), (6, encoder), (10, decoder)]
+    pub(crate) fn h3_opening() -> [(u64, &'static [u8]); 3] {
+        [
+            (CONTROL_STREAM, &H3_CONTROL_OPENING),
+            (6, &H3_ENCODER_OPENING),
+            (10, &H3_DECODER_OPENING),
+        ]
     }
 
     /// One UDP target as its own stream on a shared HTTP/3 connection: the extended CONNECT names `capsule-protocol: ?1` and datagrams ride DATAGRAM capsules — RFC 9298, the same capsule stream the HTTP/2 edge carries.
@@ -2777,16 +2774,17 @@ impl H3 {
         lane.send_headers(&block)?;
         let status = lane.read_head()?;
         opened(status)?;
-        let mut request = Vec::new();
+        let mut request = [0u8; 32];
         // Both families in one capsule: the proxy replaces its allowed sources with each answer, so a second request would leave the first family unroutable.
-        connectip::address_requests(
+        let request_len = connectip::address_requests_into(
             &[(ADDRESS_V4, 4, &[0, 0, 0, 0]), (ADDRESS_V6, 6, &[0; 16])],
             &mut request,
-        );
+        )
+        .ok_or(Failure::Frame)?;
         // The request rides one DATA frame the way a packet does: capsules here are framed, and raw bytes would read as a frame header.
         let mut head = [0u8; 9];
-        let hl = frames::h3_data_header(&mut head, request.len() as u64);
-        lane.send_pair(lane.quic.id, &head[..hl], &request)?;
+        let hl = frames::h3_data_header(&mut head, request_len as u64);
+        lane.send_pair(lane.quic.id, &head[..hl], &request[..request_len])?;
         Ok(lane)
     }
 
@@ -4565,6 +4563,57 @@ pub(crate) fn refusal_reply(failure: Failure) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The H3 opening is one static byte sequence, so two connections share its addresses instead of each copying the same bytes.
+    #[test]
+    fn the_h3_opening_is_shared_static_bytes() {
+        let (first, counts) = ferrox_core::alloc_count::measure(H3::h3_opening);
+        assert_eq!(counts.allocs, 0, "the opening is static, not built");
+        let second = H3::h3_opening();
+        for (one, two) in first.iter().zip(second.iter()) {
+            assert_eq!(one.0, two.0);
+            assert_eq!(one.1.as_ptr(), two.1.as_ptr());
+        }
+        assert_eq!(
+            first[0].1,
+            &[0x00, 0x04, 0x06, 0x01, 0x00, 0x07, 0x00, 0x08, 0x00][..]
+        );
+        assert_eq!(first[1].1, &[0x02][..]);
+        assert_eq!(first[2].1, &[0x03][..]);
+    }
+
+    #[inline(never)]
+    fn h3_static_probe() -> usize {
+        let mut sum = 0;
+        for _ in 0..4096 {
+            for (_, bytes) in H3::h3_opening() {
+                sum += std::hint::black_box(bytes).len();
+            }
+        }
+        sum
+    }
+
+    #[inline(never)]
+    fn h3_built_probe() -> usize {
+        let mut sum = 0;
+        for _ in 0..4096 {
+            let opening = [
+                std::hint::black_box(H3_CONTROL_OPENING.to_vec()),
+                std::hint::black_box(H3_ENCODER_OPENING.to_vec()),
+                std::hint::black_box(H3_DECODER_OPENING.to_vec()),
+            ];
+            for bytes in &opening {
+                sum += bytes.len();
+            }
+        }
+        sum
+    }
+
+    /// The static opening is the same bytes as three built buffers, without the builds.
+    #[test]
+    fn the_static_opening_costs_no_build_where_three_vectors_do() {
+        assert_eq!(h3_static_probe(), h3_built_probe());
+    }
 
     /// A `Read` source that answers a whole buffer in one call and counts the calls it got: the read count is exact here, which is what a loopback socket cannot promise.
     struct HeadSource<'a> {
