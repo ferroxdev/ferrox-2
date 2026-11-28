@@ -1178,7 +1178,7 @@ mod tests {
         let capacity = stream.wire.capacity();
         stream.wire_at = stream.wire.len();
         stream.compact();
-        assert!(stream.wire.is_empty());
+        assert_eq!(stream.wire.as_slice(), b"");
         assert!(stream.fill().expect("second fill"));
         assert_eq!(stream.wire.as_slice(), &b"efgh"[..]);
         assert_eq!(stream.wire.capacity(), capacity, "the wire is reused");
