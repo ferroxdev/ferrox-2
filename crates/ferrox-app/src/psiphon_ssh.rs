@@ -1483,34 +1483,7 @@ impl Proxy {
         count += 1;
         write_all_parts_until::<17>(stream, deadline, &parts[..count])
             .map_err(|error| format!("psiphon: upstream proxy write: {error}"))?;
-        let mut head = Vec::with_capacity(128);
-        let mut window = [0u8; 512];
-        loop {
-            arm_tcp_io(stream, deadline)
-                .map_err(|error| format!("psiphon: upstream proxy read: {error}"))?;
-            let peeked = match stream.peek(&mut window) {
-                Ok(0) => {
-                    return Err("psiphon: upstream proxy closed before its answer".to_owned());
-                }
-                Ok(count) => count,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => {
-                    return Err(format!("psiphon: upstream proxy read: {error}"));
-                }
-            };
-            let take = crate::proxy::find_across(&head, &window[..peeked], b"\r\n\r\n")
-                .map_or(peeked, |at| at + 4 - head.len());
-            let start = head.len();
-            head.resize(start + take, 0);
-            read_exact_until(stream, deadline, &mut head[start..])
-                .map_err(|error| format!("psiphon: upstream proxy read: {error}"))?;
-            if head.ends_with(b"\r\n\r\n") {
-                break;
-            }
-            if head.len() > 4096 {
-                return Err("psiphon: upstream proxy answer is too long".to_owned());
-            }
-        }
+        let head = read_http_head(stream, deadline)?;
         let text = String::from_utf8_lossy(&head);
         let status = text
             .split_whitespace()
@@ -1660,6 +1633,37 @@ fn read_exact_until(
         }
     }
     Ok(())
+}
+
+fn read_http_head(stream: &mut TcpStream, deadline: Instant) -> Result<Vec<u8>, String> {
+    let mut head = Vec::with_capacity(128);
+    let mut window = [0u8; 512];
+    loop {
+        arm_tcp_io(stream, deadline)
+            .map_err(|error| format!("psiphon: upstream proxy read: {error}"))?;
+        let peeked = match stream.peek(&mut window) {
+            Ok(0) => {
+                return Err("psiphon: upstream proxy closed before its answer".to_owned());
+            }
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(format!("psiphon: upstream proxy read: {error}"));
+            }
+        };
+        let take = crate::proxy::find_across(&head, &window[..peeked], b"\r\n\r\n")
+            .map_or(peeked, |at| at + 4 - head.len());
+        let start = head.len();
+        head.resize(start + take, 0);
+        read_exact_until(stream, deadline, &mut head[start..])
+            .map_err(|error| format!("psiphon: upstream proxy read: {error}"))?;
+        if head.ends_with(b"\r\n\r\n") {
+            return Ok(head);
+        }
+        if head.len() > 4096 {
+            return Err("psiphon: upstream proxy answer is too long".to_owned());
+        }
+    }
 }
 
 fn write_all_until(stream: &mut TcpStream, deadline: Instant, mut bytes: &[u8]) -> io::Result<()> {
